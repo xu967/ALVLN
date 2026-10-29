@@ -2,7 +2,7 @@
 
 - 时间：2026-10-29 13:17
 - 范围：TinyAerialVLN_Final_V8 的 frontend、server、接口契约、测试及现有预览图
-- 结论：完成只读审查、CSV/worker 收尾、任务参数校验、审核包一致性、托管任务跨文件静止快照及 stopped 生命周期修复；Git 提交因目录不是仓库而阻塞
+- 结论：完成只读审查、CSV/worker 收尾、任务参数校验、审核包一致性、托管任务跨文件静止快照及 stopped 生命周期修复；Git 仓库已初始化并提交
 
 ## 做了什么
 
@@ -151,7 +151,7 @@
 - 没有实现 SIGTERM 超时后升级 SIGKILL；忽略 SIGTERM 的任务仍会停在 stopping，需要后续策略。
 - 没有修改前端停止按钮或轮询终态；前端当前未使用 stop API，该问题仍在后续范围。
 - 没有用真实训练器验证其 SIGTERM 处理行为；使用受控子进程验证生命周期逻辑。
-- 没有执行 Git commit；目录仍不是 Git 仓库。
+- 该节点尚未执行 Git commit，因为目录不是仓库；仓库初始化与提交见下一节。
 
 ### 验证到哪一步
 
@@ -166,6 +166,36 @@
 
 - 停止请求只发送一次 SIGTERM；若外部程序忽略信号，状态会长期保持 stopping，运维仍需人工确认。
 - 用户停止与崩溃几乎同时发生时，只要 SIGTERM 发送成功，最终会记 stopped；原始 exit_code 仍保留用于审计。
+
+## 更新 2026-10-29 2026-10-29 17:07
+
+### 做了什么
+
+- 在 TinyAerialVLN_Final_V8 初始化 Git 仓库，默认分支 main。
+- 设置仓库级提交身份 CodeBuddy <codebuddy@localhost>，未修改全局 Git 配置。
+- 将当前项目 122 个非忽略文件纳入初始提交 921b48c，包含源码、文档、预览图、审核记录和 references 快照 ZIP。
+- 提交信息记录本次生命周期、参数校验、审核快照和 stopped 状态修复，并注明 36 项测试通过。
+
+### 没做什么
+
+- 没有配置远端仓库，也没有 push；当前仅本地提交。
+- 没有重建历史提交或生成修复前基线；首次导入包含当前已修复状态，无法在 Git 历史中单独展示修复 diff。
+- 没有排除 24.5 MB 的 references/snapshots/OpenFly-Platform.zip；该文件未被现有 .gitignore 忽略，保留为项目快照证据。
+- 没有修改 .gitignore 或清理 .ipynb_checkpoints；保持原包内容不变。
+
+### 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| git init | 成功：main 分支 |
+| git commit | 成功：921b48c，root-commit，122 files changed，16201 insertions |
+| 提交前测试 | 通过：Ran 36 tests in 3.066s，OK |
+| 远端推送 | 未执行：未配置 remote |
+
+### 风险与遗留
+
+- 初始提交无法替代真实开发历史；后续修复应从该提交开始正常增量提交。
+- 本地提交身份为 CodeBuddy，若需要归属个人或团队，应在后续提交前调整仓库级 user.name/user.email。
 
 ## 更新 2026-10-29 16:38
 
