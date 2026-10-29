@@ -256,6 +256,37 @@
 - 远端原有 Apache-2.0 LICENSE 被导入；如项目授权不应为 Apache-2.0，需要用户确认后再调整。
 - 后续备份仍需手动 commit + push；当前没有自动定时推送。
 
+## 更新 2026-10-29 2026-10-29 17:37
+
+### 做了什么
+
+- LICENSE：删除 Apache-2.0 模板，改为 proprietary / confidential 声明，仅允许仓库所有者及明确授权人员用于内部研究，不授予对外复制、分发、商用、托管或再许可权利。
+- LICENSE：明确 references/、legacy/ 等第三方组件继续适用各自许可证，根授权不会重新许可这些材料。
+- README.md：增加 License 小节并链接 LICENSE；把本地验证测试数从 23 更新为当前 36。
+- 个人规则：在 /root/.claude/skills/personal-skill/SKILL.md、/root/.codex/skills/personal-skill/SKILL.md、/root/.codebuddy/skills/personal-skill/SKILL.md 增加 GitHub 提交与推送规范，覆盖授权、暂存检查、敏感信息、测试、提交粒度、非快进合并、禁止强推、Deploy key 保密和推送后校验。
+
+### 没做什么
+
+- 没有修改 references/、legacy/ 或任何第三方源码的原始许可证和版权声明。
+- 没有把本仓库改为 public，也没有添加对外开源许可证。
+- 没有重算 SHA256SUMS.txt 或 PACKAGE_MANIFEST.json；这两份清单在之前文档更新后已不覆盖最新内容，本次未扩大范围处理。
+- 没有修改备份目录中的 claude-skills 模板；只更新了 Claude Code、Codex 和当前 CodeBuddy 的活动规则副本。
+- 没有修改运行代码，因此不涉及功能行为变化。
+
+### 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| LICENSE 文本 | 已检查：proprietary、内部研究限定、第三方权利保留、无对外授权 |
+| 个人规则写入 | 已检查：三份活动 SKILL.md 均存在 GitHub 提交与推送规范章节 |
+| ./run.sh test | 通过：36 tests，OK |
+| 许可证法律效力 | 未做法律审查；该文本是工程用授权声明，不构成法律意见 |
+
+### 风险与遗留
+
+- 根 LICENSE 已变为 proprietary；任何外部协作者、公开镜像或论文附录不得再按 Apache-2.0 使用本项目。
+- SHA256SUMS.txt 与 PACKAGE_MANIFEST.json 已过期，发布压缩包前必须重新生成并验证。
+
 ## 更新 2026-10-29 16:38
 
 ### 做了什么
