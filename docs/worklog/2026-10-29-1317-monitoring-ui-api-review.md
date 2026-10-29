@@ -225,6 +225,37 @@
 - 必须将公钥添加为账号 SSH key 或 ALVLN 仓库的 Deploy key，并授予写权限。
 - 远端完成后仍需执行首次 push，届时本地提交才真正形成 GitHub 备份。
 
+## 更新 2026-10-29 2026-10-29 17:29
+
+### 做了什么
+
+- GitHub Deploy key 认证成功：SSH 返回 Hi xu967/ALVLN。
+- 首次 push 被安全拒绝，因为远端已有 93d0c4b Initial commit；未使用 force。
+- fetch 后确认远端只有 README.md 和 Apache-2.0 LICENSE；合并无共同祖先历史，保留本地项目 README，并导入远端 LICENSE。
+- 创建合并提交 e53f002，成功推送 main 并设置 upstream origin/main。
+
+### 没做什么
+
+- 没有强推或删除远端初始提交；93d0c4b 仍保留在合并历史中。
+- 没有修改远端 README 为项目内容；合并冲突时保留本地 README，远端原 README 只能在历史中查看。
+- 没有配置分支保护、标签、GitHub Actions 或定时推送。
+- 合并仅新增 LICENSE，没有重跑测试；此前 36 项测试结果仍对应代码内容。
+
+### 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| SSH 认证 | 通过：Hi xu967/ALVLN |
+| git push | 通过：93d0c4b..e53f002 main -> main |
+| upstream | 通过：main 跟踪 origin/main |
+| 远端 main | e53f002b15988401f4b590345e65ece6bae980d4 |
+| 工作区 | 干净 |
+
+### 风险与遗留
+
+- 远端原有 Apache-2.0 LICENSE 被导入；如项目授权不应为 Apache-2.0，需要用户确认后再调整。
+- 后续备份仍需手动 commit + push；当前没有自动定时推送。
+
 ## 更新 2026-10-29 16:38
 
 ### 做了什么
