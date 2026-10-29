@@ -119,6 +119,10 @@ The planned pipeline (spec §3) has six interfaces: `SimObservation` (RGB + time
 
 ## 本轮维护入口
 
+**Git**：本地仓库在 `.git`；远端是 `git@github.com:xu967/ALVLN.git` 的 `uav_rgb/` 子目录。
+推送在 `../ALVLN`（完整克隆）里做：替换 `uav_rgb/` → commit → push。重新克隆要 12 分钟，别删。
+本仓库有并发会话，提交前逐文件确认归属，不要 `git add -A`。
+
 **报任何数字前先读 `docs/EVAL_STANDARD.md`**：离地用 scikit-learn 宏指标（`acc` 单独无效），
 闭环用 AvoidBench(ICRA 2023) 的 SR/PO/EO/AGV/MP 定义。只报准确率、或声称跑过 AvoidBench 套件，都是违规。
 

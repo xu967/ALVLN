@@ -23,7 +23,10 @@
 
 ## 〇、接手前必读
 
-1. **本仓库不是 git 仓库**（`git status` 报错）。所有改动**没有版本控制兜底**。建议第一件事就是 `git init` + 首次提交。
+1. **已建立 Git**（2026-10-29）。本地仓库在 `uav_rgb/.git`；远端是
+   `git@github.com:xu967/ALVLN.git` 的 **`uav_rgb/` 子目录**（deploy key 只能访问这一个仓库）。
+   推送方式：`code/ALVLN`（完整克隆，**不要删**，重新克隆约 12 分钟）里替换 `uav_rgb/` 后
+   commit + push。**本仓库有并发会话在写，提交前逐文件确认归属，不要 `git add -A`。**
 2. **`ui/` 归另一个会话维护**。改 UI 前先确认，否则会覆盖对方工作。本文档只覆盖 `src/`、`sim/`、`tools/`、`docs/`。
 3. **`sim/tools/collect.py` 可能被并发修改**。动它之前先看 `mtime` 和是否有 agent 在跑。
 4. 所有任务结束必须写 `docs/worklog/YYYY-MM-DD-HHMM-<slug>.md`，含「做了什么 / 没做什么 / 验证到哪一步 / 风险遗留」。

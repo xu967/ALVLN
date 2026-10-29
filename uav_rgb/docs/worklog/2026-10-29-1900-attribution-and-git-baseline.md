@@ -90,3 +90,53 @@
 - T1/T2 不修就采新数据，会让下一轮实验同时背两个已知污染源，届时仍然无法归因。
 - D7（柱子陷在地标里）会让新数据继续带着无意义的视觉噪声；要不要先改场景再采，
   应和 episode 长度一起决定，避免采集两轮。
+
+## 更新 2026-10-29 19:50：已推送到 GitHub（子目录方案）
+
+用户选择方案 (a)：把本工程作为子目录推进 `xu967/ALVLN`，原有文件不动。
+
+### 做了什么
+
+- 建立完整克隆 `code/ALVLN`（**62 MB，完整克隆耗时 11 分 36 秒**，网络约 85 KB/s）。
+- 把本地 `uav_rgb/` 的 181 个受控文件解到 `code/ALVLN/uav_rgb/`，提交 `9805178`，
+  推送到 `origin/main`。
+- 推送一次被拒（`fetch first`）：克隆期间别人推了 `fadd614`（改 `README.md` 和一个 worklog）。
+  按规则先 `git fetch` 再 `git rebase origin/main`，无冲突后重推成功。
+- 验证：远端 `main` = `9805178` = 本地 HEAD；`uav_rgb/` 181 个文件与本地逐文件一致；
+  ALVLN 原有 123 个文件全部保留。
+
+### 没做什么 / 踩过的坑
+
+- **第一次用了 `--filter=blob:none` 的 partial clone，失败。** `git commit` 和 `git push`
+  都会触发按需拉取旧 blob，进程卡在 `git-upload-pack`（下载），6 分钟没动静后被杀。
+  代价：那次提交没写成，远端未被改动。**结论：这个仓库不能用 partial clone 做推送准备。**
+- **`pkill -f 'alvln_push'` 杀到了自己的 shell**（`CLAUDE.md` 里写过这个坑，又踩了一次）。
+  退出码 144 由此而来。以后按 PID 杀。
+- **核对文件数时用 `git ls-tree` 默认输出，被 `core.quotePath` 骗了一次**：中文文件名显示为
+  `"docs/\345\256\211..."`，前缀多了引号，`grep '^uav_rgb/'` 数出 178 而不是 181，
+  差点误报「3 个中文文档丢了」。加 `-c core.quotePath=false` 后确认 181 个全在。
+- 没有把工作目录搬进克隆。原因：`:35` 与当前有其它 claude/codex 会话以
+  `code/uav_rgb` 为工作目录，搬目录会直接打断它们。
+
+### 维护方式（当前是过渡态）
+
+本地 `code/uav_rgb` 与 `code/ALVLN/uav_rgb` 是两份拷贝，推送靠手动同步：
+
+```bash
+cd /root/claude-code-backup-20261028/code/uav_rgb && git archive HEAD | tar -x -C ../ALVLN/uav_rgb --overwrite
+cd /root/claude-code-backup-20261028/code/ALVLN && git add -A uav_rgb/ && git commit && git push
+```
+
+**长期应该把工作目录搬进 `code/ALVLN/uav_rgb`**，消除两份拷贝；代价是
+`../TinyAerialVLN_Final_V8/...`、`../idea/repos/...`、`../README.md` 这几处文档相对路径要改。
+等并发会话停止后再做。
+
+### 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| `git ls-remote origin main` | `9805178…` = 本地 HEAD |
+| `git -c core.quotePath=false ls-tree -r --name-only origin/main \| grep -c '^uav_rgb/'` | **181** |
+| 与本地工程 `comm -3` 逐文件比对 | 无差异 |
+| ALVLN 原有文件数 | **123**，全部保留 |
+| `git status --short --branch` | `## main...origin/main`，干净 |
