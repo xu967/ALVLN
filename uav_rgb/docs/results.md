@@ -319,3 +319,38 @@ e71bf144dce144d9  train↔test   seeds=[1192, 1129]
 
 - 新增产物：`<run_dir>/ckpt_best.bin`；checkpoint 版本 2 → 3（新增 `best_macro_f1`）。
 - 未验证：真实采集数据、跨版本续训、磁盘满。
+
+## 2026-10-29 22:00 数据完整性修复回归
+
+- 环境：GPU 模式；本组为纯 Python/预处理测试，未启动 Gazebo。
+
+| 命令 | 结果 |
+| --- | --- |
+| `python3 sim/tools/test_split_manifest.py` | 9 tests OK（含 seed 337/3651 同 gid 同 split） |
+| `python3 sim/tools/test_collect.py` | 14 项通过（含 pose 停更 fail-closed） |
+| `python3 sim/tools/teacher.py` | 全部通过（含全堵且 base 堵 → SAFE_NEUTRAL） |
+| `python3 -m py_compile`（collect/preprocess/split_manifest/teacher/tests） | OK |
+| 同 gid 跨 train/val → `tools/preprocess.py` | rc=1，`几何组 g_same 同时出现在 split=train 与 val`，不产 dataset |
+| 无 gid 的合成 episode → preprocess | rc=0，`dataset.uavr` 634630 B |
+
+修复前复现：`seed 337` y=`-0.0` → gid `e8c96d776cd0ba5c` → test；
+`seed 3651` y=`0.0` → gid `cc45e868b6e1e474` → train，物理布局相同。
+`salt` 已从 `uavrgb.geom.v1` 升到 `v2`，v1 数据不得与 v2 混用。
+
+## 2026-10-29 22:05 真实训练接入（界面里跑 uavrgb_train）
+
+- 环境：`DISPLAY=:20`，Tk 8.6；真实 trainer `src/build/uavrgb_train`（18:03 构建）；数据集 `/tmp/bench_ds.uavr`（29 MB，448 样本）。
+
+| 项 | 实测 |
+| --- | --- |
+| 界面启动真实训练（3 epoch / batch 64） | `运行中 pid=619634` → `训练完成 rc=0`；表格 3 行、事件 26 条 |
+| 启动瞬间 run 目录 | `[]`（RunOwner 空目录要求） |
+| run 目录产物 | `ckpt.bin` / `config.json` / `metrics.jsonl` / `results.csv`，无 train.log |
+| `<run>.monitor/` | `train.log` / `train_command.txt` / `train_config.json` |
+| 跑 4 s 后点停止 | `已停止 rc=-2`；已完成产物保留，无半截文件 |
+| 命令行 resume 1 epoch | `rc=0`；`results.csv` 4 行（epoch 1–4）、事件 36 条，监控台正常解析 |
+| `env -u DISPLAY python3 ui/test_monitor.py` | 61 项通过，1 项跳过，EXIT=0 |
+| `DISPLAY=:20 python3 ui/test_monitor.py` | **100 项通过**，EXIT=0 |
+| `python3 ui/test_trainer_demo.py` | 89 项通过，EXIT=0 |
+
+说明：这次接的是真实 `uavrgb_train`（`ui/trainer_native.py` 把 `uavrgb.train.v1` 转成 CLI 后 execv），不再依赖 DEMO。

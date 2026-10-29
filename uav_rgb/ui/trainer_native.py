@@ -35,8 +35,6 @@ def load_config(path):
     for key in ("run_dir", "epochs", "batch_size", "lr", "seed"):
         if key not in cfg:
             raise ConfigError(f"配置缺少 {key}")
-    if not cfg.get("data"):
-        raise ConfigError("缺数据集；请在控制台「训练命令」里写 --data <dataset.uavr>")
     return cfg
 
 
@@ -49,13 +47,18 @@ def main(argv=None):
     except ConfigError as exc:
         print(f"trainer_native: {exc}", file=sys.stderr)
         return 2
+    # 数据集既可以写在配置里（data 字段），也可以直接写在控制台的「训练命令」里
+    data = cfg.get("data") or ""
+    if not data and "--data" not in extra:
+        print("trainer_native: 缺数据集；请在控制台「训练命令」里写 --data <dataset.uavr>",
+              file=sys.stderr)
+        return 2
     trainer = os.environ.get("UAVRGB_TRAIN_BIN", DEFAULT_TRAINER)
     if not os.access(trainer, os.X_OK):
         print(f"trainer_native: 找不到可执行的 trainer: {trainer}（先构建 src/）",
               file=sys.stderr)
         return 2
-    cmd = [trainer,
-           "--data", str(cfg["data"]),
+    cmd = [trainer] + (["--data", str(data)] if data else []) + [
            "--epochs", str(cfg["epochs"]),
            "--batch", str(cfg["batch_size"]),
            "--lr", repr(float(cfg["lr"])),

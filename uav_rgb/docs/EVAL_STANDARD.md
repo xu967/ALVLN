@@ -101,6 +101,11 @@
   障碍几何规范化后取 sha256 得到 gid，再用固定 salt hash 决定
   `train / val / test`。同几何不同 seed 永远同 split，跨 split 交集为 0。
   旧策略 `scene_id % 10` 在 seed 0..1999 上实测有 241 组跨 split 泄漏，已废弃。
+- **salt 已升到 v2**（2026-10-29 22:00）：v1 把 `-0.0` 格式化成 `-0.000`，
+  seed 337 与 3651 的同几何被分到 test/train 两边。修复后 gid 变化，
+  v1 时期采集的数据必须重采或显式重标，不能与 v2 数据混用。
+- `collect.py` 在带 `--scene-meta` 时会核对 `--split` 与几何组的固定 split；
+  `preprocess.py` 会拒绝同一 `geometry_gid` 出现在两个 split。
 - **val 用来看，test 用来报**。test 只在训练结束时评估一次，不参与任何模型选择。
   实现：`src/trainer.cpp` 训练循环之后的 `Split::kTest` 事件；
   best-checkpoint 只按 dev 宏 F1 选择，不看 test。

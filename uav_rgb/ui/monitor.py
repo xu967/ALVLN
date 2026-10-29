@@ -454,6 +454,7 @@ class MonitorApp:
         self._last_rc = None
         self._train_log_state = {}
         self._train_log_lines = 0
+        self._closing = False
 
         self.root.title("uav_rgb 训练监控台")
         self.root.geometry("980x660")
@@ -770,7 +771,15 @@ class MonitorApp:
             return
         d = filedialog.askdirectory(initialdir=self.run_dir, title="选择训练 run 目录")
         if d:
-            self._set_run_dir(os.path.abspath(d))
+            d = os.path.abspath(d)
+            self._set_run_dir(d)
+            # 浏览历史 run 不改下一次训练的输出目录，否则点“开始”必报“不是空目录”。
+            try:
+                nonempty = os.path.isdir(d) and bool(os.listdir(d))
+            except OSError:
+                nonempty = False
+            if nonempty:
+                self.train_dir_var.set(self._default_run_dir())
 
     def _set_run_dir(self, path):
         # 先复位状态再碰 Tk：路径显示失败也不会留下“新目录+旧事件”的半切换状态。
@@ -960,7 +969,19 @@ class MonitorApp:
     def _tick_delay(self):
         return TRAIN_POLL_MS if self.proc is not None else self.refresh_ms
 
+    def _request_quit(self, *_args):
+        """SIGINT/SIGTERM 走和关窗同一条清理路径（信号处理里不直接碰 Tk）。"""
+        if self._closing:
+            return
+        try:
+            self.root.after(0, self._on_close)
+        except tk.TclError:
+            pass
+
     def _on_close(self):
+        if self._closing:
+            return
+        self._closing = True
         proc = self.proc
         if proc is not None and proc.poll() is None:
             self._user_stop = True
@@ -1008,7 +1029,8 @@ class MonitorApp:
             traceback.print_exc()
             self.status.config(text=f"刷新失败: {exc}")
         finally:
-            self.root.after(self._tick_delay(), self._tick)
+            if not self._closing:
+                self.root.after(self._tick_delay(), self._tick)
 
 
 def main():
@@ -1022,8 +1044,11 @@ def main():
     if tk is None:
         raise SystemExit("monitor.py 需要 tkinter；请使用带 tkinter 的 Python 3 运行")
     root = tk.Tk()
-    MonitorApp(root, os.path.abspath(os.path.expanduser(args.run_dir)),
-               int(args.refresh * 1000))
+    app = MonitorApp(root, os.path.abspath(os.path.expanduser(args.run_dir)),
+                     int(args.refresh * 1000))
+    # 终端 Ctrl+C / 注销的 SIGTERM：先收训练子进程再退，别留孤儿。
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, app._request_quit)
     root.mainloop()
 
 

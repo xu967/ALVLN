@@ -345,13 +345,14 @@
 
 - 此前不同文件可能在各自时刻读取；后续更新已在当前服务托管写入者范围内实现跨文件静止快照，外部写入者限制见最新一节。
 
-## 更新 2026-10-29 2026-10-29 21:59：同步 uav_rgb 快照
+## 更新 2026-10-29 21:59：同步 uav_rgb 快照
 
 ### 做了什么
 
 - 从 ../uav_rgb 同步当前工作快照到 uav_rgb/，排除 .git、.venv-tools、build、__pycache__、数据集、权重和 logs/runs。
 - 同步 best-checkpoint、checkpoint v3/v2 兼容、trainer_eval/trainer_internal 拆分、几何 split 门禁、位姿停更拒绝、teacher 全堵安全动作、监控修复及 trainer_native 封装。
 - 新增 uav_rgb/ui/trainer_native.py，将 uavrgb.train.v1 配置转换为真实 uavrgb_train CLI。
+- 并发会话随后补充的监控 SIGTERM 收尾、真实训练结果、数据完整性文档和 UI 测试已再次增量同步。
 
 ### 没做什么
 
@@ -365,12 +366,12 @@
 | --- | --- |
 | uav_rgb tools/check.sh | 通过：18/18 CTest 与 Python 自检 |
 | sim/tools/test_collect.py | 通过：14 项 |
-| ui/test_monitor.py（DISPLAY=:20） | 通过：99 项 |
+| ui/test_monitor.py（DISPLAY=:20） | 通过：102 项 |
 | sim/tools/teacher.py | 通过，含全堵且 base 堵用例 |
 | trainer_native.py | py_compile 通过，监控测试覆盖配置转换 |
 | 镜像一致性 | 除被忽略的 logs/runs 外文件一致 |
 
 ### 风险与遗留
 
-- 同步期间源目录出现并发更新，最终提交对应本次校验后的静止快照；继续修改后需要再次同步。
+- 已等待源目录稳定后完成最终同步；若源目录继续开发，需要再次镜像。
 - GitHub 上的 uav_rgb 是交付快照，不是源仓库的完整提交历史。

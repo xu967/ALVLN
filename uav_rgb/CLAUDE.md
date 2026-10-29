@@ -89,7 +89,7 @@ DISPLAY=:20 python3 "$UAV_RGB_ROOT/ui/test_monitor.py"   # 解析/tail/绘图 + 
 
 `ui/launch_ui.sh`（及 XFCE 桌面的「UAV RGB 训练监控」快捷方式）启动该应用，并自动选择带 tkinter 的 Python（本机 `/usr/bin/python3` 已装 `python3-tk`，conda Python 也可用）。透传 `--run-dir`/`--refresh` 可指向真实 run-dir；界面内也可「选择目录」「暂停」。`metrics.jsonl` 按追加偏移增量读取，文件截断/替换时自动重载；图表用 Tkinter Canvas 手绘，不依赖 matplotlib，纯标准库。
 
-同一窗口带本地训练控制：填运行目录 + `epochs/steps_per_epoch/batch_size/lr/seed` → 原子写 `<run_dir>/train_config.json` → 用 argv（不经 shell）启动 `<trainer> --config <run_dir>/train_config.json` → 实时看曲线、指标事件和 `train.log` → SIGINT→SIGTERM→SIGKILL 停止；运行目录必须是空目录/新目录，启动失败会回滚本次产物。默认命令是纯模拟的 `ui/trainer_demo.py`（DEMO 徽标，不代表真实训练）；原生 C++/CUDA trainer 仍需自己实现同一合同：读 `uavrgb.train.v1` 配置、写 `results.csv` + `metrics.jsonl`、SIGINT 退 130。自检：`python3 ui/test_trainer_demo.py`；GUI 侧 `DISPLAY=:20 python3 ui/test_monitor.py`（无显示自动跳过 GUI）。
+同一窗口带本地训练控制：填运行目录 + `epochs/steps_per_epoch/batch_size/lr/seed` → 原子写 `<run_dir>.monitor/train_config.json` → 用 argv（不经 shell）启动 `<trainer> --config <run_dir>.monitor/train_config.json` → 实时看曲线、指标事件和 `train.log` → SIGINT→SIGTERM→SIGKILL 停止；运行目录必须是空目录/新目录，启动失败会回滚本次产物。控制台自己的文件（配置/命令/日志）都在 `<run_dir>.monitor/`，run 目录只归 trainer（`RunOwner` 要求空目录）。默认命令是纯模拟的 `ui/trainer_demo.py`（DEMO 徽标，不代表真实训练）；跑真实训练把命令改成 `python3 ui/trainer_native.py --data <dataset.uavr>`——它把 `uavrgb.train.v1` 转成 `uavrgb_train --data/--epochs/--batch/--lr/--seed/--out` 并 `execv`，额外参数（`--resume` 等）原样透传；resume 目前只能命令行跑（界面强制空目录），跑完可用「选择目录」看曲线。自检：`python3 ui/test_trainer_demo.py`；GUI 侧 `DISPLAY=:20 python3 ui/test_monitor.py`（无显示自动跳过 GUI）。
 
 ## CUDA build rules for this machine
 

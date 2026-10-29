@@ -285,6 +285,29 @@ with tempfile.TemporaryDirectory() as d:
     zh2, _ = monitor.tail_text(zhq, st3)
     check("tail_text 中文不被切坏", "�" not in zh1 + zh2 and zh1.endswith("\n"))
 
+    # 文件末尾还没有换行：半行要留到下一次追加后整行显示。
+    half = os.path.join(d, "half.log")
+    with open(half, "w", encoding="utf-8") as f:
+        f.write("abc")
+    st4 = {}
+    h1, _ = monitor.tail_text(half, st4)
+    with open(half, "a", encoding="utf-8") as f:
+        f.write("def\n")
+    h2, _ = monitor.tail_text(half, st4)
+    check("tail_text 末尾半行不提前显示", h1 == "" and h2 == "abcdef\n")
+
+    # 多字节字符被块边界切开：半行缓存必须按字节保留，不能 decode 成替换符。
+    mb = os.path.join(d, "mb.log")
+    raw = "中文\n".encode("utf-8")
+    with open(mb, "wb") as f:
+        f.write(raw[:1])
+    st5 = {}
+    m1, _ = monitor.tail_text(mb, st5)
+    with open(mb, "ab") as f:
+        f.write(raw[1:])
+    m2, _ = monitor.tail_text(mb, st5)
+    check("tail_text 多字节不被切开", m1 == "" and m2 == "中文\n")
+
 # 9. 真实 trainer 封装：uavrgb.train.v1 -> uavrgb_train CLI
 NATIVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trainer_native.py")
 with tempfile.TemporaryDirectory() as d:
@@ -312,6 +335,12 @@ with tempfile.TemporaryDirectory() as d:
     del cfg["data"]
     with open(cfp, "w", encoding="utf-8") as f:
         json.dump(cfg, f)
+    rc = subprocess.call([sys.executable, NATIVE, "--config", cfp,
+                          "--data", "/tmp/other.uavr"], env=env)
+    with open(dump, encoding="utf-8") as f:
+        got = f.read().split()
+    check("native 命令框给数据集", rc == 0 and got.count("--data") == 1
+          and got[got.index("--data") + 1] == "/tmp/other.uavr")
     rc = subprocess.call([sys.executable, NATIVE, "--config", cfp], env=env,
                          stderr=subprocess.DEVNULL)
     check("native 缺 data 报错", rc == 2)

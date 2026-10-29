@@ -74,6 +74,7 @@
   "scenes": [{"scene_id":42,"split":"train"},{"scene_id":43,"split":"val"}],
   "episodes": [
     {"episode_id":1,"scene_id":42,"seed":7,"version":"synthetic","split":"train",
+     "geometry_gid":"e8c96d776cd0ba5c",
      "num_steps":6,"sample_start":0,"sample_count":6,"source_dir":"/abs/path/ep1"}
   ]
 }
@@ -87,7 +88,10 @@
   是打包时用 `--drop-collision` 已经丢掉的步数（此时 flags 里不会再出现 `'1'`）。
   为什么重要：专家在撞墙那一步的动作本身就是错的，不剔除等于把错标签喂给学生。
 - `split_policy` 恒为 `scene_id`：预处理强制**同一 scene_id 只能属于一个 split**，
-  冲突直接报错退出。训练器按 `episodes[].sample_start/sample_count/split`
+  冲突直接报错退出。`geometry_gid` 是 `sim/tools/split_manifest.py` 算出的几何组 ID；
+  有该字段时预处理还强制**同一 gid 只能属于一个 split**（同几何不同 scene_id/seed
+  也会被拦）。旧数据/合成夹具没有该字段，仍按 scene_id 检查。
+  训练器按 `episodes[].sample_start/sample_count/split`
   切出 train/val/test，并独立校验 scene_id 不跨 split、区间不重叠且覆盖全部样本。
   scene_id 遵守 `EpisodeMeta` 的 int64 整数合同，不要按帧随机拆分。
 - `source_dir` 仅用于追溯，可能含机器相关绝对路径。
