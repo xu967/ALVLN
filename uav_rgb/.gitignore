@@ -1,0 +1,17 @@
+# 构建产物（`build/` 无前导斜杠，对任意层级都生效）
+build/
+
+# Python 虚拟环境与缓存
+.venv-tools/
+__pycache__/
+*.pyc
+
+# 数据集 / 权重 / 训练产物：按 CLAUDE.md 一律放 $DATA_ROOT/uav_rgb/，不进仓库
+*.uavr
+*.bin
+*.ckpt
+logs/runs/
+
+# 编辑器与临时文件
+*.swp
+.DS_Store

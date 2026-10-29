@@ -1,0 +1,435 @@
+<?xml version="1.0" ?>
+<!--
+  E1 scaffold: quadrotor + forward RGB camera for uav_rgb (monocular RGB obstacle avoidance).
+
+  The quadrotor is a self-contained, physics-equivalent copy of the official
+  OpenRobotics "X3 UAV" (Fuel) model used by the stock worlds
+  quadcopter.sdf / multicopter_velocity_control.sdf. Same mass, inertia, rotor
+  geometry, MulticopterMotorModel constants and MulticopterVelocityControl
+  gains; only the 21MB of COLLADA body/propeller meshes are replaced by simple
+  box/cylinder visuals so the world loads offline (Fuel mesh download is ~15KB/s
+  in this container). To use the official mesh model instead, replace the
+  <model name="x3"> ... </model> block with the stock <include> of
+  "https://fuel.gazebosim.org/1.0/OpenRobotics/models/X3 UAV/4" plus the same
+  four motor plugins, velocity controller and odometry publisher.
+
+  Coordinate convention (matches official X3): body forward = +X, left = +Y,
+  up = +Z. The camera optical axis points along +X (forward).
+
+  Control:
+    gz topic -t "/X3/gazebo/command/twist" -m gz.msgs.Twist \
+      -p "linear: {x: 0 y: 0 z: 0.3} angular: {z: 0}"     # ascend
+    gz topic -t "/X3/gazebo/command/twist" -m gz.msgs.Twist \
+      -p "linear: {x: 0.3 y: 0 z: 0} angular: {z: 0}"     # forward
+    gz topic -t "/X3/gazebo/command/twist" -m gz.msgs.Twist -p " "  # hover
+
+  Camera topic: /uav/camera (gz.msgs.Image, R8G8B8, 320x240 @ 30 Hz).
+  Pose/odometry: /model/x3/pose , /model/x3/odometry
+-->
+<sdf version="1.6">
+  <world name="uav_rgb">
+    <physics name="4ms" type="ignored">
+      <max_step_size>0.004</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <!-- contact sensor system: publishes /uav/contact (gz.msgs.Contacts) only
+         while base_link or any rotor collision is touching something
+         (sparse/triggered topic) -->
+    <plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact"/>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+          <material>
+            <ambient>0.8 0.8 0.8 1</ambient>
+            <diffuse>0.8 0.8 0.8 1</diffuse>
+            <specular>0.8 0.8 0.8 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- colored landmarks in front of the spawn (forward = +X) -->
+    <model name="landmark_red">
+      <static>true</static>
+      <pose>3 0 1 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>1 1 1</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>1 1 1</size></box></geometry>
+          <material><ambient>1 0 0 1</ambient><diffuse>1 0 0 1</diffuse><specular>1 0 0 1</specular></material>
+        </visual>
+      </link>
+    </model>
+    <model name="landmark_green">
+      <static>true</static>
+      <pose>3 1.5 1 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>1 1 1</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>1 1 1</size></box></geometry>
+          <material><ambient>0 1 0 1</ambient><diffuse>0 1 0 1</diffuse><specular>0 1 0 1</specular></material>
+        </visual>
+      </link>
+    </model>
+    <model name="landmark_blue">
+      <static>true</static>
+      <pose>3 -1.5 1 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>1 1 1</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>1 1 1</size></box></geometry>
+          <material><ambient>0 0 1 1</ambient><diffuse>0 0 1 1</diffuse><specular>0 0 1 1</specular></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- tall pillars: grounded obstacles that block the drone at flight altitude.
+         +Y is body-left, so the y=+1.4 pillar blocks the teacher's left strip;
+         body-right (y<0) is open -> teacher must YAW_RIGHT. -->
+    <model name="pillar_center">
+      <static>true</static>
+      <pose>3.0 0 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.4 0.4 3</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.4 0.4 3</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.6 0.6 0.6 1</diffuse><specular>0.6 0.6 0.6 1</specular></material>
+        </visual>
+      </link>
+    </model>
+    <model name="pillar_body_left">
+      <static>true</static>
+      <pose>3.0 1.4 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.4 0.4 3</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.4 0.4 3</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.6 0.6 0.6 1</diffuse><specular>0.6 0.6 0.6 1</specular></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- X3-equivalent quadrotor (params from OpenRobotics X3 UAV) + forward RGB camera -->
+    <model name="x3">
+      <pose>0 0 0.15 0 0 0</pose>
+
+      <link name="base_link">
+        <pose>0 0 0 0 0 0</pose>
+        <inertial>
+          <mass>1.5</mass>
+          <inertia>
+            <ixx>0.0347563</ixx><ixy>0</ixy><ixz>0</ixz>
+            <iyy>0.07</iyy><iyz>0</iyz>
+            <izz>0.0977</izz>
+          </inertia>
+        </inertial>
+        <collision name="base_link_collision">
+          <geometry><box><size>0.47 0.47 0.11</size></box></geometry>
+        </collision>
+        <visual name="base_link_visual">
+          <geometry><box><size>0.47 0.47 0.11</size></box></geometry>
+          <material><ambient>0.3 0.3 0.3 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material>
+        </visual>
+
+        <sensor name="camera" type="camera">
+          <pose>0.2 0 0 0 0 0</pose>
+          <always_on>1</always_on>
+          <update_rate>30</update_rate>
+          <topic>/uav/camera</topic>
+          <camera>
+            <horizontal_fov>1.0471975512</horizontal_fov>
+            <image>
+              <width>320</width>
+              <height>240</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip>
+              <near>0.05</near>
+              <far>50</far>
+            </clip>
+          </camera>
+          <plugin filename="gz-sim-camera-video-recorder-system" name="gz::sim::systems::CameraVideoRecorder">
+            <service>uav/camera/record_video</service>
+          </plugin>
+        </sensor>
+
+        <!-- depth camera: teacher-only privileged ground truth. Same pose/FOV/res as
+             RGB so pixels align; student model never sees this topic. -->
+        <sensor name="depth" type="depth_camera">
+          <pose>0.2 0 0 0 0 0</pose>
+          <always_on>1</always_on>
+          <update_rate>30</update_rate>
+          <topic>/uav/depth</topic>
+          <camera>
+            <horizontal_fov>1.0471975512</horizontal_fov>
+            <image>
+              <width>320</width>
+              <height>240</height>
+              <format>R_FLOAT32</format>
+            </image>
+            <clip>
+              <near>0.05</near>
+              <far>20</far>
+            </clip>
+          </camera>
+        </sensor>
+
+        <!-- collision ground truth: publishes on /uav/contact while this
+             collision (or any rotor sensor below) touches something (sparse).
+             Read with a short timeout; no message within the window = no contact. -->
+        <sensor name="contact" type="contact">
+          <always_on>1</always_on>
+          <update_rate>100</update_rate>
+          <contact>
+            <collision>base_link_collision</collision>
+            <topic>/uav/contact</topic>
+          </contact>
+        </sensor>
+      </link>
+
+      <link name="rotor_0">
+        <pose>0.13 -0.22 0.023 0 0 0</pose>
+        <inertial>
+          <mass>0.005</mass>
+          <inertia>
+            <ixx>9.75e-07</ixx><ixy>0</ixy><ixz>0</ixz>
+            <iyy>4.17041e-05</iyy><iyz>0</iyz>
+            <izz>4.26041e-05</izz>
+          </inertia>
+        </inertial>
+        <collision name="rotor_0_collision">
+          <geometry><cylinder><length>0.005</length><radius>0.1</radius></cylinder></geometry>
+        </collision>
+        <visual name="rotor_0_visual">
+          <geometry><cylinder><length>0.005</length><radius>0.1</radius></cylinder></geometry>
+          <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+        </visual>
+        <!-- rotor tip radius 0.32 m > body half-width 0.235 m: without this the
+             contact topic misses tip-first grazes (S5). -->
+        <sensor name="rotor_contact_0" type="contact">
+          <always_on>1</always_on>
+          <update_rate>100</update_rate>
+          <contact>
+            <collision>rotor_0_collision</collision>
+            <topic>/uav/contact</topic>
+          </contact>
+        </sensor>
+      </link>
+      <link name="rotor_1">
+        <pose>-0.13 0.2 0.023 0 0 0</pose>
+        <inertial>
+          <mass>0.005</mass>
+          <inertia>
+            <ixx>9.75e-07</ixx><ixy>0</ixy><ixz>0</ixz>
+            <iyy>4.17041e-05</iyy><iyz>0</iyz>
+            <izz>4.26041e-05</izz>
+          </inertia>
+        </inertial>
+        <collision name="rotor_1_collision">
+          <geometry><cylinder><length>0.005</length><radius>0.1</radius></cylinder></geometry>
+        </collision>
+        <visual name="rotor_1_visual">
+          <geometry><cylinder><length>0.005</length><radius>0.1</radius></cylinder></geometry>
+          <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+        </visual>
+        <sensor name="rotor_contact_1" type="contact">
+          <always_on>1</always_on>
+          <update_rate>100</update_rate>
+          <contact>
+            <collision>rotor_1_collision</collision>
+            <topic>/uav/contact</topic>
+          </contact>
+        </sensor>
+      </link>
+      <link name="rotor_2">
+        <pose>0.13 0.22 0.023 0 0 0</pose>
+        <inertial>
+          <mass>0.005</mass>
+          <inertia>
+            <ixx>9.75e-07</ixx><ixy>0</ixy><ixz>0</ixz>
+            <iyy>4.17041e-05</iyy><iyz>0</iyz>
+            <izz>4.26041e-05</izz>
+          </inertia>
+        </inertial>
+        <collision name="rotor_2_collision">
+          <geometry><cylinder><length>0.005</length><radius>0.1</radius></cylinder></geometry>
+        </collision>
+        <visual name="rotor_2_visual">
+          <geometry><cylinder><length>0.005</length><radius>0.1</radius></cylinder></geometry>
+          <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+        </visual>
+        <sensor name="rotor_contact_2" type="contact">
+          <always_on>1</always_on>
+          <update_rate>100</update_rate>
+          <contact>
+            <collision>rotor_2_collision</collision>
+            <topic>/uav/contact</topic>
+          </contact>
+        </sensor>
+      </link>
+      <link name="rotor_3">
+        <pose>-0.13 -0.2 0.023 0 0 0</pose>
+        <inertial>
+          <mass>0.005</mass>
+          <inertia>
+            <ixx>9.75e-07</ixx><ixy>0</ixy><ixz>0</ixz>
+            <iyy>4.17041e-05</iyy><iyz>0</iyz>
+            <izz>4.26041e-05</izz>
+          </inertia>
+        </inertial>
+        <collision name="rotor_3_collision">
+          <geometry><cylinder><length>0.005</length><radius>0.1</radius></cylinder></geometry>
+        </collision>
+        <visual name="rotor_3_visual">
+          <geometry><cylinder><length>0.005</length><radius>0.1</radius></cylinder></geometry>
+          <material><ambient>0.2 0.2 0.2 1</ambient><diffuse>0.2 0.2 0.2 1</diffuse></material>
+        </visual>
+        <sensor name="rotor_contact_3" type="contact">
+          <always_on>1</always_on>
+          <update_rate>100</update_rate>
+          <contact>
+            <collision>rotor_3_collision</collision>
+            <topic>/uav/contact</topic>
+          </contact>
+        </sensor>
+      </link>
+
+      <joint name="rotor_0_joint" type="revolute">
+        <parent>base_link</parent>
+        <child>rotor_0</child>
+        <axis><xyz>0 0 1</xyz>
+          <limit><lower>-1e+16</lower><upper>1e+16</upper></limit>
+        </axis>
+      </joint>
+      <joint name="rotor_1_joint" type="revolute">
+        <parent>base_link</parent>
+        <child>rotor_1</child>
+        <axis><xyz>0 0 1</xyz>
+          <limit><lower>-1e+16</lower><upper>1e+16</upper></limit>
+        </axis>
+      </joint>
+      <joint name="rotor_2_joint" type="revolute">
+        <parent>base_link</parent>
+        <child>rotor_2</child>
+        <axis><xyz>0 0 1</xyz>
+          <limit><lower>-1e+16</lower><upper>1e+16</upper></limit>
+        </axis>
+      </joint>
+      <joint name="rotor_3_joint" type="revolute">
+        <parent>base_link</parent>
+        <child>rotor_3</child>
+        <axis><xyz>0 0 1</xyz>
+          <limit><lower>-1e+16</lower><upper>1e+16</upper></limit>
+        </axis>
+      </joint>
+
+      <plugin filename="gz-sim-multicopter-motor-model-system" name="gz::sim::systems::MulticopterMotorModel">
+        <robotNamespace>X3</robotNamespace>
+        <jointName>rotor_0_joint</jointName><linkName>rotor_0</linkName>
+        <turningDirection>ccw</turningDirection>
+        <timeConstantUp>0.0125</timeConstantUp><timeConstantDown>0.025</timeConstantDown>
+        <maxRotVelocity>800.0</maxRotVelocity>
+        <motorConstant>8.54858e-06</motorConstant><momentConstant>0.016</momentConstant>
+        <commandSubTopic>gazebo/command/motor_speed</commandSubTopic>
+        <actuator_number>0</actuator_number>
+        <rotorDragCoefficient>8.06428e-05</rotorDragCoefficient>
+        <rollingMomentCoefficient>1e-06</rollingMomentCoefficient>
+        <motorSpeedPubTopic>motor_speed/0</motorSpeedPubTopic>
+        <rotorVelocitySlowdownSim>10</rotorVelocitySlowdownSim>
+        <motorType>velocity</motorType>
+      </plugin>
+      <plugin filename="gz-sim-multicopter-motor-model-system" name="gz::sim::systems::MulticopterMotorModel">
+        <robotNamespace>X3</robotNamespace>
+        <jointName>rotor_1_joint</jointName><linkName>rotor_1</linkName>
+        <turningDirection>ccw</turningDirection>
+        <timeConstantUp>0.0125</timeConstantUp><timeConstantDown>0.025</timeConstantDown>
+        <maxRotVelocity>800.0</maxRotVelocity>
+        <motorConstant>8.54858e-06</motorConstant><momentConstant>0.016</momentConstant>
+        <commandSubTopic>gazebo/command/motor_speed</commandSubTopic>
+        <actuator_number>1</actuator_number>
+        <rotorDragCoefficient>8.06428e-05</rotorDragCoefficient>
+        <rollingMomentCoefficient>1e-06</rollingMomentCoefficient>
+        <motorSpeedPubTopic>motor_speed/1</motorSpeedPubTopic>
+        <rotorVelocitySlowdownSim>10</rotorVelocitySlowdownSim>
+        <motorType>velocity</motorType>
+      </plugin>
+      <plugin filename="gz-sim-multicopter-motor-model-system" name="gz::sim::systems::MulticopterMotorModel">
+        <robotNamespace>X3</robotNamespace>
+        <jointName>rotor_2_joint</jointName><linkName>rotor_2</linkName>
+        <turningDirection>cw</turningDirection>
+        <timeConstantUp>0.0125</timeConstantUp><timeConstantDown>0.025</timeConstantDown>
+        <maxRotVelocity>800.0</maxRotVelocity>
+        <motorConstant>8.54858e-06</motorConstant><momentConstant>0.016</momentConstant>
+        <commandSubTopic>gazebo/command/motor_speed</commandSubTopic>
+        <actuator_number>2</actuator_number>
+        <rotorDragCoefficient>8.06428e-05</rotorDragCoefficient>
+        <rollingMomentCoefficient>1e-06</rollingMomentCoefficient>
+        <motorSpeedPubTopic>motor_speed/2</motorSpeedPubTopic>
+        <rotorVelocitySlowdownSim>10</rotorVelocitySlowdownSim>
+        <motorType>velocity</motorType>
+      </plugin>
+      <plugin filename="gz-sim-multicopter-motor-model-system" name="gz::sim::systems::MulticopterMotorModel">
+        <robotNamespace>X3</robotNamespace>
+        <jointName>rotor_3_joint</jointName><linkName>rotor_3</linkName>
+        <turningDirection>cw</turningDirection>
+        <timeConstantUp>0.0125</timeConstantUp><timeConstantDown>0.025</timeConstantDown>
+        <maxRotVelocity>800.0</maxRotVelocity>
+        <motorConstant>8.54858e-06</motorConstant><momentConstant>0.016</momentConstant>
+        <commandSubTopic>gazebo/command/motor_speed</commandSubTopic>
+        <actuator_number>3</actuator_number>
+        <rotorDragCoefficient>8.06428e-05</rotorDragCoefficient>
+        <rollingMomentCoefficient>1e-06</rollingMomentCoefficient>
+        <motorSpeedPubTopic>motor_speed/3</motorSpeedPubTopic>
+        <rotorVelocitySlowdownSim>10</rotorVelocitySlowdownSim>
+        <motorType>velocity</motorType>
+      </plugin>
+
+      <plugin filename="gz-sim-multicopter-control-system" name="gz::sim::systems::MulticopterVelocityControl">
+        <robotNamespace>X3</robotNamespace>
+        <commandSubTopic>gazebo/command/twist</commandSubTopic>
+        <enableSubTopic>enable</enableSubTopic>
+        <comLinkName>base_link</comLinkName>
+        <velocityGain>2.7 2.7 2.7</velocityGain>
+        <attitudeGain>2 3 0.15</attitudeGain>
+        <angularRateGain>0.4 0.52 0.18</angularRateGain>
+        <maximumLinearAcceleration>2 2 2</maximumLinearAcceleration>
+        <rotorConfiguration>
+          <rotor><jointName>rotor_0_joint</jointName><forceConstant>8.54858e-06</forceConstant><momentConstant>0.016</momentConstant><direction>1</direction></rotor>
+          <rotor><jointName>rotor_1_joint</jointName><forceConstant>8.54858e-06</forceConstant><momentConstant>0.016</momentConstant><direction>1</direction></rotor>
+          <rotor><jointName>rotor_2_joint</jointName><forceConstant>8.54858e-06</forceConstant><momentConstant>0.016</momentConstant><direction>-1</direction></rotor>
+          <rotor><jointName>rotor_3_joint</jointName><forceConstant>8.54858e-06</forceConstant><momentConstant>0.016</momentConstant><direction>-1</direction></rotor>
+        </rotorConfiguration>
+      </plugin>
+
+      <plugin filename="gz-sim-odometry-publisher-system" name="gz::sim::systems::OdometryPublisher">
+        <dimensions>3</dimensions>
+      </plugin>
+    </model>
+  </world>
+</sdf>

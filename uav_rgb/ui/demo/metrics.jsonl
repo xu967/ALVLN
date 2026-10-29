@@ -1,0 +1,4 @@
+{"schema":"tinyvln.metrics.v1","event":"train_step","step":100,"total_steps":800,"loss":1.105,"action_accuracy":0.40,"lr":0.001,"elapsed_sec":12.5,"eta_sec":87.5}
+{"schema":"tinyvln.metrics.v1","event":"validation","step":200,"loss":1.05,"action_accuracy":0.45,"split":"val"}
+{"schema":"tinyvln.metrics.v1","event":"status","message":"checkpoint saved"}
+{"schema":"tinyvln.metrics.v1","event":"error","severity":"FATAL","code":"TRAIN_NONFINITE_METRIC","step":300,"message":"loss is NaN"}

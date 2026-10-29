@@ -1,0 +1,90 @@
+=== uav_rgb GPU benchmark: Conv2d fwd/bwd (parity CUDA wrapper) ===
+device: NVIDIA GeForce RTX 2080 Ti, sm_75, 68 SM, 22001 MiB total, 21576 MiB free at start (426 MiB in use)
+CUDA runtime 12.8, driver device clock 1.54 GHz
+shape: NCHW fp32, 128x128 input, 3x3 kernels, pad=1, stride=1; layers 3->16, 16->32, 32->64
+batches: 1, 8, 32, 128, 256; timed iters per cell = 5 (plus 1 warmup)
+caveat: wrapper cudaMalloc/cudaFree every call and cudaDeviceSynchronize after every kernel;
+        raw numbers are that implementation's real throughput, not peak kernel throughput.
+sanity CPU-vs-CUDA conv forward (2x3x16x16 -> 8ch): max_abs_err=8.941e-08 PASS
+
+--- raw throughput: mean of 5 timed iters (wrapper: malloc/free + sync per call) ---
+layer        N     fwd_ms    fwd_min   fwd_samp/s   fwd_TF     bwd_ms    bwd_min   bwd_samp/s   bwd_TF   peakF_MiB   peakB_MiB   sampF_MiB   sampB_MiB
+3->16        1       1.08       1.00        925.3    0.013       3.13       2.74        319.6    0.009        1.19        1.38        2.00        2.00
+3->16        8       4.45       4.17       1798.3    0.025      21.99      20.88        363.8    0.010        9.50       11.00       10.00       12.00
+3->16       32      31.31      30.80       1022.2    0.014      69.83      63.18        458.2    0.013       38.00       44.00       40.00       46.00
+3->16      128     117.15     113.60       1092.6    0.015     257.20     248.23        497.7    0.014      152.00      176.00      154.00      178.00
+3->16      256     216.02     208.89       1185.1    0.017     572.97     529.99        446.8    0.013      304.00      352.00      306.00      354.00
+16->32       1       2.44       1.49        410.3    0.062       3.76       3.26        266.2    0.080        3.02        4.04        4.00        6.00
+16->32       8      13.95      10.35        573.6    0.087      29.61      27.33        270.2    0.082       24.02       32.04       26.00       34.00
+16->32      32      76.01      67.33        421.0    0.064     132.45     122.57        241.6    0.073       96.02      128.04       98.00      130.00
+16->32     128     286.52     272.33        446.7    0.067     502.31     481.71        254.8    0.077      384.02      512.04      386.00      514.00
+16->32     256     579.31     521.16        441.9    0.067     984.33     952.42        260.1    0.079      768.02     1024.04      770.00     1026.00
+32->64       1       4.19       3.59        238.7    0.144       7.98       7.20        125.3    0.151        6.07        8.14        8.00       10.00
+32->64       8      37.19      35.02        215.1    0.130      58.76      56.32        136.1    0.164       48.07       64.14       50.00       66.00
+32->64      32     138.00     132.01        231.9    0.140     243.86     231.50        131.2    0.159      192.07      256.14      194.00      258.00
+32->64     128     546.33     520.92        234.3    0.142     932.69     922.77        137.2    0.166      768.07     1024.14      770.00     1026.00
+32->64     256    1056.03    1008.21        242.4    0.146    1937.55    1885.61        132.1    0.160     1536.07     2048.14     1834.69     2050.00
+note: peak*_MiB = exact analytic peak (simultaneously live device buffers); samp*_MiB = cudaMemGetInfo 200us sampling (may miss very short calls).
+
+--- ~EST (from best-case min components): remove malloc/free + host zero + per-kernel sync,
+    'opt*' keeps per-call H2D/D2H; 'kern*' assumes device-resident data (upper bound) ---
+layer        N  kernelF_ms  kernelB_ms    optF_samp/s    optB_samp/s    kernF_samp/s    kernB_samp/s
+3->16        1       0.182       2.167         1405.4          402.6          5499.6           461.4
+3->16        8       0.000      16.421         5496.6          399.5             0.0           487.2
+3->16       32       4.159      49.966         3679.0          522.0          7693.6           640.4
+3->16      128       9.342     179.167         4187.9          561.5         13701.1           714.4
+3->16      256       6.208     407.050         5086.6          520.7         41235.7           628.9
+16->32       1       0.436       1.888          990.8          379.2          2292.3           529.7
+16->32       8       1.341      18.165         1479.6          312.1          5965.9           440.4
+16->32      32      13.897      65.379         1154.6          317.7          2302.6           489.5
+16->32     128      26.662     241.189         1194.4          324.8          4800.8           530.7
+16->32     256       0.000     436.992         1292.8          327.4             0.0           585.8
+32->64       1       0.822       4.545          369.8          159.8          1216.3           220.0
+32->64       8       4.460      34.766          590.8          153.4          1793.5           230.1
+32->64      32      15.848     127.738          584.0          168.7          2019.2           250.5
+32->64     128      60.629     491.718          597.9          168.3          2111.2           260.3
+32->64     256     132.396    1105.914          653.3          163.3          1933.6           231.5
+~EST is derived from measured components, not a reimplementation; see RESULTS.md caveats.
+
+--- measured cost decomposition per wrapper call, best-case/min (ms) ---
+[3->16 N=1] fwd    1.00 = host_zero   0.06 + devalloc  0.22 + copies    0.53 + kernel~   0.18
+                       bwd    2.74 = host_zero   0.01 + devalloc  0.22 + copies    0.32 + kernel~   2.17
+[3->16 N=8] fwd    4.17 = host_zero   4.25 + devalloc  0.39 + copies    1.46 + kernel~   0.00
+                       bwd   20.88 = host_zero   0.08 + devalloc  0.75 + copies    3.60 + kernel~  16.42
+[3->16 N=32] fwd   30.80 = host_zero  21.11 + devalloc  0.98 + copies    4.54 + kernel~   4.16
+                       bwd   63.18 = host_zero   0.39 + devalloc  1.46 + copies   11.34 + kernel~  49.97
+[3->16 N=128] fwd  113.60 = host_zero  81.52 + devalloc  1.51 + copies   21.22 + kernel~   9.34
+                       bwd  248.23 = host_zero  13.97 + devalloc  6.29 + copies   48.77 + kernel~ 179.17
+[3->16 N=256] fwd  208.89 = host_zero 156.27 + devalloc  2.28 + copies   44.12 + kernel~   6.21
+                       bwd  529.99 = host_zero  30.85 + devalloc  7.42 + copies   84.64 + kernel~ 407.05
+[16->32 N=1] fwd    1.49 = host_zero   0.11 + devalloc  0.36 + copies    0.57 + kernel~   0.44
+                       bwd    3.26 = host_zero   0.07 + devalloc  0.53 + copies    0.75 + kernel~   1.89
+[16->32 N=8] fwd   10.35 = host_zero   4.20 + devalloc  0.74 + copies    4.07 + kernel~   1.34
+                       bwd   27.33 = host_zero   0.51 + devalloc  1.16 + copies    7.47 + kernel~  18.17
+[16->32 N=32] fwd   67.33 = host_zero  38.06 + devalloc  1.55 + copies   13.82 + kernel~  13.90
+                       bwd  122.57 = host_zero  18.64 + devalloc  3.17 + copies   35.35 + kernel~  65.38
+[16->32 N=128] fwd  272.33 = host_zero 157.41 + devalloc  7.75 + copies   80.50 + kernel~  26.66
+                       bwd  481.71 = host_zero  79.20 + devalloc  8.42 + copies  152.88 + kernel~ 241.19
+[16->32 N=256] fwd  521.16 = host_zero 327.79 + devalloc  4.91 + copies  198.01 + kernel~   0.00
+                       bwd  952.42 = host_zero 160.99 + devalloc  9.37 + copies  345.04 + kernel~ 436.99
+[32->64 N=1] fwd    3.59 = host_zero   0.36 + devalloc  0.52 + copies    1.88 + kernel~   0.82
+                       bwd    7.20 = host_zero   0.14 + devalloc  0.77 + copies    1.71 + kernel~   4.54
+[32->64 N=8] fwd   35.02 = host_zero  20.32 + devalloc  1.15 + copies    9.08 + kernel~   4.46
+                       bwd   56.32 = host_zero   2.41 + devalloc  1.72 + copies   17.39 + kernel~  34.77
+[32->64 N=32] fwd  132.01 = host_zero  74.98 + devalloc  2.22 + copies   38.95 + kernel~  15.85
+                       bwd  231.50 = host_zero  36.21 + devalloc  5.61 + copies   61.91 + kernel~ 127.74
+[32->64 N=128] fwd  520.92 = host_zero 301.95 + devalloc  4.89 + copies  153.45 + kernel~  60.63
+                       bwd  922.77 = host_zero 152.84 + devalloc  9.38 + copies  268.80 + kernel~ 491.72
+[32->64 N=256] fwd 1008.21 = host_zero 610.12 + devalloc  6.24 + copies  259.44 + kernel~ 132.40
+                       bwd 1885.61 = host_zero 307.65 + devalloc 10.58 + copies  461.44 + kernel~1105.91
+
+measured pageable PCIe (32->64, N=256): H2D 3.71 GB/s, D2H 9.35 GB/s
+
+--- 22 GiB capacity per layer (budget 21064 MiB = free-at-start minus 512 MiB reserve) ---
+layer       peakF@1_MiB  fwd_bytes/sample   max_batch_fwd    peakB@1_MiB  bwd_bytes/sample   max_batch_bwd
+3->16              1.19           1245184           17737           1.38           1441792           15318
+16->32             3.02           3145728            7021           4.04           4194304            5265
+32->64             6.07           6291456            3510           8.14           8388608            2632
+max_batch = one layer in isolation. Full 3-layer training graph needs more; see RESULTS.md.
+
+RESULT: PASS
