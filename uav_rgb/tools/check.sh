@@ -61,6 +61,7 @@ fi
 "$UAV_RGB_PYTHON" "$uav_check_root/sim/tools/teacher.py"
 "$UAV_RGB_PYTHON" "$uav_check_root/sim/tools/scene_gen.py" --self-check
 "$UAV_RGB_PYTHON" "$uav_check_root/sim/tools/gz_io.py" --self-check
+"$UAV_RGB_PYTHON" "$uav_check_root/tools/airsim_to_uavr.py" --self-check
 for uav_check_test in "$uav_check_root"/sim/tools/test_*.py; do
   "$UAV_RGB_PYTHON" "$uav_check_test"
 done

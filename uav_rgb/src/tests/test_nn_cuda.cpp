@@ -58,6 +58,18 @@ int main() {
       if (x[i] == 0.0f && (dx_cpu[i] != 0.0f || dx_cuda[i] != 0.0f)) zero_ok = false;
     }
     check(zero_ok, "ReLU x==0 的次梯度约定（0）CPU/CUDA 一致");
+
+    // NaN 必须继续传播，不能被 ReLU 压成 0（会掩盖坏权重/溢出）。
+    Tensor nx = Tensor::from_flat({3}, {std::nanf(""), -1.0f, 2.0f});
+    Tensor ndy = Tensor::from_flat({3}, {std::nanf(""), 1.0f, 1.0f});
+    const Tensor ny_cpu = relu_forward(nx);
+    const Tensor ny_cuda = relu_forward_cuda(nx);
+    check(std::isnan(ny_cpu[0]) && std::isnan(ny_cuda[0]),
+          "ReLU 前向 NaN CPU/CUDA 都继续传播");
+    const Tensor ndx_cpu = relu_backward(nx, ndy);
+    const Tensor ndx_cuda = relu_backward_cuda(nx, ndy);
+    check(std::isnan(ndx_cpu[0]) && std::isnan(ndx_cuda[0]),
+          "ReLU 反向 NaN CPU/CUDA 都继续传播");
   }
 
   // ---- MaxPool2d（k=s=2）：前向 y/argmax + 反向 dx parity；H/W 为奇数验证向下取整 ----
@@ -181,6 +193,25 @@ int main() {
     check(std::fabs(c_cpu - expected_coef) < 1e-6f && std::fabs(c_cuda - expected_coef) < 1e-6f,
           "clip 系数 min(1, max_norm/(norm+1e-6)) 与独立重算一致");
     check(c_cpu < 1.0f, "裁剪系数 <1（测试值确实超过 max_norm）");
+  }
+
+  // 梯度含 NaN：CPU/CUDA 必须一致地抛错，不能一边返回 1.0、一边把梯度乘成 NaN。
+  {
+    Tensor ng = Tensor::from_flat({2}, {std::nanf(""), 0.0f});
+    Tensor ng_cuda = ng;
+    bool cpu_threw = false;
+    bool cuda_threw = false;
+    try {
+      (void)global_grad_norm({&ng});
+    } catch (const std::runtime_error&) {
+      cpu_threw = true;
+    }
+    try {
+      (void)global_grad_norm_cuda({&ng_cuda});
+    } catch (const std::runtime_error&) {
+      cuda_threw = true;
+    }
+    check(cpu_threw && cuda_threw, "非有限梯度 norm CPU/CUDA 都抛错");
   }
 
   // ---- 形状异常自检（防越界/错位） ----

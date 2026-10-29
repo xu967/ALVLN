@@ -62,6 +62,8 @@ void Trainer::write_csv_header_if_needed() const {
   std::ofstream f(p, std::ios::app);
   if (!f) throw std::runtime_error("trainer: 无法写 " + p);
   f << kResultsCsvHeader << '\n';
+  f.flush();
+  if (!f) throw std::runtime_error("trainer: 写 results.csv 表头失败");
 }
 
 void Trainer::run() {
@@ -97,6 +99,11 @@ void Trainer::run() {
   std::ofstream metrics(metrics_path, std::ios::app);
   std::ofstream csv(csv_path, std::ios::app);
   if (!metrics || !csv) throw std::runtime_error("trainer: 无法追加写 " + cfg_.out_dir);
+  // 打开成功不代表后续写成功（磁盘满/quota/FUSE 错误）：每次 flush 后必须查流状态，
+  // 否则训练照常 exit 0，结果文件却是空的。
+  auto check_out = [](const std::ofstream& f, const char* name) {
+    if (!f) throw std::runtime_error(std::string("trainer: 写 ") + name + " 失败（磁盘满/IO 错误）");
+  };
 
   const std::size_t bs = static_cast<std::size_t>(cfg_.batch);
   const std::uint32_t per_epoch =
@@ -116,6 +123,7 @@ void Trainer::run() {
             << '\n';
   }
   metrics.flush();
+  check_out(metrics, "metrics.jsonl");
 
   std::mt19937 rng(cfg_.seed);
   std::vector<std::uint32_t> order = ds.train_idx;
@@ -162,6 +170,7 @@ void Trainer::run() {
       metrics << metrics_json(make_train_step(step, total_steps, loss, acc, cfg_.lr, elapsed, eta))
               << '\n';
       metrics.flush();  // 监控台按追加偏移增量读，每步必须落盘
+      check_out(metrics, "metrics.jsonl");
 
       // results.csv 的 train_ce 必须与 dev_ce 同口径（都是无权 CE），否则两列不可比。
       const float plain = class_weights_.empty() ? loss : softmax_ce_loss_cuda(logits, y);
@@ -172,10 +181,21 @@ void Trainer::run() {
     const double train_ce = ce_sum / static_cast<double>(seen);
     EvalStats dev_stats;
     evaluate(ds, dev, &dev_stats);
+    // dev 非有限值必须中止：否则 CSV 写 "null"、宏 F1 仍有限，失效模型会被选成 best。
+    if (!std::isfinite(dev_stats.ce) || !std::isfinite(dev_stats.acc) ||
+        !std::isfinite(dev_stats.macro_f1) || !std::isfinite(dev_stats.balanced_acc)) {
+      metrics << metrics_json(make_error(Severity::kFatal, "DEV_NONFINITE_METRIC", step + 1,
+                                         "dev 指标非有限值（lr 过大或数值溢出），中止"))
+              << '\n';
+      metrics.flush();
+      throw std::runtime_error("trainer: dev 指标非有限值（step " +
+                               std::to_string(step + 1) + "）");
+    }
     state_.epoch = epoch_base + ep;
     csv << state_.epoch << ',' << num(train_ce) << ',' << num(dev_stats.ce) << ','
         << num(dev_stats.acc) << '\n';
     csv.flush();
+    check_out(csv, "results.csv");
     MetricsEvent vev = make_validation(step, static_cast<float>(dev_stats.ce),
                                        static_cast<float>(dev_stats.acc),
                                        dev_is_train ? Split::kTrain : Split::kVal);
@@ -197,6 +217,7 @@ void Trainer::run() {
               << '\n';
     }
     metrics.flush();
+    check_out(metrics, "metrics.jsonl");
     // 交付模型不能是最后一轮：dev 宏 F1 峰值常早于末轮（见 docs/results.md）。
     // dev 回退到 train 时不选模型，否则等于用训练集挑权重。
     if (!dev_is_train && dev_stats.macro_f1 > static_cast<double>(state_.best_macro_f1)) {
@@ -207,6 +228,7 @@ void Trainer::run() {
                                           num(dev_stats.macro_f1)))
               << '\n';
       metrics.flush();
+      check_out(metrics, "metrics.jsonl");
     }
     // 必须在更新 best 之后写：否则续训从 ckpt.bin 读到的 best 比 ckpt_best.bin 落后一轮。
     save_checkpoint(ckpt_path, model_, state_);
@@ -231,6 +253,7 @@ void Trainer::run() {
                                       num(elapsed_sec_) + " s, ckpt=" + ckpt_path))
           << '\n';
   metrics.flush();
+  check_out(metrics, "metrics.jsonl");
 }
 
 }  // namespace uavrgb

@@ -60,6 +60,46 @@ void check_shape(const std::string& name, const Tensor& t, const std::vector<std
   if (t.dims() != dims) bad(name + ": 形状与模型不符");
 }
 
+// ReLU 会把 NaN 激活压成 0，NaN 权重可能一路训到 exit 0；checkpoint 是信任边界，
+// 读入/写出都必须拒绝非有限值，否则坏模型会被静默保存并被 resume 继续使用。
+void check_finite(const std::string& name, const Tensor& t) {
+  for (std::size_t i = 0; i < t.numel(); ++i) {
+    if (!std::isfinite(t[i])) {
+      bad(name + ": 含非有限值（索引 " + std::to_string(i) + "）");
+    }
+  }
+}
+
+struct Header {
+  std::uint32_t version = 0;
+  std::uint32_t param_count = 0;
+  std::int32_t in_h = 0, in_w = 0, in_c = 0, num_classes = 0;
+};
+
+// magic/version/结构元信息；load 与 read_checkpoint_meta 共用，避免两处格式走样。
+Header read_header(std::ifstream& f) {
+  char magic[8] = {};
+  f.read(magic, sizeof magic);
+  if (f.gcount() != static_cast<std::streamsize>(sizeof magic) ||
+      std::memcmp(magic, kMagic, sizeof kMagic) != 0) {
+    bad("magic 不符（不是 UAVRCK01）");
+  }
+  Header h;
+  get<std::uint32_t>(f, h.version, "version");
+  if (h.version < kMinVersion || h.version > kVersion) {
+    bad("version 不支持: " + std::to_string(h.version));
+  }
+  get<std::uint32_t>(f, h.param_count, "param_count");
+  get<std::int32_t>(f, h.in_h, "in_h");
+  get<std::int32_t>(f, h.in_w, "in_w");
+  get<std::int32_t>(f, h.in_c, "in_c");
+  get<std::int32_t>(f, h.num_classes, "num_classes");
+  if (h.in_h <= 0 || h.in_w <= 0 || h.in_c <= 0 || h.num_classes <= 0) {
+    bad("结构元信息非正数");
+  }
+  return h;
+}
+
 }  // namespace
 
 TrainState make_train_state(const CnnModel& model, float lr) {
@@ -93,12 +133,17 @@ void save_checkpoint(const std::string& path, const CnnModel& model, const Train
   for (float w : st.class_weights) put<float>(f, w);
   put<float>(f, st.best_macro_f1);
 
-  for (const Tensor* p : ps) put_tensor(f, *p);
+  for (std::size_t i = 0; i < ps.size(); ++i) {
+    check_finite("param[" + std::to_string(i) + "]", *ps[i]);
+    put_tensor(f, *ps[i]);
+  }
   for (const Adam& a : st.adam) {
+    check_finite("adam.m", a.m);
     f.write(reinterpret_cast<const char*>(a.m.data()),
             static_cast<std::streamsize>(a.m.numel() * sizeof(float)));
   }
   for (const Adam& a : st.adam) {
+    check_finite("adam.v", a.v);
     f.write(reinterpret_cast<const char*>(a.v.data()),
             static_cast<std::streamsize>(a.v.numel() * sizeof(float)));
   }
@@ -110,35 +155,26 @@ void save_checkpoint(const std::string& path, const CnnModel& model, const Train
   if (ec) throw std::runtime_error("checkpoint: rename 失败 " + path);
 }
 
+CheckpointMeta read_checkpoint_meta(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) throw std::runtime_error("checkpoint: 无法打开 " + path);
+  const Header h = read_header(f);
+  return {h.in_h, h.in_w, h.in_c, h.num_classes};
+}
+
 void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
   std::ifstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("checkpoint: 无法打开 " + path);
-  char magic[8] = {};
-  f.read(magic, sizeof magic);
-  if (f.gcount() != static_cast<std::streamsize>(sizeof magic) ||
-      std::memcmp(magic, kMagic, sizeof kMagic) != 0) {
-    bad("magic 不符（不是 UAVRCK01）");
-  }
-  std::uint32_t version = 0, count = 0;
-  get<std::uint32_t>(f, version, "version");
-  if (version < kMinVersion || version > kVersion) {
-    bad("version 不支持: " + std::to_string(version));
-  }
-  get<std::uint32_t>(f, count, "param_count");
-
-  std::int32_t in_h = 0, in_w = 0, in_c = 0, ncls = 0;
-  get<std::int32_t>(f, in_h, "in_h");
-  get<std::int32_t>(f, in_w, "in_w");
-  get<std::int32_t>(f, in_c, "in_c");
-  get<std::int32_t>(f, ncls, "num_classes");
-  if (in_h != model.in_h || in_w != model.in_w || in_c != model.c1.in ||
-      ncls != model.fc.out) {
-    bad("模型结构不符（ckpt " + std::to_string(in_c) + "x" + std::to_string(in_h) + "x" +
-        std::to_string(in_w) + "->" + std::to_string(ncls) + "）");
+  const Header h = read_header(f);
+  const std::uint32_t version = h.version;
+  if (h.in_h != model.in_h || h.in_w != model.in_w || h.in_c != model.c1.in ||
+      h.num_classes != model.fc.out) {
+    bad("模型结构不符（ckpt " + std::to_string(h.in_c) + "x" + std::to_string(h.in_h) + "x" +
+        std::to_string(h.in_w) + "->" + std::to_string(h.num_classes) + "）");
   }
 
   const std::vector<Tensor*> ps = cnn_params(model);
-  if (count != ps.size() || st.adam.size() != ps.size()) bad("参数个数不符");
+  if (h.param_count != ps.size() || st.adam.size() != ps.size()) bad("参数个数不符");
 
   std::uint32_t t = 0;
   std::uint32_t epoch = 0;
@@ -167,15 +203,18 @@ void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
     get_dims(f, "param", dims);
     check_shape("param[" + std::to_string(i) + "]", *ps[i], dims);
     get_floats(f, *ps[i], "param");
+    check_finite("param[" + std::to_string(i) + "]", *ps[i]);
   }
   // m/v 落盘时不带形状头（顺序与参数一致），但本地张量必须与参数同形，否则 float 流错位。
   for (std::size_t i = 0; i < st.adam.size(); ++i) {
     check_shape("adam.m", st.adam[i].m, ps[i]->dims());
     get_floats(f, st.adam[i].m, "adam.m");
+    check_finite("adam.m", st.adam[i].m);
   }
   for (std::size_t i = 0; i < st.adam.size(); ++i) {
     check_shape("adam.v", st.adam[i].v, ps[i]->dims());
     get_floats(f, st.adam[i].v, "adam.v");
+    check_finite("adam.v", st.adam[i].v);
   }
   for (Adam& a : st.adam) a.t = static_cast<int>(t);
   if (f.peek() != std::char_traits<char>::eof()) bad("文件尾部有多余数据");

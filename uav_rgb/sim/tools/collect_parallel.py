@@ -391,7 +391,7 @@ def main():
     p.add_argument("--steps", type=int, default=80,
                    help="每 episode 步数（默认 80：实测每步 0.105 m，穿柱区要 68–76 步）")
     p.add_argument("--hold", type=float, default=1.0,
-                   help="每动作 wall-clock 秒（行为随 RTF 漂移，不可复现）")
+                   help="每动作仿真时间秒（走满即发零速，与 RTF 无关）")
     p.add_argument("--out", required=True, help="汇总输出目录（必须为空/不存在）")
     p.add_argument("--base-seed", type=int, default=0,
                    help="scene_id = seed = base_seed + i*E + e")

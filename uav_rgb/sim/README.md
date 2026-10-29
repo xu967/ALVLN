@@ -167,9 +167,11 @@ I/O（2026-10-29 起）：`collect.py` 启动时给 camera/depth/pose/contact/ca
   （本机 RTF 约 0.3–1.0），**不是墙钟**。旧记录里的「每步约 1.7 s」是旧版
   **sim_dt**（旧版实测 1.50–1.82 s/步），不能当成 wall 拿来和现在的数字比。
 - **`wall`（墙钟）**：`collect.py` 的 `timing.total`，一步真实耗时。`--hold` 的
-  单位是 wall 秒，动作窗口也按墙钟计。
-- 关系：`sim_dt ≈ RTF × wall`。低 RTF 下同样 hold 推进的 sim-time 更少、前进距离
-  更短；`stuck` 阈值已按 sim_dt 缩放，不会误报。
+  单位是**仿真时间**秒（D1 起）：窗口要 `/model/x3/pose` 的 sim-time 走满 hold
+  才发零速，与 RTF 无关。墙钟只作兜底（`hold / MIN_WINDOW_RTF`，RTF 低于 0.05
+  判本步失败）。
+- 关系：`wall ≈ sim_dt / RTF`。低 RTF 下 `wall` 变长但 `sim_dt` 稳定在 hold；
+  `stuck` 阈值按 `sim_dt` 缩放，不会误报。
 
 ## 4.6 场景随机化 + 并行采集（数据量流水线）
 
@@ -304,8 +306,8 @@ Segmentation fault (Address not mapped to object [0x220])
 
 ## 尚未完成的仿真验收
 
-1. 采集循环、episode 写入及最近时间戳配对已实现；仍需给深度配对残差和传感器
-   停更设置拒绝门槛，动作持续时间仍按墙钟，未实现 sim-time advance。
+1. 采集循环、episode 写入及最近时间戳配对已实现；动作持续时间已改为 sim-time
+   advance（D1）。仍需给深度配对残差和传感器停更设置拒绝门槛。
 2. 已保存相机声明的内参；尚未完成相机外参/畸变的独立标定和 episode reset。
    当前并行编排通过每集重启世界隔离状态。
 3. 尚无学生策略接入 Gazebo 的闭环评测器，也没有独立测试集上的成功率、碰撞率、

@@ -38,6 +38,7 @@ HEAD_LEN = 64          # 首部指纹，识别同 inode 的原地重写
 # 训练控制：默认接本仓库的 DEMO trainer；真实 C++/CUDA trainer 以后实现同一
 # `--config` 合同即可。全部子进程用 argv 列表启动，不经过 shell。
 TRAIN_SCHEMA = "uavrgb.train.v1"
+EVAL_SCHEMA = "uavrgb.eval.v1"   # <run_dir>/eval.json，由 sim/tools/eval_closed_loop.py 产出
 TRAIN_POLL_MS = 1000   # 训练运行期刷新间隔（空闲仍用 --refresh）
 STOP_GRACE_S = 5.0     # SIGINT→SIGTERM→SIGKILL 每一级的等待
 TRAIN_LOG_LINES = 2000
@@ -260,6 +261,91 @@ def _fmt3(v):
     return "—" if v is None else f"{v:.3f}"
 
 
+def load_eval(run_dir):
+    """读 <run_dir>/eval.json（uavrgb.eval.v1）；缺失/损坏/别的 schema 返回 None。"""
+    try:
+        with open(os.path.join(run_dir, "eval.json"), encoding="utf-8-sig") as f:
+            ev = json.load(f)
+    except (OSError, ValueError, RecursionError):
+        return None
+    if not isinstance(ev, dict) or ev.get("schema") != EVAL_SCHEMA:
+        return None
+    return ev
+
+
+def _num(v):
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def _pct(rate):
+    return f"{rate * 100:.1f}%" if _num(rate) else "—"
+
+
+def _ms(v):
+    return f"{v:.2f} ms" if _num(v) else "—"
+
+
+def fmt_eval(ev):
+    """uavrgb.eval.v1 -> 多行摘要。rate 为 null 表示没有有效集，不折算成 0。"""
+    failed = ev.get("failed") if isinstance(ev.get("failed"), list) else []
+    rates = (ev.get("success_rate"), ev.get("collision_rate"), ev.get("false_forward_rate"))
+    lines = [
+        f"ckpt: {os.path.basename(str(ev.get('ckpt') or '—'))}   split: {ev.get('split') or '—'}",
+        f"episodes: {ev.get('episodes_done', '—')}/{ev.get('episodes_requested', '—')}"
+        + (f"（失败 {len(failed)}）" if failed else ""),
+        "无有效集（三个 rate 均为 null）" if all(r is None for r in rates) else
+        f"SR: {_pct(rates[0])} · 碰撞: {_pct(rates[1])} · false_forward: {_pct(rates[2])}",
+    ]
+    ms = ev.get("inference_ms") if isinstance(ev.get("inference_ms"), dict) else {}
+    if ms:
+        n = ms.get("n_warm")
+        lines.append(f"推理 p50/p95: {_ms(ms.get('p50'))} / {_ms(ms.get('p95'))}（warm 帧"
+                     + (f"，n={n}" if isinstance(n, int) else "") + "）")
+    cold = ms.get("cold_first_ms")
+    if isinstance(cold, list) and cold and all(_num(c) for c in cold):
+        # 每集首帧含 CUDA 初始化，单独一行，不混进 p50/p95
+        lines.append(f"冷启动首帧: {min(cold):.1f}–{max(cold):.1f} ms（{len(cold)} 集）")
+    dist = ev.get("action_distribution")
+    if isinstance(dist, dict) and dist:
+        lines.append("动作次数: " + " · ".join(f"{k} {v}" for k, v in dist.items()))
+    return lines
+
+
+def _eval_chart(canvas, episodes):
+    """每集 max_x 柱状图：红=碰撞、绿=成功、灰=失败/未知。"""
+    canvas.delete("all")
+    w, h = canvas.winfo_width(), canvas.winfo_height()
+    if w < 60 or h < 40:
+        return
+    bars = [(ep["max_x"], bool(ep.get("collision")), bool(ep.get("success")))
+            for ep in episodes
+            if isinstance(ep, dict) and _num(ep.get("max_x"))]
+    if not bars:
+        canvas.create_text(w / 2, h / 2, text="(无 per_episode 数据)", fill="#888")
+        return
+    pad_l, pad_t, pad_b = 8, 16, 8
+    # goal 全一致时画参照线，否则单条线会误导；柱子按 goal/max_x 的较大者缩放
+    goals = [ep.get("goal_x") for ep in episodes
+             if isinstance(ep, dict) and _num(ep.get("goal_x"))]
+    goal = goals[0] if goals and max(goals) - min(goals) < 1e-6 else None
+    vmax = max([v for v, _, _ in bars] + ([goal] if goal is not None else [])) or 1.0
+    bw = max(1, (w - 2 * pad_l) // len(bars))
+    canvas.create_text(w / 2, 2, text="每集 max_x（红=碰撞，绿=成功，灰=失败）",
+                       anchor="n", font=("TkDefaultFont", 8))
+    for i, (v, collided, ok) in enumerate(bars):
+        x0 = pad_l + i * bw
+        y0 = h - pad_b - (v / vmax) * (h - pad_t - pad_b)
+        color = "#c53030" if collided else ("#2f855a" if ok else "#999")
+        canvas.create_rectangle(x0, y0, x0 + max(1, bw - 1), h - pad_b,
+                                fill=color, outline="")
+    canvas.create_line(pad_l, h - pad_b, w - pad_l, h - pad_b, fill="#555")
+    if goal is not None:
+        gy = h - pad_b - (goal / vmax) * (h - pad_t - pad_b)
+        canvas.create_line(pad_l, gy, w - pad_l, gy, dash=(3, 2), fill="#b45309")
+        canvas.create_text(w - pad_l - 2, gy - 1, text=f"goal {goal:g}", anchor="se",
+                           fill="#b45309", font=("TkDefaultFont", 8))
+
+
 def _fmt_age(seconds):
     seconds = max(0, int(seconds))
     if seconds < 120:
@@ -454,6 +540,8 @@ class MonitorApp:
         self._last_rc = None
         self._train_log_state = {}
         self._train_log_lines = 0
+        self._eval_sig = "unset"   # eval.json 的文件签名；"unset" 强制首轮重画
+        self._eval = None
         self._closing = False
 
         self.root.title("uav_rgb 训练监控台")
@@ -560,9 +648,20 @@ class MonitorApp:
         self.train_log.grid(row=0, column=0, sticky="ew")
         tsb.grid(row=0, column=1, sticky="ns")
         nb.add(out, text="训练输出")
+
+        ev = ttk.Frame(nb, padding=(4, 2))
+        ev.columnconfigure(1, weight=1)
+        self.eval_text = tk.Text(ev, width=46, height=6, wrap="none", state="disabled",
+                                 relief="flat", font=("TkFixedFont", 9))
+        self.eval_text.grid(row=0, column=0, sticky="nsew")
+        self.eval_canvas = tk.Canvas(ev, height=96, background="#ffffff",
+                                     highlightthickness=1, highlightbackground="#ddd")
+        self.eval_canvas.grid(row=0, column=1, sticky="nsew", padx=(6, 0))
+        nb.add(ev, text="评测结果")
         self.notebook = nb
         self.tab_events = events
         self.tab_output = out
+        self.tab_eval = ev
 
     def _build_body(self):
         body = ttk.Frame(self.root, padding=(8, 0, 8, 8))
@@ -651,6 +750,7 @@ class MonitorApp:
 
     def refresh(self, force=False):
         """读文件并刷新界面；文件签名未变时只更新状态，避免无谓重绘。"""
+        self._set_eval()   # eval.json 单独按签名刷新，训练产物没变也要跟上
         paths = [os.path.join(self.run_dir, n) for n in ("results.csv", "metrics.jsonl")]
         stats = []
         for p in paths:
@@ -681,6 +781,16 @@ class MonitorApp:
         self._sig = sig
 
     def _update_status(self):
+        # 评测目录没有 results.csv/metrics.jsonl，别显示“等待训练产物”
+        if self._eval is not None and not self._rows and not self._events:
+            ev = self._eval
+            parts = [f"评测 {ev.get('split') or '—'}",
+                     f"SR {_pct(ev.get('success_rate'))}",
+                     f"{ev.get('episodes_done', '—')}/{ev.get('episodes_requested', '—')} 集"]
+            if self._paused:
+                parts.append("已暂停")
+            self.status.config(text=" · ".join(parts))
+            return
         valid = sum(1 for r in self._rows if r["epoch"] is not None)
         parts = [f"{valid} epochs", f"{len(self._events)} 事件"]
         if self._data_mtime is not None:
@@ -755,6 +865,31 @@ class MonitorApp:
                 self.log.itemconfig("end", foreground="#c53030")
         self.log.yview_moveto(1.0 if follow else pos[0])
 
+    def _set_eval(self):
+        """eval.json 变了才重画「评测结果」页；文件不存在时给一句提示。"""
+        try:
+            st = os.stat(os.path.join(self.run_dir, "eval.json"))
+            sig = (st.st_mtime_ns, st.st_size, st.st_ino)
+        except OSError:
+            sig = None
+        if sig == self._eval_sig:
+            return
+        self._eval_sig = sig
+        ev = load_eval(self.run_dir) if sig else None
+        self._eval = ev
+        if ev is None:
+            text = ("该目录没有 eval.json（评测结果由 sim/tools/eval_closed_loop.py 产出）"
+                    if sig is None else "eval.json 无法解析，或 schema 不是 uavrgb.eval.v1")
+            episodes = []
+        else:
+            text = "\n".join(fmt_eval(ev))
+            episodes = ev.get("per_episode") if isinstance(ev.get("per_episode"), list) else []
+        self.eval_text.config(state="normal")
+        self.eval_text.delete("1.0", "end")
+        self.eval_text.insert("1.0", _safe_text(text))
+        self.eval_text.config(state="disabled")
+        _eval_chart(self.eval_canvas, episodes)
+
     def _on_resize(self, _event=None):
         # 窗口 map/缩放后 Canvas 才有真实尺寸；去抖后补画，避免启动时空白 5 秒。
         if self._resize_job is not None:
@@ -789,6 +924,7 @@ class MonitorApp:
         self._rows = []
         self._sig = None
         self._data_mtime = None
+        self._eval_sig = "unset"
         self._update_title()
         self._update_demo_tag()
         self.run_label.config(text=_safe_text(_short_path(path)))

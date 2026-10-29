@@ -37,6 +37,15 @@ struct TrainState {
 
 inline int train_step(const TrainState& st) { return st.adam.empty() ? 0 : st.adam[0].t; }
 
+// 只读文件头，给推理端在构造模型前拿结构尺寸（load_checkpoint 要求模型已存在且尺寸一致）。
+struct CheckpointMeta {
+  int in_h = 0;
+  int in_w = 0;
+  int in_c = 0;
+  int num_classes = 0;
+};
+CheckpointMeta read_checkpoint_meta(const std::string& path);
+
 // adam 为空时按 params 形状分配（m/v 全零），lr 由调用方给。
 TrainState make_train_state(const CnnModel& model, float lr);
 

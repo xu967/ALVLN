@@ -51,20 +51,20 @@ struct DeviceBuf {
 
 constexpr int kThreads = 256;
 
-// ReLU 前向：x==0 → 0。
+// ReLU 前向：x==0 → 0；NaN 继续传播（压成 0 会把坏权重藏起来）。
 __global__ void relu_forward_kernel(const float* __restrict__ x, float* __restrict__ y,
                                     int total) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
-  y[i] = x[i] > 0.0f ? x[i] : 0.0f;
+  y[i] = (x[i] > 0.0f || isnan(x[i])) ? x[i] : 0.0f;
 }
 
-// ReLU 反向：dx = dy * (x > 0)；x==0 取次梯度 0（与 nn_cpu.cpp 注释/实现一致）。
+// ReLU 反向：dx = dy * (x > 0)；x==0 取次梯度 0；NaN 继续传播。
 __global__ void relu_backward_kernel(const float* __restrict__ x, const float* __restrict__ dy,
                                      float* __restrict__ dx, int total) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
-  dx[i] = x[i] > 0.0f ? dy[i] : 0.0f;
+  dx[i] = (x[i] > 0.0f || isnan(x[i])) ? dy[i] : 0.0f;
 }
 
 // MaxPool 前向：每线程一个输出元素；窗口内严格 > 才更新 → 并列取行优先第一个。
@@ -304,6 +304,9 @@ float global_grad_norm_cuda(const std::vector<const Tensor*>& grads) {
   }
   double sum = 0.0;
   CUDA_CHECK(cudaMemcpy(&sum, d_sum.p, sizeof(double), cudaMemcpyDeviceToHost));
+  if (!std::isfinite(sum)) {
+    throw std::runtime_error("global_grad_norm_cuda: 梯度含非有限值");
+  }
   return static_cast<float>(std::sqrt(sum));
 }
 

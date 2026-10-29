@@ -39,8 +39,8 @@
 | 启动瞬间 run 目录 / 完成后产物 | `[]` → `ckpt.bin config.json metrics.jsonl results.csv` |
 | 停止（跑 4 s） | `已停止 rc=-2`，产物文件完整 |
 | 命令行 resume 1 epoch | `rc=0`，`results.csv` 4 行，事件 36 条 |
-| `DISPLAY=:20 python3 ui/test_monitor.py` | 100 项通过，EXIT=0 |
-| `env -u DISPLAY python3 ui/test_monitor.py` | 61 项通过，1 项跳过，EXIT=0 |
+| `DISPLAY=:20 python3 ui/test_monitor.py` | 102 项通过，EXIT=0 |
+| `env -u DISPLAY python3 ui/test_monitor.py` | 63 项通过，1 项跳过，EXIT=0 |
 | `python3 ui/test_trainer_demo.py` | 89 项通过，EXIT=0 |
 | `py_compile` | OK |
 

@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """E3 采集器：驱动四旋翼在 Gazebo 里跑专家策略，录 RGB/位姿/碰撞成完整 episode。
 
-依赖一个已在运行的 gz sim（见 sim/README.md 启动命令）。纯 stdlib，导入同目录 teacher。
+依赖一个已在运行的 gz sim（见 sim/README.md 启动命令）。teacher/forward 路径纯 stdlib；
+student 路径需要 PIL 与 uavrgb_infer（见 sim/tools/student.py）。
 
 用法：
   python3 collect.py --steps 20 --out /tmp/ep0 --scene-id 1 --seed 42 --split train
   python3 collect.py --steps 8 --out /tmp/ep1 --policy forward   # 盲策略（恒定前进）基线
+  python3 collect.py --steps 80 --out /tmp/ep2 --policy student \
+      --student-ckpt run/ckpt.bin --stop-on-collision           # 学生闭环评测
 
 I/O：启动时给 camera/depth/pose/contact/camera_info 各起一个常驻订阅
 （gz_io.TopicSub：一个 `gz topic -e` 进程 + 后台读线程 + latest-wins 环形缓冲），
@@ -18,7 +21,7 @@ gz.transport13；当前解释器没有该模块时用 `/usr/bin/python3` helper 
 每步（顺序是因果链的一部分，别调换）：
   等一帧新 RGB（锚点）-> 按 sim-time 挑最近的深度、挑晚于 RGB 的位姿 ->
   teacher 得动作 -> 发动作 -> 写 PNG（落在 hold 窗口内）->
-  持 hold 秒（期间轮询 contact）-> 立刻发零速并等它发布完成 -> 取动作后位姿 ->
+  持 hold 秒仿真时间（期间轮询 contact）-> 立刻发零速并等它发布完成 -> 取动作后位姿 ->
   增量落盘/刷盘。
 RGB 仍然是**动作前**的观测（M1：rgb_ts < action_start_ts），动作窗口结束立刻发零速（M2）。
 动作后的状态只进 oracle.jsonl；actions.jsonl 的 timestamp_ns 是动作前 RGB 帧。
@@ -28,7 +31,7 @@ RGB 仍然是**动作前**的观测（M1：rgb_ts < action_start_ts），动作�
                          相机内参（/uav/camera_info 的 RGB 那条）+ camera_source
   actions.jsonl          每步 step/timestamp_ns(RGB)/action_expert/action_executed/
                          collision/rgb_ok/frame/depth_ts/depth_rgb_gap_ns/pose_ts/
-                         pose_rgb_gap_ns/rgb_ts/action_start_ns
+                         pose_rgb_gap_ns/rgb_ts/action_start_ns/pose_before/yaw_before
   oracle.jsonl           每步 step/timestamp_ns(动作后 pose)/pose_gt + 动作起止 sim-time
   rgb_%05d.png           320x240 原图（降采样到 160x120 由 tools/preprocess.py 负责）
 
@@ -72,6 +75,7 @@ FRAME_WAIT = 2.0      # 每步等一帧新 RGB 的上限（相机 30 Hz；卡住
 POSE_WAIT = 0.5       # 等一帧「晚于 RGB」的位姿的上限（M1；位姿 45 Hz）
 READY_TIMEOUT = 10.0  # 启动时等 camera/depth/pose 首帧的上限
 CONTACT_POLL = 0.02   # 动作窗口内轮询接触信号的间隔（接触时 225 Hz，缓冲覆盖 ~70 ms）
+MIN_WINDOW_RTF = 0.05 # 动作窗口的墙钟兜底：仿真时间走不动时按此 RTF 折算等待上限
 
 # 动作 -> 速度指令。forward=+X，left=+Y，up=+Z；yaw 正 z = 左转（右手定则）。
 # vz 是**高度保持**分量（见 altitude_vz）：速度控制器只吃速度指令，z:0 是「零垂直速度」
@@ -512,7 +516,7 @@ def take_off(pose_sub, publisher, z_target=Z_TARGET, timeout=30.0):
 # ---------------------------------------------------------------- 单步
 
 def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
-                prev_action=None, prev_rgb_ts=0, pillars=None):
+                prev_action=None, prev_rgb_ts=0, pillars=None, student=None):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。"""
     t_step = time.perf_counter()
 
@@ -541,6 +545,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     pose_before_ts, pose_msg = pose_pick
     pose_before, _, yaw_before = _pose_parts(pose_msg)
 
+    infer_ms = None
     if policy == "teacher":
         if pillars:
             # 有柱子真值就用 carrot planner：真值只决定标签，不进学生输入。
@@ -553,6 +558,13 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         else:
             # 没有真值就退回深度反应式专家（传 prev_action 启用滞回）。
             action = expert_action(d, w, h, prev_action=prev_action)
+    elif policy == "student":
+        if student is None:
+            return None, "student 策略未初始化"
+        try:
+            action, infer_ms, _probs = student.act(rgb_msg)
+        except Exception as e:  # noqa: BLE001 - 推理进程任何失败都算本步失败
+            return None, f"学生推理失败: {type(e).__name__}: {e}"
     else:  # policy == "forward": 盲策略（恒定前进），用于撞柱/基线对照
         action = FORWARD_SLOW
     t_io = time.perf_counter()
@@ -577,12 +589,24 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             rgb_msg, os.path.join(out_dir, "rgb_%05d.png" % step_idx))
 
         contact = False
-        zero_deadline = t_action_start + hold
+        # 动作窗口按仿真时间计：动作前的位姿戳 + hold 秒。旧实现用墙钟，RTF 一抖
+        # 实际走过的仿真时间就差得远（/tmp/ds200 实测 sim_dt 变异系数 18%），
+        # 标签「前进 1 秒」到底代表多少位移变得不可复现。
+        hold_end_ns = action_start_ns + int(hold * 1e9)
+        wall_cap = t_action_start + hold / MIN_WINDOW_RTF   # 位姿停更时不死等
         while True:
-            remaining = zero_deadline - time.perf_counter()
-            if remaining <= 0:
+            msg = subs["pose"].latest()
+            if msg is not None and _pose_stamp(msg) >= hold_end_ns:
                 break
-            time.sleep(min(CONTACT_POLL, remaining))
+            if not subs["pose"].healthy():
+                # 订阅进程已死：不必等满墙钟兜底，也能给出比「RTF 过低」准确的诊断。
+                _try_zero(publisher)
+                return None, "动作窗口内 pose 订阅进程已退出"
+            if time.perf_counter() >= wall_cap:
+                _try_zero(publisher)   # 动作还在生效，先刹车再报错
+                return None, (f"动作窗口超时：{hold / MIN_WINDOW_RTF:.1f}s 墙钟内"
+                              f"仿真时间没走满 hold={hold}s（位姿停更或 RTF 过低）")
+            time.sleep(CONTACT_POLL)
             if not contact:
                 contact = _contact_since(subs["contact"], contact_seq0)
 
@@ -641,6 +665,9 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         "collision": contact or stuck,
         "pose_gt": pose_after,
         "pose_ts": pose_ts,
+        # 动作前位姿：audit 用它 + scene 柱子真值复算标签，验证「标签=该帧该做的动作」。
+        "pose_before": pose_before,
+        "yaw_before": yaw_before,
         "rgb_ok": rgb_ok,
         "frame": "rgb_%05d.png" % step_idx,
         "depth_ts": depth_ts,
@@ -650,6 +677,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         "displacement_m": dist,
         "dyaw_deg": dyaw,
         "sim_dt": sim_dt,
+        "infer_ms": infer_ms,
         "action_wall_s": action_wall,
         "src": "+".join(s for s, on in (("contact", contact), ("stuck", stuck)) if on) or None,
         # 每步耗时分解（秒）：io=取帧+解码+teacher，window=动作到零速的窗口，
@@ -668,6 +696,14 @@ def write_manifest(path, manifest):
     os.replace(tmp, path)
 
 
+def write_scene_meta(path, raw):
+    """原样落盘 scene_gen 的 JSON：audit 复算标签要读 pillars。"""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(raw)
+    os.replace(tmp, path)
+
+
 def _median(xs):
     xs = sorted(xs)
     return xs[len(xs) // 2]
@@ -680,10 +716,15 @@ def main():
     p.add_argument("--steps", type=int, default=80)
     p.add_argument("--out", required=True)
     p.add_argument("--hold", type=float, default=1.0,
-                   help="每动作持续时间（秒，wall-clock；结束立即发零速）")
+                   help="每动作持续时间（秒，仿真时间；走满即发零速）")
     p.add_argument("--no-takeoff", action="store_true")
-    p.add_argument("--policy", choices=("teacher", "forward"), default="teacher",
-                   help="teacher=专家策略；forward=盲策略（恒定前进），验证碰撞/对照基线")
+    p.add_argument("--policy", choices=("teacher", "forward", "student"), default="teacher",
+                   help="teacher=专家策略；forward=盲策略（恒定前进）；student=模型闭环")
+    p.add_argument("--student-ckpt", default=None, help="--policy student 的 checkpoint")
+    p.add_argument("--infer-bin", default=None,
+                   help="uavrgb_infer 路径（默认 src/build/uavrgb_infer）")
+    p.add_argument("--stop-on-collision", action="store_true",
+                   help="碰撞后立即结束本 episode（闭环评测用）")
     p.add_argument("--scene-id", type=int, default=0, help="EpisodeMeta.scene_id（场景隔离关键字段）")
     p.add_argument("--seed", type=int, default=0, help="EpisodeMeta.seed")
     p.add_argument("--episode-id", type=int, default=None, help="EpisodeMeta.episode_id（默认=seed）")
@@ -698,6 +739,8 @@ def main():
         p.error("--hold must be finite and > 0")
     if args.steps < 1:
         p.error("--steps must be >= 1")
+    if args.policy == "student" and not args.student_ckpt:
+        p.error("--policy student 需要 --student-ckpt")
     if os.path.isdir(args.out) and os.listdir(args.out):
         p.error(f"--out {args.out} 不是空目录；请换新目录（或先清空）")
     os.makedirs(args.out, exist_ok=True)
@@ -712,6 +755,9 @@ def main():
         for k, pl in enumerate(pillars):
             if "x" not in pl or "y" not in pl:
                 p.error(f"--scene-meta {args.scene_meta}: pillars[{k}] 缺 x/y")
+        # 柱子真值随 episode 一起落盘：audit 的 label_recompute 要用它复算标签。
+        # 只有 collect_parallel 复制过 scene.json，单跑 collect.py 的集会永远 SKIP。
+        write_scene_meta(os.path.join(args.out, "scene.json"), raw_meta)
         # split 由几何组唯一决定；手传的 --split 与它不符会把同几何放进两个 split。
         scene_gid = sm.geometry_gid(pillars)
         want_split = sm.split_for_gid(scene_gid)
@@ -721,6 +767,8 @@ def main():
     # 事后只能靠这个字段区分（旧版没有任何记录）。
     if args.policy == "forward":
         teacher_kind = "forward"
+    elif args.policy == "student":
+        teacher_kind = "student"
     elif pillars:
         teacher_kind = "plan_action"
     else:
@@ -734,12 +782,14 @@ def main():
     oracle_f = open(oracle_path, "w")
     subs = {}
     publisher = None
+    student = None
     cam_info = None
     rows_written = 0
     all_rgb_ok = True
     all_pose_ok = True
     error = None
     completed = False
+    stopped_on_collision = False
     prev_action = None
     prev_rgb_ts = 0
     timings = []
@@ -767,13 +817,18 @@ def main():
                   f"（每条指令约 +1.0 s）", file=sys.stderr)
             publisher = CliTwistPublisher()
 
+        if args.policy == "student":
+            from student import StudentPolicy
+            print("学生策略: 启动推理进程…", file=sys.stderr)
+            student = StudentPolicy(args.student_ckpt, args.infer_bin)
+
         if not args.no_takeoff:
             print("起飞中…", file=sys.stderr)
             take_off(subs["pose"], publisher)
 
         for i in range(args.steps):
             r, reason = collect_one(args.out, i, args.hold, args.policy, subs,
-                                    publisher, prev_action, prev_rgb_ts, pillars)
+                                    publisher, prev_action, prev_rgb_ts, pillars, student)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -794,7 +849,11 @@ def main():
                     "pose_rgb_gap_ns": pose_gap_ns,
                     "dyaw_deg": r["dyaw_deg"],
                     "displacement_m": r["displacement_m"],
-                    "action_start_ns": r["action_start_ns"]}) + "\n")
+                    "infer_ms": r["infer_ms"],
+                    "action_start_ns": r["action_start_ns"],
+                    # 动作前位姿：audit 的 label_recompute 靠它 + 柱子真值重跑 teacher。
+                    "pose_before": r["pose_before"],
+                    "yaw_before": r["yaw_before"]}) + "\n")
             actions_f.flush()
             oracle_f.write(json.dumps({"step": r["step"],
                                        "timestamp_ns": r["pose_ts"],
@@ -820,6 +879,10 @@ def main():
                   f"pose_gap={'-' if pose_gap_ns is None else f'{pose_gap_ns/1e6:.0f}ms'} "
                   f"io={(r['timing']['io']):.2f}s step={(r['timing']['total']):.2f}s",
                   file=sys.stderr)
+            if args.stop_on_collision and r["collision"]:
+                stopped_on_collision = True
+                print(f"step {i}: 碰撞，按 --stop-on-collision 结束", file=sys.stderr)
+                break
         completed = rows_written == args.steps
 
         if timings:
@@ -855,6 +918,13 @@ def main():
             if publisher is not None:
                 publisher.close()
         close_subs(subs)
+        if student is not None:
+            try:
+                student.close()
+            except Exception as e:  # noqa: BLE001 - 收尾失败要写进 manifest，不能静默
+                if error is None:
+                    error = f"学生推理收尾失败: {e}"
+                print(f"警告: {error}", file=sys.stderr)
         actions_f.close()
         oracle_f.close()
         episode_id = args.episode_id if args.episode_id is not None else args.seed
@@ -875,8 +945,8 @@ def main():
             # 标签由哪个教师产生：forward=盲策略对照，expert_action=深度反应式，
             # plan_action=柱子真值 carrot planner。缺这个字段就无法事后区分数据集。
             "teacher": teacher_kind,
-            # hold 是墙钟秒、行为随 RTF 漂移：同 scene 的 0.5 与 1.0 两批数据
-            # 不记下这个数就分不出来。
+            # hold 是**仿真时间**秒（D1 起）：窗口按位姿戳走满这个数才发零速，
+            # 与 RTF 无关。同 scene 的 0.5 与 1.0 两批数据仍靠它区分。
             "hold_s": args.hold,
             "scene_meta_sha256": scene_meta_sha,
             "actions_ref": "actions.jsonl",
@@ -892,6 +962,9 @@ def main():
             },
             "num_steps": rows_written,
             "requested_steps": args.steps,
+            # 评测集会在碰撞处提前结束；validity 仍按「跑满请求步数」严格填，
+            # 下游据此区分「采集完整」与「评测终止」，不要混淆。
+            "stopped_on_collision": stopped_on_collision,
             "error": error,
         }
         write_manifest(os.path.join(args.out, "episode_manifest.json"), manifest)

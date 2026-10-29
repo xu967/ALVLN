@@ -103,6 +103,15 @@ std::vector<float> resolve_class_weights(const std::string& spec, const UavrData
   bool any = false;
   for (float v : w) any = any || v > 0.0f;
   if (!any) throw std::invalid_argument("--class-weights 不能全为 0（每个样本权重都是 0）");
+  // 训练集存在的类若权重为 0，一个只含该类的 batch 会让 Σw=0、归一化除零并中止训练。
+  std::vector<std::size_t> count(w.size(), 0);
+  for (std::uint32_t i : ds.train_idx) ++count[ds.labels[i]];
+  for (std::size_t k = 0; k < w.size(); ++k) {
+    if (w[k] == 0.0f && count[k] > 0) {
+      throw std::invalid_argument("--class-weights 给训练集存在的类 " + std::to_string(k) +
+                                  " 设了 0 权重（纯该类 batch 会除零）；用 auto 或正权重");
+    }
+  }
   return w;
 }
 

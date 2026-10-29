@@ -229,6 +229,9 @@ int main() {
   // 3) checkpoint 往返
   const std::string ckpt = root + "/ckpt.bin";
   save_checkpoint(ckpt, tr.model(), tr.state());
+  const CheckpointMeta meta = read_checkpoint_meta(ckpt);
+  check(meta.in_h == 120 && meta.in_w == 160 && meta.in_c == 3 && meta.num_classes == 4,
+        "read_checkpoint_meta 读回的尺寸不符");
   CnnModel m2 = make_cnn(120, 160, cfg.seed, 4);
   TrainState st2 = make_train_state(m2, cfg.lr);
   load_checkpoint(ckpt, m2, st2);
@@ -273,6 +276,31 @@ int main() {
   bool v2_same = true;
   for (std::size_t i = 0; i < pa.size(); ++i) v2_same = v2_same && same_bits(*pa[i], *pc[i]);
   check(v2_same, "v2 checkpoint 参数读回后不一致");
+
+  // 含 NaN 参数的 checkpoint 必须在读入边界被拒绝（ReLU 会把中间 NaN 压成 0，
+  // 不查 checkpoint 的话坏模型能被静默续训并写回）。
+  const std::string nan_ckpt = root + "/ckpt_nan.bin";
+  {
+    std::ifstream in(ckpt, std::ios::binary);
+    std::vector<char> bytes((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());
+    std::uint32_t ndim = 0;
+    std::memcpy(&ndim, &bytes[48], 4);  // 参数 0 的 ndim（头部 48 B 之后）
+    const std::size_t off = 48 + 4 + static_cast<std::size_t>(ndim) * 8;
+    const std::uint32_t nan_bits = 0x7fc00000u;
+    std::memcpy(&bytes[off], &nan_bits, 4);
+    std::ofstream out(nan_ckpt, std::ios::binary);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  }
+  CnnModel m5 = make_cnn(120, 160, cfg.seed, 4);
+  TrainState st5 = make_train_state(m5, cfg.lr);
+  bool nan_rejected = false;
+  try {
+    load_checkpoint(nan_ckpt, m5, st5);
+  } catch (const std::invalid_argument&) {
+    nan_rejected = true;
+  }
+  check(nan_rejected, "含 NaN 参数的 checkpoint 必须被拒绝");
 
   // 结构不符的模型必须被拒，而不是静默加载一半
   CnnModel m3 = make_cnn(128, 128, cfg.seed, 4);

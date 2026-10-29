@@ -158,6 +158,19 @@ int main() {
   std::cout << "auto weights = [" << auto_w[0] << ", " << auto_w[1] << ", " << auto_w[2]
             << ", " << auto_w[3] << "]\n";
 
+  // 训练集存在的类被显式赋 0：纯该类 batch 会让 Σw=0，必须在入口拒绝，不能训练中途炸。
+  bool zero_rejected = false;
+  try {
+    (void)resolve_class_weights("0,1,0,1", ds);
+  } catch (const std::invalid_argument&) {
+    zero_rejected = true;
+  }
+  check(zero_rejected, "训练集存在的类显式赋 0 权重必须被拒绝");
+  const std::vector<float> absent_zero = resolve_class_weights("1,1,0,0", ds);
+  check(absent_zero[0] == 1.0f && absent_zero[1] == 1.0f && absent_zero[2] == 0.0f &&
+            absent_zero[3] == 0.0f,
+        "训练集不存在的类允许 0 权重");
+
   const std::string cfg_json = read_file(wcfg.out_dir + "/config.json");
   check(cfg_json.find("\"class_weights_source\":\"auto\"") != std::string::npos,
         "config.json 记录 class_weights_source=auto");

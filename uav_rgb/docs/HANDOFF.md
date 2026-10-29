@@ -235,6 +235,8 @@ python3 ui/monitor.py --run-dir /tmp/run1
 
 ## 六、没做的（按优先级）
 
+> 状态与排期以 `docs/TASKS.md` 为唯一来源；本节只保留优先级理由。
+
 ### P0
 1. **修好类别分布**（进行中）—— 不解决就没法训练
 2. **第一次用真实数据训练** —— 训练器至今只在合成数据上验证过
@@ -353,3 +355,67 @@ python3 ui/monitor.py --run-dir /tmp/run1
 - 提交前逐文件确认归属，不要 `git add -A`；CMakeLists 与新测试文件必须同一次提交，
   否则干净 clone 在 configure 阶段就失败。
 - 推送用 `../ALVLN` 完整克隆，**不要用 partial clone**（会卡死在 `git-upload-pack`）。
+
+---
+
+## 十一、更新 2026-10-29 22:10：环境核验、审核、best-checkpoint、数据门禁
+
+### 环境与全量验证（GPU 模式，实测）
+
+- `nvidia-smi -L` → RTX 2080 Ti；`tools/doctor.py --require-gpu --require-sim` 全 PASS。
+- `tools/check.sh`：**EXIT=0**；CTest **18/18**（95.56 s）；`cuobjdump` 仅 `sm_75`。
+- Python：teacher 全过、scene_gen 100 seeds OK、gz_io OK、`test_collect` 14、
+  `test_save_frame` PASS、`test_split_manifest` 9、`test_monitor` 102、
+  `test_trainer_demo` 89。
+- 真实 Gazebo 冒烟（1 实例 × 3 步）：起飞 z=2.12 m，3/3 步写入，EXIT=0，无残留进程。
+  该次是 v1 split；v2 之前的数据不要混用。
+
+### 监控系统（本地软件）
+
+- 确认 `ui/` 无 HTTP/socket/端口代码；旧 8799 进程已不存在；桌面快捷方式可启动。
+- 本轮已接真实训练：`ui/trainer_native.py` 把 `uavrgb.train.v1` 转成 `uavrgb_train` CLI；
+  控制台文件移到 `<run_dir>.monitor/`，run 目录只归 trainer。界面实测 3 epoch rc=0、
+  停止 rc=-2、命令行 resume 正常。
+- `tail_text` 改为半行缓存（不再显示半行/半个汉字）；SIGINT/SIGTERM 走与关窗同一清理路径；
+  浏览非空历史 run 后训练输出目录自动换新。
+- 详见 `docs/worklog/2026-10-29-2205-real-trainer-integration.md` 与
+  `docs/监控系统交接.md` §12。
+
+### best-checkpoint（已修）
+
+- 每 epoch 按 dev 宏 F1 保存 `ckpt_best.bin`；checkpoint v3 记录峰值，v2 仍可读。
+- 实测同一合成训练：峰值 macro_f1=0.1364，末轮 0.0294。
+- 详见 `docs/worklog/2026-10-29-2155-best-checkpoint.md`。
+
+### 数据完整性（已修 P1）
+
+- `-0.0` 几何 gid 泄漏（seed 337/3651 同布局跨 test/train）；`SPLIT_SALT` 升 v2。
+- `collect.py` 校验 `--split` 与几何组一致并写 `geometry_gid`；`preprocess.py` 拒绝同 gid 跨 split。
+- 动作后位姿停更不再写成功行（`physics_verified` 不再假 true）。
+- 教师全方向堵且 base 不可走 → `SAFE_NEUTRAL`。
+- 详见 `docs/worklog/2026-10-29-2200-data-integrity-fixes.md`。
+
+### C++/CUDA 静默失败（已修 P1）
+
+- 显式 0 类别权重被入口拒绝（纯零权重 batch 不再中途除零）。
+- `results.csv`/`metrics.jsonl` 写失败会中止，不再 exit 0 留下空文件。
+- dev 指标非有限值（如 lr 过大）写 Fatal 并中止；CLI 限制 `0<lr<=1`。
+- checkpoint 读/写校验 p/m/v 有限性；ReLU 传播 NaN，不再把坏参数压成 0。
+- 非有限梯度 norm 在 CPU/CUDA 都抛错（原先一边 1.0、一边 NaN）。
+- 详见 `docs/worklog/2026-10-29-2215-src-silent-failure-fixes.md`。
+- 仍留 P2：device 层未保存 `best_macro_f1`、resume 不存 RNG、checkpoint 无 fsync、
+  64 位乘法溢出、RunOwner unlink 竞态、CUDA 多 block 测试缺失。
+
+### 下一任最该先做的（更新）
+
+1. **仿真时间动作窗口**（§19.3）：`--hold` 仍是墙钟秒，采集不可复现；这是正式数据的第一阻塞。
+2. **车道几何决策**：缝 0.902 m vs 机体 0.711 m；调净空参数已被证伪，需要改几何并重采。
+3. **SAFE_NEUTRAL 数据/四类定义**：当前数据里几乎没有 SAFE，四类宏 F1 结构性失真。
+4. **学生闭环 SimulatorEval**：SR/碰撞率/推理 p50·p95；离线准确率不算验收。
+5. **传感器停更门禁**：depth/contact 静默仍可能被当成正常（审核记录的 P2）。
+
+### Git 状态
+
+- 远端 ALVLN 最新 `f5aeeaf`；本地 `uav_rgb` HEAD `70bf088` 的 192 个文件树与远端一致。
+- 本轮所有改动**未提交、未推送**（按规范需要明确指令）。工作区包含上一会话的监控修复、
+  本轮 best-checkpoint/数据修复/监控接入。提交前逐文件确认归属，不要 `git add -A`。

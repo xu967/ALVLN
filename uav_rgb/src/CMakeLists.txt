@@ -32,6 +32,7 @@ add_library(uavrgb_core
   metrics_json.cpp
   trainer.cpp
   trainer_eval.cpp
+  infer.cpp
 )
 target_include_directories(uavrgb_core PUBLIC include)
 
@@ -77,6 +78,14 @@ add_test(NAME test_nn_cuda COMMAND test_nn_cuda)
 # 训练器 CLI 与端到端自检（合成数据，不依赖真实采集）。
 add_executable(uavrgb_train train_main.cpp)
 target_link_libraries(uavrgb_train PRIVATE uavrgb_core)
+
+# 常驻推理进程：闭环评测按帧喂 RGB，避免每步重启进程。
+add_executable(uavrgb_infer infer_main.cpp)
+target_link_libraries(uavrgb_infer PRIVATE uavrgb_core)
+
+add_executable(test_infer_io tests/test_infer_io.cpp)
+target_link_libraries(test_infer_io PRIVATE uavrgb_core)
+add_test(NAME test_infer_io COMMAND test_infer_io)
 
 add_executable(test_trainer tests/test_trainer.cpp)
 target_link_libraries(test_trainer PRIVATE uavrgb_core)

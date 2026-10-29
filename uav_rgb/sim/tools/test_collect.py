@@ -122,7 +122,11 @@ def pose_msg(sec, z=2.1):
 
 
 def stale_pose_fails():
-    """动作窗口后仍没有新位姿：不能把动作前位姿当 oracle 继续写成功行。"""
+    """窗口内位姿不前进：动作窗口走不满，该步必须失败。
+
+    动作窗口改成仿真时间后，位姿停更在窗口内就被抓住（旧实现是墙钟跑满、
+    事后才发现没有新位姿），两种都是「不能把动作前位姿当 oracle 写成功行」。
+    """
     w, h = 4, 6
     rgb = image_msg(w, h, 10)
     dep = depth_msg(w, h, 4 * w, "R_FLOAT32",
@@ -169,7 +173,7 @@ def main():
                                     b"\x00" * 8)) is None)
 
     row, err = stale_pose_fails()
-    check("pose 停更 -> 该步失败", row is None and "pose 停更" in (err or ""))
+    check("pose 停更 -> 该步失败", row is None and "动作窗口超时" in (err or ""))
 
     print(f"test_collect: {passed} 项通过")
     return 0

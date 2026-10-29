@@ -61,6 +61,9 @@ class FakeCanvas:
     def create_oval(self, *args, **kwargs):
         self.items.append(("oval", args, kwargs))
 
+    def create_rectangle(self, *args, **kwargs):
+        self.items.append(("rectangle", args, kwargs))
+
 
 # 1. demo 数据
 rows = monitor.load_metrics(DEMO)
@@ -345,6 +348,54 @@ with tempfile.TemporaryDirectory() as d:
                          stderr=subprocess.DEVNULL)
     check("native 缺 data 报错", rc == 2)
 
+# 10. 评测结果（uavrgb.eval.v1）
+EVAL = {"schema": "uavrgb.eval.v1", "ckpt": "/x/runs/r1/ckpt.bin", "split": "test",
+        "episodes_requested": 3, "episodes_done": 2, "steps": 60, "hold_s": 0.5,
+        "wall_s": 12.0, "success_rate": 0.5, "collision_rate": 0.5,
+        "false_forward_rate": 0.0,
+        "inference_ms": {"p50": 3.2, "p95": 5.1, "n_warm": 58,
+                         "cold_first_ms": [300.0, 322.9]},
+        "action_distribution": {"SAFE_NEUTRAL": 20, "FORWARD_SLOW": 30,
+                                "YAW_LEFT": 5, "YAW_RIGHT": 0},
+        "failed": [{"seed": 7, "rc": 1, "stderr_tail": "boom"}],
+        "per_episode": [{"seed": 1, "max_x": 12.0, "goal_x": 20.0,
+                         "collision": False, "success": True},
+                        {"seed": 2, "max_x": 5.0, "goal_x": 20.0,
+                         "collision": True, "success": False}]}
+with tempfile.TemporaryDirectory() as d:
+    check("缺失 eval.json 返回 None", monitor.load_eval(d) is None)
+    with open(os.path.join(d, "eval.json"), "w", encoding="utf-8") as f:
+        json.dump(EVAL, f)
+    parsed = monitor.load_eval(d)
+    lines = monitor.fmt_eval(parsed)
+    check("eval.json 可解析", parsed is not None and parsed["split"] == "test")
+    check("评测摘要含 ckpt/split/SR",
+          any("ckpt: ckpt.bin" in ln for ln in lines)
+          and any("SR: 50.0%" in ln and "碰撞: 50.0%" in ln for ln in lines))
+    check("评测摘要含失败集与 warm 延迟",
+          any("失败 1" in ln for ln in lines)
+          and any("3.20 ms / 5.10 ms" in ln and "warm" in ln for ln in lines))
+    check("评测摘要含冷启动首帧",
+          any("冷启动首帧: 300.0–322.9 ms（2 集）" in ln for ln in lines))
+    check("动作次数为 0 照常显示",
+          any("YAW_RIGHT 0" in ln for ln in lines))
+    with open(os.path.join(d, "eval.json"), "w", encoding="utf-8") as f:
+        json.dump({"schema": "x"}, f)
+    check("别的 schema 拒绝", monitor.load_eval(d) is None)
+nulls = dict(EVAL, success_rate=None, collision_rate=None, false_forward_rate=None)
+check("rate 全 null 显示无有效集", any("无有效集" in ln for ln in monitor.fmt_eval(nulls)))
+canvas = FakeCanvas()
+monitor._eval_chart(canvas, EVAL["per_episode"])
+rects = [i for i in canvas.items if i[0] == "rectangle"]
+check("每集柱状图 2 根且颜色不同", len(rects) == 2
+      and rects[0][2]["fill"] != rects[1][2]["fill"])
+check("柱状图画 goal 参照线",
+      any(i[0] == "line" and i[2].get("dash") for i in canvas.items))
+canvas = FakeCanvas()
+monitor._eval_chart(canvas, [])
+check("空 per_episode 提示", any(i[0] == "text" and "无 per_episode" in i[2].get("text", "")
+                                for i in canvas.items))
+
 check("fmt_exit", monitor.fmt_exit(0, False) == "训练完成 rc=0"
       and monitor.fmt_exit(3, False) == "异常退出 rc=3"
       and monitor.fmt_exit(0, True) == "已停止 rc=0")
@@ -482,6 +533,21 @@ if gui_ok:
                 app._set_run_dir(legacy)
                 check("GUI 旧布局 train.log 仍可见",
                       "legacy log" in app.train_log.get("1.0", "end"))
+
+            with tempfile.TemporaryDirectory() as evd:
+                with open(os.path.join(evd, "eval.json"), "w", encoding="utf-8") as f:
+                    json.dump(EVAL, f)
+                app._set_run_dir(evd)
+                root.update()
+                txt = app.eval_text.get("1.0", "end")
+                check("GUI 评测页显示 SR 与 ckpt",
+                      "SR: 50.0%" in txt and "ckpt: ckpt.bin" in txt)
+                check("GUI 状态栏显示评测", "评测 test" in app.status.cget("text"))
+            with tempfile.TemporaryDirectory() as evd:
+                app._set_run_dir(evd)
+                root.update()
+                check("GUI 无 eval.json 提示",
+                      "没有 eval.json" in app.eval_text.get("1.0", "end"))
 
             os.environ["FAKE_MODE"] = "sleep"
             app.train_dir_var.set(os.path.join(td, "run2"))

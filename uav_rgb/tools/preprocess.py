@@ -214,12 +214,23 @@ def build_meta(episodes, total, size, dropped=0):
     return meta
 
 
-def load_frame(path, src_w, src_h, size):
-    """PNG -> 目标 size RGB uint8，HWC -> CHW（NCHW 数据集布局）。"""
+def load_frame(path, src_w, src_h, size, crop=None, src_expected=None):
+    """PNG -> 目标 size RGB uint8，HWC -> CHW（NCHW 数据集布局）。
+
+    crop=(left, top, right, bottom) 裁剪；src_w/src_h 指裁剪后的尺寸。
+    src_expected=(w,h) 是**裁剪前**的源图尺寸，给了就强制校验。
+    没有它时裁剪会让尺寸校验变成恒真式（裁完永远是 crop 盒子的尺寸），
+    错尺寸的源图会被静默打包成黑边样本，所以用 crop 的调用方必须给。
+    """
     out_w, out_h = size
     try:
         with Image.open(path) as im:
             im = im.convert("RGB")
+            if src_expected is not None and im.size != src_expected:
+                die("%s: 源图尺寸 %dx%d 与预期 %dx%d 不一致"
+                    % (path, im.size[0], im.size[1], src_expected[0], src_expected[1]))
+            if crop is not None:
+                im = im.crop(crop)
             if im.size != (src_w, src_h):
                 die("%s: 帧尺寸 %dx%d 与 manifest 相机 %dx%d 不一致"
                     % (path, im.size[0], im.size[1], src_w, src_h))
@@ -232,7 +243,8 @@ def load_frame(path, src_w, src_h, size):
     return np.ascontiguousarray(arr.transpose(2, 0, 1))
 
 
-def write_dataset(out_dir, episodes, total, size, dropped=0):
+def write_dataset(out_dir, episodes, total, size, dropped=0, crop=None,
+                  src_expected=None):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "dataset.uavr")
     out_w, out_h = size
@@ -257,7 +269,9 @@ def write_dataset(out_dir, episodes, total, size, dropped=0):
                                 images_off, labels_off, meta_off, len(meta_bytes)))
             for ep in episodes:
                 for s in ep["samples"]:
-                    frame = load_frame(s["png"], ep["src_w"], ep["src_h"], size)
+                    frame = load_frame(s["png"], ep["src_w"], ep["src_h"], size,
+                                       ep.get("crop", crop),
+                                       ep.get("src_expected", src_expected))
                     f.write(frame.tobytes(order="C"))
             labels = bytearray()
             for ep in episodes:

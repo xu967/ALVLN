@@ -67,15 +67,20 @@ void pool_forward_f64(const std::vector<double>& x, int n, int c, int h, int wd,
 
 Tensor relu_forward(const Tensor& x) {
   Tensor y = Tensor::zeros(x.dims());
-  for (std::size_t i = 0; i < x.numel(); ++i) y[i] = x[i] > 0.0f ? x[i] : 0.0f;
+  // NaN 必须继续传播：压成 0 会把坏权重/溢出藏起来，训练照常 exit 0。
+  for (std::size_t i = 0; i < x.numel(); ++i) {
+    y[i] = (x[i] > 0.0f || std::isnan(x[i])) ? x[i] : 0.0f;
+  }
   return y;
 }
 
 Tensor relu_backward(const Tensor& x, const Tensor& dy) {
   if (x.dims() != dy.dims()) throw std::invalid_argument("relu_backward: x/dy 形状不一致");
   Tensor dx = Tensor::zeros(x.dims());
-  // 次梯度约定：x == 0 时导数取 0（与 CUDA kernel 注释及实现一致）。
-  for (std::size_t i = 0; i < x.numel(); ++i) dx[i] = x[i] > 0.0f ? dy[i] : 0.0f;
+  // 次梯度约定：x == 0 时导数取 0（与 CUDA kernel 注释及实现一致）；NaN 继续传播。
+  for (std::size_t i = 0; i < x.numel(); ++i) {
+    dx[i] = (x[i] > 0.0f || std::isnan(x[i])) ? dy[i] : 0.0f;
+  }
   return dx;
 }
 
@@ -176,6 +181,9 @@ float global_grad_norm(const std::vector<const Tensor*>& grads) {
       const double v = (*t)[i];
       sum += v * v;
     }
+  }
+  if (!std::isfinite(sum)) {
+    throw std::runtime_error("global_grad_norm: 梯度含非有限值");
   }
   return static_cast<float>(std::sqrt(sum));
 }

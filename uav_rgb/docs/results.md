@@ -349,8 +349,45 @@ e71bf144dce144d9  train↔test   seeds=[1192, 1129]
 | `<run>.monitor/` | `train.log` / `train_command.txt` / `train_config.json` |
 | 跑 4 s 后点停止 | `已停止 rc=-2`；已完成产物保留，无半截文件 |
 | 命令行 resume 1 epoch | `rc=0`；`results.csv` 4 行（epoch 1–4）、事件 36 条，监控台正常解析 |
-| `env -u DISPLAY python3 ui/test_monitor.py` | 61 项通过，1 项跳过，EXIT=0 |
-| `DISPLAY=:20 python3 ui/test_monitor.py` | **100 项通过**，EXIT=0 |
+| `env -u DISPLAY python3 ui/test_monitor.py` | 63 项通过，1 项跳过，EXIT=0 |
+| `DISPLAY=:20 python3 ui/test_monitor.py` | **102 项通过**，EXIT=0 |
 | `python3 ui/test_trainer_demo.py` | 89 项通过，EXIT=0 |
 
 说明：这次接的是真实 `uavrgb_train`（`ui/trainer_native.py` 把 `uavrgb.train.v1` 转成 CLI 后 execv），不再依赖 DEMO。
+
+## 2026-10-29 22:03 监控台真实训练封装 + 新训练器（best-checkpoint）联调
+
+- 环境：GPU 模式（RTX 2080 Ti）；合成数据集（3 episode，train/val）。
+- 链路：`ui/trainer_native.py`（`uavrgb.train.v1` → CLI）→ `build/check/uavrgb_train`（含 RunOwner + best-checkpoint）。
+
+| 项 | 真实输出 |
+| --- | --- |
+| 命令 | `UAVRGB_TRAIN_BIN=build/check/uavrgb_train python3 ui/trainer_native.py --config cfg.json` |
+| 退出码 | `rc=0` |
+| 训练 | `完成：10 样本，0.5 s`，`dev acc=0.2000 macro_f1=0.0833` |
+| 产物 | `ckpt.bin ckpt_best.bin config.json metrics.jsonl results.csv` |
+| results.csv | 表头 + 1 行（epoch 1） |
+| best 事件 | `{"event":"status","message":"best checkpoint: epoch 1 macro_f1=0.0833333333"}` |
+
+- 说明：合成数据只有 1 个 epoch，best 必然等于末轮；该测试验证的是封装/目录/best 落盘链路，
+  不是模型效果。
+
+## 2026-10-29 22:15 C++/CUDA 静默失败修复回归
+
+- 环境：GPU 模式（RTX 2080 Ti）；`build/check` 全新编译，0 warning。
+
+| 场景 | 修复前 | 修复后（真实输出） |
+| --- | --- | --- |
+| `--class-weights 0,1,0,1 --batch 1` | 训练中途 `Σw=0` 中止 | `训练失败: --class-weights 给训练集存在的类 0 设了 0 权重…`，rc=1 |
+| `results.csv` → `/dev/full`，`--resume` | exit 0，0 字节 | `训练失败: trainer: 写 results.csv 失败（磁盘满/IO 错误）`，rc=1 |
+| `--lr 1e38` | exit 0，CSV 出现 `null`，坏模型成 best | `--lr 必须是 0<lr<=1 的有限数（当前 1e+38）`，rc=2 |
+| 含 NaN 参数的 checkpoint | 静默加载 | `checkpoint: param[0]: 含非有限值` |
+| `relu_forward/backward(NaN)` | 返回 0 | CPU/CUDA 都返回 NaN（新增 2 项断言） |
+| `global_grad_norm` 含 NaN | CPU 1.0 / CUDA NaN | 两边都抛 `runtime_error` |
+
+聚焦测试：`ctest -R 'test_nn_cuda|test_class_weights_train|test_trainer|test_overfit'`
+→ 全过（90.86 s）。全量结果见下一条。
+
+最终全量（2026-10-29 22:12，`bash tools/check.sh`）：**EXIT=0**，CTest **18/18** 95.56 s，
+`test_monitor` 102、`test_trainer_demo` 89、`test_collect` 14、`test_split_manifest` 9、
+teacher/scene_gen/gz_io 全过；`uavrgb_train` 仅 `sm_75`；编译无 warning。

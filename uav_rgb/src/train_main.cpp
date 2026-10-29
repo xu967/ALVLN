@@ -75,9 +75,11 @@ int main(int argc, char** argv) {
     return 2;
   }
   // lr<=0 时 Adam 会原地不动（0）或做梯度上升（负），跑完全部 epoch 还报成功。
-  // std::stof 也接受 "nan"，它会让参数在第 1 步后变成 NaN。
-  if (!(std::isfinite(cfg.lr) && cfg.lr > 0.0f)) {
-    std::fprintf(stderr, "--lr 必须是有限正数（当前 %g）\n", static_cast<double>(cfg.lr));
+  // std::stof 也接受 "nan"，它会让参数在第 1 步后变成 NaN。上限 1.0：更大的 lr
+  // 在 float 下会把参数推到溢出，但训练可能仍 exit 0（dev 指标检查会兜底）。
+  if (!(std::isfinite(cfg.lr) && cfg.lr > 0.0f && cfg.lr <= 1.0f)) {
+    std::fprintf(stderr, "--lr 必须是 0<lr<=1 的有限数（当前 %g）\n",
+                 static_cast<double>(cfg.lr));
     return 2;
   }
 

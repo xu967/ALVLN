@@ -73,14 +73,21 @@
 
 ## 八、当前已知的、还没修的（不要重复发现，直接接着做）
 
+> 状态与排期以 `docs/TASKS.md` 为唯一来源；本表只保留「为什么还没修」。
+
 | 项 | 位置 | 为什么还没修 |
 | --- | --- | --- |
-| 采集不可复现（`--hold` 是墙钟秒） | `sim/tools/collect.py`、`collect_parallel.py` | 要实现 §19.3 仿真时间动作窗口 |
 | 深度/contact 话题停更无检测 | `sim/tools/collect.py` | 会给采集加新失败路径，需要多轮真机验证 |
 | 车道缝 0.902 m vs 机体外接直径 0.711 m | `sim/tools/scene_gen.py` | 场景设计决策；实测收紧净空会把穿越率从 5/8 打到 2/8 |
 | resume 不校验数据签名 | `src/class_weights.cpp` | 需要给 checkpoint 加字段并升版本 |
 | 采集器同 `--out` 并发有 TOCTOU | `sim/tools/collect_parallel.py` | 要加锁文件，属独立改造 |
 | 设备层 / `BatchReader` / `RunOwner` 未接入训练路径 | `src/device/`、`src/batch_reader.cpp` | 并行训练的后续阶段 |
+| device 层不保存 `best_macro_f1`、resume 不存 RNG 状态 | `src/device/state.cpp`、`src/trainer.cpp` | device 未接入主路径；RNG 要升 checkpoint 版本 |
+| checkpoint 无 fsync；`UavrDataset` 缺 64 位乘法溢出检查 | `src/checkpoint.cpp`、`src/dataset.cpp` | 掉电/恶意文件属低概率防御项 |
+| `RunOwner` 的 `.run.lock` 被删除重建后互斥失效 | `src/run_owner.cpp` | 需要改成对目录 fd 加锁，独立改造 |
+| CUDA 单测只有单 block；softmax N>256 / maxpool 重叠窗口未覆盖 | `src/tests/test_*_cuda.cpp` | 补多 block parity 用例 |
+| `collect_parallel` 对 SIGTERM 无清理；actions.jsonl 含位姿派生量 | `sim/tools/collect_parallel.py`、`collect.py` | 进程级测试/契约变更，独立处理 |
 
-详细证据见 `docs/experiments/2026-10-29-teacher-traverse-ablations.md` 与
-`docs/worklog/2026-10-29-2103-audit-fixes.md`。
+详细证据见 `docs/experiments/2026-10-29-teacher-traverse-ablations.md`、
+`docs/worklog/2026-10-29-2103-audit-fixes.md`、`2026-10-29-2200-data-integrity-fixes.md`
+与 `2026-10-29-2215-src-silent-failure-fixes.md`。
