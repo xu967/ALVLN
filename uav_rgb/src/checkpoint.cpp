@@ -13,7 +13,8 @@ namespace uavrgb {
 namespace {
 
 constexpr char kMagic[8] = {'U', 'A', 'V', 'R', 'C', 'K', '0', '1'};
-constexpr std::uint32_t kVersion = 2;
+constexpr std::uint32_t kVersion = 3;
+constexpr std::uint32_t kMinVersion = 2;  // v2 没有 best_macro_f1，读回 -1
 
 [[noreturn]] void bad(const std::string& msg) {
   throw std::invalid_argument("checkpoint: " + msg);
@@ -90,6 +91,7 @@ void save_checkpoint(const std::string& path, const CnnModel& model, const Train
   }
   put<std::uint32_t>(f, static_cast<std::uint32_t>(st.class_weights.size()));
   for (float w : st.class_weights) put<float>(f, w);
+  put<float>(f, st.best_macro_f1);
 
   for (const Tensor* p : ps) put_tensor(f, *p);
   for (const Adam& a : st.adam) {
@@ -119,7 +121,9 @@ void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
   }
   std::uint32_t version = 0, count = 0;
   get<std::uint32_t>(f, version, "version");
-  if (version != kVersion) bad("version 不支持: " + std::to_string(version));
+  if (version < kMinVersion || version > kVersion) {
+    bad("version 不支持: " + std::to_string(version));
+  }
   get<std::uint32_t>(f, count, "param_count");
 
   std::int32_t in_h = 0, in_w = 0, in_c = 0, ncls = 0;
@@ -149,6 +153,13 @@ void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
   for (float& w : st.class_weights) {
     get<float>(f, w, "class_weight");
     if (!(w >= 0.0f) || !std::isfinite(w)) bad("class_weights 含非有限/负值");
+  }
+  st.best_macro_f1 = -1.0f;
+  if (version >= 3) {
+    get<float>(f, st.best_macro_f1, "best_macro_f1");
+    if (!std::isfinite(st.best_macro_f1) || st.best_macro_f1 < -1.0f) {
+      bad("best_macro_f1 非法");
+    }
   }
 
   std::vector<std::int64_t> dims;

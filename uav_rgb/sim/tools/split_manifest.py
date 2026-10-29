@@ -22,7 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scene_gen as sg  # noqa: E402
 
 SPLITS = ("train", "val", "test")
-SPLIT_SALT = "uavrgb.geom.v1"
+# v2：v1 把 -0.0 格式化成 "-0.000"，同几何不同符号会得到不同 gid（seed 337/3651）。
+SPLIT_SALT = "uavrgb.geom.v2"
 LAYOUT_PATTERN = "lane3_serpentine"   # sample_pillars 的布局模式；改模式要同步改这里
 GEOMETRY_PRECISION = 3                # scene_gen 的 x/y 输出精度（round 到 3 位）
 SCHEMA = "navlab.split_manifest.v1"
@@ -30,7 +31,8 @@ GEN_PATH = os.path.join(sg.SIM_DIR, "tools", "scene_gen.py")
 
 
 def _fmt(v):
-    return ("%." + str(GEOMETRY_PRECISION) + "f") % v
+    # +0.0 把 -0.0 归一成 0.0：否则 "%.3f" % -0.0 是 "-0.000"，同几何会算出不同 gid。
+    return ("%." + str(GEOMETRY_PRECISION) + "f") % (v + 0.0)
 
 
 def canonical_geometry(pillars):

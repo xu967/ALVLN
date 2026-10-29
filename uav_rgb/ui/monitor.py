@@ -343,17 +343,26 @@ def _write_atomic(path, text):
     os.replace(tmp, path)
 
 
-def write_train_config(run_dir, config, argv):
-    """写 train_config.json + train_command.txt；都原子替换，spawn 前完成。"""
-    _write_atomic(os.path.join(run_dir, "train_config.json"),
+def monitor_dir(run_dir):
+    """监控台自己的文件（配置/命令/日志）放 run 目录旁边的 <run_dir>.monitor/。
+
+    真实 trainer 要求输出目录为空（RunOwner 拒绝任何多余条目），所以这些不能写在
+    run 目录里；放同级目录后 run 目录只归 trainer。
+    """
+    return run_dir.rstrip(os.sep) + ".monitor"
+
+
+def write_train_config(art_dir, config, argv):
+    """写 train_config.json + train_command.txt 到监控台目录；都原子替换，spawn 前完成。"""
+    _write_atomic(os.path.join(art_dir, "train_config.json"),
                   json.dumps(config, indent=2, ensure_ascii=False) + "\n")
-    _write_atomic(os.path.join(run_dir, "train_command.txt"),
+    _write_atomic(os.path.join(art_dir, "train_command.txt"),
                   shlex.join(argv) + "\n")
 
 
 def spawn_trainer(argv, log_path, cwd=REPO_ROOT):
     """启动 trainer；stdout/stderr 都进 train.log，独立进程组便于整组停止。"""
-    with open(log_path, "ab", buffering=0) as f:
+    with open(log_path, "wb", buffering=0) as f:
         return subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=f,
                                 stderr=subprocess.STDOUT, cwd=cwd,
                                 start_new_session=True)
@@ -375,6 +384,9 @@ def signal_trainer(proc, sig):
 def tail_text(path, state, max_bytes=TAIL_TEXT_BYTES):
     """增量读文本文件；返回 (text, reset)。日志轮转/截断时 reset=True。
 
+    只返回完整行：末尾没换行的半行留在 state["partial"]，下次追加后拼起来再显示。
+    按 b"\\n" 切不会切坏 UTF-8（换行字节不会出现在多字节序列中间）。
+
     shortcut: 每次只读 max_bytes（64 KiB），日志产出快过它时显示会落后；
     接真实 trainer 后若看到追不上末尾，再改成循环读到 EOF。
     """
@@ -386,7 +398,7 @@ def tail_text(path, state, max_bytes=TAIL_TEXT_BYTES):
     reset = False
     if state.get("inode") != st.st_ino or st.st_size < state.get("offset", 0):
         state.clear()
-        state.update(inode=st.st_ino, offset=0)
+        state.update(inode=st.st_ino, offset=0, partial=b"")
         reset = True
     try:
         with open(path, "rb") as f:
@@ -396,7 +408,17 @@ def tail_text(path, state, max_bytes=TAIL_TEXT_BYTES):
     except OSError:
         state.clear()
         return "", reset
-    return chunk.decode("utf-8", "replace"), reset
+    data = state.get("partial", b"") + chunk
+    cut = data.rfind(b"\n")
+    if cut < 0:
+        if len(data) > max_bytes:
+            # 单行超过一个窗口：再等下去内存无上限，先按当前内容显示（病态输入）。
+            state["partial"] = b""
+            return data.decode("utf-8", "replace"), reset
+        state["partial"] = data
+        return "", reset
+    state["partial"] = data[cut + 1:]
+    return data[:cut + 1].decode("utf-8", "replace"), reset
 
 
 def fmt_exit(rc, user_stop):
@@ -590,7 +612,13 @@ class MonitorApp:
 
     def _default_run_dir(self):
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        return os.path.join(REPO_ROOT, "logs", "runs", stamp + "-demo")
+        path = os.path.join(REPO_ROOT, "logs", "runs", stamp + "-demo")
+        n = 1
+        # 同一整秒内开始又结束的跑会算出同名目录；跳过已存在的，重试时不用手改。
+        while os.path.exists(path):
+            n += 1
+            path = os.path.join(REPO_ROOT, "logs", "runs", f"{stamp}-{n}-demo")
+        return path
 
     def _choose_train_dir(self):
         d = filedialog.askdirectory(
@@ -764,6 +792,8 @@ class MonitorApp:
             self.train_log.delete("1.0", "end")
             self.train_log.config(state="disabled")
         self.refresh(force=True)
+        if hasattr(self, "train_log"):
+            self._refresh_train_log()   # 切目录后立刻显示该 run 的日志，不等下一次 tick
 
     def _apply_train_state(self, state):
         self._train_state = state
@@ -808,17 +838,21 @@ class MonitorApp:
             if not os.path.isdir(run_dir):
                 raise ValueError(f"无法创建运行目录: {run_dir}")
             rollback = True
+            art_dir = monitor_dir(run_dir)
+            os.makedirs(art_dir, exist_ok=True)
             argv = build_train_argv(self.train_cmd_var.get(),
-                                    os.path.join(run_dir, "train_config.json"))
-            write_train_config(run_dir, config, argv)
-            log_path = os.path.join(run_dir, "train.log")
+                                    os.path.join(art_dir, "train_config.json"))
+            write_train_config(art_dir, config, argv)
+            log_path = os.path.join(art_dir, "train.log")
             self._apply_train_state("starting")
             proc = spawn_trainer(argv, log_path)
         except (ValueError, OSError) as exc:
             if rollback:   # 否则改好命令后同一目录也报“不是空目录”
-                for name in ("train_config.json", "train_command.txt", "train.log"):
+                for name in ("train_config.json", "train_config.json.tmp",
+                             "train_command.txt", "train_command.txt.tmp",
+                             "train.log"):   # .tmp 是写盘中途失败时 _write_atomic 留下的
                     try:
-                        os.remove(os.path.join(run_dir, name))
+                        os.remove(os.path.join(art_dir, name))
                     except OSError:
                         pass
             self._apply_train_state("idle")
@@ -895,8 +929,10 @@ class MonitorApp:
         self.train_dir_var.set(self._default_run_dir())
 
     def _refresh_train_log(self):
-        text, reset = tail_text(os.path.join(self.run_dir, "train.log"),
-                                self._train_log_state)
+        path = os.path.join(monitor_dir(self.run_dir), "train.log")
+        if not os.path.exists(path):   # 兼容旧布局：早期版本把日志写在 run 目录里
+            path = os.path.join(self.run_dir, "train.log")
+        text, reset = tail_text(path, self._train_log_state)
         if reset:
             self._train_log_lines = 0
             self.train_log.config(state="normal")

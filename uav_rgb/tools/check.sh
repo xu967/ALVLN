@@ -38,6 +38,23 @@ if [[ "${1:-}" != "--python-only" ]]; then
   g++ -std=c++17 -O2 -Wall -Wextra "$uav_check_root/tools/read_dataset.cpp" \
     -o "$uav_check_fmt/read_dataset"
   "$uav_check_fmt/read_dataset" "$uav_check_fmt/ds/dataset.uavr" --selfcheck >/dev/null
+
+  # 同几何（同 geometry_gid）跨 split 必须在打包关口被拒绝；只查 scene_id 挡不住。
+  "$UAV_RGB_PYTHON" - "$uav_check_fmt/ep" <<'PY'
+import json, sys
+root = sys.argv[1]
+for name in ("ep1", "ep3"):
+    path = f"{root}/{name}/episode_manifest.json"
+    man = json.load(open(path, encoding="utf-8"))
+    man["geometry_gid"] = "check.shared_geometry"
+    json.dump(man, open(path, "w", encoding="utf-8"))
+PY
+  if "$UAV_RGB_PYTHON" "$uav_check_root/tools/preprocess.py" \
+       --out "$uav_check_fmt/ds_leak" "$uav_check_fmt/ep/ep1" "$uav_check_fmt/ep/ep3" \
+       >/dev/null 2>&1; then
+    echo "几何 split 门禁未生效：同 geometry_gid 跨 train/val 被接受" >&2
+    exit 1
+  fi
 else
   echo "SKIP: 用户指定 --python-only，未验证 C++/CUDA 构建和 GPU 测试。"
 fi

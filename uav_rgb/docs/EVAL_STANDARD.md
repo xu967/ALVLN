@@ -97,14 +97,24 @@
 
 - **按 scene_id 隔离**：同一场景的所有帧只能落在一个 split。`dataset.cpp` 的
   `assign_split()` 在加载时就拒绝跨 split 的 scene_id，不是靠约定。
-- 比例固定 `scene_id % 10 < 8 → train`、`== 8 → val`、`== 9 → test`（见 `collect_parallel.py`）。
+- **按几何组分配 split**（2026-10-29 18:20 起）：`sim/tools/split_manifest.py` 把
+  障碍几何规范化后取 sha256 得到 gid，再用固定 salt hash 决定
+  `train / val / test`。同几何不同 seed 永远同 split，跨 split 交集为 0。
+  旧策略 `scene_id % 10` 在 seed 0..1999 上实测有 241 组跨 split 泄漏，已废弃。
 - **val 用来看，test 用来报**。test 只在训练结束时评估一次，不参与任何模型选择。
-  实现：`src/trainer.cpp` 训练循环之后的 `Split::kTest` 事件。
+  实现：`src/trainer.cpp` 训练循环之后的 `Split::kTest` 事件；
+  best-checkpoint 只按 dev 宏 F1 选择，不看 test。
 - 同一 scene_id 生成两次必须字节级一致（`scene_gen.py --self-check` 用 sha256 保证）。
+- 当前场景族只有 1 个（`family_holdout=false`）：几何不重复不等于跨族泛化。
 
 ## 5. 已知的、会污染评测的问题（必须写进任何结论里）
 
-0. **episode 太短，无人机从未进入障碍场。**（2026-10-29 实测，最严重的一条）
+0. **episode 太短，无人机从未进入障碍场。**（2026-10-29 上午实测，最严重的一条）
+
+   > **2026-10-29 19:55 后续**：专家改用 GT carrot planner、默认 `--steps 80` 后，
+   > seed 0..7 有 5/8 在 68–76 步穿过 x=5.0（见
+   > `experiments/2026-10-29-teacher-traverse-ablations.md`）。下面这组旧数据
+   > 仍说明旧数据集的分布，但不再是“当前专家一定进不去”；采集不可复现的问题仍在。
 
    | 事实 | 数字 |
    | --- | --- |

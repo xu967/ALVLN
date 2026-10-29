@@ -3,12 +3,14 @@
 //
 // 文件布局（偏移 B）：
 //   0    char[8]  magic "UAVRCK01"
-//   8    u32      version = 2（v2 起带类别权重；v1 无此段，读端直接拒绝）
+//   8    u32      version = 3（v2 起带类别权重；v3 追加 best_macro_f1。
+//                读端接受 v2/v3；v1 无类别权重段，直接拒绝）
 //   12   u32      param_count（固定 8）
 //   16   i32 in_h, i32 in_w, i32 in_c, i32 num_classes   ← 模型结构元信息
 //   32   u32      adam_t（已完成 step 数；8 个 Adam 共享同一 t）
 //   36   u32      epoch（已完成 epoch 数，续训时 results.csv 接着编号）
 //   40   u32      weight_count（0 或 num_classes），随后 f32 class_weights[weight_count]
+//        (v3) f32 best_macro_f1（dev 宏 F1 峰值；-1 = 尚未评估）
 //        逐参数（顺序同 cnn_params）：u32 ndim、i64 dims[ndim]、f32 data[numel]
 //        再逐参数：f32 m[numel]
 //        再逐参数：f32 v[numel]
@@ -28,6 +30,9 @@ struct TrainState {
   std::vector<Adam> adam;          // 与 cnn_params(model) 一一对应；adam[0].t 即全局 step
   int epoch = 0;                   // 已完成 epoch 数（results.csv 的 epoch 列从这里接着编）
   std::vector<float> class_weights;  // 空 = 无权训练；否则长度 = num_classes
+  // dev 宏 F1 的当前最高值，-1 表示还没有可用 dev 评估。入盘是为了续训时
+  // 不把已有的 ckpt_best.bin 用更差的模型覆盖掉。
+  float best_macro_f1 = -1.0f;
 };
 
 inline int train_step(const TrainState& st) { return st.adam.empty() ? 0 : st.adam[0].t; }

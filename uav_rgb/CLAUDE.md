@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-`uav_rgb` 已实现单目 RGB 四动作 CNN、CPU/CUDA 数值算子、Adam、UAVR 数据读取、checkpoint/resume 和 Gazebo 专家采集。2026-10-29 本轮 13/13 CTest 通过，真实仿真 5 帧已完成预处理、GPU 训练和恢复；单场景冒烟不代表泛化或可飞。GRU/语言导航、学生闭环评测、板端部署尚未实现。当前入口见 `README.md`，完整证据见 `docs/worklog/2026-10-29-1145-project-review.md`。设计规格仍位于 `../TinyAerialVLN_Final_V8/references/reviews/UBUNTU_BASE_GUIDE_V1.md`。文档与代码注释保持中文。
+`uav_rgb` 已实现单目 RGB 四动作 CNN、CPU/CUDA 数值算子、Adam、UAVR 数据读取、checkpoint/resume（含按 dev 宏 F1 保存的 `ckpt_best.bin`）和 Gazebo 专家采集。2026-10-29 本轮 13/13 CTest 通过，真实仿真 5 帧已完成预处理、GPU 训练和恢复；单场景冒烟不代表泛化或可飞。GRU/语言导航、学生闭环评测、板端部署尚未实现。当前入口见 `README.md`，完整证据见 `docs/worklog/2026-10-29-1145-project-review.md`。设计规格仍位于 `../TinyAerialVLN_Final_V8/references/reviews/UBUNTU_BASE_GUIDE_V1.md`。文档与代码注释保持中文。
 
 Design boundaries that must not be violated:
 - The vision model outputs only four discrete high-level actions: `SAFE_NEUTRAL`, `FORWARD_SLOW`, `YAW_LEFT`, `YAW_RIGHT`. It must never output PWM, motor speeds, or unprotected attitude commands; the ESP32 flight controller keeps final veto.

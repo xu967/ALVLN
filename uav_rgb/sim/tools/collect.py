@@ -55,6 +55,7 @@ from teacher import (expert_action, plan_action, SAFE_NEUTRAL, FORWARD_SLOW,
                      YAW_LEFT, YAW_RIGHT, ACTIONS)
 import gz_io
 import save_frame
+import split_manifest as sm
 
 TWIST_TOPIC = "/X3/gazebo/command/twist"
 CAMERA_TOPIC = "/uav/camera"
@@ -611,6 +612,9 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             newer = subs["pose"].latest_after(action_start_ns, timeout=1.0)
             if newer is not None:
                 pose_after, pose_ts, yaw_after = _pose_parts(newer)
+        if pose_ts <= action_start_ns:
+            # 仍拿不到动作后的帧：这一步的 oracle 和 stuck 都不可信，不能盖 physics_verified。
+            return None, "pose 停更：动作窗口后没有晚于 action_start 的位姿"
         if not contact:
             contact = _contact_since(subs["contact"], contact_seq0)
         t_end = time.perf_counter()
@@ -625,7 +629,8 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             if yaw_after is not None and yaw_before is not None else None)
     # 低 RTF 时动作窗口的 sim 时间会变短，卡滞阈值跟着缩放，避免误报。
     stuck_eps = min(STUCK_EPS, 0.5 * SPEED_FWD * sim_dt)
-    stuck = bool(action == FORWARD_SLOW and dist is not None and dist < stuck_eps)
+    stuck = bool(action == FORWARD_SLOW and sim_dt > 0 and dist is not None
+                 and dist < stuck_eps)
 
     return {
         "step": step_idx,
@@ -698,6 +703,7 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     pillars = None
     scene_meta_sha = None
+    scene_gid = None
     if args.scene_meta:
         with open(args.scene_meta, "rb") as f:
             raw_meta = f.read()
@@ -706,6 +712,11 @@ def main():
         for k, pl in enumerate(pillars):
             if "x" not in pl or "y" not in pl:
                 p.error(f"--scene-meta {args.scene_meta}: pillars[{k}] 缺 x/y")
+        # split 由几何组唯一决定；手传的 --split 与它不符会把同几何放进两个 split。
+        scene_gid = sm.geometry_gid(pillars)
+        want_split = sm.split_for_gid(scene_gid)
+        if args.split != want_split:
+            p.error(f"--split {args.split} 与几何组 {scene_gid} 的固定 split={want_split} 不一致")
     # 标签来自哪个教师必须进 manifest：两种策略产出的数据长得一模一样，
     # 事后只能靠这个字段区分（旧版没有任何记录）。
     if args.policy == "forward":
@@ -859,6 +870,8 @@ def main():
             "seed": args.seed,
             "version": args.version,
             "split": args.split,
+            # 几何组 ID：preprocess 用它拦住「同几何跨 split」，手写 split 也绕不过。
+            "geometry_gid": scene_gid,
             # 标签由哪个教师产生：forward=盲策略对照，expert_action=深度反应式，
             # plan_action=柱子真值 carrot planner。缺这个字段就无法事后区分数据集。
             "teacher": teacher_kind,

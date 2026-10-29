@@ -1,8 +1,8 @@
 // NativeTrainer 实现：分 batch → forward → softmax-CE → backward → 裁剪 → Adam → 指标。
 #include "uavrgb/trainer.hpp"
 
+#include "trainer_internal.hpp"
 #include "uavrgb/class_weights.hpp"
-#include "uavrgb/eval_metrics.hpp"
 #include "uavrgb/linear_cuda.hpp"
 #include "uavrgb/nn.hpp"
 #include "uavrgb/softmax_cuda.hpp"
@@ -52,20 +52,6 @@ std::uint64_t count_correct(const Tensor& logits, const std::vector<int>& labels
   return ok;
 }
 
-std::vector<int> take_labels(const UavrDataset& ds, const std::vector<std::uint32_t>& idx,
-                             std::size_t start, std::size_t end) {
-  std::vector<int> y;
-  y.reserve(end - start);
-  for (std::size_t i = start; i < end; ++i) y.push_back(ds.labels[idx[i]]);
-  return y;
-}
-
-std::vector<std::uint32_t> slice(const std::vector<std::uint32_t>& v, std::size_t s,
-                                 std::size_t e) {
-  return std::vector<std::uint32_t>(v.begin() + static_cast<std::ptrdiff_t>(s),
-                                    v.begin() + static_cast<std::ptrdiff_t>(e));
-}
-
 }  // namespace
 
 void Trainer::write_csv_header_if_needed() const {
@@ -76,46 +62,6 @@ void Trainer::write_csv_header_if_needed() const {
   std::ofstream f(p, std::ios::app);
   if (!f) throw std::runtime_error("trainer: 无法写 " + p);
   f << kResultsCsvHeader << '\n';
-}
-
-void Trainer::evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& idx,
-                       EvalStats* out) {
-  *out = EvalStats{};
-  if (idx.empty()) return;
-  const int c = static_cast<int>(ds.num_classes);
-  Confusion conf;
-  conf.reset(c);
-  const std::size_t b = static_cast<std::size_t>(cfg_.batch);
-  Tensor x;
-  double sum = 0.0;
-  std::uint64_t seen = 0;
-  for (std::size_t s = 0; s < idx.size(); s += b) {
-    const std::size_t e = std::min(idx.size(), s + b);
-    const std::vector<std::uint32_t> part = slice(idx, s, e);
-    const std::vector<int> y = take_labels(ds, idx, s, e);
-    ds.load_images(part, x);
-    const Tensor logits = forward(model_, x);
-    // dev_ce 合同为无权 Teacher CE，不能随训练权重或 batch 划分改变。
-    sum += static_cast<double>(softmax_ce_loss_cuda(logits, y)) *
-           static_cast<double>(part.size());
-    for (std::size_t i = 0; i < y.size(); ++i) {
-      const float* row = logits.data() + i * static_cast<std::size_t>(c);
-      int best = 0;
-      for (int j = 1; j < c; ++j) {
-        if (row[j] > row[best]) best = j;
-      }
-      conf.add(y[i], best);
-    }
-    seen += part.size();
-  }
-  std::uint64_t ok = 0;
-  for (int k = 0; k < c; ++k) ok += conf.at(k, k);
-  out->ce = sum / static_cast<double>(seen);
-  out->acc = static_cast<double>(ok) / static_cast<double>(seen);
-  out->macro_f1 = macro_f1(conf);
-  out->balanced_acc = balanced_accuracy(conf);
-  out->recall = per_class_recall(conf);
-  out->confusion.assign(conf.cells.begin(), conf.cells.end());
 }
 
 void Trainer::run() {
@@ -146,6 +92,7 @@ void Trainer::run() {
   const std::string metrics_path = cfg_.out_dir + "/metrics.jsonl";
   const std::string csv_path = cfg_.out_dir + "/results.csv";
   const std::string ckpt_path = cfg_.out_dir + "/ckpt.bin";
+  const std::string best_ckpt_path = cfg_.out_dir + "/ckpt_best.bin";
   write_csv_header_if_needed();
   std::ofstream metrics(metrics_path, std::ios::app);
   std::ofstream csv(csv_path, std::ios::app);
@@ -184,8 +131,8 @@ void Trainer::run() {
     std::uint64_t seen = 0;
     for (std::size_t s = 0; s < order.size(); s += bs) {
       const std::size_t e = std::min(order.size(), s + bs);
-      const std::vector<std::uint32_t> part = slice(order, s, e);
-      const std::vector<int> y = take_labels(ds, order, s, e);
+      const std::vector<std::uint32_t> part = detail::slice(order, s, e);
+      const std::vector<int> y = detail::take_labels(ds, order, s, e);
       ds.load_images(part, x);
 
       CnnCache cache;
@@ -250,6 +197,18 @@ void Trainer::run() {
               << '\n';
     }
     metrics.flush();
+    // 交付模型不能是最后一轮：dev 宏 F1 峰值常早于末轮（见 docs/results.md）。
+    // dev 回退到 train 时不选模型，否则等于用训练集挑权重。
+    if (!dev_is_train && dev_stats.macro_f1 > static_cast<double>(state_.best_macro_f1)) {
+      state_.best_macro_f1 = static_cast<float>(dev_stats.macro_f1);
+      save_checkpoint(best_ckpt_path, model_, state_);
+      metrics << metrics_json(make_status("best checkpoint: epoch " +
+                                          std::to_string(state_.epoch) + " macro_f1=" +
+                                          num(dev_stats.macro_f1)))
+              << '\n';
+      metrics.flush();
+    }
+    // 必须在更新 best 之后写：否则续训从 ckpt.bin 读到的 best 比 ckpt_best.bin 落后一轮。
     save_checkpoint(ckpt_path, model_, state_);
     samples_seen_ += seen;
   }

@@ -153,6 +153,9 @@ def plan_action(x, y, yaw_deg, pillars, lookahead=1.6, clearance=0.36,
                 + turn_weight * abs((yaw_deg - th + 180.0) % 360.0 - 180.0))
         if best is None or cost < best:
             aim, best = th, cost
+    # 所有方向都堵时不能默认 base 可走：base 自己可能正对着柱子。
+    if best is None and not ray_clear(x, y, base, lookahead, pillars, clearance):
+        return SAFE_NEUTRAL
     err = (yaw_deg - aim + 180.0) % 360.0 - 180.0
     if abs(err) > tol:
         return YAW_LEFT if err < 0 else YAW_RIGHT
@@ -254,6 +257,18 @@ if __name__ == "__main__":
         got = plan_action(**kw)
         ok = ok and got == want
         print(f"  {'ok' if got == want else 'FAIL'}  {name}: got {ACTIONS[got]}, want {ACTIONS[want]}")
+
+    # 所有射线都堵、且 base 自身也被堵：必须 SAFE_NEUTRAL，不能默认前进撞柱。
+    orig_ray_clear = ray_clear
+    ray_clear = lambda *a, **k: False
+    try:
+        got = plan_action(0.0, 0.0, 0.0, [])
+    finally:
+        ray_clear = orig_ray_clear
+    want = SAFE_NEUTRAL
+    ok = ok and got == want
+    print(f"  {'ok' if got == want else 'FAIL'}  全堵且 base 堵 -> 中立: "
+          f"got {ACTIONS[got]}, want {ACTIONS[want]}")
 
     # 深度失效必须 fail closed（M5）。
     extra = [

@@ -285,3 +285,37 @@ e71bf144dce144d9  train↔test   seeds=[1192, 1129]
 | 选中已跑完的 run 目录 | `train.log` 2122 B，「训练输出」0 字符 | 1887 字符，首行 `[DEMO] 模拟训练（非真实训练）开始，run_dir=...` |
 | 一次训练结束后再点开始 | 输入框仍是刚用过的目录 → 必报「不是空目录」 | 自动换新默认目录（实测 `20261029-124456-demo`） |
 | 死代码 | `prepare_train_log` 只在空目录（`train.log` 必然不存在）上调用，永不触发 | 已删函数、`TRAIN_LOG_CAP` 与对应自检（净减 13 行） |
+
+## 2026-10-29 21:40 监控台二审修复回归
+
+- 环境：`DISPLAY=:20`，Tk 8.6；系统 Python 3.12.3。
+
+| 命令 | 结果 |
+| --- | --- |
+| `DISPLAY=:20 python3 ui/test_monitor.py` | **94 项通过**，EXIT=0 |
+| `env -u DISPLAY python3 ui/test_monitor.py` | 57 项通过，1 项跳过，EXIT=0 |
+| `python3 ui/test_trainer_demo.py` | 89 项通过，EXIT=0 |
+| `python3 -m py_compile ui/monitor.py ui/trainer_demo.py ui/test_monitor.py` | OK |
+
+修复对照（真实窗口内实跑，1 epoch / 1 step 的 DEMO）：
+
+| 场景 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 快跑（同整秒内起停）结束后再点开始 | 默认目录仍是 `20261029-211951-demo` → `启动失败: 运行目录不是空目录` | 默认变成 `20261029-213653-2-demo`（不存在），再点直接 `运行中 pid=...`，`rc=0` |
+| 186 KB 中文 `train.log`（6000 行）分 3 tick 读 | 块边界切在行中间，出现半行与 `�` | 2000 行（视图上限）全部是完整行，`含替换符: False` |
+| 写盘中途失败留下的 `train_config.json.tmp` | 不在回滚名单 → 重试报「不是空目录」 | 回滚后目录为空（自检里用假 `write_train_config` 制造该文件） |
+
+## 2026-10-29 21:55 best-checkpoint 回归
+
+- 环境：GPU 模式（RTX 2080 Ti，sm_75）；CUDA 12.8；合成数据集走 GPU 训练器。
+
+| 命令 | 结果 |
+| --- | --- |
+| `cmake --build build/check --parallel 8` | 成功，无 warning 输出 |
+| `ctest --test-dir build/check --output-on-failure` | **18/18 passed**，99.04 s |
+| `./build/check/test_trainer` | `best dev macro_f1=0.136364 state=0.136364`，`RESULT: PASS` |
+| 同一测试末轮 | dev macro_f1=0.0294（若交付末轮，会比峰值差 4.6 倍） |
+| checkpoint v2 兼容 | 由 v3 原地降级后读回：参数逐位一致、`best_macro_f1=-1` |
+
+- 新增产物：`<run_dir>/ckpt_best.bin`；checkpoint 版本 2 → 3（新增 `best_macro_f1`）。
+- 未验证：真实采集数据、跨版本续训、磁盘满。

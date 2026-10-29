@@ -11,6 +11,7 @@ import os
 import struct
 import subprocess
 import sys
+import tempfile
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS)
@@ -66,6 +67,75 @@ def depth_msg(w, h, step, fmt, raw):
             "data": base64.b64encode(raw).decode()}
 
 
+class FakeSub:
+    def __init__(self, frames=(), latest=None, after=None):
+        self._frames, self._latest, self._after = list(frames), latest, after
+
+    def frames(self):
+        return self._frames
+
+    def latest(self):
+        return self._latest
+
+    def healthy(self):
+        return True
+
+    def latest_after(self, _ts, timeout=0.0):
+        return self._after
+
+    def close(self):
+        pass
+
+
+class FakePub:
+    def __init__(self):
+        self.t = 0.0
+
+    def start(self, *args):
+        self.t += 0.001
+        return self.t
+
+    def wait(self, handle):
+        return handle
+
+    def abort(self, handle):
+        pass
+
+    def close(self):
+        pass
+
+
+def image_msg(w, h, sec):
+    data = bytes((i * 7) % 256 for i in range(w * h * 3))
+    return {"width": w, "height": h, "step": w * 3,
+            "pixelFormatType": "RGB_INT8",
+            "data": base64.b64encode(data).decode(),
+            "header": {"stamp": {"sec": sec, "nsec": 0}}}
+
+
+def pose_msg(sec, z=2.1):
+    whole = int(sec)
+    return {"pose": [{"position": {"x": 0.0, "y": 0.0, "z": z},
+                      "orientation": {"x": 0.0, "y": 0.0, "z": 0.0, "w": 1.0},
+                      "header": {"stamp": {"sec": whole,
+                                           "nsec": int(round((sec - whole) * 1e9))}}}]}
+
+
+def stale_pose_fails():
+    """动作窗口后仍没有新位姿：不能把动作前位姿当 oracle 继续写成功行。"""
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    dep = depth_msg(w, h, 4 * w, "R_FLOAT32",
+                    struct.pack("<%df" % (w * h), *([5.0] * (w * h))))
+    dep["header"] = {"stamp": {"sec": 10, "nsec": 0}}
+    pos = pose_msg(10.5)
+    subs = {"rgb": FakeSub(after=rgb), "depth": FakeSub(frames=[(1, dep)]),
+            "pose": FakeSub(frames=[(1, pos)], latest=pos), "contact": FakeSub()}
+    with tempfile.TemporaryDirectory() as d:
+        row, err = collect.collect_one(d, 0, 0.01, "teacher", subs, FakePub())
+    return row, err
+
+
 def main():
     contact("contact 有元素 -> True", b'{"contact":[{}]}', want=True)
     contact("contact 空列表 -> False", b'{"contact":[]}')
@@ -97,6 +167,9 @@ def main():
     check("深度 payload 截断拒绝",
           read_depth_with(depth_msg(2, 2, 8, "R_FLOAT32",
                                     b"\x00" * 8)) is None)
+
+    row, err = stale_pose_fails()
+    check("pose 停更 -> 该步失败", row is None and "pose 停更" in (err or ""))
 
     print(f"test_collect: {passed} 项通过")
     return 0

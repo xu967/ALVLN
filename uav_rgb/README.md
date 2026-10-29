@@ -58,7 +58,7 @@ UI 的默认启动命令是 DEMO；原生训练器目前用上面的 CLI 启动�
 
 | 模块 | 实现与证据 | 尚缺 |
 | --- | --- | --- |
-| 数值核心与 CNN | CPU/CUDA 算子、gradcheck、Adam、100,388 参数 CNN、18 项 CTest | 设备常驻优化、best-checkpoint、更完整异常边界 |
+| 数值核心与 CNN | CPU/CUDA 算子、gradcheck、Adam、100,388 参数 CNN、18 项 CTest、best-checkpoint（dev 宏 F1） | 设备常驻优化、更完整异常边界 |
 | 数据读写 | 320×240 → 160×120、NCHW、碰撞过滤、读端 scene_id/区间校验 | 几何去重、数据质量门禁 |
 | 仿真采集 | 常驻订阅/发布、随机世界、独立 UUID 分区、真实 5 步 | 传感器停更故障处理、严格 sim-time 步进 |
 | 真实数据训练 | 5 帧 GPU 训练和恢复成功，权重/指标/配置已保存 | 有规模的场景隔离训练与泛化验证 |

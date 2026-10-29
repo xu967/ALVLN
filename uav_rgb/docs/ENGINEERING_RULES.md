@@ -75,7 +75,6 @@
 
 | 项 | 位置 | 为什么还没修 |
 | --- | --- | --- |
-| 没有 best-checkpoint，每 epoch 覆盖 | `src/trainer.cpp:253` | `trainer.cpp` 已 277 行、上限 280，要先拆文件 |
 | 采集不可复现（`--hold` 是墙钟秒） | `sim/tools/collect.py`、`collect_parallel.py` | 要实现 §19.3 仿真时间动作窗口 |
 | 深度/contact 话题停更无检测 | `sim/tools/collect.py` | 会给采集加新失败路径，需要多轮真机验证 |
 | 车道缝 0.902 m vs 机体外接直径 0.711 m | `sim/tools/scene_gen.py` | 场景设计决策；实测收紧净空会把穿越率从 5/8 打到 2/8 |

@@ -28,6 +28,14 @@ class GeometryGroupTests(unittest.TestCase):
         self.assertEqual(sm.canonical_geometry(pillars_of(1007)),
                          sm.canonical_geometry(pillars_of(1007)))
 
+    def test_negative_zero_and_zero_are_the_same_geometry(self):
+        # seed 337 的 pillar y 是 -0.0，3651 是 0.0；物理布局相同，必须同 gid 同 split。
+        self.assertEqual(sm._fmt(-0.0), sm._fmt(0.0))
+        gid337 = sm.geometry_gid(pillars_of(337))
+        gid3651 = sm.geometry_gid(pillars_of(3651))
+        self.assertEqual(gid337, gid3651)
+        self.assertEqual(sm.split_for_gid(gid337), sm.split_for_gid(gid3651))
+
 
 class SplitAssignmentTests(unittest.TestCase):
     def test_split_only_depends_on_gid(self):

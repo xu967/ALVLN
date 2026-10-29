@@ -9,6 +9,7 @@ import io
 import json
 import os
 import shlex
+import subprocess
 import sys
 import tempfile
 import time
@@ -267,6 +268,54 @@ with tempfile.TemporaryDirectory() as d:
     text, reset = monitor.tail_text(logp, state)
     check("tail_text 截断 reset", reset and text == "z\n")
 
+    line = "epoch 0001 loss=0.12345 action_acc=0.678\n"
+    logq = os.path.join(d, "big.log")
+    with open(logq, "w", encoding="utf-8") as f:
+        f.write(line * 3000)                                   # 123 KB，必然分块
+    st2 = {}
+    first, _ = monitor.tail_text(logq, st2)
+    second, _ = monitor.tail_text(logq, st2)
+    check("tail_text 按行边界切", first.endswith("\n") and second.startswith("epoch 0001")
+          and first.count("\n") + second.count("\n") == 3000)
+    zhq = os.path.join(d, "zh.log")
+    with open(zhq, "w", encoding="utf-8") as f:
+        f.write("中文日志行：epoch 完成\n" * 6000)          # 186 KB 短行日志
+    st3 = {}
+    zh1, _ = monitor.tail_text(zhq, st3)
+    zh2, _ = monitor.tail_text(zhq, st3)
+    check("tail_text 中文不被切坏", "�" not in zh1 + zh2 and zh1.endswith("\n"))
+
+# 9. 真实 trainer 封装：uavrgb.train.v1 -> uavrgb_train CLI
+NATIVE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "trainer_native.py")
+with tempfile.TemporaryDirectory() as d:
+    fake_bin = os.path.join(d, "fake_train")
+    dump = os.path.join(d, "argv.txt")
+    with open(fake_bin, "w", encoding="utf-8") as f:
+        f.write(f"#!/bin/sh\nprintf '%s\\n' \"$@\" > {dump}\n")
+    os.chmod(fake_bin, 0o755)
+    cfp = os.path.join(d, "train_config.json")
+    cfg = {"schema": monitor.TRAIN_SCHEMA, "run_dir": os.path.join(d, "run"),
+           "epochs": 3, "steps_per_epoch": 9, "batch_size": 16,
+           "lr": 0.001, "seed": 7, "data": "/tmp/bench_ds.uavr"}
+    with open(cfp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    env = dict(os.environ, UAVRGB_TRAIN_BIN=fake_bin)
+    rc = subprocess.call([sys.executable, NATIVE, "--config", cfp,
+                          "--resume", "/x/ckpt.bin"], env=env)
+    with open(dump, encoding="utf-8") as f:
+        got = f.read().split()
+    check("native 封装转 CLI", rc == 0 and got[:2] == ["--data", "/tmp/bench_ds.uavr"]
+          and got[got.index("--batch") + 1] == "16"
+          and got[got.index("--out") + 1] == os.path.join(d, "run")
+          and "--config" not in got)
+    check("native 封装透传额外参数", got[-2:] == ["--resume", "/x/ckpt.bin"])
+    del cfg["data"]
+    with open(cfp, "w", encoding="utf-8") as f:
+        json.dump(cfg, f)
+    rc = subprocess.call([sys.executable, NATIVE, "--config", cfp], env=env,
+                         stderr=subprocess.DEVNULL)
+    check("native 缺 data 报错", rc == 2)
+
 check("fmt_exit", monitor.fmt_exit(0, False) == "训练完成 rc=0"
       and monitor.fmt_exit(3, False) == "异常退出 rc=3"
       and monitor.fmt_exit(0, True) == "已停止 rc=0")
@@ -391,10 +440,19 @@ if gui_ok:
             check("GUI 训练输出",
                   "fake stdout" in app.train_log.get("1.0", "end"))
             check("GUI 训练指标", len(app.table.get_children()) >= 1)
+            check("GUI 控制台文件在 run 目录外",
+                  not os.path.exists(os.path.join(td, "run1", "train.log"))
+                  and os.path.exists(os.path.join(td, "run1.monitor", "train.log")))
             app._set_run_dir(os.path.join(td, "run1"))   # 重新打开已跑完的目录
             app._refresh_train_log()
             check("GUI 历史 run 日志可见",
                   "fake stdout" in app.train_log.get("1.0", "end"))
+            with tempfile.TemporaryDirectory() as legacy:   # 旧布局：日志写在 run 目录里
+                with open(os.path.join(legacy, "train.log"), "w", encoding="utf-8") as f:
+                    f.write("legacy log\n")
+                app._set_run_dir(legacy)
+                check("GUI 旧布局 train.log 仍可见",
+                      "legacy log" in app.train_log.get("1.0", "end"))
 
             os.environ["FAKE_MODE"] = "sleep"
             app.train_dir_var.set(os.path.join(td, "run2"))
@@ -430,8 +488,9 @@ if gui_ok:
             app._start_training()
             check("GUI 启动失败提示", "启动失败" in app.train_status.cget("text"))
             check("GUI 启动失败不留产物",
-                  not os.path.exists(os.path.join(td, "run4")) or
-                  os.listdir(os.path.join(td, "run4")) == [])
+                  (not os.path.exists(os.path.join(td, "run4")) or
+                   os.listdir(os.path.join(td, "run4")) == [])
+                  and os.listdir(os.path.join(td, "run4.monitor")) == [])
             app.train_cmd_var.set(f"{shlex.quote(sys.executable)} {shlex.quote(fake)}")
             os.environ["FAKE_MODE"] = "ok"
             app._start_training()
@@ -443,6 +502,34 @@ if gui_ok:
                 root.update()
                 time.sleep(0.02)
             check("GUI 重试训练完成", app.proc is None and app._last_rc == 0)
+
+            # 结束后默认目录必须是新的：快跑（同整秒内起停）不能算回刚用过的目录
+            check("GUI 结束后默认目录换新",
+                  app.train_dir_var.get() != os.path.join(td, "run4")
+                  and not os.path.exists(app.train_dir_var.get()))
+            made = app._default_run_dir()
+            os.makedirs(made)
+            try:
+                check("GUI 默认目录跳过已存在", app._default_run_dir() != made)
+            finally:
+                os.rmdir(made)
+
+            # 写盘中途失败留下的 .tmp 也要回滚，否则目录永远“不是空的”
+            def bad_write(rd, _cfg, _argv):
+                with open(os.path.join(rd, "train_config.json.tmp"), "w"):
+                    pass
+                raise OSError("disk full")
+
+            orig_write = monitor.write_train_config
+            monitor.write_train_config = bad_write
+            try:
+                app.train_dir_var.set(os.path.join(td, "run5"))
+                app._start_training()
+            finally:
+                monitor.write_train_config = orig_write
+            check("GUI 写盘失败回滚 .tmp",
+                  os.listdir(os.path.join(td, "run5")) == []
+                  and os.listdir(os.path.join(td, "run5.monitor")) == [])
 
         # 刷新异常也必须重排 after，否则自动刷新永久停掉。
         calls = []

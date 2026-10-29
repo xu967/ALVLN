@@ -31,6 +31,7 @@ add_library(uavrgb_core
   eval_metrics.cpp
   metrics_json.cpp
   trainer.cpp
+  trainer_eval.cpp
 )
 target_include_directories(uavrgb_core PUBLIC include)
 

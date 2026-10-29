@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <iterator>
 #include <random>
 #include <string>
 #include <vector>
@@ -133,6 +134,16 @@ void check_metrics_jsonl(const std::string& path, std::vector<double>* losses) {
   check(n_other >= 1, "缺 status 事件");
 }
 
+// 取文件里某个数值字段的最大值；没有匹配行时返回 NaN。
+double max_field(const std::string& path, const std::string& pat) {
+  double best = std::nan("");
+  for (const std::string& line : read_lines(path)) {
+    const double v = field_num(line, pat);
+    if (std::isfinite(v) && !(v <= best)) best = v;
+  }
+  return best;
+}
+
 void check_results_csv(const std::string& path, int epochs) {
   const auto rows = read_lines(path);
   check(!rows.empty() && rows[0] == kResultsCsvHeader, "results.csv 表头不符");
@@ -186,6 +197,29 @@ int main() {
   // 4) results.csv 字段
   check_results_csv(cfg.out_dir + "/results.csv", cfg.epochs);
 
+  // 5) best-checkpoint：记录值必须等于 dev 宏 F1 峰值，且文件能读回。
+  const double best_seen = max_field(cfg.out_dir + "/metrics.jsonl", "\"macro_f1\":");
+  std::cout << "best dev macro_f1=" << best_seen
+            << " state=" << tr.state().best_macro_f1 << "\n";
+  check(std::isfinite(best_seen), "metrics.jsonl 无 macro_f1");
+  check(tr.state().best_macro_f1 >= 0.0f, "best_macro_f1 未被记录");
+  check(std::fabs(static_cast<double>(tr.state().best_macro_f1) - best_seen) < 1e-5,
+        "best_macro_f1 与 metrics 峰值不一致");
+  const std::string best_ckpt = cfg.out_dir + "/ckpt_best.bin";
+  check(fs::exists(best_ckpt), "缺 ckpt_best.bin");
+  CnnModel best_model = make_cnn(120, 160, cfg.seed, 4);
+  TrainState best_state = make_train_state(best_model, cfg.lr);
+  load_checkpoint(best_ckpt, best_model, best_state);
+  check(best_state.best_macro_f1 == tr.state().best_macro_f1,
+        "ckpt_best.bin 未保存 best_macro_f1");
+  check(best_state.epoch >= 1 && best_state.epoch <= cfg.epochs, "ckpt_best.bin epoch 越界");
+  // ckpt.bin 必须在更新 best 之后写，否则续训读到的峰值落后一轮、可能覆盖掉 ckpt_best。
+  CnnModel last_model = make_cnn(120, 160, cfg.seed, 4);
+  TrainState last_state = make_train_state(last_model, cfg.lr);
+  load_checkpoint(cfg.out_dir + "/ckpt.bin", last_model, last_state);
+  check(last_state.best_macro_f1 == tr.state().best_macro_f1,
+        "ckpt.bin 的 best_macro_f1 落后于 ckpt_best.bin");
+
   // 2) 参数确实变了：同 seed 的 make_cnn 就是训练前的初始化（make_cnn 确定性）
   const CnnModel init = make_cnn(120, 160, cfg.seed, 4);
   const std::size_t ndiff = count_diffs(init, tr.model());
@@ -213,6 +247,32 @@ int main() {
   check(train_step(st2) == train_step(tr.state()) && train_step(st2) == 20,
         "checkpoint step 数不符（应为 20）");
   check(st2.epoch == tr.state().epoch && st2.epoch == cfg.epochs, "checkpoint epoch 数不符");
+  check(st2.best_macro_f1 == tr.state().best_macro_f1,
+        "checkpoint best_macro_f1 读回不一致");
+
+  // v3 -> v2 兼容：旧 checkpoint 没有 best_macro_f1 字段，读回应为 -1。
+  const std::string v2 = root + "/ckpt_v2.bin";
+  {
+    std::ifstream in(ckpt, std::ios::binary);
+    std::vector<char> bytes((std::istreambuf_iterator<char>(in)),
+                            std::istreambuf_iterator<char>());
+    std::uint32_t nw = 0;
+    std::memcpy(&nw, &bytes[40], 4);
+    check(nw == 0, "v2 兼容用例假设 checkpoint 无类别权重");
+    const std::uint32_t two = 2;
+    std::memcpy(&bytes[8], &two, 4);
+    bytes.erase(bytes.begin() + 44, bytes.begin() + 48);  // 去掉 v3 的 best 字段
+    std::ofstream out(v2, std::ios::binary);
+    out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
+  }
+  CnnModel m4 = make_cnn(120, 160, cfg.seed, 4);
+  TrainState st4 = make_train_state(m4, cfg.lr);
+  load_checkpoint(v2, m4, st4);
+  check(st4.best_macro_f1 == -1.0f, "v2 checkpoint 的 best_macro_f1 应为 -1");
+  const auto pc = cnn_params(m4);
+  bool v2_same = true;
+  for (std::size_t i = 0; i < pa.size(); ++i) v2_same = v2_same && same_bits(*pa[i], *pc[i]);
+  check(v2_same, "v2 checkpoint 参数读回后不一致");
 
   // 结构不符的模型必须被拒，而不是静默加载一半
   CnnModel m3 = make_cnn(128, 128, cfg.seed, 4);

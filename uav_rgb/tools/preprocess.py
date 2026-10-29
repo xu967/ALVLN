@@ -72,6 +72,9 @@ def load_episode(ep_dir, drop_collision=False):
     scene_id = man.get("scene_id")
     if scene_id is None:
         die("%s: 缺 scene_id（scene 隔离 split 必需）" % man_path)
+    gid = man.get("geometry_gid")
+    if gid is not None and (not isinstance(gid, str) or not gid):
+        die("%s: geometry_gid 必须是非空字符串（实际 %r）" % (man_path, gid))
     # collect.py 采集中断时会写 error 并把半截 episode 留在磁盘上；
     # 不能让没采完的 episode 静默进数据集（它会伪装成一条正常的短 episode）。
     if man.get("error"):
@@ -128,6 +131,7 @@ def load_episode(ep_dir, drop_collision=False):
         "seed": man.get("seed", 0),
         "version": str(man.get("version", "")),
         "split": split,
+        "geometry_gid": gid,
         "src_w": src_w,
         "src_h": src_h,
         "samples": samples,
@@ -137,7 +141,7 @@ def load_episode(ep_dir, drop_collision=False):
 
 def scan(ep_dirs, drop_collision=False):
     """加载全部 episode 索引，并检查 scene_id 的 split 唯一性。"""
-    episodes, scene_split, total, dropped = [], {}, 0, 0
+    episodes, scene_split, gid_split, total, dropped = [], {}, {}, 0, 0
     for d in ep_dirs:
         ep = load_episode(d, drop_collision)
         sid = ep["scene_id"]
@@ -145,6 +149,12 @@ def scan(ep_dirs, drop_collision=False):
             die("scene_id=%r 同时出现在 split=%s 与 %s（必须按场景隔离）"
                 % (sid, scene_split[sid], ep["split"]))
         scene_split[sid] = ep["split"]
+        gid = ep["geometry_gid"]
+        if gid is not None:
+            if gid in gid_split and gid_split[gid] != ep["split"]:
+                die("几何组 %s 同时出现在 split=%s 与 %s（同几何必须同 split）"
+                    % (gid, gid_split[gid], ep["split"]))
+            gid_split[gid] = ep["split"]
         ep["sample_start"] = total
         ep["num_samples"] = len(ep["samples"])
         if episodes and (ep["src_w"], ep["src_h"]) != (episodes[0]["src_w"], episodes[0]["src_h"]):
@@ -194,6 +204,7 @@ def build_meta(episodes, total, size, dropped=0):
             "seed": ep["seed"],
             "version": ep["version"],
             "split": ep["split"],
+            "geometry_gid": ep["geometry_gid"],
             "num_steps": ep["num_samples"],
             "sample_start": ep["sample_start"],
             "sample_count": ep["num_samples"],

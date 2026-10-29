@@ -335,14 +335,14 @@ python3 ui/monitor.py --run-dir /tmp/run1
 全部证据见 `docs/worklog/2026-10-29-2103-audit-fixes.md`、
 `docs/experiments/2026-10-29-teacher-traverse-ablations.md`。
 
-### 下一任最该先做的三件事
+### 下一任最该先做的两件事
 
-1. **加 best-checkpoint**（`src/trainer.cpp:253`）。现在交付的永远是最后一轮，
-   `docs/results.md` 里实测过峰值在 ep27、交付的是 ep30。**需要先按职责拆 `trainer.cpp`**
-   （已 277 行、上限 280），再按 dev macro_f1 保存 `ckpt_best.bin`。
-2. **决定车道间距要不要放宽**。缝 0.902 m，机体外接直径 0.711 m。实测把净空从
+0. ~~**加 best-checkpoint**~~ **已完成（2026-10-29 21:55）**：`Trainer::evaluate` 拆到
+   `src/trainer_eval.cpp`，每 epoch 按 dev 宏 F1 保存 `ckpt_best.bin`；
+   best 值写入 checkpoint v3（v2 仍可读）。详见本轮 worklog。
+1. **决定车道间距要不要放宽**。缝 0.902 m，机体外接直径 0.711 m。实测把净空从
    0.36 提到 0.40 会把穿越率从 5/8 打到 2/8——**继续调参数没用，要改几何**。
-3. **实现 §19.3 仿真时间动作窗口**。`--hold` 是墙钟秒，同 seed 两次采集终点
+2. **实现 §19.3 仿真时间动作窗口**。`--hold` 是墙钟秒，同 seed 两次采集终点
    x 分别是 1.40 / 2.36，数据集目前不可复现。
 
 ### 不要重复踩的坑
