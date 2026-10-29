@@ -1,0 +1,31 @@
+{
+  "schema": "navlab.registry.v1",
+  "training_profiles": [
+    {
+      "id": "cpp_tinyvln_v1",
+      "task": "aerialvln_s_v1",
+      "architecture": "tinyvln_cpp_v1",
+      "ready": false,
+      "executable": "build/tinyvln_train",
+      "argv": ["--config", "{config_file}", "--output", "{run_dir}"],
+      "requirements": ["build/tinyvln_train"],
+      "note": "Template only; training executable not implemented. Edit and validate after development."
+    }
+  ],
+  "simulation_profiles": [
+    {
+      "id": "lani_registered_evaluator_v1",
+      "task": "lani_v1",
+      "ready": false,
+      "auto_launch_supported": false,
+      "executable": "/ABSOLUTE/PATH/TO/python3",
+      "argv": ["/ABSOLUTE/PATH/TO/scripts/verify_lani.py", "--mode", "evaluate", "--output", "{sim_dir}"],
+      "requirements": ["/ABSOLUTE/PATH/TO/scripts/verify_lani.py"],
+      "note": "Exact supported flags must be checked in the source snapshot; this is NOT ready to run."
+    }
+  ],
+  "datasets": [],
+  "checkpoints": [],
+  "splits": [],
+  "scenes": []
+}

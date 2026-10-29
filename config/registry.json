@@ -1,0 +1,10 @@
+{
+  "schema": "navlab.registry.v1",
+  "training_profiles": [],
+  "simulation_profiles": [],
+  "datasets": [],
+  "checkpoints": [],
+  "splits": [],
+  "scenes": [],
+  "readme": "All profiles must be approved server-side. No default train/simulator is enabled."
+}

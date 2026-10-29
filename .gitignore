@@ -1,0 +1,14 @@
+artifacts/
+build/
+.venv/
+__pycache__/
+*.py[cod]
+*.swp
+.env
+*.log
+*.cvimodel
+*.onnx
+*.pt
+*.pth
+*.ckpt
+.DS_Store

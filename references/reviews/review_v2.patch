@@ -1,0 +1,883 @@
+diff -ruN a/.gitignore b/.gitignore
+--- a/.gitignore
++++ b/.gitignore
+@@ -13,3 +13,4 @@
+ *.mp4
+ *.zip
+ .DS_Store
++build/
+diff -ruN a/code/include/tinyvln/training_monitor.hpp b/code/include/tinyvln/training_monitor.hpp
+--- a/code/include/tinyvln/training_monitor.hpp
++++ b/code/include/tinyvln/training_monitor.hpp
+@@ -1,6 +1,7 @@
+ #pragma once
+ // Real training hook: progress on stderr and structured metrics in metrics.jsonl.
+ // Include from a FUTURE trainer; this header does not train a model by itself.
++// Every line carries "schema":"tinyvln.metrics.v1"; numbers are always written in the C locale.
+ #include <algorithm>
+ #include <chrono>
+ #include <cmath>
+@@ -8,10 +9,15 @@
+ #include <fstream>
+ #include <iomanip>
+ #include <iostream>
++#include <limits>
++#include <locale>
++#include <sstream>
+ #include <stdexcept>
+ #include <string>
+ 
+ namespace tinyvln {
++inline constexpr const char* kMetricsSchema = "tinyvln.metrics.v1";
++
+ inline std::string JsonEscape(const std::string& s) {
+   std::string out;
+   for (char c : s) {
+@@ -25,52 +31,77 @@
+ 
+ class TrainingMonitor {
+  public:
+-  explicit TrainingMonitor(const std::string& jsonl_path)
+-      : file_(jsonl_path, std::ios::app), begin_(Clock::now()) {
++  // resume_step: steps already completed when this process started (0 for a fresh run),
++  // so that ETA after a checkpoint resume is not underestimated.
++  explicit TrainingMonitor(const std::string& jsonl_path, std::size_t resume_step = 0)
++      : file_(jsonl_path, std::ios::app), begin_(Clock::now()), resume_step_(resume_step) {
+     if (!file_) throw std::runtime_error("METRICS_OPEN_FAILED: " + jsonl_path);
++    file_.imbue(std::locale::classic());  // never "26,000" or "0,75" inside JSON
++    file_ << std::setprecision(std::numeric_limits<double>::max_digits10);  // lossless round trip
+   }
+ 
+   void Step(std::size_t step, std::size_t total, double loss,
+             double accuracy, double lr) {
+     if (!std::isfinite(loss) || !std::isfinite(accuracy) || !std::isfinite(lr))
+-      throw std::runtime_error("TRAIN_NONFINITE_METRIC: loss/accuracy/lr");
++      Fail(step, "TRAIN_NONFINITE_METRIC", "loss/accuracy/lr is NaN or Inf");
+     if (total == 0 || step > total || accuracy < 0 || accuracy > 1)
+-      throw std::runtime_error("TRAIN_METRIC_RANGE: step/total/accuracy");
++      Fail(step, "TRAIN_METRIC_RANGE", "step/total/accuracy out of range");
+     const double elapsed = std::chrono::duration<double>(Clock::now() - begin_).count();
+-    const double eta = step ? elapsed * (static_cast<double>(total - step) / step) : 0;
+-    file_ << "{\"event\":\"train_step\",\"step\":" << step
++    const std::size_t done = step > resume_step_ ? step - resume_step_ : 0;
++    const double eta = done ? elapsed * (static_cast<double>(total - step) / done) : 0;
++    file_ << "{\"schema\":\"" << kMetricsSchema << "\",\"event\":\"train_step\",\"step\":" << step
+           << ",\"total_steps\":" << total << ",\"loss\":" << loss
+           << ",\"action_accuracy\":" << accuracy << ",\"lr\":" << lr
+           << ",\"elapsed_sec\":" << elapsed << ",\"eta_sec\":" << eta << "}\n";
+     file_.flush();
++    // Format in a private stream: std::cerr's flags/precision are never modified.
++    std::ostringstream bar;
++    bar.imbue(std::locale::classic());
+     constexpr int kWidth = 28;
+     const int filled = static_cast<int>(kWidth * static_cast<double>(step) / total);
+-    std::cerr << '\r' << "[TRAIN] [" << std::string(filled, '#')
+-              << std::string(kWidth - filled, '-') << "] " << step << '/' << total
+-              << " loss=" << std::fixed << std::setprecision(4) << loss
+-              << " acc=" << std::setprecision(1) << accuracy * 100 << '%'
+-              << " ETA=" << std::setprecision(0) << eta << "s" << std::flush;
+-    if (step == total) std::cerr << '\n';
++    bar << '\r' << "[TRAIN] [" << std::string(filled, '#')
++        << std::string(kWidth - filled, '-') << "] " << step << '/' << total
++        << " loss=" << std::fixed << std::setprecision(4) << loss
++        << " acc=" << std::setprecision(1) << accuracy * 100 << '%'
++        << " ETA=" << std::setprecision(0) << eta << "s";
++    if (step == total) bar << '\n';
++    std::cerr << bar.str() << std::flush;
+   }
+ 
+-  void Validation(std::size_t step, double sr, double stop_f1) {
++  // split: e.g. "val_unseen"; n_episodes: episodes behind `sr`;
++  // closed_loop=false marks teacher-forced / offline proxies so the UI cannot pass them off as SR.
++  void Validation(std::size_t step, double sr, double stop_f1, const std::string& split,
++                  std::size_t n_episodes, bool closed_loop) {
+     if (!std::isfinite(sr) || sr < 0 || sr > 1 || !std::isfinite(stop_f1)
+-        || stop_f1 < 0 || stop_f1 > 1)
+-      throw std::runtime_error("VAL_METRIC_INVALID");
+-    file_ << "{\"event\":\"validation\",\"step\":" << step
+-          << ",\"sr\":" << sr << ",\"stop_f1\":" << stop_f1 << "}\n";
++        || stop_f1 < 0 || stop_f1 > 1 || n_episodes == 0)
++      Fail(step, "VAL_METRIC_INVALID", "sr/stop_f1 outside [0,1] or n_episodes == 0");
++    file_ << "{\"schema\":\"" << kMetricsSchema << "\",\"event\":\"validation\",\"step\":" << step
++          << ",\"sr\":" << sr << ",\"stop_f1\":" << stop_f1
++          << ",\"split\":\"" << JsonEscape(split) << "\",\"n_episodes\":" << n_episodes
++          << ",\"closed_loop\":" << (closed_loop ? "true" : "false") << "}\n";
+     file_.flush();
+   }
+ 
+   void Status(const std::string& event, const std::string& message) {
+-    file_ << "{\"event\":\"" << JsonEscape(event) << "\",\"message\":\""
+-          << JsonEscape(message) << "\"}\n";
++    file_ << "{\"schema\":\"" << kMetricsSchema << "\",\"event\":\"" << JsonEscape(event)
++          << "\",\"message\":\"" << JsonEscape(message) << "\"}\n";
+     file_.flush();
+   }
+ 
+  private:
+   using Clock = std::chrono::steady_clock;
++
++  // Record why training stopped before throwing, so the dashboard can show the cause.
++  [[noreturn]] void Fail(std::size_t step, const char* code, const char* message) {
++    file_ << "{\"schema\":\"" << kMetricsSchema << "\",\"event\":\"error\",\"severity\":\"FATAL\""
++          << ",\"code\":\"" << code << "\",\"step\":" << step
++          << ",\"message\":\"" << JsonEscape(message) << "\"}\n";
++    file_.flush();
++    throw std::runtime_error(std::string(code) + ": " + message);
++  }
++
+   std::ofstream file_;
+   Clock::time_point begin_;
++  std::size_t resume_step_;
+ };
+ }  // namespace tinyvln
+diff -ruN a/code/tests/test_infrastructure.py b/code/tests/test_infrastructure.py
+--- a/code/tests/test_infrastructure.py
++++ b/code/tests/test_infrastructure.py
+@@ -16,6 +16,7 @@
+ class InfrastructureTest(unittest.TestCase):
+     def test_scene_deterministic_and_well_formed(self):
+         from xml.etree import ElementTree as ET
++        (ROOT / 'artifacts').mkdir(exist_ok=True)  # artifacts/ is gitignored: absent in a fresh clone
+         with tempfile.TemporaryDirectory(dir=ROOT / 'artifacts') as d:
+             output = Path(d)
+             first = scene_tool.generate('forest', 123, 30, output)
+@@ -36,6 +37,8 @@
+             scene_tool.generate('forest', 42, -1, ROOT / 'artifacts' / 'scenes')
+ 
+     def test_refuses_nonexistent_training_binary(self):
++        if (ROOT / 'build' / 'tinyvln_train').exists():
++            self.skipTest('trainer is built; this test must never launch real training')
+         p = subprocess.run([str(ROOT / 'run.sh'), 'train', '--run-id', 'forbidden_test'],
+                            text=True, capture_output=True)
+         self.assertNotEqual(p.returncode, 0)
+diff -ruN a/code/tests/test_review_regressions.py b/code/tests/test_review_regressions.py
+--- a/code/tests/test_review_regressions.py
++++ b/code/tests/test_review_regressions.py
+@@ -0,0 +1,169 @@
++"""Regression tests for the V7.1 review (v2) findings B01–B16 and gate P0-2."""
++import http.client
++import json
++from pathlib import Path
++import shutil
++import socket
++import subprocess
++import sys
++import tempfile
++import threading
++import time
++import unittest
++from unittest.mock import patch
++
++ROOT = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(ROOT / 'tools'))
++import dashboard  # noqa: E402
++import scene_tool  # noqa: E402
++
++GOOD = b'{"event":"train_step","step":1,"total_steps":2,"loss":0.5}\n'
++
++
++def free_port():
++    with socket.socket() as s:
++        s.bind(('127.0.0.1', 0))
++        return s.getsockname()[1]
++
++
++def start_server():
++    port = free_port()
++    threading.Thread(target=dashboard.serve, args=(port,), daemon=True).start()
++    for _ in range(50):
++        try:
++            socket.create_connection(('127.0.0.1', port), timeout=0.1).close()
++            return port
++        except OSError:
++            time.sleep(0.05)
++    raise RuntimeError('dashboard did not start')
++
++
++def get(port, path, host=None):
++    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=5)
++    conn.request('GET', path, headers={'Host': host} if host else {})
++    resp = conn.getresponse()
++    return resp.status, resp.read()
++
++
++class MetricsRobustness(unittest.TestCase):
++    def run_with(self, payload):
++        tmp = tempfile.TemporaryDirectory()
++        self.addCleanup(tmp.cleanup)
++        base = Path(tmp.name)
++        (base / 'r1').mkdir()
++        (base / 'r1' / 'metrics.jsonl').write_bytes(GOOD + payload + GOOD)
++        with patch.object(dashboard, 'RUNS', base):
++            return dashboard.metrics_for('r1')
++
++    def test_B01_nested_nonfinite_line_is_skipped_not_fatal(self):
++        data = self.run_with(b'{"event":"train_step","extra":{"grad_norm":NaN}}\n')
++        self.assertEqual(len(data['events']), 2)
++        self.assertTrue(any('LOG_NONFINITE' in w for w in data['warnings']))
++
++    def test_B02_deep_nesting_and_huge_int_are_skipped(self):
++        for bad in (b'{"event":"x","v":' + b'[' * 30000 + b']' * 30000 + b'}\n',
++                    b'{"event":"x","v":' + b'9' * 5000 + b'}\n'):
++            self.assertEqual(len(self.run_with(bad)['events']), 2)
++
++
++class SceneManifests(unittest.TestCase):
++    def test_B03_B06_invalid_manifests_never_break_or_count_as_ready(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            base = Path(tmp)
++            (base / 'a.json').write_text('[]')
++            (base / 'b.json').write_text('{broken')
++            with patch.object(dashboard, 'SCENES', base):
++                scenes = dashboard.scene_list()
++                self.assertTrue(all(s['status'] == 'manifest_invalid' for s in scenes))
++                check = {c['key']: c for c in dashboard.status()['checks']}['scenes']
++                self.assertEqual(check['state'], 'blocked')
++
++
++class RunListing(unittest.TestCase):
++    def test_B07_total_is_reported_beyond_listing_cap(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            base = Path(tmp)
++            for i in range(85):
++                (base / f'r{i:03}').mkdir()
++                (base / f'r{i:03}' / 'metrics.jsonl').write_bytes(GOOD)
++            with patch.object(dashboard, 'RUNS', base):
++                self.assertEqual(dashboard.status()['run_count'], 85)
++                self.assertEqual(len(dashboard.runs_list()), dashboard.MAX_RUNS_LISTED)
++                dashboard.metrics_for('r000')  # listed or not, a valid run stays readable
++
++
++class HttpLayer(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        cls.port = start_server()
++
++    def test_B05_foreign_host_header_is_rejected(self):
++        self.assertEqual(get(self.port, '/api/audit', host='evil.example:%d' % self.port)[0], 421)
++        self.assertEqual(get(self.port, '/api/audit')[0], 200)
++
++    def test_B04_io_error_with_non_ascii_path_still_answers_500(self):
++        def boom(_name):
++            raise PermissionError(13, 'Permission denied', '/home/u/项目_工程/metrics.jsonl')
++        with patch.object(dashboard, 'metrics_for', boom):
++            self.assertEqual(get(self.port, '/api/metrics?run=x')[0], 500)
++
++
++class LauncherContract(unittest.TestCase):
++    def run_sh(self, *args):
++        return subprocess.run([str(ROOT / 'run.sh'), *args], capture_output=True, text=True)
++
++    def test_B08_non_ascii_run_id_rejected_like_dashboard(self):
++        for bad in ('实验一', 'ｒｕｎ１'):
++            r = self.run_sh('train', '--run-id', bad)
++            self.assertIn('RUN_ID_INVALID', r.stderr)
++
++    def test_B10_planned_subcommands_report_not_implemented(self):
++        for args in (('board', 'doctor'), ('uart', 'dry-run')):
++            r = self.run_sh(*args)
++            self.assertEqual(r.returncode, 3)
++            self.assertIn('FEATURE_NOT_IMPLEMENTED', r.stderr)
++
++
++@unittest.skipUnless(shutil.which('g++'), 'g++ not available')
++class TrainingMonitorHeader(unittest.TestCase):
++    PROGRAM = r'''
++#include "tinyvln/training_monitor.hpp"
++#include <locale>
++struct Comma : std::numpunct<char> {
++  char do_decimal_point() const override { return ','; }
++  char do_thousands_sep() const override { return '.'; }
++  std::string do_grouping() const override { return "\3"; }
++};
++int main(int, char** argv) {
++  std::locale::global(std::locale(std::locale::classic(), new Comma));
++  tinyvln::TrainingMonitor m(argv[1]);
++  m.Step(26000, 52000, 0.75, 0.5, 2e-4);
++  std::cerr << "\nprobe=" << 0.37 << "\n";
++  try { m.Step(26001, 52000, 0.0 / 0.0, 0.5, 2e-4); } catch (const std::exception&) { std::cerr << "THROWN\n"; }
++}
++'''
++
++    def test_B12_B13_B14_locale_stream_state_and_error_event(self):
++        with tempfile.TemporaryDirectory() as tmp:
++            src, exe, log = Path(tmp) / 't.cpp', Path(tmp) / 't', Path(tmp) / 'm.jsonl'
++            src.write_text(self.PROGRAM)
++            subprocess.run(['g++', '-std=c++17', '-I', str(ROOT / 'code/include'), str(src), '-o', str(exe)],
++                           check=True, capture_output=True)
++            r = subprocess.run([str(exe), str(log)], capture_output=True, text=True)
++            events = [json.loads(line) for line in log.read_text().splitlines()]  # B13: valid JSON
++            self.assertEqual(events[0]['step'], 26000)
++            self.assertIn('probe=0.37', r.stderr)  # B12: std::cerr state untouched
++            self.assertIn('THROWN', r.stderr)
++            self.assertEqual(events[-1]['code'], 'TRAIN_NONFINITE_METRIC')  # B14: logged before throw
++
++
++class SceneGate(unittest.TestCase):
++    @unittest.expectedFailure  # P0-2: remove the decorator once the generator stops reserving a straight corridor
++    def test_P0_2_scenes_require_more_than_flying_straight(self):
++        blocked = sum(any(abs(o['y']) - o['r'] < 0.3 for o in scene_tool.create_obstacles('forest', seed, 60))
++                      for seed in range(200))
++        self.assertGreater(blocked / 200, 0.5)
++
++
++if __name__ == '__main__':
++    unittest.main()
+diff -ruN a/sim/tests/test_v7_contract.py b/sim/tests/test_v7_contract.py
+--- a/sim/tests/test_v7_contract.py
++++ b/sim/tests/test_v7_contract.py
+@@ -1,18 +1,51 @@
+ import pathlib
+ import subprocess
++import sys
++import tempfile
+ import unittest
+ 
+ ROOT = pathlib.Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(ROOT / 'tools'))
++import scene_tool  # noqa: E402
++
++MOTOR = ('<plugin filename="gz-sim-multicopter-motor-model-system" '
++         'name="gz::sim::systems::MulticopterMotorModel"/>')
++VELOCITY_ONLY = ('<plugin filename="gz-sim-multicopter-control-system" '
++                 'name="gz::sim::systems::MulticopterVelocityControl"/>')
++
++
++def smoke(world):
++    return subprocess.run([str(ROOT / 'run.sh'), 'sim', 'smoke', '--world', str(world), '--dry-run'],
++                          capture_output=True, text=True)
++
+ 
+ class V7Contract(unittest.TestCase):
+     def test_static_scene_rejected_as_flight(self):
+-        scene = ROOT / 'artifacts/scenes/forest_42.sdf'
+-        r = subprocess.run([str(ROOT/'run.sh'), 'sim', 'smoke', '--world', str(scene), '--dry-run'], capture_output=True, text=True)
+-        self.assertNotEqual(r.returncode,0)
++        (ROOT / 'artifacts').mkdir(exist_ok=True)  # do not depend on gitignored, pre-generated files
++        with tempfile.TemporaryDirectory(dir=ROOT / 'artifacts') as d:
++            r = smoke(scene_tool.generate('forest', 42, 24, pathlib.Path(d)))
++        self.assertNotEqual(r.returncode, 0)
+         self.assertIn('GZ_MOTOR_MODEL_MISSING', r.stderr)
++
++    def test_velocity_controller_alone_is_not_motor_dynamics(self):
++        with tempfile.TemporaryDirectory() as d:
++            world = pathlib.Path(d) / 'w.sdf'
++            world.write_text(f'<sdf version="1.9"><world name="w">{VELOCITY_ONLY}</world></sdf>')
++            r = smoke(world)
++        self.assertIn('GZ_MOTOR_MODEL_MISSING', r.stderr)
++
++    def test_four_motor_plugins_pass_the_static_check(self):
++        with tempfile.TemporaryDirectory() as d:
++            world = pathlib.Path(d) / 'w.sdf'
++            world.write_text(f'<sdf version="1.9"><world name="w">{MOTOR * 4}</world></sdf>')
++            r = smoke(world)
++        self.assertNotIn('GZ_MOTOR_MODEL_MISSING', r.stderr)
++
+     def test_unimplemented_camera_cannot_false_pass(self):
+-        r = subprocess.run([str(ROOT/'run.sh'), 'sim', 'camera'],capture_output=True,text=True)
+-        self.assertNotEqual(r.returncode,0)
++        r = subprocess.run([str(ROOT / 'run.sh'), 'sim', 'camera'], capture_output=True, text=True)
++        self.assertNotEqual(r.returncode, 0)
+         self.assertIn('FEATURE_NOT_IMPLEMENTED', r.stderr)
+ 
+-if __name__ == '__main__': unittest.main()
++
++if __name__ == '__main__':
++    unittest.main()
+diff -ruN a/tools/dashboard.py b/tools/dashboard.py
+--- a/tools/dashboard.py
++++ b/tools/dashboard.py
+@@ -1,50 +1,84 @@
+ #!/usr/bin/env python3
+ """V7.1 read-only local research cockpit. No training or simulator actions are executed here.
+ 
+-All status values are derived from local files / binary presence. Dashboard does NOT
++Every status check carries `derived_from`: `file_probe` (computed from local files / binaries)
++or `hardcoded` (a hand-maintained label until a gate-evidence file exists). Dashboard does NOT
+ claim that an available binary, world file or metric proves a validated flight.
+ """
+ from __future__ import annotations
+ 
+ import argparse
++from collections import deque
+ from datetime import datetime, timezone
++import hashlib
+ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+ import json
+ import math
++import os
+ from pathlib import Path
+ import re
+ import shutil
++import sys
+ from urllib.parse import urlparse, parse_qs
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ RUNS = ROOT / 'artifacts' / 'runs'
+ SCENES = ROOT / 'artifacts' / 'scenes'
+ HTML = ROOT / 'assets' / 'dashboard.html'
+-RUN_ID = re.compile(r'^[A-Za-z0-9_]{1,70}$')
++RUN_ID = re.compile(r'^[A-Za-z0-9_]{1,70}$')  # tools/launcher.py uses the same rule
+ MAX_LOG_TAIL_BYTES = 2 * 1024 * 1024
+ MAX_EVENTS = 2000
+ MAX_LINE_BYTES = 64 * 1024
++MAX_RUNS_LISTED = 80
++MAX_MANIFEST_BYTES = 1024 * 1024
++MAX_JSON_DEPTH = 32
++PROVENANCE_FILES = ('tools/dashboard.py', 'tools/launcher.py', 'tools/scene_tool.py',
++                    'tools/sim_preflight.py', 'assets/dashboard.html')
+ 
+ 
+ def utc_now():
+     return datetime.now(timezone.utc).isoformat(timespec='seconds')
+ 
+ 
+-def runs_list():
++def all_finite(value, depth=0):
++    """True only if every number in a bounded-depth JSON value is finite."""
++    if depth > MAX_JSON_DEPTH:
++        return False
++    if isinstance(value, float):
++        return math.isfinite(value)
++    if isinstance(value, dict):
++        return all(all_finite(v, depth + 1) for v in value.values())
++    if isinstance(value, list):
++        return all(all_finite(v, depth + 1) for v in value)
++    return True
++
++
++def run_ok(path):
++    metrics = path / 'metrics.jsonl'
++    return bool(RUN_ID.fullmatch(path.name) and path.is_dir() and not path.is_symlink()
++                and metrics.is_file() and not metrics.is_symlink())
++
++
++def all_runs():
+     if not RUNS.is_dir():
+         return []
+-    return sorted((p.name for p in RUNS.iterdir() if p.is_dir() and not p.is_symlink()
+-                   and RUN_ID.fullmatch(p.name) and (p / 'metrics.jsonl').is_file()
+-                   and not (p / 'metrics.jsonl').is_symlink()), reverse=True)[:80]
++    runs = [p for p in RUNS.iterdir() if run_ok(p)]
++    runs.sort(key=lambda p: (p / 'metrics.jsonl').stat().st_mtime, reverse=True)  # newest first
++    return [p.name for p in runs]
++
++
++def runs_list():
++    return all_runs()[:MAX_RUNS_LISTED]
+ 
+ 
+ def metrics_for(name):
+-    if not RUN_ID.fullmatch(name) or name not in runs_list():
++    if not RUN_ID.fullmatch(name or '') or not run_ok(RUNS / name):
+         raise ValueError('RUN_NOT_FOUND')
+     path = RUNS / name / 'metrics.jsonl'
+-    rows, warnings = [], []
+-    size = path.stat().st_size
+-    with path.open('rb') as f:
++    rows, warnings = deque(maxlen=MAX_EVENTS), []
++    fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))  # no symlink swap after the check
++    with os.fdopen(fd, 'rb') as f:
++        size = os.fstat(f.fileno()).st_size
+         offset = max(0, size - MAX_LOG_TAIL_BYTES)
+         f.seek(offset)
+         if offset:
+@@ -59,20 +93,18 @@
+                 continue
+             try:
+                 event = json.loads(raw.decode('utf-8'))
+-            except (UnicodeDecodeError, json.JSONDecodeError):
++            except (UnicodeDecodeError, ValueError, RecursionError):
++                # ValueError also covers the int-digit limit; one bad line must never fail the run
+                 warnings.append(f'LOG_JSON_INVALID: near_tail_line={number}')
+                 continue
+             if not isinstance(event, dict) or not isinstance(event.get('event'), str):
+                 warnings.append(f'LOG_EVENT_INVALID: near_tail_line={number}')
+                 continue
+-            # Prevent NaN, Infinity, unexpected object graphs leaking into UI.
+-            if any(isinstance(v, float) and not math.isfinite(v) for v in event.values()):
+-                warnings.append(f'LOG_NONFINITE: near_tail_line={number}')
++            if not all_finite(event):  # recursive: nested NaN/Inf or over-deep objects
++                warnings.append(f'LOG_NONFINITE_OR_TOO_DEEP: near_tail_line={number}')
+                 continue
+             rows.append(event)
+-            if len(rows) > MAX_EVENTS:
+-                rows.pop(0)
+-    return {'run_id': name, 'events': rows, 'warnings': warnings[-15:],
++    return {'run_id': name, 'events': list(rows), 'warnings': warnings[-15:],
+             'truncated': size > MAX_LOG_TAIL_BYTES, 'source': 'real_jsonl_only'}
+ 
+ 
+@@ -85,56 +117,81 @@
+             continue
+         sdf = path.with_suffix('.sdf')
+         try:
++            if path.stat().st_size > MAX_MANIFEST_BYTES:
++                raise ValueError('manifest larger than 1 MiB')
+             spec = json.loads(path.read_text(encoding='utf-8'))
++            if not isinstance(spec, dict):
++                raise ValueError('manifest root must be a JSON object')
++            sha_ok = None
++            if sdf.is_file() and isinstance(spec.get('sha256'), str):
++                sha_ok = hashlib.sha256(sdf.read_bytes()).hexdigest() == spec['sha256']
+             scenes.append({'name': path.stem, 'preset': str(spec.get('preset', 'unknown')),
+                            'seed': spec.get('seed'), 'obstacles': spec.get('placed_obstacles', spec.get('requested_obstacles')),
+-                           'sdf_exists': sdf.is_file(), 'kind': 'static_geometry_only',
++                           'sdf_exists': sdf.is_file(), 'sdf_sha256_ok': sha_ok, 'kind': 'static_geometry_only',
+                            'status': 'not_a_flight_simulator'})
+-        except (OSError, ValueError, TypeError) as exc:
++        except (OSError, ValueError, TypeError, RecursionError) as exc:
++            detail = type(exc).__name__ if isinstance(exc, OSError) else str(exc)[:160]  # no local paths
+             scenes.append({'name': path.stem, 'status': 'manifest_invalid',
+-                           'error_code': 'SCENE_MANIFEST_INVALID', 'detail': str(exc)[:180]})
++                           'error_code': 'SCENE_MANIFEST_INVALID', 'detail': detail})
+     return scenes
+ 
+ 
+-def state_check(key, label, state, detail, command=None):
+-    value = {'key': key, 'label': label, 'state': state, 'detail': detail}
++def state_check(key, label, state, detail, command=None, derived_from='file_probe'):
++    value = {'key': key, 'label': label, 'state': state, 'detail': detail, 'derived_from': derived_from}
+     if command:
+         value['command'] = command
+     return value
+ 
+ 
+ def status():
+-    found_runs = runs_list()
++    found_runs = all_runs()
++    scenes = scene_list()
++    valid = sum(1 for s in scenes if s.get('status') == 'not_a_flight_simulator')
++    invalid = len(scenes) - valid
++    gz = shutil.which('gz')
++    trainer = (ROOT / 'build/tinyvln_train').is_file()
++    config = (ROOT / 'config/experiment.yaml').is_file()
+     checks = [
+-        state_check('dashboard', '本地指标看板', 'ready', '只读服务；只显示已记录的 JSONL', './run.sh dashboard --port 8765'),
+-        state_check('scenes', '程序化静态场景', 'ready' if scene_list() else 'blocked',
+-                    f'已发现 {len(scene_list())} 份 scene manifest；这不是 RGB 飞行仿真',
++        state_check('dashboard', '本地指标看板', 'ready', '只读服务；只显示已记录的 JSONL',
++                    './run.sh dashboard --port 8765', derived_from='hardcoded'),
++        state_check('scenes', '程序化静态场景', 'ready' if valid else 'blocked',
++                    f'有效 manifest {valid} 份，损坏 {invalid} 份；这不是 RGB 飞行仿真',
+                     './run.sh scene --preset forest --seed 42 --count 24'),
+-        state_check('gazebo', 'Gazebo CLI', 'available_unverified' if shutil.which('gz') else 'blocked',
+-                    '已发现 gz CLI，但动力学/电机/RGB 尚未验证' if shutil.which('gz') else '当前机器找不到 gz 命令',
++        state_check('gazebo', 'Gazebo CLI', 'available_unverified' if gz else 'blocked',
++                    '已发现 gz CLI，但动力学/电机/RGB 尚未验证' if gz else '当前机器找不到 gz 命令',
+                     './run.sh sim doctor'),
+         state_check('physics', '四旋翼物理闭环 GZ0–GZ3', 'not_implemented',
+-                    '尚无通过测试的四电机→动力学→RGB 运行链路'),
++                    '尚无通过测试的四电机→动力学→RGB 运行链路', derived_from='hardcoded'),
+         state_check('cf_sil', 'CF-Drone 软件在环', 'not_implemented',
+-                    '尚未移植 PID 控制核；原 ESP32 固件未改动'),
+-        state_check('trainer', '自研 C++/CUDA 学生训练器',
+-                    'available_unverified' if (ROOT / 'build/tinyvln_train').is_file() else 'not_implemented',
+-                    '发现训练文件但尚未通过训练验证' if (ROOT / 'build/tinyvln_train').is_file() else '尚无已编译训练器；不提供模拟曲线'),
+-        state_check('model_config', '训练配置', 'ready' if (ROOT / 'config/experiment.yaml').is_file() else 'blocked',
+-                    '已提供训练配置' if (ROOT / 'config/experiment.yaml').is_file() else '仅有 .planned 占位，不得启动训练'),
++                    '尚未移植 PID 控制核；原 ESP32 固件未改动', derived_from='hardcoded'),
++        state_check('trainer', '自研 C++/CUDA 学生训练器', 'available_unverified' if trainer else 'not_implemented',
++                    '发现训练文件但尚未通过训练验证' if trainer else '尚无已编译训练器；不提供模拟曲线'),
++        state_check('model_config', '训练配置', 'ready' if config else 'blocked',
++                    '已提供训练配置（未校验内容）' if config else '仅有 .planned 占位，不得启动训练'),
+         state_check('edge', 'SG2002 NPU 部署', 'not_implemented',
+-                    '未提供设备实测 cvimodel / camera→UART 端到端结果'),
++                    '未提供设备实测 cvimodel / camera→UART 端到端结果', derived_from='hardcoded'),
+         state_check('firmware', 'ESP32 固件', 'frozen',
+-                    '本次只读参考 CF-Drone.zip；没有修改、烧录或验证新固件'),
++                    '本次只读参考 CF-Drone.zip；没有修改、烧录或验证新固件', derived_from='hardcoded'),
+     ]
+     return {'version': '7.1', 'generated_at': utc_now(), 'checks': checks,
+-            'run_count': len(found_runs), 'scene_count': len(scene_list()),
++            'run_count': len(found_runs), 'runs_listed': min(len(found_runs), MAX_RUNS_LISTED),
++            'scene_count': valid, 'scene_invalid_count': invalid,
+             'read_only': True, 'no_fake_metrics': True}
+ 
+ 
++def provenance():
++    hashes = {}
++    for rel in PROVENANCE_FILES:
++        try:
++            hashes[rel] = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
++        except OSError:
++            hashes[rel] = None
++    return {'file_sha256': hashes}
++
++
+ def audit():
+     return {'schema': 'tinyvln.audit.v1', 'generated_at': utc_now(),
+-            'project': 'TinyAerialVLN V7.1', 'status': status(),
++            'project': 'TinyAerialVLN V7.1', 'status': status(), 'provenance': provenance(),
+             'evidence_levels': {'ready': '文件或工具存在；不等于物理闭环验证',
+                                 'available_unverified': '仅发现资源，缺运行验收',
+                                 'blocked': '缺前置依赖',
+@@ -147,6 +204,7 @@
+                 '尚无 SG2002 端到端推理实测',
+                 '没有修改 CF-Drone 的 ESP32 固件',
+                 '静态障碍场景不等于可飞行的模拟器',
++                'derived_from=hardcoded 的状态由人工维护，不是自动验收结果',
+                 '本页不支持开始训练或修改设备配置'
+             ],
+             'verification_commands': ['python3 -m unittest discover -s code/tests -p "test_*.py"',
+@@ -155,8 +213,17 @@
+ 
+ 
+ def serve(port):
++    allowed_hosts = {f'127.0.0.1:{port}', f'localhost:{port}'}  # blocks DNS-rebinding reads
++
+     class Handler(BaseHTTPRequestHandler):
++        def fail(self, code, error_code):
++            # The reason phrase goes into the latin-1 status line: keep it an ASCII error code.
++            self.send_error(code, error_code)
++
+         def do_GET(self):
++            if self.headers.get('Host', '') not in allowed_hosts:
++                self.fail(421, 'HOST_NOT_ALLOWED')
++                return
+             path = urlparse(self.path)
+             try:
+                 if path.path in ('/', '/index.html'):
+@@ -164,7 +231,10 @@
+                 elif path.path == '/api/health':
+                     body, ctype, code = {'status': 'ok', 'read_only': True}, 'application/json', 200
+                 elif path.path == '/api/runs':
+-                    body, ctype, code = {'runs': runs_list()}, 'application/json', 200
++                    total = all_runs()
++                    body = {'runs': total[:MAX_RUNS_LISTED], 'total': len(total),
++                            'truncated': len(total) > MAX_RUNS_LISTED}
++                    ctype, code = 'application/json', 200
+                 elif path.path == '/api/metrics':
+                     name = parse_qs(path.query).get('run', [''])[0]
+                     body, ctype, code = metrics_for(name), 'application/json', 200
+@@ -175,7 +245,7 @@
+                 elif path.path == '/api/audit':
+                     body, ctype, code = audit(), 'application/json', 200
+                 else:
+-                    self.send_error(404, 'NOT_FOUND'); return
++                    self.fail(404, 'NOT_FOUND'); return
+                 if not isinstance(body, bytes):
+                     body = json.dumps(body, ensure_ascii=False, allow_nan=False).encode('utf-8')
+                 self.send_response(code)
+@@ -184,14 +254,23 @@
+                 self.send_header('X-Content-Type-Options', 'nosniff')
+                 self.send_header('Content-Security-Policy',
+                                  "default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; "
+-                                 "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'")
++                                 "connect-src 'self'; img-src 'self' data:; base-uri 'none'; form-action 'none'; "
++                                 "frame-ancestors 'none'")
+                 self.send_header('Content-Length', str(len(body)))
+                 self.end_headers()
+                 self.wfile.write(body)
+             except ValueError as exc:
+-                self.send_error(404, str(exc))
++                if str(exc) == 'RUN_NOT_FOUND':
++                    self.fail(404, 'RUN_NOT_FOUND')
++                else:
++                    print(f'[DASHBOARD][DASHBOARD_INTERNAL_ERROR] {exc!r}', file=sys.stderr)
++                    self.fail(500, 'DASHBOARD_INTERNAL_ERROR')
+             except OSError as exc:
+-                self.send_error(500, f'DASHBOARD_IO_ERROR: {exc}')
++                print(f'[DASHBOARD][DASHBOARD_IO_ERROR] {exc!r}', file=sys.stderr)
++                self.fail(500, 'DASHBOARD_IO_ERROR')
++            except Exception as exc:  # never drop a connection without a response
++                print(f'[DASHBOARD][DASHBOARD_INTERNAL_ERROR] {exc!r}', file=sys.stderr)
++                self.fail(500, 'DASHBOARD_INTERNAL_ERROR')
+ 
+         def do_POST(self):
+             self.send_error(405, 'READ_ONLY_DASHBOARD')
+@@ -199,7 +278,11 @@
+         def log_message(self, fmt, *args):
+             print('[DASHBOARD]', fmt % args)
+ 
+-    httpd = ThreadingHTTPServer(('127.0.0.1', port), Handler)
++    try:
++        httpd = ThreadingHTTPServer(('127.0.0.1', port), Handler)
++    except OSError as exc:
++        print(f'[ERR][DASHBOARD_PORT_UNAVAILABLE] 127.0.0.1:{port} 无法监听：{exc.strerror}', file=sys.stderr)
++        raise SystemExit(4)
+     print(f'[OK] TinyAerialVLN V7.1 看板: http://127.0.0.1:{port}/')
+     print('[INFO] 本地只读，不执行训练、仿真或固件改动。Ctrl+C 退出。')
+     try:
+diff -ruN a/tools/launcher.py b/tools/launcher.py
+--- a/tools/launcher.py
++++ b/tools/launcher.py
+@@ -5,12 +5,26 @@
+ from datetime import datetime
+ import os
+ from pathlib import Path
++import re
+ import shutil
+ import subprocess
+ import sys
+ 
+ ROOT = Path(__file__).resolve().parents[1]
+ RUNS = ROOT / 'artifacts' / 'runs'
++RUN_ID = re.compile(r'^[A-Za-z0-9_]{1,70}$')  # identical to tools/dashboard.py
++# Exit codes shared with tools/sim_preflight.py
++EXIT_USAGE, EXIT_NOT_IMPLEMENTED, EXIT_INPUT, EXIT_PROCESS, EXIT_NOT_BUILT = 2, 3, 4, 5, 6
++
++
++def probe(cmd: list[str]) -> str:
++    """Run a version probe; FOUND in PATH is not evidence that the tool works."""
++    try:
++        out = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
++    except (OSError, subprocess.TimeoutExpired) as exc:
++        return f'probe failed: {type(exc).__name__}'
++    lines = (out.stdout or out.stderr).strip().splitlines()
++    return (lines[-1] if lines else '(no output)') + ('' if out.returncode == 0 else f' [exit={out.returncode}]')
+ 
+ 
+ def doctor() -> int:
+@@ -20,9 +34,15 @@
+     missing = []
+     for cmd, optional in commands:
+         found = shutil.which(cmd)
+-        print(f'{"[OK]" if found else "[WARN]"} {cmd}: {found or "未安装/不在 PATH"}')
++        print(f'{"[FOUND]" if found else "[WARN]"} {cmd}: {found or "未安装/不在 PATH"}')
+         if not found and not optional:
+             missing.append(cmd)
++    probes = {'nvcc': ['nvcc', '--version'], 'gz': ['gz', 'sim', '--versions'],
++              'nvidia-smi': ['nvidia-smi', '--query-gpu=name,driver_version,compute_cap', '--format=csv,noheader']}
++    for cmd, argv in probes.items():
++        if shutil.which(cmd):
++            print(f'[PROBE] {cmd}: {probe(argv)}')
++    print('[INFO] FOUND 只表示可执行文件在 PATH 中；RTX 5090 (sm_120) 需要 CUDA ≥ 12.8，请核对 PROBE 行。')
+     for key in ['artifacts', 'tools', 'code', 'assets']:
+         print(f'{"[OK]" if (ROOT / key).exists() else "[ERR]"} project/{key}')
+     if not (ROOT / 'config' / 'experiment.yaml').exists():
+@@ -33,33 +53,49 @@
+     return 0 if not missing else 2
+ 
+ 
+-def gated_binary(name: str, run_id: str | None) -> int:
++def gated_binary(name: str, run_id: str | None, mode: str = 'train') -> int:
++    if mode == 'train':
++        run_id = run_id or datetime.now().strftime('run_%Y%m%d_%H%M%S')
++    elif not run_id:
++        print('[ERR][RUN_ID_REQUIRED] eval 必须用 --run-id 指定一个已有的训练 run。', file=sys.stderr)
++        return EXIT_INPUT
++    if not RUN_ID.fullmatch(run_id):  # validate input before probing the environment
++        print('[ERR][RUN_ID_INVALID] run ID 只能用 ASCII 字母、数字和下划线，1–70 字符（与看板一致）。', file=sys.stderr)
++        return EXIT_INPUT
+     exe = ROOT / 'build' / name
+     cfg = ROOT / 'config' / 'experiment.yaml'
+     if not exe.is_file() or not os.access(exe, os.X_OK):
+         print(f'[ERR][BINARY_NOT_BUILT] {exe} 不存在或不可执行。先按开发门禁实现并编译。', file=sys.stderr)
+-        return 3
++        return EXIT_NOT_BUILT
+     if not cfg.is_file():
+         print(f'[ERR][CONFIG_NOT_READY] 缺少 {cfg}，不得使用 .planned 占位文件训练。', file=sys.stderr)
+-        return 4
+-    run_id = run_id or datetime.now().strftime('run_%Y%m%d_%H%M%S')
+-    if not run_id.replace('_', '').isalnum() or len(run_id) > 70:
+-        print('[ERR][RUN_ID_INVALID] run ID 只能用字母、数字和下划线，≤70字。', file=sys.stderr)
+-        return 4
+-    out = RUNS / run_id
+-    if out.exists():
+-        print(f'[ERR][RUN_EXISTS] {out} 已存在，禁止覆盖旧实验。', file=sys.stderr)
+-        return 4
++        return EXIT_INPUT
++    run_dir = RUNS / run_id
++    extra: list[str] = []
++    if mode == 'train':
++        if run_dir.exists():
++            print(f'[ERR][RUN_EXISTS] {run_dir} 已存在，禁止覆盖旧实验。', file=sys.stderr)
++            return EXIT_INPUT
++        out = run_dir
++    else:  # eval never overwrites the training run: it writes a sub-directory per evaluation
++        if not run_dir.is_dir():
++            print(f'[ERR][RUN_NOT_FOUND] {run_dir} 不存在，无法评测。', file=sys.stderr)
++            return EXIT_INPUT
++        out = run_dir / datetime.now().strftime('eval_%Y%m%d_%H%M%S')
++        if out.exists():
++            print(f'[ERR][RUN_EXISTS] {out} 已存在，请稍后重试。', file=sys.stderr)
++            return EXIT_INPUT
++        extra = ['--run-dir', str(run_dir)]
+     out.mkdir(parents=True)
+-    print(f'[INFO] 启动 {name}; run_id={run_id}; Ctrl+C 请求终止。')
++    print(f'[INFO] 启动 {name}; run_id={run_id}; output={out}; Ctrl+C 请求终止。')
+     try:
+-        return subprocess.call([str(exe), '--config', str(cfg), '--output', str(out)], cwd=ROOT)
++        return subprocess.call([str(exe), '--config', str(cfg), *extra, '--output', str(out)], cwd=ROOT)
+     except KeyboardInterrupt:
+         print('\n[WARN][USER_INTERRUPT] 请求中止；检查是否生成完整 checkpoint。', file=sys.stderr)
+         return 130
+     except OSError as exc:
+         print(f'[ERR][PROCESS_START_FAILED] {exc}', file=sys.stderr)
+-        return 5
++        return EXIT_PROCESS
+ 
+ 
+ def menu() -> int:
+@@ -74,13 +110,15 @@
+             '2': lambda: subprocess.call([sys.executable, str(ROOT / 'tools/scene_tool.py')], cwd=ROOT),
+             '3': lambda: subprocess.call([sys.executable, str(ROOT / 'tools/dashboard.py')], cwd=ROOT),
+             '4': lambda: gated_binary('tinyvln_train', None),
+-            '5': lambda: gated_binary('tinyvln_eval_bridge', None)}.get(
++            '5': lambda: gated_binary('tinyvln_eval_bridge', input('评测哪个 run ID: ').strip(), 'eval')}.get(
+                 selection, lambda: print('[ERR][MENU_OPTION_INVALID] 请输入 0..5。') or 2)()
+ 
+ 
+ def main() -> int:
+     p = argparse.ArgumentParser(description='TinyAerialVLN CLI (no fake training)')
+-    p.add_argument('command', nargs='?', choices=['doctor', 'scene', 'dashboard', 'ui', 'train', 'eval'], default=None)
++    p.add_argument('command', nargs='?', default=None,
++                   choices=['doctor', 'scene', 'dashboard', 'ui', 'train', 'eval', 'board', 'uart'])
++    p.add_argument('rest', nargs='*', help='board/uart 的子命令（尚未实现）')
+     p.add_argument('--run-id', default=None)
+     p.add_argument('--port', type=int, default=8765)
+     p.add_argument('--preset', choices=['forest', 'corridor', 'columns', 'mixed'], default='forest')
+@@ -89,6 +127,12 @@
+     args = p.parse_args()
+     if args.command is None:
+         return menu()
++    if args.command in ('board', 'uart'):  # listed in plan §11, gated by EDGE/HIL
++        print(f'[ERR][FEATURE_NOT_IMPLEMENTED] ./run.sh {args.command} {" ".join(args.rest)} 需在 EDGE/HIL 门禁实现后提供。',
++              file=sys.stderr)
++        return EXIT_NOT_IMPLEMENTED
++    if args.rest:
++        p.error(f'unexpected arguments: {" ".join(args.rest)}')
+     if args.command == 'doctor':
+         return doctor()
+     if args.command in ('dashboard', 'ui'):
+@@ -98,7 +142,7 @@
+                                '--seed', str(args.seed), '--count', str(args.count)], cwd=ROOT)
+     if args.command == 'train':
+         return gated_binary('tinyvln_train', args.run_id)
+-    return gated_binary('tinyvln_eval_bridge', args.run_id)
++    return gated_binary('tinyvln_eval_bridge', args.run_id, 'eval')
+ 
+ 
+ if __name__ == '__main__':
+diff -ruN a/tools/sim_preflight.py b/tools/sim_preflight.py
+--- a/tools/sim_preflight.py
++++ b/tools/sim_preflight.py
+@@ -11,6 +11,10 @@
+ import sys
+ import xml.etree.ElementTree as ET
+ 
++MOTOR_PLUGIN_FILENAMES = {'gz-sim-multicopter-motor-model-system', 'libgz-sim-multicopter-motor-model-system.so',
++                          'ignition-gazebo-multicopter-motor-model-system'}
++MOTOR_PLUGIN_NAMES = {'gz::sim::systems::MulticopterMotorModel', 'ignition::gazebo::systems::MulticopterMotorModel'}
++
+ 
+ def main() -> int:
+     parser = argparse.ArgumentParser(description="TinyAerialVLN Gazebo bring-up diagnostic")
+@@ -44,9 +48,13 @@
+     if doc.tag != 'sdf' or doc.find('world') is None:
+         print("[ERR][SDF_WORLD_INVALID] Expected an SDF root containing a world.", file=sys.stderr)
+         return 4
+-    # Only a smoke launcher, but fail if given the old V6.1 static geometry world.
+-    if not any('multicopter' in (p.get('filename','').lower()) for p in doc.findall('.//plugin')):
+-        print("[ERR][GZ_MOTOR_MODEL_MISSING] SDF has no multicopter system plugin. Static scene != flight dynamics.", file=sys.stderr)
++    # Count real rotor-force plugins; a velocity controller or a static scene is not motor dynamics.
++    motors = [p for p in doc.iter('plugin')
++              if p.get('filename', '') in MOTOR_PLUGIN_FILENAMES or p.get('name', '') in MOTOR_PLUGIN_NAMES]
++    if len(motors) < 4:
++        print(f"[ERR][GZ_MOTOR_MODEL_MISSING] found {len(motors)} MulticopterMotorModel plugin(s), need >= 4. "
++              "Static scene or velocity-control plugin != flight dynamics. If the plugins live inside an "
++              "<include>d model file, pass an expanded world.", file=sys.stderr)
+         return 4
+     if not gz:
+         print("[ERR][GZ_NOT_INSTALLED] Install Gazebo Harmonic and retry.", file=sys.stderr)

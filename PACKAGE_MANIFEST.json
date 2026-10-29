@@ -1,0 +1,735 @@
+{
+  "schema": "navlab.package.v8",
+  "generated_utc": "2026-10-28",
+  "purpose": "file integrity (not physics/ML verification)",
+  "file_count": 121,
+  "files": [
+    {
+      "path": ".env.example",
+      "sha256": "d9bd9039a8230424abd7aebed93e292789cb93721a130fbb8d97bf6a7124522d",
+      "bytes": 202,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": ".gitignore",
+      "sha256": "ef023d5b4a08eaa2e63e606b7076104acea53ee35e41e1f36ff4e389f9379d69",
+      "bytes": 111,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "README.md",
+      "sha256": "d166b652f7b4caa25bec6ecbc5bdb91556aa5c9ee9ba43a7a0d3f0f7e9939703",
+      "bytes": 961,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "START_HERE.md",
+      "sha256": "a7c74040fcd64595b4b381b11e0d76b9f3f4becacfb0c94961d4caf7b66a0ab8",
+      "bytes": 6582,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "config/registry.example.json",
+      "sha256": "810494dbb9a66d4887be7f25a3faf65b4e6bc8af0a80a72135a103f27b4b6385",
+      "bytes": 1040,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "config/registry.json",
+      "sha256": "72b334b4814c5af43aa47be80c56c6457f0058d4b1c16779607e01aff342a1c3",
+      "bytes": 261,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "cpp/CMakeLists.txt",
+      "sha256": "7297637a16ae86e6829ede8169f91f10d6f0aac58be80467e7cbad11a07c5c58",
+      "bytes": 417,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "cpp/include/tensor_ops.hpp",
+      "sha256": "231d914a4f32f4f989a289f61892ba1a99f653e8c1a3eeb46bde55995e48558c",
+      "bytes": 1213,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "cpp/include/training_monitor.hpp",
+      "sha256": "c24c1b11fb42ad9d3e40140071ba5c6e138e2305d2b0ec7f8e3ba0a46965a84a",
+      "bytes": 4951,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "cpp/tests/gradcheck.cpp",
+      "sha256": "99ee0412ef63faf0f227de877c9023dcf8d3f1338f2f899db55339b10a32fa9f",
+      "bytes": 648,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/00_FINAL_DECISIONS.md",
+      "sha256": "65c0be1c44408f26f2e54af7323a796e8aec3c2fd46e59e960298b191bb701b3",
+      "bytes": 4012,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/01_UBUNTU_5090_SETUP.md",
+      "sha256": "36930873eb05a2434da1857d7ef9ee264e7dd8f5940a0b56cdd73cec383a23a4",
+      "bytes": 3750,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/02_DATA_AND_SCENE_PROTOCOL.md",
+      "sha256": "f21291a6457c98ff690d7e0fba1f6a01f2fa747f323b656da1abb39d4fcb7efd",
+      "bytes": 7172,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/03_GAZEBO_PHYSICS_CLOSED_LOOP.md",
+      "sha256": "9d2ee04174f869b3e25f8bc8d5425acb0e83528987e86b68a883aaaf2706210a",
+      "bytes": 8528,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/04_CPP_CUDA_IMPLEMENTATION.md",
+      "sha256": "7a3e47e3d311717df574d29d0b5f0ef4b714c316808a9fdca88de835470fec54",
+      "bytes": 8110,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/05_ECPT_SPEC.md",
+      "sha256": "a6d0f650c68347c9ef81761ecb64348b641598b93c8c339f386882c07a3038c5",
+      "bytes": 6438,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/06_SIMULATION_ORCHESTRATION.md",
+      "sha256": "a2d3cbb746d8345b192b87897f4c05474f37228a37c0fd77be571ae9b709066c",
+      "bytes": 9342,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/07_API_LOGGING_CONTRACT.md",
+      "sha256": "0c3ee800b3214ca5e0864b0eb6f3ef7f13c8c0ed99a8ef3abc9bb4c350a61502",
+      "bytes": 11943,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/08_CF_DRONE_SAFETY.md",
+      "sha256": "bb28073fb237a577879388049e28c8270f3c70971a8f3c032d62e7c2384dcd9b",
+      "bytes": 4621,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/09_SG2002_DEPLOYMENT.md",
+      "sha256": "a9f6d246944e6e24bc4662bca90c3ff487b9160d540fcc303b7db04d5e7d426c",
+      "bytes": 3613,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/10_IMPLEMENTATION_GATES.md",
+      "sha256": "953af4b9563fda1d1909c5401f0d6875c3d797c4ba9544c95276a3a79afaaac7",
+      "bytes": 4855,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/11_CODE_RULES.md",
+      "sha256": "8f17e85113a09fa50f4d03f6b00c9ea75e78bdc0d1fb3e1947006bb8c11c42e1",
+      "bytes": 3869,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/12_AI_REVIEW_HANDOFF.md",
+      "sha256": "4869b4934524d0028bb539e7b78d07bf6148d2d57a89ffcab3b4d8f49a3d0a07",
+      "bytes": 3766,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/13_PROVENANCE_LICENSE.md",
+      "sha256": "8a8db1df75588ef94b90889a254cd54fc012787116245a0b3d3e9b6d82aed2a7",
+      "bytes": 3288,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/14_UI_BACKEND_OPERATION.md",
+      "sha256": "467a85d2f84e781e225278a6c3d7a51cc939d171b4fa41a6befc243150809185",
+      "bytes": 5991,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "docs/TEST_REPORT_LOCAL.md",
+      "sha256": "d93154243dfab7e9c03d4b0b7a94eed5e2289992dd56b671fbaa06edbc8c92da",
+      "bytes": 2112,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "frontend/API_LOGGING_CONTRACT.md",
+      "sha256": "0c3ee800b3214ca5e0864b0eb6f3ef7f13c8c0ed99a8ef3abc9bb4c350a61502",
+      "bytes": 11943,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "frontend/README.md",
+      "sha256": "01b3ed80bf7e2dae49fb9c326b3b4bc11f10e210cc8cb53dc287b19694ca1252",
+      "bytes": 2569,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "frontend/SIMULATION_ORCHESTRATION.md",
+      "sha256": "a2d3cbb746d8345b192b87897f4c05474f37228a37c0fd77be571ae9b709066c",
+      "bytes": 9342,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "frontend/app.js",
+      "sha256": "5c64199e88247205329333a689a2a757b4e7b0d6ca42ac4895d53113447aaf1c",
+      "bytes": 35119,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "frontend/index.html",
+      "sha256": "b08b022e93b5331dc0adaeae38d95f470fac2b762379eae646aff8b36c6e3ab6",
+      "bytes": 22312,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "frontend/preview_ai_audit.png",
+      "sha256": "47a59c76deaa65a2864b52be7867b01dd918dc4cef232052005de6ad0497d3ea",
+      "bytes": 293591,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "frontend/preview_audit.png",
+      "sha256": "1d378aa168a4461321d989d61ca9a64f8fa08ef918607a7df636f45238553898",
+      "bytes": 290164,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "frontend/preview_inference.png",
+      "sha256": "19d98335694c3f6499a507c425f2206a526af986d125ed652505a3a4abaf7adb",
+      "bytes": 187127,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "frontend/preview_mobile.png",
+      "sha256": "a1eb0d15172fe489b8a187985816443efb62a40a37271a14a5ddaf81fe3e679e",
+      "bytes": 180454,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "frontend/preview_simulation.png",
+      "sha256": "391242c82ec368f6d9baca7a6ac595d52f69382c1bb325dadb84829dca09fe25",
+      "bytes": 313957,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "frontend/preview_single_step.png",
+      "sha256": "d6758d48f4dc7c34fb6fac24234d7bbf04c64e3a1dfd6dc13fb222181f38b31a",
+      "bytes": 220386,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "frontend/preview_training.png",
+      "sha256": "b0b5c51d2d6689289e66e10bcd8a9299d10b3acb127034f4b8c49ebe8f758ab5",
+      "bytes": 308327,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "frontend/styles.css",
+      "sha256": "023966146fdaaf057efaf8a5331d15a3acf439693ff9a76e92c7f0a0ecd2281f",
+      "bytes": 32392,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/.gitignore",
+      "sha256": "b5402b540d7b91fda6112587ca1717510431ba42f0b50f38ddf837e1a1c05c01",
+      "bytes": 116,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/CMakeLists.txt.planned",
+      "sha256": "d93ec76c4883ca561c0edb851f176daa3d3e26ff0da57d3791ed09789a51a312",
+      "bytes": 63,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/CODE_RULES.md",
+      "sha256": "e0486a02a26323525be36329b3a7ee0a827693c36a0d94537bf6ead77faaee0d",
+      "bytes": 15420,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/README.md",
+      "sha256": "db5d1cdcaf36aa23c044a9e32edbc2df129c4e14b471eb22762dc3514ec73c02",
+      "bytes": 2808,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/V7_1_RESEARCH_PLAN.md",
+      "sha256": "90dc5959e0b1f8281910fcc91c8c49ba3e5c9ff419136e2575013926ef4d792c",
+      "bytes": 74935,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/adapters/aerialvln/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/adapters/babyai/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/adapters/miniworld/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/artifacts/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/artifacts/scenes/corridor_83.json",
+      "sha256": "66f7726f039e3895b4160069078893731b2ae9d00274ccad8f1dafc0a44f8556",
+      "bytes": 2596,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/artifacts/scenes/corridor_83.sdf",
+      "sha256": "b14bfee478acd69ea8984dfb373c6589db7f74ab379222962503ecba2d8d679e",
+      "bytes": 9393,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/artifacts/scenes/forest_42.json",
+      "sha256": "72c961dccd5c69a6200486ee09ca37bb1a1d4c25d93c7a74e893297d3d09c759",
+      "bytes": 2276,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/artifacts/scenes/forest_42.sdf",
+      "sha256": "9ac5f4cd4f0f989b982b7acef9001e8f6a17e92365d1bf7bc3ea2e16a021ed2b",
+      "bytes": 8138,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/assets/dashboard.html",
+      "sha256": "dd22878431af98e2618e1797ee55b27e46f3c010f500f28bd7db3cee783a2ee8",
+      "bytes": 33818,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/cuda/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/include/tinyvln/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/include/tinyvln/training_monitor.hpp",
+      "sha256": "c24c1b11fb42ad9d3e40140071ba5c6e138e2305d2b0ec7f8e3ba0a46965a84a",
+      "bytes": 4951,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/src/board/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/src/core/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/src/data/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/src/export/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/src/model/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/src/ops/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/src/train/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/tests/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/tests/test_dashboard_v7_1.py",
+      "sha256": "247f4e99cd0dad3aa53f5c718d7b5f44eba5bd8cc6477c0cda315f101e0f7af2",
+      "bytes": 4191,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/tests/test_infrastructure.py",
+      "sha256": "6b2e11f8d11e1365dc60dacc51331165aa5016333b4516576ec3f0277250e9cb",
+      "bytes": 2295,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/code/tests/test_review_regressions.py",
+      "sha256": "29663016a530adbc50f0cd2bdf449732460750b2683162c9cbbad82efd609f1d",
+      "bytes": 6889,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/config/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/config/deployment.yaml.planned",
+      "sha256": "4fa4a89873c10acf765272ad5872a170af8d76cd3e906a3ce4b9d390258f88c0",
+      "bytes": 70,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/config/experiment.yaml.planned",
+      "sha256": "620f591ba4c218086894aab87f22d9193e7d38c4dd2155e7816836555b21b8dc",
+      "bytes": 74,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/docs/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/docs/V7_1_INDEPENDENT_AI_REVIEW.md",
+      "sha256": "bf51b7b8d3d40b3e10e1835a04745f1288fc822976b7cce5acdad97af6844af9",
+      "bytes": 10987,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/docs/V7_1_TEST_REPORT.md",
+      "sha256": "8347e93723ab835aaa10eca7d9fbab225ee57713cd922a30f56d09f14110880a",
+      "bytes": 3205,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/docs/V7_1_UI_SYSTEM_DESIGN.md",
+      "sha256": "2681138f48ed642592cbafb46eda5cc1a800f39ba86c0f53fbece2339dd92474",
+      "bytes": 9242,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/manifests/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/run.sh",
+      "sha256": "167765ac75013e6eb06cf435cbeefdb9ddb199f52d644103ef31e3aac826a361",
+      "bytes": 379,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/sim/README.md",
+      "sha256": "43e6e5a82fc038d1ffe2ae295bfb5577e32c40532914693ef89b0f81255f248a",
+      "bytes": 718,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/sim/include/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/sim/models/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/sim/src/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/sim/tests/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/sim/tests/test_v7_contract.py",
+      "sha256": "152cb92f960f185f5d33badf33c7161fa8214bf3b692e3d8e82ddc1e672da1cf",
+      "bytes": 2106,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/sim/worlds/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/third_party/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/tools/.gitkeep",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/tools/dashboard.py",
+      "sha256": "46fb70efcb4009d4682c89ec2cdd73f64cec14bc83f9a9f59c5aa8b55314f7c2",
+      "bytes": 14768,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/tools/launcher.py",
+      "sha256": "c28729295eb6ff4338d4ec9e33548bef9b58eb0476b461adc7b02cfb95510bb2",
+      "bytes": 7681,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/tools/scene_tool.py",
+      "sha256": "f9420215a934a6ba068d18c76430e0160aec729908c9dbf82b609781a2290444",
+      "bytes": 5816,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "legacy/V7_1_patched/tools/sim_preflight.py",
+      "sha256": "8db2f7a87d59edb6350e2a69c8badafc8d7f7f115dcef05be5a6c8f5a88e05f2",
+      "bytes": 3478,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/CF_DRONE_SOURCE_AUDIT.md",
+      "sha256": "2527bd5a79f1ac3dfbb50e775ea598d7fc5c021210a57075df6311656bfd6ab5",
+      "bytes": 23511,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/Flying_in_Clutter_Monocular_RGB_3DGS_DA.md",
+      "sha256": "5ec5a5ed81d0deb4dfb94fa6ed90d1e3f6efa10b5db8a125738f2c57d698e524",
+      "bytes": 22097,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/GPT_V7_2_REVIEW.md",
+      "sha256": "95b9a42f24c5240db60ff0bc180bced05d2b042b1203480225e89a13cce4c8b8",
+      "bytes": 30202,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/INDEPENDENT_REVIEW_V1.md",
+      "sha256": "ad1abfc3c6bc1c118e17bbbb568363c9d1415b1cd6161cf659c76eb9500ccebd",
+      "bytes": 46274,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/INDEPENDENT_REVIEW_V2.md",
+      "sha256": "e404f3859b3387bd63a8520b603711879cca02d37d4b605bf6392661dca532ca",
+      "bytes": 43657,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/REVIEW_REPRO_AND_PATCH.md",
+      "sha256": "0dd8c50d9372c9a5a21d995d76c164736937c916e3be6e3bd69dbef2b36c4c9e",
+      "bytes": 104622,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/Swarm_of_Micro_Flying_Robots_in_the_Wild.md",
+      "sha256": "a3aa8b85540c34f15a4da29495b00999860cae561c2c043c8abc7063b0fa71ac",
+      "bytes": 48615,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/UBUNTU_BASE_GUIDE_V1.md",
+      "sha256": "c59a93e16f85edb4e8feaded2b23c9dada4ceca81c1104b2fcea415d0b4ce80b",
+      "bytes": 24151,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/V5_RESEARCH_PLAN.md",
+      "sha256": "459ccb208274dbfe589edbe7f07c33e429fa6d4b2049cd66110f1e303ad233f3",
+      "bytes": 39452,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/V6_RESEARCH_PLAN.md",
+      "sha256": "1661e6c3b463a8020e0f92805743198763ff183993bc389a43590b63bd75d0b2",
+      "bytes": 54184,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/V7_1_CODE_RULES.md",
+      "sha256": "e0486a02a26323525be36329b3a7ee0a827693c36a0d94537bf6ead77faaee0d",
+      "bytes": 15420,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/V7_1_RESEARCH_PLAN.md",
+      "sha256": "90dc5959e0b1f8281910fcc91c8c49ba3e5c9ff419136e2575013926ef4d792c",
+      "bytes": 74935,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/V7_2_AUDIT_EVIDENCE.zip",
+      "sha256": "1e92f9cc2418a9cfc7f613b47e2e6a5a94a4d4a1f9dd94ea54216f71c3e06d23",
+      "bytes": 19482,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/V7_GAZEBO_CF_PLANNING.md",
+      "sha256": "59ce294a37d1e76beadd7a32f98e4cb62109d5cd62f46c35b32b468696d1723f",
+      "bytes": 66835,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/review_v2.patch",
+      "sha256": "35c80aab757caf4c42576bae0e081d8939708af1040dfeb8f7043a5940e59ab9",
+      "bytes": 43629,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/reviews/review_v2_repro.py",
+      "sha256": "74670b6a15ea0e010c5449e93a0ddd0c91503e796d2dc768d4cc7d082bac0bd3",
+      "bytes": 15057,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "references/snapshots/CF-Drone.zip",
+      "sha256": "97e216f024c9126959536c7682432da63012ea9fb8949caa416077659be1f4a0",
+      "bytes": 332395,
+      "provenance": "original_user_upload"
+    },
+    {
+      "path": "references/snapshots/NavLab_Studio_UI_v3_original.zip",
+      "sha256": "9ad00e59a68704f735a8cb9bbc45568155c58b4bd55b063386d4439b4e998c19",
+      "bytes": 1782164,
+      "provenance": "original_user_upload"
+    },
+    {
+      "path": "references/snapshots/OpenFly-Platform.zip",
+      "sha256": "9b7de3c548608b3b29e96ee4075c2efb86e32d6e209a3e2e208cdfb7b49f2a82",
+      "bytes": 24499402,
+      "provenance": "original_user_upload"
+    },
+    {
+      "path": "references/snapshots/README.md",
+      "sha256": "6107d5957673aaec4c6307706e646832081c0d976e09b8768720aaea513264c3",
+      "bytes": 1017,
+      "provenance": "original_user_upload"
+    },
+    {
+      "path": "references/snapshots/TinyAerialVLN_V7_1_original.zip",
+      "sha256": "7f9be1bd532cc1e16f4e59541be2a8b0374118aa8eec8f68badb9434f2b79834",
+      "bytes": 96893,
+      "provenance": "original_user_upload"
+    },
+    {
+      "path": "references/snapshots/web_code_review_20261027.zip",
+      "sha256": "9efd251697f83c77b917eac6c81facc6aa7da66a75f0a209c7f8af628bd3248b",
+      "bytes": 774302,
+      "provenance": "original_user_upload"
+    },
+    {
+      "path": "run.sh",
+      "sha256": "78d3188224789d045ece2235f71f61496af5f7151421a25984121026a377268f",
+      "bytes": 1755,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "scripts/setup_ubuntu24.sh",
+      "sha256": "c475498ce5fe6fa7ee6dad1ff5a9b73e6942f4f66062603a6872224fffc8823b",
+      "bytes": 1772,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "scripts/verify_package.sh",
+      "sha256": "b883f25871d0302efa9fc21ea182d5ea05cd3270a683a68cdd437b2d8645194a",
+      "bytes": 281,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "server/__init__.py",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "server/app.py",
+      "sha256": "d9e7b72ba8f806ed36a089a31d9c8a896c0ba4d35f2be3fdf334cafcbf23f905",
+      "bytes": 11464,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "server/core.py",
+      "sha256": "bb1fd477c2a80bfef43045ccb99d144c0e05a6b7914cda3090f53e1bc41cfeec",
+      "bytes": 14852,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "tests/test_engineering.py",
+      "sha256": "0230a7694022c57dfe4f78562724459bb3e6fe4c2c77de40575f6f88c197ff06",
+      "bytes": 8701,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "tools/doctor.py",
+      "sha256": "3c841335a0baecfb3f8966641d05f64a4d53e133df7dc793203ccc3c7d6c1096",
+      "bytes": 1350,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "tools/gazebo_probe.py",
+      "sha256": "701b7596b2f4c88e5ac30568e4299772e3b3b5dfff1480a52b6db37aeffc1701",
+      "bytes": 1672,
+      "provenance": "source_or_document"
+    },
+    {
+      "path": "tools/scene_generator.py",
+      "sha256": "dbd6fedbf7284dc26c2620160e8ea806bfc1efa8acc7ab15fd0a66700623f604",
+      "bytes": 7751,
+      "provenance": "source_or_document"
+    }
+  ],
+  "lite_exclusion": "382 MB code.zip original missing; use FULL for all source snapshots"
+}

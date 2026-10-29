@@ -1,0 +1,16 @@
+artifacts/
+__pycache__/
+*.pyc
+*.o
+*.so
+*.onnx
+*.cvimodel
+*.pth
+*.pt
+*.ckpt
+*.npz
+*.npy
+*.mp4
+*.zip
+.DS_Store
+build/
