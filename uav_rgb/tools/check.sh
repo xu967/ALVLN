@@ -25,6 +25,19 @@ if [[ "${1:-}" != "--python-only" ]]; then
   cmake -S "$uav_check_root/src" -B "$uav_check_build" -G Ninja -DCMAKE_BUILD_TYPE=Release
   cmake --build "$uav_check_build" --parallel "${UAV_RGB_BUILD_JOBS:-8}"
   ctest --test-dir "$uav_check_build" --output-on-failure
+
+  # UAVR 格式有三份实现：preprocess.py（写）、dataset.cpp（读）、synthetic_dataset.hpp
+  # （测试夹具，另一份写）。CTest 只用夹具喂 C++ 读端，真正的 Python 产物没人校验——
+  # 这条链路把它接起来，格式漂移（例如头里的 H/W 换位）会在这里红。
+  uav_check_fmt="$(mktemp -d)"
+  trap 'rm -rf "$uav_check_fmt"' EXIT
+  "$UAV_RGB_PYTHON" "$uav_check_root/tools/make_synthetic_episode.py" \
+    --out "$uav_check_fmt/ep" >/dev/null
+  "$UAV_RGB_PYTHON" "$uav_check_root/tools/preprocess.py" --out "$uav_check_fmt/ds" \
+    "$uav_check_fmt"/ep/ep1 "$uav_check_fmt"/ep/ep2 "$uav_check_fmt"/ep/ep3 >/dev/null
+  g++ -std=c++17 -O2 -Wall -Wextra "$uav_check_root/tools/read_dataset.cpp" \
+    -o "$uav_check_fmt/read_dataset"
+  "$uav_check_fmt/read_dataset" "$uav_check_fmt/ds/dataset.uavr" --selfcheck >/dev/null
 else
   echo "SKIP: 用户指定 --python-only，未验证 C++/CUDA 构建和 GPU 测试。"
 fi

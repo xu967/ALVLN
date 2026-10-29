@@ -2,6 +2,7 @@
 #include "uavrgb/device/state.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -9,14 +10,24 @@
 namespace uavrgb::device {
 namespace {
 
+// 收尾失败必须标记FAILED并留诊断，但不能替换导致收尾的首次异常。
+void check_cleanup(Context& context, cudaError_t result, const char* operation) noexcept {
+  try {
+    context.check(result, operation);
+  } catch (...) {
+    std::fprintf(stderr, "device transfer cleanup: %s: %s\n", operation,
+                 cudaGetErrorString(result));
+  }
+}
+
 // 提交中途失败也须先排空，避免锁页源/目标仍在被 DMA 使用时被释放。
 template <class F> void transfer(Context& context, F submit) {
   try {
     submit();
     context.finish();
   } catch (...) {
-    (void)cudaSetDevice(context.device());
-    (void)cudaStreamSynchronize(context.stream());
+    check_cleanup(context, cudaSetDevice(context.device()), "cudaSetDevice");
+    check_cleanup(context, cudaStreamSynchronize(context.stream()), "cudaStreamSynchronize");
     throw;
   }
 }

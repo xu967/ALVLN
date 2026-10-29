@@ -55,7 +55,8 @@ void read_exact_at(int fd, std::uint64_t offset, void* destination, std::size_t 
 }
 
 BatchReader::BatchReader(const std::string& path, LoadOptions options)
-    : path_(std::filesystem::absolute(path).lexically_normal().string()) {
+    : path_(std::filesystem::absolute(path).string()) {
+  // 保留 symlink/.. 的解析顺序及原始路径，才能检出运行期间的改指向。
   // 先锁定文件身份，元数据校验之后再核验，避免校验与实际读取混用版本。
   fd_ = ::open(path_.c_str(), O_RDONLY | O_CLOEXEC);
   if (fd_ < 0) io_error("BatchReader open");

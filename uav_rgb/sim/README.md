@@ -120,7 +120,10 @@ gz topic -e -t /model/x3/odometry   # gz.msgs.Odometry
 
 ```bash
 # 专家策略采集（自动避障，通常无碰撞）
-python3 sim/tools/collect.py --steps 20 --out /tmp/ep0 --scene-id 1 --seed 42 --split train
+# 必须带 --scene-meta 才会用柱子真值的 carrot planner；不给会退回深度反应式专家，
+# manifest 的 teacher 字段会如实记为 expert_action。
+python3 sim/tools/collect.py --steps 80 --out /tmp/ep0 --scene-id 1 --seed 42 \
+  --split train --scene-meta /tmp/scene_1.json
 # 盲策略（恒定前进）采集：撞柱，验证 collision=True
 python3 sim/tools/collect.py --steps 10 --hold 1.5 --policy forward \
   --out /tmp/ep1 --scene-id 1 --seed 43
@@ -188,7 +191,7 @@ python3 sim/tools/scene_gen.py --self-check          # 100 个 seed 自检
   车道障碍约 1.3 m，对应「每前进 1–1.5 m 做一次左右选择」。
 - **数量上限 9 的原因**：全对缝隙 ≥0.9 m 等价于任意两柱心的 Chebyshev 距离
   ≥1.3 m；在 3.5×3.0 m 的密布区内最多 3×3=9 根。任务要求 8–12 根，10–12 根
-  必然出现一对缝隙 <0.9 m（旋翼跨度 0.64 m 过不去），因此采样取 8–9 根。
+  必然出现一对缝隙 <0.9 m（机体外接直径 0.711 m，过不去），因此采样取 8–9 根。
 - 第一根是「门柱」，中心车道 |y|≤0.25：teacher 只在画面中间带（约 ±10.9°）、
   1.5 m 内才转向；柱心 x=1.5 时相机（x≈0.2）深度约 1.1 m，**Step 0 就触发**
   一次左右选择，保证 episode 不会整集 FORWARD。
@@ -196,14 +199,15 @@ python3 sim/tools/scene_gen.py --self-check          # 100 个 seed 自检
   ≥1.3 m。任意两柱不满足缝 ≥0.9 m 则整组重采样，最多 100 次。
 - 同 seed 字节级一致（`--self-check` 核对两次 sha256）。同名 `.json` 写
   `scene_id / seed / 障碍清单 / 净空检查 / world_sha256`，供汇总 manifest 用。
-- 没做：x>5 的更远障碍（20 步行程到不了）；没有利用 4 条动作以外的连续转向
+- 没做：x>5 的更远障碍；没有利用 4 条动作以外的连续转向
   控制（teacher 的转向角由 hold 与 RTF 决定，见 4.6.2 的 RTF 说明）。
 
 ### 4.6.2 并行采集
 
 ```bash
-# 默认 --steps 20 --hold 1.0：每步实际前进约 0.18–0.28 m（随 RTF），
-# 20 步约 4–5.5 m，覆盖近组 [1.5, 4.0] 的障碍（hold=0.5 约一半，到不了）。
+# 默认 --steps 80 --hold 1.0：实测每步只前进 0.105 m（/tmp/ds200 2814 步 p50，
+# p90=0.144、max=0.237，随 RTF 漂移），穿完 x∈[1.5,5.0] 柱区要 68–76 步。
+# 旧文档写的「0.18–0.28 m/步、20 步约 5 m」是错的，实际差 2–4 倍。
 python3 sim/tools/collect_parallel.py --instances 4 --episodes-per-instance 1 \
   --out /tmp/dataset --keep-worlds
 python3 sim/tools/collect_parallel.py --instances 4 --episodes-per-instance 1 \
@@ -228,8 +232,9 @@ python3 sim/tools/collect_parallel.py --instances 4 --episodes-per-instance 1 \
 - 收尾：对每个 sim / collect 进程组 `kill -- -PGID`（SIGTERM→超时 SIGKILL），
   并只对命令行里带本次 world 路径的 ruby 兜底；**不会**用 `pkill -f 'gz sim'`
   或全局杀 ruby。
-- split 按 scene_id 隔离：`scene_id % 10 < 8 -> train`，`== 8 -> val`，
-  `== 9 -> test`；该策略写进 `collection_manifest.json`。
+- split 按**几何组**隔离（`split_manifest.py` 的固定 salt hash）：同几何永远同
+  split，与 scene_id 无关；该策略和每集的几何 gid 写进 `collection_manifest.json`。
+  旧的 `scene_id % 10` 已废弃——2000 个 seed 只有 1124 种柱布局，实测 241 组跨 split。
 - 产物布局：`<out>/<split>/<scene_id>/{actions.jsonl,oracle.jsonl,rgb_*.png,
   episode_manifest.json,scene.json}`；`<out>/collection_manifest.json` 汇总
   每个 episode 的 scene/seed/split/world_sha256/validity/耗时；失败 episode
@@ -243,9 +248,12 @@ python3 sim/tools/collect_parallel.py --instances 4 --episodes-per-instance 1 \
   `FLFFFRFFFFLLFLFLFLFL`、`RFFFFFFFFFFFFFFFFFFF`，**4/4 含非 FORWARD**，
   每条都与近组障碍交叉过（最近 0.57–1.29 m）。
 - 已知限制：订阅仍走 `gz topic -e` 子进程（未做 gz-transport 订阅直连；发布已直连，
-  见 4.5）；没有数据增强；teacher 是纯反应式（只看中间带 ±10.9°、
-  1.5 m），两根近组柱分居航线两侧时可能来回摆振并擦柱（上述 4 条中 1 条
-  12 步 `collision=true`）；collision 真值会如实记录，训练前可按需过滤。
+  见 4.5）；没有数据增强；`collect_parallel` 现在会给每集传 `--scene-meta`，
+  因此走的是柱子真值的 carrot planner（`teacher.py:plan_action`），**不再**是
+  第 4.6.1 节描述的纯反应式深度专家——那一套只在单独跑 `collect.py` 且不给
+  `--scene-meta` 时生效，manifest 的 `teacher` 字段会区分两者。
+  实测（seed 0..7 × 80 步）carrot planner 5/8 穿过 x=5.0，失败的 3 条都撞柱后
+  无法倒车（四动作里没有后退）。collision 真值会如实记录，训练前可按需过滤。
 
 ## 5. 对齐冻结的 ObservationSpec / EpisodeSchema
 

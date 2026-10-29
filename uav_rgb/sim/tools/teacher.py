@@ -99,6 +99,66 @@ def expert_action(depth, w, h, turn_dist=1.5, emergency=0.8, prev_action=None,
     return SAFE_NEUTRAL
 
 
+def ray_clear(x, y, th_deg, length, pillars, clearance, half=0.2, samples=33):
+    """从 (x,y) 沿 th_deg 走 length 米，线段是否离所有柱子的**方框表面** ≥ clearance。
+
+    不能用外接圆：0.4×0.4 方的外接圆半径 0.283 m，而车道缝隙只有 0.902 m，
+    按外接圆算会把大部分窄缝判成堵死。
+
+    采样精度：点到方框的距离是 1-Lipschitz，相邻采样点之间真实距离最多再降半个
+    间隔。samples=33 时 1.6/32 = 0.05 m 间隔 → 最坏低算 25 mm（实测统计约 14 mm）。
+    原先这里写"误差 < 1 mm"是错的。
+
+    余量（已知不足，故意保留）：机体真实外接半径 = hypot(0.13,0.22)+0.1 = 0.3555 m
+    （SDF 四个旋翼中心 ±0.13/±0.22、桨盘半径 0.1）。clearance=0.36 在最不利的
+    角点方向只剩 4.5 mm，比上面的采样误差还小。
+    为什么没有放大：实测把 clearance 提到 0.40（采样同时加密到 65）后，
+    8 场景 × 80 步的穿越率从 5/8 掉到 2/8，max|y| 从 0.69 涨到 1.86——0.902 m
+    的缝里根本不存在 0.40 净空的直线，planner 只能退回 base 并失去回中线。
+    真正的解法是**放宽车道间距**（0.902 m 缝 vs 0.711 m 机体外接直径），
+    不是继续调这个余量。见 docs/experiments/2026-10-29-teacher-traverse-ablations.md。
+    """
+    c, s = math.cos(math.radians(th_deg)), math.sin(math.radians(th_deg))
+    for i in range(samples):
+        t = length * i / (samples - 1)
+        px, py = x + t * c, y + t * s
+        for p in pillars:
+            dx = max(0.0, abs(px - p["x"]) - half)
+            dy = max(0.0, abs(py - p["y"]) - half)
+            if dx * dx + dy * dy < clearance * clearance:
+                return False
+    return True
+
+
+def plan_action(x, y, yaw_deg, pillars, lookahead=1.6, clearance=0.36,
+                y_gain=25.0, y_max=30.0, tol=10.0, turn_weight=0.25, grid=5):
+    """GT carrot planner：挑一条净空视线，代价 = 偏离目标角 + 0.25×当前转角。
+
+    深度反应式专家解不了这条走廊（60 步 × 8 场景实测只有 1 个穿过，其余卡在
+    门柱前左右摆）：它没有目标方向，转开之后只能直飞，航向一偏就斜着飞出
+    ±1.5 m 柱区。这里改用柱子真值（特权信息，只决定标签、不进学生输入）。
+
+    目标角 base = clamp(-y_gain*y, ±y_max) 把机器拉回走廊中线。**不能**简单地
+    「从 base 向外试、取第一条空视线」：净空锥很窄时它会从 +43° 一步跳到 -47°，
+    机器跟着左右各转 100° 以上、净位移为零（实测 4/8 场景这样卡死）。所以对
+    -85°..85° 每 5° 求一次代价取最小；turn_weight 只用来在同分时偏向小转角，
+    不影响「回中线」的方向偏好。全都堵就退回 base。
+    """
+    base = max(-y_max, min(y_max, -y_gain * y))
+    aim, best = base, None
+    for th in range(-85, 86, grid):
+        if not ray_clear(x, y, th, lookahead, pillars, clearance):
+            continue
+        cost = (abs(th - base)
+                + turn_weight * abs((yaw_deg - th + 180.0) % 360.0 - 180.0))
+        if best is None or cost < best:
+            aim, best = th, cost
+    err = (yaw_deg - aim + 180.0) % 360.0 - 180.0
+    if abs(err) > tol:
+        return YAW_LEFT if err < 0 else YAW_RIGHT
+    return FORWARD_SLOW
+
+
 def _make(w, h, left_d, center_d, right_d):
     """构造 w*h 深度图：左/中/右三条竖带各填一个深度值（所有行一致）。"""
     depth = []
@@ -177,6 +237,23 @@ if __name__ == "__main__":
     want = YAW_LEFT   # 三侧相同 -> 确定性地先左转
     ok = ok and got == want
     print(f"  {'ok' if got == want else 'FAIL'}  三带都 1.2m -> 转向而非停住: got {ACTIONS[got]}, want {ACTIONS[want]}")
+
+    # GT carrot planner：正前方有柱子时必须选出一条让开的视线，而不是硬顶。
+    gate = [{"x": 1.5, "y": 0.0}]
+    ok = ok and not ray_clear(0.0, 0.0, 0.0, 1.6, gate, 0.36)
+    ok = ok and ray_clear(0.0, 0.0, 0.0, 1.6, [], 0.36)
+    got = plan_action(0.0, 0.0, 0.0, gate)
+    ok = ok and got in (YAW_LEFT, YAW_RIGHT)   # 正中门柱左右对称，任一侧都对
+    print(f"  {'ok' if got in (YAW_LEFT, YAW_RIGHT) else 'FAIL'}  门柱正前方 -> 让开: got {ACTIONS[got]}")
+    plan_cases = [
+        (dict(x=0.0, y=0.0, yaw_deg=0.0, pillars=[]), FORWARD_SLOW, "无柱子 -> 前进"),
+        (dict(x=0.0, y=0.0, yaw_deg=40.0, pillars=[]), YAW_RIGHT, "航向偏左 40° -> 右转"),
+        (dict(x=0.0, y=-1.2, yaw_deg=0.0, pillars=[]), YAW_LEFT, "偏在右侧 -> 左转回中线"),
+    ]
+    for kw, want, name in plan_cases:
+        got = plan_action(**kw)
+        ok = ok and got == want
+        print(f"  {'ok' if got == want else 'FAIL'}  {name}: got {ACTIONS[got]}, want {ACTIONS[want]}")
 
     # 深度失效必须 fail closed（M5）。
     extra = [

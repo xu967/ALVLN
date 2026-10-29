@@ -15,9 +15,11 @@ export UAVRGB_GZ_PYTHON="${UAVRGB_GZ_PYTHON:-/usr/bin/python3}"
 # 幂等追加函数：只有目标目录尚未出现时才前置
 __uav_rgb_prepend() {
   local var_name="$1" dir="$2"
-  case ":${!var_name}:" in
+  # 必须用 ${!var_name-}：set -u 下引用未定义变量会直接退出 shell，
+  # 而 LD_LIBRARY_PATH 在干净容器/CI 里通常就是未定义的。
+  case ":${!var_name-}:" in
     *":$dir:"*) ;;
-    *) export "${var_name}=$dir${!var_name:+:${!var_name}}" ;;
+    *) export "${var_name}=$dir${!var_name-:+:${!var_name-}}" ;;
   esac
 }
 __uav_rgb_prepend PATH "$CUDA_HOME/bin"

@@ -2,7 +2,7 @@
 
 - 时间：2026-10-29 17:58
 - 范围：`src/tests/test_device_state.cpp`、`src/tests/device_state_test_helpers.hpp`
-- 结论：部分完成；测试源码与静态编译完成，GPU 结果等待集成负责人串行执行后记录。
+- 结论：完成；测试源码、静态编译与集成GPU/memcheck验收通过，GPU及sanitizer由集成负责人串行执行。
 
 ## 做了什么
 
@@ -53,3 +53,9 @@
 - 添加snapshot中途失败用例：正常状态的adam_m buffer替换为4字节，先提交params D2H，再因m容量不足抛异常；显式finish并销毁局部状态，之后重新导入/导出完整状态校验上下文仍可用。该用例交给集成sanitizer验证DMA生命周期。
 - 测试主文件增至259行，辅助头保持79行。重新执行 `g++ ... -fsyntax-only`，退出码0，无输出或warning。
 - 未由本agent运行追加用例的GPU/sanitizer；原因仍为集成负责人统一串行调度，源码已重新冻结。
+
+## 更新 2026-10-29 18:37：集成验证
+
+- 集成负责人确认最终CTest 16/16通过，`test_device_state`真实GPU运行通过；最新event同步错误注入和snapshot中途D2H失败清理用例均已纳入。
+- 集成负责人执行 `compute-sanitizer memcheck --leak-check full`，结果为0 errors、0 bytes leaked。
+- 真实命令、耗时、环境及原始输出统一见[首批集成验证结果](../experiments/2026-10-29-parallel-training-first-batch.md)。本agent仍未自行执行GPU或sanitizer，本轮仅据集成反馈更新文档，未修改源码。

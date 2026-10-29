@@ -102,11 +102,22 @@ add_executable(test_class_weights_train tests/test_class_weights_train.cpp)
 target_link_libraries(test_class_weights_train PRIVATE uavrgb_core)
 add_test(NAME test_class_weights_train COMMAND test_class_weights_train)
 
+# EVAL_STANDARD 强制报告的宏指标；test_trainer 只校验键名，数值靠这一项。
+add_executable(test_eval_metrics tests/test_eval_metrics.cpp)
+target_link_libraries(test_eval_metrics PRIVATE uavrgb_core)
+add_test(NAME test_eval_metrics COMMAND test_eval_metrics)
+
 # 首批并行训练基础设施；GPU 用例串行运行，CPU reader/锁包含故障注入。
 add_executable(test_device_state tests/test_device_state.cpp)
 target_link_libraries(test_device_state PRIVATE uavrgb_device)
 target_link_options(test_device_state PRIVATE "-Wl,--wrap=cudaEventSynchronize")
 add_test(NAME test_device_state COMMAND test_device_state)
+
+add_executable(test_device_transfer_errors tests/test_device_transfer_errors.cpp)
+target_link_libraries(test_device_transfer_errors PRIVATE uavrgb_device)
+target_link_options(test_device_transfer_errors PRIVATE
+  "-Wl,--wrap=cudaStreamSynchronize" "-Wl,--wrap=cudaSetDevice")
+add_test(NAME test_device_transfer_errors COMMAND test_device_transfer_errors)
 
 add_executable(test_batch_reader tests/test_batch_reader.cpp)
 target_link_libraries(test_batch_reader PRIVATE uavrgb_core)

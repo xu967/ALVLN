@@ -3,11 +3,14 @@
 //                [--resume <ckpt>] [--seed S] [--max-grad-norm G]
 //                [--class-weights auto|<w0,w1,w2,w3>] [--drop-collision]
 // 落盘：<run_dir>/results.csv、metrics.jsonl、config.json、ckpt.bin（每 epoch 覆盖）。
+#include <cmath>
 #include <cstdio>
 #include <exception>
+#include <optional>
 #include <stdexcept>
 #include <string>
 
+#include "uavrgb/run_owner.hpp"
 #include "uavrgb/trainer.hpp"
 
 namespace {
@@ -69,6 +72,24 @@ int main(int argc, char** argv) {
   if (!(cfg.max_grad_norm > 0.0f)) {
     std::fprintf(stderr, "--max-grad-norm 必须 > 0（当前 %g 会把梯度清零）\n",
                  static_cast<double>(cfg.max_grad_norm));
+    return 2;
+  }
+  // lr<=0 时 Adam 会原地不动（0）或做梯度上升（负），跑完全部 epoch 还报成功。
+  // std::stof 也接受 "nan"，它会让参数在第 1 步后变成 NaN。
+  if (!(std::isfinite(cfg.lr) && cfg.lr > 0.0f)) {
+    std::fprintf(stderr, "--lr 必须是有限正数（当前 %g）\n", static_cast<double>(cfg.lr));
+    return 2;
+  }
+
+  // 单写者锁 + 拒绝复用非空目录：否则两轮训练会往同一个 results.csv 追加、
+  // 互相覆盖 ckpt.bin，产物无法区分。--resume 明确表示续跑同一目录时才放行。
+  // 这是用法错误不是训练失败，所以单独 catch 后返回 2（与 --lr 等预检一致）；
+  // 用 optional 是因为 RunOwner 必须活到 main 结束才持有锁，不能在 try 里构造。
+  std::optional<uavrgb::RunOwner> owner;
+  try {
+    owner.emplace(cfg.out_dir, !cfg.resume.empty());
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "%s\n", e.what());
     return 2;
   }
 

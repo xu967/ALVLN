@@ -29,6 +29,7 @@ import json
 import os
 import struct
 import sys
+import tempfile
 from datetime import datetime, timezone
 
 try:
@@ -71,6 +72,10 @@ def load_episode(ep_dir, drop_collision=False):
     scene_id = man.get("scene_id")
     if scene_id is None:
         die("%s: 缺 scene_id（scene 隔离 split 必需）" % man_path)
+    # collect.py 采集中断时会写 error 并把半截 episode 留在磁盘上；
+    # 不能让没采完的 episode 静默进数据集（它会伪装成一条正常的短 episode）。
+    if man.get("error"):
+        die("%s: 采集失败（%s），不能打包" % (man_path, man["error"]))
     camera = man.get("camera") or {}
     src_w = int(camera.get("width") or 320)
     src_h = int(camera.get("height") or 240)
@@ -83,6 +88,10 @@ def load_episode(ep_dir, drop_collision=False):
         die("读取 %s 失败：%s" % (actions_path, exc))
     if not rows:
         die("%s: actions.jsonl 为空" % ep_dir)
+    expected = man.get("num_steps")
+    if isinstance(expected, int) and len(rows) != expected:
+        die("%s: actions.jsonl %d 行 != manifest num_steps %d（文件被截断？）"
+            % (actions_path, len(rows), expected))
 
     samples, seen = [], set()
     dropped = 0
@@ -98,7 +107,11 @@ def load_episode(ep_dir, drop_collision=False):
             die("%s: step %d 重复" % (actions_path, step))
         seen.add(step)
         # 碰撞步的 action_expert 是专家在撞墙后的错误标签，过滤是标签清洗而不是丢样本。
-        collision = bool(row.get("collision", False))
+        # 必须是真正的 bool：bool("false") 是 True，字符串会让过滤彻底失效。
+        collision = row.get("collision", False)
+        if not isinstance(collision, bool):
+            die("%s step %d: collision 必须是 true/false（实际 %r）"
+                % (actions_path, step, collision))
         if drop_collision and collision:
             dropped += 1
             continue
@@ -211,7 +224,6 @@ def load_frame(path, src_w, src_h, size):
 def write_dataset(out_dir, episodes, total, size, dropped=0):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "dataset.uavr")
-    tmp_path = out_path + ".tmp"
     out_w, out_h = size
 
     meta_bytes = json.dumps(build_meta(episodes, total, size, dropped),
@@ -221,8 +233,13 @@ def write_dataset(out_dir, episodes, total, size, dropped=0):
     labels_off = images_off + images_len
     meta_off = labels_off + total
 
+    # 唯一临时名：两个进程写同一个 --out 时不会共写一个文件，finally 保证
+    # Ctrl-C / 异常都会清掉（旧版只捕 SystemExit/OSError，Ctrl-C 会留下整份 .tmp）。
+    tmp_path = None
     try:
-        with open(tmp_path, "wb") as f:
+        # 放在 try 里：分区满/无权限时也要走下面的 die，而不是甩一段 traceback。
+        fd, tmp_path = tempfile.mkstemp(dir=out_dir, prefix=".dataset.", suffix=".tmp")
+        with os.fdopen(fd, "wb") as f:
             f.write(HEADER.pack(MAGIC, VERSION, HEADER_SIZE, total,
                                 out_h, out_w, OBS_C,
                                 DTYPE_UINT8, DTYPE_UINT8, 0,
@@ -237,14 +254,12 @@ def write_dataset(out_dir, episodes, total, size, dropped=0):
             f.write(bytes(labels))
             f.write(meta_bytes)
         os.replace(tmp_path, out_path)  # 原子落盘，失败不留半截数据集
-    except SystemExit:  # load_frame/die 在写盘中途失败
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
-        raise
+        tmp_path = None
     except OSError as exc:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
         die("写 %s 失败：%s" % (out_path, exc))
+    finally:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            os.remove(tmp_path)
 
     return out_path, meta_bytes
 
@@ -256,6 +271,9 @@ def parse_size(text):
         raise argparse.ArgumentTypeError("尺寸格式应为 WxH，如 160x120")
     if not (1 <= w <= 4096 and 1 <= h <= 4096):
         raise argparse.ArgumentTypeError("W/H 需在 1..4096")
+    # make_cnn 要求 H/W 是 8 的倍数；在这里挡住，别让几十分钟的预处理白跑。
+    if w % 8 != 0 or h % 8 != 0:
+        raise argparse.ArgumentTypeError("W/H 必须是 8 的倍数（模型下采样要求），如 160x120")
     return w, h
 
 

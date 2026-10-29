@@ -302,3 +302,54 @@ python3 ui/monitor.py --run-dir /tmp/run1
 
 关键决策点：**先用 200 episode（约半小时训练）验证链路，再决定要不要花 1–3 小时采 2000 条**。
 不要一步到位采完才发现模型学不动。
+
+---
+
+## 十、交接更新 2026-10-29 22:00
+
+### 现在的真实状态
+
+| 项 | 事实 |
+| --- | --- |
+| CTest | **18/18 通过**（RTX 2080 Ti，全新构建目录，零编译警告）。本文档 §一 里的 "12/12" 已过期 |
+| 专家策略 | **换了**。`collect_parallel` 会给每集传 `--scene-meta`，走 `teacher.py:plan_action`（柱子真值 carrot planner），不再是 §五 描述的深度反应式 |
+| 专家通过率 | seed 0..7 × 80 步：**5/8 穿过 x=5.0**（第 68–76 步），失败 3 条都撞柱后无法倒车 |
+| 采集默认步数 | `--steps` 默认 **80**（原 20）。实测每 FORWARD 步只前进 0.108 m，20 步只有约 2 m |
+| 训练入口保护 | `--lr` 非有限负值拒绝；`--class-weights` 空项/全 0 拒绝；非空 `--out` 拒绝（`RunOwner` 已接入） |
+| 数据可追溯 | episode manifest 新增 `teacher` / `hold_s` / `scene_meta_sha256` |
+| 工程规范 | 见 [`ENGINEERING_RULES.md`](ENGINEERING_RULES.md)（动手前必读） |
+
+### 本轮改了什么（按影响排序）
+
+1. **专家换成了 GT carrot planner**：`sim/tools/teacher.py` 新增 `ray_clear` /
+   `plan_action`；`collect.py` 新增 `--scene-meta`。真值只决定标签，不进学生输入。
+2. **修掉一批「跑完还报成功」的缺陷**：`--lr` 负数做梯度上升、`--class-weights`
+   空 token 静默变 0 权重、同一 `--out` 连跑两次产生 `1,2,1,2` 的 results.csv。
+3. **`nn_cuda.cu` 从 `std::exit` 改为抛异常**：训练中途显存出错不再直接杀进程跳过快照。
+4. **碰撞/半截数据不再静默进训练集**：`preprocess.py` 拒收 `error` 非空的 episode、
+   拒绝 `collision` 非 bool、行数与 `num_steps` 不符报错；`dataset.cpp` 在没开
+   `--drop-collision` 时打印碰撞步占比。
+5. **补测试**：`src/tests/test_eval_metrics.cpp`（宏指标，原先零覆盖）；
+   `tools/check.sh` 增加 preprocess→read_dataset 的格式契约链路。
+
+全部证据见 `docs/worklog/2026-10-29-2103-audit-fixes.md`、
+`docs/experiments/2026-10-29-teacher-traverse-ablations.md`。
+
+### 下一任最该先做的三件事
+
+1. **加 best-checkpoint**（`src/trainer.cpp:253`）。现在交付的永远是最后一轮，
+   `docs/results.md` 里实测过峰值在 ep27、交付的是 ep30。**需要先按职责拆 `trainer.cpp`**
+   （已 277 行、上限 280），再按 dev macro_f1 保存 `ckpt_best.bin`。
+2. **决定车道间距要不要放宽**。缝 0.902 m，机体外接直径 0.711 m。实测把净空从
+   0.36 提到 0.40 会把穿越率从 5/8 打到 2/8——**继续调参数没用，要改几何**。
+3. **实现 §19.3 仿真时间动作窗口**。`--hold` 是墙钟秒，同 seed 两次采集终点
+   x 分别是 1.40 / 2.36，数据集目前不可复现。
+
+### 不要重复踩的坑
+
+- `--scene-meta` 不给会**静默**退回深度专家（现在有 manifest 的 `teacher` 字段 +
+  stderr 警告，但仍然会降级）。
+- 采集必须 `DISPLAY=:20`；纯 headless 相机会 segfault。
+- 提交前逐文件确认归属，不要 `git add -A`；CMakeLists 与新测试文件必须同一次提交，
+  否则干净 clone 在 configure 阶段就失败。
+- 推送用 `../ALVLN` 完整克隆，**不要用 partial clone**（会卡死在 `git-upload-pack`）。

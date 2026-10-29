@@ -119,6 +119,10 @@ The planned pipeline (spec §3) has six interfaces: `SimObservation` (RGB + time
 
 ## 本轮维护入口
 
+**动手前先读 [`docs/ENGINEERING_RULES.md`](docs/ENGINEERING_RULES.md)**：它是执行细则
+（动手前声明范围 → 最小改动 → 全量验证 → 留痕 → git → 清理 → 汇报），
+并列出「已知未修项」，避免重复发现。本文档管环境与边界，`EVAL_STANDARD.md` 管口径。
+
 **Git**：本地仓库在 `.git`；远端是 `git@github.com:xu967/ALVLN.git` 的 `uav_rgb/` 子目录。
 推送在 `../ALVLN`（完整克隆）里做：替换 `uav_rgb/` → commit → push。重新克隆要 12 分钟，别删。
 本仓库有并发会话，提交前逐文件确认归属，不要 `git add -A`。

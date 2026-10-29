@@ -21,7 +21,8 @@ bash tools/check.sh                  # 构建 + CTest + Python 自检
 无卡时可显式执行 `bash tools/check.sh --python-only`，它会打印跳过 C++/CUDA 的说明。
 
 默认新构建目录为 `build/check`；可用 `UAV_RGB_BUILD_DIR` 覆盖。
-本轮已完成的构建在 `build/review-core`，**13/13 CTest 通过**，编译产物仅 sm_75。
+最近一次全量验证（2026-10-29，全新构建目录）**18/18 CTest 通过**，编译产物仅 sm_75。
+注意 `build/review-core` 是更早的 13 项构建，不要拿它的 `ctest -N` 当准。
 `UAV_RGB_BUILD_JOBS` 默认 8。Python 工具用 `UAV_RGB_PYTHON`，Gazebo helper 用
 `UAVRGB_GZ_PYTHON`（默认系统 `/usr/bin/python3`），避免混用 conda 与系统绑定。
 
@@ -32,17 +33,20 @@ bash tools/check.sh                  # 构建 + CTest + Python 自检
 
 ```bash
 source env.sh
-# 每次指定新的输出目录。默认 :20 的软件 GL 显示需已可用。
+# 默认 :20 的软件 GL 显示需已可用。
+# 每次必须用新的输出目录：collect_parallel 和 uavrgb_train 都会拒绝复用非空目录
+# （uavrgb_train 的 RunOwner 只认 --resume），所以这里按时间戳建一个。
+RUN="$DATA_ROOT/uav_rgb/smoke/$(date +%Y%m%d-%H%M%S)"
 "$UAV_RGB_PYTHON" sim/tools/collect_parallel.py \
   --instances 1 --episodes-per-instance 1 --steps 5 --hold 0.5 \
-  --base-seed 42 --out "$DATA_ROOT/uav_rgb/smoke/collection"
+  --base-seed 42 --out "$RUN/collection"
 "$UAV_RGB_PYTHON" tools/preprocess.py --drop-collision \
-  --out "$DATA_ROOT/uav_rgb/smoke/preprocessed" "$DATA_ROOT/uav_rgb/smoke/collection/train/42"
+  --out "$RUN/preprocessed" "$RUN/collection/train/42"
 ./build/check/uavrgb_train \
-  --data "$DATA_ROOT/uav_rgb/smoke/preprocessed/dataset.uavr" \
+  --data "$RUN/preprocessed/dataset.uavr" \
   --epochs 1 --batch 5 --lr 0.001 --class-weights auto --drop-collision \
-  --out "$DATA_ROOT/uav_rgb/smoke/train"
-DISPLAY=:20 /usr/bin/python3 ui/monitor.py --run-dir "$DATA_ROOT/uav_rgb/smoke/train"
+  --out "$RUN/train"
+DISPLAY=:20 /usr/bin/python3 ui/monitor.py --run-dir "$RUN/train"
 ```
 
 只有 train 时会明确输出 `DEV_SPLIT_EMPTY`，JSONL 的评测 `split=train`。
@@ -54,7 +58,7 @@ UI 的默认启动命令是 DEMO；原生训练器目前用上面的 CLI 启动�
 
 | 模块 | 实现与证据 | 尚缺 |
 | --- | --- | --- |
-| 数值核心与 CNN | CPU/CUDA 算子、gradcheck、Adam、100,388 参数 CNN、13 项 CTest | 设备常驻优化、更完整异常边界 |
+| 数值核心与 CNN | CPU/CUDA 算子、gradcheck、Adam、100,388 参数 CNN、18 项 CTest | 设备常驻优化、best-checkpoint、更完整异常边界 |
 | 数据读写 | 320×240 → 160×120、NCHW、碰撞过滤、读端 scene_id/区间校验 | 几何去重、数据质量门禁 |
 | 仿真采集 | 常驻订阅/发布、随机世界、独立 UUID 分区、真实 5 步 | 传感器停更故障处理、严格 sim-time 步进 |
 | 真实数据训练 | 5 帧 GPU 训练和恢复成功，权重/指标/配置已保存 | 有规模的场景隔离训练与泛化验证 |

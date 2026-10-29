@@ -44,6 +44,37 @@ struct TemporaryDirectory {
   }
   ~TemporaryDirectory() { std::error_code ec; std::filesystem::remove_all(path, ec); }
 };
+
+void test_symlink_parent_path(const std::filesystem::path& base) {
+  namespace fs = std::filesystem;
+  using namespace uavrgb;
+  fs::create_directories(base / "real/inner");
+  fs::create_directory_symlink(base / "real/inner", base / "link");
+  uavrgb_test::write_synthetic_uavr((base / "data.uavr").string(), 2, 8, 16, 1, 123);
+  uavrgb_test::write_synthetic_uavr((base / "real/data.uavr").string(), 3, 8, 16, 2, 456);
+  // Linux 先解析 link，再处理 ..；词法折叠会误读 base/data.uavr。
+  const auto path = (base / "link/../data.uavr").string();
+  const auto reference = load_uavr(path);
+  BatchReader reader(path);
+  const auto& metadata = reader.metadata();
+  check(reference.n == 3 && metadata.n == reference.n && metadata.c == reference.c &&
+        metadata.h == reference.h && metadata.w == reference.w &&
+        metadata.num_classes == reference.num_classes && metadata.labels == reference.labels &&
+        metadata.train_idx == reference.train_idx && metadata.val_idx == reference.val_idx &&
+        metadata.test_idx == reference.test_idx, "符号链接后接父目录与旧 loader 元数据一致");
+  const std::vector<std::uint32_t> indices{1, 0};
+  Tensor expected;
+  reference.load_images(indices, expected);
+  std::vector<float> actual(expected.numel());
+  reader.read_images(indices, actual.data(), actual.size());
+  check(std::memcmp(actual.data(), expected.data(), actual.size() * sizeof(float)) == 0,
+        "符号链接后接父目录的像素与旧 loader 逐 bit 一致");
+  fs::create_directories(base / "other/inner");
+  fs::copy_file(base / "real/data.uavr", base / "other/data.uavr");
+  fs::remove(base / "link");
+  fs::create_directory_symlink(base / "other/inner", base / "link");
+  rejected([&] { reader.verify_unchanged(); }, "原始路径符号链接改指向仍检出替换");
+}
 }  // namespace
 
 extern "C" ssize_t __real_pread(int fd, void* buffer, size_t count, off_t offset);
@@ -64,6 +95,7 @@ int main() {
   namespace fs = std::filesystem;
   try {
     TemporaryDirectory temporary;
+    test_symlink_parent_path(temporary.path);
     const auto source = temporary.path / "samples.uavr";
     uavrgb_test::write_synthetic_uavr(source.string(), 7, 8, 16, 5, 987);
     const auto reference = load_uavr(source.string());

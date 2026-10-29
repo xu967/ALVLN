@@ -29,6 +29,7 @@ split 策略（写入 collection_manifest.json）：按几何组而不是 scene_
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import signal
@@ -241,7 +242,8 @@ def _popen_collect(task, args, env, log_path):
            "--steps", str(args.steps), "--hold", str(args.hold),
            "--out", staging,
            "--scene-id", str(task.scene_id), "--seed", str(task.seed),
-           "--episode-id", str(task.scene_id), "--split", task.split]
+           "--episode-id", str(task.scene_id), "--split", task.split,
+           "--scene-meta", task.scene_meta_path]
     if args.policy != "teacher":
         cmd += ["--policy", args.policy]
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
@@ -292,8 +294,12 @@ def _run_episode_once(task, args, staging_root, logs_dir):
             task.validity = m.get("validity")
             if m.get("error") and not task.error:
                 task.error = str(m["error"])
+            # 三个 validity 是 AND：相机没出图时 rgb 写盘会返回 False，但行照写、步数照满，
+            # 只看 episode_executed 会把它当成功搬进 train/（preprocess 随后在缺帧上 die）。
+            validity = m.get("validity") or {}
             task.ok = (task.exit_code == 0 and task.steps_completed == args.steps
-                       and bool((m.get("validity") or {}).get("episode_executed")))
+                       and all(validity.get(k) for k in
+                               ("episode_executed", "camera_verified", "physics_verified")))
         else:
             if not task.error:
                 task.error = "episode_manifest.json 缺失"
@@ -382,10 +388,10 @@ def main():
     p.add_argument("--instances", type=int, default=4, help="并行实例数（默认 4）")
     p.add_argument("--episodes-per-instance", type=int, default=1,
                    help="每个实例顺序采的 episode 数（每个 episode 重启一次 sim）")
-    p.add_argument("--steps", type=int, default=20,
-                   help="每 episode 步数（默认 20：hold=1.0 时约 4–5.5 m 行程）")
+    p.add_argument("--steps", type=int, default=80,
+                   help="每 episode 步数（默认 80：实测每步 0.105 m，穿柱区要 68–76 步）")
     p.add_argument("--hold", type=float, default=1.0,
-                   help="每动作 wall-clock 秒（默认 1.0：每步约前进 0.18–0.28 m）")
+                   help="每动作 wall-clock 秒（行为随 RTF 漂移，不可复现）")
     p.add_argument("--out", required=True, help="汇总输出目录（必须为空/不存在）")
     p.add_argument("--base-seed", type=int, default=0,
                    help="scene_id = seed = base_seed + i*E + e")
@@ -403,8 +409,9 @@ def main():
         p.error("--episodes-per-instance must be >= 1")
     if args.steps < 1:
         p.error("--steps must be >= 1")
-    if args.hold <= 0:
-        p.error("--hold must be > 0")
+    # NaN <= 0 是 False，只判 <=0 会让 --hold nan 一路跑进 sleep 里挂死。
+    if not (math.isfinite(args.hold) and args.hold > 0):
+        p.error("--hold must be finite and > 0")
     if args.episode_timeout <= 0 or args.sim_timeout <= 0:
         p.error("timeouts must be > 0")
     for path, name in ((SCENE_GEN, "scene_gen.py"), (COLLECT, "collect.py"),

@@ -2,7 +2,9 @@
 #include "uavrgb/dataset.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <map>
@@ -138,24 +140,60 @@ void assign_split(UavrDataset& ds, const std::vector<EpisodeSpan>& eps) {
 }
 
 // meta 追加字段 collision_flags 是 N 个 '0'/'1'（preprocess.py 写），1 = 碰撞步。
-// 按全局下标从三个 split 里删掉碰撞步；缺字段直接报错，不静默当"无碰撞"。
-void drop_collision_samples(UavrDataset& ds, const std::string& meta) {
+// 字段缺失返回空串：只有真要按它过滤时才强制要求。
+std::string read_collision_flags(const std::string& meta) {
   const std::string key = "\"collision_flags\":\"";
   const std::size_t p = meta.find(key);
-  if (p == std::string::npos) {
-    fail("meta 缺 collision_flags，无法按碰撞过滤（用新版 tools/preprocess.py 重打包）");
-  }
+  if (p == std::string::npos) return {};
   const std::size_t b = p + key.size();
   const std::size_t e = meta.find('"', b);
   if (e == std::string::npos) fail("meta collision_flags 未闭合");
-  const std::string flags = meta.substr(b, e - b);
+  return meta.substr(b, e - b);
+}
+
+// 校验并统计 flags 里 '1' 的个数；格式不合规直接报错。
+std::size_t count_collisions(const UavrDataset& ds, const std::string& flags) {
   if (flags.size() != static_cast<std::size_t>(ds.n)) {
     fail("meta collision_flags 长度 != N（" + std::to_string(flags.size()) + " vs " +
          std::to_string(ds.n) + "）");
   }
+  std::size_t n = 0;
   for (char c : flags) {
     if (c != '0' && c != '1') fail("meta collision_flags 只能含 '0'/'1'");
+    if (c == '1') ++n;
   }
+  return n;
+}
+
+// 没开 --drop-collision 时，专家在撞墙那一步的标签本身就是错的，却会照样进训练集。
+// 不能静默——至少把比例打到 stderr。
+void warn_collision_kept(const UavrDataset& ds, const std::string& meta) {
+  const std::string flags = read_collision_flags(meta);
+  if (flags.empty()) return;
+  // 这里只做提示：字段格式坏了说明文件可疑，但不该把原本能训练的数据集挡在门外
+  // （以前不带 --drop-collision 时这个字段根本不解析）。硬校验留给过滤路径。
+  std::size_t n = 0;
+  try {
+    n = count_collisions(ds, flags);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "警告: %s（不影响训练，只是无法统计碰撞步）\n", e.what());
+    return;
+  }
+  if (n == 0) return;
+  std::fprintf(stderr,
+               "警告: 数据集中 %zu/%zu 步 collision=true（%.1f%%），专家在这些帧上的标签是错的；"
+               "加 --drop-collision 才会剔除\n",
+               n, flags.size(),
+               100.0 * static_cast<double>(n) / static_cast<double>(flags.size()));
+}
+
+// 按全局下标从三个 split 里删掉碰撞步；缺字段直接报错，不静默当"无碰撞"。
+void drop_collision_samples(UavrDataset& ds, const std::string& meta) {
+  const std::string flags = read_collision_flags(meta);
+  if (flags.empty()) {
+    fail("meta 缺 collision_flags，无法按碰撞过滤（用新版 tools/preprocess.py 重打包）");
+  }
+  count_collisions(ds, flags);
   auto drop = [&](std::vector<std::uint32_t>& idx) {
     idx.erase(std::remove_if(idx.begin(), idx.end(),
                              [&](std::uint32_t i) { return flags[i] == '1'; }),
@@ -218,7 +256,11 @@ UavrDataset load_uavr(const std::string& path, const LoadOptions& opts) {
   read_exact(ds.file, meta_off, meta.data(), meta.size(), "meta 区");
   if (str_field(meta, "split_policy") != "scene_id") fail("split_policy 必须为 scene_id");
   assign_split(ds, parse_episodes(meta));
-  if (opts.drop_collision) drop_collision_samples(ds, meta);
+  if (opts.drop_collision) {
+    drop_collision_samples(ds, meta);
+  } else {
+    warn_collision_kept(ds, meta);
+  }
   return ds;
 }
 

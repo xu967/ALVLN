@@ -41,6 +41,7 @@ RGB 仍然是**动作前**的观测（M1：rgb_ts < action_start_ts），动作�
 """
 import argparse
 import base64
+import hashlib
 import json
 import math
 import os
@@ -50,8 +51,8 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from teacher import (expert_action, SAFE_NEUTRAL, FORWARD_SLOW, YAW_LEFT, YAW_RIGHT,
-                     ACTIONS)
+from teacher import (expert_action, plan_action, SAFE_NEUTRAL, FORWARD_SLOW,
+                     YAW_LEFT, YAW_RIGHT, ACTIONS)
 import gz_io
 import save_frame
 
@@ -510,7 +511,7 @@ def take_off(pose_sub, publisher, z_target=Z_TARGET, timeout=30.0):
 # ---------------------------------------------------------------- 单步
 
 def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
-                prev_action=None, prev_rgb_ts=0):
+                prev_action=None, prev_rgb_ts=0, pillars=None):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。"""
     t_step = time.perf_counter()
 
@@ -540,8 +541,17 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     pose_before, _, yaw_before = _pose_parts(pose_msg)
 
     if policy == "teacher":
-        # 传 prev_action 启用滞回，避免左右摆振污染标签。
-        action = expert_action(d, w, h, prev_action=prev_action)
+        if pillars:
+            # 有柱子真值就用 carrot planner：真值只决定标签，不进学生输入。
+            # 位姿缺失时不能悄悄退回深度专家——manifest 已经记成 plan_action 了，
+            # 混进去的深度专家标签事后看不出来。宁可让这一步失败。
+            if not pose_before:
+                return None, "carrot planner 需要位姿真值，但该步 pose 缺 position"
+            action = plan_action(pose_before["x"], pose_before["y"], yaw_before,
+                                 pillars)
+        else:
+            # 没有真值就退回深度反应式专家（传 prev_action 启用滞回）。
+            action = expert_action(d, w, h, prev_action=prev_action)
     else:  # policy == "forward": 盲策略（恒定前进），用于撞柱/基线对照
         action = FORWARD_SLOW
     t_io = time.perf_counter()
@@ -660,9 +670,11 @@ def _median(xs):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--steps", type=int, default=20)
+    # 默认 80：实测每个 FORWARD 步只前进 0.105 m（/tmp/ds200 2814 步 p50），
+    # 柱区 x∈[1.5, 5.0]，穿过去要 68–76 步。20 步只有约 2 m，落在柱区外面。
+    p.add_argument("--steps", type=int, default=80)
     p.add_argument("--out", required=True)
-    p.add_argument("--hold", type=float, default=0.5,
+    p.add_argument("--hold", type=float, default=1.0,
                    help="每动作持续时间（秒，wall-clock；结束立即发零速）")
     p.add_argument("--no-takeoff", action="store_true")
     p.add_argument("--policy", choices=("teacher", "forward"), default="teacher",
@@ -672,14 +684,38 @@ def main():
     p.add_argument("--episode-id", type=int, default=None, help="EpisodeMeta.episode_id（默认=seed）")
     p.add_argument("--split", choices=("train", "val", "test"), default="train")
     p.add_argument("--version", default="1", help="EpisodeMeta.version（采集器版本）")
+    p.add_argument("--scene-meta", default=None,
+                   help="scene_gen 产出的场景 JSON；给了就用柱子真值的 carrot planner，"
+                        "否则用深度反应式专家")
     args = p.parse_args()
-    if args.hold <= 0:
-        p.error("--hold must be > 0")
+    # NaN <= 0 是 False，只判 <=0 会让 --hold nan 一路跑进 sleep 里挂死。
+    if not (math.isfinite(args.hold) and args.hold > 0):
+        p.error("--hold must be finite and > 0")
     if args.steps < 1:
         p.error("--steps must be >= 1")
     if os.path.isdir(args.out) and os.listdir(args.out):
         p.error(f"--out {args.out} 不是空目录；请换新目录（或先清空）")
     os.makedirs(args.out, exist_ok=True)
+    pillars = None
+    scene_meta_sha = None
+    if args.scene_meta:
+        with open(args.scene_meta, "rb") as f:
+            raw_meta = f.read()
+        scene_meta_sha = hashlib.sha256(raw_meta).hexdigest()
+        pillars = json.loads(raw_meta.decode("utf-8"))["pillars"]
+        for k, pl in enumerate(pillars):
+            if "x" not in pl or "y" not in pl:
+                p.error(f"--scene-meta {args.scene_meta}: pillars[{k}] 缺 x/y")
+    # 标签来自哪个教师必须进 manifest：两种策略产出的数据长得一模一样，
+    # 事后只能靠这个字段区分（旧版没有任何记录）。
+    if args.policy == "forward":
+        teacher_kind = "forward"
+    elif pillars:
+        teacher_kind = "plan_action"
+    else:
+        teacher_kind = "expert_action"
+        print("警告: 没给 --scene-meta，退回深度反应式专家；manifest.teacher=expert_action",
+              file=sys.stderr)
 
     actions_path = os.path.join(args.out, "actions.jsonl")
     oracle_path = os.path.join(args.out, "oracle.jsonl")
@@ -726,7 +762,7 @@ def main():
 
         for i in range(args.steps):
             r, reason = collect_one(args.out, i, args.hold, args.policy, subs,
-                                    publisher, prev_action, prev_rgb_ts)
+                                    publisher, prev_action, prev_rgb_ts, pillars)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -745,6 +781,8 @@ def main():
                     # 配对用的动作前位姿帧；动作后的 oracle 位姿只在 oracle.jsonl。
                     "pose_ts": r["action_start_ns"],
                     "pose_rgb_gap_ns": pose_gap_ns,
+                    "dyaw_deg": r["dyaw_deg"],
+                    "displacement_m": r["displacement_m"],
                     "action_start_ns": r["action_start_ns"]}) + "\n")
             actions_f.flush()
             oracle_f.write(json.dumps({"step": r["step"],
@@ -821,6 +859,13 @@ def main():
             "seed": args.seed,
             "version": args.version,
             "split": args.split,
+            # 标签由哪个教师产生：forward=盲策略对照，expert_action=深度反应式，
+            # plan_action=柱子真值 carrot planner。缺这个字段就无法事后区分数据集。
+            "teacher": teacher_kind,
+            # hold 是墙钟秒、行为随 RTF 漂移：同 scene 的 0.5 与 1.0 两批数据
+            # 不记下这个数就分不出来。
+            "hold_s": args.hold,
+            "scene_meta_sha256": scene_meta_sha,
             "actions_ref": "actions.jsonl",
             "oracle_ref": "oracle.jsonl",
             "camera": camera,

@@ -67,6 +67,8 @@
              "source":"actions.jsonl:action_expert"},
   "resize": {"method":"bilinear","from":[320,240],"to":[160,120],"aspect":"preserve"},
   "split_policy": "scene_id",
+  "collision_flags": "000000000000000",
+  "collision_dropped": 0,
   "splits": {"train":10,"val":5,"test":0},
   "num_samples": 15,
   "scenes": [{"scene_id":42,"split":"train"},{"scene_id":43,"split":"val"}],
@@ -79,6 +81,11 @@
 
 - `resize.aspect`：`preserve` = 目标纵横比与原图相同（如 160×120、224×168）；
   `squash` = 强行拉伸到目标方形/异形（如 128×128）。
+- `collision_flags`：N 个 `'0'/'1'` 字符，与**全局样本顺序**对齐，`'1'` = 该步
+  `actions.jsonl` 的 `collision=true`。`LoadOptions.drop_collision=true` 时训练器
+  按它剔除；缺失该字段会直接报错，不会静默当成"无碰撞"。`collision_dropped`
+  是打包时用 `--drop-collision` 已经丢掉的步数（此时 flags 里不会再出现 `'1'`）。
+  为什么重要：专家在撞墙那一步的动作本身就是错的，不剔除等于把错标签喂给学生。
 - `split_policy` 恒为 `scene_id`：预处理强制**同一 scene_id 只能属于一个 split**，
   冲突直接报错退出。训练器按 `episodes[].sample_start/sample_count/split`
   切出 train/val/test，并独立校验 scene_id 不跨 split、区间不重叠且覆盖全部样本。

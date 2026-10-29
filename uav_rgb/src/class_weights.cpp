@@ -35,9 +35,11 @@ std::vector<float> parse_explicit(const std::string& spec) {
     } catch (const std::exception&) {
       used = 0;
     }
-    if (used != tok.size() || !(v >= 0.0f) || !std::isfinite(v)) {
+    // tok 为空时必须单独判：std::stof("") 抛异常后 used=0，而 0 == tok.size()，
+    // 原条件放行，空串会静默变成一个 0 权重，那个类从此拿不到任何梯度。
+    if (tok.empty() || used != tok.size() || !(v >= 0.0f) || !std::isfinite(v)) {
       throw std::invalid_argument("--class-weights 非法权重 '" + tok +
-                                  "'（应为非负有限数字）");
+                                  "'（应为非负有限数字，且不能有空项）");
     }
     w.push_back(v);
     if (e == std::string::npos) break;
@@ -97,6 +99,10 @@ std::vector<float> resolve_class_weights(const std::string& spec, const UavrData
     throw std::invalid_argument("--class-weights 需要 " + std::to_string(ds.num_classes) +
                                 " 个权重（实际 " + std::to_string(w.size()) + "）");
   }
+  // 全 0 的加权求和恒为 0，loss 归一化时除零；与其训练到第一个 batch 才炸，不如入口就拒绝。
+  bool any = false;
+  for (float v : w) any = any || v > 0.0f;
+  if (!any) throw std::invalid_argument("--class-weights 不能全为 0（每个样本权重都是 0）");
   return w;
 }
 

@@ -8,18 +8,21 @@
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
+#include <string>
 
 namespace uavrgb {
 namespace {
 
-// 统一 CUDA API 错误检查：失败即打印并退出，避免静默假结果。
+// 统一 CUDA API 错误检查：抛 runtime_error 而不是 std::exit——与 conv/linear/softmax
+// 三个 .cu 保持一致。训练中途显存或驱动出错时栈上 RAII 能正常析构，train_main 的
+// catch 能收到，`save_checkpoint` 不会被静默跳过。
 #define CUDA_CHECK(call)                                                        \
   do {                                                                          \
     cudaError_t err_ = (call);                                                  \
     if (err_ != cudaSuccess) {                                                  \
-      std::fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__,        \
-                   cudaGetErrorString(err_));                                   \
-      std::exit(EXIT_FAILURE);                                                  \
+      throw std::runtime_error(std::string("CUDA error ") + __FILE__ + ":" +    \
+                               std::to_string(__LINE__) + ": " +                \
+                               cudaGetErrorString(err_));                       \
     }                                                                           \
   } while (0)
 
@@ -27,8 +30,8 @@ namespace {
 void check_after_kernel(const char* name) {
   cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
-    std::fprintf(stderr, "CUDA kernel %s: %s\n", name, cudaGetErrorString(err));
-    std::exit(EXIT_FAILURE);
+    throw std::runtime_error(std::string("CUDA kernel ") + name + ": " +
+                             cudaGetErrorString(err));
   }
   CUDA_CHECK(cudaDeviceSynchronize());
 }
@@ -159,6 +162,8 @@ PoolDims check_pool_dims(const MaxPool2d& m, const Tensor& x) {
 
 Tensor relu_forward_cuda(const Tensor& x) {
   const int total = static_cast<int>(x.numel());
+  // 0 个元素时不能 launch：grid 会算成 0，cudaErrorInvalidConfiguration。
+  if (total == 0) return Tensor::zeros(x.dims());
   DeviceBuf<float> d_x(static_cast<std::size_t>(total) * sizeof(float));
   DeviceBuf<float> d_y(static_cast<std::size_t>(total) * sizeof(float));
   CUDA_CHECK(cudaMemcpy(d_x.p, x.data(), static_cast<std::size_t>(total) * sizeof(float),
@@ -174,6 +179,7 @@ Tensor relu_forward_cuda(const Tensor& x) {
 Tensor relu_backward_cuda(const Tensor& x, const Tensor& dy) {
   if (x.dims() != dy.dims()) throw std::invalid_argument("relu_backward_cuda: x/dy 形状不一致");
   const int total = static_cast<int>(x.numel());
+  if (total == 0) return Tensor::zeros(x.dims());
   DeviceBuf<float> d_x(static_cast<std::size_t>(total) * sizeof(float));
   DeviceBuf<float> d_dy(static_cast<std::size_t>(total) * sizeof(float));
   DeviceBuf<float> d_dx(static_cast<std::size_t>(total) * sizeof(float));
@@ -194,6 +200,12 @@ MaxPoolResult maxpool2d_forward_cuda(const MaxPool2d& m, const Tensor& x) {
   const PoolDims d = check_pool_dims(m, x);
   const int total_in = d.n * d.c * d.h * d.wd;
   const int total_out = d.n * d.c * d.oh * d.ow;
+  if (total_out == 0) {
+    MaxPoolResult empty;
+    empty.y = Tensor::zeros({d.n, d.c, d.oh, d.ow});
+    empty.argmax = Tensor::zeros({d.n, d.c, d.oh, d.ow});
+    return empty;
+  }
   DeviceBuf<float> d_x(static_cast<std::size_t>(total_in) * sizeof(float));
   DeviceBuf<float> d_y(static_cast<std::size_t>(total_out) * sizeof(float));
   DeviceBuf<float> d_arg(static_cast<std::size_t>(total_out) * sizeof(float));
@@ -235,6 +247,7 @@ Tensor maxpool2d_backward_cuda(const MaxPool2d& m, const Tensor& x, const Tensor
   }
   const int total_in = d.n * d.c * d.h * d.wd;
   const int total_out = d.n * d.c * d.oh * d.ow;
+  if (total_out == 0) return Tensor::zeros(x.dims());
   DeviceBuf<float> d_arg(static_cast<std::size_t>(total_out) * sizeof(float));
   DeviceBuf<float> d_dy(static_cast<std::size_t>(total_out) * sizeof(float));
   DeviceBuf<float> d_dx(static_cast<std::size_t>(total_in) * sizeof(float));
@@ -261,6 +274,7 @@ void adam_step_cuda(Adam& st, Tensor& param, const Tensor& grad) {
   const float bc1 = static_cast<float>(1.0 - std::pow(static_cast<double>(st.beta1), st.t));
   const float bc2 = static_cast<float>(1.0 - std::pow(static_cast<double>(st.beta2), st.t));
   const int total = static_cast<int>(param.numel());
+  if (total == 0) return;  // st.t 已自增，与 CPU 参考的步数一致
   const std::size_t bytes = static_cast<std::size_t>(total) * sizeof(float);
   DeviceBuf<float> d_p(bytes), d_g(bytes), d_m(bytes), d_v(bytes);
   CUDA_CHECK(cudaMemcpy(d_p.p, param.data(), bytes, cudaMemcpyHostToDevice));
@@ -281,6 +295,7 @@ float global_grad_norm_cuda(const std::vector<const Tensor*>& grads) {
   for (const Tensor* t : grads) {
     if (!t) throw std::invalid_argument("global_grad_norm_cuda: 张量指针为空");
     const int total = static_cast<int>(t->numel());
+    if (total == 0) continue;
     DeviceBuf<float> d_x(static_cast<std::size_t>(total) * sizeof(float));
     CUDA_CHECK(cudaMemcpy(d_x.p, t->data(), static_cast<std::size_t>(total) * sizeof(float),
                           cudaMemcpyHostToDevice));
@@ -301,6 +316,7 @@ float clip_grad_norm_cuda(std::vector<Tensor*> grads, float max_norm) {
   if (coef >= 1.0f) return coef;
   for (Tensor* t : grads) {
     const int total = static_cast<int>(t->numel());
+    if (total == 0) continue;
     const std::size_t bytes = static_cast<std::size_t>(total) * sizeof(float);
     DeviceBuf<float> d_x(bytes);
     CUDA_CHECK(cudaMemcpy(d_x.p, t->data(), bytes, cudaMemcpyHostToDevice));
