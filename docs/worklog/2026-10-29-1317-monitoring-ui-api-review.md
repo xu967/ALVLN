@@ -197,6 +197,34 @@
 - 初始提交无法替代真实开发历史；后续修复应从该提交开始正常增量提交。
 - 本地提交身份为 CodeBuddy，若需要归属个人或团队，应在后续提交前调整仓库级 user.name/user.email。
 
+## 更新 2026-10-29 2026-10-29 17:19
+
+### 做了什么
+
+- 为 xu967/ALVLN 私有备份生成专用 Ed25519 密钥 ~/.ssh/alvln_github，并配置 github.com 使用该密钥。
+- 将仓库级提交身份改为 xu967 <15651293197@163.com>。
+- 配置 origin 为 git@github.com:xu967/ALVLN.git。
+- 验证 github.com 主机 Ed25519 指纹为 SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU，与 GitHub 官方文档一致。
+
+### 没做什么
+
+- 尚未推送：新公钥还未添加到 GitHub 账号或 ALVLN 仓库 Deploy key，SSH 返回 Permission denied (publickey)。
+- 没有读取、输出或提交私钥内容；私钥仅保存在 ~/.ssh/alvln_github。
+
+### 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| GitHub 主机指纹 | 通过：与官方 Ed25519 指纹一致 |
+| SSH 公钥认证 | 未通过：Permission denied (publickey)，等待添加公钥 |
+| git remote | 已配置：origin -> git@github.com:xu967/ALVLN.git |
+| git push | 未执行：认证尚未完成 |
+
+### 风险与遗留
+
+- 必须将公钥添加为账号 SSH key 或 ALVLN 仓库的 Deploy key，并授予写权限。
+- 远端完成后仍需执行首次 push，届时本地提交才真正形成 GitHub 备份。
+
 ## 更新 2026-10-29 16:38
 
 ### 做了什么
