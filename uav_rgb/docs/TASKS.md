@@ -10,7 +10,7 @@
 
 | ID | P | 状态 | owner | 文件域 | 任务 | 验收 |
 | --- | --- | --- | --- | --- | --- | --- |
-| T7-R | P0 | **todo**（上一轮 14/20 被会话中断） | code-4b | `sim/tools/eval_closed_loop.py`、`docs/` | 重跑前 preflight（GPU 空闲、无 `gz sim`/`ruby` 残留、无并发 CTest/训练），`setsid` + `--keep-work` 到 `eval-student-r01b`（命令见 HANDOFF §4.1） | 20/20 集 + `eval.json`；与旧 `eval-student` 对比；一页结论 + 失败分类（SAFE 悬停/过线碰撞/false-forward）；`0.90` 标明仅 R01 前；更新 T7 实验记录/worklog/TASKS/CLAUDE.md |
+| T7-R | P0 | **done**（2026-10-31 00:00） | code-4b | `sim/tools/eval_closed_loop.py`、`docs/` | dispatch 语义 20 seed 复跑：SR 0.55（11/20），collision 0.45，false_forward 0.30；A/B observation 2/2 vs dispatch 0/2 | 见 `experiments/2026-10-31-t7-r01b-and-window-ab.md`；0.90 只适用于 observation 语义 |
 | C0 | P0 | done | code-3b + code-4b | git | 清 37 文件积压，按主题提交 | 工作树干净；5 个主题提交 |
 | E6-1 | P0 | done | code-4b | `src/infer_main.cpp`、`src/CMakeLists.txt`、`src/tests/` | 常驻推理进程：stdin 收 H×W RGB uint8，stdout 回 action/probs/infer_ms | 加载现有 ckpt；同帧 100 次输出一致；JSON 可解析（`2026-10-29-2226-infer-process.md`） |
 | E6-2 | P0 | done | code-4b | `sim/tools/eval_closed_loop.py`、`sim/tools/collect.py` | 复用 collect 的 gz 连接，学生动作闭环飞，碰撞即停 | 1 个 test 场景跑通并输出 JSON（`2026-10-29-2232-closed-loop-eval.md`） |
@@ -32,6 +32,8 @@ D5/G1–G6 暂缓；V8、CF-Drone、SG2002、AerialVLN-S 官方基准冻结。
 | ID | P | 状态 | owner | 任务 | 验收 |
 | --- | --- | --- | --- | --- | --- |
 | D-STACK | P0 | 待拍板 | 用户 | 语言模型栈：全自研 C++/CUDA，还是 Python 原型 + C++ 部署 | 选定后再开 L0/L2；未定不写模型代码 |
+| T4 | P0 | **doing** | code-4b | 完整 20 seed observation v1 基线（`eval-student-v1-observation`），作为当前环境 v1 数字 | `eval.json` + 与历史 0.90 对比；标明与 dispatch 不可混报 |
+| T5b | P0 | todo | code-4b | dispatch 语义全量重采 599 集（`t5b-dispatch-20261031`）→ preprocess → 训练 → 闭环复评 | audit 全 PASS；与 v1 对比；新执行合同 |
 | B1 | P1 | 待立项 | code-4b | 训练数据替换防护：把 `batch_reader.cpp` 的 `verify_unchanged` 接入 trainer，或训练启动时对 open fd 做 fstat 校验 | 训练中覆盖 `.uavr` 被拒/检测；负例测试通过 |
 | B4 | P1 | 待立项 | code-4b | infer 语义对拍：已知像素图案 → logits 与 NCHW 直喂一致；`infer_main` 子进程冒烟 | 通道/数值对拍通过；在 L0 改 TEXT 协议前完成 |
 | D-GEODUP | P3 | 待立项 | code-4b | 几何近重复检测：3 位舍入 gid 会把只差 5 mm 的场景当不同几何（T7-R 实测 seed 49/57 动作逐位相同）；按柱坐标容差聚类，报告 test 内近重复组 | 近重复组清单 + 20 seed 独立性结论；不阻塞 T7 |

@@ -3,7 +3,8 @@
 - 目标：把 T7 baseline 钉死 → 确定执行语义合同 → 建立语言条件 VLN 的最小闭环。
 - 原则：**按依赖编排，不设人为时间截止**；同一时刻只跑一个 Gazebo/GPU 任务；
   长任务可跨小时/跨天，每过一个 gate 汇报、提交、推送。
-- 模型：禁止用 flash/haiku 等低配模型做审核/规划/改代码（见 personal-skill）。
+- 模型：**禁止用 DeepSeek Pro**；审核/规划/改代码用 flash 档或当前会话主模型
+  （见 personal-skill）。
 - 当前状态：T7-R 进行中（`eval-student-r01b`）；旧 SR 0.90 是 R01 前语义；
   `2bfaf57`/`e654d93` 已提交，ALVLN `0499f0f` 已 push。B1/B4/D-GEODUP 已入任务板。
 

@@ -179,7 +179,8 @@ def run_episode(seed, args, workdir, seen_gids):
                "--policy", args.policy,
                "--stop-on-collision",
                "--scene-id", str(seed), "--seed", str(seed),
-               "--scene-meta", meta_path, "--split", split]
+               "--scene-meta", meta_path, "--split", split,
+               "--window-from", args.window_from]
         if args.policy == "student":
             cmd += ["--student-ckpt", args.ckpt]
             if args.infer_bin:
@@ -228,6 +229,10 @@ def main():
                    help="成功评测的 episode 数（缺省：给了 --seeds 用其个数，否则 3）")
     p.add_argument("--steps", type=int, default=80, help="每集最大步数")
     p.add_argument("--hold", type=float, default=1.0, help="每动作仿真时间秒")
+    p.add_argument("--window-from", choices=("dispatch", "observation"),
+                   default="dispatch",
+                   help="动作窗口起点：dispatch=派发位姿（默认，R01）；"
+                        "observation=观测位姿（旧语义，仅诊断/兼容旧数据）")
     p.add_argument("--split", choices=("train", "val", "test"), default="test")
     p.add_argument("--base-seed", type=int, default=0)
     p.add_argument("--max-seeds", type=int, default=500,

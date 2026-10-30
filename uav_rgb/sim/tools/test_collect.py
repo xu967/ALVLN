@@ -237,8 +237,8 @@ def stale_pose_fails():
     return row, err
 
 
-def delayed_inference_window():
-    """推理期间仿真推进：执行窗口必须从派发时刻算，不能从观测帧算。
+def delayed_inference_window(window_from="dispatch"):
+    """推理期间仿真推进：dispatch 从派发时刻算，observation 保留旧语义。
 
     回归 R01：旧实现 action_start_ns=观测戳(10.2)，act 期间仿真到 11.2，
     hold=1.0 的终点 11.2 已经过去，零速会和动作在同一仿真时刻发出。
@@ -274,12 +274,18 @@ def delayed_inference_window():
             patch.object(collect, "write_rgb_png", return_value=(True, None)), \
             patch.object(collect.time, "sleep", side_effect=advance):
         row, err = collect.collect_one(d, 0, 1.0, "student", subs, pub,
-                                       student=Student())
-    return (err is None and row is not None
-            and row["pose_before_ts"] == 10_200_000_000
-            and row["action_start_ns"] == 11_200_000_000
+                                       student=Student(), window_from=window_from)
+    if err is not None or row is None:
+        return False
+    if window_from == "dispatch":
+        return (row["pose_before_ts"] == 10_200_000_000
+                and row["action_start_ns"] == 11_200_000_000
+                and row["sim_dt"] == 1.0
+                and [s for s, _ in pub.sent] == [11_200_000_000, 12_200_000_000])
+    return (row["pose_before_ts"] == 10_200_000_000
+            and row["action_start_ns"] == 10_200_000_000
             and row["sim_dt"] == 1.0
-            and [s for s, _ in pub.sent] == [11_200_000_000, 12_200_000_000])
+            and [s for s, _ in pub.sent] == [11_200_000_000, 11_200_000_000])
 
 
 def main():
@@ -327,7 +333,9 @@ def main():
     check("动作窗口内 contact 退出 -> 该步失败",
           row is None and "动作窗口内 contact" in (err or ""))
     check("起飞前 contact 退出 -> 拒绝起飞", dead_contact_takeoff_fails())
-    check("推理延迟不缩短执行窗口", delayed_inference_window())
+    check("推理延迟不缩短执行窗口（dispatch）", delayed_inference_window("dispatch"))
+    check("observation 语义保留旧行为（窗口被推理吃掉）",
+          delayed_inference_window("observation"))
 
     print(f"test_collect: {passed} 项通过")
     return 0

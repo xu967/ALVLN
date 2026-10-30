@@ -1,9 +1,9 @@
 # uav_rgb 交接文档
 
-- 更新时间：2026-10-30 22:35
-- **当前状态**：T1–T7 已完成；D4（depth/contact 停更门禁）已完成；
-  **T7 同版本复跑上一轮在 14/20 集被会话中断，待用 `eval-student-r01b` 重跑**，见 §四 4.1。
-  旧 T7 的 `SR 0.90` 是 R01 修复前的数字，不能直接当作当前代码的结论。
+- 更新时间：2026-10-31 00:25
+- **当前状态**：T1–T7 已完成；D4 已完成；**T7-R（dispatch）完成 `SR 0.55`**；
+  A/B 证明 R01 窗口语义是主因（observation 2/2 vs dispatch 0/2）。旧 `SR 0.90`
+  只适用于 observation 语义；完整 observation v1 基线在跑。见 §四 4.1。
 - **接手第一件事**：读完本文件 → 读 `docs/TASKS.md` → 读 `docs/ENGINEERING_RULES.md`
 - **口径唯一来源**：`docs/EVAL_STANDARD.md`。报任何数字前必读，违反口径的数字等于造假。
 
@@ -83,54 +83,39 @@ nvidia-smi -L                                   # 先判定 GPU 模式，别凭�
 > 更新时间：2026-10-30 21:55。T1 之前的「闭环 0 / 20」「公开数据 SAFE=0」等
 > 历史基线已移出本节，需要时看 `docs/experiments/` 与 `docs/worklog/`。
 
-### 4.1 当前唯一 L3 任务（待重跑）
+### 4.1 T7-R 完成 + 动作窗口语义 A/B
 
-**T7 同版本复跑**。旧 T7 的 `SR 0.90` 是在 R01 修复前测的；R01 把动作窗口起点
-从观测戳改为派发位姿，D4 又加了 depth/contact 门禁。旧数字不能代表当前代码，
-所以用同一 20 个冻结 test seed、同一 `ckpt_best.bin` 再跑一遍。
+**T7 同版本复跑（dispatch 默认）已完成**：20/20 集，`SR 0.55`（11/20）、
+collision 0.45、false_forward 0.30、stuck 0；产物
+`$BASE/eval-student-r01b/eval.json`，实验记录
+`experiments/2026-10-31-t7-r01b-and-window-ab.md`。
 
-**状态（2026-10-30 22:35）**：上一轮 21:29 启动，在 14/20 集被会话结束连带杀掉，
-`eval-student-r01/` 为空、没有 `eval.json`；日志停在 seed 116。中间快照
-7 成功 / 7 碰撞**不是结论**。下一步用新目录 `eval-student-r01b` 重跑，必须
-加 `--keep-work` 保留逐集原始 `actions.jsonl`/位姿，进程用 `setsid` 脱离会话。
-
-```bash
-cd /root/claude-code-backup-20261028/code/uav_rgb && source env.sh
-BASE=/root/rivermind-data/uav_rgb/t6-full-1640
-mkdir -p "$BASE/tmp"
-setsid nohup env DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg TMPDIR="$BASE/tmp" \
-  "$UAV_RGB_PYTHON" sim/tools/eval_closed_loop.py --policy student \
-  --ckpt "$BASE/run/ckpt_best.bin" --steps 80 --hold 1.0 --split test \
-  --seeds 23,25,36,45,48,49,50,54,57,84,88,99,114,116,129,137,147,171,173,180 \
-  --keep-work --out "$BASE/eval-student-r01b" \
-  > "$BASE/eval-student-r01b.log" 2>&1 < /dev/null &
-```
+**A/B（同一 ckpt、同一环境、紧邻运行）**：`observation` 语义 seed 49/57
+**2/2 成功**；`dispatch` 语义 **0/2 碰撞**。推理 p50 两次都约 11 ms，
+排除资源竞争。结论：**R01 的动作窗口语义是 0.90 → 0.55 的主因**；旧模型
+训练在 observation 数据上，dispatch 评测是分布外。
 
 | 项 | 值 |
 | --- | --- |
-| 产物 | `$BASE/eval-student-r01b/eval.json`；原始轨迹 `$BASE/eval-student-r01b/.work/` |
-| 日志 | `$BASE/eval-student-r01b.log` |
-| 预计 | 约 1 h（旧 T7 同规模 58 min） |
-| 上一轮 | 21:29 启动，14/20 集被会话中断；7 成功/7 碰撞，**不是结论** |
+| 旧 T7（observation 语义） | SR 0.90（18/20）；collision 0.05；p50 40.4 ms |
+| T7-R（dispatch 语义） | SR 0.55（11/20）；collision 0.45；p50 10.9 ms |
+| A/B observation | seed 49/57，2/2 成功 |
+| A/B dispatch | seed 49/57，0/2 碰撞 |
 
-**跑完后的动作**（按顺序）：
+**下一步（不设时间截止）**：
 
-1. 读 `eval.json`，与旧 `eval-student/eval.json` 对比 `success_rate` /
-   `collision_rate` / `stuck_rate` / `false_forward_rate` / 动作分布 / p50/p95。
-2. 若 SR 明显低于 0.90，先看 `.work/` 的逐步动作与位姿、日志里的 RTF/推理耗时，
-   区分「资源竞争」与「R01 窗口语义变化」；不要先改模型。若确认是窗口语义，
-   正确做法是用 R01 语义重采 T5 数据并重训，不是把窗口调回去。
-3. 在 `docs/experiments/2026-10-30-t7-closed-loop.md` **追加**
-   `## 更新 2026-10-30 <时间>：R01/D4 同版本复跑`，旧结论保留并标明适用版本。
-4. 更新 `docs/TASKS.md`、本文件 §四、`CLAUDE.md`；写 worklog。
-5. 向用户汇报后再决定 **T8** 还是 **D5**，不要自行开工。
+1. 跑完整 20 seed 的 **observation v1 基线**（`eval-student-v1-observation`），
+   作为当前环境的 v1 数字；历史 0.90 来自不同负载环境，不能直接当现值。
+2. 启动 **T5b 全量重采**（dispatch 语义，新目录 `t5b-dispatch-20261031`），
+   再 preprocess → 训练 → 闭环复评；dispatch 是新的执行合同。
+3. T5b 采集期间只做 L0（不改 `collect.py`/`collect_parallel.py`/`scene_gen.py`/
+   `teacher.py`/`gz_io.py`），采集结束后再改 collect 的 instruction 字段。
+4. 数字口径：v1 = observation 语义；dispatch 数字必须标注「新执行合同」，
+   两套数字禁止混报。seed 49/57 近重复几何（差 5 mm）记入 D-GEODUP。
 
 **禁止**：同时启动第二个 Gazebo 采集/评测/训练；先 `mkdir` 输出目录
 （`eval_closed_loop.py` 拒绝非空目录）。日志按集 flush，日志不动不等于卡死，
 先 `ps -p <pid>`。
-
-上一轮已确认：进程退出后没有 `eval.json`，`ps` 无 `gz sim` / `gz-transport-topic`
-残留。重跑不要覆盖 `eval-student-r01`，用新目录 `eval-student-r01b`。
 
 ### 4.2 已完成
 
@@ -153,15 +138,17 @@ setsid nohup env DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg TMPDIR="$BASE/tmp" \
 | 训练数据 | 599 集 / 23960 步；train 18520 / val 2800 / test 2640 |
 | T6 best 离线 test | acc 0.9186 / macro_f1 0.8589 / balanced_acc 0.8497；recall `[1.000, 0.952, 0.700, 0.747]` |
 | 多数类先验 test | acc 0.6492 / macro_f1 0.1968 / balanced_acc 0.2500 |
-| T7 旧版闭环 | SR 0.90（18/20）/ collision 0.05 / stuck 0.00 / false_forward 0.05；动作 SAFE 57 / FWD 1095 / LEFT 178 / RIGHT 211；p50 40.4 ms / p95 59.3 ms（warm n=1521） |
+| T7 旧版闭环（observation） | SR 0.90（18/20）/ collision 0.05 / stuck 0.00 / false_forward 0.05；动作 SAFE 57 / FWD 1095 / LEFT 178 / RIGHT 211；p50 40.4 ms / p95 59.3 ms（warm n=1521） |
 | 盲前进基线 | SR 0 / collision 1.00 / false_forward 1.00 |
-| T7 复跑 | **未完成**：上一轮 14/20 被会话中断，重跑产物以 `eval-student-r01b/eval.json` 为准；0.90 和 14/20 快照都不是当前结论 |
+| T7-R（dispatch） | SR 0.55（11/20）/ collision 0.45 / false_forward 0.30 / stuck 0.00；p50 10.9 ms / p95 15.2 ms；动作 SAFE 14 / FWD 709 / LEFT 263 / RIGHT 351 |
+| A/B 窗口语义 | seed 49/57：observation 2/2 成功，dispatch 0/2 碰撞；p50 均约 11 ms |
 
 > **T6 数字的出处**：`0.8589` 出自 `eval-best/metrics.jsonl`（ckpt_best 复评）；
 > `run/metrics.jsonl` 末条是末轮 `ckpt.bin` 的 0.8042，抓错文件会差 5 个点。
 
-旧 T7 的失败集：seed 45 一直 SAFE 悬停（max_x 3.26），seed 99 第 21 步 FORWARD 撞柱
-（false_forward）。复跑结束后要确认这两个模式是否仍在，并解释新增失败集。
+T7-R（dispatch）失败分类：起步早碰撞 49/57/99；过线后碰撞 25/36/114/116/137；
+未到线碰撞 50。旧版 observation 的 seed 45 SAFE 悬停/seed 99 早碰撞仅作历史对照。
+完整 observation v1 基线（20 seed）在跑；v1 与 dispatch 数字禁止混报。
 
 ### 4.4 数据与产物路径
 
@@ -173,7 +160,9 @@ setsid nohup env DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg TMPDIR="$BASE/tmp" \
 | `$DATA_ROOT/uav_rgb/t6-full-1640/eval-best/` | T6 best 离线复评 |
 | `$DATA_ROOT/uav_rgb/t6-full-1640/eval-student/` | T7 旧版闭环（R01 前） |
 | `$DATA_ROOT/uav_rgb/t6-full-1640/eval-forward/` | 盲前进基线 |
-| `$DATA_ROOT/uav_rgb/t6-full-1640/eval-student-r01b/` | **T7 同版本复跑（待跑，`--keep-work`）** |
+| `$DATA_ROOT/uav_rgb/t6-full-1640/eval-student-r01b/` | T7-R dispatch 复跑（SR 0.55，`--keep-work`） |
+| `$DATA_ROOT/uav_rgb/t6-full-1640/ab-observation/`、`ab-dispatch/` | 窗口语义 A/B（49/57） |
+| `$DATA_ROOT/uav_rgb/t6-full-1640/eval-student-v1-observation/` | 完整 observation v1 基线（运行中/待出） |
 
 ## 五、工作纪律（必须遵守）
 

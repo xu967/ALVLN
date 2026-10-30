@@ -514,8 +514,10 @@ def take_off(pose_sub, publisher, contact_sub=None, z_target=Z_TARGET, timeout=1
 
 def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 prev_action=None, prev_rgb_ts=0, pillars=None, student=None,
-                global_plan=True):
+                global_plan=True, window_from="dispatch"):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。"""
+    if window_from not in ("dispatch", "observation"):
+        raise ValueError(f"window_from 无效: {window_from!r}")
     t_step = time.perf_counter()
 
     # 1) 观测：以新的 RGB 帧为锚点，depth/pose 按 sim-time 配对
@@ -599,11 +601,14 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     action_wall = 0.0
     rgb_ok = False
     try:
-        action_start_ns = exec_ts   # 派发前最新位姿的 sim-time（执行窗口起点）
+        # dispatch=R01 语义（派发位姿起算）；observation=旧语义（观测位姿起算，
+        # 推理/解码耗时从窗口里扣掉），只用于诊断/兼容旧数据。
+        action_start_ns = exec_ts if window_from == "dispatch" else pose_before_ts
+        pose_for_action = pose_before if window_from == "observation" else pose_exec
         t_action_start = time.perf_counter()
         try:
             action_handle = publisher.start(
-                *twist_fields(action, altitude_vz(pose_exec)))
+                *twist_fields(action, altitude_vz(pose_for_action)))
         except Exception:
             # 动作没发出去也要确认没有旧指令在飞；失败原因继续上抛。
             _try_zero(publisher)
@@ -746,6 +751,10 @@ def main():
     p.add_argument("--out", required=True)
     p.add_argument("--hold", type=float, default=1.0,
                    help="每动作持续时间（秒，仿真时间；走满即发零速）")
+    p.add_argument("--window-from", choices=("dispatch", "observation"),
+                   default="dispatch",
+                   help="动作窗口起点：dispatch=派发位姿（默认，R01）；"
+                        "observation=观测位姿（旧语义，仅诊断/兼容旧数据）")
     p.add_argument("--no-takeoff", action="store_true")
     p.add_argument("--policy", choices=("teacher", "forward", "student"), default="teacher",
                    help="teacher=专家策略；forward=盲策略（恒定前进）；student=模型闭环")
@@ -864,7 +873,8 @@ def main():
         for i in range(args.steps):
             r, reason = collect_one(args.out, i, args.hold, args.policy, subs,
                                     publisher, prev_action, prev_rgb_ts, pillars, student,
-                                    global_plan=(scene_spawn_mode != "safe"))
+                                    global_plan=(scene_spawn_mode != "safe"),
+                                    window_from=args.window_from)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -995,6 +1005,7 @@ def main():
             # hold 是**仿真时间**秒（D1 起）：窗口按位姿戳走满这个数才发零速，
             # 与 RTF 无关。同 scene 的 0.5 与 1.0 两批数据仍靠它区分。
             "hold_s": args.hold,
+            "window_from": args.window_from,
             "scene_meta_sha256": scene_meta_sha,
             "actions_ref": "actions.jsonl",
             "oracle_ref": "oracle.jsonl",
