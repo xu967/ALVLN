@@ -76,3 +76,25 @@ src/build/uavrgb_train --data "$BASE5/ds/dataset.uavr" --epochs 10 --batch 64 \
 - 596 集里可能有未触发 SAFE+碰撞的 contact 步；preprocess 用 `--drop-collision` 过滤。
 - dispatch 合同下教师 SAFE 比例约 20%；训练后闭环是否稳定要看 20 seed 复评。
 - 与 v1（observation）不可混报；T5b 是新执行合同的数据。
+
+## 7. 训练与离线复评（2026-10-31 05:30）
+
+```bash
+src/build/uavrgb_train --data "$BASE5/ds/dataset.uavr" --epochs 10 --batch 64 \
+  --lr 1e-3 --class-weights auto --drop-collision --out "$BASE5/run"
+src/build/uavrgb_train --data "$BASE5/ds/dataset.uavr" \
+  --eval-only "$BASE5/run/ckpt_best.bin" --out "$BASE5/eval-best" \
+  --batch 128 --split all --drop-collision
+```
+
+| 项 | 结果 |
+| --- | --- |
+| 训练 | 183770 样本 × 10 轮，2632.0 s，69.8 样本/秒 |
+| best | epoch 5，dev macro_f1 0.8357 |
+| val（best 复评） | ce 0.3196 / acc 0.9025 / **macro_f1 0.8357** / bal_acc 0.8572 / recall [1.000 0.912 0.773 0.744] |
+| test（best 复评） | ce 0.3217 / acc 0.8940 / **macro_f1 0.8287** / bal_acc 0.8494 / recall [1.000 0.914 0.747 0.737] |
+
+对比 T6（observation 数据）：test macro_f1 0.8589 → T5b 0.8287，低 3.0 pp。
+dispatch 数据的类别分布/执行窗口不同，属预期内的轻微下降，不改变合同判断。
+
+闭环复评（dispatch 20 seed，`eval-student-dispatch`）进行中，结果另记。
