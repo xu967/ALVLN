@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -130,7 +131,12 @@ double gradcheck_conv2d(const Conv2d& m, const Tensor& x, double eps) {
     *p = orig - eps;
     const double lm = conv_loss_f64(conv_forward_f64(wv, bv, xv, n, c_in, h, wd, out, kh, kw, pad));
     *p = orig;
-    max_err = std::max(max_err, std::fabs((lp - lm) / (2.0 * eps) - analytic));
+    const double diff = std::fabs((lp - lm) / (2.0 * eps) - analytic);
+    if (!std::isfinite(diff)) {
+      max_err = std::numeric_limits<double>::infinity();
+      return;
+    }
+    max_err = std::max(max_err, diff);
   };
 
   for (int oc = 0; oc < out; ++oc) {

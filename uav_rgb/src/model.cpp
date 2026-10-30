@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -51,7 +52,11 @@ CnnModel make_cnn(int in_h, int in_w, std::uint32_t seed, int num_classes) {
   m.c1 = Conv2d(3, 16, 3, 3, 1);
   m.c2 = Conv2d(16, 32, 3, 3, 1);
   m.c3 = Conv2d(32, 64, 3, 3, 1);
-  m.fc = Linear(64 * (in_h / 8) * (in_w / 8), num_classes);
+  const std::int64_t flat = flat_dim(m);
+  if (flat > static_cast<std::int64_t>(std::numeric_limits<int>::max())) {
+    throw std::invalid_argument("make_cnn: fc 输入维超出 int 范围");
+  }
+  m.fc = Linear(static_cast<int>(flat), num_classes);
 
   std::mt19937 rng(seed);
   auto xavier = [&rng](Tensor& w, int fan_in, int fan_out) {

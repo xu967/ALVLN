@@ -4,6 +4,10 @@
 
 namespace uavrgb {
 
+// resume 是否就在 out 目录内（规范化后比较父目录）；resume 为空返回 false。
+bool same_run_dir(const std::filesystem::path& out_dir,
+                  const std::filesystem::path& resume_path);
+
 class RunOwner {
  public:
   explicit RunOwner(const std::filesystem::path& output_directory, bool resume = false);

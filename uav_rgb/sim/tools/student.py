@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 
 from PIL import Image
 
@@ -30,9 +31,12 @@ class StudentPolicy:
                 f"找不到推理程序 {binary}；先构建：cmake --build src/build --target uavrgb_infer")
         if not os.path.isfile(ckpt):
             raise RuntimeError(f"找不到 checkpoint {ckpt}")
+        # stderr 用临时文件而不是 PIPE：长采集时 CUDA/驱动警告写满 64 KiB 管道会让
+        # 子进程阻塞在 write，父进程的 readline 永远等不到结果（T5 卡死风险）。
+        self._err = tempfile.TemporaryFile()
         self.proc = subprocess.Popen(
             [binary, "--ckpt", ckpt],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._err)
         line = self.proc.stdout.readline()
         if not line:
             raise RuntimeError(f"推理进程启动失败：{self._stderr()}")
@@ -43,6 +47,17 @@ class StudentPolicy:
         if self.in_c != 3:
             raise RuntimeError(f"模型输入通道 {self.in_c} != 3，相机是 RGB")
         self.frames = 0
+        self._warmup()
+
+    def _warmup(self):
+        """先跑一帧全零：把 CUDA 模块加载/首帧开销移出第 1 步动作。
+
+        否则每集第一帧的推理要多花约 0.4 s，动作基于更旧的画面。
+        """
+        self.proc.stdin.write(bytes(self.h * self.w * self.in_c))
+        self.proc.stdin.flush()
+        if not self.proc.stdout.readline():
+            raise RuntimeError(f"推理进程 warmup 失败：{self._stderr()}")
 
     def act(self, msg):
         """gz.msgs.Image dict -> (action, infer_ms, probs)。解码/推理失败抛异常。"""
@@ -73,17 +88,17 @@ class StudentPolicy:
         except subprocess.TimeoutExpired:
             proc.kill()
             rc = proc.wait()
+        err = self._stderr()
         if rc != 0:
-            err = (proc.stderr.read().decode("utf-8", "replace").strip()
-                   if proc.stderr else "")
             raise RuntimeError(f"推理进程退出码 {rc}：{err or '（空）'}")
+        self._err.close()
+        self._err = None
 
     def _stderr(self):
-        if self.proc is None or self.proc.stderr is None:
+        if self._err is None:
             return "（无 stderr）"
-        if self.proc.poll() is None:
-            return "（进程仍在运行）"
         try:
-            return self.proc.stderr.read().decode("utf-8", "replace").strip() or "（空）"
-        except ValueError:
+            self._err.seek(0)
+            return self._err.read().decode("utf-8", "replace").strip() or "（空）"
+        except (OSError, ValueError):
             return "（stderr 已关闭）"

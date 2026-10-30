@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -33,6 +34,18 @@ bool throws_invalid(F&& f) {
   return false;
 }
 
+// NaN 差值必须变成 inf；否则 std::max 会丢掉它、parity 测试可能假绿。
+double max_abs_diff(const uavrgb::Tensor& a, const uavrgb::Tensor& b) {
+  if (a.numel() != b.numel()) return std::numeric_limits<double>::infinity();
+  double d = 0.0;
+  for (std::size_t i = 0; i < a.numel(); ++i) {
+    const double diff = std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
+    if (!std::isfinite(diff)) return std::numeric_limits<double>::infinity();
+    d = std::max(d, diff);
+  }
+  return d;
+}
+
 }  // namespace
 
 int main() {
@@ -57,11 +70,13 @@ int main() {
   const Tensor g_cuda = softmax_ce_grad_cuda(logits, labels);
 
   const double e_loss = std::fabs(static_cast<double>(loss_cpu) - static_cast<double>(loss_cuda));
-  double e_grad = 0.0;
-  for (std::size_t i = 0; i < g_cpu.numel(); ++i) {
-    e_grad = std::max(e_grad, std::fabs(static_cast<double>(g_cpu[i]) - static_cast<double>(g_cuda[i])));
-  }
+  const double e_grad = max_abs_diff(g_cpu, g_cuda);
   const double worst = std::max(e_loss, e_grad);
+
+  check(!std::isfinite(max_abs_diff(Tensor::from_flat({1}, {0.0f}),
+                                    Tensor::from_flat(
+                                        {1}, {std::numeric_limits<float>::quiet_NaN()}))),
+        "max_abs_diff 必须把 NaN 判成非有限");
 
   std::cout << "softmax_ce parity (N=" << n << " C=" << c << ")\n";
   std::cout << "  loss_cpu = " << loss_cpu << ", loss_cuda = " << loss_cuda << "\n";

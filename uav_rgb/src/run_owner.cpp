@@ -10,6 +10,19 @@
 
 namespace uavrgb {
 
+bool same_run_dir(const std::filesystem::path& out_dir,
+                  const std::filesystem::path& resume_path) {
+  if (resume_path.empty()) return false;
+  std::error_code ec1;
+  std::error_code ec2;
+  const std::filesystem::path rdir = resume_path.has_parent_path()
+                                         ? resume_path.parent_path()
+                                         : std::filesystem::path(".");
+  const auto rc = std::filesystem::weakly_canonical(rdir, ec1);
+  const auto oc = std::filesystem::weakly_canonical(out_dir, ec2);
+  return !ec1 && !ec2 && rc == oc;
+}
+
 RunOwner::RunOwner(const std::filesystem::path& output_directory, bool resume) {
   if (output_directory.empty()) throw std::invalid_argument("RunOwner: 输出目录不能为空");
   std::filesystem::create_directories(output_directory);
@@ -25,7 +38,8 @@ RunOwner::RunOwner(const std::filesystem::path& output_directory, bool resume) {
     if (!resume) {
       for (const auto& entry : std::filesystem::directory_iterator(directory_)) {
         if (entry.path().filename() != ".run.lock") {
-          throw std::runtime_error("RunOwner: 非空输出目录要求显式 resume");
+          throw std::runtime_error(
+              "RunOwner: 非空输出目录要求同目录 --resume（跨目录续训只能写进空目录）");
         }
       }
     }

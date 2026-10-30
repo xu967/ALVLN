@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -307,7 +308,13 @@ float global_grad_norm_cuda(const std::vector<const Tensor*>& grads) {
   if (!std::isfinite(sum)) {
     throw std::runtime_error("global_grad_norm_cuda: 梯度含非有限值");
   }
-  return static_cast<float>(std::sqrt(sum));
+  const double norm = std::sqrt(sum);
+  // 每个分量都有限、但 norm 超出 float 时，转 float 会变 inf，clip 系数变成 0，
+  // 梯度被静默清零；必须拒绝而不是继续 Adam。
+  if (!(norm <= static_cast<double>(std::numeric_limits<float>::max()))) {
+    throw std::runtime_error("global_grad_norm_cuda: 梯度范数超出 float 可表示范围");
+  }
+  return static_cast<float>(norm);
 }
 
 float clip_grad_norm_cuda(std::vector<Tensor*> grads, float max_norm) {

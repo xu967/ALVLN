@@ -31,12 +31,15 @@ inline void put_u64(std::ostream& f, std::uint64_t v) {
   for (int i = 0; i < 8; ++i) f.put(static_cast<char>((v >> (8 * i)) & 0xff));
 }
 
-// n 个样本，前 train_n 个归 train episode，其余归 val episode（train_n == n 时无 val）。
+// n 个样本，前 train_n 个归 train episode，接着 test_n 个归 test episode，
+// 其余归 val episode（val_n/test_n 为 0 时不写对应 episode）。
 inline SynthDataset write_synthetic_uavr(const std::string& path, int n, int h, int w,
-                                         int train_n, std::uint32_t seed) {
-  if (n <= 0 || h <= 0 || w <= 0 || train_n < 0 || train_n > n) {
+                                         int train_n, std::uint32_t seed, int test_n = 0) {
+  if (n <= 0 || h <= 0 || w <= 0 || train_n < 0 || train_n > n || test_n < 0 ||
+      train_n + test_n > n) {
     throw std::invalid_argument("write_synthetic_uavr: 参数非法");
   }
+  const int val_n = n - train_n - test_n;
   const std::uint64_t plane = static_cast<std::uint64_t>(3) * h * w;
   const std::uint64_t images_off = 48;
   const std::uint64_t labels_off = images_off + static_cast<std::uint64_t>(n) * plane;
@@ -56,7 +59,8 @@ inline SynthDataset write_synthetic_uavr(const std::string& path, int n, int h, 
            ",\"sample_count\":" + std::to_string(count) + ",\"source_dir\":\"/tmp\"}";
   };
   meta += episode(1, 1, "train", 0, train_n);
-  if (n - train_n > 0) meta += "," + episode(2, 2, "val", train_n, n - train_n);
+  if (val_n > 0) meta += "," + episode(2, 2, "val", train_n, val_n);
+  if (test_n > 0) meta += "," + episode(3, 3, "test", train_n + val_n, test_n);
   meta += "]}";
 
   std::ofstream f(path, std::ios::binary | std::ios::trunc);

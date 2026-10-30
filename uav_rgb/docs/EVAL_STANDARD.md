@@ -66,8 +66,9 @@
 其中 `d_min` 是起终点之间的**最短自由路径长度**（AvoidBench 用 A\* 算），不是直线距离。
 
 环境侧另有两个指标：**traversability**（可通行度）与 **relative gap size**（相对缝隙宽度）。
-它们描述地图而不是算法；我们的 `scene_gen.py` 已有缝隙下限 `MIN_GAP=0.9 m` 和车道间距
-`LANE_SEP=1.302 m`，可以直接换算成 relative gap size。
+它们描述地图而不是算法；我们的 `scene_gen.py` 已有缝隙下限 `MIN_GAP=0.9 m` 和
+车道间距 `LANE_SEP=1.6 m`（T1 起，横向车道缝 1.2 m），可以直接换算成 relative
+gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与 v3 混用。
 
 ## 2. 我们能不能直接跑 AvoidBench
 

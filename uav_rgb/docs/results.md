@@ -391,3 +391,28 @@ e71bf144dce144d9  train↔test   seeds=[1192, 1129]
 最终全量（2026-10-29 22:12，`bash tools/check.sh`）：**EXIT=0**，CTest **18/18** 95.56 s，
 `test_monitor` 102、`test_trainer_demo` 89、`test_collect` 14、`test_split_manifest` 9、
 teacher/scene_gen/gz_io 全过；`uavrgb_train` 仅 `sm_75`；编译无 warning。
+
+## 2026-10-30 05:00 T2 数据闸门 / T3 端到端放行
+
+- 环境：GPU 模式（RTX 2080 Ti）；`DISPLAY=:20`；4 实例并发仿真。
+- 数据：`$DATA_ROOT/uav_rgb/t2-v3c-044240`，52 集 / 2080 步，40 步/集、`hold=1.0`。
+
+| 项 | 真实输出 |
+| --- | --- |
+| 采集 | 52/52 集成功，0 碰撞步，17.9 min；safe 出生 11 集（train 6 / val 2 / test 3） |
+| audit | 11 项全 PASS；`transition_lag` 164 过渡中位 44%（阈值 20%）；`label_recompute` 0/2080 不一致 |
+| 打包 | `ds/dataset.uavr` 119,829,229 B（train 1560 / val 240 / test 280） |
+| 训练 10 轮 | 294.9 s；dev acc 0.5417；`ckpt_best` = epoch 7（dev macro_f1 0.4973） |
+| eval-only best（test） | acc 0.7286 / macro_f1 0.5859 / bal_acc 0.6807；recall `[1.000 0.504 0.278 0.941]` |
+| 多数类先验（test） | acc 0.4464 / macro_f1 0.1543 / bal_acc 0.2500 |
+| L2 `bash tools/check.sh` | EXIT=0，CTest 20/20，Python 自测全过 |
+| 闭环冒烟（新权重 3 集，seed 23/25/36） | SR=0、3/3 撞柱；max_x 3.38/3.39/3.66；FORWARD 52 / LEFT 5 / RIGHT 7 / **SAFE 0**；p50 6.86 ms（warm 61） |
+
+## 2026-10-30 06:00 审核修复回归
+
+| 项 | 真实输出 |
+| --- | --- |
+| T1 当前 teacher 复跑（20 test seed，40 步） | 20/20 过线、0 碰撞；`label_recompute` 0/800；吞吐 1.52 步/s（525 s） |
+| T2 重审（修复后 audit） | 11 项全 PASS；`class_share` 新增 split 内缺席检查后仍 PASS |
+| T2 `traverse_rate --min-rate 0.9` | 41/41 task 集 100%（safe 出生 11 集自动剔除） |
+| Python 自测 | teacher/scene_gen/test_spawn/test_audit_dataset/test_traverse_rate 全过 |

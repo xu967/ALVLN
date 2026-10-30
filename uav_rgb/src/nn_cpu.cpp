@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -185,7 +186,13 @@ float global_grad_norm(const std::vector<const Tensor*>& grads) {
   if (!std::isfinite(sum)) {
     throw std::runtime_error("global_grad_norm: 梯度含非有限值");
   }
-  return static_cast<float>(std::sqrt(sum));
+  const double norm = std::sqrt(sum);
+  // 每个分量都有限、但 norm 超出 float 时，转 float 会变 inf，clip 系数变成 0，
+  // 梯度被静默清零；必须拒绝而不是继续 Adam。
+  if (!(norm <= static_cast<double>(std::numeric_limits<float>::max()))) {
+    throw std::runtime_error("global_grad_norm: 梯度范数超出 float 可表示范围");
+  }
+  return static_cast<float>(norm);
 }
 
 float clip_grad_norm(std::vector<Tensor*> grads, float max_norm) {
@@ -221,7 +228,9 @@ double gradcheck_relu(const Tensor& x, double eps) {
     const double lm = loss();
     xv[i] = orig;
     const double analytic = orig > 0.0 ? 2.0 * orig : 0.0;  // x==0 取次梯度 0
-    max_err = std::max(max_err, std::fabs((lp - lm) / (2.0 * eps) - analytic));
+    const double diff = std::fabs((lp - lm) / (2.0 * eps) - analytic);
+    if (!std::isfinite(diff)) return std::numeric_limits<double>::infinity();
+    max_err = std::max(max_err, diff);
   }
   return max_err;
 }
@@ -252,7 +261,9 @@ double gradcheck_maxpool2d(const MaxPool2d& m, const Tensor& x, double eps) {
     xv[i] = orig - eps;
     const double lm = loss();
     xv[i] = orig;
-    max_err = std::max(max_err, std::fabs((lp - lm) / (2.0 * eps) - dx[i]));
+    const double diff = std::fabs((lp - lm) / (2.0 * eps) - dx[i]);
+    if (!std::isfinite(diff)) return std::numeric_limits<double>::infinity();
+    max_err = std::max(max_err, diff);
   }
   return max_err;
 }

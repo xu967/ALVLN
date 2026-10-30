@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-`uav_rgb` 已实现单目 RGB 四动作 CNN、CPU/CUDA 数值算子、Adam、UAVR 数据读取、checkpoint/resume（含按 dev 宏 F1 保存的 `ckpt_best.bin`）和 Gazebo 专家采集。2026-10-29 本轮 13/13 CTest 通过，真实仿真 5 帧已完成预处理、GPU 训练和恢复；单场景冒烟不代表泛化或可飞。GRU/语言导航、学生闭环评测、板端部署尚未实现。当前入口见 `README.md`，完整证据见 `docs/worklog/2026-10-29-1145-project-review.md`。设计规格仍位于 `../TinyAerialVLN_Final_V8/references/reviews/UBUNTU_BASE_GUIDE_V1.md`。文档与代码注释保持中文。
+`uav_rgb` 已实现单目 RGB 四动作 CNN、CPU/CUDA 数值算子、Adam、UAVR 数据读取、checkpoint/resume（含按 dev 宏 F1 保存的 `ckpt_best.bin`）、eval-only 复评、Gazebo 专家采集、数据验收闸门（11 条不变量，含标签复算）、常驻推理进程与学生闭环评测。**2026-10-30：T1–T7 全部完成**——T5 采集 599 集 / 23960 步（audit 11/11 PASS）；T6 best 权重 test `acc 0.9186 / macro_f1 0.8589 / bal_acc 0.8497`，四类 recall `[1.000, 0.952, 0.700, 0.747]`；T7 20 个冻结 test seed 闭环 `SR 0.90 / collision 0.05 / stuck 0.00 / false_forward 0.05`（盲前进基线 SR 0 / collision 1.00；该 0.90 是 **R01 修复前**版本，R01+D4 同版本复跑上一轮 14/20 被会话中断，待用 `eval-student-r01b` 重跑，以 `docs/HANDOFF.md §4.1` 为准）。GRU/语言导航、板端部署尚未实现。**接手先读 [`docs/HANDOFF.md`](docs/HANDOFF.md)**，任务与验收以 [`docs/TASKS.md`](docs/TASKS.md) 为准，实验数字见 `docs/experiments/`。设计规格仍位于 `../ALVLN/references/reviews/UBUNTU_BASE_GUIDE_V1.md`。文档与代码注释保持中文。
 
 Design boundaries that must not be violated:
 - The vision model outputs only four discrete high-level actions: `SAFE_NEUTRAL`, `FORWARD_SLOW`, `YAW_LEFT`, `YAW_RIGHT`. It must never output PWM, motor speeds, or unprotected attitude commands; the ESP32 flight controller keeps final veto.
@@ -56,7 +56,7 @@ Build and test the core library (`src/`, C++ + CUDA kernels):
 source "$UAV_RGB_ROOT/env.sh"
 cmake -S "$UAV_RGB_ROOT/src" -B "$UAV_RGB_ROOT/src/build" -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build "$UAV_RGB_ROOT/src/build"
-ctest --test-dir "$UAV_RGB_ROOT/src/build" --output-on-failure   # 当前 13 项，以 ctest -N 为准
+ctest --test-dir "$UAV_RGB_ROOT/src/build" --output-on-failure   # 当前 20 项，以 ctest -N 为准
 ```
 
 Train a model end-to-end (collect → preprocess → train):
@@ -64,7 +64,7 @@ Train a model end-to-end (collect → preprocess → train):
 ```bash
 # 并行采集（自动生成随机场景、按 GZ_PARTITION 隔离实例；纯 headless 相机会 segfault，必须 DISPLAY=:20）
 DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg python3 "$UAV_RGB_ROOT/sim/tools/collect_parallel.py" \
-  --instances 6 --episodes-per-instance 1 --steps 20 --hold 1.0 --base-seed 0 --out /tmp/dataset
+  --instances 4 --episodes-per-instance 1 --steps 40 --hold 1.0 --base-seed 0 --out /tmp/dataset
 
 # 打包成 UAVR 数据集（默认 160×120，按 scene_id 划分 split）
 python3 "$UAV_RGB_ROOT/tools/preprocess.py" --out /tmp/ds /tmp/dataset/train/*/
@@ -112,6 +112,8 @@ Directory roles from the spec:
 - `data/`, `models/`, `logs/` — historical placeholders/demo; all new datasets, weights and runs belong under `$DATA_ROOT/uav_rgb/`, outside `code/`
 - `experiments/` — each experiment is a self-contained CMake project (see `experiments/cuda_smoke/` as the template: source + `CMakeLists.txt` + local `build/`)
 - `docs/` — design and acceptance records
+
+**Datasets live in `/root/rivermind-data/uav_rgb/` (`$DATA_ROOT/uav_rgb`)** — every collected episode, packaged `.uavr`, checkpoint, run artifact, audit/eval JSON. Never write datasets into this repository (`code/`); the in-repo `data/`, `models/`, `logs/` are legacy placeholders. This is enforced as a hard constraint in `docs/ENGINEERING_RULES.md §二.6`.
 
 Data splits must be by scene/map, never by random frames from the same scene. Episodes synchronize `rgb/timestamp/action_expert/action_executed/collision/episode_id/scene_id/seed`; simulation ground truth (position, obstacle geometry) must never leak into the student model's input.
 

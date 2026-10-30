@@ -78,13 +78,24 @@ std::vector<float> auto_weights(const UavrDataset& ds) {
 
 std::string quote(const std::string& s) {
   std::string o = "\"";
-  for (char ch : s) {
-    if (ch == '"' || ch == '\\') o += '\\';
-    if (ch == '\n') {
+  for (unsigned char ch : s) {
+    if (ch == '"' || ch == '\\') {
+      o += '\\';
+      o += static_cast<char>(ch);
+    } else if (ch == '\n') {
       o += "\\n";
-      continue;
+    } else if (ch == '\r') {
+      o += "\\r";
+    } else if (ch == '\t') {
+      o += "\\t";
+    } else if (ch < 0x20) {
+      // JSON 不允许裸控制字符；与 metrics_json.cpp 的 quoted 保持一致。
+      char b[7];
+      std::snprintf(b, sizeof b, "\\u%04x", static_cast<unsigned>(ch));
+      o += b;
+    } else {
+      o += static_cast<char>(ch);
     }
-    o += ch;
   }
   return o + '"';
 }

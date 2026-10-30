@@ -164,6 +164,13 @@ void check_results_csv(const std::string& path, int epochs) {
 }  // namespace
 
 int main() {
+  // JSON 控制字符必须转义，否则 metrics.jsonl 不是合法 JSON（G0/B3）。
+  {
+    const std::string js = metrics_json(make_error(Severity::kWarn, "X", 1, "a\tb\rc"));
+    check(js.find("\\t") != std::string::npos, "metrics_json 未转义 \\t");
+    check(js.find("\\r") != std::string::npos, "metrics_json 未转义 \\r");
+  }
+
   const std::string root = (fs::temp_directory_path() /
                             ("uavrgb_test_trainer_" + std::to_string(std::random_device{}())))
                                .string();

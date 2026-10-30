@@ -250,7 +250,12 @@ float softmax_ce_loss_weighted_cuda(const Tensor& logits, const std::vector<int>
 Tensor softmax_ce_grad_weighted_cuda(const Tensor& logits, const std::vector<int>& labels,
                                      const std::vector<float>& weights) {
   const auto [n, c] = check_dims(logits, labels);
-  const float wsum = static_cast<float>(check_weight_sum(labels, weights, c));
+  const double wsum_d = check_weight_sum(labels, weights, c);
+  // kernel 参数是 float：Σw 超出 float 会变成 inf，梯度静默全 0。
+  if (!(wsum_d <= static_cast<double>(std::numeric_limits<float>::max()))) {
+    throw std::invalid_argument("softmax_cuda: 权重按样本求和超出 float 可表示范围，梯度会全为 0");
+  }
+  const float wsum = static_cast<float>(wsum_d);
   const std::int64_t total = static_cast<std::int64_t>(n) * c;
 
   DeviceBuf<float> d_logits(static_cast<std::size_t>(total) * sizeof(float));

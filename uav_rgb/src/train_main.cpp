@@ -2,7 +2,10 @@
 //   uavrgb_train --data <dataset.uavr> --epochs N --batch B --lr L --out <run_dir>
 //                [--resume <ckpt>] [--seed S] [--max-grad-norm G]
 //                [--class-weights auto|<w0,w1,w2,w3>] [--drop-collision]
+//   uavrgb_train --data <dataset.uavr> --eval-only <ckpt> --out <run_dir>
+//                [--batch B] [--split val|test|all] [--drop-collision]
 // 落盘：<run_dir>/results.csv、metrics.jsonl、config.json、ckpt.bin（每 epoch 覆盖）。
+// eval-only 只向 metrics.jsonl 追加 validation 事件，不写 results.csv、不更新权重。
 #include <cmath>
 #include <cstdio>
 #include <exception>
@@ -19,13 +22,17 @@ void usage() {
   std::fprintf(stderr,
                "用法: uavrgb_train --data <dataset.uavr> --epochs N --batch B --lr L "
                "--out <run_dir> [--resume <ckpt>] [--seed S] [--max-grad-norm G] "
-               "[--class-weights auto|<w0,w1,w2,w3>] [--drop-collision]\n");
+               "[--class-weights auto|<w0,w1,w2,w3>] [--drop-collision]\n"
+               "  或: uavrgb_train --data <dataset.uavr> --eval-only <ckpt> --out "
+               "<run_dir> [--batch B] [--split val|test|all] [--drop-collision]\n");
 }
 
 }  // namespace
 
 int main(int argc, char** argv) {
   uavrgb::TrainConfig cfg;
+  std::string eval_ckpt;
+  std::string eval_split = "all";
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&](const char* name) -> std::string {
@@ -53,6 +60,13 @@ int main(int argc, char** argv) {
         cfg.class_weights = next("--class-weights");
       } else if (a == "--drop-collision") {
         cfg.drop_collision = true;
+      } else if (a == "--eval-only") {
+        eval_ckpt = next("--eval-only");
+      } else if (a == "--split") {
+        eval_split = next("--split");
+        if (eval_split != "val" && eval_split != "test" && eval_split != "all") {
+          throw std::invalid_argument("--split 只能是 val/test/all");
+        }
       } else {
         std::fprintf(stderr, "未知参数: %s\n", a.c_str());
         usage();
@@ -67,6 +81,29 @@ int main(int argc, char** argv) {
   if (cfg.data_path.empty() || cfg.out_dir.empty()) {
     usage();
     return 2;
+  }
+  if (!eval_ckpt.empty()) {
+    if (cfg.batch <= 0) {
+      std::fprintf(stderr, "--batch 必须为正\n");
+      return 2;
+    }
+    // 输出目录通常就是训练 run-dir（非空），允许在已有产物上追加评估事件；
+    // 仍用 RunOwner 防止与正在写同一目录的训练并发。
+    std::optional<uavrgb::RunOwner> eval_owner;
+    try {
+      eval_owner.emplace(cfg.out_dir, true);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "%s\n", e.what());
+      return 2;
+    }
+    try {
+      uavrgb::Trainer tr(cfg);
+      tr.eval_only(eval_ckpt, eval_split != "test", eval_split != "val");
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "评估失败: %s\n", e.what());
+      return 1;
+    }
+    return 0;
   }
   // max_grad_norm=0 会把所有梯度按 0 缩放，训练照跑但模型完全不动，必须挡在入口。
   if (!(cfg.max_grad_norm > 0.0f)) {
@@ -84,12 +121,14 @@ int main(int argc, char** argv) {
   }
 
   // 单写者锁 + 拒绝复用非空目录：否则两轮训练会往同一个 results.csv 追加、
-  // 互相覆盖 ckpt.bin，产物无法区分。--resume 明确表示续跑同一目录时才放行。
+  // 互相覆盖 ckpt.bin，产物无法区分。--resume 只有在**同一目录**续跑时才允许
+  // 复用非空 out；跨目录 resume 必须写进空目录，不能拿别的 run 当覆盖目标。
   // 这是用法错误不是训练失败，所以单独 catch 后返回 2（与 --lr 等预检一致）；
   // 用 optional 是因为 RunOwner 必须活到 main 结束才持有锁，不能在 try 里构造。
+  const bool resume_same_dir = uavrgb::same_run_dir(cfg.out_dir, cfg.resume);
   std::optional<uavrgb::RunOwner> owner;
   try {
-    owner.emplace(cfg.out_dir, !cfg.resume.empty());
+    owner.emplace(cfg.out_dir, resume_same_dir);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "%s\n", e.what());
     return 2;

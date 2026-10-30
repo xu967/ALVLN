@@ -60,12 +60,13 @@ class SplitAssignmentTests(unittest.TestCase):
         self.assertFalse(sm.summarize(man)["family_holdout"])
 
     def test_legacy_policy_leakage_matches_handoff(self):
-        # HANDOFF 记录 seed 0..1999 有 241 组跨 split、1124 种几何。
+        # HANDOFF 记录旧几何（v2，缝 0.902 m）seed 0..1999 有 241 组跨 split、
+        # 1124 种几何；T1 放宽到 v3（缝 1.2 m）后重算为 291 / 759。
         # 改 scene_gen 几何语义会让这两个数字变，届时必须同步 bump SPLIT_SALT。
         pairs = [(s, "train" if s % 10 < 8 else ("val" if s % 10 == 8 else "test"))
                  for s in range(2000)]
-        self.assertEqual(len(sm.cross_split_groups(pairs)), 241)
-        self.assertEqual(len({sm.geometry_gid(pillars_of(s)) for s in range(2000)}), 1124)
+        self.assertEqual(len(sm.cross_split_groups(pairs)), 291)
+        self.assertEqual(len({sm.geometry_gid(pillars_of(s)) for s in range(2000)}), 759)
 
 
 if __name__ == "__main__":

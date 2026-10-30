@@ -15,8 +15,9 @@ I/O：启动时给 camera/depth/pose/contact/camera_info 各起一个常驻订�
 每步从缓冲取帧，不再每帧 spawn 一个 `gz topic -e -n 1`（本机约 250 ms/次）。
 发布：启动时建一个常驻 twist publisher（gz_io.open_twist_publisher：优先进程内
 gz.transport13；当前解释器没有该模块时用 `/usr/bin/python3` helper 子进程），
-每步 publish 是内存操作（实测 <0.1 ms）。都建不起来时回退 `gz topic -p` CLI，
-并在 stderr 打一行警告（CLI 每条固定 ~1.0 s）。
+每步 publish 是内存操作（实测 <0.1 ms）。都建不起来时**直接失败**，不回退
+`gz topic -p` CLI：CLI 每条固定 ~1.0 s，动作窗口会严重失真；CLI 只保留给
+finally 的零速安全网。
 
 每步（顺序是因果链的一部分，别调换）：
   等一帧新 RGB（锚点）-> 按 sim-time 挑最近的深度、挑晚于 RGB 的位姿 ->
@@ -25,6 +26,8 @@ gz.transport13；当前解释器没有该模块时用 `/usr/bin/python3` helper 
   增量落盘/刷盘。
 RGB 仍然是**动作前**的观测（M1：rgb_ts < action_start_ts），动作窗口结束立刻发零速（M2）。
 动作后的状态只进 oracle.jsonl；actions.jsonl 的 timestamp_ns 是动作前 RGB 帧。
+新鲜度门禁：depth 与 RGB 的 sim-time 差 > 100 ms 判停更/不同步；contact 订阅
+进程退出即失败（contact 是稀疏话题，无消息不等于停更）。
 
 输出（与冻结 EpisodeStep/EpisodeMeta 对齐，参照 doc 02 §四 建议 schema）：
   episode_manifest.json  episode_id/scene_id/seed/version/split + 文件引用 +
@@ -54,8 +57,9 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from teacher import (expert_action, plan_action, SAFE_NEUTRAL, FORWARD_SLOW,
-                     YAW_LEFT, YAW_RIGHT, ACTIONS)
+from teacher import (expert_action, plan_action, plan_action_global,
+                     SAFE_NEUTRAL, FORWARD_SLOW, YAW_LEFT, YAW_RIGHT, ACTIONS,
+                     TEACHER_VERSION)
 import gz_io
 import save_frame
 import split_manifest as sm
@@ -74,6 +78,7 @@ STUCK_EPS = 0.03      # FORWARD_SLOW 下动作窗口位移 < 3cm 视为卡滞（
 FRAME_WAIT = 2.0      # 每步等一帧新 RGB 的上限（相机 30 Hz；卡住时报错而不是阻塞）
 POSE_WAIT = 0.5       # 等一帧「晚于 RGB」的位姿的上限（M1；位姿 45 Hz）
 READY_TIMEOUT = 10.0  # 启动时等 camera/depth/pose 首帧的上限
+DEPTH_STALE_NS = 100_000_000  # depth 与 RGB 的 sim-time 差上限；超过视为停更/不同步
 CONTACT_POLL = 0.02   # 动作窗口内轮询接触信号的间隔（接触时 225 Hz，缓冲覆盖 ~70 ms）
 MIN_WINDOW_RTF = 0.05 # 动作窗口的墙钟兜底：仿真时间走不动时按此 RTF 折算等待上限
 
@@ -110,7 +115,7 @@ def _twist_text(x, y, z, wz):
 
 
 def make_twist(action, vz=0.0):
-    """把四动作 + 高度保持分量编成 gz.msgs.Twist 文本（CLI 回退路径用）。"""
+    """把四动作 + 高度保持分量编成 gz.msgs.Twist 文本（CLI 零速安全网用）。"""
     return _twist_text(*twist_fields(action, vz))
 
 
@@ -164,29 +169,6 @@ def cmd_twist(twist):
             if attempt == 2:
                 raise
             time.sleep(0.2)
-
-
-class CliTwistPublisher:
-    """回退路径：每条指令 spawn 一个 `gz topic -p`（本机固定 ~1.0 s/次）。
-
-    接口与 gz_io 常驻 publisher 对齐：start 异步启动、wait 等发布完成、abort 清理。
-    """
-
-    mode = "gz topic -p CLI（回退）"
-
-    def start(self, x, y, z, wz):
-        return spawn_twist(_twist_text(x, y, z, wz))
-
-    def wait(self, proc):
-        return finish_twist(proc, "twist")
-
-    def abort(self, proc):
-        if proc is not None and proc.poll() is None:
-            proc.kill()
-            proc.wait()
-
-    def close(self):
-        pass
 
 
 def publish_blocking(publisher, action, vz=0.0, tries=2):
@@ -481,11 +463,14 @@ def _contact_since(sub, seq0):
     return any(seq > seq0 and _contact_nonempty(msg) for seq, msg in sub.frames())
 
 
-def take_off(pose_sub, publisher, z_target=Z_TARGET, timeout=30.0):
+def take_off(pose_sub, publisher, contact_sub=None, z_target=Z_TARGET, timeout=120.0):
     """按位姿闭环升到 z_target；位姿取常驻订阅的最新帧（S7：不用固定 wall-clock）。
 
     起飞前先查一次高度：明显高于地面说明 world 没有复位（上一 episode 的
     残存状态），直接报错，避免把上一集的位置/姿态当成本集起点。
+
+    timeout=120s（旧值 30s）：8 实例软件 GL 下 RTF 可低到 0.15，0.3 m/s 升
+    1.95 m 要 6.5 s 仿真 ≈ 43 s 墙钟；30s 会在 z≈1.5 处误报，触发整集重试。
     """
     def pose_now():
         msg = pose_sub.latest()
@@ -496,14 +481,26 @@ def take_off(pose_sub, publisher, z_target=Z_TARGET, timeout=30.0):
     if z0 is not None and z0 > 0.5:
         raise RuntimeError(
             f"world 未复位：起飞前 z={z0:.2f} m > 0.5；请重启 gz sim 或换新 world")
+    if contact_sub is not None and not contact_sub.healthy():
+        raise RuntimeError("contact 订阅进程已退出")
 
+    air_seq0 = None   # 离地后才开始查 contact：地面接触不是撞柱
     publish_blocking(publisher, SAFE_NEUTRAL, TAKEOFF_VZ)
     deadline = time.monotonic() + timeout
     last_z = None
     while time.monotonic() < deadline:
+        if contact_sub is not None and not contact_sub.healthy():
+            publish_blocking(publisher, SAFE_NEUTRAL, 0.0)
+            raise RuntimeError("起飞阶段 contact 订阅进程已退出")
         pos, _, _ = pose_now()
         if isinstance(pos, dict):
             last_z = pos.get("z")
+            if contact_sub is not None and last_z is not None and last_z > 0.5:
+                if air_seq0 is None:
+                    air_seq0 = _contact_seq(contact_sub)
+                elif _contact_since(contact_sub, air_seq0):
+                    publish_blocking(publisher, SAFE_NEUTRAL, 0.0)
+                    raise RuntimeError("起飞阶段检测到 contact（spawn 太近或撞柱）")
             if last_z is not None and last_z >= z_target:
                 publish_blocking(publisher, SAFE_NEUTRAL, 0.0)
                 print(f"起飞完成: z={last_z:.2f} m", file=sys.stderr)
@@ -516,7 +513,8 @@ def take_off(pose_sub, publisher, z_target=Z_TARGET, timeout=30.0):
 # ---------------------------------------------------------------- 单步
 
 def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
-                prev_action=None, prev_rgb_ts=0, pillars=None, student=None):
+                prev_action=None, prev_rgb_ts=0, pillars=None, student=None,
+                global_plan=True):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。"""
     t_step = time.perf_counter()
 
@@ -529,14 +527,20 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     if rgb_ts <= 0:
         return None, "RGB 帧缺少 header.stamp"
 
+    if not subs["depth"].healthy():
+        return None, "depth 订阅进程已退出"
     depth_pick = _pick_depth(subs["depth"], rgb_ts)
     if depth_pick is None:
-        return None, ("depth 无帧" if subs["depth"].healthy()
-                      else "depth 订阅进程已退出")
+        return None, "depth 无帧"
     depth = decode_depth(depth_pick[1])
     if depth is None:
         return None, "depth 解码失败"
     d, w, h, depth_ts = depth
+    depth_gap_ns = abs(depth_ts - rgb_ts)
+    if depth_gap_ns > DEPTH_STALE_NS:
+        # 话题静默时缓冲里仍是旧帧；不设上限会把旧深度当本步观测写进数据。
+        return None, (f"depth 停更/不同步：与 RGB 相差 {depth_gap_ns / 1e6:.1f} ms"
+                      f" > {DEPTH_STALE_NS / 1e6:.0f} ms")
 
     pose_pick = _pick_pose_after(subs["pose"], rgb_ts)
     if pose_pick is None:
@@ -553,8 +557,13 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             # 混进去的深度专家标签事后看不出来。宁可让这一步失败。
             if not pose_before:
                 return None, "carrot planner 需要位姿真值，但该步 pose 缺 position"
-            action = plan_action(pose_before["x"], pose_before["y"], yaw_before,
-                                 pillars)
+            # safe 出生用局部规划（要保留真正的 SAFE 标签）；普通集用 A* 全局路径。
+            if global_plan:
+                action = plan_action_global(pose_before["x"], pose_before["y"],
+                                            yaw_before, pillars)
+            else:
+                action = plan_action(pose_before["x"], pose_before["y"], yaw_before,
+                                     pillars)
         else:
             # 没有真值就退回深度反应式专家（传 prev_action 启用滞回）。
             action = expert_action(d, w, h, prev_action=prev_action)
@@ -569,16 +578,32 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         action = FORWARD_SLOW
     t_io = time.perf_counter()
 
+    # 动作窗口的起点是**派发时刻**的最新位姿，不是观测帧位姿：策略推理/解码
+    # 期间仿真仍在走，用观测戳会让实际执行窗口短于 hold（学生与基线不公平）。
+    exec_msg = subs["pose"].latest()
+    exec_ts = _pose_stamp(exec_msg) if exec_msg is not None else 0
+    if exec_ts < pose_before_ts:
+        exec_msg, exec_ts = pose_msg, pose_before_ts
+    pose_exec, _, yaw_exec = _pose_parts(exec_msg)
+    if pose_exec is None:
+        pose_exec = pose_before
+    if yaw_exec is None:
+        yaw_exec = yaw_before
+
+    # contact 是稀疏触发话题（无接触时 0 msg/s），不能把「长时间无消息」当停更；
+    # 这里只拒绝订阅进程退出。话题静默/插件不发布的检测需要额外心跳，见 D4 记录。
+    if not subs["contact"].healthy():
+        return None, "contact 订阅进程已退出"
     contact_seq0 = _contact_seq(subs["contact"])
     action_handle = zero_handle = None
     action_wall = 0.0
     rgb_ok = False
     try:
-        action_start_ns = pose_before_ts   # 发指令前最后一次观测的 sim-time
+        action_start_ns = exec_ts   # 派发前最新位姿的 sim-time（执行窗口起点）
         t_action_start = time.perf_counter()
         try:
             action_handle = publisher.start(
-                *twist_fields(action, altitude_vz(pose_before)))
+                *twist_fields(action, altitude_vz(pose_exec)))
         except Exception:
             # 动作没发出去也要确认没有旧指令在飞；失败原因继续上抛。
             _try_zero(publisher)
@@ -595,6 +620,9 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         hold_end_ns = action_start_ns + int(hold * 1e9)
         wall_cap = t_action_start + hold / MIN_WINDOW_RTF   # 位姿停更时不死等
         while True:
+            if not subs["contact"].healthy():
+                _try_zero(publisher)
+                return None, "动作窗口内 contact 订阅进程已退出"
             msg = subs["pose"].latest()
             if msg is not None and _pose_stamp(msg) >= hold_end_ns:
                 break
@@ -613,8 +641,8 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         # M2：hold 到点立刻发零速，并等它真正发布完成才继续（不丢零速）。
         try:
             zero_handle = publisher.start(*twist_fields(SAFE_NEUTRAL, 0.0))
-            # 先收动作的发布完成时刻：CLI 回退时 wait 的返回值是「观察到进程
-            # 退出」的时刻，若先等零速再等动作，动作的完成时刻会被记晚而误判。
+            # 先收动作的发布完成时刻：若先等零速再等动作，动作的完成时刻
+            # 会被记晚而误判。
             action_pub_wall = publisher.wait(action_handle)
             zero_pub_wall = publisher.wait(zero_handle)
         except Exception:
@@ -639,6 +667,8 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         if pose_ts <= action_start_ns:
             # 仍拿不到动作后的帧：这一步的 oracle 和 stuck 都不可信，不能盖 physics_verified。
             return None, "pose 停更：动作窗口后没有晚于 action_start 的位姿"
+        if not subs["contact"].healthy():
+            return None, "动作窗口后 contact 订阅进程已退出"
         if not contact:
             contact = _contact_since(subs["contact"], contact_seq0)
         t_end = time.perf_counter()
@@ -646,11 +676,12 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         publisher.abort(action_handle)
         publisher.abort(zero_handle)
 
-    sim_dt = (pose_ts - pose_before_ts) / 1e9 if pose_ts and pose_before_ts else 0.0
-    dist = (_dist3(pose_before, pose_after)
-            if pose_before and pose_after else None)
-    dyaw = (_angle_diff(yaw_after, yaw_before)
-            if yaw_after is not None and yaw_before is not None else None)
+    # 位移/偏航/sim_dt 用执行起点（派发位姿）；标签用的 pose_before 保持观测帧。
+    sim_dt = (pose_ts - action_start_ns) / 1e9 if pose_ts and action_start_ns else 0.0
+    dist = (_dist3(pose_exec, pose_after)
+            if pose_exec and pose_after else None)
+    dyaw = (_angle_diff(yaw_after, yaw_exec)
+            if yaw_after is not None and yaw_exec is not None else None)
     # 低 RTF 时动作窗口的 sim 时间会变短，卡滞阈值跟着缩放，避免误报。
     stuck_eps = min(STUCK_EPS, 0.5 * SPEED_FWD * sim_dt)
     stuck = bool(action == FORWARD_SLOW and sim_dt > 0 and dist is not None
@@ -711,9 +742,7 @@ def _median(xs):
 
 def main():
     p = argparse.ArgumentParser()
-    # 默认 80：实测每个 FORWARD 步只前进 0.105 m（/tmp/ds200 2814 步 p50），
-    # 柱区 x∈[1.5, 5.0]，穿过去要 68–76 步。20 步只有约 2 m，落在柱区外面。
-    p.add_argument("--steps", type=int, default=80)
+    p.add_argument("--steps", type=int, default=sm.DEFAULT_STEPS)
     p.add_argument("--out", required=True)
     p.add_argument("--hold", type=float, default=1.0,
                    help="每动作持续时间（秒，仿真时间；走满即发零速）")
@@ -747,11 +776,16 @@ def main():
     pillars = None
     scene_meta_sha = None
     scene_gid = None
+    scene_version = None
+    scene_spawn_mode = None
     if args.scene_meta:
         with open(args.scene_meta, "rb") as f:
             raw_meta = f.read()
         scene_meta_sha = hashlib.sha256(raw_meta).hexdigest()
-        pillars = json.loads(raw_meta.decode("utf-8"))["pillars"]
+        scene_meta_obj = json.loads(raw_meta.decode("utf-8"))
+        pillars = scene_meta_obj["pillars"]
+        scene_version = scene_meta_obj.get("geometry_version")
+        scene_spawn_mode = (scene_meta_obj.get("spawn") or {}).get("mode")
         for k, pl in enumerate(pillars):
             if "x" not in pl or "y" not in pl:
                 p.error(f"--scene-meta {args.scene_meta}: pillars[{k}] 缺 x/y")
@@ -766,13 +800,14 @@ def main():
     # 标签来自哪个教师必须进 manifest：两种策略产出的数据长得一模一样，
     # 事后只能靠这个字段区分（旧版没有任何记录）。
     if args.policy == "forward":
-        teacher_kind = "forward"
+        teacher_kind, planner_kind = "forward", None
     elif args.policy == "student":
-        teacher_kind = "student"
+        teacher_kind, planner_kind = "student", None
     elif pillars:
         teacher_kind = "plan_action"
+        planner_kind = "plan_action" if scene_spawn_mode == "safe" else "astar"
     else:
-        teacher_kind = "expert_action"
+        teacher_kind, planner_kind = "expert_action", None
         print("警告: 没给 --scene-meta，退回深度反应式专家；manifest.teacher=expert_action",
               file=sys.stderr)
 
@@ -812,10 +847,10 @@ def main():
             if getattr(publisher, "warning", None):
                 print(f"警告: {publisher.warning}", file=sys.stderr)
             print(f"指令发布: {publisher.mode}", file=sys.stderr)
-        except Exception as e:  # noqa: BLE001 - 任何建不起来都回退 CLI
-            print(f"警告: 常驻 publisher 不可用（{e}）；回退 gz topic -p CLI"
-                  f"（每条指令约 +1.0 s）", file=sys.stderr)
-            publisher = CliTwistPublisher()
+        except Exception as e:  # noqa: BLE001 - 任何建不起来都直接失败
+            raise RuntimeError(
+                f"常驻 twist publisher 不可用（{e}）；定量采集不做 gz topic -p CLI"
+                f" 回退（每条指令约 +1.0 s，动作窗口会失真）") from e
 
         if args.policy == "student":
             from student import StudentPolicy
@@ -824,11 +859,12 @@ def main():
 
         if not args.no_takeoff:
             print("起飞中…", file=sys.stderr)
-            take_off(subs["pose"], publisher)
+            take_off(subs["pose"], publisher, subs["contact"])
 
         for i in range(args.steps):
             r, reason = collect_one(args.out, i, args.hold, args.policy, subs,
-                                    publisher, prev_action, prev_rgb_ts, pillars, student)
+                                    publisher, prev_action, prev_rgb_ts, pillars, student,
+                                    global_plan=(scene_spawn_mode != "safe"))
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -836,16 +872,18 @@ def main():
             prev_action = r["action_expert"]   # 下一步的滞回基准
             prev_rgb_ts = r["rgb_ts"]
             gap_ns = r["rgb_ts"] - r["depth_ts"] if r["depth_ts"] else None
-            # 配对残差用**动作前**那帧位姿（action_start_ns），不是动作后的 oracle 位姿。
-            pose_gap_ns = r["action_start_ns"] - r["rgb_ts"]
+            # 配对残差用**观测帧**位姿（pose_before_ts），action_start_ns 是派发时刻。
+            pose_gap_ns = r["pose_before_ts"] - r["rgb_ts"]
             actions_f.write(json.dumps({k: r[k] for k in (
                 "step", "timestamp_ns", "action_expert", "action_executed",
                 "collision", "rgb_ok", "frame")} | {
+                    # 评测端按 EVAL_STANDARD §5.1 只把 contact 当碰撞，stuck 单列。
+                    "src": r["src"],
                     "rgb_ts": r["rgb_ts"],
                     "depth_ts": r["depth_ts"],
                     "depth_rgb_gap_ns": gap_ns,
-                    # 配对用的动作前位姿帧；动作后的 oracle 位姿只在 oracle.jsonl。
-                    "pose_ts": r["action_start_ns"],
+                    # 配对用的观测位姿帧；动作后的 oracle 位姿只在 oracle.jsonl。
+                    "pose_ts": r["pose_before_ts"],
                     "pose_rgb_gap_ns": pose_gap_ns,
                     "dyaw_deg": r["dyaw_deg"],
                     "displacement_m": r["displacement_m"],
@@ -942,9 +980,18 @@ def main():
             "split": args.split,
             # 几何组 ID：preprocess 用它拦住「同几何跨 split」，手写 split 也绕不过。
             "geometry_gid": scene_gid,
+            # 几何语义版本：v2/v3 的 gid 天然不同，只查 gid 交集查不出混包。
+            "geometry_version": scene_version,
             # 标签由哪个教师产生：forward=盲策略对照，expert_action=深度反应式，
             # plan_action=柱子真值 carrot planner。缺这个字段就无法事后区分数据集。
             "teacher": teacher_kind,
+            # 教师实现版本：改规划参数/前向安全门后必须能区分新旧标签。
+            "teacher_version": (TEACHER_VERSION if teacher_kind in ("plan_action",
+                                                                    "expert_action")
+                                else None),
+            # plan_action 的具体实现：astar=全局路径（普通集），plan_action=局部
+            # （safe 出生集，保留真 SAFE 标签）。audit 复算必须按这个字段选。
+            "planner": planner_kind,
             # hold 是**仿真时间**秒（D1 起）：窗口按位姿戳走满这个数才发零速，
             # 与 RTF 无关。同 scene 的 0.5 与 1.0 两批数据仍靠它区分。
             "hold_s": args.hold,

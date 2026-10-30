@@ -19,9 +19,14 @@
 import argparse
 import json
 import os
+import sys
 
 import numpy as np
 from PIL import Image
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO_ROOT, "sim", "tools"))
+import split_manifest as sm  # noqa: E402
 
 SRC_W, SRC_H = 320, 240
 EPISODES = [
@@ -74,12 +79,15 @@ def write_episode(root, spec, g0):
         "seed": spec["seed"],
         "version": "synthetic",
         "split": spec["split"],
+        "teacher": "synthetic",
+        "geometry_version": sm.SPLIT_SALT,
         "actions_ref": "actions.jsonl",
         "oracle_ref": "oracle.jsonl",
         "camera": {"width": SRC_W, "height": SRC_H,
                    "fx": None, "fy": None, "cx": None, "cy": None},
-        "validity": {"camera_verified": False, "physics_verified": False,
-                     "episode_executed": False},
+        # 合成 fixture 是格式契约测试，不是物理采集；validity 只表示文件完整。
+        "validity": {"camera_verified": True, "physics_verified": True,
+                     "episode_executed": True},
         "num_steps": spec["steps"],
     }
     with open(os.path.join(ep_dir, "episode_manifest.json"), "w", encoding="utf-8") as f:

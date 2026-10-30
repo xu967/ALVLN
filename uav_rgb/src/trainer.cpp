@@ -35,6 +35,42 @@ std::string num(double v) {
   return b;
 }
 
+// resume 的历史 best 必须能在新目录独立交付：同目录核对文件存在且状态一致；
+// 跨目录先核对再复制，绝不能让新 run 继承一个分数却没有对应权重文件。
+void carry_resume_best(const std::string& resume_path, const std::string& out_dir,
+                       int h, int w, std::uint32_t seed, int num_classes, float lr,
+                       const TrainState& state) {
+  namespace fs = std::filesystem;
+  if (!(state.best_macro_f1 >= 0.0f)) return;  // 旧格式/从未评估过，无 best 可带
+  const fs::path rp(resume_path);
+  const fs::path src_dir = rp.has_parent_path() ? rp.parent_path() : fs::path(".");
+  const fs::path src_best = src_dir / "ckpt_best.bin";
+  const fs::path dst_best = fs::path(out_dir) / "ckpt_best.bin";
+  if (!fs::exists(src_best)) {
+    throw std::runtime_error("resume: checkpoint 记录 best_macro_f1=" +
+                             num(state.best_macro_f1) + "，但 " + src_best.string() +
+                             " 不存在；无法交付历史 best");
+  }
+  // 核对源 best 确实属于这次 resume：分数、类别权重都要与 checkpoint 记录一致。
+  CnnModel m = make_cnn(h, w, seed, num_classes);
+  TrainState s = make_train_state(m, lr);
+  load_checkpoint(src_best.string(), m, s);
+  if (s.best_macro_f1 != state.best_macro_f1 || s.class_weights != state.class_weights) {
+    throw std::runtime_error("resume: " + src_best.string() +
+                             " 与 checkpoint 记录的历史 best 不一致（分数/类别权重对不上）");
+  }
+  std::error_code ec1;
+  std::error_code ec2;
+  const auto rc = fs::weakly_canonical(src_dir, ec1);
+  const auto oc = fs::weakly_canonical(out_dir, ec2);
+  if (!ec1 && !ec2 && rc == oc) return;  // 同目录：文件已经在目标位置
+  if (fs::exists(dst_best)) {
+    throw std::runtime_error("resume: 目标目录已有 " + dst_best.string() +
+                             "；跨目录续训不会覆盖它");
+  }
+  fs::copy_file(src_best, dst_best);
+}
+
 std::uint64_t count_correct(const Tensor& logits, const std::vector<int>& labels) {
   const int n = static_cast<int>(labels.size());
   const int c = static_cast<int>(logits.dims()[1]);
@@ -85,6 +121,10 @@ void Trainer::run() {
                                                  state_.class_weights);
   }
   state_.class_weights = class_weights_;
+  if (!cfg_.resume.empty()) {
+    carry_resume_best(cfg_.resume, cfg_.out_dir, ds.h, ds.w, cfg_.seed,
+                      static_cast<int>(ds.num_classes), cfg_.lr, state_);
+  }
   write_run_config(cfg_.out_dir, cfg_, class_weights_, class_weights_source_);
 
   std::vector<std::uint32_t> dev = ds.val_idx;

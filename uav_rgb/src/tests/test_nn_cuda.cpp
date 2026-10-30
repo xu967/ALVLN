@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 
 #include "uavrgb/nn.hpp"
@@ -19,11 +20,15 @@ void check(bool ok, const char* msg) {
   }
 }
 
-// 两个同形状 Tensor 的最大绝对误差。
+// 两个同形状 Tensor 的最大绝对误差。NaN 不能被 std::max 吞掉（NaN 比较恒
+// false），否则 CUDA 侧全是 NaN 时误差仍是 0，parity 测试会假绿。
 double max_abs_err(const uavrgb::Tensor& a, const uavrgb::Tensor& b) {
+  if (a.numel() != b.numel()) return std::numeric_limits<double>::infinity();
   double m = 0.0;
   for (std::size_t i = 0; i < a.numel(); ++i) {
-    m = std::max(m, std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
+    const double d = std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
+    if (!std::isfinite(d)) return std::numeric_limits<double>::infinity();
+    m = std::max(m, d);
   }
   return m;
 }
@@ -70,6 +75,13 @@ int main() {
     const Tensor ndx_cuda = relu_backward_cuda(nx, ndy);
     check(std::isnan(ndx_cpu[0]) && std::isnan(ndx_cuda[0]),
           "ReLU 反向 NaN CPU/CUDA 都继续传播");
+  }
+
+  // 最大误差 helper 不能让 NaN 静默通过（std::max(0, NaN) 返回 0）。
+  {
+    const Tensor a = Tensor::from_flat({2}, {0.0f, std::nanf("")});
+    const Tensor b = Tensor::from_flat({2}, {0.0f, 1.0f});
+    check(std::isinf(max_abs_err(a, b)), "max_abs_err 遇到 NaN 必须返回非有限值");
   }
 
   // ---- MaxPool2d（k=s=2）：前向 y/argmax + 反向 dx parity；H/W 为奇数验证向下取整 ----
@@ -143,6 +155,9 @@ int main() {
     const double err = gradcheck_relu(x);
     std::cout << "relu gradcheck_max_err    = " << err << "\n";
     check(err < 1e-5, "ReLU FP64 中心差分 gradcheck 最大绝对误差 < 1e-5");
+    check(!std::isfinite(gradcheck_relu(
+              Tensor::from_flat({2}, {0.0f, std::numeric_limits<float>::infinity()}))),
+          "gradcheck_relu 遇到非有限差分必须返回非有限");
   }
 
   // ---- FP64 中心差分 gradcheck：loss = Σ y²（MaxPool k=s=2） ----
@@ -155,6 +170,10 @@ int main() {
     const double err = gradcheck_maxpool2d(m, x);
     std::cout << "maxpool gradcheck_max_err = " << err << "\n";
     check(err < 1e-5, "MaxPool FP64 中心差分 gradcheck 最大绝对误差 < 1e-5");
+    Tensor x_inf = Tensor::zeros({1, 1, 2, 2});
+    x_inf[0] = std::numeric_limits<float>::infinity();
+    check(!std::isfinite(gradcheck_maxpool2d(m, x_inf)),
+          "gradcheck_maxpool2d 遇到非有限差分必须返回非有限");
   }
 
   // ---- 梯度裁剪：global L2 norm + 原地缩放 CPU/CUDA parity + 公式独立自检 ----
@@ -212,6 +231,25 @@ int main() {
       cuda_threw = true;
     }
     check(cpu_threw && cuda_threw, "非有限梯度 norm CPU/CUDA 都抛错");
+  }
+
+  // 分量有限但范数超出 float：转 float 会变 inf，clip 系数变 0 把梯度静默清零。
+  {
+    Tensor hg = Tensor::from_flat({2}, {3e38f, 3e38f});
+    Tensor hg_cuda = hg;
+    bool cpu_threw = false;
+    bool cuda_threw = false;
+    try {
+      (void)global_grad_norm({&hg});
+    } catch (const std::runtime_error&) {
+      cpu_threw = true;
+    }
+    try {
+      (void)global_grad_norm_cuda({&hg_cuda});
+    } catch (const std::runtime_error&) {
+      cuda_threw = true;
+    }
+    check(cpu_threw && cuda_threw, "范数超出 float 范围 CPU/CUDA 都抛错");
   }
 
   // ---- 形状异常自检（防越界/错位） ----

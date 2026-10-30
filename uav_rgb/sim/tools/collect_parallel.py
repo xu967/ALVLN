@@ -11,7 +11,8 @@
   2. 每个 instance 一个 worker：顺序跑 E 个 episode；每个 episode 都新起一个
      `gz sim -s -r <world>`（collect.py 没有 episode reset，world 必须全新），
      setsid 独立进程组，每个 episode 独立 GZ_PARTITION、DISPLAY=:20、LP_NUM_THREADS=1
-     （软件渲染限线程：6 实例并发实测 RTF 0.21→0.50，否则 30 s 起飞超时）。
+     （软件渲染限线程：6 实例并发实测 RTF 0.21→0.50；起飞 timeout 已从
+     30 s 提到 120 s，RTF 0.2 时爬升 1.95 m 要 ~60 s 墙钟）。
      某个 episode 失败会重启 sim 重试 1 次（collect.py 发布层偶发丢首条指令）。
   3. 并发跑 collect.py（子进程，各自 --scene-id/--seed/--split）。
   4. 全部结束后把 staging 汇总到 --out/<split>/<scene_id>/。
@@ -51,7 +52,7 @@ DEFAULT_TEMPLATE = os.path.join(SIM_DIR, "worlds", "uav_rgb.sdf")
 DISPLAY_VALUE = ":20"
 XDG_RUNTIME_DIR = "/tmp/xdg"
 SIM_SETTLE_S = 3.0   # sim-ready 后再稳 3 s 才发首条起飞指令（发布层偶发丢首包）
-SPLIT_POLICY = ("geometry group: sha256(uavrgb.geom.v1:<gid>) % 100 -> "
+SPLIT_POLICY = ("geometry group: sha256(uavrgb.geom.v3:<gid>) % 100 -> "
                 "<80 train; <90 val; else test")
 
 _REG_LOCK = threading.Lock()
@@ -137,11 +138,39 @@ def stop_group(proc, label, term_timeout=8.0):
     return clean
 
 
+def _sweep_orphan_topics():
+    """杀掉父进程已死的 gz-transport-topic 订阅者。
+
+    collect.py 被 SIGKILL 时它起的 `gz topic -e` 子进程会掉到 init（ppid=1）并
+    继续订阅；实测 30+ 个残留把 4 实例 RTF 压到 0.1（10 s/步），清掉后 1.4 s/步。
+    只认 /uav/ 与 /model/x3 话题，避免误杀别的 gz topic。
+    """
+    try:
+        r = subprocess.run(["ps", "-eo", "pid,ppid,args", "--no-headers"],
+                           capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    for line in r.stdout.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[1] != "1":
+            continue
+        pid_s, _ppid, cmd = parts
+        if "gz-transport-topic" not in cmd:
+            continue
+        if "/uav/" not in cmd and "/model/x3" not in cmd:
+            continue
+        try:
+            os.kill(int(pid_s), signal.SIGKILL)
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+
+
 def cleanup_all():
     with _REG_LOCK:
         procs = list(_PROC_GROUPS.values())
     for proc in procs:
         stop_group(proc, "cleanup")
+    _sweep_orphan_topics()
 
 
 def _tail(path, n=20):
@@ -224,6 +253,7 @@ class Task:
     partition: str = field(default_factory=lambda: "uavrgb_" + uuid.uuid4().hex)
     world_sha256: str = ""
     scene_meta: dict = field(default_factory=dict)
+    spawn_mode: str = "default"
     staging: str = ""
     final_dir: str = ""
     status: str = "pending"
@@ -388,13 +418,21 @@ def main():
     p.add_argument("--instances", type=int, default=4, help="并行实例数（默认 4）")
     p.add_argument("--episodes-per-instance", type=int, default=1,
                    help="每个实例顺序采的 episode 数（每个 episode 重启一次 sim）")
-    p.add_argument("--steps", type=int, default=80,
-                   help="每 episode 步数（默认 80：实测每步 0.105 m，穿柱区要 68–76 步）")
+    p.add_argument("--steps", type=int, default=sm.DEFAULT_STEPS,
+                   help="每 episode 步数（默认见 split_manifest.DEFAULT_STEPS=40）")
     p.add_argument("--hold", type=float, default=1.0,
                    help="每动作仿真时间秒（走满即发零速，与 RTF 无关）")
     p.add_argument("--out", required=True, help="汇总输出目录（必须为空/不存在）")
     p.add_argument("--base-seed", type=int, default=0,
-                   help="scene_id = seed = base_seed + i*E + e")
+                   help="scene_id = seed = base_seed + 扫描序号；给 --split 时只取该 split 的 seed")
+    p.add_argument("--seeds", default="",
+                   help="固定 seed 列表（逗号分隔或 a:b），优先于 base-seed/实例数派生")
+    p.add_argument("--split", choices=("train", "val", "test"), default=None,
+                   help="只采命中该 split 的几何组；seed 从 base-seed 起向后扫描")
+    p.add_argument("--spawn-mode", choices=("default", "random"), default="default",
+                   help="普通 episode 的出生位姿（random = y/yaw 随机化）")
+    p.add_argument("--safe-spawn-fraction", type=float, default=0.0,
+                   help="每 N 个 episode 有 1 个用 SAFE 出生位姿（T2 的 SAFE 数据来源）")
     p.add_argument("--policy", choices=("teacher", "forward"), default="teacher")
     p.add_argument("--template", default=DEFAULT_TEMPLATE)
     p.add_argument("--keep-worlds", action="store_true",
@@ -414,6 +452,13 @@ def main():
         p.error("--hold must be finite and > 0")
     if args.episode_timeout <= 0 or args.sim_timeout <= 0:
         p.error("timeouts must be > 0")
+    if not (0.0 <= args.safe_spawn_fraction <= 1.0):
+        p.error("--safe-spawn-fraction 必须在 [0,1]")
+    # 实现是「每 N 集 1 个」，不是任意比例；0.4/0.6 等会静默错配成 1/2。
+    if args.safe_spawn_fraction > 0:
+        n = 1.0 / args.safe_spawn_fraction
+        if abs(n - round(n)) > 1e-9:
+            p.error("--safe-spawn-fraction 必须是 1/N（0.5/0.333/0.25/0.2/0.1…）")
     for path, name in ((SCENE_GEN, "scene_gen.py"), (COLLECT, "collect.py"),
                        (args.template, "template")):
         if not os.path.isfile(path):
@@ -423,6 +468,7 @@ def main():
     if os.path.isdir(out) and os.listdir(out):
         p.error(f"--out {out} 非空；请用新目录（或先清空）")
     os.makedirs(out, exist_ok=True)
+    _sweep_orphan_topics()   # 上一轮被 SIGKILL 的订阅者会拖垮本轮 RTF
     try:
         os.makedirs(XDG_RUNTIME_DIR, mode=0o700, exist_ok=True)
         os.chmod(XDG_RUNTIME_DIR, 0o700)
@@ -437,15 +483,50 @@ def main():
     os.makedirs(logs_dir, exist_ok=True)
     os.makedirs(staging_root, exist_ok=True)
 
+    target = args.instances * args.episodes_per_instance
+    scene_ids = []
+    if args.seeds:
+        for part in args.seeds.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            a, _, b = part.partition(":")
+            scene_ids.extend(range(int(a), int(b) if b else int(a) + 1))
+        if args.split:
+            scene_ids = [s for s in scene_ids
+                         if sm.split_for_gid(sm.geometry_gid(
+                             sm.sg.sample_pillars(s)[0])) == args.split]
+    elif args.split:
+        # 只取目标 split：test 只占几何组的 ~10%，顺序取 base-seed 起的前 N 个
+        # 会全是 train。这里按几何 gid 的固定 split 过滤，扫描上限防止写错 split
+        # 后无限循环。
+        seed = args.base_seed
+        while len(scene_ids) < target:
+            if seed > args.base_seed + 100_000:
+                p.error(f"从 base-seed={args.base_seed} 扫了 100000 个 seed 仍凑不齐 "
+                        f"{target} 个 split={args.split} 的场景")
+            pillars, _, _ = sm.sg.sample_pillars(seed)
+            if sm.split_for_gid(sm.geometry_gid(pillars)) == args.split:
+                scene_ids.append(seed)
+            seed += 1
+    else:
+        scene_ids = list(range(args.base_seed,
+                               args.base_seed + target))
+    if not scene_ids:
+        p.error("没有可采的 scene_id（--seeds 为空或与 --split 无交集）")
+    # SAFE 出生按固定 stride 铺开，保证 train/val/test 都能分到（T3 四类 recall 需要）。
+    safe_stride = (max(1, round(1.0 / args.safe_spawn_fraction))
+                   if args.safe_spawn_fraction > 0 else 0)
     tasks = []
-    for i in range(args.instances):
-        for e in range(args.episodes_per_instance):
-            scene_id = args.base_seed + i * args.episodes_per_instance + e
-            tasks.append(Task(
-                instance=i, episode=e, scene_id=scene_id, seed=scene_id,
-                split="",  # 世界生成后按几何组填，见下
-                world=os.path.join(worlds_dir, f"scene_{scene_id}.sdf"),
-                scene_meta_path=os.path.join(worlds_dir, f"scene_{scene_id}.json")))
+    for k, scene_id in enumerate(scene_ids):
+        i = k % args.instances
+        spawn_mode = ("safe" if safe_stride and k % safe_stride == 0 else args.spawn_mode)
+        tasks.append(Task(
+            instance=i, episode=k // args.instances, scene_id=scene_id, seed=scene_id,
+            split="",  # 世界生成后按几何组填，见下
+            spawn_mode=spawn_mode,
+            world=os.path.join(worlds_dir, f"scene_{scene_id}.sdf"),
+            scene_meta_path=os.path.join(worlds_dir, f"scene_{scene_id}.json")))
     if len({t.scene_id for t in tasks}) != len(tasks):
         p.error("scene_id 冲突（base-seed 派生异常）")
 
@@ -457,7 +538,7 @@ def main():
             r = subprocess.run(
                 [sys.executable, SCENE_GEN, "--seed", str(t.seed),
                  "--scene-id", str(t.scene_id), "--out", t.world,
-                 "--template", args.template],
+                 "--spawn-mode", t.spawn_mode, "--template", args.template],
                 capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 print(r.stdout, flush=True)
@@ -540,6 +621,13 @@ def main():
             "steps": args.steps,
             "hold_s": args.hold,
             "policy": args.policy,
+            "split": args.split,
+            "seeds": args.seeds,
+            "spawn_mode": args.spawn_mode,
+            "safe_spawn_fraction": args.safe_spawn_fraction,
+            "safe_episodes_requested": sum(1 for t in tasks if t.spawn_mode == "safe"),
+            "unique_geometry": len({sm.geometry_gid(t.scene_meta["pillars"])
+                                    for t in tasks if t.scene_meta}),
             "split_policy": SPLIT_POLICY,
             "template": _rel(os.path.abspath(args.template)),
             "keep_worlds": bool(args.keep_worlds),
@@ -572,6 +660,7 @@ def main():
                 "scene_id": t.scene_id,
                 "seed": t.seed,
                 "split": t.split,
+                "spawn_mode": t.spawn_mode,
                 "status": t.status,
                 "ok": t.ok,
                 "attempts": t.attempts,

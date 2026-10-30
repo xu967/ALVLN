@@ -12,6 +12,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS)
@@ -68,8 +69,9 @@ def depth_msg(w, h, step, fmt, raw):
 
 
 class FakeSub:
-    def __init__(self, frames=(), latest=None, after=None):
+    def __init__(self, frames=(), latest=None, after=None, healthy=True):
         self._frames, self._latest, self._after = list(frames), latest, after
+        self._healthy = healthy
 
     def frames(self):
         return self._frames
@@ -78,13 +80,36 @@ class FakeSub:
         return self._latest
 
     def healthy(self):
-        return True
+        return self._healthy
 
     def latest_after(self, _ts, timeout=0.0):
         return self._after
 
     def close(self):
         pass
+
+
+class DyingContact(FakeSub):
+    """第一次 healthy() 为真（步首检查），之后为假（动作窗口内退出）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def healthy(self):
+        self.calls += 1
+        return self.calls == 1
+
+
+class ClockPoseSub(FakeSub):
+    """latest() 返回当前假时钟；测试通过 act/sleep 推进它。"""
+
+    def __init__(self, initial):
+        super().__init__(frames=[(1, initial)], latest=initial)
+        self.current = initial
+
+    def latest(self):
+        return self.current
 
 
 class FakePub:
@@ -121,6 +146,78 @@ def pose_msg(sec, z=2.1):
                                            "nsec": int(round((sec - whole) * 1e9))}}}]}
 
 
+def _fresh_depth(w, h, sec=10):
+    dep = depth_msg(w, h, 4 * w, "R_FLOAT32",
+                    struct.pack("<%df" % (w * h), *([5.0] * (w * h))))
+    dep["header"] = {"stamp": {"sec": sec, "nsec": 0}}
+    return dep
+
+
+def stale_depth_fails():
+    """depth 缓冲里只有旧帧：不能把旧深度当本步观测。"""
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    dep = _fresh_depth(w, h, sec=9)       # 比 RGB 旧 1 s
+    pos = pose_msg(10.5)
+    subs = {"rgb": FakeSub(after=rgb), "depth": FakeSub(frames=[(1, dep)]),
+            "pose": FakeSub(frames=[(1, pos)], latest=pos), "contact": FakeSub()}
+    with tempfile.TemporaryDirectory() as d:
+        row, err = collect.collect_one(d, 0, 0.01, "teacher", subs, FakePub())
+    return row, err
+
+
+def dead_depth_fails():
+    """depth 订阅进程退出：即使缓冲里还有旧帧也必须失败。"""
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    dep = _fresh_depth(w, h)
+    pos = pose_msg(10.5)
+    subs = {"rgb": FakeSub(after=rgb),
+            "depth": FakeSub(frames=[(1, dep)], healthy=False),
+            "pose": FakeSub(frames=[(1, pos)], latest=pos), "contact": FakeSub()}
+    with tempfile.TemporaryDirectory() as d:
+        row, err = collect.collect_one(d, 0, 0.01, "teacher", subs, FakePub())
+    return row, err
+
+
+def dead_contact_fails():
+    """contact 订阅进程退出：步首就拒绝，不能默认「无接触」。"""
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    pos = pose_msg(10.5)
+    subs = {"rgb": FakeSub(after=rgb),
+            "depth": FakeSub(frames=[(1, _fresh_depth(w, h))]),
+            "pose": FakeSub(frames=[(1, pos)], latest=pos),
+            "contact": FakeSub(healthy=False)}
+    with tempfile.TemporaryDirectory() as d:
+        row, err = collect.collect_one(d, 0, 0.01, "teacher", subs, FakePub())
+    return row, err
+
+
+def dying_contact_window_fails():
+    """动作窗口内 contact 订阅退出：必须零速并失败，不能把碰撞漏成 False。"""
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    pose = ClockPoseSub(pose_msg(10.5))
+    subs = {"rgb": FakeSub(after=rgb),
+            "depth": FakeSub(frames=[(1, _fresh_depth(w, h))]),
+            "pose": pose, "contact": DyingContact()}
+    with tempfile.TemporaryDirectory() as d, \
+            patch.object(collect, "write_rgb_png", return_value=(True, None)):
+        row, err = collect.collect_one(d, 0, 1.0, "teacher", subs, FakePub())
+    return row, err
+
+
+def dead_contact_takeoff_fails():
+    """起飞前 contact 订阅已退出：直接拒绝，不能带着瞎掉的碰撞检测起飞。"""
+    pos = FakeSub(latest=pose_msg(0.2, z=0.2))
+    try:
+        collect.take_off(pos, FakePub(), FakeSub(healthy=False), timeout=0.01)
+    except RuntimeError as e:
+        return "contact" in str(e)
+    return False
+
+
 def stale_pose_fails():
     """窗口内位姿不前进：动作窗口走不满，该步必须失败。
 
@@ -138,6 +235,51 @@ def stale_pose_fails():
     with tempfile.TemporaryDirectory() as d:
         row, err = collect.collect_one(d, 0, 0.01, "teacher", subs, FakePub())
     return row, err
+
+
+def delayed_inference_window():
+    """推理期间仿真推进：执行窗口必须从派发时刻算，不能从观测帧算。
+
+    回归 R01：旧实现 action_start_ns=观测戳(10.2)，act 期间仿真到 11.2，
+    hold=1.0 的终点 11.2 已经过去，零速会和动作在同一仿真时刻发出。
+    """
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    dep = depth_msg(w, h, 4 * w, "R_FLOAT32",
+                    struct.pack("<%df" % (w * h), *([5.0] * (w * h))))
+    dep["header"] = {"stamp": {"sec": 10, "nsec": 0}}
+    pose = ClockPoseSub(pose_msg(10.2))
+    subs = {"rgb": FakeSub(after=rgb), "depth": FakeSub(frames=[(1, dep)]),
+            "pose": pose, "contact": FakeSub()}
+
+    class Student:
+        def act(self, msg):
+            pose.current = pose_msg(11.2)   # 推理期间仿真走到 11.2
+            return 1, 500.0, [0.0, 1.0, 0.0, 0.0]
+
+    class RecordingPub(FakePub):
+        def __init__(self):
+            super().__init__()
+            self.sent = []
+
+        def start(self, *args):
+            self.sent.append((collect._pose_stamp(pose.latest()), args))
+            return super().start(*args)
+
+    def advance(_secs):
+        pose.current = pose_msg(12.2)       # 窗口走满 1 s
+
+    pub = RecordingPub()
+    with tempfile.TemporaryDirectory() as d, \
+            patch.object(collect, "write_rgb_png", return_value=(True, None)), \
+            patch.object(collect.time, "sleep", side_effect=advance):
+        row, err = collect.collect_one(d, 0, 1.0, "student", subs, pub,
+                                       student=Student())
+    return (err is None and row is not None
+            and row["pose_before_ts"] == 10_200_000_000
+            and row["action_start_ns"] == 11_200_000_000
+            and row["sim_dt"] == 1.0
+            and [s for s, _ in pub.sent] == [11_200_000_000, 12_200_000_000])
 
 
 def main():
@@ -174,6 +316,18 @@ def main():
 
     row, err = stale_pose_fails()
     check("pose 停更 -> 该步失败", row is None and "动作窗口超时" in (err or ""))
+    row, err = stale_depth_fails()
+    check("depth 停更 -> 该步失败", row is None and "depth 停更" in (err or ""))
+    row, err = dead_depth_fails()
+    check("depth 订阅退出 -> 该步失败", row is None and "depth 订阅进程已退出" in (err or ""))
+    row, err = dead_contact_fails()
+    check("contact 订阅退出 -> 该步失败",
+          row is None and "contact 订阅进程已退出" in (err or ""))
+    row, err = dying_contact_window_fails()
+    check("动作窗口内 contact 退出 -> 该步失败",
+          row is None and "动作窗口内 contact" in (err or ""))
+    check("起飞前 contact 退出 -> 拒绝起飞", dead_contact_takeoff_fails())
+    check("推理延迟不缩短执行窗口", delayed_inference_window())
 
     print(f"test_collect: {passed} 项通过")
     return 0

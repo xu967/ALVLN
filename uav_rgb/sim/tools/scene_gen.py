@@ -13,43 +13,60 @@
   - 障碍 8–9 根，0.4×0.4×3 m，z∈[0,3]，挡住 z≈2.3 m 巡航高度；
     x∈[1.5, 5.0] 均匀递增（实测每步仅前进 0.105 m，穿完这段要 68–76 步；默认
     --steps 因此是 80，见 collect_parallel.py 的参数注释），
-    y∈[-1.5, 1.5] 走三条车道：中心车道 ±0.2 m、左右车道 ±1.3 m。
-  - 车道间距 1.302 m（柱宽 0.4 + 缝 0.902 m）；按「中-左-右」蛇形循环，
-    柱 i 与 i+3 同车道、x 间距 ≥3×0.4375=1.3125 m（≥1.302 m 最小间距）。
+    y∈[-1.7, 1.7] 走三条车道：中心车道 ±0.1 m、左右车道 ±1.6 m。
+  - 车道间距 1.6 m（柱宽 0.4 + 缝 1.2 m）；按「中-左-右」蛇形循环，
+    柱 i 与 i+3 同车道、x 间距 3×0.4375=1.3125 m（纵向缝 0.9125 m ≥ MIN_GAP）。
     走到下一根同车道障碍约 1.3 m，对应「每前进 1–1.5 m 做一次左右选择」。
+    v3 把缝从 0.902 放宽到 1.2 m：机体外接直径 0.711 m，单侧余量从 9.5 cm
+    提到 24.5 cm（T1，2026-10-30）。
   - 第一根在中心车道（|y|≤0.25）作「门柱」：teacher 只在中间 ±10.9°、
-    1.5 m 内转向；柱心 x=1.5 时相机（x≈0.2）深度约 1.1 m，Step 0 就触发避障。
+    1.5 m 内转向；出生点 x=-0.5 时相机（x≈-0.3）到门柱约 1.6 m，Step 0 附近
+    就触发避障。
   - 出生区 x<1.0 无遮挡（柱体最近边 x≥1.3）。
-  - 任意两柱在 x 或 y 方向至少有一条 ≥0.9 m 的缝。机体真实外接直径是 0.711 m
+  - 任意两柱在 x 或 y 方向至少有一条 ≥0.9 m 的缝（同车道纵向缝仍由 x 间距
+    保证，最小 0.9125 m）。机体真实外接直径是 0.711 m
     （旋翼中心 hypot(0.13,0.22)=0.256 m + 桨盘半径 0.1 m，再乘 2），
-    所以 0.902 m 的缝只剩 0.19 m 余量；旧文案写的「跨度 0.64 m」偏小；
-    每根柱到 y=±3 走廊边界也各留 ≥0.9 m。不满足则整组重采样，最多 100 次。
+    横向车道缝 1.2 m 留 0.2445 m 单侧余量；每根柱到 y=±3 走廊边界至少留
+    1.1 m。不满足则整组重采样，最多 100 次。
   - 同次生成在 <out>.json 写 scene_id / seed / 障碍清单 / 净空检查，供 manifest 用。
 
 注：任务要求 8–12 根，但 3.5×3.0 m 的密布区 + 全对 ≥0.9 m 缝（柱心间距
 Chebyshev ≥1.3 m）最多只能放 3×3=9 根；10–12 根必然出现一对缝隙 <0.9 m，
-因此采样上限取 9（详见 sim/README.md §4.6.1）。三条车道已占满 y∈[-1.5, 1.5]
-的可用宽度，边界净空 3−1.5−0.2=1.3 m。
+因此采样上限取 9（详见 sim/README.md §4.6.1）。三条车道占 y∈[-1.7, 1.7]，
+边界净空 3−1.7−0.2=1.1 m。
 """
 import argparse
 import hashlib
 import json
 import os
 import random
+import re
 import sys
+
+# 几何语义版本：改柱子/车道/spawn 规则必须 bump。split_manifest 直接用它当
+# SPLIT_SALT，collect 写进 episode manifest，preprocess 拒绝跨版本混包。
+GEOMETRY_VERSION = "uavrgb.geom.v3"
 
 PILLAR_SIZE = 0.4
 PILLAR_HEIGHT = 3.0
 PILLAR_Z = PILLAR_HEIGHT / 2.0
 PILLAR_X_RANGE = (1.5, 5.0)
-PILLAR_Y_RANGE = (-1.5, 1.5)
+PILLAR_Y_RANGE = (-1.7, 1.7)
 Y_RANGE = (-3.0, 3.0)      # 走廊边界（比密布区宽），边界净空按此校验
-LANE_SEP = 1.302           # 车道中心距 = 柱宽 0.4 + 缝隙 0.902（避开 0.9 浮点抖动）
-LANE_CENTER_ABS_MAX = 0.19  # 中心车道摆动上限：0.19+1.302 ≤ 1.5
+LANE_SEP = 1.6             # 车道中心距 = 柱宽 0.4 + 缝隙 1.2（T1 放宽几何）
+LANE_CENTER_ABS_MAX = 0.1  # 中心车道摆动上限：0.1+1.6 ≤ 1.7
 PILLAR_COUNT_RANGE = (8, 9)  # 10–12 根违反全对缝隙契约（3×3 密堆上限）
 GATE_Y_ABS_MAX = 0.25   # 门柱 |y| 上限：teacher 只对正前方 1.5 m 内障碍转向
 MIN_GAP = 0.9
 SPAWN_CLEAR_X = 1.0
+# 出生点后移 0.5 m：门柱在 x=1.5，原来 1.5 m 内要横移 ~0.8 m 才能避开，
+# 实测 15/24 集在 x≈1.05 擦柱。后移给转向多 0.5 m 的纵向空间。
+SPAWN_X = -0.5
+SPAWN_Z = 0.15
+SPAWN_BODY_HALF = 0.235 + 0.01  # 0.47 m 机身方框 + 1 cm 余量
+# SDF 的四个旋翼中心与桨盘半径；出生净空必须按真实几何查，不能只查机身方框。
+ROTOR_OFFSETS = ((0.13, -0.22), (0.13, 0.22), (-0.13, 0.2), (-0.13, -0.2))
+ROTOR_RADIUS = 0.1
 CRUISE_HEIGHT = 2.3
 MAX_ATTEMPTS = 100
 
@@ -119,7 +136,7 @@ def sample_pillars(seed):
     """random.Random(seed) 采样；整组不满足契约则重采样，最多 MAX_ATTEMPTS 次。
 
     8–9 根沿 x 均匀递增；y 走「中心-侧-反侧」三车道蛇形，第二根随机选左/右。
-    三条车道间距 1.3 m，柱 i 与 i+3 同车道且 x 间距 ≥1.3 m，构造上满足缝隙
+    三条车道间距 1.6 m，柱 i 与 i+3 同车道且 x 间距 ≥1.3 m，构造上满足缝隙
     契约；validate_pillars 只做兜底。rng 调用顺序固定（n、center、side），
     同 seed 结果字节级一致。
     """
@@ -147,6 +164,85 @@ def sample_pillars(seed):
     raise RuntimeError(f"seed={seed}: {MAX_ATTEMPTS} 次重采样仍未满足缝隙契约")
 
 
+def _spawn_collides(x, y, pillars):
+    """出生点是否与柱子重叠：0.47 m 机身方框 + 四个桨盘（半径 0.1）。
+
+    只查机身方框会放进「机身没碰、桨盘已进柱」的 safe 出生点（review 实测
+    0.30 m 面距时桨盘只剩 7 cm 余量）；按真实旋翼中心查更准。
+    """
+    for p in pillars:
+        if (abs(x - p["x"]) < PILLAR_SIZE / 2 + SPAWN_BODY_HALF and
+                abs(y - p["y"]) < PILLAR_SIZE / 2 + SPAWN_BODY_HALF):
+            return True
+        for rx, ry in ROTOR_OFFSETS:
+            dx = max(0.0, abs(x + rx - p["x"]) - PILLAR_SIZE / 2)
+            dy = max(0.0, abs(y + ry - p["y"]) - PILLAR_SIZE / 2)
+            if dx * dx + dy * dy < ROTOR_RADIUS * ROTOR_RADIUS:
+                return True
+    return False
+
+
+def make_spawn(pillars, seed, mode="default"):
+    """返回出生位姿。mode=default/random/safe。
+
+    safe：T2 用。在柱区里找一个 plan_action 真正判 SAFE 的位姿，让「停」类样本
+    由教师规则天然产生，而不是人工造标签。候选点围绕前 3 根柱子取 ±0.5/±0.25 m
+    偏移；不满足 AABB 净空或 plan_action 不是 SAFE 就换下一个，顺序由 seed 决定。
+    找不到才退回粗网格；再找不到就报错（不静默给 default）。
+    """
+    if mode == "default":
+        return {"x": SPAWN_X, "y": 0.0, "z": SPAWN_Z, "yaw_deg": 0.0, "mode": mode}
+    rng = random.Random(seed ^ 0x5AFE)   # 独立 RNG，不能扰动 sample_pillars 的序列
+    if mode == "random":
+        # 出生在门柱与侧柱之间的缝中心附近（|y|≈0.8）：直线就能穿过第一排，
+        # 不再需要 1.5 m 内横移 0.8 m。y=0 的起始留给 safe/default 模式。
+        y = rng.choice((-1.0, 1.0)) * round(rng.uniform(0.72, 0.88), 3)
+        return {"x": SPAWN_X, "y": y, "z": SPAWN_Z,
+                "yaw_deg": round(rng.uniform(-5.0, 5.0), 1), "mode": mode}
+    if mode != "safe":
+        raise ValueError(f"unknown spawn mode {mode!r}")
+
+    from teacher import plan_action, SAFE_NEUTRAL
+    offsets = [(dx, dy) for dx in (-0.5, 0.5)
+               for dy in (-0.25, -0.125, 0.0, 0.125, 0.25)]
+    candidates = [(p["x"] + dx, p["y"] + dy) for p in pillars[:3] for dx, dy in offsets]
+    rng.shuffle(candidates)
+    for x, y in candidates:
+        x, y = round(x, 3), round(y, 3)
+        if not (PILLAR_X_RANGE[0] - 0.5 <= x <= PILLAR_X_RANGE[1] + 0.5):
+            continue
+        if not (PILLAR_Y_RANGE[0] <= y <= PILLAR_Y_RANGE[1]):
+            continue
+        if _spawn_collides(x, y, pillars):
+            continue
+        if plan_action(x, y, 0.0, pillars) == SAFE_NEUTRAL:
+            return {"x": x, "y": y, "z": SPAWN_Z, "yaw_deg": 0.0, "mode": mode}
+    # 粗网格兜底：候选偏移全不中时仍要给出真实 SAFE 位姿。
+    for xi in range(8, 41):
+        x = round(xi * 0.125, 3)
+        for yi in range(-13, 14):
+            y = round(yi * 0.125, 3)
+            if _spawn_collides(x, y, pillars):
+                continue
+            if plan_action(x, y, 0.0, pillars) == SAFE_NEUTRAL:
+                return {"x": x, "y": y, "z": SPAWN_Z, "yaw_deg": 0.0, "mode": mode}
+    raise RuntimeError(f"seed={seed}: 找不到 SAFE 出生位姿")
+
+
+X3_POSE_RE = re.compile(r'(<model name="x3">\s*<pose>)([^<]*)(</pose>)')
+
+
+def _apply_spawn(world, spawn):
+    """只替换 x3 模型的第一条 pose；控制 spawn 不影响其它模板内容。"""
+    def repl(m):
+        return (m.group(1) + f"{spawn['x']:g} {spawn['y']:g} {spawn['z']:g} "
+                f"0 0 {spawn['yaw_deg'] * 3.141592653589793 / 180.0:.6f}" + m.group(3))
+    world, n = X3_POSE_RE.subn(repl, world, count=1)
+    if n != 1:
+        raise ValueError(f"template x3 pose 匹配到 {n} 处，应为 1")
+    return world
+
+
 def _pillar_xml(p):
     return f"""    <model name="{p['name']}">
       <static>true</static>
@@ -161,7 +257,7 @@ def _pillar_xml(p):
     </model>"""
 
 
-def build_scene(template, seed, scene_id):
+def build_scene(template, seed, scene_id, spawn_mode="default"):
     """返回 (world_text, meta)。template 只读，任何标记异常都直接报错。"""
     for mark in (START_MARK, END_MARK):
         if template.count(mark) != 1:
@@ -171,16 +267,21 @@ def build_scene(template, seed, scene_id):
     if end <= start:
         raise ValueError("template markers out of order")
     pillars, clearance, attempts = sample_pillars(seed)
+    spawn = make_spawn(pillars, seed, spawn_mode)
     lines = [f"    <!-- scene_gen: scene_id={scene_id} seed={seed} "
              f"pillars={len(pillars)}; generated, do not edit -->"]
     lines += [_pillar_xml(p) for p in pillars]
     lines.append("")
     world = template[:start] + "\n".join(lines) + "\n" + template[end:]
+    world = _apply_spawn(world, spawn)
     meta = {
         "schema": "navlab.scene.v1",
         "scene_id": scene_id,
         "seed": seed,
         "generator": "sim/tools/scene_gen.py",
+        # 数据版本：与 SPLIT_SALT 同源，preprocess/audit 用它拦住 v2/v3 混包。
+        "geometry_version": GEOMETRY_VERSION,
+        "spawn": spawn,
         "template_sha256": sha256(template.encode("utf-8")),
         "world_sha256": sha256(world.encode("utf-8")),
         "pillar_count": len(pillars),
@@ -194,6 +295,7 @@ def build_scene(template, seed, scene_id):
             "pillar_x_range": list(PILLAR_X_RANGE),
             "pillar_y_range": list(PILLAR_Y_RANGE),
             "lane_sep_m": LANE_SEP,
+            "lane_gap_m": round(LANE_SEP - PILLAR_SIZE, 4),
             "pillar_count_range": list(PILLAR_COUNT_RANGE),
             "gate_y_abs_max_m": GATE_Y_ABS_MAX,
             "spawn_clear_before_x_m": SPAWN_CLEAR_X,
@@ -222,6 +324,10 @@ def run_self_check(template_path, n_seeds):
     bad = []
     counts = {}
     example = None
+    # T1 契约：横向车道缝必须 ≥1.2 m（机体外接直径 0.711 m，单侧余量 ≥0.24 m）。
+    lane_gap = LANE_SEP - PILLAR_SIZE
+    if lane_gap < 1.2:
+        bad.append((-1, f"lane gap {lane_gap:.3f} m < 1.2 m"))
     for seed in range(n_seeds):
         try:
             w1, m1 = build_scene(template, seed, seed)
@@ -250,7 +356,8 @@ def run_self_check(template_path, n_seeds):
         print(f"scene_gen self-check: FAIL ({len(bad)} seeds)", file=sys.stderr)
         return 1
     print(f"scene_gen self-check: PASS（同 seed 字节级一致，障碍 "
-          f"{PILLAR_COUNT_RANGE[0]}–{PILLAR_COUNT_RANGE[1]} 根，缝隙契约全过）")
+          f"{PILLAR_COUNT_RANGE[0]}–{PILLAR_COUNT_RANGE[1]} 根，车道缝 "
+          f"{LANE_SEP - PILLAR_SIZE:.2f} m，缝隙契约全过）")
     return 0
 
 
@@ -261,6 +368,8 @@ def main():
     p.add_argument("--out", help="输出 SDF 路径；同名 .json 写场景清单")
     p.add_argument("--scene-id", type=int, default=None,
                    help="EpisodeMeta.scene_id（默认=seed）")
+    p.add_argument("--spawn-mode", choices=("default", "random", "safe"), default="default",
+                   help="出生位姿：default=模板原点；random=y/yaw 随机；safe=柱区内真 SAFE 位姿")
     p.add_argument("--template", default=DEFAULT_TEMPLATE,
                    help=f"模板 SDF（默认 {_rel(DEFAULT_TEMPLATE)}）")
     p.add_argument("--self-check", action="store_true",
@@ -278,7 +387,7 @@ def main():
     scene_id = args.seed if args.scene_id is None else args.scene_id
 
     template = _read_template(args.template)
-    world, meta = build_scene(template, args.seed, scene_id)
+    world, meta = build_scene(template, args.seed, scene_id, args.spawn_mode)
     meta["template"] = _rel(os.path.abspath(args.template))
     out = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
@@ -287,7 +396,7 @@ def main():
     _write_atomic(meta_path, (json.dumps(meta, indent=2, ensure_ascii=False) + "\n")
                   .encode("utf-8"))
     print(f"scene_id={scene_id} seed={args.seed} pillars={meta['pillar_count']} "
-          f"sha256={sha256(world.encode('utf-8'))}")
+          f"spawn={meta['spawn']} sha256={sha256(world.encode('utf-8'))}")
     print(f"  world -> {out}")
     print(f"  meta  -> {meta_path}")
     for pillar in meta["pillars"]:

@@ -95,6 +95,11 @@ add_executable(test_overfit tests/test_overfit.cpp)
 target_link_libraries(test_overfit PRIVATE uavrgb_core)
 add_test(NAME test_overfit COMMAND test_overfit)
 
+# T4：--eval-only 与训练期同权重/同数据的 validation 事件必须逐字节对账。
+add_executable(test_eval_only tests/test_eval_only.cpp)
+target_link_libraries(test_eval_only PRIVATE uavrgb_core)
+add_test(NAME test_eval_only COMMAND test_eval_only)
+
 # 类别权重 + 碰撞过滤（数值 / 数据集 / 端到端不平衡实验）。
 add_executable(test_weighted_loss tests/test_weighted_loss.cpp)
 target_link_libraries(test_weighted_loss PRIVATE uavrgb_core)

@@ -22,8 +22,15 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scene_gen as sg  # noqa: E402
 
 SPLITS = ("train", "val", "test")
+# v3：T1 把车道缝从 0.902 m 放宽到 1.2 m（LANE_SEP 1.302→1.6），几何语义变了，
+#     必须换 salt；旧 v2 数据不能与 v3 混用，见 docs/experiments/2026-10-30-t1-lane-geometry.md。
 # v2：v1 把 -0.0 格式化成 "-0.000"，同几何不同符号会得到不同 gid（seed 337/3651）。
-SPLIT_SALT = "uavrgb.geom.v2"
+# 单一来源：SPLIT_SALT 与 scene.json 的 geometry_version 必须是同一个字符串。
+SPLIT_SALT = sg.GEOMETRY_VERSION
+# 采集默认步数（collect.py / collect_parallel.py 共用，改一处即可）：
+# v3 几何 + A* 每步约 0.27 m，T2 实测 29–38 步过线（中位 30），40 步留余量；
+# 80 步会让约一半帧在柱区外原地转向。
+DEFAULT_STEPS = 40
 LAYOUT_PATTERN = "lane3_serpentine"   # sample_pillars 的布局模式；改模式要同步改这里
 GEOMETRY_PRECISION = 3                # scene_gen 的 x/y 输出精度（round 到 3 位）
 SCHEMA = "navlab.split_manifest.v1"

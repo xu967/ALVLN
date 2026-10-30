@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdint>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -34,11 +35,15 @@ bool throws_invalid(F&& f) {
   return false;
 }
 
-// 两个同形状 Tensor 的最大绝对误差。
+// 两个同形状 Tensor 的最大绝对误差。NaN 不能被 std::max 吞掉（NaN 比较恒
+// false），否则 CUDA 侧全是 NaN 时误差仍是 0，parity 测试会假绿。
 double max_abs_err(const uavrgb::Tensor& a, const uavrgb::Tensor& b) {
+  if (a.numel() != b.numel()) return std::numeric_limits<double>::infinity();
   double m = 0.0;
   for (std::size_t i = 0; i < a.numel(); ++i) {
-    m = std::max(m, std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
+    const double d = std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
+    if (!std::isfinite(d)) return std::numeric_limits<double>::infinity();
+    m = std::max(m, d);
   }
   return m;
 }
@@ -47,6 +52,12 @@ double max_abs_err(const uavrgb::Tensor& a, const uavrgb::Tensor& b) {
 
 int main() {
   using namespace uavrgb;
+
+  // 守卫自身的负例：NaN 差值必须变成 inf，不能被 std::max 吞掉。
+  check(!std::isfinite(max_abs_err(Tensor::from_flat({1}, {0.0f}),
+                                   Tensor::from_flat(
+                                       {1}, {std::numeric_limits<float>::quiet_NaN()}))),
+        "max_abs_err 必须把 NaN 判成非有限");
 
   const int in = 8;
   const int out = 4;

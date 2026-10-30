@@ -3,6 +3,7 @@
 #include "uavrgb/ops.hpp"
 
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -80,7 +81,14 @@ Tensor softmax_ce_grad_weighted(const Tensor& logits, const std::vector<int>& la
   check_logits(logits, kGradName);
   const std::int64_t n = logits.dims().at(0);
   const std::int64_t c = logits.dims().at(1);
-  const float wsum = static_cast<float>(check_weighted(labels, weights, n, c, kGradName));
+  const double wsum_d = check_weighted(labels, weights, n, c, kGradName);
+  // kernel/参考实现都用 float 分母：Σw 超出 float 会变成 inf，梯度静默全 0。
+  // 合同允许有限非负权重，所以这里必须拒绝，不能返回一个“看起来正常”的零梯度。
+  if (!(wsum_d <= static_cast<double>(std::numeric_limits<float>::max()))) {
+    throw std::invalid_argument(std::string(kGradName) +
+                                ": 权重按样本求和超出 float 可表示范围，梯度会全为 0");
+  }
+  const float wsum = static_cast<float>(wsum_d);
   Tensor g = Tensor::zeros({n, c});
   for (std::int64_t i = 0; i < n; ++i) {
     const int label = labels[static_cast<std::size_t>(i)];

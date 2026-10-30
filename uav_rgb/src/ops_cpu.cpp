@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -229,7 +230,12 @@ double gradcheck_impl(const Linear& m, const Tensor& x, const std::vector<int>& 
     const double lm =
         softmax_ce_loss_f64(forward_f64(w, bvec, xvec, n, in, out), n, out, labels, weights);
     *p = orig;
-    max_err = std::max(max_err, std::fabs((lp - lm) / (2.0 * eps) - analytic));
+    const double diff = std::fabs((lp - lm) / (2.0 * eps) - analytic);
+    if (!std::isfinite(diff)) {
+      max_err = std::numeric_limits<double>::infinity();
+      return;
+    }
+    max_err = std::max(max_err, diff);
   };
 
   for (int k = 0; k < out; ++k) {

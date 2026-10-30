@@ -12,7 +12,7 @@ latest-wins（deque(maxlen=N)），不做队列积压：30 Hz 下积压 100 帧�
     sub.close()
 
     pub = open_twist_publisher("/X3/gazebo/command/twist")   # 建不起来抛 PublisherUnavailable
-    h = pub.start(0.3, 0.0, 0.05, 0.0)   # 发布并返回完成时刻（CLI 回退时是进程句柄）
+    h = pub.start(0.3, 0.0, 0.05, 0.0)   # 发布并返回完成时刻/发布句柄
     pub.wait(h)
     pub.close()
 
@@ -35,7 +35,7 @@ DEFAULT_GZ_PYTHON = "/usr/bin/python3"
 
 
 class PublisherUnavailable(RuntimeError):
-    """常驻 twist publisher 建不起来；调用方应回退 `gz topic -p` CLI。"""
+    """常驻 twist publisher 建不起来；定量采集应失败，不要回退 `gz topic -p` CLI。"""
 
 
 def header_stamp_ns(msg):
@@ -269,7 +269,8 @@ class _HelperTwistPublisher:
 def open_twist_publisher(topic, connect_timeout=PUBLISHER_START_TIMEOUT):
     """建常驻 twist publisher：优先当前解释器内，否者用 helper 子进程。
 
-    都失败抛 PublisherUnavailable，调用方负责回退 `gz topic -p` CLI。
+    都失败抛 PublisherUnavailable。定量采集应把失败当错误：`gz topic -p` CLI
+    每条约 1 s，动作窗口会失真；CLI 只保留给零速安全网。
     """
     try:
         from gz.transport13 import Node  # noqa: F401 - 只探测能否导入

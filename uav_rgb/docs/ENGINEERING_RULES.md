@@ -24,6 +24,10 @@
    - 模型只输出 4 个离散动作；仿真真值（位置、障碍几何、深度）**不进学生输入**，
      只能用来生成教师标签。
    - 数据 split 按场景/几何组，不按帧随机拆。
+   - **数据集必须放 `/root/rivermind-data/uav_rgb/`（`$DATA_ROOT/uav_rgb`）**：
+     采集、打包（`.uavr`）、权重、run 产物、审计/评测 JSON 一律放这里，
+     绝不写进 `code/` 仓库；仓库内 `data/`、`models/`、`logs/` 只是历史占位，
+     不再放新数据。
    - `ui/` 归另一会话，不改。
 7. **注释只写代码看不出来的"为什么"**。不写"这里做了什么"，不写显而易见的。
    已知局限用 `shortcut: <限制>，<什么时候必须修>` 标出来，让它成为显式决策而不是隐患。
@@ -77,8 +81,8 @@
 
 | 项 | 位置 | 为什么还没修 |
 | --- | --- | --- |
-| 深度/contact 话题停更无检测 | `sim/tools/collect.py` | 会给采集加新失败路径，需要多轮真机验证 |
-| 车道缝 0.902 m vs 机体外接直径 0.711 m | `sim/tools/scene_gen.py` | 场景设计决策；实测收紧净空会把穿越率从 5/8 打到 2/8 |
+| ~~深度/contact 话题停更无检测~~ | `sim/tools/collect.py` | **D4 已修**：depth 与 RGB 差 >100 ms、contact 订阅进程退出即失败；contact 是稀疏话题，无消息不等于停更 |
+| ~~车道缝 0.902 m vs 机体外接直径 0.711 m~~ | `sim/tools/scene_gen.py` | **T1 已修**：v3 车道缝 1.2 m，见 `docs/experiments/2026-10-30-t1-lane-geometry.md` |
 | resume 不校验数据签名 | `src/class_weights.cpp` | 需要给 checkpoint 加字段并升版本 |
 | 采集器同 `--out` 并发有 TOCTOU | `sim/tools/collect_parallel.py` | 要加锁文件，属独立改造 |
 | 设备层 / `BatchReader` / `RunOwner` 未接入训练路径 | `src/device/`、`src/batch_reader.cpp` | 并行训练的后续阶段 |

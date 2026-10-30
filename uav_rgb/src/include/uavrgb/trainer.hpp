@@ -49,6 +49,12 @@ class Trainer {
 
   void run();
 
+  // T4：只评估一个 checkpoint，不建优化器、不更新权重。向 cfg_.out_dir/metrics.jsonl
+  // 追加 split=val/test 的 validation 事件（字段与训练期一致，监控台可直接读）。
+  // eval_val/eval_test 至少一个为 true；显式请求的 split 为空时写 EVAL_SPLIT_EMPTY
+  // FATAL 并抛错（调用方返回非零），不能把空集当成评估成功。
+  void eval_only(const std::string& ckpt_path, bool eval_val, bool eval_test);
+
   const CnnModel& model() const { return model_; }
   CnnModel& model() { return model_; }
   TrainState& state() { return state_; }

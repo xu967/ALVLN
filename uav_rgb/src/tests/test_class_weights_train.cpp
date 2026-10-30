@@ -196,6 +196,25 @@ int main() {
   check(read_file(rcfg.out_dir + "/config.json").find("\"class_weights_source\":\"checkpoint\"") !=
             std::string::npos,
         "resume 的 config.json 标记来源 checkpoint");
+  // 跨目录 resume 必须把源 run 的历史 best 一并交付，不能只继承分数。
+  check(fs::exists(rcfg.out_dir + "/ckpt_best.bin"),
+        "跨目录 resume 输出目录必须包含历史 ckpt_best.bin");
+
+  // 源 run 的 best 文件丢了：不能只继承分数，必须失败而不是悄悄少交付 best。
+  const std::string missing_src = root + "/run_missing_best";
+  fs::create_directories(missing_src);
+  fs::copy_file(wcfg.out_dir + "/ckpt.bin", missing_src + "/ckpt.bin");
+  TrainConfig mcfg = rcfg;
+  mcfg.out_dir = root + "/run_missing_best_out";
+  mcfg.resume = missing_src + "/ckpt.bin";
+  bool missing_rejected = false;
+  try {
+    Trainer t(mcfg);
+    t.run();
+  } catch (const std::exception&) {
+    missing_rejected = true;
+  }
+  check(missing_rejected, "源 run 缺 ckpt_best.bin 时 resume 必须失败");
 
   bool rejected = false;
   try {

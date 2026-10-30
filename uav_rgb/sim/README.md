@@ -122,7 +122,7 @@ gz topic -e -t /model/x3/odometry   # gz.msgs.Odometry
 # 专家策略采集（自动避障，通常无碰撞）
 # 必须带 --scene-meta 才会用柱子真值的 carrot planner；不给会退回深度反应式专家，
 # manifest 的 teacher 字段会如实记为 expert_action。
-python3 sim/tools/collect.py --steps 80 --out /tmp/ep0 --scene-id 1 --seed 42 \
+python3 sim/tools/collect.py --steps 40 --out /tmp/ep0 --scene-id 1 --seed 42 \
   --split train --scene-meta /tmp/scene_1.json
 # 盲策略（恒定前进）采集：撞柱，验证 collision=True
 python3 sim/tools/collect.py --steps 10 --hold 1.5 --policy forward \
@@ -153,13 +153,16 @@ I/O（2026-10-29 起）：`collect.py` 启动时给 camera/depth/pose/contact/ca
 （`tools/gz_io.py` 的 `open_twist_publisher`）。当前解释器能 `import gz.transport13`
 时在进程内 advertise `/X3/gazebo/command/twist`；不能时自动改用 `/usr/bin/python3`
 起一个常驻 helper 子进程发布（`UAVRGB_GZ_PYTHON` 可覆盖解释器），并在 stderr
-打一行警告。两者都建不起来才回退 `gz topic -p` CLI（同样打警告）。
+打一行警告。两者都建不起来时 `collect.py` **直接失败**，不回退 `gz topic -p` CLI：
+CLI 每条固定 ~1 s，动作窗口会失真；CLI 只保留给 finally 的零速安全网。
 常驻通道每条指令是内存级 publish（实测 <0.1 ms）；`--hold` 到点立刻发零速并等它
 发布完成，不会因 hold 早于发布完成而丢零速。
 实测 20 步（hold=0.5）：每步 wall **0.515–0.530 s**（I/O=0.015–0.029 s、
-动作窗口=0.500 s、发布≈0.000 s），20/20 步 ≤0.59 s，M1 20/20。回退 CLI 时仍是 1.50 s/步，
-发布开销 0.995 s（`gz topic -p` 在本机固定 `nanosleep(0, 800000000)` 后再发布，
-见 worklog）。
+动作窗口=0.500 s、发布≈0.000 s），20/20 步 ≤0.59 s，M1 20/20。旧版 CLI 动作发布
+是 1.50 s/步、发布开销 0.995 s（`gz topic -p` 在本机固定 `nanosleep(0, 800000000)`
+后再发布，见 worklog）；该路径已从 `collect.py` 删除。
+新鲜度门禁（D4）：depth 与 RGB 的 sim-time 差 >100 ms，或 contact 订阅进程退出，
+该集直接失败；contact 是稀疏话题，无消息不等于停更。
 
 时间口径（别混）：
 
@@ -185,31 +188,39 @@ python3 sim/tools/scene_gen.py --self-check          # 100 个 seed 自检
 ```
 
 - 以 `worlds/uav_rgb.sdf` 为模板，**只替换**「tall pillars」注释到 X3 模型之间
-  的障碍段落；四旋翼 / RGB / 深度 / contact 插件和三个固定地标原样保留。
+  的障碍段落和 X3 的出生 pose；四旋翼 / RGB / 深度 / contact 插件和三个固定地标
+  原样保留。
 - 障碍 **8–9 根**，0.4×0.4×3 m，z∈[0,3] 挡住 `Z_TARGET≈2.1 m` 巡航高度；
-  x∈**[1.5, 5.0]** 均匀递增；y∈**[-1.5, 1.5]** 走三条车道（中心车道 ±0.19 m、
-  左右车道 ±1.302 m），按「中-左-右」蛇形循环。车道间距 1.302 m = 柱宽 0.4 +
-  缝 0.902 m；同车道第 i / i+3 根 x 间距 ≥1.3125 m ≥ 1.302 m。走到下一根同
-  车道障碍约 1.3 m，对应「每前进 1–1.5 m 做一次左右选择」。
+  x∈**[1.5, 5.0]** 均匀递增；y∈**[-1.7, 1.7]** 走三条车道（中心车道 ±0.1 m、
+  左右车道 ±1.6 m），按「中-左-右」蛇形循环。车道间距 1.6 m = 柱宽 0.4 +
+  **缝 1.2 m**（T1 从 0.902 放宽；机体外接直径 0.711 m，单侧余量 0.2445 m）。
+  同车道第 i / i+3 根 x 间距 1.3125 m（纵向缝 0.9125 m，仍 ≥ `MIN_GAP`）。
 - **数量上限 9 的原因**：全对缝隙 ≥0.9 m 等价于任意两柱心的 Chebyshev 距离
   ≥1.3 m；在 3.5×3.0 m 的密布区内最多 3×3=9 根。任务要求 8–12 根，10–12 根
   必然出现一对缝隙 <0.9 m（机体外接直径 0.711 m，过不去），因此采样取 8–9 根。
 - 第一根是「门柱」，中心车道 |y|≤0.25：teacher 只在画面中间带（约 ±10.9°）、
-  1.5 m 内才转向；柱心 x=1.5 时相机（x≈0.2）深度约 1.1 m，**Step 0 就触发**
-  一次左右选择，保证 episode 不会整集 FORWARD。
+  1.5 m 内才转向；出生点 x=-0.5 时相机（x≈-0.3）到门柱约 1.6 m，**Step 0 附近
+  就触发**一次左右选择，保证 episode 不会整集 FORWARD。
 - 出生区 x<1.0 无遮挡（柱体最近边 x≥1.3 m）；每根柱到 y=±3 走廊边界
-  ≥1.3 m。任意两柱不满足缝 ≥0.9 m 则整组重采样，最多 100 次。
+  ≥1.1 m。任意两柱不满足缝 ≥0.9 m 则整组重采样，最多 100 次。
+- **出生位姿** `--spawn-mode default|random|safe`：default 在 x=-0.5、y=0；random 在
+  门柱与侧柱的缝中心 |y|∈[0.72,0.88]、yaw∈±5° 内随机；safe 在柱区内找一个
+  `plan_action` 真正判 `SAFE_NEUTRAL` 的位姿（T2 的「停」样本来源），并用
+  0.47 m 机身方框 + 四个桨盘（半径 0.1）校验不撞柱；起飞阶段 z>0.5 后若出现
+  contact 直接判本集失败。`collect_parallel --safe-spawn-fraction 1/N` 按固定
+  stride 混入 safe episode（只接受 1/N，避免 0.4 被静默当成 0.5）。
 - 同 seed 字节级一致（`--self-check` 核对两次 sha256）。同名 `.json` 写
-  `scene_id / seed / 障碍清单 / 净空检查 / world_sha256`，供汇总 manifest 用。
+  `scene_id / seed / geometry_version / spawn / 障碍清单 / 净空检查 / world_sha256`，
+  供汇总 manifest 用。
 - 没做：x>5 的更远障碍；没有利用 4 条动作以外的连续转向
   控制（teacher 的转向角由 hold 与 RTF 决定，见 4.6.2 的 RTF 说明）。
 
 ### 4.6.2 并行采集
 
 ```bash
-# 默认 --steps 80 --hold 1.0：实测每步只前进 0.105 m（/tmp/ds200 2814 步 p50，
-# p90=0.144、max=0.237，随 RTF 漂移），穿完 x∈[1.5,5.0] 柱区要 68–76 步。
-# 旧文档写的「0.18–0.28 m/步、20 步约 5 m」是错的，实际差 2–4 倍。
+# 默认 --steps 40 --hold 1.0（2026-10-30 起）：v3 几何 + A* 每步约 0.27 m，
+# T2 实测 29–38 步过线（中位 30）；80 步会让约一半帧在柱区外原地转向。
+# 旧几何（v2）曾需要 68–76 步，那时的默认 80 已不适用。
 python3 sim/tools/collect_parallel.py --instances 4 --episodes-per-instance 1 \
   --out /tmp/dataset --keep-worlds
 python3 sim/tools/collect_parallel.py --instances 4 --episodes-per-instance 1 \
@@ -224,7 +235,7 @@ python3 sim/tools/collect_parallel.py --instances 4 --episodes-per-instance 1 \
   分区记录在 collection manifest 的 task 中）+ `DISPLAY=:20` +
   `XDG_RUNTIME_DIR=/tmp/xdg` + **`LP_NUM_THREADS=1`**。最后一项很关键：
   llvmpipe 默认每个 sim 进程开满渲染线程，6 实例并发时互相抢核，实测 sim
-  RTF 从 1.0 掉到 **0.21**，`collect.py` 的 30 s 起飞超时必炸；限成 1 线程后
+  RTF 从 1.0 掉到 **0.21**，30 s 起飞超时会误报；限成 1 线程后
   同一场景 RTF **0.50**（外部负载下实测 0.65），起飞 ~15–25 s 可完成。
 - sim ready 后再稳 3 s 才启动 `collect.py`；某个 episode 失败会重启 sim
   重试 1 次（world 由 seed 确定性生成，不换场景）。这是对 `collect.py`
@@ -250,12 +261,14 @@ python3 sim/tools/collect_parallel.py --instances 4 --episodes-per-instance 1 \
   `FLFFFRFFFFLLFLFLFLFL`、`RFFFFFFFFFFFFFFFFFFF`，**4/4 含非 FORWARD**，
   每条都与近组障碍交叉过（最近 0.57–1.29 m）。
 - 已知限制：订阅仍走 `gz topic -e` 子进程（未做 gz-transport 订阅直连；发布已直连，
-  见 4.5）；没有数据增强；`collect_parallel` 现在会给每集传 `--scene-meta`，
-  因此走的是柱子真值的 carrot planner（`teacher.py:plan_action`），**不再**是
-  第 4.6.1 节描述的纯反应式深度专家——那一套只在单独跑 `collect.py` 且不给
-  `--scene-meta` 时生效，manifest 的 `teacher` 字段会区分两者。
-  实测（seed 0..7 × 80 步）carrot planner 5/8 穿过 x=5.0，失败的 3 条都撞柱后
-  无法倒车（四动作里没有后退）。collision 真值会如实记录，训练前可按需过滤。
+  见 4.5）；没有数据增强；`collect_parallel` 会给每集传 `--scene-meta`，
+  普通集走 **A\* 全局路径 + 纯追踪**（`teacher.py:plan_action_global`），
+  safe 出生集走局部 `plan_action`（保留真 SAFE 标签）；manifest 的
+  `teacher`/`planner` 字段区分。第 4.6.1 节描述的纯反应式深度专家只在单独跑
+  `collect.py` 且不给 `--scene-meta` 时生效。
+  T1 实测（20 个 test 场景、20 个唯一几何、40 步/集）**20/20 无碰撞穿过
+  x=6.0，100%**；旧局部规划在 v3 上 24 集 15 集擦柱。collision 真值会如实
+  记录，训练前按需过滤。
 
 ## 5. 对齐冻结的 ObservationSpec / EpisodeSchema
 
@@ -310,5 +323,9 @@ Segmentation fault (Address not mapped to object [0x220])
    advance（D1）。仍需给深度配对残差和传感器停更设置拒绝门槛。
 2. 已保存相机声明的内参；尚未完成相机外参/畸变的独立标定和 episode reset。
    当前并行编排通过每集重启世界隔离状态。
-3. 尚无学生策略接入 Gazebo 的闭环评测器，也没有独立测试集上的成功率、碰撞率、
-   误前向率和推理 p50/p95 验收。采集成功和专家自测通过不能代替此项。
+3. 学生策略闭环评测器已实现（`eval_closed_loop.py`，E6-2/E6-4），能输出成功率、
+   碰撞率、误前向率和推理 p50/p95。但**还没有一次跑出可用的成绩**：旧 checkpoint
+   20/20 撞柱、SR=0，原因是当时的训练数据没有 `SAFE_NEUTRAL` 类。2026-10-30 T2/T3
+   已补出四类数据（52 集/2080 步）并离线过闸（test macro_f1 0.5859）；新权重
+   闭环冒烟仍 SR=0（3 集全撞，碰撞点 3.4–3.7 m，0 次 SAFE，见
+   `docs/worklog/2026-10-30-0530-t7-smoke.md`）。采集成功和专家自测通过不能代替此项。

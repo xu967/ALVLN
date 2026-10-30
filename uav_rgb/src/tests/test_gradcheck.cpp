@@ -1,6 +1,7 @@
 // softmax 交叉熵 + 线性层/卷积层前向/反向 gradcheck 自检：无外部测试框架，返回 0 表示通过。
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -60,6 +61,10 @@ int main() {
   double err = gradcheck_linear(m, x, labels);
   std::cout << "loss=" << loss << " gradcheck_max_err=" << err << "\n";
   expect(err < 1e-5, "gradcheck 最大绝对误差 < 1e-5");
+  Tensor x_nan = x;
+  x_nan[0] = std::numeric_limits<float>::quiet_NaN();
+  expect(!std::isfinite(gradcheck_linear(m, x_nan, labels)),
+         "gradcheck_linear 遇到 NaN 必须返回非有限");
 
   // 形状不匹配应抛异常（防止越界读 W），见 ops_cpu.cpp 的校验。
   bool shape_threw = false;

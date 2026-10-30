@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <vector>
 
@@ -40,9 +41,12 @@ bool throws_invalid(F&& f) {
 bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(float)) == 0; }
 
 double max_abs_diff(const uavrgb::Tensor& a, const uavrgb::Tensor& b) {
+  if (a.numel() != b.numel()) return std::numeric_limits<double>::infinity();
   double d = 0.0;
   for (std::size_t i = 0; i < a.numel(); ++i) {
-    d = std::max(d, std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i])));
+    const double diff = std::fabs(static_cast<double>(a[i]) - static_cast<double>(b[i]));
+    if (!std::isfinite(diff)) return std::numeric_limits<double>::infinity();
+    d = std::max(d, diff);
   }
   return d;
 }
@@ -51,6 +55,12 @@ double max_abs_diff(const uavrgb::Tensor& a, const uavrgb::Tensor& b) {
 
 int main() {
   using namespace uavrgb;
+
+  // 守卫自身的负例：NaN 差值必须变成 inf，不能被 std::max 吞掉。
+  check(!std::isfinite(max_abs_diff(Tensor::from_flat({1}, {0.0f}),
+                                    Tensor::from_flat(
+                                        {1}, {std::numeric_limits<float>::quiet_NaN()}))),
+        "max_abs_diff 必须把 NaN 判成非有限");
 
   const int n = 6;
   const int c = 5;
@@ -94,6 +104,10 @@ int main() {
   const double gc_err = gradcheck_linear_weighted(m, x, labels2, weights2);
   std::cout << "weighted gradcheck_max_err = " << gc_err << "\n";
   check(std::isfinite(gc_err) && gc_err < 1e-5, "加权 gradcheck 最大绝对误差 < 1e-5");
+  Tensor x_nan = x;
+  x_nan[0] = std::numeric_limits<float>::quiet_NaN();
+  check(!std::isfinite(gradcheck_linear_weighted(m, x_nan, labels2, weights2)),
+        "gradcheck_linear_weighted 遇到 NaN 必须返回非有限");
 
   // ---- 3) CPU/CUDA parity（非平凡权重） ----
   const float cpu_loss = softmax_ce_loss_weighted(logits, labels, w);
@@ -134,6 +148,13 @@ int main() {
         "CUDA weights 长度非法抛 invalid_argument");
   check(throws_invalid([&] { (void)gradcheck_linear_weighted(m, x, labels2, {1.0f}); }),
         "gradcheck 加权版 weights 长度非法抛 invalid_argument");
+
+  // 有限但极大的权重让 Σw 超出 float 范围：梯度会被 1/inf 静默清零，必须拒绝。
+  const std::vector<float> huge_w(5, 3e38f);
+  check(throws_invalid([&] { (void)softmax_ce_grad_weighted(logits, labels, huge_w); }),
+        "权重和超出 float 范围（梯度会全 0）抛 invalid_argument");
+  check(throws_invalid([&] { (void)softmax_ce_grad_weighted_cuda(logits, labels, huge_w); }),
+        "CUDA 权重和超出 float 范围抛 invalid_argument");
 
   if (g_failures == 0) {
     std::cout << "test_weighted_loss: PASS\n";

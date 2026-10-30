@@ -1,8 +1,12 @@
 # uav_rgb：单目 RGB 四动作避障
 
-本项目已实现自研 C++/CUDA CNN 训练器、Gazebo 专家采集和本地监控。
-2026-10-29 本轮实测通过 **真实仿真 5 帧 → UAVR → GPU 训练 → checkpoint → 恢复训练**。
-这只是链路冒烟：单场景、两个动作类别、没有独立验证集；尚未完成学生闭环避障验收。
+本项目已实现自研 C++/CUDA CNN 训练器、Gazebo 专家采集、数据验收闸门、常驻推理进程和学生闭环评测。
+
+2026-10-30 当前进度：T5 599 集 / 23960 步（audit 11/11 PASS）；T6 best 权重离线 test
+`acc 0.9186 / macro_f1 0.8589 / bal_acc 0.8497`（多数类先验 macro_f1 0.1968）；
+T7 旧版闭环 20 个冻结 test seed `SR 0.90`（**R01 修复前版本**）。R01/D4 同版本复跑
+上一轮 14/20 被会话中断，待用 `eval-student-r01b` 重跑；复跑完成前，`0.90` 和
+14/20 快照都不是当前代码的最终结论。语言/GRU/STOP 尚未实现，闭环指标不能替代。
 
 ## 环境与一键检查
 
@@ -21,8 +25,9 @@ bash tools/check.sh                  # 构建 + CTest + Python 自检
 无卡时可显式执行 `bash tools/check.sh --python-only`，它会打印跳过 C++/CUDA 的说明。
 
 默认新构建目录为 `build/check`；可用 `UAV_RGB_BUILD_DIR` 覆盖。
-最近一次全量验证（2026-10-29，全新构建目录）**18/18 CTest 通过**，编译产物仅 sm_75。
-注意 `build/review-core` 是更早的 13 项构建，不要拿它的 `ctest -N` 当准。
+最近一次全量验证（2026-10-30）**20/20 CTest 通过**，编译产物仅 sm_75。
+（接手开发先读 [`docs/HANDOFF.md`](docs/HANDOFF.md)；任务与验收见 [`docs/TASKS.md`](docs/TASKS.md)。）
+唯一有效构建目录是 `build/check`；`src/build` 保留给 `student.py` 的 `uavrgb_infer`，不要删。
 `UAV_RGB_BUILD_JOBS` 默认 8。Python 工具用 `UAV_RGB_PYTHON`，Gazebo helper 用
 `UAVRGB_GZ_PYTHON`（默认系统 `/usr/bin/python3`），避免混用 conda 与系统绑定。
 
@@ -58,20 +63,20 @@ UI 的默认启动命令是 DEMO；原生训练器目前用上面的 CLI 启动�
 
 | 模块 | 实现与证据 | 尚缺 |
 | --- | --- | --- |
-| 数值核心与 CNN | CPU/CUDA 算子、gradcheck、Adam、100,388 参数 CNN、18 项 CTest、best-checkpoint（dev 宏 F1） | 设备常驻优化、更完整异常边界 |
-| 数据读写 | 320×240 → 160×120、NCHW、碰撞过滤、读端 scene_id/区间校验 | 几何去重、数据质量门禁 |
-| 仿真采集 | 常驻订阅/发布、随机世界、独立 UUID 分区、真实 5 步 | 传感器停更故障处理、严格 sim-time 步进 |
-| 真实数据训练 | 5 帧 GPU 训练和恢复成功，权重/指标/配置已保存 | 有规模的场景隔离训练与泛化验证 |
-| 学生闭环评测 | 尚无实现 | 模型接入 SimulatorEval、成功率/碰撞率/时延 |
+| 数值核心与 CNN | CPU/CUDA 算子、gradcheck、Adam、100,388 参数 CNN、20 项 CTest、best-checkpoint（dev 宏 F1） | 设备常驻优化、更完整异常边界 |
+| 数据读写 | 320×240 → 160×120、NCHW、碰撞过滤、按几何组 split、11 条 audit 闸门 | 多场景族泛化 |
+| 仿真采集 | 常驻订阅/发布、随机世界、独立 UUID 分区、仿真时间窗口（D1）、depth/contact 停更门禁（D4） | 8 实例并发与更严格 RTF 门禁 |
+| 真实数据训练 | 599 集 / 23960 步，T6 best test macro_f1 0.8589 | 场景族与鲁棒性验证 |
+| 学生闭环评测 | 已实现；T7 20 seed（R01 前 SR 0.90）、p50/p95 | R01/D4 后复跑、失败模式分析 |
 | 硬件部署 | 四动作边界已定义 | 荔枝派型号、NPU 合同、ESP32 协议与安全联调 |
 
-正式采集的首要阻塞：2000 个 seed 只有 1124 种实际柱布局，241 组跨 split；
-seed 4/train 与 1618/val 几何相同。scene_id 检查不能消除此类泄漏。
-必须先按规范化几何分组划分或去重，再做正式数据集；本轮没有更改既有划分合同。
+split 已改为按规范化几何组（`sim/tools/split_manifest.py`，几何 gid + salt），
+跨 split 交集为 0；旧的 `scene_id % 10` 划分已废弃。当前只有一种场景族，
+几何去重不等于泛化，见 `docs/HANDOFF.md §八`。
 
 ## 交接与证据
 
-- [并行训练与正确性改造方案](docs/PARALLEL_TRAINING_PLAN.md)（拟实施，含模块分工与验收门禁）
+- [并行训练与正确性改造方案](docs/archive/PARALLEL_TRAINING_PLAN.md)（已归档，未实施）
 - [本轮总审查与过程记录](docs/worklog/2026-10-29-1145-project-review.md)
 - [核心修复与阅读清单](docs/worklog/2026-10-29-1205-core-review.md)
 - [仿真实测与缺陷复现](docs/worklog/2026-10-29-1152-sim-review.md)

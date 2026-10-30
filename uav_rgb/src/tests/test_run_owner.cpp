@@ -70,6 +70,17 @@ int main(int argc, char** argv) {
     }
     { RunOwner reacquired(output); }
     check(fs::exists(output / ".run.lock"), "锁文件可以保留，不能据其存在判锁");
+
+    // --resume 同目录判定：RunOwner 用它决定能否复用非空 out。
+    check(uavrgb::same_run_dir(output, output / "ckpt.bin"), "同目录 resume 判定");
+    check(!uavrgb::same_run_dir(temporary.path / "other_out", output / "ckpt.bin"),
+          "跨目录 resume 判定");
+    check(uavrgb::same_run_dir(output, fs::relative(output / "ckpt.bin")),
+          "相对路径 resume 判定");
+    check(!uavrgb::same_run_dir(output, ""), "空 resume 不算同目录");
+    fs::create_directory_symlink(output, temporary.path / "outlink");
+    check(uavrgb::same_run_dir(temporary.path / "outlink", output / "ckpt.bin"),
+          "软链 out 规范化后判同目录");
     try { RunOwner owner(output); throw std::runtime_error("受控异常"); }
     catch (const std::exception&) {}
     { RunOwner after_exception(output); }

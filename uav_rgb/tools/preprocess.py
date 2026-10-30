@@ -32,6 +32,10 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(REPO_ROOT, "sim", "tools"))
+import split_manifest as sm  # noqa: E402
+
 try:
     import numpy as np
     from PIL import Image
@@ -57,8 +61,12 @@ def die(msg):
     sys.exit("preprocess: %s" % msg)
 
 
-def load_episode(ep_dir, drop_collision=False):
-    """读 manifest + actions.jsonl，只建立样本索引，不碰像素（内存友好）。"""
+def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False):
+    """读 manifest + actions.jsonl，只建立样本索引，不碰像素（内存友好）。
+
+    exclude_collision_episodes=True 时，只要该集有 collision=true 就返回 None
+    （整集丢弃）。碰撞后的专家标签不可信，T2 的 SAFE 硬约束也不允许 SAFE+碰撞。
+    """
     man_path = os.path.join(ep_dir, "episode_manifest.json")
     try:
         with open(man_path, encoding="utf-8") as f:
@@ -79,6 +87,35 @@ def load_episode(ep_dir, drop_collision=False):
     # 不能让没采完的 episode 静默进数据集（它会伪装成一条正常的短 episode）。
     if man.get("error"):
         die("%s: 采集失败（%s），不能打包" % (man_path, man["error"]))
+    # 评测集会在碰撞处提前结束；它看起来像一条正常短 episode，但标签只到碰撞点，
+    # 直接进训练会污染数据。训练数据必须逐集跑满。
+    if man.get("stopped_on_collision"):
+        die("%s: stopped_on_collision=true（闭环评测产物），不能当训练数据打包"
+            % man_path)
+    validity = man.get("validity")
+    if not isinstance(validity, dict) or not all(
+            validity.get(k) for k in ("camera_verified", "physics_verified",
+                                      "episode_executed")):
+        die("%s: validity 缺失或未全 true（%r），不能打包" % (man_path, validity))
+    # v2/v3 的 geometry_gid 天然不同，只查 gid 交集查不出两套几何混包。
+    gver = man.get("geometry_version")
+    if gver != sm.SPLIT_SALT:
+        die("%s: geometry_version=%r 与当前 %s 不一致（旧几何数据不能混进新数据集）"
+            % (man_path, gver, sm.SPLIT_SALT))
+    # 最后一道防泄漏门：split 必须等于几何 gid 应属的 split。只查「同 gid 跨 split」
+    # 挡不住单集包内被改过的 manifest（没有对照集，一致性检查永远通过）。
+    if gid is not None:
+        want = sm.split_for_gid(gid)
+        if split != want:
+            die("%s: split=%s 与 geometry_gid=%s 应属的 split=%s 不一致（manifest 被改动？）"
+                % (man_path, split, gid, want))
+    # 标签只能来自教师。forward=盲策略对照、student=学生自采，它们的标签是
+    # 「被测对象」而不是监督信号；这类集 validity 也全 true，不拦就会静默进训练集，
+    # 而 audit 的 label_recompute 只复算 plan_action，不会发现。
+    teacher = man.get("teacher")
+    if teacher not in ("plan_action", "expert_action", "synthetic"):
+        die("%s: teacher=%r 不是教师标签（forward/student 产物不能当训练数据打包）"
+            % (man_path, teacher))
     camera = man.get("camera") or {}
     src_w = int(camera.get("width") or 320)
     src_h = int(camera.get("height") or 240)
@@ -91,6 +128,8 @@ def load_episode(ep_dir, drop_collision=False):
         die("读取 %s 失败：%s" % (actions_path, exc))
     if not rows:
         die("%s: actions.jsonl 为空" % ep_dir)
+    if exclude_collision_episodes and any(r.get("collision") is True for r in rows):
+        return None
     expected = man.get("num_steps")
     if isinstance(expected, int) and len(rows) != expected:
         die("%s: actions.jsonl %d 行 != manifest num_steps %d（文件被截断？）"
@@ -132,6 +171,8 @@ def load_episode(ep_dir, drop_collision=False):
         "version": str(man.get("version", "")),
         "split": split,
         "geometry_gid": gid,
+        "geometry_version": gver,
+        "teacher": man.get("teacher"),
         "src_w": src_w,
         "src_h": src_h,
         "samples": samples,
@@ -139,11 +180,21 @@ def load_episode(ep_dir, drop_collision=False):
     }
 
 
-def scan(ep_dirs, drop_collision=False):
+def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False):
     """加载全部 episode 索引，并检查 scene_id 的 split 唯一性。"""
     episodes, scene_split, gid_split, total, dropped = [], {}, {}, 0, 0
+    skipped = 0
+    seen_dirs = set()
     for d in ep_dirs:
-        ep = load_episode(d, drop_collision)
+        # 同一目录经两个 glob/软链传两次会静默双打包，同一批样本被算两遍。
+        real = os.path.realpath(d)
+        if real in seen_dirs:
+            die("重复的 episode 目录：%s（同一集只能打包一次）" % real)
+        seen_dirs.add(real)
+        ep = load_episode(d, drop_collision, exclude_collision_episodes)
+        if ep is None:
+            skipped += 1
+            continue
         sid = ep["scene_id"]
         if sid in scene_split and scene_split[sid] != ep["split"]:
             die("scene_id=%r 同时出现在 split=%s 与 %s（必须按场景隔离）"
@@ -163,6 +214,8 @@ def scan(ep_dirs, drop_collision=False):
         total += ep["num_samples"]
         dropped += ep["dropped"]
         episodes.append(ep)
+    if skipped:
+        print("preprocess: 跳过含碰撞整集 %d 个" % skipped)
     if total == 0:
         die("没有可写样本")
     return episodes, total, dropped
@@ -173,8 +226,11 @@ def build_meta(episodes, total, size, dropped=0):
     out_w, out_h = size
     preserve = out_w * src_h == out_h * src_w  # 交叉相乘判断目标是否与原图同纵横比
     counts = {s: 0 for s in SPLITS}
+    class_counts = {s: [0] * len(ACTION_NAMES) for s in SPLITS}
     for ep in episodes:
         counts[ep["split"]] += ep["num_samples"]
+        for s in ep["samples"]:
+            class_counts[ep["split"]][s["label"]] += 1
     scenes = {}
     for ep in episodes:
         scenes[ep["scene_id"]] = ep["split"]
@@ -195,6 +251,8 @@ def build_meta(episodes, total, size, dropped=0):
                                    for ep in episodes for s in ep["samples"]),
         "collision_dropped": dropped,
         "splits": counts,
+        # 每 split 的每类样本数：T3 的「四类 recall >0」需要先确认 val/test 有 support。
+        "class_counts": class_counts,
         "num_samples": total,
         "scenes": [{"scene_id": sid, "split": sp}
                    for sid, sp in sorted(scenes.items())],
@@ -205,6 +263,9 @@ def build_meta(episodes, total, size, dropped=0):
             "version": ep["version"],
             "split": ep["split"],
             "geometry_gid": ep["geometry_gid"],
+            # airsim_to_uavr 直接构造 episode dict，没有这两键；必须用 get。
+            "geometry_version": ep.get("geometry_version"),
+            "teacher": ep.get("teacher"),
             "num_steps": ep["num_samples"],
             "sample_start": ep["sample_start"],
             "sample_count": ep["num_samples"],
@@ -311,10 +372,13 @@ def main():
                    help="输出分辨率；160x120 保持 4:3，128x128 会压扁画面（对照实验）")
     p.add_argument("--drop-collision", action="store_true",
                    help="跳过 collision=true 的步（专家撞墙后的标签本身是错的）")
+    p.add_argument("--exclude-collision-episodes", action="store_true",
+                   help="整集丢弃含 collision 步的 episode（T2 硬约束）")
     p.add_argument("episodes", nargs="+", help="一个或多个 collect.py episode 目录")
     args = p.parse_args()
 
-    episodes, total, dropped = scan(args.episodes, args.drop_collision)
+    episodes, total, dropped = scan(args.episodes, args.drop_collision,
+                                    args.exclude_collision_episodes)
     out_path, meta_bytes = write_dataset(args.out, episodes, total, args.size, dropped)
     meta = json.loads(meta_bytes.decode("utf-8"))
     out_w, out_h = args.size
@@ -324,6 +388,9 @@ def main():
           % (len(episodes), total, len(meta["scenes"])))
     print("splits: train=%d val=%d test=%d"
           % (meta["splits"]["train"], meta["splits"]["val"], meta["splits"]["test"]))
+    for split in SPLITS:
+        cc = meta["class_counts"][split]
+        print("  %-5s %s" % (split, dict(zip(ACTION_NAMES, cc))))
     seen = total + dropped
     print("collision: dropped %d of %d steps (%.1f%%), kept %d"
           % (dropped, seen, 100.0 * dropped / seen if seen else 0.0, total))

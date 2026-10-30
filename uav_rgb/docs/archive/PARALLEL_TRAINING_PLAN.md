@@ -3,7 +3,7 @@
 - 日期：2026-10-29
 - 状态：实施中；第38节首张内存/状态工单已验收，reader/run锁已独立实现；训练backend、kernel迁移及流水线等后续门禁尚未完成
 - 主线：设备常驻执行器 + 梯度并行归约 + 有界数据流水线；数据可信性同步推进
-- 基线：`../experiments/pipeline_profile/README.md`，实测原始证据在 DATA_ROOT
+- 基线：`../../experiments/pipeline_profile/README.md`，实测原始证据在 DATA_ROOT
 - 适用设备：当前 RTX2080Ti / sm_75 / CUDA12.8，FP32
 - 详细实施版更新：2026-10-29；第1–9节为总体决策，第10–22节为任务拆分、接口和验收细则。
 - 代码实现说明：**第23–31节是算子实现，第32–38节是接口接线、调度和失败处理的补充规格**。
@@ -14,7 +14,7 @@
 数据与运行模块开发读第16/17/19节；审查者按第20/22节逐项验收。所有新路径与选项均为设计草案。
 
 2026-10-29首批落地见 [实现状态](PARALLEL_TRAINING_IMPLEMENTATION.md) 和
-[实测记录](experiments/2026-10-29-parallel-training-first-batch.md)。下文保留实施规格；
+[实测记录](../experiments/2026-10-29-parallel-training-first-batch.md)。下文保留实施规格；
 已实现范围以上述记录为准，首批通过不代表P0/P1整阶段或全方案已经完成。
 
 ## 1. 目标与范围
