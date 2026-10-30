@@ -24,10 +24,12 @@ def _dist2(p, spawn):
     return (p["x"] - spawn["x"]) ** 2 + (p["y"] - spawn["y"]) ** 2
 
 
-def waypoint_for(target, pillars, standoff=0.7, y_range=(-3.0, 3.0)):
+def waypoint_for(target, pillars, standoff=0.8, y_range=(-3.0, 3.0)):
     """目标柱旁的通路点：朝走廊中心偏 standoff，避开其它柱。
 
-    standoff=0.7 = 柱半宽 0.2 + A* 余量 0.5，正好落在 A* 的自由一侧。
+    standoff=0.8 = 柱半宽 0.2 + A* 余量 0.5 + 0.1 栅格余量：
+    0.7 时 waypoint 的 0.1 m 栅格单元会落进 0.5 m 余量内，A* 直接失败
+    （L1 pilot 7/52 实测），0.8 后可达。
     """
     sign = -1.0 if target["y"] > 0 else 1.0
     for _ in range(2):

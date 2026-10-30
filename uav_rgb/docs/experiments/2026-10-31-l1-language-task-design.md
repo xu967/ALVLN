@@ -38,9 +38,9 @@ image-only 基线不知道选哪根，文本打乱会走错。这已经能回答
   `label_recompute` 用同一 waypoint 复算。若 waypoint 不可达，该集不采。
   - 实现：`plan_action_global(..., waypoint=None)`；有 waypoint 时
     `astar_path(start→wp) + astar_path(wp→end)` 拼接后纯追踪；无 waypoint 走原路径。
-  - `assign_landmarks` 额外返回 `waypoint`：目标柱左右两侧各取
-    `PILLAR_SIZE/2 + clearance + 0.3` 的偏移点，选不在柱内/边界外的一侧；
-    写 `meta["waypoint"]`。
+  - `assign_landmarks` 额外返回 `waypoint`：目标柱朝走廊中心偏 **0.8 m**
+    （柱半宽 0.2 + A* 余量 0.5 + 0.1 栅格余量）；0.7 m 会让栅格单元落进
+    余量内导致 A* 失败（52 集 pilot 实测 7 集），写 `meta["waypoint"]`。
   - `collect.py`/`audit_dataset.py` 都从 scene meta 读 waypoint 传给 teacher；
     两边不一致会让 label_recompute 假 FAIL，必须同一来源。
 - `preprocess.py`：已支持 `instruction` 侧车（L0），无需改格式。
