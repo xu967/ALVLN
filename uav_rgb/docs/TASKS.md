@@ -33,12 +33,12 @@ D5/G1–G6 暂缓；V8、CF-Drone、SG2002、AerialVLN-S 官方基准冻结。
 | --- | --- | --- | --- | --- | --- |
 | D-STACK | P0 | 待拍板 | 用户 | 语言模型栈：全自研 C++/CUDA，还是 Python 原型 + C++ 部署 | 选定后再开 L0/L2；未定不写模型代码 |
 | T4 | P0 | **done**（2026-10-31 00:54） | code-4b | 完整 20 seed observation v1 基线（`eval-student-v1-observation`） | **SR 0.90（18/20）**，collision 0.05，p50 10.26 ms；与历史 0.90 一致，失败 seed 23/88；与 dispatch 不可混报 |
-| T5b | P0 | todo | code-4b | dispatch 语义全量重采 599 集（`t5b-dispatch-20261031`）→ preprocess → 训练 → 闭环复评 | audit 全 PASS；与 v1 对比；新执行合同 |
+| T5b | P0 | **doing**（2026-10-31 01:20 起） | code-4b | dispatch 语义全量重采 599 集（`t5b-dispatch-20261031`）→ preprocess → 训练 → 闭环复评 | audit 全 PASS；与 v1 对比；新执行合同 |
 | B1 | P1 | 待立项 | code-4b | 训练数据替换防护：把 `batch_reader.cpp` 的 `verify_unchanged` 接入 trainer，或训练启动时对 open fd 做 fstat 校验 | 训练中覆盖 `.uavr` 被拒/检测；负例测试通过 |
 | B4 | P1 | 待立项 | code-4b | infer 语义对拍：已知像素图案 → logits 与 NCHW 直喂一致；`infer_main` 子进程冒烟 | 通道/数值对拍通过；在 L0 改 TEXT 协议前完成 |
 | D-GEODUP | P3 | 待立项 | code-4b | 几何近重复检测：3 位舍入 gid 会把只差 5 mm 的场景当不同几何（T7-R 实测 seed 49/57 动作逐位相同）；按柱坐标容差聚类，报告 test 内近重复组 | 近重复组清单 + 20 seed 独立性结论；不阻塞 T7 |
-| L0 | P1 | 待立项 | code-4b | 指令数据通路：episode 旁路 `instructions.jsonl`（`episode_id → instruction`）+ audit 校验 + infer `--text` CSV（单集一条；多指令再升 TEXT 头）+ 文本权重/token 表随 checkpoint；文本侧 CPU embedding+mean-pool，不新增 CUDA kernel | 50 集带指令；缺/多/错指令 audit FAIL；零文本 dummy 模型端到端跑通 |
-| L1 | P1 | 待立项 | code-4b | 最小语言任务：1 个模板 `fly to the {color} pillar and stop` + 2 根彩色柱（目标/干扰）；4 动作；无关系词、无 STOP | ≥50 集 pilot audit 全 PASS；目标颜色随机且不总是最近；同图换指令对可生成 |
+| L0 | P1 | **doing**（侧车/audit/--text 已完成；collect 字段待 T5b 后） | code-4b | 指令数据通路：episode 旁路 `instructions.jsonl`（`episode_id → instruction`）+ audit 校验 + infer `--text` CSV（单集一条；多指令再升 TEXT 头）+ 文本权重/token 表随 checkpoint；文本侧 CPU embedding+mean-pool，不新增 CUDA kernel | 50 集带指令；缺/多/错指令 audit FAIL；零文本 dummy 模型端到端跑通 |
+| L1 | P1 | **doing**（instruction.py 词表/模板已完成；彩色柱待 T5b 后） | code-4b | 最小语言任务：1 个模板 `fly to the {color} pillar and stop` + 2 根彩色柱（目标/干扰）；4 动作；无关系词、无 STOP | ≥50 集 pilot audit 全 PASS；目标颜色随机且不总是最近；同图换指令对可生成 |
 | L2 | P1 | 待立项 | code-4b | 语言 baseline + 消融（原 L2/L3 合并）：CNN + 16 维文本向量 + FiLM/concat；训练 + 闭环 SR + 文本置空/打乱/同图换指令 | 阈值先冻结（建议 +10pp / -10pp / 一致率 ≥60%）；语言版 SR 高于 image-only；不达标先改任务设计，不开 ECPT |
 | ECPT | P2 | 条件项（未立项） | — | 只在 L2 显示语言增益后评估：证据置信/相位 + STOP 门控 | 届时有同参数同数据消融 |
 
