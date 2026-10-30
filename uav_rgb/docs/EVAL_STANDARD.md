@@ -176,6 +176,8 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
   （含学生推理进程崩溃）进 `failed`，不进分子分母。因此绝对 SR 对失败集是乐观的；
   报告必须同时给 `failed` 数。盲前进基线同口径，两个基线对比仍公平。
 - **处理时间 p50/p95** 是学生策略前向 + 决策，不含物理执行；本机 GPU 数字，不是板端。
+- **L1 route-choice**：success 还必须满足 `waypoint_min_dist ≤ 1.0 m`（经过目标柱旁
+  的通路点），否则 image-only 可以忽略指令直接冲线；`eval.json` per_episode 记录该字段。
 
 ## 6. 下一步（按优先级）
 

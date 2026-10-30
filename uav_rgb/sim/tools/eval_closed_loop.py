@@ -87,16 +87,19 @@ def _src(a):
     return a.get("src") or ""
 
 
-def summarize_episode(actions, oracle, goal_x):
+def summarize_episode(actions, oracle, goal_x, waypoint=None, waypoint_radius=1.0):
     """单集指标；纯函数，便于单测。actions/oracle 是 jsonl 行。
 
     EVAL_STANDARD §5.1：stuck（FORWARD 位移 < 阈值）不是碰撞，碰撞率只看 contact。
     新 collect 在 actions.jsonl 写 src（contact/stuck/contact+stuck）；旧数据没有该
     字段时退回原 collision 口径，不会把历史结果改成另一个数。
+    L1 route-choice：success 还必须经过目标 waypoint（≤ waypoint_radius），
+    否则 image-only 可以忽略指令直接冲线。
     """
     if not actions:
         return {"steps": 0, "collision": False, "stuck": False, "false_forward": False,
-                "success": False, "max_x": None, "infer_ms": []}
+                "success": False, "max_x": None, "waypoint_min_dist": None,
+                "infer_ms": []}
     collision = any(bool(a.get("collision")) and _src(a) != "stuck" for a in actions)
     stuck = any(bool(a.get("collision")) and "stuck" in _src(a) for a in actions)
     false_forward = any(bool(a.get("collision")) and _src(a) != "stuck" and
@@ -104,11 +107,21 @@ def summarize_episode(actions, oracle, goal_x):
     xs = [float(o["pose_gt"]["x"]) for o in oracle
           if isinstance(o.get("pose_gt"), dict) and "x" in o["pose_gt"]]
     max_x = max(xs) if xs else None
-    success = bool(not collision and max_x is not None and max_x >= goal_x)
+    wp_min = None
+    if isinstance(waypoint, dict):
+        ds = []
+        for o in oracle:
+            pg = o.get("pose_gt")
+            if isinstance(pg, dict) and "x" in pg and "y" in pg:
+                ds.append(((pg["x"] - waypoint["x"]) ** 2 +
+                           (pg["y"] - waypoint["y"]) ** 2) ** 0.5)
+        wp_min = min(ds) if ds else None
+    reached = wp_min is None or wp_min <= waypoint_radius
+    success = bool(not collision and max_x is not None and max_x >= goal_x and reached)
     infer = [float(a["infer_ms"]) for a in actions if a.get("infer_ms") is not None]
     return {"steps": len(actions), "collision": collision, "stuck": stuck,
             "false_forward": false_forward, "success": success,
-            "max_x": max_x, "infer_ms": infer}
+            "max_x": max_x, "waypoint_min_dist": wp_min, "infer_ms": infer}
 
 
 def aggregate(episodes):
@@ -205,7 +218,7 @@ def run_episode(seed, args, workdir, seen_gids):
     oracle_path = os.path.join(ep_dir, "oracle.jsonl")
     actions = load_jsonl(actions_path) if os.path.isfile(actions_path) else []
     oracle = load_jsonl(oracle_path) if os.path.isfile(oracle_path) else []
-    summary = summarize_episode(actions, oracle, goal_x)
+    summary = summarize_episode(actions, oracle, goal_x, meta.get("waypoint"))
     summary.update({
         "seed": seed, "geometry_gid": gid, "split": split, "policy": args.policy,
         "pillars": meta.get("pillar_count"), "goal_x": goal_x,

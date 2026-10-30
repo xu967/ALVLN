@@ -9,7 +9,7 @@
 
 | 变体 | 成功判据 | teacher | 改动量 | 结论 |
 | --- | --- | --- | --- | --- |
-| **A route-choice** | 保留 `max_x ≥ goal_x`（现有走廊终点） | A\* 加一个彩色 waypoint | 小 | **先做** |
+| **A route-choice** | `max_x ≥ goal_x` **且** `waypoint_min_dist ≤ 1.0 m` | A\* 加一个彩色 waypoint | 小 | **先做** |
 | B goal-stop | 距目标柱 ≤1.5 m 且无碰撞 | goal-aware A\* + 新 evaluator | 大 | A 跑通后再做 |
 
 A 的语言必要性：同一画面里两根彩色柱，指令只指定其中一根；

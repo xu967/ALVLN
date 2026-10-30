@@ -39,7 +39,7 @@ D5/G1–G6 暂缓；V8、CF-Drone、SG2002、AerialVLN-S 官方基准冻结。
 | B4 | P1 | 待立项 | code-4b | infer 语义对拍：已知像素图案 → logits 与 NCHW 直喂一致；`infer_main` 子进程冒烟 | 通道/数值对拍通过；在 L0 改 TEXT 协议前完成 |
 | D-GEODUP | P3 | 待立项 | code-4b | 几何近重复检测：3 位舍入 gid 会把只差 5 mm 的场景当不同几何（T7-R 实测 seed 49/57 动作逐位相同）；按柱坐标容差聚类，报告 test 内近重复组 | 近重复组清单 + 20 seed 独立性结论；不阻塞 T7 |
 | L0 | P1 | **doing**（侧车/audit/--text 已完成；collect 字段待 T5b 后） | code-4b | 指令数据通路：episode 旁路 `instructions.jsonl`（`episode_id → instruction`）+ audit 校验 + infer `--text` CSV（单集一条；多指令再升 TEXT 头）+ 文本权重/token 表随 checkpoint；文本侧 CPU embedding+mean-pool，不新增 CUDA kernel | 50 集带指令；缺/多/错指令 audit FAIL；零文本 dummy 模型端到端跑通 |
-| L1 | P1 | **doing**（instruction.py 词表/模板已完成；彩色柱待 T5b 后） | code-4b | 最小语言任务：1 个模板 `fly to the {color} pillar and stop` + 2 根彩色柱（目标/干扰）；4 动作；无关系词、无 STOP | ≥50 集 pilot audit 全 PASS；目标颜色随机且不总是最近；同图换指令对可生成 |
+| L1 | P1 | **done**（pilot 120 PASS） | code-4b | 最小语言任务：1 模板 + 前排两色 + waypoint；4 动作；无关系词/STOP | 120/4800；audit 15/15 PASS；teacher_waypoint 0；class_share 全过；见 `experiments/2026-10-31-l1-pilot-120.md` |
 | L2 | P1 | 待立项 | code-4b | 语言 baseline + 消融（原 L2/L3 合并）：CNN + 16 维文本向量 + FiLM/concat；训练 + 闭环 SR + 文本置空/打乱/同图换指令 | 阈值先冻结（建议 +10pp / -10pp / 一致率 ≥60%）；语言版 SR 高于 image-only；不达标先改任务设计，不开 ECPT |
 | ECPT | P2 | 条件项（未立项） | — | 只在 L2 显示语言增益后评估：证据置信/相位 + STOP 门控 | 届时有同参数同数据消融 |
 

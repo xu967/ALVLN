@@ -53,3 +53,14 @@
 - 彩色柱是否在 RGB 帧里清晰可见，需 52 集 pilot 抽帧确认。
 - safe 出生集不跟 waypoint，语言增益主要看非 safe 集；分析时要分列。
 - waypoint 距离阈值 1.0 m 是初值，pilot 后按实测调整并写进 EVAL_STANDARD。
+
+## 更新 2026-10-31 07:30：120 集 L1 pilot 与 waypoint 评测口径
+
+- 120 集 / 4800 步，train 89 / val 10 / test 21；1.883 步/s，42.5 min。
+- audit **15/15 PASS**：instruction 120/120、target 0 不一致、balance 60/60、
+  teacher_waypoint 0 失败、safe_collision 0/960、class_share 全过、label 0/4800。
+- 52 集的问题与修复：waypoint 0.7→0.8（7/52 A* fallback）、120 集解决 val 缺 SAFE。
+- **评测口径修正**：route-choice success 现在要求 `waypoint_min_dist ≤1.0 m`，
+  否则 image-only 可忽略指令冲线；`test_eval_summary` 加两条断言。
+- 实验记录：`experiments/2026-10-31-l1-pilot-120.md`。
+- 下一步：preprocess → image-only baseline → L2（D-STACK 待拍板）。

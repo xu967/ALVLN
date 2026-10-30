@@ -32,6 +32,14 @@ def main():
     s = run([{"collision": False, "action_executed": 1}])
     assert s["success"] and not s["collision"] and not s["stuck"], s
 
+    # L1：经过 waypoint 才算 success；没经过即使过线也不算
+    rows = [{"collision": False, "action_executed": 1}]
+    oracle = [{"pose_gt": {"x": 6.0, "y": 0.0}}]
+    s = ec.summarize_episode(rows, oracle, 5.0, {"x": 6.0, "y": 0.0})
+    assert s["success"] and s["waypoint_min_dist"] == 0.0, s
+    s = ec.summarize_episode(rows, oracle, 5.0, {"x": 6.0, "y": 2.0})
+    assert not s["success"] and s["waypoint_min_dist"] == 2.0, s
+
     # 空集：字段齐全，不计成功
     s = ec.summarize_episode([], [], 5.0)
     assert s["steps"] == 0 and "stuck" in s and not s["success"], s
