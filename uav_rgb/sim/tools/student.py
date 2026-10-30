@@ -24,7 +24,7 @@ RESAMPLE = (Image.Resampling.BILINEAR if hasattr(Image, "Resampling")
 class StudentPolicy:
     """推理进程只启动一次；每帧写 RGB 字节、读一行 JSON。"""
 
-    def __init__(self, ckpt, infer_bin=None):
+    def __init__(self, ckpt, infer_bin=None, text_ids=None):
         binary = infer_bin or DEFAULT_INFER
         if not os.path.isfile(binary):
             raise RuntimeError(
@@ -34,9 +34,12 @@ class StudentPolicy:
         # stderr 用临时文件而不是 PIPE：长采集时 CUDA/驱动警告写满 64 KiB 管道会让
         # 子进程阻塞在 write，父进程的 readline 永远等不到结果（T5 卡死风险）。
         self._err = tempfile.TemporaryFile()
+        cmd = [binary, "--ckpt", ckpt]
+        if text_ids:
+            # L0：单集一条指令；L2 才把 token 送进文本编码器。
+            cmd += ["--text", ",".join(str(int(t)) for t in text_ids)]
         self.proc = subprocess.Popen(
-            [binary, "--ckpt", ckpt],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._err)
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._err)
         line = self.proc.stdout.readline()
         if not line:
             raise RuntimeError(f"推理进程启动失败：{self._stderr()}")
