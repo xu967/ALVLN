@@ -32,3 +32,12 @@
 
 - 词表固定；真实指令超出词表会落到 `<unk>`，L1 只用模板，不触发。
 - 目前只支持单目标颜色；多目标/关系组合要扩模板与审计。
+
+## 更新 2026-10-31 01:35：landmarks.py 彩色柱分配
+
+- 新增 `sim/tools/landmarks.py`：`COLOR_RGB` 材质表 + `assign_landmarks`：
+  同排优先选 2 根柱、两色不同、目标近/远按 seed 奇偶交替、返回目标色 + 指令。
+- `geometry_gid` 只取 x/y/z/size（`split_manifest.canonical_geometry`），
+  加 `color` 不会改 gid；L1 仍用独立数据目录与 `task_version` 隔离。
+- `test_landmarks.py`：两色/确定性/近远平衡/同排/指令一致/单柱报错，PASS。
+- 未接 `scene_gen._pillar_xml`：T5b 采集正在用 scene_gen，等采完再改材质。
