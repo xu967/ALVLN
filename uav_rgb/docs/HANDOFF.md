@@ -1,9 +1,10 @@
 # uav_rgb 交接文档
 
-- 更新时间：2026-10-31 00:25
-- **当前状态**：T1–T7 已完成；D4 已完成；**T7-R（dispatch）完成 `SR 0.55`**；
-  A/B 证明 R01 窗口语义是主因（observation 2/2 vs dispatch 0/2）。旧 `SR 0.90`
-  只适用于 observation 语义；完整 observation v1 基线在跑。见 §四 4.1。
+- 更新时间：2026-10-31 01:00
+- **当前状态**：T1–T7 已完成；D4 已完成；**v1 复测（observation）`SR 0.90`**，
+  **T7-R（dispatch）`SR 0.55`**；A/B 证明 R01 窗口语义是主因（observation 2/2
+  vs dispatch 0/2）。0.90 只适用于 observation 语义；下一步 T5b dispatch 重采。
+  见 §四 4.1。
 - **接手第一件事**：读完本文件 → 读 `docs/TASKS.md` → 读 `docs/ENGINEERING_RULES.md`
 - **口径唯一来源**：`docs/EVAL_STANDARD.md`。报任何数字前必读，违反口径的数字等于造假。
 
@@ -98,6 +99,7 @@ collision 0.45、false_forward 0.30、stuck 0；产物
 | 项 | 值 |
 | --- | --- |
 | 旧 T7（observation 语义） | SR 0.90（18/20）；collision 0.05；p50 40.4 ms |
+| **v1 复测（observation，当前环境）** | **SR 0.90（18/20）**；collision 0.05；p50 10.26 ms；失败 seed 23/88 |
 | T7-R（dispatch 语义） | SR 0.55（11/20）；collision 0.45；p50 10.9 ms |
 | A/B observation | seed 49/57，2/2 成功 |
 | A/B dispatch | seed 49/57，0/2 碰撞 |
@@ -139,6 +141,7 @@ collision 0.45、false_forward 0.30、stuck 0；产物
 | T6 best 离线 test | acc 0.9186 / macro_f1 0.8589 / balanced_acc 0.8497；recall `[1.000, 0.952, 0.700, 0.747]` |
 | 多数类先验 test | acc 0.6492 / macro_f1 0.1968 / balanced_acc 0.2500 |
 | T7 旧版闭环（observation） | SR 0.90（18/20）/ collision 0.05 / stuck 0.00 / false_forward 0.05；动作 SAFE 57 / FWD 1095 / LEFT 178 / RIGHT 211；p50 40.4 ms / p95 59.3 ms（warm n=1521） |
+| **v1 复测（observation，当前环境）** | **SR 0.90（18/20）** / collision 0.05 / false_forward 0.05；p50 10.26 ms / p95 13.10 ms；失败 seed 23/88 |
 | 盲前进基线 | SR 0 / collision 1.00 / false_forward 1.00 |
 | T7-R（dispatch） | SR 0.55（11/20）/ collision 0.45 / false_forward 0.30 / stuck 0.00；p50 10.9 ms / p95 15.2 ms；动作 SAFE 14 / FWD 709 / LEFT 263 / RIGHT 351 |
 | A/B 窗口语义 | seed 49/57：observation 2/2 成功，dispatch 0/2 碰撞；p50 均约 11 ms |

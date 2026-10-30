@@ -120,9 +120,9 @@ DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg setsid nohup \
   （`episode_id, instruction, sample_start, sample_count`）；缺/多/错失败。
 - `sim/tools/audit_dataset.py`：`instruction_coverage`：每集非空、无坐标泄漏、
   与 scene 目标色一致（L1 字段）；缺字段 SKIP/FAIL 规则写清。
-- `src/infer_main.cpp` / `infer.cpp`：协议加 `TEXT <len> <id...>` 头；
-  L0 只解析/校验，文本向量先置零；`student.py` 发送；
-  `src/tests/test_infer_io.cpp` 加合法/畸形头；`test_collect.py` 加字段回归。
+- `src/infer_main.cpp` / `infer.cpp`：加 `--text <id,id,...>` CSV（单集一条；
+  多指令再升 TEXT 头）；L0 只解析/校验，文本向量先置零；`student.py` 发送；
+  `src/tests/test_infer_io.cpp` 加带 text_ids 的回归；`test_collect.py` 加字段回归。
 - **`collect.py` 的 instruction 字段等 T5b 结束后再改**（文件锁）。
 - 验收：`test_audit_dataset`/`test_collect`/`test_infer_io` PASS；
   G 空闲后 `bash tools/check.sh` 全量 PASS。

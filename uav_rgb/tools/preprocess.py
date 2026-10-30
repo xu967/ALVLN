@@ -116,6 +116,9 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False)
     if teacher not in ("plan_action", "expert_action", "synthetic"):
         die("%s: teacher=%r 不是教师标签（forward/student 产物不能当训练数据打包）"
             % (man_path, teacher))
+    instruction = man.get("instruction")
+    if instruction is not None and not isinstance(instruction, str):
+        die("%s: instruction 必须是字符串（实际 %r）" % (man_path, instruction))
     camera = man.get("camera") or {}
     src_w = int(camera.get("width") or 320)
     src_h = int(camera.get("height") or 240)
@@ -173,6 +176,7 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False)
         "geometry_gid": gid,
         "geometry_version": gver,
         "teacher": man.get("teacher"),
+        "instruction": instruction,
         "src_w": src_w,
         "src_h": src_h,
         "samples": samples,
@@ -218,6 +222,11 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False):
         print("preprocess: 跳过含碰撞整集 %d 个" % skipped)
     if total == 0:
         die("没有可写样本")
+    # L0：指令要么全有、要么全无。部分集有指令会让「文本是否可用」变成静默偏置。
+    have = [bool(ep.get("instruction") and ep["instruction"].strip()) for ep in episodes]
+    if any(have) and not all(have):
+        die("instruction 只覆盖部分 episode（%d/%d 集缺）"
+            % (have.count(False), len(have)))
     return episodes, total, dropped
 
 
@@ -350,6 +359,20 @@ def write_dataset(out_dir, episodes, total, size, dropped=0, crop=None,
     return out_path, meta_bytes
 
 
+def write_instructions(out_dir, episodes):
+    """旁路写 instructions.jsonl；不改 UAVR 二进制格式（L0）。"""
+    path = os.path.join(out_dir, "instructions.jsonl")
+    with open(path, "w", encoding="utf-8") as f:
+        for ep in episodes:
+            f.write(json.dumps({
+                "episode_id": ep["episode_id"],
+                "instruction": ep["instruction"].strip(),
+                "sample_start": ep["sample_start"],
+                "sample_count": ep["num_samples"],
+            }, ensure_ascii=False) + "\n")
+    return path
+
+
 def parse_size(text):
     try:
         w, h = (int(v) for v in text.lower().split("x"))
@@ -380,6 +403,9 @@ def main():
     episodes, total, dropped = scan(args.episodes, args.drop_collision,
                                     args.exclude_collision_episodes)
     out_path, meta_bytes = write_dataset(args.out, episodes, total, args.size, dropped)
+    if any(ep.get("instruction") and ep["instruction"].strip() for ep in episodes):
+        ipath = write_instructions(args.out, episodes)
+        print("wrote %s (%d instructions)" % (ipath, len(episodes)))
     meta = json.loads(meta_bytes.decode("utf-8"))
     out_w, out_h = args.size
     aspect = meta["resize"]["aspect"]

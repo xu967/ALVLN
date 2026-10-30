@@ -30,9 +30,12 @@ import split_manifest as sm  # noqa: E402
 
 SRC_W, SRC_H = 320, 240
 EPISODES = [
-    {"name": "ep1", "episode_id": 1, "scene_id": 42, "seed": 7, "split": "train", "steps": 6},
-    {"name": "ep2", "episode_id": 2, "scene_id": 42, "seed": 8, "split": "train", "steps": 4},
-    {"name": "ep3", "episode_id": 3, "scene_id": 43, "seed": 9, "split": "val", "steps": 5},
+    {"name": "ep1", "episode_id": 1, "scene_id": 42, "seed": 7, "split": "train", "steps": 6,
+     "instruction": "fly to the red pillar and stop"},
+    {"name": "ep2", "episode_id": 2, "scene_id": 42, "seed": 8, "split": "train", "steps": 4,
+     "instruction": "fly to the blue pillar and stop"},
+    {"name": "ep3", "episode_id": 3, "scene_id": 43, "seed": 9, "split": "val", "steps": 5,
+     "instruction": "fly to the red pillar and stop"},
 ]
 
 
@@ -80,6 +83,7 @@ def write_episode(root, spec, g0):
         "version": "synthetic",
         "split": spec["split"],
         "teacher": "synthetic",
+        "instruction": spec.get("instruction"),
         "geometry_version": sm.SPLIT_SALT,
         "actions_ref": "actions.jsonl",
         "oracle_ref": "oracle.jsonl",

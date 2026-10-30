@@ -71,6 +71,17 @@ int main() {
     check(values == static_cast<std::size_t>(kNumActions), "probs 数量应等于动作数");
   }
 
+  {
+    std::istringstream in(frame);
+    std::ostringstream out;
+    const std::size_t n = run_infer_loop(model, in, out, {1, 2, 3});
+    check(n == 1, "带 text_ids 应处理 1 帧");
+    const std::string with_text = out.str();
+    const std::size_t tcut = with_text.find(key);
+    check(tcut != std::string::npos && with_text.substr(0, tcut) == head,
+          "L0 text_ids 不应改变动作输出");
+  }
+
   check(run("").first == 0, "空输入应返回 0 帧");
 
   bool threw = false;

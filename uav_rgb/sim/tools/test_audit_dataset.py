@@ -15,13 +15,14 @@ PILLARS = [{"name": "pillar_0", "x": 1.5, "y": 0.0, "z": 1.5, "size": [0.4, 0.4,
 OTHER = [{"name": "pillar_0", "x": 9.5, "y": 0.0, "z": 1.5, "size": [0.4, 0.4, 3.0]}]
 
 
-def write_ep(root, split, eid, actions, dts=None, pillars=PILLARS):
+def write_ep(root, split, eid, actions, dts=None, pillars=PILLARS, instruction=None):
     d = os.path.join(root, split, str(eid))
     os.makedirs(d)
     with open(os.path.join(d, "scene.json"), "w", encoding="utf-8") as f:
         json.dump({"pillars": pillars}, f)
     man = {"split": split, "teacher": "plan_action", "planner": "plan_action",
            "geometry_version": sm.SPLIT_SALT, "teacher_version": TEACHER_VERSION,
+           "instruction": instruction,
            "actions_ref": "actions.jsonl", "oracle_ref": "oracle.jsonl",
            "validity": {"camera_verified": True, "physics_verified": True,
                         "episode_executed": True}}
@@ -310,6 +311,25 @@ def main():
         c14 = details(root14)["geometry_version"]
         assert c14["status"] == "FAIL" and "lane_sep_m" in c14["detail"], c14
         shutil.rmtree(root14)
+
+        # 15) 指令覆盖：全有 PASS、部分缺 FAIL、含坐标 FAIL、全无 SKIP。
+        root15 = tempfile.mkdtemp(prefix="audit_test_")
+        write_ep(root15, "train", 1, CLEAN,
+                 instruction="fly to the red pillar and stop")
+        write_ep(root15, "train", 2, CLEAN,
+                 instruction="fly to the blue pillar and stop")
+        c15 = details(root15)["instruction_coverage"]
+        assert c15["status"] == "PASS", c15
+        write_ep(root15, "train", 3, CLEAN)  # 缺 instruction
+        c15b = details(root15)["instruction_coverage"]
+        assert c15b["status"] == "FAIL", c15b
+        shutil.rmtree(root15)
+
+        root15b = tempfile.mkdtemp(prefix="audit_test_")
+        write_ep(root15b, "train", 1, CLEAN, instruction="go to x=1.5")
+        c15c = details(root15b)["instruction_coverage"]
+        assert c15c["status"] == "FAIL" and "坐标" in c15c["detail"], c15c
+        shutil.rmtree(root15b)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

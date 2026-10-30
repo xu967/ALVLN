@@ -37,6 +37,11 @@ if [[ "${1:-}" != "--python-only" ]]; then
   # 这条链路把它接起来，格式漂移（例如头里的 H/W 换位）会在这里红。
   "$UAV_RGB_PYTHON" "$uav_check_root/tools/preprocess.py" --out "$uav_check_fmt/ds" \
     "$uav_check_fmt"/ep/ep1 "$uav_check_fmt"/ep/ep2 "$uav_check_fmt"/ep/ep3 >/dev/null
+  # L0：带 instruction 的集必须写出旁路侧车，否则文本通路静默丢失。
+  [[ -s "$uav_check_fmt/ds/instructions.jsonl" ]] || {
+    echo "缺 instructions.jsonl（L0 侧车未写出）" >&2; exit 1; }
+  [[ "$(wc -l < "$uav_check_fmt/ds/instructions.jsonl")" -eq 3 ]] || {
+    echo "instructions.jsonl 行数 != 3" >&2; exit 1; }
   g++ -std=c++17 -O2 -Wall -Wextra "$uav_check_root/tools/read_dataset.cpp" \
     -o "$uav_check_fmt/read_dataset"
   "$uav_check_fmt/read_dataset" "$uav_check_fmt/ds/dataset.uavr" --selfcheck >/dev/null

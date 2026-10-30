@@ -12,7 +12,9 @@
 
 namespace uavrgb {
 
-std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream& out) {
+std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream& out,
+                           std::vector<std::uint8_t> text_ids) {
+  (void)text_ids;  // L0：先打通协议；L2 才把 token 送进文本编码器。
   const int h = model.in_h;
   const int w = model.in_w;
   const int c = model.c1.in;

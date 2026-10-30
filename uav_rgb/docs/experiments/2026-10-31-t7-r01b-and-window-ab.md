@@ -25,16 +25,20 @@ eval_closed_loop.py ... --seeds 49,57 --window-from dispatch \
 
 ## 2. 结果
 
-| 项 | 旧 T7（observation） | 新 T7-R（dispatch） |
-| --- | --- | --- |
-| episodes_done | 20/20 | 20/20 |
-| SR | **0.90**（18/20） | **0.55**（11/20） |
-| collision_rate | 0.05 | 0.45 |
-| stuck_rate | 0.00 | 0.00 |
-| false_forward_rate | 0.05 | 0.30 |
-| 动作分布 | SAFE 57 / FWD 1095 / LEFT 178 / RIGHT 211 | SAFE 14 / FWD 709 / LEFT 263 / RIGHT 351 |
-| inference p50/p95 | 40.42 / 59.28 ms | 10.94 / 15.24 ms |
-| wall | 3475.8 s | 2501.4 s |
+| 项 | 旧 T7（observation） | **v1 复测（observation）** | 新 T7-R（dispatch） |
+| --- | --- | --- | --- |
+| episodes_done | 20/20 | 20/20 | 20/20 |
+| SR | **0.90**（18/20） | **0.90**（18/20） | **0.55**（11/20） |
+| collision_rate | 0.05 | 0.05 | 0.45 |
+| stuck_rate | 0.00 | 0.00 | 0.00 |
+| false_forward_rate | 0.05 | 0.05 | 0.30 |
+| 动作分布 | SAFE 57 / FWD 1095 / LEFT 178 / RIGHT 211 | SAFE 73 / FWD 1014 / LEFT 210 / RIGHT 288 | SAFE 14 / FWD 709 / LEFT 263 / RIGHT 351 |
+| inference p50/p95 | 40.42 / 59.28 ms | 10.26 / 13.10 ms | 10.94 / 15.24 ms |
+| wall | 3475.8 s | 1690 s 左右 | 2501.4 s |
+
+v1 复测的失败集与历史不同：seed 23 第 65 步碰撞（max_x 7.79）；
+seed 88 未成功（max_x 3.21，SAFE 悬停型）。**SR 与历史 0.90 一致**，
+说明 observation 语义在当前环境可复现，失败 seed 的差异来自 Gazebo 非逐位确定。
 
 A/B（同一 ckpt、同一环境、紧邻运行）：
 
@@ -67,9 +71,8 @@ A/B（同一 ckpt、同一环境、紧邻运行）：
 ## 5. 没做什么
 
 - **没有改模型/重新训练**：本次只做诊断与 A/B。
-- **没有用 observation 语义跑完整 20 seed**：A/B 只跑了 49/57；
-  完整 v1 observation 基线已启动（`eval-student-v1-observation`），结果另记。
-- **没有启动 T5b 全量重采**：等完整 v1 observation 基线跑完再启动（G 车道互斥）。
+- **没有启动 T5b 全量重采**：v1 已跑完，下一步启动（G 车道互斥）。
+- **没有修 D-GEODUP**：seed 49/57 近重复几何只记录，未改 gid/容差。
 - **没有修 D-GEODUP**：seed 49/57 近重复几何只记录，未改 gid/容差。
 
 ## 6. 风险

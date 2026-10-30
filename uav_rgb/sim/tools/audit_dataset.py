@@ -11,6 +11,7 @@
 判定口径（阈值都在下面常量里，改阈值要同步改本文件顶部的说明）：
 
   manifest_validity  每集 validity 三项全 true      训练集必须是逐集跑满的
+  instruction_coverage 每集 instruction 非空/无坐标 旧数据无字段 SKIP；部分缺 FAIL
   time_pairing       每步 depth/pose 与 RGB 的 |gap| > 50 ms 说明观测不同步
   action_window      动作窗口 sim_dt 的变异系数       > 5% 说明 hold 随 RTF 漂移
   forward_motion     稳态 FORWARD_SLOW 步的位移       < 0.4×SPEED_FWD×dt 说明动作没生效
@@ -26,6 +27,7 @@
 import argparse
 import json
 import os
+import re
 import statistics
 import sys
 from collections import Counter
@@ -64,6 +66,8 @@ MIN_TRANSITION_RATIO = 0.2
 YAW_MIN_DEG = 0.5
 MIN_CLASS_SHARE = 0.05
 MAX_LABEL_MISMATCH = 0.0     # plan_action 是确定性的，同一输入必然同一标签
+# 指令里出现坐标/带单位小数说明把 oracle 泄漏进了文本（L0/L1）
+COORD_RE = re.compile(r"(?:\bx\s*=|\by\s*=|\(\s*-?\d|\d+\.\d+\s*m\b)", re.IGNORECASE)
 
 
 def load_jsonl(path):
@@ -88,6 +92,10 @@ def episode_facts(ep_dir):
         oracle = load_jsonl(os.path.join(ep_dir, man["oracle_ref"]))
     except (OSError, KeyError, ValueError) as e:
         return {"dir": ep_dir, "error": f"{type(e).__name__}: {e}"}
+
+    instruction = man.get("instruction")
+    if instruction is not None and not isinstance(instruction, str):
+        return {"dir": ep_dir, "error": "instruction 必须是字符串"}
 
     # 行数不一致时 zip 会静默截短：被截掉的尾步（例如 SAFE+碰撞）永远不会进
     # 任何检查，整个闸门会给出假 PASS。必须先于 zip 拒绝。
@@ -165,6 +173,7 @@ def episode_facts(ep_dir):
         "gid": gid,
         "pillars": pillars,
         "clearance": clearance,
+        "instruction": instruction,
         "validity": man.get("validity") or {},
         "num_steps": len(steps),
         "requested_steps": man.get("requested_steps"),
@@ -208,6 +217,25 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
                             f"{len(bad_val)}/{len(gate)} 集 validity 不全 true"
                             f"（含已排除 {len(pre_excluded)} 集）",
                             samples=bad_val[:5]))
+
+    # 1b) 指令覆盖（L0）：全有 → 非空/无坐标；部分缺 → FAIL；全无 → SKIP
+    instr = [f for f in gate if isinstance(f.get("instruction"), str)]
+    missing_instr = len(gate) - len(instr)
+    nonempty = [f for f in instr if f["instruction"].strip()]
+    leaks = [f["dir"] for f in nonempty if COORD_RE.search(f["instruction"])]
+    if not instr:
+        checks.append(check("instruction_coverage", "SKIP",
+                            "全部 manifest 无 instruction（旧格式）"))
+    elif missing_instr or len(nonempty) != len(instr):
+        checks.append(check("instruction_coverage", "FAIL",
+                            f"{missing_instr} 集缺 instruction，"
+                            f"{len(instr) - len(nonempty)} 集为空"))
+    elif leaks:
+        checks.append(check("instruction_coverage", "FAIL",
+                            f"{len(leaks)} 条指令含坐标/数值", samples=leaks[:5]))
+    else:
+        checks.append(check("instruction_coverage", "PASS",
+                            f"{len(nonempty)}/{len(gate)} 集有非空指令，无坐标泄漏"))
 
     # 2) 时间配对（缺 gap 字段的步单列；部分缺失不能让检查按 0 放过）
     covered = [s["gap"] for s in steps if s["gap"] is not None]

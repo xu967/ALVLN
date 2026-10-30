@@ -4,9 +4,9 @@
 
 2026-10-30 当前进度：T5 599 集 / 23960 步（audit 11/11 PASS）；T6 best 权重离线 test
 `acc 0.9186 / macro_f1 0.8589 / bal_acc 0.8497`（多数类先验 macro_f1 0.1968）；
-T7 旧版闭环（observation 语义）20 个冻结 test seed `SR 0.90`；T7-R（dispatch 语义）
-`SR 0.55`（11/20），A/B 证明 R01 窗口语义是主因（seed 49/57 observation 2/2 vs
-dispatch 0/2）。完整 observation v1 基线在跑；v1 与 dispatch 数字禁止混报。
+T7 旧版闭环（observation 语义）`SR 0.90`；v1 当前环境复测（observation）`SR 0.90`
+（18/20）；T7-R（dispatch 语义）`SR 0.55`（11/20），A/B 证明 R01 窗口语义是主因
+（seed 49/57 observation 2/2 vs dispatch 0/2）。v1 与 dispatch 数字禁止混报。
 语言/GRU/STOP 尚未实现，闭环指标不能替代。
 
 ## 环境与一键检查
