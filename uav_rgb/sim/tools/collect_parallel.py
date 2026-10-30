@@ -273,7 +273,8 @@ def _popen_collect(task, args, env, log_path):
            "--out", staging,
            "--scene-id", str(task.scene_id), "--seed", str(task.seed),
            "--episode-id", str(task.scene_id), "--split", task.split,
-           "--scene-meta", task.scene_meta_path]
+           "--scene-meta", task.scene_meta_path,
+           "--window-from", args.window_from]
     if args.policy != "teacher":
         cmd += ["--policy", args.policy]
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
@@ -422,6 +423,10 @@ def main():
                    help="每 episode 步数（默认见 split_manifest.DEFAULT_STEPS=40）")
     p.add_argument("--hold", type=float, default=1.0,
                    help="每动作仿真时间秒（走满即发零速，与 RTF 无关）")
+    p.add_argument("--window-from", choices=("dispatch", "observation"),
+                   default="dispatch",
+                   help="动作窗口起点：dispatch=派发位姿（默认）；"
+                        "observation=观测位姿（v1 baseline 语义）")
     p.add_argument("--out", required=True, help="汇总输出目录（必须为空/不存在）")
     p.add_argument("--base-seed", type=int, default=0,
                    help="scene_id = seed = base_seed + 扫描序号；给 --split 时只取该 split 的 seed")
@@ -431,6 +436,8 @@ def main():
                    help="只采命中该 split 的几何组；seed 从 base-seed 起向后扫描")
     p.add_argument("--spawn-mode", choices=("default", "random"), default="default",
                    help="普通 episode 的出生位姿（random = y/yaw 随机化）")
+    p.add_argument("--task", choices=("base", "l1"), default="base",
+                   help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
     p.add_argument("--safe-spawn-fraction", type=float, default=0.0,
                    help="每 N 个 episode 有 1 个用 SAFE 出生位姿（T2 的 SAFE 数据来源）")
     p.add_argument("--policy", choices=("teacher", "forward"), default="teacher")
@@ -538,7 +545,8 @@ def main():
             r = subprocess.run(
                 [sys.executable, SCENE_GEN, "--seed", str(t.seed),
                  "--scene-id", str(t.scene_id), "--out", t.world,
-                 "--spawn-mode", t.spawn_mode, "--template", args.template],
+                 "--spawn-mode", t.spawn_mode, "--template", args.template,
+                 "--task", args.task],
                 capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 print(r.stdout, flush=True)

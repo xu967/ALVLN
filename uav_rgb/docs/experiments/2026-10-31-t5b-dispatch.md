@@ -98,3 +98,32 @@ src/build/uavrgb_train --data "$BASE5/ds/dataset.uavr" \
 dispatch 数据的类别分布/执行窗口不同，属预期内的轻微下降，不改变合同判断。
 
 闭环复评（dispatch 20 seed，`eval-student-dispatch`）进行中，结果另记。
+
+## 8. dispatch 闭环复评（2026-10-31 06:10）
+
+命令：20 个冻结 test seed，`--window-from dispatch --keep-work`，
+`ckpt_best.bin`（T5b 训练，dispatch 数据）。
+
+| 项 | 结果 |
+| --- | --- |
+| SR | **0.60**（12/20） |
+| collision_rate | 0.35 |
+| false_forward_rate | 0.25 |
+| stuck_rate | 0.00 |
+| inference p50/p95 | 10.10 / 11.84 ms |
+| failed | [] |
+
+失败集：23、25、57、84、88、171、180 碰撞（其中 23/57/84/88/171 为 false_forward）；
+45 未成功（max_x 5.63，未到 goal 6.0）。
+
+### 结论
+
+- v1（observation 模型 + observation 评测）：**0.90**
+- T7-R（observation 模型 + dispatch 评测，OOD）：**0.55**
+- T5b（dispatch 模型 + dispatch 评测）：**0.60**
+
+即使按 dispatch 语义重采重训，SR 也只从 0.55 提到 0.60，远低于「v1 − 5 pp」
+（0.85）的采纳线。**dispatch（hold=1.0）不作为 baseline 采纳**；v1 observation
+仍是当前唯一稳定基线，语言线（L1/L2）按 observation 语义采集/评测。
+dispatch 合同若要继续，应先调 hold/动作适配/教师，而不是直接换数据。
+T5b 数据与模型保留作证据，不与 v1 数据混训/混报。

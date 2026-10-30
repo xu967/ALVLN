@@ -37,9 +37,12 @@ def main():
         check(target in lm.COLORS, f"seed {seed}: 目标色非法 {target}")
         check(parse_target_color(instr) == target,
               f"seed {seed}: 指令目标色不一致 {instr}")
-        check(colored[0]["x"] == colored[1]["x"],
-              f"seed {seed}: 未优先选同排")
-        check(wp["x"] == colored[0]["x"], f"seed {seed}: waypoint x 不在目标排")
+        check(all(p["x"] <= lm.VISIBLE_X_MAX for p in colored),
+              f"seed {seed}: 彩色柱不在前排 {colored}")
+        check(abs(colored[0]["y"] - colored[1]["y"]) > 0.5,
+              f"seed {seed}: 两彩色柱 y 太近")
+        wp_target = next(p for p in colored if p["color"] == target)
+        check(wp["x"] == wp_target["x"], f"seed {seed}: waypoint x 不在目标柱")
         check(abs(wp["y"]) <= 3.0, f"seed {seed}: waypoint 越界 {wp}")
         check(all(abs(wp["x"] - p["x"]) >= 0.6 or abs(wp["y"] - p["y"]) >= 0.6
                   for p in colored), f"seed {seed}: waypoint 落在彩色柱内 {wp}")

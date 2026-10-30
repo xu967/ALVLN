@@ -34,6 +34,7 @@ from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scene_gen as sg  # noqa: E402
+from instruction import parse_target_color  # noqa: E402
 from split_manifest import SPLIT_SALT, geometry_gid  # noqa: E402
 from teacher import TEACHER_VERSION, plan_action, plan_action_global  # noqa: E402
 
@@ -110,6 +111,7 @@ def episode_facts(ep_dir):
     gid = None
     pillars = None
     clearance = None
+    target_color = waypoint = scene_spawn = None
     scene_path = os.path.join(ep_dir, "scene.json")
     if os.path.exists(scene_path):
         try:
@@ -122,6 +124,9 @@ def episode_facts(ep_dir):
                 gid = geometry_gid(pillars)
             if isinstance(scene.get("clearance"), dict):
                 clearance = scene["clearance"]
+            target_color = scene.get("target_color")
+            waypoint = scene.get("waypoint")
+            scene_spawn = scene.get("spawn")
         except (KeyError, OSError, ValueError, TypeError):
             pillars = None
 
@@ -163,6 +168,16 @@ def episode_facts(ep_dir):
         # 旧格式/坏行不能让整个 audit 崩掉；按「这集读不出来」计 FAIL。
         return {"dir": ep_dir, "error": f"{type(e).__name__}: {e}"}
 
+    wp_min = None
+    if isinstance(waypoint, dict):
+        ds = []
+        for o in oracle:
+            pg = o.get("pose_gt")
+            if isinstance(pg, dict) and "x" in pg and "y" in pg:
+                ds.append(((pg["x"] - waypoint["x"]) ** 2 +
+                           (pg["y"] - waypoint["y"]) ** 2) ** 0.5)
+        wp_min = min(ds) if ds else None
+
     return {
         "dir": ep_dir,
         "split": man.get("split"),
@@ -174,6 +189,10 @@ def episode_facts(ep_dir):
         "pillars": pillars,
         "clearance": clearance,
         "instruction": instruction,
+        "target_color": target_color,
+        "waypoint": waypoint,
+        "scene_spawn": scene_spawn,
+        "waypoint_min_dist": wp_min,
         "validity": man.get("validity") or {},
         "num_steps": len(steps),
         "requested_steps": man.get("requested_steps"),
@@ -236,6 +255,59 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
     else:
         checks.append(check("instruction_coverage", "PASS",
                             f"{len(nonempty)}/{len(gate)} 集有非空指令，无坐标泄漏"))
+
+    # 1c) L1：指令目标色 / 近远平衡 / teacher 是否经过 waypoint
+    l1 = [f for f in gate if isinstance(f.get("instruction"), str)
+          and f["instruction"].strip()]
+    if not l1:
+        checks.append(check("target_color", "SKIP", "无 instruction（非 L1 数据）"))
+        checks.append(check("landmark_balance", "SKIP", "无 instruction（非 L1 数据）"))
+        checks.append(check("teacher_waypoint", "SKIP", "无 instruction（非 L1 数据）"))
+    else:
+        bad = []
+        for f in l1:
+            want = parse_target_color(f["instruction"])
+            colors = {p.get("color") for p in (f.get("pillars") or [])}
+            if want is None or want != f.get("target_color") or want not in colors:
+                bad.append(f["dir"])
+        checks.append(check("target_color", "FAIL" if bad else "PASS",
+                            f"{len(bad)}/{len(l1)} 集指令目标色与 scene 不一致",
+                            samples=bad[:5]))
+
+        near = far = no_data = 0
+        for f in l1:
+            colored = [p for p in (f.get("pillars") or []) if p.get("color")]
+            spawn = f.get("scene_spawn") or {}
+            if len(colored) < 2 or "x" not in spawn or "y" not in spawn:
+                no_data += 1
+                continue
+            nearest = min(colored, key=lambda p: (p["x"] - spawn["x"]) ** 2 +
+                          (p["y"] - spawn["y"]) ** 2)
+            if nearest.get("color") == f.get("target_color"):
+                near += 1
+            else:
+                far += 1
+        if near + far == 0:
+            checks.append(check("landmark_balance", "SKIP",
+                                f"无可计算集（缺数据 {no_data}）"))
+        else:
+            checks.append(check(
+                "landmark_balance", "FAIL" if (near == 0 or far == 0) else "PASS",
+                f"目标最近 {near} / 非最近 {far}，缺数据 {no_data}"))
+
+        # safe 出生集走局部 plan_action，本来就不跟 waypoint；不纳入该项检查。
+        l1w = [f for f in l1 if isinstance(f.get("waypoint"), dict)
+               and (f.get("scene_spawn") or {}).get("mode") != "safe"]
+        if not l1w:
+            checks.append(check("teacher_waypoint", "SKIP", "无 waypoint"))
+        else:
+            miss = [f["dir"] for f in l1w if f.get("waypoint_min_dist") is None]
+            badw = [f["dir"] for f in l1w if f.get("waypoint_min_dist") is not None
+                    and f["waypoint_min_dist"] > 1.0]
+            checks.append(check(
+                "teacher_waypoint", "FAIL" if (badw or miss) else "PASS",
+                f"{len(badw)} 集最近距离 >1.0 m，{len(miss)} 集无位姿",
+                samples=(badw + miss)[:5]))
 
     # 2) 时间配对（缺 gap 字段的步单列；部分缺失不能让检查按 0 放过）
     covered = [s["gap"] for s in steps if s["gap"] is not None]
@@ -446,7 +518,8 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
             total += 1
             # 普通集用 A*，safe 出生集用局部规划；manifest.planner 是唯一开关。
             if f.get("planner") == "astar":
-                want = plan_action_global(pb["x"], pb["y"], yb, f["pillars"])
+                want = plan_action_global(pb["x"], pb["y"], yb, f["pillars"],
+                                          waypoint=f.get("waypoint"))
             else:
                 want = plan_action(pb["x"], pb["y"], yb, f["pillars"])
             if want != s["action_expert"]:

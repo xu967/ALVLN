@@ -150,7 +150,7 @@ def run_episode(seed, args, workdir, seen_gids):
     meta_path = os.path.join(workdir, f"scene_{seed}.json")
     r = subprocess.run(
         [sys.executable, SCENE_GEN, "--seed", str(seed), "--scene-id", str(seed),
-         "--out", world, "--template", args.template],
+         "--out", world, "--template", args.template, "--task", args.task],
         capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         raise RuntimeError(f"scene_gen seed={seed} 失败：{r.stderr.strip()}")
@@ -233,6 +233,8 @@ def main():
                    default="dispatch",
                    help="动作窗口起点：dispatch=派发位姿（默认，R01）；"
                         "observation=观测位姿（旧语义，仅诊断/兼容旧数据）")
+    p.add_argument("--task", choices=("base", "l1"), default="base",
+                   help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
     p.add_argument("--split", choices=("train", "val", "test"), default="test")
     p.add_argument("--base-seed", type=int, default=0)
     p.add_argument("--max-seeds", type=int, default=500,

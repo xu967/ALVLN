@@ -43,6 +43,8 @@ import random
 import re
 import sys
 
+import landmarks
+
 # 几何语义版本：改柱子/车道/spawn 规则必须 bump。split_manifest 直接用它当
 # SPLIT_SALT，collect 写进 episode manifest，preprocess 拒绝跨版本混包。
 GEOMETRY_VERSION = "uavrgb.geom.v3"
@@ -244,6 +246,9 @@ def _apply_spawn(world, spawn):
 
 
 def _pillar_xml(p):
+    # L1 彩色 landmark：p["color"] 存在时按 landmarks.COLOR_RGB 上色，否则灰柱。
+    rgb = landmarks.COLOR_RGB.get(p.get("color"), (0.6, 0.6, 0.6))
+    mat = f"{rgb[0]:g} {rgb[1]:g} {rgb[2]:g} 1"
     return f"""    <model name="{p['name']}">
       <static>true</static>
       <pose>{p['x']:.3f} {p['y']:.3f} {PILLAR_Z:.1f} 0 0 0</pose>
@@ -251,14 +256,20 @@ def _pillar_xml(p):
         <collision name="collision"><geometry><box><size>{PILLAR_SIZE:g} {PILLAR_SIZE:g} {PILLAR_HEIGHT:g}</size></box></geometry></collision>
         <visual name="visual">
           <geometry><box><size>{PILLAR_SIZE:g} {PILLAR_SIZE:g} {PILLAR_HEIGHT:g}</size></box></geometry>
-          <material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.6 0.6 0.6 1</diffuse><specular>0.6 0.6 0.6 1</specular></material>
+          <material><ambient>{mat}</ambient><diffuse>{mat}</diffuse><specular>{mat}</specular></material>
         </visual>
       </link>
     </model>"""
 
 
-def build_scene(template, seed, scene_id, spawn_mode="default"):
-    """返回 (world_text, meta)。template 只读，任何标记异常都直接报错。"""
+def build_scene(template, seed, scene_id, spawn_mode="default", task="base"):
+    """返回 (world_text, meta)。template 只读，任何标记异常都直接报错。
+
+    task="l1" 时额外给两根柱上色，写 target_color/instruction/waypoint；
+    task="base" 保持原几何与人任务无关的 meta 不变。
+    """
+    if task not in ("base", "l1"):
+        raise ValueError(f"unknown task {task!r}")
     for mark in (START_MARK, END_MARK):
         if template.count(mark) != 1:
             raise ValueError(f"template marker {mark!r} count != 1")
@@ -268,6 +279,10 @@ def build_scene(template, seed, scene_id, spawn_mode="default"):
         raise ValueError("template markers out of order")
     pillars, clearance, attempts = sample_pillars(seed)
     spawn = make_spawn(pillars, seed, spawn_mode)
+    target_color = instruction = waypoint = None
+    if task == "l1":
+        target_color, instruction, waypoint = landmarks.assign_landmarks(
+            pillars, seed, spawn)
     lines = [f"    <!-- scene_gen: scene_id={scene_id} seed={seed} "
              f"pillars={len(pillars)}; generated, do not edit -->"]
     lines += [_pillar_xml(p) for p in pillars]
@@ -304,6 +319,13 @@ def build_scene(template, seed, scene_id, spawn_mode="default"):
             "ok": True,
         },
     }
+    if task == "l1":
+        meta.update({
+            "task_version": "l1.v1",
+            "target_color": target_color,
+            "instruction": instruction,
+            "waypoint": waypoint,
+        })
     return world, meta
 
 
@@ -370,6 +392,8 @@ def main():
                    help="EpisodeMeta.scene_id（默认=seed）")
     p.add_argument("--spawn-mode", choices=("default", "random", "safe"), default="default",
                    help="出生位姿：default=模板原点；random=y/yaw 随机；safe=柱区内真 SAFE 位姿")
+    p.add_argument("--task", choices=("base", "l1"), default="base",
+                   help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
     p.add_argument("--template", default=DEFAULT_TEMPLATE,
                    help=f"模板 SDF（默认 {_rel(DEFAULT_TEMPLATE)}）")
     p.add_argument("--self-check", action="store_true",
@@ -387,7 +411,7 @@ def main():
     scene_id = args.seed if args.scene_id is None else args.scene_id
 
     template = _read_template(args.template)
-    world, meta = build_scene(template, args.seed, scene_id, args.spawn_mode)
+    world, meta = build_scene(template, args.seed, scene_id, args.spawn_mode, args.task)
     meta["template"] = _rel(os.path.abspath(args.template))
     out = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)

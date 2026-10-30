@@ -514,7 +514,7 @@ def take_off(pose_sub, publisher, contact_sub=None, z_target=Z_TARGET, timeout=1
 
 def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 prev_action=None, prev_rgb_ts=0, pillars=None, student=None,
-                global_plan=True, window_from="dispatch"):
+                global_plan=True, window_from="dispatch", waypoint=None):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。"""
     if window_from not in ("dispatch", "observation"):
         raise ValueError(f"window_from 无效: {window_from!r}")
@@ -562,7 +562,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             # safe 出生用局部规划（要保留真正的 SAFE 标签）；普通集用 A* 全局路径。
             if global_plan:
                 action = plan_action_global(pose_before["x"], pose_before["y"],
-                                            yaw_before, pillars)
+                                            yaw_before, pillars, waypoint=waypoint)
             else:
                 action = plan_action(pose_before["x"], pose_before["y"], yaw_before,
                                      pillars)
@@ -787,6 +787,7 @@ def main():
     scene_gid = None
     scene_version = None
     scene_spawn_mode = None
+    instruction_text = target_color = waypoint = task_version = None
     if args.scene_meta:
         with open(args.scene_meta, "rb") as f:
             raw_meta = f.read()
@@ -795,6 +796,10 @@ def main():
         pillars = scene_meta_obj["pillars"]
         scene_version = scene_meta_obj.get("geometry_version")
         scene_spawn_mode = (scene_meta_obj.get("spawn") or {}).get("mode")
+        instruction_text = scene_meta_obj.get("instruction")
+        target_color = scene_meta_obj.get("target_color")
+        waypoint = scene_meta_obj.get("waypoint")
+        task_version = scene_meta_obj.get("task_version")
         for k, pl in enumerate(pillars):
             if "x" not in pl or "y" not in pl:
                 p.error(f"--scene-meta {args.scene_meta}: pillars[{k}] 缺 x/y")
@@ -862,9 +867,11 @@ def main():
                 f" 回退（每条指令约 +1.0 s，动作窗口会失真）") from e
 
         if args.policy == "student":
+            from instruction import tokenize
             from student import StudentPolicy
             print("学生策略: 启动推理进程…", file=sys.stderr)
-            student = StudentPolicy(args.student_ckpt, args.infer_bin)
+            text_ids = tokenize(instruction_text) if instruction_text else None
+            student = StudentPolicy(args.student_ckpt, args.infer_bin, text_ids=text_ids)
 
         if not args.no_takeoff:
             print("起飞中…", file=sys.stderr)
@@ -874,7 +881,7 @@ def main():
             r, reason = collect_one(args.out, i, args.hold, args.policy, subs,
                                     publisher, prev_action, prev_rgb_ts, pillars, student,
                                     global_plan=(scene_spawn_mode != "safe"),
-                                    window_from=args.window_from)
+                                    window_from=args.window_from, waypoint=waypoint)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -1006,6 +1013,10 @@ def main():
             # 与 RTF 无关。同 scene 的 0.5 与 1.0 两批数据仍靠它区分。
             "hold_s": args.hold,
             "window_from": args.window_from,
+            "task_version": task_version,
+            "instruction": instruction_text,
+            "target_color": target_color,
+            "waypoint": waypoint,
             "scene_meta_sha256": scene_meta_sha,
             "actions_ref": "actions.jsonl",
             "oracle_ref": "oracle.jsonl",

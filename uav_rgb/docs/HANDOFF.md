@@ -1,10 +1,10 @@
 # uav_rgb 交接文档
 
-- 更新时间：2026-10-31 01:00
+- 更新时间：2026-10-31 06:15
 - **当前状态**：T1–T7 已完成；D4 已完成；**v1 复测（observation）`SR 0.90`**，
-  **T7-R（dispatch）`SR 0.55`**；A/B 证明 R01 窗口语义是主因（observation 2/2
-  vs dispatch 0/2）。0.90 只适用于 observation 语义；下一步 T5b dispatch 重采。
-  见 §四 4.1。
+  **T7-R（dispatch）`SR 0.55`**，**T5b（dispatch 重训）`SR 0.60`**。
+  dispatch（hold=1.0）未达到采纳线（v1−5pp），**不采纳为 baseline**；v1 observation
+  仍是语言线唯一稳定基线。见 §四 4.1。
 - **接手第一件事**：读完本文件 → 读 `docs/TASKS.md` → 读 `docs/ENGINEERING_RULES.md`
 - **口径唯一来源**：`docs/EVAL_STANDARD.md`。报任何数字前必读，违反口径的数字等于造假。
 
@@ -84,7 +84,7 @@ nvidia-smi -L                                   # 先判定 GPU 模式，别凭�
 > 更新时间：2026-10-30 21:55。T1 之前的「闭环 0 / 20」「公开数据 SAFE=0」等
 > 历史基线已移出本节，需要时看 `docs/experiments/` 与 `docs/worklog/`。
 
-### 4.1 T7-R 完成 + 动作窗口语义 A/B
+### 4.1 执行语义三条合同：v1 / T7-R / T5b
 
 **T7 同版本复跑（dispatch 默认）已完成**：20/20 集，`SR 0.55`（11/20）、
 collision 0.45、false_forward 0.30、stuck 0；产物
@@ -101,19 +101,19 @@ collision 0.45、false_forward 0.30、stuck 0；产物
 | 旧 T7（observation 语义） | SR 0.90（18/20）；collision 0.05；p50 40.4 ms |
 | **v1 复测（observation，当前环境）** | **SR 0.90（18/20）**；collision 0.05；p50 10.26 ms；失败 seed 23/88 |
 | T7-R（dispatch 语义） | SR 0.55（11/20）；collision 0.45；p50 10.9 ms |
+| **T5b（dispatch 重采重训）** | **SR 0.60（12/20）**；collision 0.35；p50 10.1 ms；离线 test macro_f1 0.8287 |
 | A/B observation | seed 49/57，2/2 成功 |
 | A/B dispatch | seed 49/57，0/2 碰撞 |
 
-**下一步（不设时间截止）**：
+**合同结论（2026-10-31 06:15）**：
 
-1. 跑完整 20 seed 的 **observation v1 基线**（`eval-student-v1-observation`），
-   作为当前环境的 v1 数字；历史 0.90 来自不同负载环境，不能直接当现值。
-2. 启动 **T5b 全量重采**（dispatch 语义，新目录 `t5b-dispatch-20261031`），
-   再 preprocess → 训练 → 闭环复评；dispatch 是新的执行合同。
-3. T5b 采集期间只做 L0（不改 `collect.py`/`collect_parallel.py`/`scene_gen.py`/
-   `teacher.py`/`gz_io.py`），采集结束后再改 collect 的 instruction 字段。
-4. 数字口径：v1 = observation 语义；dispatch 数字必须标注「新执行合同」，
-   两套数字禁止混报。seed 49/57 近重复几何（差 5 mm）记入 D-GEODUP。
+1. **v1 observation 是唯一 baseline**（SR 0.90）；语言线（L1/L2）按 observation
+   语义采集/评测。
+2. dispatch（hold=1.0）重采重训后只有 0.60，低于「v1 − 5 pp」的采纳线（0.85）；
+   **不采纳为 baseline**。若继续，先调 hold/动作适配/教师，不是换数据。
+3. T5b 数据/模型保留作证据，**不与 v1 混训/混报**；dispatch 数字必须标注合同。
+4. L1 用 observation 语义：`collect_parallel.py` 需透传 `--window-from`；
+   评测用 `eval_closed_loop.py --window-from observation`。
 
 **禁止**：同时启动第二个 Gazebo 采集/评测/训练；先 `mkdir` 输出目录
 （`eval_closed_loop.py` 拒绝非空目录）。日志按集 flush，日志不动不等于卡死，
@@ -144,14 +144,16 @@ collision 0.45、false_forward 0.30、stuck 0；产物
 | **v1 复测（observation，当前环境）** | **SR 0.90（18/20）** / collision 0.05 / false_forward 0.05；p50 10.26 ms / p95 13.10 ms；失败 seed 23/88 |
 | 盲前进基线 | SR 0 / collision 1.00 / false_forward 1.00 |
 | T7-R（dispatch） | SR 0.55（11/20）/ collision 0.45 / false_forward 0.30 / stuck 0.00；p50 10.9 ms / p95 15.2 ms；动作 SAFE 14 / FWD 709 / LEFT 263 / RIGHT 351 |
+| T5b（dispatch 重训） | SR 0.60（12/20）/ collision 0.35 / false_forward 0.25 / stuck 0.00；p50 10.1 ms / p95 11.8 ms；离线 test macro_f1 0.8287 |
 | A/B 窗口语义 | seed 49/57：observation 2/2 成功，dispatch 0/2 碰撞；p50 均约 11 ms |
 
 > **T6 数字的出处**：`0.8589` 出自 `eval-best/metrics.jsonl`（ckpt_best 复评）；
 > `run/metrics.jsonl` 末条是末轮 `ckpt.bin` 的 0.8042，抓错文件会差 5 个点。
 
 T7-R（dispatch）失败分类：起步早碰撞 49/57/99；过线后碰撞 25/36/114/116/137；
-未到线碰撞 50。旧版 observation 的 seed 45 SAFE 悬停/seed 99 早碰撞仅作历史对照。
-完整 observation v1 基线（20 seed）在跑；v1 与 dispatch 数字禁止混报。
+未到线碰撞 50。T5b（dispatch 重训）失败：23/25/57/84/88/171/180 碰撞，45 未到线。
+旧版 observation 的 seed 45 SAFE 悬停/seed 99 早碰撞仅作历史对照。
+**v1 observation 是唯一 baseline；v1 与 dispatch 数字禁止混报。**
 
 ### 4.4 数据与产物路径
 
