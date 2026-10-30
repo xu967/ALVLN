@@ -157,6 +157,9 @@ setsid nohup env DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg TMPDIR="$BASE/tmp" \
 | 盲前进基线 | SR 0 / collision 1.00 / false_forward 1.00 |
 | T7 复跑 | **未完成**：上一轮 14/20 被会话中断，重跑产物以 `eval-student-r01b/eval.json` 为准；0.90 和 14/20 快照都不是当前结论 |
 
+> **T6 数字的出处**：`0.8589` 出自 `eval-best/metrics.jsonl`（ckpt_best 复评）；
+> `run/metrics.jsonl` 末条是末轮 `ckpt.bin` 的 0.8042，抓错文件会差 5 个点。
+
 旧 T7 的失败集：seed 45 一直 SAFE 悬停（max_x 3.26），seed 99 第 21 步 FORWARD 撞柱
 （false_forward）。复跑结束后要确认这两个模式是否仍在，并解释新增失败集。
 
