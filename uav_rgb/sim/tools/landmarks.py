@@ -22,8 +22,31 @@ def _dist2(p, spawn):
     return (p["x"] - spawn["x"]) ** 2 + (p["y"] - spawn["y"]) ** 2
 
 
+def waypoint_for(target, pillars, standoff=0.7, y_range=(-3.0, 3.0)):
+    """目标柱旁的通路点：朝走廊中心偏 standoff，避开其它柱。
+
+    standoff=0.7 = 柱半宽 0.2 + A* 余量 0.5，正好落在 A* 的自由一侧。
+    """
+    sign = -1.0 if target["y"] > 0 else 1.0
+    for _ in range(2):
+        wy = round(target["y"] + sign * standoff, 3)
+        if y_range[0] <= wy <= y_range[1]:
+            clear = True
+            for p in pillars:
+                if p is target:
+                    continue
+                if (abs(target["x"] - p["x"]) < 0.2 + 0.4 and
+                        abs(wy - p["y"]) < 0.2 + 0.4):
+                    clear = False
+                    break
+            if clear:
+                return {"x": target["x"], "y": wy}
+        sign = -sign
+    raise ValueError("找不到目标柱旁的 waypoint")
+
+
 def assign_landmarks(pillars, seed, spawn=None):
-    """就地给两根柱加 color，返回 (target_color, instruction)。
+    """就地给两根柱加 color，返回 (target_color, instruction, waypoint)。
 
     spawn 默认 (-0.5, 0)；scene_gen 应传真实出生位姿。
     优先选同一 x 的一排（同时可见），没有同排就任选两根。
@@ -51,4 +74,5 @@ def assign_landmarks(pillars, seed, spawn=None):
     colors = list(COLORS)
     rng.shuffle(colors)
     target["color"], distractor["color"] = colors[0], colors[1]
-    return target["color"], make_instruction(target["color"])
+    wp = waypoint_for(target, pillars)
+    return target["color"], make_instruction(target["color"]), wp
