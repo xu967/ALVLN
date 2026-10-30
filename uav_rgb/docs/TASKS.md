@@ -21,7 +21,7 @@
 
 ## 下一步（2026-10-30 22:55 审核后）
 
-> 夜间自主执行计划（23:55–07:30）：`docs/experiments/2026-10-31-overnight-autonomous-plan.md`。
+> 自主执行任务编排（无固定截止）：`docs/experiments/2026-10-31-overnight-autonomous-plan.md`。
 
 **当前唯一 P0 是上表的 T7-R。** T8 不单独立项，失败分类并入 T7-R 的验收；
 D5/G1–G6 暂缓；V8、CF-Drone、SG2002、AerialVLN-S 官方基准冻结。
