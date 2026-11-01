@@ -149,8 +149,9 @@ class EpisodeSequenceDataset(Dataset):
     """split 目录（train/val/test 之一）下每个 episode 目录一个序列样本。"""
 
     def __init__(self, split_dir, seq_len, image_size=IMAGE_SIZE,
-                 require_depth=True):
+                 require_depth=True, stride=1):
         self.seq_len = int(seq_len)
+        self.stride = max(1, int(stride))
         self.image_size = int(image_size)
         self.require_depth = bool(require_depth)
         if self.seq_len < 1:
@@ -165,12 +166,18 @@ class EpisodeSequenceDataset(Dataset):
             _warn(f"{root} 下没有 episode 目录（需含 episode_manifest.json）")
         self.samples = []
         for ep_dir in ep_dirs:
-            sample = self._build_sample(ep_dir)
-            if sample is not None:
-                self.samples.append(sample)
-        _warn(f"{root}: {len(self.samples)}/{len(ep_dirs)} 个 episode 可用")
+            samples = self._build_samples(ep_dir)
+            if samples:
+                self.samples.extend(samples)
+        _warn(f"{root}: {len(self.samples)} 个滑窗样本，来自 "
+              f"{len({s['episode_id'] for s in self.samples})}/{len(ep_dirs)} 个 episode")
 
-    def _build_sample(self, ep_dir):
+    def _build_samples(self, ep_dir):
+        """每集产出多个滑窗样本：窗口 = 连续 seq_len 帧，标签取**窗口末帧**的动作。
+
+        旧实现只取每集最后 seq_len 帧、标签取最后一帧，而教师集都以停在 waypoint
+        的 SAFE 收尾，导致所有标签恒为 SAFE_NEUTRAL（训练 acc 假性 1.0）。
+        """
         try:
             with open(ep_dir / "episode_manifest.json", encoding="utf-8") as f:
                 manifest = json.load(f)
@@ -206,10 +213,9 @@ class EpisodeSequenceDataset(Dataset):
         if len(rows) < self.seq_len:
             _warn(f"跳过 {ep_dir}: 有效帧 {len(rows)} < seq_len {self.seq_len}")
             return None
-        rows = rows[-self.seq_len:]  # 每集只取最后 T 帧
 
-        rgb_paths = []
-        depth_paths = [] if self.require_depth else None
+        rgb_all = []
+        depth_all = [] if self.require_depth else None
         for row in rows:
             step = row.get("step")
             frame = row.get("frame")
@@ -222,7 +228,7 @@ class EpisodeSequenceDataset(Dataset):
             if not rgb_path.is_file():
                 _warn(f"跳过 {ep_dir}: 缺 RGB 文件 {frame}")
                 return None
-            rgb_paths.append(rgb_path)
+            rgb_all.append(rgb_path)
             if self.require_depth:
                 depth_path = _depth_path(ep_dir, manifest, row)
                 if depth_path is None or not depth_path.is_file():
@@ -230,28 +236,37 @@ class EpisodeSequenceDataset(Dataset):
                           f"（当前 collect.py 不保存深度；"
                           f"仅验证 RGB 用 require_depth=False）")
                     return None
-                depth_paths.append(depth_path)
+                depth_all.append(depth_path)
 
         poses = _pose_sequence(rows)
         if poses is None:
             _warn(f"跳过 {ep_dir}: actions.jsonl 缺 pose_before/yaw_before")
             return None
 
-        label = rows[-1].get("action_expert")
-        if not isinstance(label, int) or not 0 <= label < NUM_ACTIONS:
-            _warn(f"跳过 {ep_dir}: action_expert 非法 ({label!r})")
-            return None
+        labels = [r.get("action_expert") for r in rows]
+        for i, lab in enumerate(labels):
+            if not isinstance(lab, int) or not 0 <= lab < NUM_ACTIONS:
+                _warn(f"跳过 {ep_dir}: 第 {i} 帧 action_expert 非法 ({lab!r})")
+                return None
 
-        return {
-            "ep_dir": ep_dir,
-            "rgb_paths": rgb_paths,
-            "depth_paths": depth_paths,
-            "depth_format": manifest.get("depth_format"),
-            "pose": poses,
-            "text": np.asarray(text_ids, dtype=np.int64),
-            "label": label,
-            "episode_id": str(manifest.get("episode_id", ep_dir.name)),
-        }
+        episode_id = str(manifest.get("episode_id", ep_dir.name))
+        text_arr = np.asarray(text_ids, dtype=np.int64)
+        depth_format = manifest.get("depth_format")
+        out = []
+        for end in range(self.seq_len, len(rows) + 1, self.stride):
+            lo = end - self.seq_len
+            out.append({
+                "ep_dir": ep_dir,
+                "rgb_paths": rgb_all[lo:end],
+                "depth_paths": depth_all[lo:end] if depth_all is not None else None,
+                "depth_format": depth_format,
+                "pose": poses[lo:end],
+                "text": text_arr,
+                "label": labels[end - 1],
+                "episode_id": episode_id,
+                "step": end - 1,
+            })
+        return out
 
     def __len__(self):
         return len(self.samples)

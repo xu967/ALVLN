@@ -109,3 +109,75 @@ df /root/rivermind-data        → 116 G 可用（清理前 110 G）
 3. **深度落盘未在真实仿真验证**；若某版本 gz 的深度不是米，毫米换算会整体偏移。
 4. **CPU torch 训练 Teacher 不可行**，GPU 方案未定。
 5. 根分区仍只有 30 G（已用 94%），后续装包要放数据盘。
+
+---
+
+## 更新 2026-11-02 05:10
+
+### 1. v4 三组闭环按 goal_reach 重跑完成
+
+产物 `$DATA_ROOT/uav_rgb/l1-v4-closed-goalreach-20261102/`，三组共 138 min。
+
+| 组 | SR | 碰撞 | false_forward | 完成 |
+| --- | --- | --- | --- | --- |
+| student-keep | **0.4043**（19/47） | 0.319 | 0.277 | 47 |
+| student-shuffle | **0.000** | 0.298 | 0.255 | 47 |
+| forward | **0.000** | 0.463 | 0.463 | 41 |
+
+- Wilson 95% CI `[0.276, 0.547]`；McNemar p < 1e-5
+- 失败分解：成功 19 / 撞柱 15（**15/15 都 ≤1.5 m**）/ 未达 13
+- **旧 0.426 作废**：复算值，重跑不可复现（Gazebo 非逐位确定）
+- 详见 `experiments/2026-11-02-l1-v4-goalreach-rerun.md`
+
+### 2. 深度落盘端到端验证
+
+真采 1 集 20 步：20 个 `I;16` 320×240 PNG，值域 0–19611 mm（中位 2076 mm），
+`depth_file` 进 actions.jsonl，manifest 记 `depth_ref` + `depth_format=png16_mm`。
+Teacher 侧读出来 0–19.4 m（单位换算正确）。
+
+### 3. Teacher pilot（50 集）与一个严重设计 bug
+
+第一次训练出现 `train_acc=1.0 / val_acc=1.0 / loss=0.0`。查明原因：
+`teacher/dataset.py` 每集只取**最后 seq_len 帧**、标签取**最后一帧**，
+而教师集都以停在 waypoint 的 `SAFE_NEUTRAL` 收尾 → **全部样本标签恒为 0**。
+
+修复：改为滑窗（每集 `帧数 − seq_len + 1` 个样本，标签取窗口末帧），
+新增 `stride`。修复后 pilot train 505 样本，标签分布
+{SAFE 130, FORWARD 297, YAW_L 36, YAW_R 42}；重训 30 轮
+train_acc 0.92 / val_acc 0.88（best），loss 1.03 → 0.27。
+
+> 这个 bug 只影响 Teacher 侧；学生 `.uavr` 是逐帧样本，不受影响。
+
+### 4. teacher-nn 闭环通道
+
+新增 `--policy teacher-nn` + `--teacher-ckpt`：
+- `sim/tools/teacher_policy.py`：帧缓冲 + 与 dataset 完全一致的预处理
+- `collect.py` / `eval_closed_loop.py` 接入；manifest 记 `teacher="teacher_nn"`
+- 起 sim 前用 `sys.executable` 探针检查 torch，避免跑到一半才失败
+
+3 集冒烟：链路通、无崩溃、无碰撞，但 3/3 都在距 waypoint ~1.8 m 提前停
+（模型 43 集训练，样本不足，不下结论）。
+
+### 5. GPU 环境
+
+`teacher-venv` 换成 torch **2.14.1+cu126**（cu128 索引最高只到 2.11.0；
+第一次 `pip install --upgrade` 因 CPU 版同为 2.15.0 被判定「已满足」而静默跳过）。
+cuDNN 9.1.2 随 wheel 自带，RTX 2080 Ti 可用。
+
+### 6. 进行中
+
+400 集带深度采集（4 实例 × 100 集 × 60 步，base-seed 930000，约 1.5–2 h）。
+采完 → audit → 重训 Teacher → 20 集闭环闸门（SR ≥ 80%）。
+
+### 没做什么
+
+- 没有在 400 集上跑 Teacher 训练或闭环（采集进行中，GPU 任务不能与采集并发）
+- 没有改 `collect_parallel.py` 的 policy choice（teacher-nn 只用于 eval，
+  eval 直接用 `sys.executable` 起 collect.py，不需要并行采集器）
+- 没有记录 teacher ckpt 的 hash 到 eval.json（当前只记 policy 名）
+
+### 风险
+
+- Teacher 冒烟 3/3 提前停，可能是样本不足，也可能是预处理/时序缓冲的
+  分布偏移；400 集重训后必须复查
+- vx/vy 按 1 s 差分，`--hold != 1.0` 时速度尺度失真（代码已标 shortcut）

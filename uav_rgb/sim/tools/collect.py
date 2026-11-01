@@ -2,7 +2,8 @@
 """E3 采集器：驱动四旋翼在 Gazebo 里跑专家策略，录 RGB/位姿/碰撞成完整 episode。
 
 依赖一个已在运行的 gz sim（见 sim/README.md 启动命令）。teacher/forward 路径纯 stdlib；
-student 路径需要 PIL 与 uavrgb_infer（见 sim/tools/student.py）。
+student 路径需要 PIL 与 uavrgb_infer（见 sim/tools/student.py）；teacher-nn 路径需要
+torch/PIL/numpy（见 sim/tools/teacher_policy.py，解释器建议用 teacher-venv）。
 
 用法：
   python3 collect.py --steps 20 --out /tmp/ep0 --scene-id 1 --seed 42 --split train
@@ -554,7 +555,8 @@ def take_off(pose_sub, publisher, contact_sub=None, z_target=Z_TARGET, timeout=1
 def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 prev_action=None, prev_rgb_ts=0, pillars=None, student=None,
                 global_plan=True, window_from="dispatch", waypoint=None,
-                stop_at_waypoint=False, stop_radius=0.5, save_depth=False):
+                stop_at_waypoint=False, stop_radius=0.5, save_depth=False,
+                teacher_nn=None, text_ids=None):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。"""
     if window_from not in ("dispatch", "observation"):
         raise ValueError(f"window_from 无效: {window_from!r}")
@@ -618,6 +620,23 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             action, infer_ms, _probs = student.act(rgb_msg)
         except Exception as e:  # noqa: BLE001 - 推理进程任何失败都算本步失败
             return None, f"学生推理失败: {type(e).__name__}: {e}"
+    elif policy == "teacher-nn":
+        if teacher_nn is None:
+            return None, "teacher-nn 策略未初始化"
+        try:
+            import numpy as np
+            # RGB 解码成 HWC uint8；注意别覆盖已有的 depth 的 w/h（后面写深度图要用）。
+            rgb_w, rgb_h, rgb_nch, rgb_rows = save_frame.decode(rgb_msg)
+            rgb_hwc = np.frombuffer(rgb_rows, dtype=np.uint8).reshape(
+                rgb_h, rgb_w, rgb_nch)
+            depth_hw = np.asarray(d, dtype=np.float32).reshape(h, w)
+            if not isinstance(pose_before, dict) or yaw_before is None:
+                raise ValueError("缺少 pose_before/yaw_before")
+            pose_xyz = (pose_before["x"], pose_before["y"], pose_before["z"])
+            action = teacher_nn.act(rgb_hwc, depth_hw, pose_xyz, yaw_before,
+                                    text_ids)
+        except Exception as e:  # noqa: BLE001 - 推理任何失败都算本步失败
+            return None, f"teacher-nn 推理失败: {type(e).__name__}: {e}"
     else:  # policy == "forward": 盲策略（恒定前进），用于撞柱/基线对照
         action = FORWARD_SLOW
     t_io = time.perf_counter()
@@ -836,9 +855,13 @@ def main():
                    help="动作窗口起点：observation=观测位姿（默认，唯一被采纳基线）；"
                         "dispatch=派发位姿（R01，仅复现 T7-R，数字不可与 observation 混报）")
     p.add_argument("--no-takeoff", action="store_true")
-    p.add_argument("--policy", choices=("teacher", "forward", "student"), default="teacher",
-                   help="teacher=专家策略；forward=盲策略（恒定前进）；student=模型闭环")
+    p.add_argument("--policy", choices=("teacher", "forward", "student", "teacher-nn"),
+                   default="teacher",
+                   help="teacher=专家策略；forward=盲策略（恒定前进）；student=模型闭环；"
+                        "teacher-nn=特权教师网络闭环")
     p.add_argument("--student-ckpt", default=None, help="--policy student 的 checkpoint")
+    p.add_argument("--teacher-ckpt", default=None,
+                   help="--policy teacher-nn 的 PrivilegedTeacher checkpoint")
     p.add_argument("--infer-bin", default=None,
                    help="uavrgb_infer 路径（默认 src/build/uavrgb_infer）")
     p.add_argument("--stop-on-collision", action="store_true",
@@ -861,6 +884,8 @@ def main():
         p.error("--steps must be >= 1")
     if args.policy == "student" and not args.student_ckpt:
         p.error("--policy student 需要 --student-ckpt")
+    if args.policy == "teacher-nn" and not args.teacher_ckpt:
+        p.error("--policy teacher-nn 需要 --teacher-ckpt")
     if os.path.isdir(args.out) and os.listdir(args.out):
         p.error(f"--out {args.out} 不是空目录；请换新目录（或先清空）")
     os.makedirs(args.out, exist_ok=True)
@@ -902,6 +927,9 @@ def main():
         teacher_kind, planner_kind = "forward", None
     elif args.policy == "student":
         teacher_kind, planner_kind = "student", None
+    elif args.policy == "teacher-nn":
+        # 标签来自训练好的特权教师网络，必须与 plan_action/expert_action 区分。
+        teacher_kind, planner_kind = "teacher_nn", None
     elif pillars:
         teacher_kind = "plan_action"
         planner_kind = "astar"
@@ -917,6 +945,8 @@ def main():
     subs = {}
     publisher = None
     student = None
+    teacher_nn = None
+    text_ids = None
     cam_info = None
     rows_written = 0
     all_rgb_ok = True
@@ -958,6 +988,12 @@ def main():
             print("学生策略: 启动推理进程…", file=sys.stderr)
             text_ids = tokenize(instruction_text) if instruction_text else None
             student = StudentPolicy(args.student_ckpt, args.infer_bin, text_ids=text_ids)
+        elif args.policy == "teacher-nn":
+            from instruction import tokenize
+            from teacher_policy import TeacherPolicy
+            print(f"teacher-nn 策略: 加载 {args.teacher_ckpt}…", file=sys.stderr)
+            text_ids = tokenize(instruction_text) if instruction_text else None
+            teacher_nn = TeacherPolicy(args.teacher_ckpt)
 
         if not args.no_takeoff:
             print("起飞中…", file=sys.stderr)
@@ -972,7 +1008,8 @@ def main():
                                     window_from=args.window_from, waypoint=waypoint,
                                     stop_at_waypoint=goal_stop,
                                     stop_radius=stop_radius or 0.5,
-                                    save_depth=args.save_depth)
+                                    save_depth=args.save_depth,
+                                    teacher_nn=teacher_nn, text_ids=text_ids)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -1087,7 +1124,8 @@ def main():
             # 几何语义版本：v2/v3 的 gid 天然不同，只查 gid 交集查不出混包。
             "geometry_version": scene_version,
             # 标签由哪个教师产生：forward=盲策略对照，expert_action=深度反应式，
-            # plan_action=柱子真值 carrot planner。缺这个字段就无法事后区分数据集。
+            # plan_action=柱子真值 carrot planner，teacher_nn=特权教师网络。
+            # 缺这个字段就无法事后区分数据集。
             "teacher": teacher_kind,
             # 教师实现版本：改规划参数/前向安全门后必须能区分新旧标签。
             "teacher_version": (TEACHER_VERSION if teacher_kind in ("plan_action",

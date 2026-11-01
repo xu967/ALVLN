@@ -173,15 +173,22 @@ collision 0.45、false_forward 0.30、stuck 0；产物
 | 离线 test 末轮（E20） | acc 0.8467 / macro_f1 0.7633 / bal_acc 0.7405 | `eval-last-test` |
 | 多数类先验 test | acc 0.6590 / macro_f1 0.1986 / bal_acc 0.2500 | — |
 | 文本探针（801 决定性帧） | flip 0.9638 / acc_correct 0.8814 / acc_alt 0.9026 / **follow 0.8090** | `probe-best.json` |
-| 闭环 keep（47 集） | **SR 0.426**（goal_reach）/ 碰撞 0.277 / false_forward 0.234 | `l1-v4-closed-20261101/student-keep` |
-| 闭环 shuffle（47 集） | **SR 0.000** / 碰撞 0.383 / false_forward 0.362 | `.../student-shuffle` |
-| 盲前进（44 集） | **SR 0.000** / 碰撞 0.455 / false_forward 0.455 | `.../forward` |
-| 共同 44 集 | keep SR 0.409 / 碰撞 0.295；shuffle 0.000 / 0.409；盲前进 0.000 / 0.455 | 复算 |
-| keep Wilson 95% CI | `[0.295, 0.567]`（47 集） | — |
-| keep vs shuffle | McNemar 精确 **p < 1e-5** | — |
+| 闭环 keep（47 集，**2026-11-02 重跑**） | **SR 0.4043**（goal_reach）/ 碰撞 0.319 / false_forward 0.277 / p50 15.9 ms | `l1-v4-closed-goalreach-20261102/student-keep` |
+| 闭环 shuffle（47 集，重跑） | **SR 0.000** / 碰撞 0.298 / false_forward 0.255 | `.../student-shuffle` |
+| 盲前进（41 集完成 / 47 请求，重跑） | **SR 0.000** / 碰撞 0.463 / false_forward 0.463 | `.../forward` |
+| 共同 41 集 | keep SR 0.4146 | 复算 |
+| keep Wilson 95% CI | `[0.276, 0.547]`（47 集） | — |
+| keep vs shuffle | McNemar 精确 **p < 1e-5**（keep 19 成功 vs shuffle 0） | — |
 
-**失败分解（keep，47 集，三者互斥且刚好分完）**：成功 20、
-**到了却撞柱 13（13/13 都在 ≤1.5 m 内）**、到了但没进 1.5 m 14。
+**失败分解（keep，47 集）**：成功 19、**撞柱 15（15/15 都在 ≤1.5 m 内）**、
+未达 waypoint 13。
+
+> **旧数字作废**：此前表里的 `SR 0.426 / 碰撞 0.277` 出自
+> `l1-v4-closed-20261101`，其 `eval.json` 实际是 `goal_stop` 口径、值 `0.3404`；
+> 0.426 是对旧 per_episode 手工复算的 goal_reach，**重跑不可复现**。
+> 2026-11-02 按 `goal_reach` + `observation` 重跑后真实值是 **0.4043**。
+> 两者差异来自 Gazebo 非逐位确定性（HANDOFF §八 坑 #10），不是口径问题。
+> 论文/汇报只能用 `l1-v4-closed-goalreach-20261102` 的数字。
 
 #### 4.3.2 历史基线（v1 / T6，**不要与新数字混报**）
 
@@ -296,18 +303,34 @@ collision 0.45、false_forward 0.30、stuck 0；产物
 | 同一文件 `success_rate` | **0.3404**（16/47） |
 | goal_reach 复算 | 20/47 = 0.4255 |
 
-**验收状态：v4 未过 50% 线，两种口径都不达标。** 论文与汇报只能引用 `eval.json`
-的 `0.3404`，或明确标注「0.426 为按 goal_reach 复算」。三组（keep / shuffle / forward）
-如需正式结论，必须按 goal_reach 重跑（约 80 min）。
+**验收状态：v4 未过 50% 线，两种口径都不达标。**
+
+**2026-11-02 已按 goal_reach + observation 重跑**（产物
+`$DATA_ROOT/uav_rgb/l1-v4-closed-goalreach-20261102/`，三组共 138 min）：
+
+| 组 | SR | 碰撞 | false_forward | 完成 |
+| --- | --- | --- | --- | --- |
+| student-keep | **0.4043**（19/47） | 0.319 | 0.277 | 47 |
+| student-shuffle | **0.000** | 0.298 | 0.255 | 47 |
+| forward | **0.000** | 0.463 | 0.463 | 41（3 集起飞超时） |
+
+`eval.json` 的 `success_criterion` 均已是 `goal_reach`、`window_from=observation`。
+**旧的 0.426 作废**——重跑不可复现（Gazebo 非逐位确定），
+论文与汇报一律引用 0.4043。
 
 #### L2 文本分支（**已训练，v4 主线用的就是它**）
 
 自研 C++ 文本分支，零 PyTorch：
 
 ```
-token ids [N,9] → emb[22,16]（CPU 查表）→ 忽略 <pad> 求均值 → [N,16]
-                                                 ↓ 逐样本 concat
-image [N,3,120,160] → conv×3 → flatten [N,19200] ─┴→ fc [19216→4]
+token ids [N,9] → emb[22,16]（CPU 查表）→ 按位置拼接 [N,144]（<pad> 槽位保持 0）
+                                                 ↓ film 线性层
+                                          γ/β [N,2×64]
+                                                 ↓ 调制 c3 每个空间位置
+image [N,3,120,160] → conv×3 → pool → c3 [N,64,20,15]
+                                          y' = (1+γ)·y + β
+                                                 ↓ flatten
+                                          [N,19200] → fc → [N,4]
 ```
 
 > 上图是初版的 mean-pool + concat，**已被 FiLM 取代**（见

@@ -10,6 +10,10 @@ GZ_PARTITION 的 gz sim -> collect.py --policy student --stop-on-collision ->
       --episodes 3 --out /tmp/eval1 --split test
   python3 sim/tools/eval_closed_loop.py --policy forward --episodes 3 \
       --out /tmp/eval-blind --split test
+  # teacher-nn 用训练好的特权教师闭环（必须用带 torch 的解释器跑，见 --teacher-ckpt）
+  $DATA_ROOT/uav_rgb/teacher-venv/bin/python sim/tools/eval_closed_loop.py \
+      --policy teacher-nn --teacher-ckpt $DATA_ROOT/uav_rgb/teacher-run-pilot/ckpt_best.pth \
+      --episodes 3 --out /tmp/eval-teacher --split test
   # T7 三个基线用同一批场景：把 student 的 seeds 回传给 --seeds。
   # 动作窗口默认 observation（唯一被采纳基线）；--window-from dispatch 仅用于复现
   # T7-R，其 SR/碰撞率不可与 observation 结果混报。
@@ -293,6 +297,8 @@ def run_episode(seed, args, workdir, seen_gids):
             cmd += ["--student-ckpt", args.ckpt]
             if args.infer_bin:
                 cmd += ["--infer-bin", args.infer_bin]
+        elif args.policy == "teacher-nn":
+            cmd += ["--teacher-ckpt", args.teacher_ckpt]
         env = cp.gz_env(partition)
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -341,8 +347,12 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt", default=None, help="学生 checkpoint（--policy student 必填）")
-    p.add_argument("--policy", choices=("student", "forward"), default="student",
-                   help="student=模型闭环；forward=盲前进基线（T7）")
+    p.add_argument("--policy", choices=("student", "forward", "teacher-nn"),
+                   default="student",
+                   help="student=模型闭环；forward=盲前进基线（T7）；"
+                        "teacher-nn=特权教师网络闭环（可解性闸门）")
+    p.add_argument("--teacher-ckpt", default=None,
+                   help="PrivilegedTeacher checkpoint（--policy teacher-nn 必填）")
     p.add_argument("--episodes", type=int, default=None,
                    help="成功评测的 episode 数（缺省：给了 --seeds 用其个数，否则 3）")
     p.add_argument("--steps", type=int, default=80, help="每集最大步数")
@@ -395,6 +405,22 @@ def main():
         value = getattr(args, name)
         if not (math.isfinite(value) and value > 0):
             p.error(f"--{name.replace('_', '-')} 必须是有限正数")
+    if args.policy == "teacher-nn":
+        if not args.teacher_ckpt:
+            p.error("--policy teacher-nn 需要 --teacher-ckpt")
+        if not os.path.isfile(args.teacher_ckpt):
+            p.error(f"teacher checkpoint 不存在: {args.teacher_ckpt}")
+        # collect.py 由 run_episode 用 sys.executable 起，所以这里探的就是子进程解释器。
+        # 不能只看 find_spec：本机 conda 的 torch 装了但缺 libcudnn，import 会失败。
+        try:
+            torch_ok = subprocess.run([sys.executable, "-c", "import torch"],
+                                      capture_output=True,
+                                      timeout=120).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            torch_ok = False
+        if not torch_ok:
+            p.error("teacher-nn 需要带 torch 的解释器，例如 "
+                    "$DATA_ROOT/uav_rgb/teacher-venv/bin/python")
     if args.text_mode != "keep" and args.policy != "student":
         p.error("--text-mode 只对 --policy student 有意义")
     infer_bin = None
