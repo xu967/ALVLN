@@ -20,7 +20,8 @@ int usage() {
   return 2;
 }
 
-// --text 是当前 episode 的指令 token（逗号分隔 0..255）；空串=无指令。
+// --text 是当前 episode 的指令 token（逗号分隔，必须 < kTextVocab）。
+// 模型把未知 id 静默当 <pad>，所以越界必须在这里拦住，不能等推理时悄悄丢词。
 bool parse_text(const std::string& s, std::vector<std::uint8_t>& out) {
   out.clear();
   if (s.empty()) return true;
@@ -32,7 +33,7 @@ bool parse_text(const std::string& s, std::vector<std::uint8_t>& out) {
     if (tok.empty()) return false;
     char* end = nullptr;
     const long v = std::strtol(tok.c_str(), &end, 10);
-    if (end == nullptr || *end != '\0' || v < 0 || v > 255) return false;
+    if (end == nullptr || *end != '\0' || v < 0 || v >= uavrgb::kTextVocab) return false;
     out.push_back(static_cast<std::uint8_t>(v));
     if (comma == std::string::npos) break;
     start = comma + 1;
@@ -58,11 +59,12 @@ int main(int argc, char** argv) {
 
   try {
     const uavrgb::CheckpointMeta meta = uavrgb::read_checkpoint_meta(ckpt);
-    uavrgb::CnnModel model = uavrgb::make_cnn(meta.in_h, meta.in_w, 0, meta.num_classes);
+    uavrgb::CnnModel model =
+        uavrgb::make_cnn(meta.in_h, meta.in_w, 0, meta.num_classes, meta.text_dim);
     uavrgb::TrainState st = uavrgb::make_train_state(model, 0.0f);
     uavrgb::load_checkpoint(ckpt, model, st);
-    std::printf("{\"in_h\":%d,\"in_w\":%d,\"in_c\":%d,\"num_classes\":%d}\n",
-                meta.in_h, meta.in_w, meta.in_c, meta.num_classes);
+    std::printf("{\"in_h\":%d,\"in_w\":%d,\"in_c\":%d,\"num_classes\":%d,\"text_dim\":%d}\n",
+                meta.in_h, meta.in_w, meta.in_c, meta.num_classes, meta.text_dim);
     std::fflush(stdout);
     const std::size_t frames =
         uavrgb::run_infer_loop(model, std::cin, std::cout, text_ids);

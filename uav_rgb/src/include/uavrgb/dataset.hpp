@@ -3,6 +3,7 @@
 // H/W/C 一律从 48 B 文件头读，不假定 160x120；train/val/test 划分取 meta JSON 的
 // episodes[].sample_start/sample_count/split（按 scene_id 隔离，不按帧随机拆）。
 #include "uavrgb/tensor.hpp"
+#include "uavrgb/text.hpp"  // kTextLen
 
 #include <cstdint>
 #include <fstream>
@@ -27,6 +28,9 @@ struct UavrDataset {
   std::uint64_t images_off = 0;
   std::uint64_t labels_off = 0;
   std::vector<std::uint8_t> labels;         // [n]，已校验 0..num_classes-1
+  // 语言侧车 instructions.jsonl 里的 token id，展开后 [n * kTextLen]，缺位补 <pad>(0)。
+  // 没有侧车时为空——此时只能训练无文本模型。
+  std::vector<std::uint8_t> text_ids;
   std::vector<std::uint32_t> train_idx;     // 全局样本下标
   std::vector<std::uint32_t> val_idx;
   std::vector<std::uint32_t> test_idx;
@@ -38,6 +42,9 @@ struct UavrDataset {
 
   // 读 idx 指定的样本，写满 out[b,c,h,w]（float32，像素归一化到 [0,1]）；换 shape 时重新分配。
   void load_images(const std::vector<std::uint32_t>& idx, Tensor& out) const;
+
+  // 取 idx 对应的 token id，写满 out（[idx.size() * kTextLen]）；无侧车时抛异常。
+  void load_text(const std::vector<std::uint32_t>& idx, std::vector<std::uint8_t>& out) const;
 };
 
 // 校验文件头/meta/标签后返回；任何不自洽抛 std::runtime_error。

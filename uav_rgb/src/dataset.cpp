@@ -2,6 +2,7 @@
 #include "uavrgb/dataset.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -48,7 +49,29 @@ struct EpisodeSpan {
   std::uint32_t count = 0;
   std::string split;
   std::int64_t scene = 0;
+  std::string id;  // episode_id 原样（字符串或数字）；旧数据可能缺省
 };
+
+// 取标量原值（字符串去引号，数字原样）；缺字段返回空串。用于 episode_id 绑定，
+// 不能要求所有旧数据集都有该字段。
+std::string scalar_field(const std::string& obj, const char* key) {
+  const std::string pat = std::string("\"") + key + "\":";
+  const std::size_t p = obj.find(pat);
+  if (p == std::string::npos) return {};
+  std::size_t b = p + pat.size();
+  while (b < obj.size() && obj[b] == ' ') ++b;
+  if (b < obj.size() && obj[b] == '"') {
+    const std::size_t e = obj.find('"', b + 1);
+    if (e == std::string::npos) fail(std::string("字段未闭合 ") + key);
+    return obj.substr(b + 1, e - b - 1);
+  }
+  std::size_t e = b;
+  while (e < obj.size() && obj[e] != ',' && obj[e] != '}' && obj[e] != ' ' &&
+         obj[e] != '\n' && obj[e] != '\r') {
+    ++e;
+  }
+  return obj.substr(b, e - b);
+}
 
 std::string str_field(const std::string& obj, const char* key) {
   const std::string pat = std::string("\"") + key + "\":\"";
@@ -98,6 +121,7 @@ std::vector<EpisodeSpan> parse_episodes(const std::string& meta) {
     s.count = num_field(obj, "sample_count");
     s.split = str_field(obj, "split");
     s.scene = int_field(obj, "scene_id");
+    s.id = scalar_field(obj, "episode_id");
     out.push_back(std::move(s));
     i = e;
   }
@@ -204,6 +228,133 @@ void drop_collision_samples(UavrDataset& ds, const std::string& meta) {
   drop(ds.test_idx);
 }
 
+// ---- 语言侧车 ----
+// instructions.jsonl 每行：{"episode_id":..,"instruction":"..","sample_start":..,
+//   "sample_count":..,"text_ids":[..]}；只取区间与 token id，按样本展开成 [n,kTextLen]。
+// 没有侧车就不加载——无文本模型照常训练。
+std::uint32_t side_num(const std::string& line, const char* key) {
+  const std::string pat = std::string("\"") + key + "\":";
+  const std::size_t p = line.find(pat);
+  if (p == std::string::npos) fail(std::string("instructions.jsonl 缺字段 ") + key);
+  std::size_t b = p + pat.size();
+  while (b < line.size() && line[b] == ' ') ++b;  // json.dumps 默认写成 "key": 0
+  std::size_t e = b;
+  while (e < line.size() && std::isdigit(static_cast<unsigned char>(line[e])) != 0) ++e;
+  if (e == b) fail(std::string("instructions.jsonl 字段非整数 ") + key);
+  // 自己累加并检查上界：stoul 结果截断成 uint32 会让 2^32+k 回绕成 k，
+  // 超大数还会抛 out_of_range 而不是本文件的 runtime_error。
+  std::uint64_t v = 0;
+  for (std::size_t i = b; i < e; ++i) {
+    const std::uint64_t d = static_cast<std::uint64_t>(line[i] - '0');
+    // 先检查再乘：20 位以上的数字会让 uint64 先回绕，绕过下面的上界比较。
+    if (v > (0xFFFFFFFFull - d) / 10) {
+      fail(std::string("instructions.jsonl 字段超 uint32: ") + key);
+    }
+    v = v * 10 + d;
+  }
+  return static_cast<std::uint32_t>(v);
+}
+
+void load_text_sidecar(UavrDataset& ds, const std::string& uavr_path,
+                       const std::vector<EpisodeSpan>& eps) {
+  const auto side = std::filesystem::path(uavr_path).parent_path() / "instructions.jsonl";
+  std::error_code ec;
+  if (!std::filesystem::exists(side, ec)) return;
+  std::ifstream f(side);
+  if (!f) fail("无法打开 " + side.string());
+  std::vector<std::uint8_t> ids(static_cast<std::size_t>(ds.n) * kTextLen, 0);
+  std::vector<char> seen(eps.size(), 0);
+  std::string line;
+  std::size_t lineno = 0;
+  std::size_t used = 0;
+  while (std::getline(f, line)) {
+    ++lineno;
+    if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
+    ++used;
+    const std::uint32_t start = side_num(line, "sample_start");
+    const std::uint32_t count = side_num(line, "sample_count");
+    if (static_cast<std::uint64_t>(start) + count > static_cast<std::uint64_t>(ds.n)) {
+      fail("instructions.jsonl 第 " + std::to_string(lineno) + " 行区间越界");
+    }
+    // 侧车必须按 episode 身份绑定：区间要唯一匹配 meta.episodes[]，同一集不能写两次。
+    // 只查「样本被覆盖过」挡不住旧侧车/异源侧车配到新数据集上。
+    std::size_t match = eps.size();
+    for (std::size_t i = 0; i < eps.size(); ++i) {
+      if (eps[i].start == start && eps[i].count == count) {
+        if (match != eps.size()) {
+          fail("instructions.jsonl 第 " + std::to_string(lineno) + " 行区间匹配多个 episode");
+        }
+        match = i;
+      }
+    }
+    if (match == eps.size()) {
+      fail("instructions.jsonl 第 " + std::to_string(lineno) +
+           " 行区间与 meta episodes[] 不匹配（侧车不属于该数据集？）");
+    }
+    if (seen[match] != 0) {
+      fail("instructions.jsonl 第 " + std::to_string(lineno) + " 行重复覆盖 episode");
+    }
+    seen[match] = 1;
+    const std::string side_id = scalar_field(line, "episode_id");
+    if (!side_id.empty() && !eps[match].id.empty() && side_id != eps[match].id) {
+      fail("instructions.jsonl 第 " + std::to_string(lineno) + " 行 episode_id 不匹配（侧车 " +
+           side_id + " vs meta " + eps[match].id + "）");
+    }
+    // 旧侧车（L2 之前）没有 text_ids：当作没有侧车。image-only 照常训练，
+    // 真需要文本的模型由 trainer 报「没有侧车」，不在读取层拦整个数据集。
+    const std::size_t kp = line.find("\"text_ids\":");
+    if (kp == std::string::npos) return;
+    const std::size_t lb = line.find('[', kp);
+    const std::size_t rb = line.find(']', kp);
+    if (lb == std::string::npos || rb == std::string::npos || rb < lb) {
+      fail("instructions.jsonl text_ids 数组未闭合");
+    }
+    std::vector<std::uint8_t> tok;
+    std::size_t i = lb + 1;
+    while (i < rb) {
+      const unsigned char c = static_cast<unsigned char>(line[i]);
+      if (c == ' ' || c == ',' || c == '\t') {
+        ++i;
+        continue;
+      }
+      // 只接受十进制数字：旧实现跳过任意非数字字符，会把 [-1] 读成 1。
+      if (std::isdigit(c) == 0) {
+        fail("instructions.jsonl 第 " + std::to_string(lineno) + " 行 text_ids 含非数字");
+      }
+      std::uint32_t v = 0;
+      while (i < rb && std::isdigit(static_cast<unsigned char>(line[i])) != 0) {
+        v = v * 10 + static_cast<std::uint32_t>(line[i] - '0');
+        if (v >= static_cast<std::uint32_t>(kTextVocab)) {
+          fail("instructions.jsonl token id 越界: " + std::to_string(v));
+        }
+        ++i;
+      }
+      tok.push_back(static_cast<std::uint8_t>(v));
+    }
+    // 超长必须报错：静默截断会悄悄改掉指令的意思（preprocess.py 的 TEXT_LEN 与
+    // text.hpp 的 kTextLen 是两份定义，漂了就靠这里兜）。
+    if (tok.size() > static_cast<std::size_t>(kTextLen)) {
+      fail("instructions.jsonl 第 " + std::to_string(lineno) + " 行 text_ids 有 " +
+           std::to_string(tok.size()) + " 个 token，超过 kTextLen=" +
+           std::to_string(kTextLen));
+    }
+    for (std::uint32_t k = 0; k < count; ++k) {
+      const std::size_t s = static_cast<std::size_t>(start) + k;
+      for (std::size_t t = 0; t < tok.size() && t < static_cast<std::size_t>(kTextLen); ++t) {
+        ids[s * kTextLen + t] = tok[t];
+      }
+    }
+  }
+  if (used != eps.size()) {
+    fail("instructions.jsonl 行数 " + std::to_string(used) + " != 数据集 episode 数 " +
+         std::to_string(eps.size()) + "（侧车缺集或多集）");
+  }
+  for (std::size_t i = 0; i < seen.size(); ++i) {
+    if (seen[i] == 0) fail("instructions.jsonl 未覆盖 episode " + std::to_string(i));
+  }
+  ds.text_ids = std::move(ids);
+}
+
 }  // namespace
 
 UavrDataset load_uavr(const std::string& path) { return load_uavr(path, LoadOptions{}); }
@@ -255,12 +406,14 @@ UavrDataset load_uavr(const std::string& path, const LoadOptions& opts) {
   std::string meta(meta_len, '\0');
   read_exact(ds.file, meta_off, meta.data(), meta.size(), "meta 区");
   if (str_field(meta, "split_policy") != "scene_id") fail("split_policy 必须为 scene_id");
-  assign_split(ds, parse_episodes(meta));
+  const std::vector<EpisodeSpan> eps = parse_episodes(meta);
+  assign_split(ds, eps);
   if (opts.drop_collision) {
     drop_collision_samples(ds, meta);
   } else {
     warn_collision_kept(ds, meta);
   }
+  load_text_sidecar(ds, path, eps);  // 无侧车时 text_ids 保持空
   return ds;
 }
 
@@ -277,6 +430,17 @@ void UavrDataset::load_images(const std::vector<std::uint32_t>& idx, Tensor& out
                "图像区");
     float* dst = out.data() + static_cast<std::size_t>(i) * plane;  // 文件已是 NCHW
     for (std::size_t j = 0; j < plane; ++j) dst[j] = static_cast<float>(buf[j]) * inv;
+  }
+}
+
+void UavrDataset::load_text(const std::vector<std::uint32_t>& idx,
+                            std::vector<std::uint8_t>& out) const {
+  if (text_ids.empty()) fail("数据集没有 instructions.jsonl 侧车，无法训练文本模型");
+  out.resize(idx.size() * static_cast<std::size_t>(kTextLen));
+  for (std::size_t i = 0; i < idx.size(); ++i) {
+    if (idx[i] >= static_cast<std::uint32_t>(n)) fail("样本下标越界");
+    std::copy_n(text_ids.begin() + static_cast<std::size_t>(idx[i]) * kTextLen, kTextLen,
+                out.begin() + static_cast<std::ptrdiff_t>(i) * kTextLen);
   }
 }
 

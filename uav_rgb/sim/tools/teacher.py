@@ -22,7 +22,7 @@ ACTIONS = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 # 教师实现版本：改动作选择（A* 参数/前向安全门/局部容差）必须 bump。
 # collect 写进 manifest，audit 只对同版本数据做 label_recompute，避免用新算法
 # 复算旧标签造成假 FAIL。
-TEACHER_VERSION = "uavrgb.teacher.v4"
+TEACHER_VERSION = "uavrgb.teacher.v5"  # v5：goal-stop（waypoint 作为最终目标）
 
 # 只取竖直方向的中间带（正前方走廊），比例范围 [0.4, 0.6)。
 BAND_LO, BAND_HI = 0.4, 0.6
@@ -306,28 +306,38 @@ def _path_carrot(path, x, y, lookahead):
 
 
 def plan_action_global(x, y, yaw_deg, pillars, clearance=0.5, step=0.1,
-                       lookahead=0.7, tol=25.0, waypoint=None):
+                       lookahead=0.7, tol=25.0, waypoint=None,
+                       stop_at_waypoint=False, stop_radius=0.5):
     """A* 全局路径 + 纯追踪；失败时退回局部 plan_action。
 
     tol=25°：偏航一步约 34°，容差小于半步会左右过冲（T1 门柱振荡的根因）。
     路径目标比 T1 验收终点（最右柱 x+1.0）再远 1 m：目标正好落在验收线上时，
     飞控会在终点前转头/减速，max_x 常停在 5.97 而判失败；多飞 1 m 才真正越过。
-    waypoint 非空时先到彩色目标柱旁，再去走廊终点（L1 route-choice）。
+
+    stop_at_waypoint=True（L1 v2 goal-stop）：waypoint 就是最终目标，距其
+    ≤ stop_radius 时输出 SAFE_NEUTRAL；不再去走廊终点。旧 route-choice 的
+    “先到 waypoint 再飞终点”保留为默认，只用于复现旧数据。
     """
     if not pillars:
         return plan_action(x, y, yaw_deg, [], tol=tol)
-    goal = (max(float(p["x"]) for p in pillars) + 2.0, 0.0)
-    if waypoint is None:
-        path = astar_path(pillars, (x, y), goal, clearance=clearance, step=step)
-    else:
+    if waypoint is not None:
         try:
             wp = (float(waypoint["x"]), float(waypoint["y"]))
         except (KeyError, TypeError, ValueError):
             return plan_action(x, y, yaw_deg, pillars, tol=tol)
-        first = astar_path(pillars, (x, y), wp, clearance=clearance, step=step)
-        rest = (astar_path(pillars, wp, goal, clearance=clearance, step=step)
-                if first is not None else None)
-        path = (first + rest[1:]) if first is not None and rest is not None else None
+        if stop_at_waypoint:
+            if math.hypot(x - wp[0], y - wp[1]) <= stop_radius:
+                return SAFE_NEUTRAL
+            path = astar_path(pillars, (x, y), wp, clearance=clearance, step=step)
+        else:
+            goal = (max(float(p["x"]) for p in pillars) + 2.0, 0.0)
+            first = astar_path(pillars, (x, y), wp, clearance=clearance, step=step)
+            rest = (astar_path(pillars, wp, goal, clearance=clearance, step=step)
+                    if first is not None else None)
+            path = (first + rest[1:]) if first is not None and rest is not None else None
+    else:
+        goal = (max(float(p["x"]) for p in pillars) + 2.0, 0.0)
+        path = astar_path(pillars, (x, y), goal, clearance=clearance, step=step)
     if path is None:
         return plan_action(x, y, yaw_deg, pillars, tol=tol)
     tx, ty = _path_carrot(path, x, y, lookahead)
@@ -519,6 +529,16 @@ if __name__ == "__main__":
     ok = ok and got != SAFE_NEUTRAL
     print(f"  {'ok' if path is not None and got != SAFE_NEUTRAL else 'FAIL'}  "
           f"A* 绕门柱: path={len(path) if path else None}, action={ACTIONS[got]}")
+
+    # v5 goal-stop：waypoint 半径内必须 SAFE；半径外不能误停。
+    wp = {"x": 2.0, "y": 1.0}
+    got_stop = plan_action_global(2.1, 1.05, 0.0, gate, waypoint=wp,
+                                  stop_at_waypoint=True, stop_radius=0.5)
+    got_go = plan_action_global(0.0, 0.0, 0.0, gate, waypoint=wp,
+                                stop_at_waypoint=True, stop_radius=0.5)
+    ok = ok and got_stop == SAFE_NEUTRAL and got_go != SAFE_NEUTRAL
+    print(f"  {'ok' if got_stop == SAFE_NEUTRAL and got_go != SAFE_NEUTRAL else 'FAIL'}  "
+          f"goal-stop: 半径内={ACTIONS[got_stop]}, 半径外={ACTIONS[got_go]}")
 
     print("teacher: " + ("全部通过" if ok else "有失败"))
     raise SystemExit(0 if ok else 1)

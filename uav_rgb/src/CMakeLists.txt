@@ -134,6 +134,11 @@ target_link_options(test_device_transfer_errors PRIVATE
   "-Wl,--wrap=cudaStreamSynchronize" "-Wl,--wrap=cudaSetDevice")
 add_test(NAME test_device_transfer_errors COMMAND test_device_transfer_errors)
 
+# L2 文本分支：token 影响 logits、embedding 解析梯度对拍、侧车展开、checkpoint v4 往返。
+add_executable(test_text_branch tests/test_text_branch.cpp)
+target_link_libraries(test_text_branch PRIVATE uavrgb_core)
+add_test(NAME test_text_branch COMMAND test_text_branch)
+
 add_executable(test_batch_reader tests/test_batch_reader.cpp)
 target_link_libraries(test_batch_reader PRIVATE uavrgb_core)
 target_link_options(test_batch_reader PRIVATE "-Wl,--wrap=pread")

@@ -13,7 +13,7 @@ namespace uavrgb {
 namespace {
 
 constexpr char kMagic[8] = {'U', 'A', 'V', 'R', 'C', 'K', '0', '1'};
-constexpr std::uint32_t kVersion = 3;
+constexpr std::uint32_t kVersion = 4;     // v4 追加 text_dim（0 = 无文本分支）
 constexpr std::uint32_t kMinVersion = 2;  // v2 没有 best_macro_f1，读回 -1
 
 [[noreturn]] void bad(const std::string& msg) {
@@ -100,6 +100,15 @@ Header read_header(std::ifstream& f) {
   return h;
 }
 
+// v4 把 text_dim 放在 best_macro_f1 之后（新版本只追加，旧偏移不变）。
+std::int32_t read_text_dim(std::ifstream& f, std::uint32_t version) {
+  if (version < 4) return 0;
+  std::int32_t text_dim = 0;
+  get<std::int32_t>(f, text_dim, "text_dim");
+  if (text_dim < 0 || text_dim > kMaxTextDim) bad("text_dim 非法");
+  return text_dim;
+}
+
 }  // namespace
 
 TrainState make_train_state(const CnnModel& model, float lr) {
@@ -132,6 +141,7 @@ void save_checkpoint(const std::string& path, const CnnModel& model, const Train
   put<std::uint32_t>(f, static_cast<std::uint32_t>(st.class_weights.size()));
   for (float w : st.class_weights) put<float>(f, w);
   put<float>(f, st.best_macro_f1);
+  put<std::int32_t>(f, model.text_dim);  // v4 追加，放在 best 之后：旧版本读端不受影响
 
   for (std::size_t i = 0; i < ps.size(); ++i) {
     check_finite("param[" + std::to_string(i) + "]", *ps[i]);
@@ -159,7 +169,21 @@ CheckpointMeta read_checkpoint_meta(const std::string& path) {
   std::ifstream f(path, std::ios::binary);
   if (!f) throw std::runtime_error("checkpoint: 无法打开 " + path);
   const Header h = read_header(f);
-  return {h.in_h, h.in_w, h.in_c, h.num_classes};
+  // 跳过 adam_t/epoch/class_weights/best_macro_f1 才到 text_dim。
+  std::uint32_t t = 0, epoch = 0, nw = 0;
+  get<std::uint32_t>(f, t, "adam_t");
+  get<std::uint32_t>(f, epoch, "epoch");
+  get<std::uint32_t>(f, nw, "class_weight_count");
+  if (nw != 0 && nw != static_cast<std::uint32_t>(h.num_classes)) bad("class_weights 数量不符");
+  for (std::uint32_t i = 0; i < nw; ++i) {
+    float w = 0.0f;
+    get<float>(f, w, "class_weight");
+  }
+  if (h.version >= 3) {
+    float best = -1.0f;
+    get<float>(f, best, "best_macro_f1");
+  }
+  return {h.in_h, h.in_w, h.in_c, h.num_classes, read_text_dim(f, h.version)};
 }
 
 void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
@@ -196,6 +220,11 @@ void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
     if (!std::isfinite(st.best_macro_f1) || st.best_macro_f1 < -1.0f) {
       bad("best_macro_f1 非法");
     }
+  }
+  const std::int32_t ck_text_dim = read_text_dim(f, version);
+  if (ck_text_dim != model.text_dim) {
+    bad("text_dim 与模型不符（ckpt " + std::to_string(ck_text_dim) + " vs 模型 " +
+        std::to_string(model.text_dim) + "）");
   }
 
   std::vector<std::int64_t> dims;

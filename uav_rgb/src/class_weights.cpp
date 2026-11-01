@@ -160,7 +160,8 @@ void write_run_config(const std::string& out_dir, const TrainConfig& cfg,
   os.precision(9);
   os << "{\"schema\":\"uavrgb.train_config.v1\",\"data\":" << quote(cfg.data_path)
      << ",\"epochs\":" << cfg.epochs << ",\"batch\":" << cfg.batch << ",\"lr\":" << cfg.lr
-     << ",\"seed\":" << cfg.seed << ",\"max_grad_norm\":" << cfg.max_grad_norm
+     << ",\"seed\":" << cfg.seed << ",\"text_dim\":" << cfg.text_dim
+     << ",\"max_grad_norm\":" << cfg.max_grad_norm
      << ",\"drop_collision\":" << (cfg.drop_collision ? "true" : "false")
      << ",\"class_weights\":[";
   for (std::size_t i = 0; i < weights.size(); ++i) os << (i ? "," : "") << weights[i];

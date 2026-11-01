@@ -3,14 +3,15 @@
 //
 // 文件布局（偏移 B）：
 //   0    char[8]  magic "UAVRCK01"
-//   8    u32      version = 3（v2 起带类别权重；v3 追加 best_macro_f1。
-//                读端接受 v2/v3；v1 无类别权重段，直接拒绝）
-//   12   u32      param_count（固定 8）
+//   8    u32      version = 4（v2 起带类别权重；v3 追加 best_macro_f1；
+//                v4 追加 text_dim。读端接受 v2/v3/v4；v1 无类别权重段，直接拒绝）
+//   12   u32      param_count（8；有文本分支时 9）
 //   16   i32 in_h, i32 in_w, i32 in_c, i32 num_classes   ← 模型结构元信息
 //   32   u32      adam_t（已完成 step 数；8 个 Adam 共享同一 t）
 //   36   u32      epoch（已完成 epoch 数，续训时 results.csv 接着编号）
 //   40   u32      weight_count（0 或 num_classes），随后 f32 class_weights[weight_count]
 //        (v3) f32 best_macro_f1（dev 宏 F1 峰值；-1 = 尚未评估）
+//        (v4) i32 text_dim（0 = 无文本分支）——只追加在 best 之后，旧偏移不变
 //        逐参数（顺序同 cnn_params）：u32 ndim、i64 dims[ndim]、f32 data[numel]
 //        再逐参数：f32 m[numel]
 //        再逐参数：f32 v[numel]
@@ -43,6 +44,7 @@ struct CheckpointMeta {
   int in_w = 0;
   int in_c = 0;
   int num_classes = 0;
+  int text_dim = 0;  // 0 = 无文本分支（推理端据此决定要不要读 --text）
 };
 CheckpointMeta read_checkpoint_meta(const std::string& path);
 

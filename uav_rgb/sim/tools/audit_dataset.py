@@ -33,6 +33,7 @@ import sys
 from collections import Counter
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import landmarks as lm  # noqa: E402
 import scene_gen as sg  # noqa: E402
 from instruction import parse_target_color  # noqa: E402
 from split_manifest import SPLIT_SALT, geometry_gid  # noqa: E402
@@ -111,7 +112,8 @@ def episode_facts(ep_dir):
     gid = None
     pillars = None
     clearance = None
-    target_color = waypoint = scene_spawn = None
+    target_color = relation = waypoint = scene_spawn = stop_radius = None
+    task_version = None
     scene_path = os.path.join(ep_dir, "scene.json")
     if os.path.exists(scene_path):
         try:
@@ -125,8 +127,11 @@ def episode_facts(ep_dir):
             if isinstance(scene.get("clearance"), dict):
                 clearance = scene["clearance"]
             target_color = scene.get("target_color")
+            relation = scene.get("relation")
             waypoint = scene.get("waypoint")
             scene_spawn = scene.get("spawn")
+            stop_radius = scene.get("stop_radius")
+            task_version = scene.get("task_version")
         except (KeyError, OSError, ValueError, TypeError):
             pillars = None
 
@@ -169,6 +174,7 @@ def episode_facts(ep_dir):
         return {"dir": ep_dir, "error": f"{type(e).__name__}: {e}"}
 
     wp_min = None
+    final_wp = None
     if isinstance(waypoint, dict):
         ds = []
         for o in oracle:
@@ -177,6 +183,7 @@ def episode_facts(ep_dir):
                 ds.append(((pg["x"] - waypoint["x"]) ** 2 +
                            (pg["y"] - waypoint["y"]) ** 2) ** 0.5)
         wp_min = min(ds) if ds else None
+        final_wp = ds[-1] if ds else None
 
     return {
         "dir": ep_dir,
@@ -190,9 +197,15 @@ def episode_facts(ep_dir):
         "clearance": clearance,
         "instruction": instruction,
         "target_color": target_color,
+        "relation": relation,
         "waypoint": waypoint,
         "scene_spawn": scene_spawn,
+        "task_version": task_version,
+        "stop_radius": stop_radius,
+        "stopped_on_goal": man.get("stopped_on_goal"),
         "waypoint_min_dist": wp_min,
+        "final_waypoint_dist": final_wp,
+        "last_action": steps[-1]["action"] if steps else None,
         "validity": man.get("validity") or {},
         "num_steps": len(steps),
         "requested_steps": man.get("requested_steps"),
@@ -256,48 +269,57 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
         checks.append(check("instruction_coverage", "PASS",
                             f"{len(nonempty)}/{len(gate)} 集有非空指令，无坐标泄漏"))
 
-    # 1c) L1：指令目标色 / 近远平衡 / teacher 是否经过 waypoint
+    # 1c) L1：指令目标色/关系词 / 左右平衡 / teacher 是否经过 waypoint
     l1 = [f for f in gate if isinstance(f.get("instruction"), str)
           and f["instruction"].strip()]
     if not l1:
         checks.append(check("target_color", "SKIP", "无 instruction（非 L1 数据）"))
-        checks.append(check("landmark_balance", "SKIP", "无 instruction（非 L1 数据）"))
+        checks.append(check("relation_balance", "SKIP", "无 instruction（非 L1 数据）"))
         checks.append(check("teacher_waypoint", "SKIP", "无 instruction（非 L1 数据）"))
     else:
         bad = []
         for f in l1:
             want = parse_target_color(f["instruction"])
             colors = {p.get("color") for p in (f.get("pillars") or [])}
-            if want is None or want != f.get("target_color") or want not in colors:
+            words = set(f["instruction"].lower().split())
+            if (want is None or want != f.get("target_color") or want not in colors
+                    or f.get("relation") not in ("left", "right")
+                    or f["relation"] not in words):
                 bad.append(f["dir"])
         checks.append(check("target_color", "FAIL" if bad else "PASS",
-                            f"{len(bad)}/{len(l1)} 集指令目标色与 scene 不一致",
+                            f"{len(bad)}/{len(l1)} 集指令与 scene 的目标色/关系词不一致",
                             samples=bad[:5]))
 
-        near = far = no_data = 0
+        # 同色柱对：两根彩色柱必须分居出生点左右，且 left/right 两类都要有。
+        # 旧版查的「目标最近/最远」在同色下失效——两根都是目标色，恒为最近。
+        left_n = right_n = no_data = 0
+        bad_pair = []
         for f in l1:
             colored = [p for p in (f.get("pillars") or []) if p.get("color")]
             spawn = f.get("scene_spawn") or {}
-            if len(colored) < 2 or "x" not in spawn or "y" not in spawn:
+            rel = f.get("relation")
+            if (len(colored) != 2 or "x" not in spawn or "y" not in spawn
+                    or rel not in ("left", "right")):
                 no_data += 1
                 continue
-            nearest = min(colored, key=lambda p: (p["x"] - spawn["x"]) ** 2 +
-                          (p["y"] - spawn["y"]) ** 2)
-            if nearest.get("color") == f.get("target_color"):
-                near += 1
+            lat = sorted(lm.lateral(p, spawn) for p in colored)
+            if lat[0] > -lm.LATERAL_MIN or lat[1] < lm.LATERAL_MIN:
+                bad_pair.append(f["dir"])
+            elif rel == "left":
+                left_n += 1
             else:
-                far += 1
-        if near + far == 0:
-            checks.append(check("landmark_balance", "SKIP",
+                right_n += 1
+        if left_n + right_n == 0:
+            checks.append(check("relation_balance", "SKIP",
                                 f"无可计算集（缺数据 {no_data}）"))
         else:
             checks.append(check(
-                "landmark_balance", "FAIL" if (near == 0 or far == 0) else "PASS",
-                f"目标最近 {near} / 非最近 {far}，缺数据 {no_data}"))
+                "relation_balance",
+                "FAIL" if (bad_pair or left_n == 0 or right_n == 0) else "PASS",
+                f"left {left_n} / right {right_n}，两柱未分居左右 {len(bad_pair)} 集，"
+                f"缺数据 {no_data}", samples=bad_pair[:5]))
 
-        # safe 出生集走局部 plan_action，本来就不跟 waypoint；不纳入该项检查。
-        l1w = [f for f in l1 if isinstance(f.get("waypoint"), dict)
-               and (f.get("scene_spawn") or {}).get("mode") != "safe"]
+        l1w = [f for f in l1 if isinstance(f.get("waypoint"), dict)]
         if not l1w:
             checks.append(check("teacher_waypoint", "SKIP", "无 waypoint"))
         else:
@@ -308,6 +330,28 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
                 "teacher_waypoint", "FAIL" if (badw or miss) else "PASS",
                 f"{len(badw)} 集最近距离 >1.0 m，{len(miss)} 集无位姿",
                 samples=(badw + miss)[:5]))
+
+        # goal-stop（v2）：teacher 必须停在 waypoint 半径内，且末动作是 SAFE。
+        # 旧 route-choice 数据没有 stop_radius，SKIP，不把历史数据改判。
+        l1s = [f for f in l1 if f.get("stop_radius") is not None
+               and f.get("planner") == "astar"]
+        if not l1s:
+            # 有 stop_radius 却没有任何可核验的 astar 集（例如全是 safe 出生集
+            # 或 planner 字段缺失）时不能 SKIP：那等于门禁对这类数据整体失效。
+            has_stop = any(f.get("stop_radius") is not None for f in l1)
+            checks.append(check(
+                "teacher_stop", "FAIL" if has_stop else "SKIP",
+                "有 stop_radius 但没有 planner=astar 的集可核验" if has_stop
+                else "无 stop_radius（旧 route-choice 数据）"))
+        else:
+            bad = [f["dir"] for f in l1s
+                   if f.get("final_waypoint_dist") is None
+                   or f["final_waypoint_dist"] > float(f["stop_radius"]) + 0.2
+                   or f.get("last_action") != 0]
+            checks.append(check(
+                "teacher_stop", "FAIL" if bad else "PASS",
+                f"{len(bad)}/{len(l1s)} 集未停在 waypoint 半径内或末动作不是 SAFE",
+                samples=bad[:5]))
 
     # 2) 时间配对（缺 gap 字段的步单列；部分缺失不能让检查按 0 放过）
     covered = [s["gap"] for s in steps if s["gap"] is not None]
@@ -470,6 +514,20 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
                 detail += "（旧 scene.json 无 clearance）"
             checks.append(check("geometry_version", "PASS", detail))
 
+    # 6d) 采集口径一致性：teacher/task 版本混包时，label_recompute 只跳过非当前
+    #     teacher_version，门禁看起来全绿，但 SR/成功判据在包里已经有两种定义。
+    prov = [(f.get("teacher_version"), f.get("task_version")) for f in gate]
+    miss_p = sum(1 for t, k in prov if t is None or k is None)
+    uniq = {p for p in prov if p[0] is not None and p[1] is not None}
+    if not uniq:
+        checks.append(check("provenance_uniform", "SKIP",
+                            "全部缺 teacher_version/task_version（旧格式）"))
+    elif miss_p or len(uniq) > 1:
+        checks.append(check("provenance_uniform", "FAIL",
+                            f"{miss_p}/{len(prov)} 集缺版本字段；混用 {sorted(uniq)}"))
+    else:
+        checks.append(check("provenance_uniform", "PASS", f"teacher/task = {sorted(uniq)[0]}"))
+
     # 7) split 几何隔离（含被排除的集：排除碰撞集不能把跨 split 泄漏洗掉）
     by_split = {}
     for f in gate:
@@ -518,8 +576,11 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
             total += 1
             # 普通集用 A*，safe 出生集用局部规划；manifest.planner 是唯一开关。
             if f.get("planner") == "astar":
-                want = plan_action_global(pb["x"], pb["y"], yb, f["pillars"],
-                                          waypoint=f.get("waypoint"))
+                want = plan_action_global(
+                    pb["x"], pb["y"], yb, f["pillars"],
+                    waypoint=f.get("waypoint"),
+                    stop_at_waypoint=bool(f.get("stop_radius")),
+                    stop_radius=f.get("stop_radius") or 0.5)
             else:
                 want = plan_action(pb["x"], pb["y"], yb, f["pillars"])
             if want != s["action_expert"]:
@@ -556,6 +617,41 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
     return checks
 
 
+# 不属于采集数据的目录：评测 .work、并行采集 staging、失败集、模板/日志。
+IGNORED_DIRS = {".work", ".staging", "failed", "worlds", "logs"}
+
+
+def collection_dirs(root):
+    """返回 (episode 目录列表, 扫描来源)。
+
+    有 collection_manifest.json 时只审计它登记的 (split, scene_id)：否则在实验根
+    目录里跑 audit 会把 eval 的 .work/ 当采集数据，统计被稀释或直接 FAIL。
+    没有 manifest 时退回 os.walk，并剪掉非采集目录。
+    """
+    manifest = os.path.join(root, "collection_manifest.json")
+    if os.path.isfile(manifest):
+        with open(manifest, encoding="utf-8") as f:
+            data = json.load(f)
+        dirs = []
+        for split, scene_ids in (data.get("splits") or {}).items():
+            for sid in scene_ids:
+                d = os.path.join(root, split, str(sid))
+                if os.path.isdir(d):
+                    dirs.append(d)
+        if dirs:
+            return sorted(dirs), "collection_manifest"
+    dirs = []
+    for dirpath, subdirs, files in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        parts = [] if rel == "." else rel.split(os.sep)
+        if any(part in IGNORED_DIRS for part in parts):
+            subdirs[:] = []
+            continue
+        if "episode_manifest.json" in files:
+            dirs.append(dirpath)
+    return sorted(dirs), "walk"
+
+
 def main(argv=None):
     p = argparse.ArgumentParser(description="数据集验收闸门")
     p.add_argument("--dataset", required=True, help="采集输出根目录（递归找 episode_manifest.json）")
@@ -566,15 +662,7 @@ def main(argv=None):
 
     if not os.path.isdir(args.dataset):
         p.error(f"--dataset 不是目录: {args.dataset}")
-    eps = []
-    for dirpath, _dirs, files in os.walk(args.dataset):
-        # collect_parallel 把重试两次仍失败的集搬进 <out>/failed/；它们不是训练
-        # 数据，混进全量闸门会让「全量过闸门」永远失败，也会污染类别统计。
-        if os.sep + "failed" + os.sep in dirpath + os.sep:
-            continue
-        if "episode_manifest.json" in files:
-            eps.append(dirpath)
-    eps.sort()
+    eps, scan_source = collection_dirs(args.dataset)
     if not eps:
         p.error(f"{args.dataset} 下没有 episode_manifest.json")
 
@@ -602,6 +690,7 @@ def main(argv=None):
     result = {
         "schema": "uavrgb.audit.v1",
         "dataset": os.path.abspath(args.dataset),
+        "scan_source": scan_source,
         "episodes_found": len(eps),
         # 闸门实际审计的集数；episodes_found 含被 --exclude-collision-episodes 排除的集。
         "episodes": len(facts),

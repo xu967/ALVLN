@@ -72,6 +72,22 @@ def main():
     else:
         raise AssertionError("缺失推理程序未报错")
 
+    # 非四类模型必须拒绝：否则越界动作会在 collect 里静默变成悬停。
+    with tempfile.TemporaryDirectory() as td:
+        fake = os.path.join(td, "fake3.py")
+        with open(fake, "w", encoding="utf-8") as f:
+            f.write(FAKE.replace('"num_classes": 4', '"num_classes": 3'))
+        os.chmod(fake, os.stat(fake).st_mode | stat.S_IXUSR)
+        ckpt = os.path.join(td, "ckpt.bin")
+        with open(ckpt, "wb") as f:
+            f.write(b"x")
+        try:
+            StudentPolicy(ckpt, fake)
+        except RuntimeError as exc:
+            assert "3 类" in str(exc), exc
+        else:
+            raise AssertionError("非四类模型未拒绝")
+
     print("test_student: PASS")
     return 0
 

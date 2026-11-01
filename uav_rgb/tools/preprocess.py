@@ -35,6 +35,10 @@ from datetime import datetime, timezone
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "sim", "tools"))
 import split_manifest as sm  # noqa: E402
+import instruction as instr  # noqa: E402
+
+# 必须与 src/include/uavrgb/text.hpp 的 kTextLen 一致：不足补 <pad>，超长由两端报错。
+TEXT_LEN = 9
 
 try:
     import numpy as np
@@ -119,6 +123,8 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False)
     instruction = man.get("instruction")
     if instruction is not None and not isinstance(instruction, str):
         die("%s: instruction 必须是字符串（实际 %r）" % (man_path, instruction))
+    task_version = man.get("task_version")
+    target_color = man.get("target_color")
     camera = man.get("camera") or {}
     src_w = int(camera.get("width") or 320)
     src_h = int(camera.get("height") or 240)
@@ -176,7 +182,14 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False)
         "geometry_gid": gid,
         "geometry_version": gver,
         "teacher": man.get("teacher"),
+        "planner": man.get("planner"),
         "instruction": instruction,
+        "task_version": task_version,
+        "target_color": target_color,
+        "waypoint": man.get("waypoint"),
+        "stop_radius": man.get("stop_radius"),
+        "window_from": man.get("window_from"),
+        "hold_s": man.get("hold_s"),
         "src_w": src_w,
         "src_h": src_h,
         "samples": samples,
@@ -219,15 +232,30 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False):
         dropped += ep["dropped"]
         episodes.append(ep)
     if skipped:
-        print("preprocess: 跳过含碰撞整集 %d 个" % skipped)
+        print("preprocess: 跳过整集 %d 个（--exclude-collision-episodes）" % skipped)
     if total == 0:
         die("没有可写样本")
+    # 同一数据集不能混 observation/dispatch、不同 hold 或不同任务版本，否则
+    # eval.json / 训练日志里的数字无法归因。缺字段的旧数据与有字段的数据也不能混。
+    for key in ("window_from", "hold_s", "task_version", "stop_radius"):
+        vals = {ep.get(key) for ep in episodes if ep.get(key) is not None}
+        if len(vals) > 1:
+            die("episode 的 %s 不一致: %s（不同口径不能混包）"
+                % (key, sorted(str(v) for v in vals)))
+        if vals and any(ep.get(key) is None for ep in episodes):
+            die("部分 episode 缺 %s，不能与有该字段的数据混包" % key)
     # L0：指令要么全有、要么全无。部分集有指令会让「文本是否可用」变成静默偏置。
     have = [bool(ep.get("instruction") and ep["instruction"].strip()) for ep in episodes]
     if any(have) and not all(have):
         die("instruction 只覆盖部分 episode（%d/%d 集缺）"
             % (have.count(False), len(have)))
     return episodes, total, dropped
+
+
+def _uniform(episodes, key):
+    """所有 episode 同值才返回该值；调用方已在 scan 里拒绝不一致。"""
+    vals = {ep.get(key) for ep in episodes if ep.get(key) is not None}
+    return next(iter(vals)) if len(vals) == 1 else None
 
 
 def build_meta(episodes, total, size, dropped=0):
@@ -254,6 +282,12 @@ def build_meta(episodes, total, size, dropped=0):
                    "to": [out_w, out_h],
                    "aspect": "preserve" if preserve else "squash"},
         "split_policy": "scene_id",
+        # 口径字段：eval/训练/audit 从数据集本身就能看出 observation/dispatch 与任务版本。
+        "geometry_version": sm.SPLIT_SALT,
+        "window_from": _uniform(episodes, "window_from"),
+        "hold_s": _uniform(episodes, "hold_s"),
+        "task_version": _uniform(episodes, "task_version"),
+        "stop_radius": _uniform(episodes, "stop_radius"),
         # 逐样本碰撞标记（'1' = collision=true），供 C++ 读端 LoadOptions.drop_collision
         # 在不重新打包的情况下过滤；--drop-collision 打包时已丢弃的步不在这里。
         "collision_flags": "".join("1" if s["collision"] else "0"
@@ -275,6 +309,15 @@ def build_meta(episodes, total, size, dropped=0):
             # airsim_to_uavr 直接构造 episode dict，没有这两键；必须用 get。
             "geometry_version": ep.get("geometry_version"),
             "teacher": ep.get("teacher"),
+            "task_version": ep.get("task_version"),
+            "instruction": ep.get("instruction"),
+            "target_color": ep.get("target_color"),
+            # 扁平字段：C++ meta 扫描器假定 episode 项内无嵌套对象。
+            "waypoint_x": (ep.get("waypoint") or {}).get("x"),
+            "waypoint_y": (ep.get("waypoint") or {}).get("y"),
+            "stop_radius": ep.get("stop_radius"),
+            "window_from": ep.get("window_from"),
+            "hold_s": ep.get("hold_s"),
             "num_steps": ep["num_samples"],
             "sample_start": ep["sample_start"],
             "sample_count": ep["num_samples"],
@@ -359,17 +402,39 @@ def write_dataset(out_dir, episodes, total, size, dropped=0, crop=None,
     return out_path, meta_bytes
 
 
-def write_instructions(out_dir, episodes):
-    """旁路写 instructions.jsonl；不改 UAVR 二进制格式（L0）。"""
+def instruction_rows(episodes):
+    """先算好并校验全部指令行，避免 dataset.uavr 已替换后才发现侧车写不了。"""
+    rows = []
+    for ep in episodes:
+        text = ep["instruction"].strip()
+        ids = instr.tokenize(text)
+        if len(ids) > TEXT_LEN:
+            die("%s: 指令 %r 有 %d 个 token，超过 TEXT_LEN=%d"
+                % (ep["dir"], text, len(ids), TEXT_LEN))
+        rows.append({
+            "episode_id": ep["episode_id"],
+            "instruction": text,
+            "sample_start": ep["sample_start"],
+            "sample_count": ep["num_samples"],
+            "text_ids": ids,
+        })
+    return rows
+
+
+def write_instructions(out_dir, rows):
+    """旁路写 instructions.jsonl；tmp + rename，失败不留半截/不截断旧文件。"""
     path = os.path.join(out_dir, "instructions.jsonl")
-    with open(path, "w", encoding="utf-8") as f:
-        for ep in episodes:
-            f.write(json.dumps({
-                "episode_id": ep["episode_id"],
-                "instruction": ep["instruction"].strip(),
-                "sample_start": ep["sample_start"],
-                "sample_count": ep["num_samples"],
-            }, ensure_ascii=False) + "\n")
+    # mkstemp：固定 ".tmp" 名在并发打包同一 --out 时会互相截断。
+    fd, tmp = tempfile.mkstemp(prefix=".instructions.", suffix=".tmp", dir=out_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        os.replace(tmp, path)
+    except OSError as exc:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        die("写 %s 失败：%s" % (path, exc))
     return path
 
 
@@ -402,10 +467,23 @@ def main():
 
     episodes, total, dropped = scan(args.episodes, args.drop_collision,
                                     args.exclude_collision_episodes)
+    # 先校验侧车内容，再替换 dataset.uavr；有指令时先删旧侧车。
+    # 这样侧车写失败时结果是「新数据集、没有侧车」（文本模型会显式报错），
+    # 而不是「新数据集 + 旧侧车」被 C++ 按同集区间静默绑定。
+    rows = (instruction_rows(episodes)
+            if any(ep.get("instruction") and ep["instruction"].strip() for ep in episodes)
+            else [])
+    stale = os.path.join(args.out, "instructions.jsonl")
+    if rows and os.path.exists(stale):
+        os.remove(stale)
     out_path, meta_bytes = write_dataset(args.out, episodes, total, args.size, dropped)
-    if any(ep.get("instruction") and ep["instruction"].strip() for ep in episodes):
-        ipath = write_instructions(args.out, episodes)
-        print("wrote %s (%d instructions)" % (ipath, len(episodes)))
+    if rows:
+        ipath = write_instructions(args.out, rows)
+        print("wrote %s (%d instructions)" % (ipath, len(rows)))
+    else:
+        if os.path.exists(stale):
+            os.remove(stale)
+            print("removed stale %s（新数据集没有指令）" % stale)
     meta = json.loads(meta_bytes.decode("utf-8"))
     out_w, out_h = args.size
     aspect = meta["resize"]["aspect"]

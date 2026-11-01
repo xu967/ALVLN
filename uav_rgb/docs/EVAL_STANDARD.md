@@ -86,7 +86,7 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
 
 | AvoidBench 概念 | 本仓库对应物 | 当前状态 |
 | --- | --- | --- |
-| trial（一次起终点飞行） | 一个 episode：出生点 → `goal_x`（最右柱 x + `--goal-margin`） | ✅ 已实现（`sim/tools/eval_closed_loop.py`）；成功 = 无碰撞且 `max_x ≥ goal_x` |
+| trial（一次起终点飞行） | 一个 episode：出生点 → `goal_x`（最右柱 x + `--goal-margin`）；L1 v2 例外：飞到目标柱 waypoint 并停 | ✅ 已实现；旧口径成功 = 无碰撞且 `max_x ≥ goal_x`；L1 v2 成功 = 无碰撞 + 最终距 waypoint ≤ `stop_radius`+0.2 + 末动作 `SAFE_NEUTRAL` |
 | 起点 / 终点 | `(-0.5, 0, 0.15)` 出生点 / `goal_x` | ✅ 已实现；`CRUISE_END_X` 已废弃 |
 | `d_trav`（实飞路径长度） | `oracle.jsonl` 的 `pose_gt` 轨迹累加 | ✅ 数据已在 |
 | `d_min`（A\* 最短自由路径） | 由 `scene.json` 的柱子几何做栅格 A\* | ❌ **未实现** |
@@ -176,13 +176,37 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
   （含学生推理进程崩溃）进 `failed`，不进分子分母。因此绝对 SR 对失败集是乐观的；
   报告必须同时给 `failed` 数。盲前进基线同口径，两个基线对比仍公平。
 - **处理时间 p50/p95** 是学生策略前向 + 决策，不含物理执行；本机 GPU 数字，不是板端。
-- **L1 route-choice**：success 还必须满足 `waypoint_min_dist ≤ 1.0 m`（经过目标柱旁
-  的通路点），否则 image-only 可以忽略指令直接冲线；`eval.json` per_episode 记录该字段。
+- **L1 goal-reach（2026-11-01 起，`success_criterion="goal_reach"`）**：`stop_radius`
+  非空时 success = 无碰撞 + 最终位姿距 waypoint ≤ `REACH_RADIUS`（1.5 m）。
+  **不再要求末动作是 `SAFE_NEUTRAL`**：waypoint 在柱阵外侧 ±2.4 m，相机 60° 视场在
+  真停止点上 40% 的帧一根柱子都看不到，「停」本身不可观测
+  （见 `worklog/2026-11-01-2130-stop-point-unobservable.md`）。
+  1.5 m 由几何定，不是调出来的：< 两候选 waypoint 最小间距 3.23 m 的一半
+  （否则停在中间的无人机对 keep 和 shuffle 都算成功，反事实失效），
+  < 出生点到 waypoint 的最小距离 2.50 m（否则原地不动也算成功）。
+  `eval.json` 顶层记录 `success_criterion`/`stop_radius`/`text_dim`，
+  per_episode 记录 `final_waypoint_dist`；`stopped` 仍返回但不参与判定。
+- **L1 goal-stop（2026-11-01 之前的历史口径，`success_criterion="goal_stop"`）**：
+  success = 无碰撞 + 最终位姿距 waypoint ≤ `stop_radius + 0.2 m` + 末动作
+  `SAFE_NEUTRAL`。**两种口径的 SR 不可混报。**
+- **L1 route-choice（历史，v1 数据）**：success 还必须满足 `waypoint_min_dist ≤ 1.0 m`。
+  v1 数据已作废，该口径只用于读旧产物。
+- **L/I/S 文本消融**：`--text-mode keep/blank/shuffle`。blank/shuffle 前必须确认
+  ckpt 的 `text_dim > 0`，否则与 keep 等价（eval 已强制检查）。shuffle 是**把关系词
+  反过来**（left↔right）：v5 起两根目标柱同色，换颜色在图像里不可观测。
+- **关系词定义**（l1.v4 起）：`left` 指**经过时**目标柱在机身左侧——waypoint 落在
+  柱子外侧，无人机从外侧绕过去，柱子留在它的 left/right 那一侧（500/500 集实测成立）。
+  这与 v3 的「出生时刻机身左侧」是**相反的口径**：v4 把 waypoint 移到外侧后，目标柱在
+  出生时位于关系词的**另一侧**。两版数据不可混报。两根同色柱必须分居机头轴线两侧且横向跨距 ≤2.4 m
+  （60° 水平视场装得下），否则该集不成立。
+- **终止条件补充**：L1 v2 的 teacher 采集在连续 3 步 `SAFE_NEUTRAL` 后提前结束。
+  （v4 起 safe 出生模式已删除，`safe_full_length` 闸门随之移除。）
 
 ## 6. 下一步（按优先级）
 
-1. 补 `d_min`（A\*）与终点定义 → 才能算 SR / PO / MP / AGV。
-2. 实现 `SimulatorEval`：加载模型 → Gazebo 闭环飞 → 按 §1.2 出报告。
+1. 补 `d_min`（A\* 最短自由路径）→ 才能算 PO / MP / AGV（SR 已实现）。
+2. `SimulatorEval` 已在 `eval_closed_loop.py` 落地；后续补终止原因落盘和
+   `failed`/`skipped` 的完整对账。
 3. 处理时间 p50/p95 —— 板端（LicheePi）未定，先报本机 GPU 的数，注明不是板端。
 4. 修 §5 的 1 与 2，否则闭环指标本身不可信。
 

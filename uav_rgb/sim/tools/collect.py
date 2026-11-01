@@ -514,7 +514,8 @@ def take_off(pose_sub, publisher, contact_sub=None, z_target=Z_TARGET, timeout=1
 
 def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 prev_action=None, prev_rgb_ts=0, pillars=None, student=None,
-                global_plan=True, window_from="dispatch", waypoint=None):
+                global_plan=True, window_from="dispatch", waypoint=None,
+                stop_at_waypoint=False, stop_radius=0.5):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。"""
     if window_from not in ("dispatch", "observation"):
         raise ValueError(f"window_from 无效: {window_from!r}")
@@ -562,7 +563,9 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             # safe 出生用局部规划（要保留真正的 SAFE 标签）；普通集用 A* 全局路径。
             if global_plan:
                 action = plan_action_global(pose_before["x"], pose_before["y"],
-                                            yaw_before, pillars, waypoint=waypoint)
+                                            yaw_before, pillars, waypoint=waypoint,
+                                            stop_at_waypoint=stop_at_waypoint,
+                                            stop_radius=stop_radius)
             else:
                 action = plan_action(pose_before["x"], pose_before["y"], yaw_before,
                                      pillars)
@@ -786,8 +789,8 @@ def main():
     scene_meta_sha = None
     scene_gid = None
     scene_version = None
-    scene_spawn_mode = None
-    instruction_text = target_color = waypoint = task_version = None
+    instruction_text = target_color = relation = waypoint = task_version = None
+    stop_radius = None
     if args.scene_meta:
         with open(args.scene_meta, "rb") as f:
             raw_meta = f.read()
@@ -795,11 +798,12 @@ def main():
         scene_meta_obj = json.loads(raw_meta.decode("utf-8"))
         pillars = scene_meta_obj["pillars"]
         scene_version = scene_meta_obj.get("geometry_version")
-        scene_spawn_mode = (scene_meta_obj.get("spawn") or {}).get("mode")
         instruction_text = scene_meta_obj.get("instruction")
         target_color = scene_meta_obj.get("target_color")
+        relation = scene_meta_obj.get("relation")
         waypoint = scene_meta_obj.get("waypoint")
         task_version = scene_meta_obj.get("task_version")
+        stop_radius = scene_meta_obj.get("stop_radius")
         for k, pl in enumerate(pillars):
             if "x" not in pl or "y" not in pl:
                 p.error(f"--scene-meta {args.scene_meta}: pillars[{k}] 缺 x/y")
@@ -819,7 +823,7 @@ def main():
         teacher_kind, planner_kind = "student", None
     elif pillars:
         teacher_kind = "plan_action"
-        planner_kind = "plan_action" if scene_spawn_mode == "safe" else "astar"
+        planner_kind = "astar"
     else:
         teacher_kind, planner_kind = "expert_action", None
         print("警告: 没给 --scene-meta，退回深度反应式专家；manifest.teacher=expert_action",
@@ -839,6 +843,7 @@ def main():
     error = None
     completed = False
     stopped_on_collision = False
+    stopped_on_goal = False
     prev_action = None
     prev_rgb_ts = 0
     timings = []
@@ -877,11 +882,15 @@ def main():
             print("起飞中…", file=sys.stderr)
             take_off(subs["pose"], publisher, subs["contact"])
 
+        stop_streak = 0
+        goal_stop = bool(stop_radius)
         for i in range(args.steps):
             r, reason = collect_one(args.out, i, args.hold, args.policy, subs,
                                     publisher, prev_action, prev_rgb_ts, pillars, student,
-                                    global_plan=(scene_spawn_mode != "safe"),
-                                    window_from=args.window_from, waypoint=waypoint)
+                                    global_plan=True,
+                                    window_from=args.window_from, waypoint=waypoint,
+                                    stop_at_waypoint=goal_stop,
+                                    stop_radius=stop_radius or 0.5)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -934,11 +943,21 @@ def main():
                   f"pose_gap={'-' if pose_gap_ns is None else f'{pose_gap_ns/1e6:.0f}ms'} "
                   f"io={(r['timing']['io']):.2f}s step={(r['timing']['total']):.2f}s",
                   file=sys.stderr)
+            # goal-stop：连续 3 步 SAFE 说明已在目标 waypoint 停稳，提前结束，
+            # 避免后 20+ 步全是 SAFE 把类别分布拉偏。
+            if goal_stop and r["action_executed"] == SAFE_NEUTRAL:
+                stop_streak += 1
+            else:
+                stop_streak = 0
+            if goal_stop and stop_streak >= 3:
+                stopped_on_goal = True
+                print(f"step {i}: goal-stop 连续 3 步 SAFE，提前结束", file=sys.stderr)
+                break
             if args.stop_on_collision and r["collision"]:
                 stopped_on_collision = True
                 print(f"step {i}: 碰撞，按 --stop-on-collision 结束", file=sys.stderr)
                 break
-        completed = rows_written == args.steps
+        completed = rows_written == args.steps or stopped_on_goal
 
         if timings:
             def avg(key):
@@ -1016,7 +1035,9 @@ def main():
             "task_version": task_version,
             "instruction": instruction_text,
             "target_color": target_color,
+            "relation": relation,
             "waypoint": waypoint,
+            "stop_radius": stop_radius,
             "scene_meta_sha256": scene_meta_sha,
             "actions_ref": "actions.jsonl",
             "oracle_ref": "oracle.jsonl",
@@ -1034,6 +1055,7 @@ def main():
             # 评测集会在碰撞处提前结束；validity 仍按「跑满请求步数」严格填，
             # 下游据此区分「采集完整」与「评测终止」，不要混淆。
             "stopped_on_collision": stopped_on_collision,
+            "stopped_on_goal": stopped_on_goal,
             "error": error,
         }
         write_manifest(os.path.join(args.out, "episode_manifest.json"), manifest)

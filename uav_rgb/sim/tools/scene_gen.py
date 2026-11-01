@@ -47,7 +47,11 @@ import landmarks
 
 # 几何语义版本：改柱子/车道/spawn 规则必须 bump。split_manifest 直接用它当
 # SPLIT_SALT，collect 写进 episode manifest，preprocess 拒绝跨版本混包。
-GEOMETRY_VERSION = "uavrgb.geom.v3"
+# v4：删除 safe 出生模式（相机贴柱面导致的纯色废帧）。生成规则变了，
+#     旧 v3 数据不能再和新数据混包，gid 也随之全部重排。
+# v5：landmark 改成「两根同色柱分居左右 + 关系词指令」（任务语义变了，
+#     和 v4 的「异色柱 + 目标色指令」训练目标不同，不能混包）。
+GEOMETRY_VERSION = "uavrgb.geom.v5"
 
 PILLAR_SIZE = 0.4
 PILLAR_HEIGHT = 3.0
@@ -185,50 +189,24 @@ def _spawn_collides(x, y, pillars):
 
 
 def make_spawn(pillars, seed, mode="default"):
-    """返回出生位姿。mode=default/random/safe。
+    """返回出生位姿。mode=default/random。
 
-    safe：T2 用。在柱区里找一个 plan_action 真正判 SAFE 的位姿，让「停」类样本
-    由教师规则天然产生，而不是人工造标签。候选点围绕前 3 根柱子取 ±0.5/±0.25 m
-    偏移；不满足 AABB 净空或 plan_action 不是 SAFE 就换下一个，顺序由 seed 决定。
-    找不到才退回粗网格；再找不到就报错（不静默给 default）。
+    2026-11-01 删除 safe 模式：plan_action 只在「±85° 内每个方向都被柱子挡住」时
+    才返回 SAFE，而那种位姿的相机必然贴着柱面——实测 100/100 个 seed 的距离都是
+    0.100 m，60° 视场被填满，产出 4000/10442 步纯色 SAFE 帧。全格搜索也找不到
+    「plan_action=SAFE 且视野 ≥0.8 m」的位姿（0/100）。SAFE 样本改由 astar 集提供
+    （到达 waypoint + 被围住，占 18.5%）。
     """
     if mode == "default":
         return {"x": SPAWN_X, "y": 0.0, "z": SPAWN_Z, "yaw_deg": 0.0, "mode": mode}
-    rng = random.Random(seed ^ 0x5AFE)   # 独立 RNG，不能扰动 sample_pillars 的序列
-    if mode == "random":
-        # 出生在门柱与侧柱之间的缝中心附近（|y|≈0.8）：直线就能穿过第一排，
-        # 不再需要 1.5 m 内横移 0.8 m。y=0 的起始留给 safe/default 模式。
-        y = rng.choice((-1.0, 1.0)) * round(rng.uniform(0.72, 0.88), 3)
-        return {"x": SPAWN_X, "y": y, "z": SPAWN_Z,
-                "yaw_deg": round(rng.uniform(-5.0, 5.0), 1), "mode": mode}
-    if mode != "safe":
+    if mode != "random":
         raise ValueError(f"unknown spawn mode {mode!r}")
-
-    from teacher import plan_action, SAFE_NEUTRAL
-    offsets = [(dx, dy) for dx in (-0.5, 0.5)
-               for dy in (-0.25, -0.125, 0.0, 0.125, 0.25)]
-    candidates = [(p["x"] + dx, p["y"] + dy) for p in pillars[:3] for dx, dy in offsets]
-    rng.shuffle(candidates)
-    for x, y in candidates:
-        x, y = round(x, 3), round(y, 3)
-        if not (PILLAR_X_RANGE[0] - 0.5 <= x <= PILLAR_X_RANGE[1] + 0.5):
-            continue
-        if not (PILLAR_Y_RANGE[0] <= y <= PILLAR_Y_RANGE[1]):
-            continue
-        if _spawn_collides(x, y, pillars):
-            continue
-        if plan_action(x, y, 0.0, pillars) == SAFE_NEUTRAL:
-            return {"x": x, "y": y, "z": SPAWN_Z, "yaw_deg": 0.0, "mode": mode}
-    # 粗网格兜底：候选偏移全不中时仍要给出真实 SAFE 位姿。
-    for xi in range(8, 41):
-        x = round(xi * 0.125, 3)
-        for yi in range(-13, 14):
-            y = round(yi * 0.125, 3)
-            if _spawn_collides(x, y, pillars):
-                continue
-            if plan_action(x, y, 0.0, pillars) == SAFE_NEUTRAL:
-                return {"x": x, "y": y, "z": SPAWN_Z, "yaw_deg": 0.0, "mode": mode}
-    raise RuntimeError(f"seed={seed}: 找不到 SAFE 出生位姿")
+    rng = random.Random(seed ^ 0x5AFE)   # 独立 RNG，不能扰动 sample_pillars 的序列
+    # 出生在门柱与侧柱之间的缝中心附近（|y|≈0.8）：直线就能穿过第一排，
+    # 不再需要 1.5 m 内横移 0.8 m。y=0 的起始留给 default 模式。
+    y = rng.choice((-1.0, 1.0)) * round(rng.uniform(0.72, 0.88), 3)
+    return {"x": SPAWN_X, "y": y, "z": SPAWN_Z,
+            "yaw_deg": round(rng.uniform(-5.0, 5.0), 1), "mode": mode}
 
 
 X3_POSE_RE = re.compile(r'(<model name="x3">\s*<pose>)([^<]*)(</pose>)')
@@ -265,7 +243,7 @@ def _pillar_xml(p):
 def build_scene(template, seed, scene_id, spawn_mode="default", task="base"):
     """返回 (world_text, meta)。template 只读，任何标记异常都直接报错。
 
-    task="l1" 时额外给两根柱上色，写 target_color/instruction/waypoint；
+    task="l1" 时额外给两根柱染同一色并写 relation/instruction/waypoint；
     task="base" 保持原几何与人任务无关的 meta 不变。
     """
     if task not in ("base", "l1"):
@@ -279,9 +257,9 @@ def build_scene(template, seed, scene_id, spawn_mode="default", task="base"):
         raise ValueError("template markers out of order")
     pillars, clearance, attempts = sample_pillars(seed)
     spawn = make_spawn(pillars, seed, spawn_mode)
-    target_color = instruction = waypoint = None
+    target_color = relation = instruction = waypoint = None
     if task == "l1":
-        target_color, instruction, waypoint = landmarks.assign_landmarks(
+        target_color, relation, instruction, waypoint = landmarks.assign_landmarks(
             pillars, seed, spawn)
     lines = [f"    <!-- scene_gen: scene_id={scene_id} seed={seed} "
              f"pillars={len(pillars)}; generated, do not edit -->"]
@@ -321,10 +299,19 @@ def build_scene(template, seed, scene_id, spawn_mode="default", task="base"):
     }
     if task == "l1":
         meta.update({
-            "task_version": "l1.v1",
+            # v2：goal-stop。waypoint 是最终目标，teacher 在半径内输出 SAFE。
+            # v1 的 route-choice（到 waypoint 后继续飞终点）实测 0/400 到 goal，
+            # 已废弃。v3 在 v2 的成功口径上把指令换成关系词（同色柱对）。
+            # v4：waypoint 从「朝走廊中心偏」改成「朝目标柱外侧偏」——v3 的两个
+            # 候选点都落在出生航线上（274/274 场景不需要选边），新数据必须用 v4，
+            # 不能和 v3 混包（preprocess 按 task_version 拦）。
+            "task_version": "l1.v4",
             "target_color": target_color,
+            # 两根同色柱的左右关系：L/I/S 消融的 shuffle 就是把它反过来。
+            "relation": relation,
             "instruction": instruction,
             "waypoint": waypoint,
+            "stop_radius": 0.5,
         })
     return world, meta
 
@@ -390,8 +377,8 @@ def main():
     p.add_argument("--out", help="输出 SDF 路径；同名 .json 写场景清单")
     p.add_argument("--scene-id", type=int, default=None,
                    help="EpisodeMeta.scene_id（默认=seed）")
-    p.add_argument("--spawn-mode", choices=("default", "random", "safe"), default="default",
-                   help="出生位姿：default=模板原点；random=y/yaw 随机；safe=柱区内真 SAFE 位姿")
+    p.add_argument("--spawn-mode", choices=("default", "random"), default="default",
+                   help="出生位姿：default=模板原点；random=y/yaw 随机")
     p.add_argument("--task", choices=("base", "l1"), default="base",
                    help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
     p.add_argument("--template", default=DEFAULT_TEMPLATE,

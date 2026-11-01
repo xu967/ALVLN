@@ -203,12 +203,15 @@ python3 sim/tools/scene_gen.py --self-check          # 100 个 seed 自检
   就触发**一次左右选择，保证 episode 不会整集 FORWARD。
 - 出生区 x<1.0 无遮挡（柱体最近边 x≥1.3 m）；每根柱到 y=±3 走廊边界
   ≥1.1 m。任意两柱不满足缝 ≥0.9 m 则整组重采样，最多 100 次。
-- **出生位姿** `--spawn-mode default|random|safe`：default 在 x=-0.5、y=0；random 在
-  门柱与侧柱的缝中心 |y|∈[0.72,0.88]、yaw∈±5° 内随机；safe 在柱区内找一个
-  `plan_action` 真正判 `SAFE_NEUTRAL` 的位姿（T2 的「停」样本来源），并用
-  0.47 m 机身方框 + 四个桨盘（半径 0.1）校验不撞柱；起飞阶段 z>0.5 后若出现
-  contact 直接判本集失败。`collect_parallel --safe-spawn-fraction 1/N` 按固定
-  stride 混入 safe episode（只接受 1/N，避免 0.4 被静默当成 0.5）。
+- **出生位姿** `--spawn-mode default|random`：default 在 x=-0.5、y=0；random 在
+  门柱与侧柱的缝中心 |y|∈[0.72,0.88]、yaw∈±5° 内随机，并用 0.47 m 机身方框 +
+  四个桨盘（半径 0.1）校验不撞柱；起飞阶段 z>0.5 后若出现 contact 直接判本集失败。
+  **`--task l1` 必须配 `--spawn-mode random`**：左右同色柱对要同时落在 60° 水平
+  视场内，default 的 y=0 只能选到跨 3.2 m 的两根侧车道柱，必然有一根出画，
+  `landmarks.assign_landmarks` 会直接报错而不是产出一个伪关系任务。
+- **L1 landmark**（`--task l1`）：两根**同色**柱分居出生点左右，指令
+  `pass the <color> pillar on your <left|right> and stop`（9 token）。同色是
+  刻意的——图像里没有颜色线索能区分两者，选哪根只能读指令。
 - 同 seed 字节级一致（`--self-check` 核对两次 sha256）。同名 `.json` 写
   `scene_id / seed / geometry_version / spawn / 障碍清单 / 净空检查 / world_sha256`，
   供汇总 manifest 用。

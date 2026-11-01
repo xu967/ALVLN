@@ -77,3 +77,10 @@ T6 best 离线：acc 0.9186 / macro_f1 0.8589 / bal_acc 0.8497。闭环同时超
 无 `eval.json`，日志停在 seed 116。中间快照 7 成功 / 7 碰撞，**不是结论**。
 下一步用 `eval-student-r01b` + `--keep-work` 重跑；完成前 §3 的 0.90 仍只适用于
 R01 前版本。
+
+## 更新 2026-10-31：复跑已完成
+
+- `eval-student-v1-observation/`：**SR 0.90（18/20）**，collision 0.05，
+  false_forward 0.05，p50 10.26 ms —— R01 后 observation 口径的正式基线。
+- `eval-student-r01b/`：dispatch 口径 **SR 0.55（11/20）**，collision 0.45。
+- 两者禁止混报；详见 `2026-10-31-t7-r01b-and-window-ab.md`。

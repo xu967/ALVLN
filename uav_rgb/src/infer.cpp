@@ -3,9 +3,11 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <istream>
 #include <ostream>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "uavrgb/tensor.hpp"
@@ -14,7 +16,26 @@ namespace uavrgb {
 
 std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream& out,
                            std::vector<std::uint8_t> text_ids) {
-  (void)text_ids;  // L0：先打通协议；L2 才把 token 送进文本编码器。
+  // 文本分支：--text 的 id 补齐到 kTextLen（缺的补 <pad>=0），逐帧复用同一段指令。
+  // 空串 = 无指令（全部 pad），L2 的「文本置空」消融就靠它。
+  std::vector<std::uint8_t> text;
+  if (model.text_dim > 0) {
+    text.assign(kTextLen, 0);
+    if (text_ids.size() > static_cast<std::size_t>(kTextLen)) {
+      throw std::invalid_argument("infer: --text token 数超过 kTextLen");
+    }
+    for (std::uint8_t id : text_ids) {
+      if (id >= kTextVocab) {
+        throw std::invalid_argument("infer: token id 越界: " + std::to_string(id));
+      }
+    }
+    if (text_ids.empty()) {
+      // 文本分支对空输入不是中性的：FiLM 会把空文本当成另一条指令。
+      std::fprintf(stderr, "uavrgb_infer: 文本模型没有 --text，按全 <pad> 推理\n");
+    }
+    std::copy(text_ids.begin(), text_ids.end(), text.begin());
+  }
+  // 没有文本分支时忽略 text_ids：L0 起 collect.py 一律带指令，image-only 权重必须照跑。
   const int h = model.in_h;
   const int w = model.in_w;
   const int c = model.c1.in;
@@ -45,7 +66,7 @@ std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream
     }
 
     const auto t0 = std::chrono::steady_clock::now();
-    const Tensor logits = forward(model, x);
+    const Tensor logits = forward(model, x, nullptr, text.empty() ? nullptr : &text);
     const auto t1 = std::chrono::steady_clock::now();
     if (logits.numel() != static_cast<std::size_t>(ncls)) {
       throw std::runtime_error("infer: logits 维度与 num_classes 不符");

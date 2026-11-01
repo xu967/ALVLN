@@ -1,5 +1,7 @@
 # 构建产物（`build/` 无前导斜杠，对任意层级都生效）
 build/
+# 临时/并行构建目录（src/build-l2 这类），别让 git add -A 把二进制树带上 GitHub
+build-*/
 
 # Python 虚拟环境与缓存
 .venv-tools/
@@ -15,3 +17,4 @@ logs/runs/
 # 编辑器与临时文件
 *.swp
 .DS_Store
+.ipynb_checkpoints/

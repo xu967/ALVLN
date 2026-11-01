@@ -23,24 +23,27 @@
 
 > 自主执行任务编排（无固定截止）：`docs/experiments/2026-10-31-overnight-autonomous-plan.md`。
 
-**当前唯一 P0 是上表的 T7-R。** T8 不单独立项，失败分类并入 T7-R 的验收；
-D5/G1–G6 暂缓；V8、CF-Drone、SG2002、AerialVLN-S 官方基准冻结。
+**当前 P0 是 v2 500 集采完后的 audit → L2 文本训练 → 离线/闭环 L/I/S。**
+T8 不单独立项，失败分类并入 T7-R；D5/G1–G6 暂缓；V8、CF-Drone、SG2002、
+AerialVLN-S 官方基准冻结。
 
-语言线（L0–L2）是提案，**先过 D-STACK 决策门再立项**；ECPT 只在 L2 显示语言增益后评估。
-语言线按 **v1 observation 语义**采集/评测；dispatch 合同未采纳。
-语言线前置：**B4**（infer 语义对拍）在 L0 改协议前完成；**B1**（数据集防替换）在语言数据采集/训练前完成。
+语言线（L0–L2）已过 D-STACK 决策门（全自研 C++/CUDA）；ECPT 只在 L2 显示
+语言增益后评估。语言线按 **v1 observation 语义**采集/评测；dispatch 未采纳。
+前置项 B4（infer 语义对拍）/ B1（数据集防替换）**未立项就被 L0/L1 越过**：
+本轮定为显式豁免（B1 部分由侧车身份绑定 + `preprocess` 原子写兜底），
+若要补做，在 L2 正式训练前完成 B4 冒烟。
 
 | ID | P | 状态 | owner | 任务 | 验收 |
 | --- | --- | --- | --- | --- | --- |
-| D-STACK | P0 | 待拍板 | 用户 | 语言模型栈：全自研 C++/CUDA，还是 Python 原型 + C++ 部署 | 选定后再开 L0/L2；未定不写模型代码 |
+| D-STACK | P0 | **done**（2026-10-31 10:03，用户拍板） | 用户 | **全自研 C++/CUDA**：文本侧 CPU embedding + mean-pool + concat，不新增 CUDA kernel，不引 PyTorch | 已选定；L2 按此栈立项 |
 | T4 | P0 | **done**（2026-10-31 00:54） | code-4b | 完整 20 seed observation v1 基线（`eval-student-v1-observation`） | **SR 0.90（18/20）**，collision 0.05，p50 10.26 ms；与历史 0.90 一致，失败 seed 23/88；与 dispatch 不可混报 |
 | T5b | P0 | **done**（2026-10-31 06:10） | code-4b | dispatch 全量重采 600 集 → 596 集 audit PASS → 训练 → 闭环 | 闭环 SR **0.60**（12/20）；离线 test macro_f1 0.8287；**未达 v1−5pp（0.85），不采纳为 baseline**；T5b 数据/模型保留作证据 |
 | B1 | P1 | 待立项 | code-4b | 训练数据替换防护：把 `batch_reader.cpp` 的 `verify_unchanged` 接入 trainer，或训练启动时对 open fd 做 fstat 校验 | 训练中覆盖 `.uavr` 被拒/检测；负例测试通过 |
 | B4 | P1 | 待立项 | code-4b | infer 语义对拍：已知像素图案 → logits 与 NCHW 直喂一致；`infer_main` 子进程冒烟 | 通道/数值对拍通过；在 L0 改 TEXT 协议前完成 |
 | D-GEODUP | P3 | 待立项 | code-4b | 几何近重复检测：3 位舍入 gid 会把只差 5 mm 的场景当不同几何（T7-R 实测 seed 49/57 动作逐位相同）；按柱坐标容差聚类，报告 test 内近重复组 | 近重复组清单 + 20 seed 独立性结论；不阻塞 T7 |
-| L0 | P1 | **doing**（侧车/audit/--text 已完成；collect 字段待 T5b 后） | code-4b | 指令数据通路：episode 旁路 `instructions.jsonl`（`episode_id → instruction`）+ audit 校验 + infer `--text` CSV（单集一条；多指令再升 TEXT 头）+ 文本权重/token 表随 checkpoint；文本侧 CPU embedding+mean-pool，不新增 CUDA kernel | 50 集带指令；缺/多/错指令 audit FAIL；零文本 dummy 模型端到端跑通 |
-| L1 | P1 | **done**（pilot 120 PASS） | code-4b | 最小语言任务：1 模板 + 前排两色 + waypoint；4 动作；无关系词/STOP | 120/4800；audit 15/15 PASS；teacher_waypoint 0；class_share 全过；见 `experiments/2026-10-31-l1-pilot-120.md` |
-| L2 | P1 | 待立项 | code-4b | 语言 baseline + 消融（原 L2/L3 合并）：CNN + 16 维文本向量 + FiLM/concat；训练 + 闭环 SR + 文本置空/打乱/同图换指令 | 阈值先冻结（建议 +10pp / -10pp / 一致率 ≥60%）；语言版 SR 高于 image-only；不达标先改任务设计，不开 ECPT |
+| L0 | P1 | **done**（2026-10-31 11:35） | code-4b | 指令数据通路：episode 旁路 `instructions.jsonl`（`episode_id → instruction`）+ infer `--text` CSV + 文本权重/token 表随 checkpoint（v4）；文本侧 CPU embedding+mean-pool，不新增 CUDA kernel | 400 集带指令且侧车带 `text_ids`；超长/越界/缺字段在读端直接报错（`test_text_branch` 覆盖）；`--text` 已进模型 |
+| L1 | P1 | **doing（v4，卡在「停得准」）** | code-4b | 最小语言任务：1 模板 + 同色柱对 + 关系词 + 外侧 waypoint | **v4 结果**：离线 test `macro_f1 0.7740`；探针 `follow 0.8090`；闭环 keep SR **0.426** / shuffle **0.000** / 盲前进 0.000（McNemar p<1e-5）。**未过 50% 验收线**：13 次碰撞 13/13 都在 ≤1.5 m 内——停止点在柱阵外侧 ±2.4 m，40% 的 SAFE 帧视野里零柱子。方案 A（判据改 goal_reach，`REACH_RADIUS=1.5`）已落地。**等用户拍板 B（改几何）或 C（改任务定义）**。见 `experiments/2026-11-01-l1-v4-text-training.md` |
+| L2 | P1 | **done（v4 已过语言门槛）** | code-4b | 语言 baseline + 消融：FiLM 融合已落地并训练 | v4 断开了 v3 的权衡：flip 0.964 下 macro_f1 0.774（v3 A 组 flip 0.970 时只有 0.479）；`follow` 0.6055 → **0.8090**。`acc_correct` 0.8814 仍未过 0.90（该阈值出自内部计划，非公开基准） |
 | ECPT | P2 | 条件项（未立项） | — | 只在 L2 显示语言增益后评估：证据置信/相位 + STOP 门控 | 届时有同参数同数据消融 |
 
 ## 阶段目标（2026-10-30 立，同日拍板口径）
@@ -112,7 +115,7 @@ D5/G1–G6 暂缓；V8、CF-Drone、SG2002、AerialVLN-S 官方基准冻结。
 | T4 | P1 | **done** | `src/train_main.cpp`、`src/trainer_eval.cpp` | 加 `--eval-only <ckpt>`：test 现在只用末轮权重跑，`ckpt_best.bin` 从未被评过 | 对 `airsim10k-run/ckpt_best.bin` 跑出 val/test 四件套并与 `metrics.jsonl` 对账；CTest 20/20；见 `2026-10-30-0320-t4-eval-only.md` |
 | T5 | P0 | **done**（2026-10-30 16:19） | `sim/tools/collect_parallel.py` | 大规模采集：600 集 × 40 步（base-seed 200000），4 实例。实测 **1.506 步/s / 135 集/h**、4 h 26 min；8 实例会起飞超时。见 `experiments/2026-10-30-t5-scaleup.md` | 599 集 / 23960 步 audit **11/11 PASS**；1 集接触集已隔离（`yaw_direction` 反转步口径修正，见 `worklog/2026-10-30-1650-t5-audit-fixes.md`） |
 | T6 | P0 | **done**（2026-10-30 18:29） | `tools/preprocess.py`、`src/` | 训练 + 离线验收：打包（23960 步）→ 训练（`--class-weights auto --drop-collision`，10 轮）→ eval-only 评 **best 权重**。2026-10-30 18:29 完成：6501.9 s / 28.5 样本/秒，best=epoch 8 | 离线四件套齐全 + 与多数类先验对比表：test macro_f1 **0.8589** vs 先验 0.1968，四类 recall [1.000, 0.952, 0.700, 0.747]，见 `worklog/2026-10-30-1829-t6-train.md`、`experiments/2026-10-30-t6-train.md` |
-| T7 | P0 | **done**（2026-10-30 19:29） | `sim/tools/eval_closed_loop.py` | 闭环验收 vs 基线阶梯（盲前进 / 多数类先验 / 我们的模型，同场景同口径）。2026-10-30 用 20 个冻结 test seed 跑 T6 best（`t6-full-1640/eval-student`）：**SR 0.90、collision 0.05、stuck 0.00、false_forward 0.05**；盲前进基线 SR 0 / collision 1.0 / false_forward 1.0。碰撞率按 contact 计、stuck 单列（`EVAL_STANDARD §5.1`）。R01 修复在 T7 之后完成，本轮是修复前版本；窗口变化对 SR 方向不确定，严格验收需同版本重跑（见实验记录 §3） | 三件套汇报齐；见 `worklog/2026-10-30-1929-t7-closed-loop.md`、`experiments/2026-10-30-t7-closed-loop.md`；本表 T1–T7 全部 done |
+| T7 | P0 | **done**（2026-10-30 19:29） | `sim/tools/eval_closed_loop.py` | 闭环验收 vs 基线阶梯（盲前进 / 多数类先验 / 我们的模型，同场景同口径）。2026-10-30 用 20 个冻结 test seed 跑 T6 best（`t6-full-1640/eval-student`）：**SR 0.90、collision 0.05、stuck 0.00、false_forward 0.05**；盲前进基线 SR 0 / collision 1.0 / false_forward 1.0。碰撞率按 contact 计、stuck 单列（`EVAL_STANDARD §5.1`）。R01 后的同版本复跑已完成：v1 observation **SR 0.90（18/20）**、dispatch T7-R **0.55（11/20）**，两者禁止混报（`experiments/2026-10-31-t7-r01b-and-window-ab.md`） | 三件套汇报齐；见 `worklog/2026-10-30-1929-t7-closed-loop.md`、`experiments/2026-10-30-t7-closed-loop.md`；本表 T1–T7 全部 done |
 
 **已知约束（T1 必须重推，不能只改一个数）**：三条车道装进 ±1.5 m 要求
 `2×LANE_SEP + 中心摆动 ≤ 3.0`；柱数上限 9 的推导随间距变；`GATE_Y_ABS_MAX=0.25`
@@ -131,7 +134,7 @@ D5/G1–G6 暂缓；V8、CF-Drone、SG2002、AerialVLN-S 官方基准冻结。
 | D4 | P2 | **done**（2026-10-30） | code-4b | `sim/tools/collect.py` | depth/contact 停更门禁 | depth 与 RGB 差 >100 ms 或 contact 订阅退出即失败；5 个注入用例通过，见 `worklog/2026-10-30-2129-d4-staleness-gate.md` |
 | D5 | P2 | todo | code-4b | `src/device/`、`src/trainer.cpp` | device 层接入训练路径、RNG/best 状态 | 吞吐对比 + resume 一致 |
 | G1 | P3 | todo | 子 agent（只写新文件） | `src/tests/` | CUDA 多 block parity | 新增用例通过 |
-| G2 | P3 | todo | code-4b | `src/checkpoint.cpp` | resume 数据签名校验（升 v4） | 换数据 resume 被拒 |
+| G2 | P3 | todo | code-4b | `src/checkpoint.cpp` | resume 数据签名校验（v4 已被 text_dim 占用，升 v5；v4 读端保持兼容） | 换数据 resume 被拒 |
 | G3 | P3 | todo | code-4b | `src/checkpoint.cpp`、`dataset.cpp`、`run_owner.cpp` | fsync、64 位溢出、目录 fd 锁 | 单测 |
 | G4 | P3 | todo | code-4b | `src/CMakeLists.txt` | `-Wall -Wextra` 全开、`.clang-format` | 0 warning（真） |
 | G5 | P3 | todo | code-4b | `sim/tools/collect_parallel.py` | 同 `--out` 并发 TOCTOU 加锁 | 并发负例被拒 |

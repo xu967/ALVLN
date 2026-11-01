@@ -26,7 +26,11 @@ def tokenize(text):
 
 
 def make_instruction(color, relation=None):
-    """生成模板指令；relation=None 为「飞到目标柱」，left/right 为「经过目标柱」。"""
+    """生成模板指令。
+
+    relation=None 是 M0.1 goal-stop 任务：飞到目标柱旁并停下；
+    left/right 是 M2 关系任务：从目标柱某侧接近后停下。
+    """
     if color not in COLORS:
         raise ValueError(f"颜色不在词表: {color!r}")
     if relation is None:

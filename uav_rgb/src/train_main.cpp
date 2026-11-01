@@ -22,7 +22,8 @@ void usage() {
   std::fprintf(stderr,
                "用法: uavrgb_train --data <dataset.uavr> --epochs N --batch B --lr L "
                "--out <run_dir> [--resume <ckpt>] [--seed S] [--max-grad-norm G] "
-               "[--class-weights auto|<w0,w1,w2,w3>] [--drop-collision]\n"
+               "[--class-weights auto|<w0,w1,w2,w3>] [--drop-collision] "
+               "[--text-dim N]\n"
                "  或: uavrgb_train --data <dataset.uavr> --eval-only <ckpt> --out "
                "<run_dir> [--batch B] [--split val|test|all] [--drop-collision]\n");
 }
@@ -60,6 +61,9 @@ int main(int argc, char** argv) {
         cfg.class_weights = next("--class-weights");
       } else if (a == "--drop-collision") {
         cfg.drop_collision = true;
+      } else if (a == "--text-dim") {
+        cfg.text_dim = std::stoi(next("--text-dim"));
+        if (cfg.text_dim < 0) throw std::invalid_argument("--text-dim 不能为负");
       } else if (a == "--eval-only") {
         eval_ckpt = next("--eval-only");
       } else if (a == "--split") {

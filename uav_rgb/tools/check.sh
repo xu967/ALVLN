@@ -20,6 +20,21 @@ if [[ "$uav_check_obs" != "$uav_check_pre" ]]; then
   echo "输入分辨率不一致: observation.hpp=${uav_check_obs} preprocess.py=${uav_check_pre}" >&2
   exit 1
 fi
+# 文本长度/词表同样是手抄两份（text.hpp vs preprocess.py/instruction.py）；
+# 漂了要到真实打包或训练才炸，这里先红。
+uav_check_tlen_c="$(sed -n 's/.*kTextLen = \([0-9]*\).*/\1/p' \
+  "$uav_check_root/src/include/uavrgb/text.hpp" | head -1)"
+uav_check_tlen_py="$(sed -n 's/^TEXT_LEN = \([0-9]*\).*/\1/p' \
+  "$uav_check_root/tools/preprocess.py" | head -1)"
+uav_check_vocab_c="$(sed -n 's/.*kTextVocab = \([0-9]*\).*/\1/p' \
+  "$uav_check_root/src/include/uavrgb/text.hpp" | head -1)"
+uav_check_vocab_py="$("$UAV_RGB_PYTHON" -c 'import sys; sys.path.insert(0, sys.argv[1]); import instruction; print(len(instruction.VOCAB))' \
+  "$uav_check_root/sim/tools")"
+if [[ "$uav_check_tlen_c" != "$uav_check_tlen_py" || "$uav_check_vocab_c" != "$uav_check_vocab_py" ]]; then
+  echo "文本常量不一致: text.hpp len=${uav_check_tlen_c} vocab=${uav_check_vocab_c}" \
+       "preprocess.py len=${uav_check_tlen_py} instruction.VOCAB=${uav_check_vocab_py}" >&2
+  exit 1
+fi
 # 格式/门禁的夹具与负例都是纯 Python，--python-only 也要跑；C++ 读端仍在下面。
 uav_check_fmt="$(mktemp -d)"
 trap 'rm -rf "$uav_check_fmt"' EXIT
@@ -30,7 +45,8 @@ if [[ "${1:-}" != "--python-only" ]]; then
   "$UAV_RGB_PYTHON" "$uav_check_root/tools/doctor.py" --require-gpu
   cmake -S "$uav_check_root/src" -B "$uav_check_build" -G Ninja -DCMAKE_BUILD_TYPE=Release
   cmake --build "$uav_check_build" --parallel "${UAV_RGB_BUILD_JOBS:-8}"
-  ctest --test-dir "$uav_check_build" --output-on-failure
+  # --no-tests=error：注册表为空时 ctest 默认 rc=0，会让「没跑测试」显示成 PASS。
+  ctest --test-dir "$uav_check_build" --output-on-failure --no-tests=error
 
   # UAVR 格式有三份实现：preprocess.py（写）、dataset.cpp（读）、synthetic_dataset.hpp
   # （测试夹具，另一份写）。CTest 只用夹具喂 C++ 读端，真正的 Python 产物没人校验——
@@ -108,7 +124,7 @@ PY
     echo "split 与几何 gid 不符被接受：防泄漏门未生效" >&2
     exit 1
   fi
-echo "PASS: preprocess 教师标签/几何隔离/重复目录/split 门禁负例"
+echo "PASS: preprocess 教师标签/几何隔离/重复目录/split 门禁 负例"
 "$UAV_RGB_PYTHON" "$uav_check_root/sim/tools/teacher.py"
 "$UAV_RGB_PYTHON" "$uav_check_root/sim/tools/scene_gen.py" --self-check
 "$UAV_RGB_PYTHON" "$uav_check_root/sim/tools/gz_io.py" --self-check
@@ -119,4 +135,8 @@ for uav_check_test in "$uav_check_root"/sim/tools/test_*.py; do
 done
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_monitor.py"
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_trainer_demo.py"
-echo "PASS: 所选检查完成；模拟采集、真实训练和学生闭环须独立验收。"
+if [[ "${1:-}" == "--python-only" ]]; then
+  echo "PASS（python-only）：C++/CUDA 构建、CTest、GPU 未验证；模拟采集、真实训练和学生闭环须独立验收。"
+else
+  echo "PASS: 所选检查完成；模拟采集、真实训练和学生闭环须独立验收。"
+fi

@@ -314,10 +314,8 @@ def main():
 
         # 15) 指令覆盖：全有 PASS、部分缺 FAIL、含坐标 FAIL、全无 SKIP。
         root15 = tempfile.mkdtemp(prefix="audit_test_")
-        write_ep(root15, "train", 1, CLEAN,
-                 instruction="fly to the red pillar and stop")
-        write_ep(root15, "train", 2, CLEAN,
-                 instruction="fly to the blue pillar and stop")
+        write_ep(root15, "train", 1, CLEAN, instruction="pass the red pillar")
+        write_ep(root15, "train", 2, CLEAN, instruction="pass the blue pillar")
         c15 = details(root15)["instruction_coverage"]
         assert c15["status"] == "PASS", c15
         write_ep(root15, "train", 3, CLEAN)  # 缺 instruction
@@ -330,6 +328,26 @@ def main():
         c15c = details(root15b)["instruction_coverage"]
         assert c15c["status"] == "FAIL" and "坐标" in c15c["detail"], c15c
         shutil.rmtree(root15b)
+
+        # 16) 扫描范围：有 collection_manifest 时只审计登记目录，不能把 eval 的
+        #     .work/ 当采集数据；没有 manifest 时 walk 也要剪掉 .work/。
+        root16 = tempfile.mkdtemp(prefix="audit_test_")
+        write_ep(root16, "train", 1, CLEAN)
+        write_ep(root16, ".work", 999, CLEAN)
+        with open(os.path.join(root16, "collection_manifest.json"), "w",
+                  encoding="utf-8") as f:
+            json.dump({"splits": {"train": [1]}}, f)
+        dirs16, src16 = ad.collection_dirs(root16)
+        assert src16 == "collection_manifest", (dirs16, src16)
+        assert dirs16 == [os.path.join(root16, "train", "1")], dirs16
+        shutil.rmtree(root16)
+        root16b = tempfile.mkdtemp(prefix="audit_test_")
+        write_ep(root16b, "train", 1, CLEAN)
+        write_ep(root16b, ".work", 999, CLEAN)
+        dirs16b, src16b = ad.collection_dirs(root16b)
+        assert src16b == "walk", (dirs16b, src16b)
+        assert dirs16b == [os.path.join(root16b, "train", "1")], dirs16b
+        shutil.rmtree(root16b)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

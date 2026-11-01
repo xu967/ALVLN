@@ -1,22 +1,32 @@
 # uav_rgb 交接文档
 
-- 更新时间：2026-10-31 06:15
-- **当前状态**：T1–T7 已完成；D4 已完成；**v1 复测（observation）`SR 0.90`**，
-  **T7-R（dispatch）`SR 0.55`**，**T5b（dispatch 重训）`SR 0.60`**。
-  dispatch（hold=1.0）未达到采纳线（v1−5pp），**不采纳为 baseline**；v1 observation
-  仍是语言线唯一稳定基线。见 §四 4.1。
-- **接手第一件事**：读完本文件 → 读 `docs/TASKS.md` → 读 `docs/ENGINEERING_RULES.md`
+- 更新时间：**2026-11-01 21:52**
+- **当前状态**：T1–T7 已完成（v1 observation baseline `SR 0.90`）。
+  语言线走到 **L1 任务 v4**：FiLM 文本分支 + 外侧 waypoint 任务，
+  离线 `macro_f1 0.7740`、文本探针 `follow 0.8090`，闭环 keep `SR 0.426` /
+  shuffle `0.000` / 盲前进 `0.000`。
+  **指令确实进决策了，但「停得准」做不到**——13 次碰撞全部落在距 waypoint
+  1.5 m 以内。原因已定位：v4 的停止点在柱阵外侧 ±2.4 m，相机 60° 视场在
+  真停止点上 40% 的帧一根柱子都看不到，「停」不可观测。
+  用户 2026-11-01 拍板方案 A（去掉「必须停」→ goal-reach），已实现；
+  **SR 0.426 仍未过 50% 验收线**。
+- **接手第一件事**：本文件 → **§4.5（当前任务 + 下一步命令）** →
+  `docs/EVAL_STANDARD.md` → `docs/TASKS.md` → `docs/ENGINEERING_RULES.md`
 - **口径唯一来源**：`docs/EVAL_STANDARD.md`。报任何数字前必读，违反口径的数字等于造假。
+  **2026-11-01 起 L1 闭环口径是 `goal_reach`（1.5 m、不看末动作），
+  与历史的 `goal_stop`（0.7 m + 末动作 SAFE）不可混报。**
+- ⚠️ **工作树有大量未提交改动**（含并发会话的），`ALVLN/uav_rgb` 仍是旧版。
+  提交前必须逐文件确认归属，见 §5「Git」。
 
 ### 30 秒上手
 
 ```bash
 cd /root/claude-code-backup-20261028/code/uav_rgb && source env.sh
 nvidia-smi -L          # 期望列出 RTX 2080 Ti；列不出就是无卡模式，见 §五
-bash tools/check.sh    # 期望最后 EXIT=0，CTest 20/20
+bash tools/check.sh    # 期望最后 EXIT=0，CTest 21/21
 ```
 
-三条都过，说明环境是活的；然后跳到 §四看当前任务，再从 §七 看下一步。
+三条都过，说明环境是活的；然后跳到 §4.5 看当前任务，再从 §七 看下一步。
 
 ---
 
@@ -69,8 +79,8 @@ nvidia-smi -L                                   # 先判定 GPU 模式，别凭�
 
 | 路径 | 作用 |
 | --- | --- |
-| `src/` | C++/CUDA 训练推理栈：`train_main.cpp`（CLI）、`trainer.cpp` / `trainer_eval.cpp`、`infer_main.cpp`（常驻推理进程）、`dataset.cpp`、`checkpoint.cpp`（v3，best-checkpoint）、`src/tests/`（**20 个 CTest**） |
-| `sim/tools/` | `scene_gen.py`（柱阵世界生成）、`collect.py` / `collect_parallel.py`（采集）、`teacher.py`（`plan_action` GT planner / `expert_action` 深度专家）、`audit_dataset.py`（**9 条数据验收闸门**）、`eval_closed_loop.py`（闭环评测）、`split_manifest.py`（几何 gid + split）、7 个 `test_*.py` |
+| `src/` | C++/CUDA 训练推理栈：`train_main.cpp`（CLI）、`trainer.cpp` / `trainer_eval.cpp`、`infer_main.cpp`（常驻推理进程）、`dataset.cpp`、`checkpoint.cpp`（v4，best-checkpoint + text_dim）、`src/tests/`（**21 个 CTest**） |
+| `sim/tools/` | `scene_gen.py`（柱阵世界生成）、`collect.py` / `collect_parallel.py`（采集）、`teacher.py`（`plan_action` GT planner / `expert_action` 深度专家）、`audit_dataset.py`（**18 条数据验收闸门**）、`eval_closed_loop.py`（闭环评测）、`split_manifest.py`（几何 gid + split）、13 个 `test_*.py` |
 | `tools/` | `preprocess.py`（采集目录 → `.uavr`）、`airsim_to_uavr.py`（公开数据接入）、`check.sh`（**L2 全量验证**）、`doctor.py` |
 | `ui/` | Tkinter 训练监控台（**另一个会话维护，改前先确认**） |
 | `docs/` | `TASKS.md`（任务板，**唯一任务来源**）、`ENGINEERING_RULES.md`（执行细则）、`EVAL_STANDARD.md`（口径）、`worklog/`、`experiments/` |
@@ -81,8 +91,9 @@ nvidia-smi -L                                   # 先判定 GPU 模式，别凭�
 
 ## 四、当前状态与关键数字
 
-> 更新时间：2026-10-30 21:55。T1 之前的「闭环 0 / 20」「公开数据 SAFE=0」等
-> 历史基线已移出本节，需要时看 `docs/experiments/` 与 `docs/worklog/`。
+> **2026-11-01 21:52 更新。§4.1 / §4.2 是历史记录（T1–T7，v1 基线）；**
+> **当前可用数字看 §4.3，当前任务看 §4.5。** 更早的「闭环 0 / 20」
+> 「公开数据 SAFE=0」等已移出，需要时看 `docs/experiments/` 与 `docs/worklog/`。
 
 ### 4.1 执行语义三条合同：v1 / T7-R / T5b
 
@@ -132,28 +143,51 @@ collision 0.45、false_forward 0.30、stuck 0；产物
 | T7（旧版） | 20 个冻结 test seed：`SR 0.90 / collision 0.05 / stuck 0.00 / false_forward 0.05`；**R01 前版本**，见 `experiments/2026-10-30-t7-closed-loop.md` |
 | D4 | depth 与 RGB sim-time 差 >100 ms、contact 订阅进程退出即失败；`test_collect` 20/20；见 `worklog/2026-10-30-2129-d4-staleness-gate.md` |
 | R01 | 动作窗口从派发位姿起算 + `StudentPolicy` warmup；见 `worklog/2026-10-30-1935-deepseek-review-fixes.md` |
+| L1 | **v1 400 集作废**（route-choice，teacher 0/400 到 goal）；v2 goal-stop 500 集采集中。见 `experiments/2026-10-31-basic-vln-plan.md §2.5/§8` |
+| D-STACK | 用户拍板**全自研 C++/CUDA**；文本分支（embedding+mean-pool+concat）已实现，CTest 21/21；见 `worklog/2026-10-31-1115-l2-text-branch.md` |
 
-### 4.3 关键数字（当前可用）
+### 4.3 关键数字
+
+#### 4.3.1 当前主线：L1 v4（2026-11-01）——**只有这组数能当现状**
+
+数据：`l1-v4-relation-500`（499 集 / 8966 步）+ `l1-v4-cf`（451 反事实集 / 8092 步），
+配对训练集 16184 样本。全部过 `audit_dataset.py` 17/17。
+
+| 项 | 数字 | 出处 |
+| --- | --- | --- |
+| 训练 | 20 轮 / 4864.9 s，best = **E17** | `l1-v4-cf/run-film-cf` |
+| 离线 test（874 样本） **best** | acc **0.8478** / macro_f1 **0.7740** / bal_acc **0.7623**；recall `[0.833, 0.903, 0.676, 0.637]` | `eval-best-test` |
+| 离线 test 末轮（E20） | acc 0.8467 / macro_f1 0.7633 / bal_acc 0.7405 | `eval-last-test` |
+| 多数类先验 test | acc 0.6590 / macro_f1 0.1986 / bal_acc 0.2500 | — |
+| 文本探针（801 决定性帧） | flip 0.9638 / acc_correct 0.8814 / acc_alt 0.9026 / **follow 0.8090** | `probe-best.json` |
+| 闭环 keep（47 集） | **SR 0.426**（goal_reach）/ 碰撞 0.277 / false_forward 0.234 | `l1-v4-closed-20261101/student-keep` |
+| 闭环 shuffle（47 集） | **SR 0.000** / 碰撞 0.383 / false_forward 0.362 | `.../student-shuffle` |
+| 盲前进（44 集） | **SR 0.000** / 碰撞 0.455 / false_forward 0.455 | `.../forward` |
+| 共同 44 集 | keep SR 0.409 / 碰撞 0.295；shuffle 0.000 / 0.409；盲前进 0.000 / 0.455 | 复算 |
+| keep Wilson 95% CI | `[0.295, 0.567]`（47 集） | — |
+| keep vs shuffle | McNemar 精确 **p < 1e-5** | — |
+
+**失败分解（keep，47 集，三者互斥且刚好分完）**：成功 20、
+**到了却撞柱 13（13/13 都在 ≤1.5 m 内）**、到了但没进 1.5 m 14。
+
+#### 4.3.2 历史基线（v1 / T6，**不要与新数字混报**）
 
 | 项 | 数字 |
 | --- | --- |
-| 训练数据 | 599 集 / 23960 步；train 18520 / val 2800 / test 2640 |
+| T6 训练数据 | 599 集 / 23960 步；train 18520 / val 2800 / test 2640 |
 | T6 best 离线 test | acc 0.9186 / macro_f1 0.8589 / balanced_acc 0.8497；recall `[1.000, 0.952, 0.700, 0.747]` |
 | 多数类先验 test | acc 0.6492 / macro_f1 0.1968 / balanced_acc 0.2500 |
-| T7 旧版闭环（observation） | SR 0.90（18/20）/ collision 0.05 / stuck 0.00 / false_forward 0.05；动作 SAFE 57 / FWD 1095 / LEFT 178 / RIGHT 211；p50 40.4 ms / p95 59.3 ms（warm n=1521） |
-| **v1 复测（observation，当前环境）** | **SR 0.90（18/20）** / collision 0.05 / false_forward 0.05；p50 10.26 ms / p95 13.10 ms；失败 seed 23/88 |
-| 盲前进基线 | SR 0 / collision 1.00 / false_forward 1.00 |
-| T7-R（dispatch） | SR 0.55（11/20）/ collision 0.45 / false_forward 0.30 / stuck 0.00；p50 10.9 ms / p95 15.2 ms；动作 SAFE 14 / FWD 709 / LEFT 263 / RIGHT 351 |
-| T5b（dispatch 重训） | SR 0.60（12/20）/ collision 0.35 / false_forward 0.25 / stuck 0.00；p50 10.1 ms / p95 11.8 ms；离线 test macro_f1 0.8287 |
-| A/B 窗口语义 | seed 49/57：observation 2/2 成功，dispatch 0/2 碰撞；p50 均约 11 ms |
+| **v1 复测（observation，唯一 baseline）** | **SR 0.90（18/20）** / collision 0.05 / false_forward 0.05；p50 10.26 ms / p95 13.10 ms；失败 seed 23/88 |
+| 盲前进基线（v1 场景） | SR 0 / collision 1.00 / false_forward 1.00 |
+| T7-R（dispatch） | SR 0.55（11/20）/ collision 0.45 / false_forward 0.30；p50 10.9 ms |
+| T5b（dispatch 重训） | SR 0.60（12/20）/ collision 0.35；离线 test macro_f1 0.8287 |
 
 > **T6 数字的出处**：`0.8589` 出自 `eval-best/metrics.jsonl`（ckpt_best 复评）；
 > `run/metrics.jsonl` 末条是末轮 `ckpt.bin` 的 0.8042，抓错文件会差 5 个点。
 
-T7-R（dispatch）失败分类：起步早碰撞 49/57/99；过线后碰撞 25/36/114/116/137；
-未到线碰撞 50。T5b（dispatch 重训）失败：23/25/57/84/88/171/180 碰撞，45 未到线。
-旧版 observation 的 seed 45 SAFE 悬停/seed 99 早碰撞仅作历史对照。
-**v1 observation 是唯一 baseline；v1 与 dispatch 数字禁止混报。**
+> **v1 的 0.90 不是「比 v4 好」。** v1 是「飞到 goal_x」的走廊穿越任务；
+> v1 任务里没有文本、没有选边、停止可观测。v4 SR 0.426 是在「必须按指令选边 +
+> 停止点不可观测」的任务上测的。**两个任务的 SR 不可比，也不可混报。**
 
 ### 4.4 数据与产物路径
 
@@ -167,7 +201,217 @@ T7-R（dispatch）失败分类：起步早碰撞 49/57/99；过线后碰撞 25/3
 | `$DATA_ROOT/uav_rgb/t6-full-1640/eval-forward/` | 盲前进基线 |
 | `$DATA_ROOT/uav_rgb/t6-full-1640/eval-student-r01b/` | T7-R dispatch 复跑（SR 0.55，`--keep-work`） |
 | `$DATA_ROOT/uav_rgb/t6-full-1640/ab-observation/`、`ab-dispatch/` | 窗口语义 A/B（49/57） |
-| `$DATA_ROOT/uav_rgb/t6-full-1640/eval-student-v1-observation/` | 完整 observation v1 基线（运行中/待出） |
+| `$DATA_ROOT/uav_rgb/t6-full-1640/eval-student-v1-observation/` | 完整 observation v1 基线（SR 0.90，已完成） |
+| `$DATA_ROOT/uav_rgb/l1-full-400-0803/{train,val,test}/` | L1 语言任务 400 集原始采集（每集 `episode_manifest.json` + `scene.json` + `rgb_*.png`） |
+| `.../l1-full-400-0803/ds/` | L1 打包：`dataset.uavr`（16000 步）+ `instructions.jsonl`（400 行，带 `text_ids`） |
+| `.../l1-full-400-0803/run/` | L1 image-only 基线权重（10 轮 / batch 64 / lr 1e-3 / seed 1234 / auto 权重 / drop_collision） |
+| `.../l1-full-400-0803/eval-student-image-only/eval.json` | L1 v1 闭环（SR 0/34，**废数据，禁止引用**） |
+| `$DATA_ROOT/uav_rgb/l1-stop-500-173307/` | L1 **v2** goal-stop 数据（498 集 / 10442 步）。**已被 v3/v4 取代，不再用于新实验** |
+| `$DATA_ROOT/uav_rgb/l1-v3-relation-500/` | L1 **v3** 同色柱对 + 关系词数据（499 集），waypoint 朝走廊中心偏 |
+| `$DATA_ROOT/uav_rgb/l1-v3-closed-20261101/` | v3 闭环（goal_stop 口径，**不可与 v4 混报**） |
+| `$DATA_ROOT/uav_rgb/l1-v4-relation-500/` | **L1 v4 原始采集**（499 集 / 8966 步，train 404 / val 47 / test 48）。waypoint 在目标柱外侧 0.8 m |
+| `.../l1-v4-relation-500/ds/` | v4 打包：`dataset.uavr` + `instructions.jsonl` |
+| `$DATA_ROOT/uav_rgb/l1-v4-cf/` | **v4 反事实集**（451 集 / 8092 步）→ `ds/` 配对训练集 16184 样本 |
+| `.../l1-v4-cf/run-film-cf/` | **当前主线权重**：`ckpt_best.bin`（E17，md5 `d91cd0f1…`）+ `ckpt.bin`（E20） |
+| `.../l1-v4-cf/eval-best-test` / `eval-last-test` | v4 离线复评（874 样本） |
+| `.../l1-v4-cf/probe-best.json` | v4 文本探针 |
+| `$DATA_ROOT/uav_rgb/l1-v4-closed-20261101/` | **v4 闭环三组**：`student-keep` / `student-shuffle` / `forward`（goal_reach，已复算；未重跑） |
+
+### 4.5 语言线（L1 / L2）现状 —— **接手先看这一节**
+
+> 2026-11-01 21:52。一句话：**L1 走到 v4，指令学会了（shuffle 0.000 vs keep 0.426），
+> 但「停得准」做不到（SR 0.426 < 50%）。两种修法待拍板。**
+
+#### 数据版本沿革（四代，每一代都不可混包）
+
+| 版本 | `task_version` | 作废/在用 | 原因 |
+| --- | --- | --- | --- |
+| v1 | `l1.v1` | **作废** | route-choice；teacher 自己 0/400 到 goal，闭环 SR 0/34 |
+| v2 | `l1.v2` | 历史 | goal-stop + 两色柱：图像里目标色唯一 → 模型可完全忽略文本（换词只改 2e-4 概率） |
+| v3 | `l1.v3` | 历史 | 同色柱对 + 关系词（文本必须读）。但 waypoint 朝**走廊中心**偏，274/274 个 test 场景都**不需要横移** → 测不到语言 |
+| **v4** | `l1.v4` | **当前** | waypoint 改到目标柱**外侧** 0.8 m，横移变成 1.6 m；几何仍是 `uavrgb.geom.v5` |
+
+几何版本 `uavrgb.geom.v5`（柱子 / 出生点 / split 都没变，只改目标点与关系词映射）。
+`preprocess.py` 按 `task_version` 拦混包。
+
+#### 当前结论：**指令学会了，停不会**
+
+- **指令确实在起作用**：shuffle（把关系词 left↔right 反过来）下**没有任何一集**
+  能靠近真 waypoint 2 m 以内（两个候选 waypoint 相距 3.2 m）。keep vs shuffle
+  McNemar `p < 1e-5`。文本探针 `follow 0.8090`（v3 只有 0.6055）。
+- **瓶颈是「停」不是「选边」**：13 次碰撞 **13/13 都发生在距 waypoint 1.5 m 以内**
+  ——飞到了、停不下来，撞在目标柱上；另有 14 集停在 1.6–2.9 m 处。27/47 与
+  「停得准」有关，与选边无关。
+- **根因已定位**：`waypoint_for` 把停止点放在 `target.y ± 0.8`，柱子只在
+  `y ∈ {0, ±1.6}`，于是停止点落在 **±2.4 m——已经出了柱阵**。实测 v4 test split：
+  **40%（57/144）的 SAFE 帧视野里一根柱子都没有**（v3 是 0%），飞行途中也有
+  13%（77/576）的 FORWARD 帧是空的。同一张空图在数据里既标 FORWARD 又标 SAFE。
+  模型学成了「柱子消失 → 停」，于是提前停 1–2 m，或撞上还没让开的柱子。
+- 另有一层：巷道网格是重复的，**单帧图像无法唯一确定沿 x 的位置**。追踪 seed
+  900101：前 12 步与教师逐帧一致，第 12 步（距 waypoint 1.77 m，**视野里有 3 根柱子**）
+  突然输出 SAFE，教师要求 YAW_R。所以不只是「看不见」，还有「看得见也分不出远近」。
+
+完整证据：`docs/worklog/2026-11-01-2130-stop-point-unobservable.md`、
+`docs/experiments/2026-11-01-l1-v4-text-training.md`。
+
+#### 已拍板并落地的方案 A（2026-11-01）：判据改 goal-reach
+
+用户选了 **A：去掉「必须停」的判定**。已实现：
+
+| 文件 | 改动 |
+| --- | --- |
+| `sim/tools/eval_closed_loop.py` | `REACH_RADIUS = 1.5`；L1 分支 success = 无碰撞 + 末态 ≤1.5 m，**末动作不参与**；`success_criterion="goal_reach"` |
+| `sim/tools/test_eval_summary.py` | L1 断言跟改 + 1.4/1.6 m 边界 + 「到位但撞柱」两条守卫 |
+| `docs/EVAL_STANDARD.md §5.1` | 补 goal_reach 口径与 1.5 m 的几何来历；修正关系词定义 |
+
+**1.5 m 是几何卡死的，不是调出来的**：必须 **< 两候选 waypoint 最小间距 3.23 m 的一半
+（1.615）**，否则停在中间的无人机对 keep 和 shuffle 都算成功、反事实失效；
+同时 **< 出生点到 waypoint 的最小距离 2.50 m**，否则原地不动也算成功。
+
+**诚实修正**：早前估计方案 A 能到 57%，实际是 **43%（0.426）**。原因两条：
+(a) 半径取 2.0 m 不安全（候选 waypoint 中点到两边各 1.62 m，会同时算成功）；
+(b) 单纯去掉 `stopped` 一条**一集都多不出来**（16 个旧成功全部 `stopped=True`）。
+
+#### 2026-11-02 更正：0.426 是复算值，不是评测文件
+
+上面写的 **0.426 是按 goal_reach 规则对旧 `per_episode` 数据手工复算**得到的，
+`eval.json` 本身**没有**按新判据重跑：
+
+| 项 | 实际值 |
+| --- | --- |
+| `l1-v4-closed-20261101/student-keep/eval.json` 的 `success_criterion` | `"goal_stop"` |
+| 同一文件 `success_rate` | **0.3404**（16/47） |
+| goal_reach 复算 | 20/47 = 0.4255 |
+
+**验收状态：v4 未过 50% 线，两种口径都不达标。** 论文与汇报只能引用 `eval.json`
+的 `0.3404`，或明确标注「0.426 为按 goal_reach 复算」。三组（keep / shuffle / forward）
+如需正式结论，必须按 goal_reach 重跑（约 80 min）。
+
+#### L2 文本分支（**已训练，v4 主线用的就是它**）
+
+自研 C++ 文本分支，零 PyTorch：
+
+```
+token ids [N,9] → emb[22,16]（CPU 查表）→ 忽略 <pad> 求均值 → [N,16]
+                                                 ↓ 逐样本 concat
+image [N,3,120,160] → conv×3 → flatten [N,19200] ─┴→ fc [19216→4]
+```
+
+> 上图的 concat 版本已被 FiLM 取代（见 `experiments/2026-11-01-l2-film-finetune.md`）：
+> 文本 embedding 过 `film` 线性层出 γ/β，作用在 pooled `c3` 上，`fc` 仍是 `[19200→4]`。
+
+| 位置 | 作用 |
+| --- | --- |
+| `src/include/uavrgb/text.hpp` | `kTextLen=9` / `kTextVocab=22`，必须与 `sim/tools/instruction.py` 一致 |
+| `src/model.cpp` | 前向查表+mean-pool → `film` 出 γ/β 作用在 pooled `c3`；concat 版本仍在（旧 ckpt 兼容） |
+| `src/dataset.cpp` | 读 `instructions.jsonl` 的 `text_ids`，按 `sample_start/count` 展开 |
+| `src/checkpoint.cpp` | **v4**：`text_dim` 追加在 `best_macro_f1` 之后，v2/v3 偏移不变 |
+| `train_main` / `trainer*` | `--text-dim N` 开文本分支；`--eval-only` 以 checkpoint 记录为准 |
+| `infer*` | `--text id,id,...`（每个 id 必须 `< 22`）；无文本分支的 ckpt 仍忽略 `--text` |
+| `tools/preprocess.py` | 侧车写 `text_ids`；`--exclude-safe-episodes` 见下面的警告 |
+
+#### 下一步（**需要用户拍板，不要自行开工**）
+
+方案 A 只把不可观测的判定从指标里拿掉了，**没有修根因**。SR 0.426 仍低于 50%
+验收线。要真修只有两条路：
+
+- **B：改几何让停止可观测**——把 waypoint 拉回柱阵内侧，或让最后一排柱子出现在
+  停止点视野里。改 `landmarks.waypoint_for` + `scene_gen`，**必须 bump
+  `SPLIT_SALT` 并重采重训**（约 1.5 h 采集 + 80 min 训练）。副作用：横移距离会变小，
+  可能又回到 v3 的「不需要横移、测不到语言」。
+- **C：改任务定义**——把「停」换成一个**可观测**的终止信号（例如「经过目标柱后
+  再前进 N 步」），或允许序列输入（多帧）。这是改任务不是改几何，代价最大。
+
+不做决定前**不要重跑三组闭环**（80 min，数值必然相同）。
+
+#### v4 复现命令（已验证跑通）
+
+```bash
+# 采集
+python3 sim/tools/collect_parallel.py --instances 5 --episodes-per-instance 100 \
+  --steps 60 --hold 1.0 --base-seed 900000 --task l1 --spawn-mode random \
+  --window-from observation --out $DATA_ROOT/uav_rgb/l1-v4-relation-500
+python3 sim/tools/audit_dataset.py --dataset $DATA_ROOT/uav_rgb/l1-v4-relation-500
+
+# 打包 + 反事实
+python3 tools/preprocess.py --drop-collision --out .../l1-v4-relation-500/ds \
+  .../l1-v4-relation-500/{train,val,test}/*/
+python3 sim/tools/make_counterfactual.py --src .../l1-v4-relation-500 \
+  --out .../l1-v4-cf --splits train,val
+python3 tools/preprocess.py --drop-collision --out .../l1-v4-cf/ds \
+  .../l1-v4-relation-500/{train,val}/*/ .../l1-v4-cf/{train,val}/*/
+
+# 训练（81 min）
+src/build/uavrgb_train --data .../l1-v4-cf/ds/dataset.uavr --text-dim 16 \
+  --epochs 20 --batch 64 --lr 5e-4 --seed 1234 --class-weights auto \
+  --drop-collision --out .../l1-v4-cf/run-film-cf
+
+# 离线复评（注意：cf/ds 只有 train+val，test 要用基础数据集的 ds）
+src/build/uavrgb_train --data .../l1-v4-relation-500/ds/dataset.uavr \
+  --eval-only .../l1-v4-cf/run-film-cf/ckpt_best.bin --split test \
+  --batch 128 --out .../l1-v4-cf/eval-best-test
+
+# 文本探针
+python3 sim/tools/probe_text_effect.py --src .../l1-v4-relation-500 \
+  --ckpt .../run-film-cf/ckpt_best.bin --split test --out .../probe-best.json
+```
+
+闭环三组的完整命令见 `docs/experiments/2026-11-01-l1-v4-text-training.md`。
+
+#### 闭环口径注意事项
+
+- **必须 `--window-from observation`**（dispatch 语义的 SR 只有 0.55，未采纳）。
+- 两个候选 waypoint 相距 **min 3.23 m**，这是「shuffle 0.000 就是真的没学会」的
+  几何依据——只要 SR > 0 就说明它读懂了指令。
+- `--text-mode blank/shuffle` 会先问 infer 的 `text_dim`，纯视觉 ckpt 上直接报错；
+  `eval.json` 同时记 `text_dim` / `success_criterion` / `stop_radius`。
+- **`stopped` 仍返回但不参与 goal_reach 判定**；`goal_stop` 与 `goal_reach` 的 SR
+  不可混报。
+- 分母是 `episodes_done`。盲前进那组有 3 集 infra 超时（`900032/900052/900101`），
+  所以同时报「共同完成的 44 集」。
+- **`flip` 只说明「文本会改变动作」**，不说明改对了；严格指标是 `follow`。
+  两个数要一起给。
+
+#### 未提交清单（2026-11-01 21:52 的工作树）
+
+`git status --short` 实测（2026-11-01 21:52）：**39 改 + 5 删 + 6 暂存删除 + 32 未跟踪**。
+全部未提交。
+
+- 未跟踪里**必须一起提交**的代码：`src/include/uavrgb/text.hpp` 和
+  `src/tests/test_text_branch.cpp` 已被 `src/CMakeLists.txt` 引用，**漏了构建直接失败**。
+- 三个新的 Python 工具：`sim/tools/make_counterfactual.py`、`make_decisive.py`、
+  `probe_text_effect.py`（+ `test_make_decisive.py`）。
+- **未跟踪里绝大多数是文档**（`docs/experiments/` 10 个 + `docs/worklog/` 15 个），
+  这些是语言线（v1→v4）的全部留痕，**没有其它备份**，一个都不能丢。
+- 工作树里有**并发会话的改动**（`ui/`、部分 `src/`）。**禁止 `git add -A`**，
+  逐文件确认归属再 `git add <path>`。
+- `.ipynb_checkpoints/` 是垃圾目录，尚未加入 `.gitignore`，别误提交。
+- **`ALVLN/uav_rgb` 仍是旧版**，本地的东西一个字节都没上 GitHub。
+
+**坑（踩过的）**：
+
+- `instructions.jsonl` 若没有 `text_ids`（L2 之前打包的），现在**当作没有侧车**处理：
+  image-only 照跑，文本模型会在 trainer 报"没有侧车"。旧数据集不用重打包也能继续用。
+- 指令超过 9 个 token 会**直接报错**（不截断）：`pass the red pillar on your right and stop`
+  正好是 9 个，是 v5 的正式模板（`kTextLen` / `TEXT_LEN` 都已抬到 9）。
+- `--exclude-safe-episodes` 不是"去噪"，是**把 SAFE 类整个删掉**（16000 → 12800，SAFE 归零），
+  对照组会变成 3 类模型，结论只能读成"没有 SAFE 类会怎样"。
+- **`audit_dataset.py` 的 17/17 PASS 认证不了图像**：17 条检查只读
+  `actions/oracle/scene` 的 jsonl，**从不打开 PNG**；`label_recompute` 是同一个
+  teacher、同一个 `pose_before` 重算，对未改动数据**数学上恒等**。所以它只证明
+  「原始采集内部自洽」，既不覆盖实际训练的配对包（反事实集的 oracle/collision/
+  validity 是从原集复制的，按原集口径审必然 FAIL），也发现不了「空帧同图标
+  FORWARD/SAFE」这类问题。要验图像必须另外开图看。
+- **反事实集 `l1-v4-cf/ds` 只有 train+val**，没有 test。`--eval-only --split test`
+  必须对基础数据集的 `ds` 跑，否则报 `eval_only: test split 为空`。
+- **训练末尾那次 test 用的是末轮模型，不是 `ckpt_best`**（`src/trainer.cpp:284-295`），
+  直接读 `metrics.jsonl` 最后一条会偏低。评 best 必须用 `--eval-only`。
+- **`carry_resume_best` 跨数据集冻结 best**（`src/trainer.cpp:40-72`），
+  resume 还会静默继承旧 `class_weights`（`src/class_weights.cpp:134-142`）。
+  **v4 没有用 `--resume`，不受影响**；以后 resume 前先修这两处。
+- **EVAL_STANDARD 的关系词定义曾经和代码相反**：v4 的 `left` 是**经过时**目标柱在
+  机身左侧，不是「出生时刻」。v4 的 waypoint 在柱子外侧，目标柱出生时位于关系词的
+  **另一侧**。文档已按 500/500 集实测改正，读旧版 EVAL_STANDARD 会理解反。
 
 ## 五、工作纪律（必须遵守）
 
@@ -218,6 +462,16 @@ T7-R（dispatch）失败分类：起步早碰撞 49/57/99；过线后碰撞 25/3
 
 按 `EVAL_STANDARD.md §1.2`（AvoidBench ICRA 2023 口径）：SR / PO / EO，
 外加碰撞率、`false_forward_rate`、动作分布、推理 p50/p95。
+**PO / EO / AGV / MP 仍未实现**（缺 `d_min` A*），只有 SR 是完整的。
+
+**L1 的 SR 有两种口径，`eval.json` 的 `success_criterion` 区分，不可混报**：
+
+| 口径 | 判据 | 用于 |
+| --- | --- | --- |
+| `goal_reach`（**2026-11-01 起**） | 无碰撞 + 末态距 waypoint ≤ **1.5 m** | L1 v4 |
+| `goal_stop`（历史） | 无碰撞 + 末态 ≤ `stop_radius+0.2`（0.7 m）+ 末动作 `SAFE_NEUTRAL` | L1 v2/v3 |
+
+**v1 走廊任务的 SR（0.90）和 L1 的 SR（0.426）不可比**，任务定义不同。
 
 ### 基线阶梯（对标对象）
 
@@ -237,13 +491,16 @@ T7-R（dispatch）失败分类：起步早碰撞 49/57/99；过线后碰撞 25/3
 每次汇报对标结果，必须同时写清三件套：**「我们的数字」/「对标数字」/
 「对标数字的出处（论文/榜单/仓库 + 日期）」**。三者缺一不算完成。
 
-## 七、任务路线（T1–T7 已完成，下一步待拍板）
+## 七、任务路线
 
-> **T1–T7 已于 2026-10-30 全部完成**，下面各节保留当时的任务定义与关键约束，
-> 不再作为待办。当前唯一未闭环的是 **T7 同版本复跑**（§4.1，待重跑）。
-> 复跑结束后由用户拍板：**T8（模型鲁棒性 / 失败模式）或 D5（device 层接入）**。
-> T8 尚未在 `docs/TASKS.md` 立项，不要自行开工；D5 定义见 `docs/TASKS.md`。
-> 状态与验收仍以 `docs/TASKS.md` 为准，本节只讲理由与关键约束。
+> **T1–T7 已于 2026-10-30 全部完成，T7 同版本复跑也已完成。**
+> 当前唯一在做的是 **L1 语言任务**（§4.5），卡在「停得准」上，等用户拍板 B/C。
+> 下面 T1–T7 各节是**历史记录与约束**，不再作为待办，但里面的几何契约
+> （改几何要联动哪些参数、必须 bump SPLIT_SALT）仍然有效。
+> **状态与验收以 `docs/TASKS.md` 为准，本节只讲理由与约束。**
+>
+> **新 AI 不要自行开工的项目**：T8（鲁棒性/失败模式）、D5（device 层）、
+> ECPT、公开数据预训练——都未立项，等用户拍板。
 
 ### T1 = D2 车道几何决策（P1）
 
@@ -407,8 +664,8 @@ host 清零 599 ms、拷贝 220 ms、**kernel 只有 167 ms**）。按此估算 
 
 **验收**：三件套汇报齐；全量数字落 `docs/experiments/` 总结 md；TASKS 全部 done 并链 worklog。
 
-> 当前状态：旧版（R01 前）已完成，20 个冻结 seed 上 `SR 0.90`；同版本复跑正在跑
-> （§4.1）。复跑完成前不要把 0.90 当作最终数字，也不要把中间快照当结论。
+> 当前状态：同版本复跑已完成。v1 observation **SR 0.90（18/20）**、dispatch
+> T7-R **0.55（11/20）**；0.90 只适用于 observation 语义，两者禁止混报（§4.1）。
 
 ### T8 候选（未立项，等用户拍板）
 
@@ -494,6 +751,10 @@ R3 最小转向评分，约 +110–130 行。**故意排在数据采集之后**�
 
 | 项 | 现状 | 卡在哪 |
 | --- | --- | --- |
+| **L1 闭环 SR 0.426 < 50%** | 方案 A 已落地（goal_reach），根因未修 | **等用户拍板 B（改几何，重采重训）还是 C（改任务定义）**，见 §4.5 |
+| **13 次碰撞全在 1.5 m 内** | 已定位为「停止点不可观测 + 单帧无法定位 x」 | 同上，B/C 二选一 |
+| `audit_dataset.py` 不验图像 | 17 条检查只读 jsonl，`label_recompute` 是自比 | 要不要加 PNG 抽样校验，未立项 |
+| `carry_resume_best` / resume 继承 class_weights | 代码缺陷已确认，v4 未触发 | 下次用 `--resume` 前必须先修 |
 | `transition_lag` 阈值 | **已定 20%**（2026-10-30：52 集/164 过渡中位 44%，50% 误杀） | 已解决 |
 | AirSim 离散化阈值 | 10 deg/s vs 我们 `YAW=0.6 rad/s=34.4 deg/s`，差 3 倍多 | 两者是否同一动作口径无依据 |
 | 公开数据是否当预训练 | 能训、训得出来，但不知道有没有用 | 郊区街道 vs 柱阵走廊，视觉域差得远；要证明有用得预训练+微调+闭环对比 |
@@ -580,7 +841,7 @@ cd /root/claude-code-backup-20261028/code/uav_rgb && source env.sh
 bash tools/check.sh
 # 无卡时：bash tools/check.sh --python-only（会打印跳过 C++/CUDA 的说明）
 
-# 单独构建 + 全量 CTest（20 项）
+# 单独构建 + 全量 CTest（21 项）
 cmake -S src -B src/build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build src/build
 ctest --test-dir src/build --output-on-failure
 
@@ -628,14 +889,36 @@ python3 sim/tools/eval_closed_loop.py --policy student --ckpt <ckpt.bin> \
 | `PILLAR_Y_RANGE` | ±1.7 | 三条车道 ±1.6 + 中心摆动 ±0.1 |
 | `PILLAR_COUNT_RANGE` | (8, 9) | 上限 9 的推导：3.5×3.0 m 区 + 任意两柱 Chebyshev ≥ 1.3 → 最多 3×3 |
 | `GATE_Y_ABS_MAX` | 0.25 | 第一根「门柱」的 \|y\| 上限 |
-| 出生点 | (−0.5, 0, 0.15) | `SPAWN_X=-0.5`，给门柱前多 0.5 m；safe 模式在柱区内另选 |
-| 教师 | A* + 纯追踪 | 普通集 `planner=astar`；safe 出生集 `planner=plan_action`（保留真 SAFE） |
+| 出生点 | (−0.5, 0, 0.15) | `SPAWN_X=-0.5`，给门柱前多 0.5 m；`--spawn-mode random` 另加 y/yaw 随机 |
+| 教师 | A* + 纯追踪 | 全部 `planner=astar`；SAFE 来自到达 waypoint 与被围住两种情况（占 18.5%） |
+
+> **2026-11-01 几何 v4**：safe 出生模式已删除。`plan_action` 只在「±85° 内每个方向
+> 都被柱子挡住」时判 SAFE，而那种位姿的相机必然贴着柱面（实测 100/100 seed 距离
+> 0.100 m），产出 4000/10442 步纯色 SAFE 帧，是闭环 34.7% 提前停车的首要嫌疑。
+> 旧的 v3 数据（含 safe 集）不能再与新数据混包；`geometry_gid` 已随 SPLIT_SALT 重排。
+
+> **2026-11-01 几何 v5（任务语义）**：L1 landmark 改成「两根**同色**柱分居左右 +
+> 关系词指令」`pass the <color> pillar on your <left|right> and stop`（9 token，
+> `kTextLen` 8→9）。原因是 v2 的两根柱异色，图像里目标色唯一，模型可以完全忽略
+> 文本（实测换词只改变 2e-4 概率、argmax 0 次变化）。v5 的图像只给出「有两个候选」，
+> 选哪根必须读指令。同源变化：`task_version` → `l1.v3`，`--task l1` 必须配
+> `--spawn-mode random`（default 的 y=0 选不出装得进 60° 视场的左右柱对），
+> S 组消融从「换色」改成「关系词取反」，`distractor_color` 字段删除。
+> v4 及更早的数据不能与 v5 混包。
+>
+> **2026-11-01 任务 v4（`task_version=l1.v4`）**：几何版本仍是 `uavrgb.geom.v5`
+> （柱子/出生点/split 都没变），只改目标点与关系词映射：
+> `landmarks.waypoint_for` 从「朝走廊中心偏 0.8 m」改成「朝目标柱外侧偏 0.8 m」，
+> `assign_landmarks` 里 relation 与目标柱的映射随之翻反（`left` 仍表示「经过时
+> 目标柱在机身左侧」）。原因见 `docs/worklog/2026-11-01-1739-code-review-waypoint-degeneracy.md`：
+> v3 的 274 个 test 场景**没有一个**要求横移，闭环 SR 只由「敢不敢飞 + 会不会停」
+> 决定。`l1.v3` 与 `l1.v4` 数据不能混包（`preprocess.py` 按 `task_version` 拦）。
 
 ### split 机制
 
 - **`geometry_gid`**：柱子坐标/尺寸 round 到 3 位 → 排序 → sha256 前 16 位。
   seed / scene_id / 文件名都不参与，所以**同几何必同 gid**。
-- **`SPLIT_SALT`**（当前 `uavrgb.geom.v3`，与 `scene_gen.GEOMETRY_VERSION` 同源）：
+- **`SPLIT_SALT`**（当前 `uavrgb.geom.v5`，与 `scene_gen.GEOMETRY_VERSION` 同源）：
   `sha256(salt + ":" + gid)` 前 8 位 %100，<80 train / <90 val / 其余 test。
   salt 的作用是让「同一份几何」在换了生成器之后落到**不同的** split，从而不会
   新旧混在一起。
@@ -646,6 +929,8 @@ python3 sim/tools/eval_closed_loop.py --policy student --ckpt <ckpt.bin> \
 
 ### 数据与产物路径
 
+> **L1 v3/v4 的路径见 §4.4**（那里是当前主线）。本表只列不在 §4.4 里的历史产物。
+
 | 路径 | 内容 |
 | --- | --- |
 | `/root/rivermind-data/uav_rgb/t5-full-1155/` | T5 原始采集（599 集 / 23960 步，`train/ val/ test/` + `audit.json`） |
@@ -653,7 +938,7 @@ python3 sim/tools/eval_closed_loop.py --policy student --ckpt <ckpt.bin> \
 | `/root/rivermind-data/uav_rgb/t6-full-1640/run/ckpt_best.bin` | T6 best 权重（epoch 8） |
 | `/root/rivermind-data/uav_rgb/t6-full-1640/eval-best/` | T6 best 离线复评 |
 | `/root/rivermind-data/uav_rgb/t6-full-1640/eval-student/` | T7 旧版闭环（R01 前） |
-| `/root/rivermind-data/uav_rgb/t6-full-1640/eval-student-r01b/` | T7 同版本复跑（待跑） |
+| `/root/rivermind-data/uav_rgb/t6-full-1640/eval-student-r01b/` | T7-R dispatch 复跑（SR 0.55） |
 | `/root/rivermind-data/uav_rgb/airsim10k-uavr/dataset.uavr` | 公开数据打包，10000 样本 549 MiB |
 | `/root/rivermind-data/uav_rgb/airsim10k-run/` | 公开数据的训练 run（含 `ckpt.bin` / `ckpt_best.bin`） |
 | `/root/rivermind-data/uav_rgb/d1-verify-a` `d1-verify-b` | 新格式自采验证量（各 2 集 × 8 步） |
@@ -671,6 +956,18 @@ python3 sim/tools/eval_closed_loop.py --policy student --ckpt <ckpt.bin> \
 
 ## 附：历史交接记录
 
-本文档 2026-10-30 03:00 重写，21:55 更新当前状态（T1–T7、D4、T7 复跑）。
-此前 01:10 / 22:00 / 22:10 三个版本的实质内容已并入上文（合同、环境事实、坑），
-未并入的部分见 git 历史与 `docs/worklog/`。
+- 2026-10-29 22:10 初版；2026-10-30 03:00 重写；2026-10-30 21:55 更新（T1–T7、D4、T7 复跑）。
+- 2026-10-31 20:10 更新（L2 文本分支、v2 500 集数据）。
+- **2026-11-01 21:52 更新（本次）**：L1 任务走到 v4；§4.3 换成 v4 数字；
+  §4.5 重写（数据四代沿革 + 停止点不可观测 + 方案 A 已落地 + B/C 待拍板）；
+  §六补 `goal_reach` 口径；§八补 6 条新坑；§九补 4 条待确认。
+  更早的实质内容已并入上文（合同、环境事实、坑），未并入的部分见
+  git 历史与 `docs/worklog/`。
+
+**给接手 AI 的最后三条**：
+
+1. **报数字前先读 `docs/EVAL_STANDARD.md`**，离地四件套（acc + macro_f1 +
+   bal_acc + 每类 recall）缺一不可，只报准确率等于造假。
+2. **不要自行重跑实验**。v4 的三组闭环要 80 min，数值不会变；训练要 81 min。
+   下一步是 B/C 的选择题，需要用户拍板。
+3. **不要 `git add -A`**。工作树里有并发会话的改动，逐文件确认归属。

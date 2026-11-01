@@ -35,7 +35,9 @@ void Trainer::evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& 
     const std::vector<std::uint32_t> part = detail::slice(idx, s, e);
     const std::vector<int> y = detail::take_labels(ds, idx, s, e);
     ds.load_images(part, x);
-    const Tensor logits = forward(model_, x);
+    std::vector<std::uint8_t> text;
+    if (cfg_.text_dim > 0) ds.load_text(part, text);
+    const Tensor logits = forward(model_, x, nullptr, text.empty() ? nullptr : &text);
     // dev_ce 合同为无权 Teacher CE，不能随训练权重或 batch 划分改变。
     sum += static_cast<double>(softmax_ce_loss_cuda(logits, y)) *
            static_cast<double>(part.size());
@@ -68,7 +70,12 @@ void Trainer::eval_only(const std::string& ckpt_path, bool eval_val, bool eval_t
   // 的指标对不上（碰撞步在两边的去留不同）。
   UavrDataset ds = load_uavr(cfg_.data_path, LoadOptions{cfg_.drop_collision});
   std::filesystem::create_directories(cfg_.out_dir);
-  model_ = make_cnn(ds.h, ds.w, cfg_.seed, static_cast<int>(ds.num_classes));
+  // 模型结构以 checkpoint 为准；--text-dim 只影响训练，不覆盖 checkpoint 记录的结构。
+  cfg_.text_dim = read_checkpoint_meta(ckpt_path).text_dim;
+  if (cfg_.text_dim > 0 && ds.text_ids.empty()) {
+    throw std::runtime_error("eval_only: checkpoint 有文本分支，但数据集没有 instructions 侧车");
+  }
+  model_ = make_cnn(ds.h, ds.w, cfg_.seed, static_cast<int>(ds.num_classes), cfg_.text_dim);
   state_ = make_train_state(model_, cfg_.lr);
   load_checkpoint(ckpt_path, model_, state_);
 

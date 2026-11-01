@@ -38,8 +38,8 @@ std::string num(double v) {
 // resume 的历史 best 必须能在新目录独立交付：同目录核对文件存在且状态一致；
 // 跨目录先核对再复制，绝不能让新 run 继承一个分数却没有对应权重文件。
 void carry_resume_best(const std::string& resume_path, const std::string& out_dir,
-                       int h, int w, std::uint32_t seed, int num_classes, float lr,
-                       const TrainState& state) {
+                       int h, int w, std::uint32_t seed, int num_classes, int text_dim,
+                       float lr, const TrainState& state) {
   namespace fs = std::filesystem;
   if (!(state.best_macro_f1 >= 0.0f)) return;  // 旧格式/从未评估过，无 best 可带
   const fs::path rp(resume_path);
@@ -52,7 +52,7 @@ void carry_resume_best(const std::string& resume_path, const std::string& out_di
                              " 不存在；无法交付历史 best");
   }
   // 核对源 best 确实属于这次 resume：分数、类别权重都要与 checkpoint 记录一致。
-  CnnModel m = make_cnn(h, w, seed, num_classes);
+  CnnModel m = make_cnn(h, w, seed, num_classes, text_dim);
   TrainState s = make_train_state(m, lr);
   load_checkpoint(src_best.string(), m, s);
   if (s.best_macro_f1 != state.best_macro_f1 || s.class_weights != state.class_weights) {
@@ -113,7 +113,11 @@ void Trainer::run() {
   class_weights_ = resolve_class_weights(cfg_.class_weights, ds);
   class_weights_source_ = class_weights_source(cfg_.class_weights);
 
-  model_ = make_cnn(ds.h, ds.w, cfg_.seed, static_cast<int>(ds.num_classes));
+  if (cfg_.text_dim > 0 && ds.text_ids.empty()) {
+    throw std::runtime_error(
+        "trainer: --text-dim>0 但数据集没有 instructions.jsonl 侧车（用新版 preprocess.py 重打包）");
+  }
+  model_ = make_cnn(ds.h, ds.w, cfg_.seed, static_cast<int>(ds.num_classes), cfg_.text_dim);
   state_ = make_train_state(model_, cfg_.lr);
   if (!cfg_.resume.empty()) {
     load_checkpoint(cfg_.resume, model_, state_);
@@ -123,7 +127,7 @@ void Trainer::run() {
   state_.class_weights = class_weights_;
   if (!cfg_.resume.empty()) {
     carry_resume_best(cfg_.resume, cfg_.out_dir, ds.h, ds.w, cfg_.seed,
-                      static_cast<int>(ds.num_classes), cfg_.lr, state_);
+                      static_cast<int>(ds.num_classes), cfg_.text_dim, cfg_.lr, state_);
   }
   write_run_config(cfg_.out_dir, cfg_, class_weights_, class_weights_source_);
 
@@ -182,9 +186,11 @@ void Trainer::run() {
       const std::vector<std::uint32_t> part = detail::slice(order, s, e);
       const std::vector<int> y = detail::take_labels(ds, order, s, e);
       ds.load_images(part, x);
+      std::vector<std::uint8_t> text;
+      if (cfg_.text_dim > 0) ds.load_text(part, text);
 
       CnnCache cache;
-      const Tensor logits = forward(model_, x, &cache);
+      const Tensor logits = forward(model_, x, &cache, text.empty() ? nullptr : &text);
       const float loss = class_weighted_loss(logits, y, class_weights_);
       if (!std::isfinite(loss)) {
         metrics << metrics_json(make_error(Severity::kFatal, "TRAIN_NONFINITE_METRIC", step + 1,

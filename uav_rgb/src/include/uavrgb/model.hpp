@@ -6,6 +6,7 @@
 #include "uavrgb/nn.hpp"
 #include "uavrgb/ops.hpp"
 #include "uavrgb/tensor.hpp"
+#include "uavrgb/text.hpp"  // kTextLen / kTextVocab
 
 #include <cstddef>
 #include <cstdint>
@@ -20,6 +21,15 @@ struct CnnModel {
   Linear fc;  // 64*(in_h/8)*(in_w/8) -> num_classes
   int in_h = 0;
   int in_w = 0;
+  // 文本分支（可选）：每个 token 位置各取 embedding，拼成 kTextLen*text_dim 维，
+  // 再经 film 生成逐通道的 γ/β，调制 conv 最后一层特征（FiLM）：
+  //   y' = (1+γ)·y + β
+  // 纯 concat 是 late fusion，换文本只能加一个与图像无关的常数 bias，无法表达
+  // “文本说红 → 去画面里的红柱”；实测三种训练都让模型忽略文本，故改 FiLM。
+  // text_dim == 0 表示没有文本分支；此时 forward 必须不传 text。
+  Tensor text_emb;  // [kTextVocab, text_dim]
+  Linear film;      // [kTextLen*text_dim] -> 2*c3.out（前半 γ，后半 β）
+  int text_dim = 0;
 };
 
 // 反向所需的中间激活；只有传了 cache 的 forward 才填充（否则全空，省内存）。
@@ -32,17 +42,25 @@ struct CnnCache {
   MaxPoolResult p2;
   Tensor c3, r3;
   MaxPoolResult p3;
-  Tensor flat;  // [N, fc.in]
+  Tensor flat;       // [N, 图像部分]：fc 的输入（FiLM 调制后的 flatten）
+  Tensor text_feat;  // [N, kTextLen*text_dim]
+  Tensor film_out;   // [N, 2*c3.out]：前半 γ，后半 β
+  std::vector<std::uint8_t> text_ids;  // [N*kTextLen]，与 text_feat 同批
 };
 
 struct CnnGrad {
   ConvGrad c1, c2, c3;
   LinearGrad fc;
+  LinearGrad film;   // 只有文本分支存在时有效
+  Tensor text_demb;  // [kTextVocab, text_dim]；无文本分支时为空
 };
 
 // Xavier-uniform 初始化 W、b 置零；seed 固定则参数可复现。
 // num_classes 默认 4（action.hpp 的 kNumActions），但保留参数用于结构自检。
-CnnModel make_cnn(int in_h, int in_w, std::uint32_t seed = 0, int num_classes = 4);
+// text_dim > 0 时额外建 [kTextVocab, text_dim] 的 embedding 表和 FiLM 层；
+// fc 输入维度不变（文本不进 concat）。
+CnnModel make_cnn(int in_h, int in_w, std::uint32_t seed = 0, int num_classes = 4,
+                  int text_dim = 0);
 
 std::size_t num_params(const CnnModel& m);
 
@@ -53,7 +71,10 @@ std::vector<const Tensor*> cnn_params(const CnnModel& m);
 std::vector<Tensor*> cnn_grad_tensors(CnnGrad& g);
 
 // logits[N,num_classes]；cache 非空时顺带保存反向所需激活。
-Tensor forward(const CnnModel& m, const Tensor& x, CnnCache* cache);
+// text 非空时按 [N*kTextLen] 的 token id 取 embedding 并 mean-pool（忽略 <pad>）；
+// m.text_dim == 0 时必须为 nullptr，否则抛异常。
+Tensor forward(const CnnModel& m, const Tensor& x, CnnCache* cache,
+               const std::vector<std::uint8_t>* text = nullptr);
 inline Tensor forward(const CnnModel& m, const Tensor& x) { return forward(m, x, nullptr); }
 
 // 逐层反传：fc → pool3 → relu3 → conv3 → … → conv1。

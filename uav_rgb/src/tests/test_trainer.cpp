@@ -204,6 +204,14 @@ int main() {
   // 4) results.csv 字段
   check_results_csv(cfg.out_dir + "/results.csv", cfg.epochs);
 
+  // 文本分支必须能从 run 目录复现：config.json 要记录 text_dim（L2 的 A/B 全靠它）。
+  {
+    std::ifstream cf(cfg.out_dir + "/config.json");
+    const std::string cjs((std::istreambuf_iterator<char>(cf)),
+                          std::istreambuf_iterator<char>());
+    check(cjs.find("\"text_dim\":0") != std::string::npos, "config.json 缺 text_dim 字段");
+  }
+
   // 5) best-checkpoint：记录值必须等于 dev 宏 F1 峰值，且文件能读回。
   const double best_seen = max_field(cfg.out_dir + "/metrics.jsonl", "\"macro_f1\":");
   std::cout << "best dev macro_f1=" << best_seen
@@ -271,7 +279,8 @@ int main() {
     check(nw == 0, "v2 兼容用例假设 checkpoint 无类别权重");
     const std::uint32_t two = 2;
     std::memcpy(&bytes[8], &two, 4);
-    bytes.erase(bytes.begin() + 44, bytes.begin() + 48);  // 去掉 v3 的 best 字段
+    // 去掉 v3 的 best_macro_f1 和 v4 的 text_dim（各 4 B），还原成 v2 布局。
+    bytes.erase(bytes.begin() + 44, bytes.begin() + 52);
     std::ofstream out(v2, std::ios::binary);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
   }
@@ -292,8 +301,13 @@ int main() {
     std::vector<char> bytes((std::istreambuf_iterator<char>(in)),
                             std::istreambuf_iterator<char>());
     std::uint32_t ndim = 0;
-    std::memcpy(&ndim, &bytes[48], 4);  // 参数 0 的 ndim（头部 48 B 之后）
-    const std::size_t off = 48 + 4 + static_cast<std::size_t>(ndim) * 8;
+    std::memcpy(&ndim, &bytes[52], 4);  // 参数 0 的 ndim（v4 头部 52 B 之后）
+    const std::size_t off = 52 + 4 + static_cast<std::size_t>(ndim) * 8;
+    check(off + 4 <= bytes.size(), "NaN 注入点超出 checkpoint 文件大小");
+    if (off + 4 > bytes.size()) {
+      std::cerr << "RESULT: FAIL（NaN 注入越界）\n";
+      return 1;
+    }
     const std::uint32_t nan_bits = 0x7fc00000u;
     std::memcpy(&bytes[off], &nan_bits, 4);
     std::ofstream out(nan_ckpt, std::ios::binary);
@@ -302,12 +316,16 @@ int main() {
   CnnModel m5 = make_cnn(120, 160, cfg.seed, 4);
   TrainState st5 = make_train_state(m5, cfg.lr);
   bool nan_rejected = false;
+  std::string nan_msg;
   try {
     load_checkpoint(nan_ckpt, m5, st5);
-  } catch (const std::invalid_argument&) {
+  } catch (const std::invalid_argument& e) {
     nan_rejected = true;
+    nan_msg = e.what();
   }
-  check(nan_rejected, "含 NaN 参数的 checkpoint 必须被拒绝");
+  // 只断言“抛了 invalid_argument”不够：形状不符也会抛，必须确认走的是有限性检查。
+  check(nan_rejected && nan_msg.find("含非有限值") != std::string::npos,
+        "含 NaN 参数的 checkpoint 必须被有限性检查拒绝（实际: " + nan_msg + "）");
 
   // 结构不符的模型必须被拒，而不是静默加载一半
   CnnModel m3 = make_cnn(128, 128, cfg.seed, 4);

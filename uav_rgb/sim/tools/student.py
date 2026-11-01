@@ -42,13 +42,24 @@ class StudentPolicy:
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._err)
         line = self.proc.stdout.readline()
         if not line:
-            raise RuntimeError(f"推理进程启动失败：{self._stderr()}")
-        hello = json.loads(line)
+            self._abort_start(f"推理进程启动失败：{self._stderr()}")
+        try:
+            hello = json.loads(line)
+        except ValueError as exc:
+            self._abort_start(f"推理进程 hello 不是合法 JSON：{exc}")
         self.h = int(hello["in_h"])
         self.w = int(hello["in_w"])
         self.in_c = int(hello["in_c"])
         if self.in_c != 3:
-            raise RuntimeError(f"模型输入通道 {self.in_c} != 3，相机是 RGB")
+            self._abort_start(f"模型输入通道 {self.in_c} != 3，相机是 RGB")
+        # 非四动作模型会让越界动作在 collect 里静默变成悬停，闭环数字看似正常但无意义。
+        # 用 get：旧 infer 没有该字段时应走 _abort_start 杀掉子进程，而不是 KeyError 泄漏。
+        classes = hello.get("num_classes")
+        if classes is None or int(classes) != 4:
+            self._abort_start(
+                f"模型输出 {classes} 类 != 4（SAFE/FORWARD/LEFT/RIGHT）")
+        # 文本分支维度：0 表示纯视觉模型；L/I/S 消融靠它确认改文本真的会改推理。
+        self.text_dim = int(hello.get("text_dim", 0))
         self.frames = 0
         self._warmup()
 
@@ -60,7 +71,7 @@ class StudentPolicy:
         self.proc.stdin.write(bytes(self.h * self.w * self.in_c))
         self.proc.stdin.flush()
         if not self.proc.stdout.readline():
-            raise RuntimeError(f"推理进程 warmup 失败：{self._stderr()}")
+            self._abort_start(f"推理进程 warmup 失败：{self._stderr()}")
 
     def act(self, msg):
         """gz.msgs.Image dict -> (action, infer_ms, probs)。解码/推理失败抛异常。"""
@@ -78,6 +89,21 @@ class StudentPolicy:
         obj = json.loads(line)
         self.frames += 1
         return int(obj["action"]), float(obj["infer_ms"]), obj["probs"]
+
+    def _abort_start(self, msg):
+        """构造失败时杀掉已启动的推理进程，避免留下阻塞在 stdin 的孤儿。"""
+        proc = self.proc
+        self.proc = None
+        if proc is not None:
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if self._err is not None:
+            self._err.close()
+            self._err = None
+        raise RuntimeError(msg)
 
     def close(self):
         if self.proc is None:
