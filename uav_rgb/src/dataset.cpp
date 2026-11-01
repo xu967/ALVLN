@@ -267,6 +267,9 @@ void load_text_sidecar(UavrDataset& ds, const std::string& uavr_path,
   std::string line;
   std::size_t lineno = 0;
   std::size_t used = 0;
+  std::size_t with_ids = 0;      // 带 text_ids 的行数
+  std::size_t missing_ids = 0;   // 缺 text_ids 的行数
+  std::size_t first_missing = 0; // 第一处缺 text_ids 的行号（混合时报错用）
   while (std::getline(f, line)) {
     ++lineno;
     if (line.find_first_not_of(" \t\r\n") == std::string::npos) continue;
@@ -300,10 +303,17 @@ void load_text_sidecar(UavrDataset& ds, const std::string& uavr_path,
       fail("instructions.jsonl 第 " + std::to_string(lineno) + " 行 episode_id 不匹配（侧车 " +
            side_id + " vs meta " + eps[match].id + "）");
     }
-    // 旧侧车（L2 之前）没有 text_ids：当作没有侧车。image-only 照常训练，
+    // 旧侧车（L2 之前）整份都没有 text_ids：当作没有侧车。image-only 照常训练，
     // 真需要文本的模型由 trainer 报「没有侧车」，不在读取层拦整个数据集。
+    // 但只有部分行缺 text_ids 说明侧车半迁移/混源：静默丢弃会让文本模型误以为
+    // 整份侧车不存在，必须报错。这里只记行号并继续，末尾校验对两种情况都要跑。
     const std::size_t kp = line.find("\"text_ids\":");
-    if (kp == std::string::npos) return;
+    if (kp == std::string::npos) {
+      if (missing_ids == 0) first_missing = lineno;
+      ++missing_ids;
+      continue;
+    }
+    ++with_ids;
     const std::size_t lb = line.find('[', kp);
     const std::size_t rb = line.find(']', kp);
     if (lb == std::string::npos || rb == std::string::npos || rb < lb) {
@@ -351,6 +361,11 @@ void load_text_sidecar(UavrDataset& ds, const std::string& uavr_path,
   }
   for (std::size_t i = 0; i < seen.size(); ++i) {
     if (seen[i] == 0) fail("instructions.jsonl 未覆盖 episode " + std::to_string(i));
+  }
+  if (missing_ids != 0) {
+    if (with_ids == 0) return;  // 整份旧侧车：视为无侧车（保持旧行为）
+    fail("instructions.jsonl 第 " + std::to_string(first_missing) +
+         " 行缺 text_ids（部分行有、部分行没有）");
   }
   ds.text_ids = std::move(ids);
 }

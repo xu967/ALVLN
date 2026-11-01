@@ -278,6 +278,8 @@ def _popen_collect(task, args, env, log_path):
            "--window-from", args.window_from]
     if args.policy != "teacher":
         cmd += ["--policy", args.policy]
+    if args.save_depth:
+        cmd.append("--save-depth")
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, bufsize=1,
                             start_new_session=True)
@@ -429,9 +431,9 @@ def main():
     p.add_argument("--hold", type=float, default=1.0,
                    help="每动作仿真时间秒（走满即发零速，与 RTF 无关）")
     p.add_argument("--window-from", choices=("dispatch", "observation"),
-                   default="dispatch",
-                   help="动作窗口起点：dispatch=派发位姿（默认）；"
-                        "observation=观测位姿（v1 baseline 语义）")
+                   default="observation",
+                   help="动作窗口起点：observation=观测位姿（默认，唯一被采纳基线）；"
+                        "dispatch=派发位姿（仅复现 T7-R，数字不可与 observation 混报）")
     p.add_argument("--out", required=True, help="汇总输出目录（必须为空/不存在）")
     p.add_argument("--base-seed", type=int, default=0,
                    help="scene_id = seed = base_seed + 扫描序号；给 --split 时只取该 split 的 seed")
@@ -444,6 +446,8 @@ def main():
     p.add_argument("--task", choices=("base", "l1"), default="base",
                    help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
     p.add_argument("--policy", choices=("teacher", "forward"), default="teacher")
+    p.add_argument("--save-depth", action="store_true",
+                   help="透传给 collect.py：每步另存 depth/depth_%%05d.png（16 位 PNG，毫米）")
     p.add_argument("--template", default=DEFAULT_TEMPLATE)
     p.add_argument("--keep-worlds", action="store_true",
                    help="把生成的 SDF 保留到 <out>/worlds/ 便于复现")
@@ -462,6 +466,10 @@ def main():
         p.error("--hold must be finite and > 0")
     if args.episode_timeout <= 0 or args.sim_timeout <= 0:
         p.error("timeouts must be > 0")
+    # default 出生在 y=0，assign_landmarks 找不到跨轴同色柱对会直接抛错；
+    # 等到生成世界才失败会白跑一轮，命令行阶段就拒绝。
+    if args.task == "l1" and args.spawn_mode != "random":
+        p.error("--task l1 必须配 --spawn-mode random")
     for path, name in ((SCENE_GEN, "scene_gen.py"), (COLLECT, "collect.py"),
                        (args.template, "template")):
         if not os.path.isfile(path):

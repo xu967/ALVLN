@@ -13,6 +13,8 @@
   manifest_validity  每集 validity 三项全 true      训练集必须是逐集跑满的
   instruction_coverage 每集 instruction 非空/无坐标 旧数据无字段 SKIP；部分缺 FAIL
   time_pairing       每步 depth/pose 与 RGB 的 |gap| > 50 ms 说明观测不同步
+  window_semantics   每集 manifest.window_from       必须全包唯一；混用
+                                                     dispatch/observation 结论不可比
   action_window      动作窗口 sim_dt 的变异系数       > 5% 说明 hold 随 RTF 漂移
   forward_motion     稳态 FORWARD_SLOW 步的位移       < 0.4×SPEED_FWD×dt 说明动作没生效
   transition_lag     偏航后第一步的位移中位数         < 50% 标称说明过渡步几乎不动
@@ -20,9 +22,17 @@
                                                      反向偏航接续步跳过（惯性不可测）
   class_share        每类样本占比 / split 内缺席     < 5% 的类学不出来；
                                                       某 split 缺整类会让 recall 结构性为 0
+  waypoint_side      waypoint 必须在目标柱外侧        目标柱按 relation 映射：
+                                                     left → 右侧柱，right → 左侧柱；
+                                                     waypoint 横向偏移必须 > 0.9 m
+  provenance_uniform teacher_version 有值必须统一    task_version 全缺视为同一代
   split_geometry     train/test 的 geometry_gid 交集 必须为 0
   label_recompute    用 pillars+动作前位姿复算标签    需 teacher=plan_action 且 actions
                                                      里有 pose_before；不一致率必须为 0
+
+反事实集（manifest.counterfactual_of 非空）复用原集 RGB/oracle/轨迹，只重写
+action 与 waypoint；teacher_waypoint/teacher_stop/forward_motion/transition_lag/
+yaw_direction/class_share 判 SKIP。label_recompute 照常执行。
 """
 import argparse
 import json
@@ -67,6 +77,7 @@ MAX_FWD_FAIL_SHARE = 0.01
 MIN_TRANSITION_RATIO = 0.2
 YAW_MIN_DEG = 0.5
 MIN_CLASS_SHARE = 0.05
+WAYPOINT_MIN_LATERAL = 0.9   # v4 waypoint 在目标柱外侧 standoff 0.8 以上
 MAX_LABEL_MISMATCH = 0.0     # plan_action 是确定性的，同一输入必然同一标签
 # 指令里出现坐标/带单位小数说明把 oracle 泄漏进了文本（L0/L1）
 COORD_RE = re.compile(r"(?:\bx\s*=|\by\s*=|\(\s*-?\d|\d+\.\d+\s*m\b)", re.IGNORECASE)
@@ -192,6 +203,10 @@ def episode_facts(ep_dir):
         "planner": man.get("planner"),
         "teacher_version": man.get("teacher_version"),
         "geometry_version": man.get("geometry_version"),
+        # make_counterfactual.py 写进 manifest 的标记；非空说明标签是重算的。
+        "counterfactual_of": man.get("counterfactual_of"),
+        # 动作窗口语义：collect.py 只写进 episode_manifest.json，actions.jsonl 行里没有。
+        "window_from": man.get("window_from"),
         "gid": gid,
         "pillars": pillars,
         "clearance": clearance,
@@ -230,6 +245,12 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
     bad = [f for f in facts if f.get("error")]
     gate = ok + [f for f in pre_excluded if not f.get("error")]
     steps = [s for f in ok for s in f["steps"]]
+    # 反事实集只重写 action/waypoint，轨迹仍是原集的：轨迹类检查对它必然假 FAIL。
+    cf_ok = [f for f in ok if f.get("counterfactual_of") is not None]
+    norm_ok = [f for f in ok if f.get("counterfactual_of") is None]
+    traj_steps = [s for f in norm_ok for s in f["steps"]]
+    CF_SKIP = ("反事实集复用原集 RGB/oracle/轨迹，只重写 action 与 waypoint，"
+               "动作类检查不适用")
     checks = []
 
     if bad:
@@ -275,20 +296,25 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
     if not l1:
         checks.append(check("target_color", "SKIP", "无 instruction（非 L1 数据）"))
         checks.append(check("relation_balance", "SKIP", "无 instruction（非 L1 数据）"))
+        checks.append(check("waypoint_side", "SKIP", "无 instruction（非 L1 数据）"))
         checks.append(check("teacher_waypoint", "SKIP", "无 instruction（非 L1 数据）"))
     else:
         bad = []
         for f in l1:
             want = parse_target_color(f["instruction"])
-            colors = {p.get("color") for p in (f.get("pillars") or [])}
+            # 同色柱对是任务定义的一部分：恰好 2 根彩色柱且同色，颜色就是目标色。
+            colored = [p for p in (f.get("pillars") or []) if p.get("color")]
+            colors = {p.get("color") for p in colored}
+            same_pair = len(colored) == 2 and len(colors) == 1
             words = set(f["instruction"].lower().split())
-            if (want is None or want != f.get("target_color") or want not in colors
+            if (want is None or not same_pair or want not in colors
+                    or want != f.get("target_color")
                     or f.get("relation") not in ("left", "right")
                     or f["relation"] not in words):
                 bad.append(f["dir"])
         checks.append(check("target_color", "FAIL" if bad else "PASS",
-                            f"{len(bad)}/{len(l1)} 集指令与 scene 的目标色/关系词不一致",
-                            samples=bad[:5]))
+                            f"{len(bad)}/{len(l1)} 集指令与 scene 的目标色/同色柱对/"
+                            f"关系词不一致", samples=bad[:5]))
 
         # 同色柱对：两根彩色柱必须分居出生点左右，且 left/right 两类都要有。
         # 旧版查的「目标最近/最远」在同色下失效——两根都是目标色，恒为最近。
@@ -319,39 +345,83 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
                 f"left {left_n} / right {right_n}，两柱未分居左右 {len(bad_pair)} 集，"
                 f"缺数据 {no_data}", samples=bad_pair[:5]))
 
-        l1w = [f for f in l1 if isinstance(f.get("waypoint"), dict)]
-        if not l1w:
-            checks.append(check("teacher_waypoint", "SKIP", "无 waypoint"))
+        # waypoint 必须在目标柱外侧。目标柱按 assign_landmarks 的映射复算：
+        # relation=left → 目标在右侧，relation=right → 目标在左侧。
+        bad_side = []
+        side_no_data = 0
+        for f in l1:
+            colored = [p for p in (f.get("pillars") or []) if p.get("color")]
+            spawn, wp = f.get("scene_spawn"), f.get("waypoint")
+            rel = f.get("relation")
+            if (len(colored) != 2 or not isinstance(spawn, dict)
+                    or "x" not in spawn or "y" not in spawn
+                    or not isinstance(wp, dict) or "x" not in wp or "y" not in wp
+                    or rel not in ("left", "right")):
+                side_no_data += 1
+                continue
+            # lateral>0 为左，目标柱在 relation 的相反侧。
+            hits = [p for p in colored
+                    if (lm.lateral(p, spawn) > 0) == (rel == "right")]
+            if len(hits) != 1:
+                bad_side.append(f["dir"])
+                continue
+            target = hits[0]
+            lat_t, lat_w = lm.lateral(target, spawn), lm.lateral(wp, spawn)
+            if (wp["x"] != target["x"] or (lat_w > 0) != (lat_t > 0)
+                    or abs(lat_w) <= WAYPOINT_MIN_LATERAL):
+                bad_side.append(f["dir"])
+        if not bad_side and side_no_data == len(l1):
+            checks.append(check("waypoint_side", "SKIP",
+                                f"无可计算集（缺数据 {side_no_data}）"))
         else:
-            miss = [f["dir"] for f in l1w if f.get("waypoint_min_dist") is None]
-            badw = [f["dir"] for f in l1w if f.get("waypoint_min_dist") is not None
-                    and f["waypoint_min_dist"] > 1.0]
             checks.append(check(
-                "teacher_waypoint", "FAIL" if (badw or miss) else "PASS",
-                f"{len(badw)} 集最近距离 >1.0 m，{len(miss)} 集无位姿",
-                samples=(badw + miss)[:5]))
+                "waypoint_side", "FAIL" if bad_side else "PASS",
+                f"{len(bad_side)}/{len(l1)} 集 waypoint 不在目标柱外侧，"
+                f"缺数据 {side_no_data}", samples=bad_side[:5]))
 
-        # goal-stop（v2）：teacher 必须停在 waypoint 半径内，且末动作是 SAFE。
-        # 旧 route-choice 数据没有 stop_radius，SKIP，不把历史数据改判。
-        l1s = [f for f in l1 if f.get("stop_radius") is not None
-               and f.get("planner") == "astar"]
-        if not l1s:
-            # 有 stop_radius 却没有任何可核验的 astar 集（例如全是 safe 出生集
-            # 或 planner 字段缺失）时不能 SKIP：那等于门禁对这类数据整体失效。
-            has_stop = any(f.get("stop_radius") is not None for f in l1)
-            checks.append(check(
-                "teacher_stop", "FAIL" if has_stop else "SKIP",
-                "有 stop_radius 但没有 planner=astar 的集可核验" if has_stop
-                else "无 stop_radius（旧 route-choice 数据）"))
+        # 反事实集的 oracle 轨迹沿用原集，teacher_waypoint/teacher_stop 必然假 FAIL。
+        l1n = [f for f in l1 if f.get("counterfactual_of") is None]
+        cf_note = (f"；另有 {len(l1) - len(l1n)} 集为反事实集未参与"
+                   if len(l1n) < len(l1) else "")
+        if not l1n:
+            checks.append(check("teacher_waypoint", "SKIP",
+                                f"{CF_SKIP}（{len(l1)} 集）"))
+            checks.append(check("teacher_stop", "SKIP",
+                                f"{CF_SKIP}（{len(l1)} 集）"))
         else:
-            bad = [f["dir"] for f in l1s
-                   if f.get("final_waypoint_dist") is None
-                   or f["final_waypoint_dist"] > float(f["stop_radius"]) + 0.2
-                   or f.get("last_action") != 0]
-            checks.append(check(
-                "teacher_stop", "FAIL" if bad else "PASS",
-                f"{len(bad)}/{len(l1s)} 集未停在 waypoint 半径内或末动作不是 SAFE",
-                samples=bad[:5]))
+            l1w = [f for f in l1n if isinstance(f.get("waypoint"), dict)]
+            if not l1w:
+                checks.append(check("teacher_waypoint", "SKIP", "无 waypoint"))
+            else:
+                miss = [f["dir"] for f in l1w if f.get("waypoint_min_dist") is None]
+                badw = [f["dir"] for f in l1w if f.get("waypoint_min_dist") is not None
+                        and f["waypoint_min_dist"] > 1.0]
+                checks.append(check(
+                    "teacher_waypoint", "FAIL" if (badw or miss) else "PASS",
+                    f"{len(badw)} 集最近距离 >1.0 m，{len(miss)} 集无位姿{cf_note}",
+                    samples=(badw + miss)[:5]))
+
+            # goal-stop（v2）：teacher 必须停在 waypoint 半径内，且末动作是 SAFE。
+            # 旧 route-choice 数据没有 stop_radius，SKIP，不把历史数据改判。
+            l1s = [f for f in l1n if f.get("stop_radius") is not None
+                   and f.get("planner") == "astar"]
+            if not l1s:
+                # 有 stop_radius 却没有任何可核验的 astar 集（例如全是 safe 出生集
+                # 或 planner 字段缺失）时不能 SKIP：那等于门禁对这类数据整体失效。
+                has_stop = any(f.get("stop_radius") is not None for f in l1n)
+                checks.append(check(
+                    "teacher_stop", "FAIL" if has_stop else "SKIP",
+                    "有 stop_radius 但没有 planner=astar 的集可核验" if has_stop
+                    else "无 stop_radius（旧 route-choice 数据）"))
+            else:
+                bad = [f["dir"] for f in l1s
+                       if f.get("final_waypoint_dist") is None
+                       or f["final_waypoint_dist"] > float(f["stop_radius"]) + 0.2
+                       or f.get("last_action") != 0]
+                checks.append(check(
+                    "teacher_stop", "FAIL" if bad else "PASS",
+                    f"{len(bad)}/{len(l1s)} 集未停在 waypoint 半径内或末动作不是 SAFE"
+                    f"{cf_note}", samples=bad[:5]))
 
     # 2) 时间配对（缺 gap 字段的步单列；部分缺失不能让检查按 0 放过）
     covered = [s["gap"] for s in steps if s["gap"] is not None]
@@ -383,10 +453,13 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
     # 4) 前进动作是否真的动。刚做完偏航的那一步有加速滞后，单独看，否则
     #    两群混在一起会得出「13% 动作没生效」的误判。
     approx = "（位移由位姿差近似，窗口错位 ±60 ms）" if any(
-        s["disp_approx"] for s in steps) else ""
-    steady = [s for s in steps if s["action"] == 1 and s["prev_action"] == 1
+        s["disp_approx"] for s in traj_steps) else ""
+    steady = [s for s in traj_steps if s["action"] == 1 and s["prev_action"] == 1
               and s["disp"] is not None]
-    if not steady:
+    if cf_ok and not norm_ok:
+        checks.append(check("forward_motion", "SKIP",
+                            f"{CF_SKIP}（{len(cf_ok)} 集）"))
+    elif not steady:
         checks.append(check("forward_motion", "SKIP", "没有连续两个前进步，无法判定"))
     else:
         bad_fwd = [s for s in steady if s["disp"] < FWD_MIN_V * s["dt"]]
@@ -397,9 +470,12 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
                             f"{approx}"))
 
     # 4b) 偏航→前进的过渡步几乎不动
-    trans = [s for s in steps if s["action"] == 1 and s["prev_action"] in (2, 3)
+    trans = [s for s in traj_steps if s["action"] == 1 and s["prev_action"] in (2, 3)
              and s["disp"] is not None and s["dt"] > 0]
-    if not trans:
+    if cf_ok and not norm_ok:
+        checks.append(check("transition_lag", "SKIP",
+                            f"{CF_SKIP}（{len(cf_ok)} 集）"))
+    elif not trans:
         checks.append(check("transition_lag", "SKIP", "没有偏航接前进的过渡步"))
     else:
         ratios = sorted(s["disp"] / (SPEED_FWD * s["dt"]) for s in trans)
@@ -413,13 +489,16 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
     # 反向偏航接续步：上一步是反向 YAW，窗口前半段要先抵消上一步的角速度，
     # 净 dyaw 反映不了新指令（T5 实测 17 个反转步里 3 个 |dyaw|<0.5°，且
     # 非反转步 0 异常）；按物理不可测跳过，但计入 detail。
-    yaw_all = [s for s in steps if s["action"] in (2, 3)]
+    yaw_all = [s for s in traj_steps if s["action"] in (2, 3)]
     yaw = [s for s in yaw_all if s["dyaw"] is not None]
     def is_reversal(s):
         return (s["prev_action"], s["action"]) in ((3, 2), (2, 3))
 
     checked = [s for s in yaw if not is_reversal(s)]
-    if not yaw_all:
+    if cf_ok and not norm_ok:
+        checks.append(check("yaw_direction", "SKIP",
+                            f"{CF_SKIP}（{len(cf_ok)} 集）"))
+    elif not yaw_all:
         checks.append(check("yaw_direction", "SKIP", "没有偏航步，无法核验偏航方向"))
     elif not yaw:
         checks.append(check("yaw_direction", "SKIP",
@@ -439,26 +518,31 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
                             f"另有 {len(yaw_all) - len(yaw)} 步 dyaw=null 未验）"))
 
     # 6) 类别分布（附 per-split 计数：T3 要确认 val/test 里 SAFE 有 support）
-    counts = Counter(s["action"] for s in steps)
-    total = len(steps)
-    dist = {NAMES[k]: counts.get(k, 0) for k in range(4)}
-    thin = [NAMES[k] for k in range(4) if counts.get(k, 0) / total < MIN_CLASS_SHARE]
-    per_split = {}
-    for f in ok:
-        c = Counter(s["action"] for s in f["steps"])
-        d = per_split.setdefault(f["split"], {n: 0 for n in NAMES})
-        for k in range(4):
-            d[NAMES[k]] += c.get(k, 0)
-    # 全局占比达标不够：某个 split 里整类缺席时，该 split 的 recall 结构性为 0，
-    # T3 的「四类 recall 全 >0」会静默变成只看 train/val 的结论。
-    empty_split = [f"{sp}:{n}" for sp, d in per_split.items()
-                   if sp in ("train", "val", "test")
-                   for n, c in d.items() if c == 0]
-    checks.append(check("class_share",
-                        "FAIL" if (thin or empty_split) else "PASS",
-                        f"每类占比低于 {MIN_CLASS_SHARE:.0%}：{thin or '无'}；"
-                        f"split 内整类缺席：{empty_split or '无'}",
-                        distribution=dist, per_split=per_split))
+    if cf_ok and not norm_ok:
+        checks.append(check("class_share", "SKIP",
+                            f"{CF_SKIP}（{len(cf_ok)} 集）"))
+    else:
+        counts = Counter(s["action"] for s in traj_steps)
+        total = len(traj_steps)
+        dist = {NAMES[k]: counts.get(k, 0) for k in range(4)}
+        thin = [NAMES[k] for k in range(4)
+                if counts.get(k, 0) / total < MIN_CLASS_SHARE]
+        per_split = {}
+        for f in norm_ok:
+            c = Counter(s["action"] for s in f["steps"])
+            d = per_split.setdefault(f["split"], {n: 0 for n in NAMES})
+            for k in range(4):
+                d[NAMES[k]] += c.get(k, 0)
+        # 全局占比达标不够：某个 split 里整类缺席时，该 split 的 recall 结构性为 0，
+        # T3 的「四类 recall 全 >0」会静默变成只看 train/val 的结论。
+        empty_split = [f"{sp}:{n}" for sp, d in per_split.items()
+                       if sp in ("train", "val", "test")
+                       for n, c in d.items() if c == 0]
+        checks.append(check("class_share",
+                            "FAIL" if (thin or empty_split) else "PASS",
+                            f"每类占比低于 {MIN_CLASS_SHARE:.0%}：{thin or '无'}；"
+                            f"split 内整类缺席：{empty_split or '无'}",
+                            distribution=dist, per_split=per_split))
 
     # 6b) SAFE 步必须无碰撞：碰撞步的「停」标签不可信（T2 硬约束）。
     # 已排除的碰撞集也要计入，否则 --exclude-collision-episodes 会把这条检查洗成 PASS。
@@ -516,17 +600,64 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
 
     # 6d) 采集口径一致性：teacher/task 版本混包时，label_recompute 只跳过非当前
     #     teacher_version，门禁看起来全绿，但 SR/成功判据在包里已经有两种定义。
-    prov = [(f.get("teacher_version"), f.get("task_version")) for f in gate]
-    miss_p = sum(1 for t, k in prov if t is None or k is None)
-    uniq = {p for p in prov if p[0] is not None and p[1] is not None}
-    if not uniq:
+    #     两字段分开判定：task_version 是后加的，全缺（base 任务）视为同一代。
+    t_vers = [f.get("teacher_version") for f in gate]
+    k_vers = [f.get("task_version") for f in gate]
+    t_have = {v for v in t_vers if v is not None}
+    k_have = {v for v in k_vers if v is not None}
+    t_missing = sum(1 for v in t_vers if v is None)
+    k_missing = sum(1 for v in k_vers if v is None)
+    problems = []
+    if len(t_have) > 1:
+        problems.append(f"teacher_version 混用 {sorted(t_have)}")
+    if len(k_have) > 1:
+        problems.append(f"task_version 混用 {sorted(k_have)}")
+    if t_have and t_missing:
+        problems.append(f"{t_missing}/{len(t_vers)} 集缺 teacher_version")
+    if k_have and k_missing:
+        problems.append(f"{k_missing}/{len(k_vers)} 集缺 task_version")
+    if problems:
+        checks.append(check("provenance_uniform", "FAIL", "；".join(problems)))
+    elif not t_have and not k_have:
         checks.append(check("provenance_uniform", "SKIP",
-                            "全部缺 teacher_version/task_version（旧格式）"))
-    elif miss_p or len(uniq) > 1:
-        checks.append(check("provenance_uniform", "FAIL",
-                            f"{miss_p}/{len(prov)} 集缺版本字段；混用 {sorted(uniq)}"))
+                            "全部集缺 teacher_version/task_version（旧格式，无法判定）"))
     else:
-        checks.append(check("provenance_uniform", "PASS", f"teacher/task = {sorted(uniq)[0]}"))
+        detail = [f"teacher_version={sorted(t_have)[0]}" if t_have
+                  else "teacher_version 全部缺失"]
+        detail.append(f"task_version={sorted(k_have)[0]}" if k_have
+                      else "task_version 全部缺失（视为同一代）")
+        checks.append(check("provenance_uniform", "PASS", "；".join(detail)))
+
+    # 6e) 动作窗口语义：dispatch 从派发时刻起算，observation 从 RGB 观测时刻起算，
+    #     差约 60 ms 仿真时间（同一模型闭环 SR 0.90 vs 0.55）。混包则结论失效。
+    #     旧数据在字段引入前采集：全缺 SKIP（无法判定），既不判 PASS 也不判 FAIL。
+    sem = [f.get("window_from") for f in gate]
+    bad_sem = [f["dir"] for f in gate if f.get("window_from") is not None
+               and not isinstance(f.get("window_from"), str)]
+    present = {v for v in sem if isinstance(v, str)}
+    missing = sum(1 for v in sem if v is None)
+    if bad_sem:
+        checks.append(check("window_semantics", "FAIL",
+                            f"{len(bad_sem)} 集 window_from 不是字符串，无法判定",
+                            samples=bad_sem[:5]))
+    elif not present:
+        checks.append(check("window_semantics", "SKIP",
+                            "全部集无 window_from（旧数据无此字段，无法判定）"))
+    elif len(present) > 1:
+        counts = Counter("missing" if v is None else v for v in sem)
+        checks.append(check("window_semantics", "FAIL",
+                            f"混用多个动作窗口语义：{dict(sorted(counts.items()))}；"
+                            "dispatch/observation 差约 60 ms 仿真时间，结论不可比",
+                            samples=[f"{os.path.basename(f['dir'])}:{f.get('window_from')}"
+                                     for f in gate][:5]))
+    elif missing:
+        checks.append(check("window_semantics", "FAIL",
+                            f"{missing}/{len(sem)} 集缺 window_from，与 "
+                            f"{next(iter(present))} 混在一起，无法确认全包同一口径",
+                            samples=[f["dir"] for f in gate if f.get("window_from") is None][:5]))
+    else:
+        checks.append(check("window_semantics", "PASS",
+                            f"{len(sem)}/{len(sem)} 集 window_from={next(iter(present))}"))
 
     # 7) split 几何隔离（含被排除的集：排除碰撞集不能把跨 split 泄漏洗掉）
     by_split = {}

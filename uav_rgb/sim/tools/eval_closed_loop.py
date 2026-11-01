@@ -11,6 +11,8 @@ GZ_PARTITION 的 gz sim -> collect.py --policy student --stop-on-collision ->
   python3 sim/tools/eval_closed_loop.py --policy forward --episodes 3 \
       --out /tmp/eval-blind --split test
   # T7 三个基线用同一批场景：把 student 的 seeds 回传给 --seeds。
+  # 动作窗口默认 observation（唯一被采纳基线）；--window-from dispatch 仅用于复现
+  # T7-R，其 SR/碰撞率不可与 observation 结果混报。
 """
 import argparse
 import hashlib
@@ -345,10 +347,11 @@ def main():
                    help="成功评测的 episode 数（缺省：给了 --seeds 用其个数，否则 3）")
     p.add_argument("--steps", type=int, default=80, help="每集最大步数")
     p.add_argument("--hold", type=float, default=1.0, help="每动作仿真时间秒")
+    # default=None 只为识别「用户显式给了 dispatch」；缺省解析成 observation。
     p.add_argument("--window-from", choices=("dispatch", "observation"),
-                   default="dispatch",
-                   help="动作窗口起点：dispatch=派发位姿（默认，R01）；"
-                        "observation=观测位姿（旧语义，仅诊断/兼容旧数据）")
+                   default=None,
+                   help="动作窗口起点：observation=观测位姿（默认，唯一被采纳基线）；"
+                        "dispatch=派发位姿（仅复现 T7-R，数字不可与 observation 混报）")
     p.add_argument("--text-mode", choices=TEXT_MODES, default="keep",
                    help="L2 消融：keep=原指令；blank=空文本；shuffle=把 left/right 反过来")
     p.add_argument("--task", choices=("base", "l1"), default="base",
@@ -368,6 +371,12 @@ def main():
     p.add_argument("--episode-timeout", type=float, default=600.0)
     p.add_argument("--keep-work", action="store_true", help="保留 world/每集原始文件")
     args = p.parse_args()
+    if args.window_from is None:
+        args.window_from = "observation"
+    elif args.window_from == "dispatch":
+        print("警告: --window-from dispatch 不是被采纳的基线语义（唯一基线是 "
+              "observation）；本次 SR/碰撞率不可与 observation 结果混报。",
+              file=sys.stderr, flush=True)
 
     try:
         seed_list = parse_seeds(args.seeds) if args.seeds else []

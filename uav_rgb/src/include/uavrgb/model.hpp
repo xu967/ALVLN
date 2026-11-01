@@ -58,21 +58,23 @@ struct CnnGrad {
 // Xavier-uniform 初始化 W、b 置零；seed 固定则参数可复现。
 // num_classes 默认 4（action.hpp 的 kNumActions），但保留参数用于结构自检。
 // text_dim > 0 时额外建 [kTextVocab, text_dim] 的 embedding 表和 FiLM 层；
-// fc 输入维度不变（文本不进 concat）。
+// fc 输入维度不变（文本只经 FiLM 调制，不拼进 fc 输入）。
 CnnModel make_cnn(int in_h, int in_w, std::uint32_t seed = 0, int num_classes = 4,
                   int text_dim = 0);
 
 std::size_t num_params(const CnnModel& m);
 
-// 参数顺序固定：c1.W, c1.b, c2.W, c2.b, c3.W, c3.b, fc.W, fc.b。
+// 参数顺序固定：c1.W, c1.b, c2.W, c2.b, c3.W, c3.b, fc.W, fc.b；
+// 有文本分支时追加 text_emb, film.W, film.b（共 11 个）。
 // checkpoint 与 Adam 状态都依赖这个顺序，改顺序必须同步改 checkpoint 版本号。
 std::vector<Tensor*> cnn_params(CnnModel& m);
 std::vector<const Tensor*> cnn_params(const CnnModel& m);
 std::vector<Tensor*> cnn_grad_tensors(CnnGrad& g);
 
 // logits[N,num_classes]；cache 非空时顺带保存反向所需激活。
-// text 非空时按 [N*kTextLen] 的 token id 取 embedding 并 mean-pool（忽略 <pad>）；
-// m.text_dim == 0 时必须为 nullptr，否则抛异常。
+// text 非空时按 [N*kTextLen] 的 token id 逐位置取 embedding，拼成
+// [N, kTextLen*text_dim]，再经 film 生成 γ/β 对 conv 最后一层做 FiLM 调制
+// （<pad> 槽位保持 0，不做 mean-pool）；m.text_dim == 0 时必须为 nullptr，否则抛异常。
 Tensor forward(const CnnModel& m, const Tensor& x, CnnCache* cache,
                const std::vector<std::uint8_t>* text = nullptr);
 inline Tensor forward(const CnnModel& m, const Tensor& x) { return forward(m, x, nullptr); }

@@ -37,7 +37,7 @@ Y_GAIN = 0.0
 def _strip_min(depth, w, y0, y1, x0, x1):
     """行 [y0,y1) × 列 [x0,x1) 的最小有效深度和有效样本数。
 
-    无效读数（<=0、NaN）跳过。返回 (inf, 0) 表示该区域一个有效样本都没有——
+    无效读数（<=0、NaN、±inf）跳过。返回 (inf, 0) 表示该区域一个有效样本都没有——
     调用方必须把它当成「不知道」，不能当成「空旷」。
     """
     best = math.inf
@@ -46,7 +46,7 @@ def _strip_min(depth, w, y0, y1, x0, x1):
         base = y * w
         for x in range(x0, x1):
             d = depth[base + x]
-            if d > 0.0:  # NaN/0/负数都是无效读数
+            if math.isfinite(d) and d > 0.0:  # NaN/±inf/0/负数都是无效读数
                 n_valid += 1
                 if d < best:
                     best = d
@@ -492,6 +492,7 @@ if __name__ == "__main__":
     extra = [
         ("全 0 深度 -> SAFE_NEUTRAL", [0.0] * (w * h), SAFE_NEUTRAL),
         ("全 NaN 深度 -> SAFE_NEUTRAL", [float("nan")] * (w * h), SAFE_NEUTRAL),
+        ("全 inf 深度 -> SAFE_NEUTRAL", [float("inf")] * (w * h), SAFE_NEUTRAL),
         ("全负深度 -> SAFE_NEUTRAL", [-1.0] * (w * h), SAFE_NEUTRAL),
         ("中心带全 0、两侧 0.3 -> SAFE_NEUTRAL",
          _make(w, h, 0.3, 0.0, 0.3), SAFE_NEUTRAL),

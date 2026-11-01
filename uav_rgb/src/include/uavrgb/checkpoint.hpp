@@ -5,7 +5,8 @@
 //   0    char[8]  magic "UAVRCK01"
 //   8    u32      version = 4（v2 起带类别权重；v3 追加 best_macro_f1；
 //                v4 追加 text_dim。读端接受 v2/v3/v4；v1 无类别权重段，直接拒绝）
-//   12   u32      param_count（8；有文本分支时 9）
+//   12   u32      param_count（无文本分支 8；有文本分支 11：
+//                8 个 CNN/fc 参数 + text_emb, film.W, film.b）
 //   16   i32 in_h, i32 in_w, i32 in_c, i32 num_classes   ← 模型结构元信息
 //   32   u32      adam_t（已完成 step 数；8 个 Adam 共享同一 t）
 //   36   u32      epoch（已完成 epoch 数，续训时 results.csv 接着编号）
@@ -19,6 +20,8 @@
 // 读回时校验 magic/version/param_count/结构元信息/逐参数 dims，任何不符直接抛异常，
 // 不做部分加载。lr/beta/eps 不入盘：恢复训练以 CLI 为准，避免「哪边生效」的歧义。
 // 类别权重必须入盘：resume 时沿用训练时的权重，否则 loss 的归一化基准会悄悄改变。
+// 文本分支只有 FiLM 一种实现：pre-FiLM checkpoint 不支持（旧 concat 分支 fc.in=19216），
+// 加载会因参数个数/text_dim/逐参数形状不符被 load_checkpoint 直接拒绝，不做兼容加载。
 #include "uavrgb/model.hpp"
 #include "uavrgb/nn.hpp"
 

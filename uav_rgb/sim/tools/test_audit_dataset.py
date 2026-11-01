@@ -13,19 +13,39 @@ from teacher import TEACHER_VERSION
 
 PILLARS = [{"name": "pillar_0", "x": 1.5, "y": 0.0, "z": 1.5, "size": [0.4, 0.4, 3.0]}]
 OTHER = [{"name": "pillar_0", "x": 9.5, "y": 0.0, "z": 1.5, "size": [0.4, 0.4, 3.0]}]
+# L1 同色柱对：relation=right → 目标 = 左侧柱（y=+1），waypoint 在它外侧。
+L1_PAIR = [
+    {"name": "p_left", "x": 1.5, "y": 1.0, "z": 1.5, "size": [0.4, 0.4, 3.0],
+     "color": "red"},
+    {"name": "p_right", "x": 1.5, "y": -1.0, "z": 1.5, "size": [0.4, 0.4, 3.0],
+     "color": "red"},
+]
+L1_SCENE = {
+    "target_color": "red", "relation": "right",
+    "waypoint": {"x": 1.5, "y": 1.8},
+    "spawn": {"x": 0.0, "y": 0.0, "yaw_deg": 0.0},
+    "stop_radius": 0.5, "task_version": "l1.v4",
+}
+L1_INSTR = "pass the red pillar on your right and stop"
 
 
-def write_ep(root, split, eid, actions, dts=None, pillars=PILLARS, instruction=None):
+def write_ep(root, split, eid, actions, dts=None, pillars=PILLARS, instruction=None,
+             window_from=None, scene_extra=None, man_extra=None):
     d = os.path.join(root, split, str(eid))
     os.makedirs(d)
+    scene = {"pillars": pillars}
+    scene.update(scene_extra or {})
     with open(os.path.join(d, "scene.json"), "w", encoding="utf-8") as f:
-        json.dump({"pillars": pillars}, f)
+        json.dump(scene, f)
     man = {"split": split, "teacher": "plan_action", "planner": "plan_action",
            "geometry_version": sm.SPLIT_SALT, "teacher_version": TEACHER_VERSION,
            "instruction": instruction,
            "actions_ref": "actions.jsonl", "oracle_ref": "oracle.jsonl",
            "validity": {"camera_verified": True, "physics_verified": True,
                         "episode_executed": True}}
+    if window_from is not None:   # 缺省不写：模拟字段引入前的旧数据
+        man["window_from"] = window_from
+    man.update(man_extra or {})
     with open(os.path.join(d, "episode_manifest.json"), "w", encoding="utf-8") as f:
         json.dump(man, f)
 
@@ -44,7 +64,8 @@ def write_ep(root, split, eid, actions, dts=None, pillars=PILLARS, instruction=N
             f.writelines(json.dumps(r) + "\n" for r in items)
 
 
-def write_plan_ep(root, split, eid, n=12):
+def write_plan_ep(root, split, eid, n=12, pillars=PILLARS, instruction=None,
+                  scene_extra=None, man_extra=None):
     """标签确实是 plan_action 算出来的集：复算应当逐条对上。
 
     这里只验审计脚本读对了哪些字段、比对口径对不对；plan_action 自身另有
@@ -52,19 +73,23 @@ def write_plan_ep(root, split, eid, n=12):
     """
     d = os.path.join(root, split, str(eid))
     os.makedirs(d)
+    scene = {"pillars": pillars}
+    scene.update(scene_extra or {})
     with open(os.path.join(d, "scene.json"), "w", encoding="utf-8") as f:
-        json.dump({"pillars": PILLARS}, f)
+        json.dump(scene, f)
     man = {"split": split, "teacher": "plan_action", "planner": "plan_action",
            "geometry_version": sm.SPLIT_SALT, "teacher_version": TEACHER_VERSION,
+           "instruction": instruction,
            "actions_ref": "actions.jsonl", "oracle_ref": "oracle.jsonl",
            "validity": {"camera_verified": True, "physics_verified": True,
                         "episode_executed": True}}
+    man.update(man_extra or {})
     with open(os.path.join(d, "episode_manifest.json"), "w", encoding="utf-8") as f:
         json.dump(man, f)
     rows, oracle, t = [], [], 0
     for i in range(n):
         pb, yb = {"x": 0.0, "y": 0.05 * i, "z": 2.0}, 0.0
-        a = ad.plan_action(pb["x"], pb["y"], yb, PILLARS)
+        a = ad.plan_action(pb["x"], pb["y"], yb, pillars)
         start, t = t, t + 1_000_000_000
         rows.append({"step": i, "action_executed": a, "action_expert": a,
                      "collision": False, "depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0,
@@ -104,6 +129,8 @@ def main():
             assert st[name] == "PASS", (name, st)
         assert st["split_geometry"] == "SKIP", st
         assert st["label_recompute"] == "SKIP", st
+        # 旧数据（无 window_from）新检查必须 SKIP。
+        assert st["window_semantics"] == "SKIP", st
 
         # 2) 动作窗口漂移 -> action_window FAIL
         root2 = tempfile.mkdtemp(prefix="audit_test_")
@@ -348,6 +375,103 @@ def main():
         assert src16b == "walk", (dirs16b, src16b)
         assert dirs16b == [os.path.join(root16b, "train", "1")], dirs16b
         shutil.rmtree(root16b)
+
+        # 17) 动作窗口语义：全一致 PASS、混用 FAIL、全缺失 SKIP（旧数据不能判死）。
+        root17 = tempfile.mkdtemp(prefix="audit_test_")
+        write_ep(root17, "train", 1, CLEAN, instruction="pass the red pillar",
+                 window_from="observation")
+        write_ep(root17, "train", 2, CLEAN, instruction="pass the red pillar",
+                 window_from="observation")
+        all17 = details(root17)
+        # 带 instruction 的常规数据：18 条 + 新增 waypoint_side = 19 条。
+        assert len(all17) == 19, all17
+        c17 = all17["window_semantics"]
+        assert c17["status"] == "PASS" and "observation" in c17["detail"], c17
+        write_ep(root17, "train", 3, CLEAN, window_from="dispatch")
+        c17b = details(root17)["window_semantics"]
+        assert c17b["status"] == "FAIL" and "dispatch" in c17b["detail"], c17b
+        shutil.rmtree(root17)
+
+        root17b = tempfile.mkdtemp(prefix="audit_test_")
+        write_ep(root17b, "train", 1, CLEAN)
+        write_ep(root17b, "train", 2, CLEAN)
+        c17c = details(root17b)["window_semantics"]
+        assert c17c["status"] == "SKIP", c17c
+        assert "旧数据无此字段，无法判定" in c17c["detail"], c17c
+        # 部分缺：新旧混包无法证明口径一致，不能当 SKIP 放过。
+        write_ep(root17b, "train", 3, CLEAN, window_from="dispatch")
+        assert details(root17b)["window_semantics"]["status"] == "FAIL"
+        shutil.rmtree(root17b)
+
+        # 18) L1 定义回归：彩色柱必须恰好 2 根同色；waypoint 必须在目标柱外侧。
+        root18 = tempfile.mkdtemp(prefix="audit_test_")
+        write_ep(root18, "train", 1, CLEAN, pillars=L1_PAIR,
+                 instruction=L1_INSTR, scene_extra=L1_SCENE)
+        # relation_balance 要求 left/right 两类都有：补一集镜像的。
+        write_ep(root18, "train", 2, CLEAN, pillars=L1_PAIR,
+                 instruction="pass the red pillar on your left and stop",
+                 scene_extra=dict(L1_SCENE, relation="left",
+                                  waypoint={"x": 1.5, "y": -1.8}))
+        d18 = details(root18)
+        assert d18["target_color"]["status"] == "PASS", d18["target_color"]
+        assert d18["relation_balance"]["status"] == "PASS", d18["relation_balance"]
+        assert d18["waypoint_side"]["status"] == "PASS", d18["waypoint_side"]
+        p18 = os.path.join(root18, "train", "1", "scene.json")
+        with open(p18, encoding="utf-8") as f:
+            s18 = json.load(f)
+        # 两根彩色柱不同色 -> FAIL
+        s18["pillars"][1]["color"] = "blue"
+        with open(p18, "w", encoding="utf-8") as f:
+            json.dump(s18, f)
+        assert details(root18)["target_color"]["status"] == "FAIL"
+        # 多于两根彩色柱 -> FAIL
+        s18["pillars"][1]["color"] = "red"
+        s18["pillars"].append({"name": "p_extra", "x": 2.0, "y": 1.6, "z": 1.5,
+                               "size": [0.4, 0.4, 3.0], "color": "red"})
+        with open(p18, "w", encoding="utf-8") as f:
+            json.dump(s18, f)
+        assert details(root18)["target_color"]["status"] == "FAIL"
+        # 不同柱 / 异侧 / 贴轴线 三种 waypoint 都 -> FAIL
+        s18["pillars"].pop()
+        for wp in ({"x": 2.0, "y": 1.8}, {"x": 1.5, "y": -1.8},
+                   {"x": 1.5, "y": 0.2}):
+            s18["waypoint"] = wp
+            with open(p18, "w", encoding="utf-8") as f:
+                json.dump(s18, f)
+            assert details(root18)["waypoint_side"]["status"] == "FAIL", wp
+        shutil.rmtree(root18)
+
+        # 19) 反事实集：轨迹类检查 SKIP（不假 FAIL），label_recompute 必须保留。
+        root19 = tempfile.mkdtemp(prefix="audit_test_")
+        write_plan_ep(root19, "train", 1, pillars=L1_PAIR, instruction=L1_INSTR,
+                      scene_extra=L1_SCENE,
+                      man_extra={"counterfactual_of": 900001})
+        d19 = details(root19)
+        for name in ("teacher_waypoint", "teacher_stop", "forward_motion",
+                     "transition_lag", "yaw_direction", "class_share"):
+            assert d19[name]["status"] == "SKIP", (name, d19[name])
+            assert "反事实集" in d19[name]["detail"], (name, d19[name])
+        assert d19["waypoint_side"]["status"] == "PASS", d19["waypoint_side"]
+        assert d19["label_recompute"]["status"] == "PASS", d19["label_recompute"]
+        shutil.rmtree(root19)
+
+        # 20) provenance：teacher_version 有值必须统一；task_version 全缺视为同代。
+        root20 = tempfile.mkdtemp(prefix="audit_test_")
+        write_ep(root20, "train", 1, CLEAN)
+        write_ep(root20, "train", 2, CLEAN)
+        c20 = details(root20)["provenance_uniform"]
+        assert c20["status"] == "PASS", c20
+        assert "task_version 全部缺失" in c20["detail"], c20
+        pm20 = os.path.join(root20, "train", "2", "episode_manifest.json")
+        with open(pm20, encoding="utf-8") as f:
+            m20 = json.load(f)
+        m20["teacher_version"] = "uavrgb.teacher.v0"
+        with open(pm20, "w", encoding="utf-8") as f:
+            json.dump(m20, f)
+        c20b = details(root20)["provenance_uniform"]
+        assert c20b["status"] == "FAIL", c20b
+        assert "teacher_version 混用" in c20b["detail"], c20b
+        shutil.rmtree(root20)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

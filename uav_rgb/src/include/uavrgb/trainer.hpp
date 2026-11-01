@@ -27,7 +27,7 @@ struct TrainConfig {
   // 空 = 无权重；"auto" = 训练集逆频率；"w0,w1,w2,w3" = 显式每类权重。
   std::string class_weights;
   bool drop_collision = false;  // 读数据集时丢弃 meta.collision_flags 标记的碰撞步
-  // >0 时启用文本分支：embedding[kTextVocab, text_dim] + mean-pool + concat。
+  // >0 时启用文本分支：embedding[kTextVocab, text_dim] → 按位置拼接 → FiLM。
   // 需要 dataset 旁边有 instructions.jsonl 侧车（preprocess.py 写）。
   int text_dim = 0;
 };

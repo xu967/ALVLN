@@ -213,6 +213,48 @@ void test_sidecar() {
   CHECK(uavrgb::load_uavr(uavr).text_ids.empty());
 
   {
+    // 3 行侧车中 1 行缺 text_ids：半迁移的侧车必须报错并指出坏行行号，
+    // 不能静默丢掉整份侧车（否则文本模型会误报「没有侧车」）。
+    // 6 样本 → train(0,2) / val(2,2) / test(4,2)，正好 3 个 episode。
+    const fs::path mixed_dir = dir / "mixed";
+    fs::create_directories(mixed_dir);
+    const std::string mixed_uavr = (mixed_dir / "dataset.uavr").string();
+    uavrgb_test::write_synthetic_uavr(mixed_uavr, 6, kH, kW, /*train_n=*/2, /*seed=*/43,
+                                      /*test_n=*/2);
+    {
+      std::ofstream f(mixed_dir / "instructions.jsonl");
+      f << "{\"episode_id\": 1, \"sample_start\": 0, \"sample_count\": 2, \"text_ids\": [2]}\n"
+           "{\"episode_id\": 2, \"sample_start\": 2, \"sample_count\": 2}\n"
+           "{\"episode_id\": 3, \"sample_start\": 4, \"sample_count\": 2, \"text_ids\": [3]}\n";
+    }
+    bool mixed_threw = false;
+    std::string mixed_msg;
+    try {
+      (void)uavrgb::load_uavr(mixed_uavr);
+    } catch (const std::runtime_error& e) {
+      mixed_threw = true;
+      mixed_msg = e.what();
+    }
+    CHECK(mixed_threw);
+    CHECK(mixed_msg.find("第 2 行") != std::string::npos);
+    CHECK(mixed_msg.find("缺 text_ids") != std::string::npos);
+
+    // 全行缺 text_ids 但未覆盖全部 episode：仍要报错，不能提前 return 绕过覆盖校验。
+    {
+      std::ofstream f(mixed_dir / "instructions.jsonl", std::ios::trunc);
+      f << "{\"episode_id\": 1, \"sample_start\": 0, \"sample_count\": 2}\n"
+           "{\"episode_id\": 2, \"sample_start\": 2, \"sample_count\": 2}\n";
+    }
+    bool incomplete_threw = false;
+    try {
+      (void)uavrgb::load_uavr(mixed_uavr);
+    } catch (const std::runtime_error&) {
+      incomplete_threw = true;
+    }
+    CHECK(incomplete_threw);
+  }
+
+  {
     // 10 个 token 超过 kTextLen=9；静默截断会悄悄改掉指令的意思，必须报错。
     std::ofstream f(dir / "instructions.jsonl", std::ios::trunc);
     f << "{\"episode_id\": 1,\"instruction\": \"pass the red pillar on your left and stop now\", "

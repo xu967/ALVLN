@@ -35,8 +35,10 @@ RGB 仍然是**动作前**的观测（M1：rgb_ts < action_start_ts），动作�
   actions.jsonl          每步 step/timestamp_ns(RGB)/action_expert/action_executed/
                          collision/rgb_ok/frame/depth_ts/depth_rgb_gap_ns/pose_ts/
                          pose_rgb_gap_ns/rgb_ts/action_start_ns/pose_before/yaw_before
+                         + depth_file（仅 --save-depth）
   oracle.jsonl           每步 step/timestamp_ns(动作后 pose)/pose_gt + 动作起止 sim-time
   rgb_%05d.png           320x240 原图（降采样到 160x120 由 tools/preprocess.py 负责）
+  depth/depth_%05d.png   --save-depth 时：16 位灰度 PNG，单位毫米（0=无回波）
 
 碰撞真值（两种真实信号，任一触发即 collision=True）：
   1. /uav/contact 接触传感器（base_link + 四个旋翼的 contact sensor + 世界级
@@ -55,6 +57,7 @@ import struct
 import subprocess
 import sys
 import time
+import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from teacher import (expert_action, plan_action, plan_action_global,
@@ -70,6 +73,9 @@ CAMERA_INFO_TOPIC = "/uav/camera_info"
 DEPTH_TOPIC = "/uav/depth"
 POSE_TOPIC = "/model/x3/pose"
 CONTACT_TOPIC = "/uav/contact"
+
+DEPTH_DIR = "depth"
+DEPTH_REF = DEPTH_DIR + "/depth_%05d.png"   # episode 内相对路径模板（downstream 按 %05d 展开）
 
 RGB_FRAME_ID = "x3::base_link::camera"   # /uav/camera_info 上 RGB 与 depth 两个 publisher
 
@@ -272,6 +278,39 @@ def read_rgb_png(path):
     if not msg:
         return False, 0
     return write_rgb_png(msg, path)
+
+
+def _depth_png16(depth, w, h):
+    """深度（米，行主序 flat list）-> 16 位灰度 PNG 字节（毫米，0=无效/无回波）。
+
+    gz 的 depth_camera 输出 R_FLOAT32（米）；PNG 存 uint16 大端样本。
+    """
+    if len(depth) < w * h:
+        raise ValueError(f"depth too short: {len(depth)} < {w * h}")
+    rows = []
+    for y in range(h):
+        vals = []
+        for v in depth[y*w:(y+1)*w]:
+            mm = int(round(v * 1000.0)) if math.isfinite(v) else 0
+            vals.append(max(0, min(65535, mm)))
+        rows.append(b"\x00" + struct.pack(">%dH" % w, *vals))
+    ihdr = struct.pack(">IIBBBBB", w, h, 16, 0, 0, 0, 0)   # 16-bit 灰度
+    return (b"\x89PNG\r\n\x1a\n"
+            + save_frame._chunk(b"IHDR", ihdr)
+            + save_frame._chunk(b"IDAT", zlib.compress(b"".join(rows), 6))
+            + save_frame._chunk(b"IEND", b""))
+
+
+def write_depth_png(depth, w, h, path):
+    """把解码后的深度写成 16 位 PNG；返回是否成功（I/O 错误仍上抛）。"""
+    try:
+        png = _depth_png16(depth, w, h)
+    except (ValueError, TypeError) as e:
+        print(f"write_depth_png: {e}", file=sys.stderr)
+        return False
+    with open(path, "wb") as f:
+        f.write(png)
+    return True
 
 
 def _yaw_deg(q):
@@ -515,7 +554,7 @@ def take_off(pose_sub, publisher, contact_sub=None, z_target=Z_TARGET, timeout=1
 def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 prev_action=None, prev_rgb_ts=0, pillars=None, student=None,
                 global_plan=True, window_from="dispatch", waypoint=None,
-                stop_at_waypoint=False, stop_radius=0.5):
+                stop_at_waypoint=False, stop_radius=0.5, save_depth=False):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。"""
     if window_from not in ("dispatch", "observation"):
         raise ValueError(f"window_from 无效: {window_from!r}")
@@ -620,6 +659,12 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         # PNG 落盘落在 hold 窗口内（RGB 已在发指令前抓到，M1 不受影响）。
         rgb_ok, _ = write_rgb_png(
             rgb_msg, os.path.join(out_dir, "rgb_%05d.png" % step_idx))
+        if save_depth:
+            # 深度图与 RGB 同 step 编号；写失败不能让 jsonl 指向不存在的文件。
+            if not write_depth_png(d, w, h,
+                                   os.path.join(out_dir, DEPTH_REF % step_idx)):
+                _try_zero(publisher)
+                return None, "深度图写盘失败"
 
         contact = False
         # 动作窗口按仿真时间计：动作前的位姿戳 + hold 秒。旧实现用墙钟，RTF 一抖
@@ -709,6 +754,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         "yaw_before": yaw_before,
         "rgb_ok": rgb_ok,
         "frame": "rgb_%05d.png" % step_idx,
+        "depth_file": (DEPTH_REF % step_idx) if save_depth else None,
         "depth_ts": depth_ts,
         "pose_before_ts": pose_before_ts,
         "action_start_ns": action_start_ns,
@@ -748,6 +794,37 @@ def _median(xs):
     return xs[len(xs) // 2]
 
 
+def action_row(r, save_depth=False):
+    """actions.jsonl 的字段白名单投影。
+
+    坑（HANDOFF §八.7）：collect_one 返回的 row 不会自动落盘，新字段必须显式
+    加到这里；save_depth=False 时字段集与旧版完全一致。
+    """
+    row = {k: r[k] for k in (
+        "step", "timestamp_ns", "action_expert", "action_executed",
+        "collision", "rgb_ok", "frame")}
+    row.update({
+        # 评测端按 EVAL_STANDARD §5.1 只把 contact 当碰撞，stuck 单列。
+        "src": r["src"],
+        "rgb_ts": r["rgb_ts"],
+        "depth_ts": r["depth_ts"],
+        "depth_rgb_gap_ns": r["depth_rgb_gap_ns"],
+        # 配对用的观测位姿帧；动作后的 oracle 位姿只在 oracle.jsonl。
+        "pose_ts": r["pose_before_ts"],
+        "pose_rgb_gap_ns": r["pose_rgb_gap_ns"],
+        "dyaw_deg": r["dyaw_deg"],
+        "displacement_m": r["displacement_m"],
+        "infer_ms": r["infer_ms"],
+        "action_start_ns": r["action_start_ns"],
+        # 动作前位姿：audit 的 label_recompute 靠它 + 柱子真值重跑 teacher。
+        "pose_before": r["pose_before"],
+        "yaw_before": r["yaw_before"],
+    })
+    if save_depth:
+        row["depth_file"] = r["depth_file"]
+    return row
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--steps", type=int, default=sm.DEFAULT_STEPS)
@@ -755,9 +832,9 @@ def main():
     p.add_argument("--hold", type=float, default=1.0,
                    help="每动作持续时间（秒，仿真时间；走满即发零速）")
     p.add_argument("--window-from", choices=("dispatch", "observation"),
-                   default="dispatch",
-                   help="动作窗口起点：dispatch=派发位姿（默认，R01）；"
-                        "observation=观测位姿（旧语义，仅诊断/兼容旧数据）")
+                   default="observation",
+                   help="动作窗口起点：observation=观测位姿（默认，唯一被采纳基线）；"
+                        "dispatch=派发位姿（R01，仅复现 T7-R，数字不可与 observation 混报）")
     p.add_argument("--no-takeoff", action="store_true")
     p.add_argument("--policy", choices=("teacher", "forward", "student"), default="teacher",
                    help="teacher=专家策略；forward=盲策略（恒定前进）；student=模型闭环")
@@ -770,6 +847,8 @@ def main():
     p.add_argument("--seed", type=int, default=0, help="EpisodeMeta.seed")
     p.add_argument("--episode-id", type=int, default=None, help="EpisodeMeta.episode_id（默认=seed）")
     p.add_argument("--split", choices=("train", "val", "test"), default="train")
+    p.add_argument("--save-depth", action="store_true",
+                   help="每步另存 depth/depth_%%05d.png（16 位灰度 PNG，毫米，0=无回波）")
     p.add_argument("--version", default="1", help="EpisodeMeta.version（采集器版本）")
     p.add_argument("--scene-meta", default=None,
                    help="scene_gen 产出的场景 JSON；给了就用柱子真值的 carrot planner，"
@@ -785,6 +864,8 @@ def main():
     if os.path.isdir(args.out) and os.listdir(args.out):
         p.error(f"--out {args.out} 不是空目录；请换新目录（或先清空）")
     os.makedirs(args.out, exist_ok=True)
+    if args.save_depth:
+        os.makedirs(os.path.join(args.out, DEPTH_DIR), exist_ok=True)
     pillars = None
     scene_meta_sha = None
     scene_gid = None
@@ -890,7 +971,8 @@ def main():
                                     global_plan=True,
                                     window_from=args.window_from, waypoint=waypoint,
                                     stop_at_waypoint=goal_stop,
-                                    stop_radius=stop_radius or 0.5)
+                                    stop_radius=stop_radius or 0.5,
+                                    save_depth=args.save_depth)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -900,24 +982,10 @@ def main():
             gap_ns = r["rgb_ts"] - r["depth_ts"] if r["depth_ts"] else None
             # 配对残差用**观测帧**位姿（pose_before_ts），action_start_ns 是派发时刻。
             pose_gap_ns = r["pose_before_ts"] - r["rgb_ts"]
-            actions_f.write(json.dumps({k: r[k] for k in (
-                "step", "timestamp_ns", "action_expert", "action_executed",
-                "collision", "rgb_ok", "frame")} | {
-                    # 评测端按 EVAL_STANDARD §5.1 只把 contact 当碰撞，stuck 单列。
-                    "src": r["src"],
-                    "rgb_ts": r["rgb_ts"],
-                    "depth_ts": r["depth_ts"],
-                    "depth_rgb_gap_ns": gap_ns,
-                    # 配对用的观测位姿帧；动作后的 oracle 位姿只在 oracle.jsonl。
-                    "pose_ts": r["pose_before_ts"],
-                    "pose_rgb_gap_ns": pose_gap_ns,
-                    "dyaw_deg": r["dyaw_deg"],
-                    "displacement_m": r["displacement_m"],
-                    "infer_ms": r["infer_ms"],
-                    "action_start_ns": r["action_start_ns"],
-                    # 动作前位姿：audit 的 label_recompute 靠它 + 柱子真值重跑 teacher。
-                    "pose_before": r["pose_before"],
-                    "yaw_before": r["yaw_before"]}) + "\n")
+            actions_f.write(json.dumps(
+                action_row(r | {"depth_rgb_gap_ns": gap_ns,
+                                "pose_rgb_gap_ns": pose_gap_ns},
+                           save_depth=args.save_depth)) + "\n")
             actions_f.flush()
             oracle_f.write(json.dumps({"step": r["step"],
                                        "timestamp_ns": r["pose_ts"],
@@ -1058,6 +1126,10 @@ def main():
             "stopped_on_goal": stopped_on_goal,
             "error": error,
         }
+        if args.save_depth:
+            # 下游按 depth_ref 模板拼路径；depth_file 行内字段优先，两者保持一致。
+            manifest["depth_ref"] = DEPTH_REF
+            manifest["depth_format"] = "png16_mm"
         write_manifest(os.path.join(args.out, "episode_manifest.json"), manifest)
         print(f"写入 {rows_written}/{args.steps} 步 -> {args.out} "
               f"(episode_id={episode_id} scene_id={args.scene_id} seed={args.seed} "

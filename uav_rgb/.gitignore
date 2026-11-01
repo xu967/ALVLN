@@ -5,6 +5,7 @@ build-*/
 
 # Python 虚拟环境与缓存
 .venv-tools/
+teacher/.venv/
 __pycache__/
 *.pyc
 

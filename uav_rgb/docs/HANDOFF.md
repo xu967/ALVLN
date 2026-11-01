@@ -144,14 +144,27 @@ collision 0.45、false_forward 0.30、stuck 0；产物
 | D4 | depth 与 RGB sim-time 差 >100 ms、contact 订阅进程退出即失败；`test_collect` 20/20；见 `worklog/2026-10-30-2129-d4-staleness-gate.md` |
 | R01 | 动作窗口从派发位姿起算 + `StudentPolicy` warmup；见 `worklog/2026-10-30-1935-deepseek-review-fixes.md` |
 | L1 | **v1 400 集作废**（route-choice，teacher 0/400 到 goal）；v2 goal-stop 500 集采集中。见 `experiments/2026-10-31-basic-vln-plan.md §2.5/§8` |
-| D-STACK | 用户拍板**全自研 C++/CUDA**；文本分支（embedding+mean-pool+concat）已实现，CTest 21/21；见 `worklog/2026-10-31-1115-l2-text-branch.md` |
+| D-STACK | 用户拍板**全自研 C++/CUDA**；文本分支（token 查表 → 按位置拼接 → FiLM）已实现，CTest 21/21；见 `worklog/2026-10-31-1115-l2-text-branch.md` |
 
 ### 4.3 关键数字
 
 #### 4.3.1 当前主线：L1 v4（2026-11-01）——**只有这组数能当现状**
 
 数据：`l1-v4-relation-500`（499 集 / 8966 步）+ `l1-v4-cf`（451 反事实集 / 8092 步），
-配对训练集 16184 样本。全部过 `audit_dataset.py` 17/17。
+配对训练集 16184 样本。
+
+**审计口径（2026-11-02 更正）**：此前写的「全部过 17/17」只对基础集成立，**反事实集
+并不通过**。修正后的实测：
+
+| 数据集 | 结果 |
+| --- | --- |
+| `l1-v4-relation-500` | **19/19 PASS**（含新增 `waypoint_side`、`window_semantics`） |
+| `l1-v4-cf` | **12 PASS / 7 SKIP / 0 FAIL** |
+
+反事实集复用原集的 RGB/oracle/轨迹、只重写 action 与 waypoint，所以
+`teacher_waypoint` / `teacher_stop` / `forward_motion` / `transition_lag` /
+`yaw_direction` / `class_share` 这几项**在 cf 上不适用**，现在判 SKIP；
+`label_recompute` 仍执行且 `0/8092` 不一致。修复前的审计会把 cf 判成 5 项 FAIL。
 
 | 项 | 数字 | 出处 |
 | --- | --- | --- |
@@ -297,13 +310,18 @@ token ids [N,9] → emb[22,16]（CPU 查表）→ 忽略 <pad> 求均值 → [N,
 image [N,3,120,160] → conv×3 → flatten [N,19200] ─┴→ fc [19216→4]
 ```
 
-> 上图的 concat 版本已被 FiLM 取代（见 `experiments/2026-11-01-l2-film-finetune.md`）：
-> 文本 embedding 过 `film` 线性层出 γ/β，作用在 pooled `c3` 上，`fc` 仍是 `[19200→4]`。
+> 上图是初版的 mean-pool + concat，**已被 FiLM 取代**（见
+> `experiments/2026-11-01-l2-film-finetune.md`）。现行实现（`model.cpp:164-199`）：
+> token 查表后**按位置拼接**成 `[kTextLen × text_dim]`（**没有**均值池化，
+> `<pad>` 槽位保持 0），过 `film` 线性层出逐通道 γ/β，
+> 对 `c3` 的每个空间位置做 `(1+γ)·y + β`；`fc` 仍是 `[19200→4]`。
+> **pre-FiLM 的 concat checkpoint 不兼容**：`fc.in=19216` 与当前 `19200` 不符，
+> `load_checkpoint` 会按 shape 直接拒绝。
 
 | 位置 | 作用 |
 | --- | --- |
 | `src/include/uavrgb/text.hpp` | `kTextLen=9` / `kTextVocab=22`，必须与 `sim/tools/instruction.py` 一致 |
-| `src/model.cpp` | 前向查表+mean-pool → `film` 出 γ/β 作用在 pooled `c3`；concat 版本仍在（旧 ckpt 兼容） |
+| `src/model.cpp` | 前向查表 → 按位置拼接 → `film` 出逐通道 γ/β 调制 `c3`；**无** concat/mean-pool 分支，pre-FiLM ckpt 不兼容 |
 | `src/dataset.cpp` | 读 `instructions.jsonl` 的 `text_ids`，按 `sample_start/count` 展开 |
 | `src/checkpoint.cpp` | **v4**：`text_dim` 追加在 `best_macro_f1` 之后，v2/v3 偏移不变 |
 | `train_main` / `trainer*` | `--text-dim N` 开文本分支；`--eval-only` 以 checkpoint 记录为准 |
@@ -361,8 +379,12 @@ python3 sim/tools/probe_text_effect.py --src .../l1-v4-relation-500 \
 #### 闭环口径注意事项
 
 - **必须 `--window-from observation`**（dispatch 语义的 SR 只有 0.55，未采纳）。
-- 两个候选 waypoint 相距 **min 3.23 m**，这是「shuffle 0.000 就是真的没学会」的
-  几何依据——只要 SR > 0 就说明它读懂了指令。
+- 两个候选 waypoint 相距 **min 3.23 m**，这是「停在中间不可能同时算 keep 和 shuffle
+  成功」的几何依据。
+- **`shuffle SR > 0` 不能单独证明模型读懂了指令**：shuffle 只换 instruction、不换
+  场景 waypoint，一个忽略文本的策略在 shuffle 下仍可能漂到原始 waypoint。语言证据
+  必须来自 **keep − shuffle 的配对差异（McNemar）** 或文本探针的 `follow`，
+  不能只引用某一组的 SR。
 - `--text-mode blank/shuffle` 会先问 infer 的 `text_dim`，纯视觉 ckpt 上直接报错；
   `eval.json` 同时记 `text_dim` / `success_criterion` / `stop_radius`。
 - **`stopped` 仍返回但不参与 goal_reach 判定**；`goal_stop` 与 `goal_reach` 的 SR
