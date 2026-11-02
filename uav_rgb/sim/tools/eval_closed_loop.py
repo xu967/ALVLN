@@ -168,15 +168,22 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
     新 collect 在 actions.jsonl 写 src（contact/stuck/contact+stuck）；旧数据没有该
     字段时退回原 collision 口径，不会把历史结果改成另一个数。
 
-    stop_radius 非空（L1 goal-reach）：success = 无碰撞 + 最终位姿距 waypoint
-    ≤ REACH_RADIUS。不再要求末动作 SAFE_NEUTRAL（原因见该分支注释）。
-    `stopped` 仍作为诊断字段返回，但不参与判定。
+    stop_radius 非空（L1）：同时算两个口径，都写进每集记录。
+
+    success（goal_reach_ever，2026-11-02 起的判据）= 无碰撞 + **轨迹上曾**进入
+    waypoint 的 REACH_RADIUS 球内。理由：waypoint 是柱阵外侧一个没有视觉标记的点，
+    把「末位姿落在 1.5 m 内」当判据实际在考「停的时机」，而 fit 到 0.03 m 却飞走的
+    集会被记成完全没到，和「根本没走过去」混为一谈，掩盖了导航能力。
+    stop_success（旧 goal_reach）= 无碰撞 + **末位姿**在 REACH_RADIUS 内，保留用于
+    对照与历史可比，不再作为主指标。
+    两者都不要求末动作 SAFE_NEUTRAL（原因见下方分支注释）；`stopped` 仍是诊断字段。
     旧 route-choice 数据仍走“max_x≥goal 且经过 waypoint”的旧口径，保持历史结果可复现。
     """
     if not actions:
         return {"steps": 0, "collision": False, "stuck": False, "false_forward": False,
-                "success": False, "max_x": None, "waypoint_min_dist": None,
-                "final_waypoint_dist": None, "stopped": False, "infer_ms": []}
+                "success": False, "stop_success": False, "max_x": None,
+                "waypoint_min_dist": None, "final_waypoint_dist": None,
+                "stopped": False, "infer_ms": []}
     collision = any(bool(a.get("collision")) and _src(a) != "stuck" for a in actions)
     stuck = any(bool(a.get("collision")) and "stuck" in _src(a) for a in actions)
     false_forward = any(bool(a.get("collision")) and _src(a) != "stuck" and
@@ -199,14 +206,18 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
         # 2026-11-01 起不再要求末动作 SAFE_NEUTRAL：waypoint 在柱阵外侧 ±2.4 m，
         # 相机 60° 视场在真停止点上 40% 的帧一根柱子都看不到，"停"不可观测
         # （worklog 2026-11-01-2130-stop-point-unobservable.md）。改成"到达"。
-        success = bool(not collision and wp_final is not None
-                       and wp_final <= REACH_RADIUS)
+        success = bool(not collision and wp_min is not None
+                       and wp_min <= REACH_RADIUS)
+        stop_success = bool(not collision and wp_final is not None
+                            and wp_final <= REACH_RADIUS)
     else:
         reached = wp_min is None or wp_min <= waypoint_radius
         success = bool(not collision and max_x is not None and max_x >= goal_x and reached)
+        stop_success = success
     infer = [float(a["infer_ms"]) for a in actions if a.get("infer_ms") is not None]
     return {"steps": len(actions), "collision": collision, "stuck": stuck,
             "false_forward": false_forward, "success": success,
+            "stop_success": stop_success,
             "max_x": max_x, "waypoint_min_dist": wp_min,
             "final_waypoint_dist": wp_final, "stopped": stopped, "infer_ms": infer}
 
@@ -228,6 +239,8 @@ def aggregate(episodes):
     return {
         "episodes_done": n,
         "success_rate": rate("success"),
+        # 旧「末位姿在 1.5 m 内」口径，保留对照；主指标改看 success_rate。
+        "stop_success_rate": rate("stop_success"),
         "collision_rate": rate("collision"),
         # stuck 是「被挡住没动」而非接触；EVAL_STANDARD 要求单列，不能混进碰撞率。
         "stuck_rate": rate("stuck"),
@@ -511,10 +524,11 @@ def main():
     report = {"schema": "uavrgb.eval.v1", "policy": args.policy,
               "task": args.task, "window_from": args.window_from,
               "text_mode": args.text_mode, "text_dim": text_dim,
-              # 成功语义跟着数据走：L1 是 goal-reach「末态在 waypoint 1.5 m 内」，
-              # 旧数据是 route-choice「越过终点」。不写死会让新旧 SR 被直接混报。
-              # 2026-11-01 之前的 L1 产物是 goal_stop（含 SAFE 判定），两者不可比。
-              "success_criterion": ("goal_reach" if stop_radius_used is not None
+              # 成功语义跟着数据走：L1 是 goal_reach_ever「轨迹上曾进入 waypoint
+              # 1.5 m 且无碰撞」，旧数据是 route_choice「越过终点」。不写死会让新旧
+              # SR 被直接混报。历史口径：2026-11-01 前是 goal_stop（含 SAFE 判定），
+              # 2026-11-01~11-02 是 goal_reach（**末位姿**在 1.5 m 内），三者都不可比。
+              "success_criterion": ("goal_reach_ever" if stop_radius_used is not None
                                     else "route_choice"),
               "goal_margin": args.goal_margin,
               "waypoint_radius": WAYPOINT_RADIUS,
@@ -538,7 +552,8 @@ def main():
 
     print("\n== 闭环评测 ==")
     print(f"episodes={agg['episodes_done']}/{args.episodes}  "
-          f"SR={agg['success_rate']}  collision={agg['collision_rate']}  "
+          f"SR={agg['success_rate']}  "
+          f"SR_stop={agg['stop_success_rate']}  collision={agg['collision_rate']}  "
           f"stuck={agg['stuck_rate']}  "
           f"false_forward={agg['false_forward_rate']}")
     im = agg["inference_ms"]

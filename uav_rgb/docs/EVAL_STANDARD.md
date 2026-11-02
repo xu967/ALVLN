@@ -176,16 +176,26 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
   （含学生推理进程崩溃）进 `failed`，不进分子分母。因此绝对 SR 对失败集是乐观的；
   报告必须同时给 `failed` 数。盲前进基线同口径，两个基线对比仍公平。
 - **处理时间 p50/p95** 是学生策略前向 + 决策，不含物理执行；本机 GPU 数字，不是板端。
-- **L1 goal-reach（2026-11-01 起，`success_criterion="goal_reach"`）**：`stop_radius`
-  非空时 success = 无碰撞 + 最终位姿距 waypoint ≤ `REACH_RADIUS`（1.5 m）。
-  **不再要求末动作是 `SAFE_NEUTRAL`**：waypoint 在柱阵外侧 ±2.4 m，相机 60° 视场在
-  真停止点上 40% 的帧一根柱子都看不到，「停」本身不可观测
-  （见 `worklog/2026-11-01-2130-stop-point-unobservable.md`）。
+- **L1 goal-reach-ever（2026-11-02 起，主指标，`success_criterion="goal_reach_ever"`）**：
+  `stop_radius` 非空时 success = 无碰撞 + **轨迹上曾**进入 waypoint 的
+  `REACH_RADIUS`（1.5 m）球内（`waypoint_min_dist ≤ 1.5`）。
+  **改口径的原因**：waypoint 是柱阵外侧一个没有视觉标记的点，原口径要求「末位姿」
+  落在 1.5 m 内，实际在考「停的时机」。实测有集次飞到距航点 0.03–0.17 m 却继续
+  飞走 4–10 m，按末位姿算「完全没到」，和「根本没走过去」混为一谈，掩盖了导航能力。
+  同一批数据两种口径的差距很大（v4 keep 47 集：0.574 vs 0.404）。
+  **不要求末动作是 `SAFE_NEUTRAL`**：相机 60° 视场在真停止点上 40% 的帧一根柱子
+  都看不到，「停」本身不可观测（见 `worklog/2026-11-01-2130-stop-point-unobservable.md`）。
   1.5 m 由几何定，不是调出来的：< 两候选 waypoint 最小间距 3.23 m 的一半
   （否则停在中间的无人机对 keep 和 shuffle 都算成功，反事实失效），
   < 出生点到 waypoint 的最小距离 2.50 m（否则原地不动也算成功）。
+  **语言证据仍然成立**：v4 shuffle 47 集在新口径下依旧是 **0.000**（keep 0.574），
+  说明放宽的是"到位判定"，不是语言判定。
+- **L1 goal-reach-stop（2026-11-01 ~ 11-02 的历史口径，`success_criterion="goal_reach"`）**：
+  success = 无碰撞 + **最终位姿**距 waypoint ≤ `REACH_RADIUS`（1.5 m）。
+  现在仍照常计算并写入 `stop_success_rate` 与 per_episode 的 `stop_success`，用于对照
+  「会不会停」，但不作为主指标。**两种口径的 SR 不可混报。**
   `eval.json` 顶层记录 `success_criterion`/`stop_radius`/`text_dim`，
-  per_episode 记录 `final_waypoint_dist`；`stopped` 仍返回但不参与判定。
+  per_episode 记录 `waypoint_min_dist`/`final_waypoint_dist`；`stopped` 仅作诊断。
 - **L1 goal-stop（2026-11-01 之前的历史口径，`success_criterion="goal_stop"`）**：
   success = 无碰撞 + 最终位姿距 waypoint ≤ `stop_radius + 0.2 m` + 末动作
   `SAFE_NEUTRAL`。**两种口径的 SR 不可混报。**

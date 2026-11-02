@@ -280,7 +280,7 @@ collision 0.45、false_forward 0.30、stuck 0；产物
 
 | 文件 | 改动 |
 | --- | --- |
-| `sim/tools/eval_closed_loop.py` | `REACH_RADIUS = 1.5`；L1 分支 success = 无碰撞 + 末态 ≤1.5 m，**末动作不参与**；`success_criterion="goal_reach"` |
+| `sim/tools/eval_closed_loop.py` | `REACH_RADIUS = 1.5`；L1 分支 success = 无碰撞 + **轨迹上曾进入** ≤1.5 m，**末动作不参与**；`success_criterion="goal_reach_ever"`（2026-11-02 改，旧口径 `goal_reach` 仍在 `stop_success` 里） |
 | `sim/tools/test_eval_summary.py` | L1 断言跟改 + 1.4/1.6 m 边界 + 「到位但撞柱」两条守卫 |
 | `docs/EVAL_STANDARD.md §5.1` | 补 goal_reach 口径与 1.5 m 的几何来历；修正关系词定义 |
 
@@ -509,12 +509,19 @@ python3 sim/tools/probe_text_effect.py --src .../l1-v4-relation-500 \
 外加碰撞率、`false_forward_rate`、动作分布、推理 p50/p95。
 **PO / EO / AGV / MP 仍未实现**（缺 `d_min` A*），只有 SR 是完整的。
 
-**L1 的 SR 有两种口径，`eval.json` 的 `success_criterion` 区分，不可混报**：
+**L1 的 SR 有三种口径，`eval.json` 的 `success_criterion` 区分，不可混报**：
 
 | 口径 | 判据 | 用于 |
 | --- | --- | --- |
-| `goal_reach`（**2026-11-01 起**） | 无碰撞 + 末态距 waypoint ≤ **1.5 m** | L1 v4 |
+| `goal_reach_ever`（**2026-11-02 起，主指标**） | 无碰撞 + **轨迹上曾**进入 waypoint 1.5 m | 新全部评测 |
+| `goal_reach`（2026-11-01 ~ 11-02） | 无碰撞 + **末态**距 waypoint ≤ **1.5 m** | 旧产物；新产物仍写进 `stop_success` |
 | `goal_stop`（历史） | 无碰撞 + 末态 ≤ `stop_radius+0.2`（0.7 m）+ 末动作 `SAFE_NEUTRAL` | L1 v2/v3 |
+
+改口径的原因：waypoint 是柱阵外侧一个**没有视觉标记的点**，"末态在 1.5 m 内"实际在考
+"停的时机"。实测有集次飞到距航点 0.03–0.17 m 后继续飞走 4–10 m，按末态算"完全没到"，
+和"根本没走过去"混为一谈，掩盖了导航能力。同一批数据的差距：
+v4 keep 47 集 `goal_reach_ever` 0.574 vs `goal_reach` 0.404。
+**语言证据不受影响**：v4 shuffle 在新口径下依旧 0.000。
 
 **v1 走廊任务的 SR（0.90）和 L1 的 SR（0.426）不可比**，任务定义不同。
 

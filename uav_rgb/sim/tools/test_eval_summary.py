@@ -64,7 +64,28 @@ def main():
     # 到位但撞了柱：不算成功
     s = ec.summarize_episode([{"collision": True, "src": "contact", "action_executed": 0}],
                              oracle_stop, 6.0, wp, stop_radius=0.5)
-    assert not s["success"], s
+    assert not s["success"] and not s["stop_success"], s
+
+    # 2026-11-02 口径：success 看「轨迹上曾进入 1.5 m」，stop_success 看「末位姿」。
+    # 到过 0.1 m 又飞走到 5 m：算 success，不算 stop_success。
+    flyby = [{"collision": False, "action_executed": 0},
+             {"collision": False, "action_executed": 1}]
+    oracle_flyby = [{"pose_gt": {"x": 2.1, "y": 1.1}}, {"pose_gt": {"x": 7.0, "y": 1.0}}]
+    s = ec.summarize_episode(flyby, oracle_flyby, 6.0, wp, stop_radius=0.5)
+    assert s["success"] and not s["stop_success"], s
+    assert s["waypoint_min_dist"] < 0.2 and s["final_waypoint_dist"] >= 5.0, s
+
+    # 全程在 1.5 m 外：两个口径都不算成功
+    s = ec.summarize_episode(flyby, [{"pose_gt": {"x": 5.0, "y": 1.0}},
+                                     {"pose_gt": {"x": 5.5, "y": 1.0}}],
+                             6.0, wp, stop_radius=0.5)
+    assert not s["success"] and not s["stop_success"], s
+
+    # 经过时撞柱：即使进入过 1.5 m 也不算成功（两个口径都要无碰撞）
+    s = ec.summarize_episode(
+        [{"collision": True, "src": "contact", "action_executed": 1}],
+        [{"pose_gt": {"x": 2.1, "y": 1.1}}], 6.0, wp, stop_radius=0.5)
+    assert not s["success"] and not s["stop_success"], s
 
     print("test_eval_summary: PASS")
     return 0
