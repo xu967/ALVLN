@@ -27,9 +27,9 @@ def _make_dataset(data_root, split, seq_len):
     return EpisodeSequenceDataset(path, seq_len=seq_len)
 
 
-def _accuracy(model, loader, device):
+def _predict(model, loader, device):
     model.eval()
-    correct = total = 0
+    gts, preds = [], []
     with torch.no_grad():
         for batch in loader:
             logits = model(
@@ -38,10 +38,28 @@ def _accuracy(model, loader, device):
                 batch["pose"].to(device),
                 batch["text"].to(device),
             )
-            pred = logits.argmax(dim=1)
-            correct += int((pred == batch["label"].to(device)).sum())
-            total += len(batch["label"])
-    return correct / total if total else 0.0
+            preds.extend(logits.argmax(dim=1).cpu().tolist())
+            gts.extend(batch["label"].cpu().tolist())
+    return gts, preds
+
+
+def _accuracy(gts, preds):
+    return sum(g == p for g, p in zip(gts, preds)) / len(gts) if gts else 0.0
+
+
+def _macro_f1(gts, preds, n=4):
+    """宏 F1（只对 GT 中出现过的类求平均）；YAW 召回低时它不会像 acc 那样被掩盖。"""
+    f1s = []
+    for c in range(n):
+        tp = sum(g == c and p == c for g, p in zip(gts, preds))
+        fp = sum(g != c and p == c for g, p in zip(gts, preds))
+        fn = sum(g == c and p != c for g, p in zip(gts, preds))
+        if tp + fn == 0:
+            continue
+        prec = tp / (tp + fp) if tp + fp else 0.0
+        rec = tp / (tp + fn)
+        f1s.append(2 * prec * rec / (prec + rec) if prec + rec else 0.0)
+    return sum(f1s) / len(f1s) if f1s else 0.0
 
 
 def main():
@@ -57,6 +75,8 @@ def main():
                    default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--pretrained", action="store_true",
                    help="ResNet18 加载 ImageNet 权重（需联网下载，默认关闭）")
+    p.add_argument("--class-weights", choices=("auto", "none"), default="auto",
+                   help="auto=训练集逆频率加权（YAW 只占 8.8%%，不加权会被 FORWARD 淹没）")
     args = p.parse_args()
 
     train_ds = _make_dataset(args.data, "train", args.seq_len)
@@ -77,7 +97,18 @@ def main():
     device = torch.device(args.device)
     model = PrivilegedTeacher(pretrained=args.pretrained).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
-    criterion = nn.CrossEntropyLoss()
+    if args.class_weights == "auto":
+        counts = [0] * 4
+        for s in train_ds.samples:
+            counts[s["label"]] += 1
+        total = sum(counts)
+        weights = [total / (4 * c) if c else 0.0 for c in counts]
+        print(f"class counts={counts} weights={[round(w, 3) for w in weights]}",
+              file=sys.stderr)
+        criterion = nn.CrossEntropyLoss(
+            weight=torch.tensor(weights, dtype=torch.float32, device=device))
+    else:
+        criterion = nn.CrossEntropyLoss()
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -105,15 +136,19 @@ def main():
             total_loss += float(loss) * len(label)
             seen += len(label)
 
-        train_acc = _accuracy(model, train_loader, device)
+        gts, preds = _predict(model, train_loader, device)
+        train_acc = _accuracy(gts, preds)
         if val_loader is not None:
-            metric = _accuracy(model, val_loader, device)
-            metric_name = "val_acc"
+            gts_v, preds_v = _predict(model, val_loader, device)
+            metric = _macro_f1(gts_v, preds_v)
+            metric_name = "val_macro_f1"
+            extra = f"val_acc={_accuracy(gts_v, preds_v):.4f}"
         else:
-            metric = train_acc
-            metric_name = "train_acc"
+            metric = _macro_f1(gts, preds)
+            metric_name = "train_macro_f1"
+            extra = f"train_acc={train_acc:.4f}"
         print(f"epoch {epoch}/{args.epochs} loss={total_loss / max(seen, 1):.4f} "
-              f"train_acc={train_acc:.4f} {metric_name}={metric:.4f}",
+              f"train_acc={train_acc:.4f} {extra} {metric_name}={metric:.4f}",
               file=sys.stderr)
 
         if metric > best_metric:

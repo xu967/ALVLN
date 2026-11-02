@@ -165,7 +165,9 @@ void write_run_config(const std::string& out_dir, const TrainConfig& cfg,
      << ",\"drop_collision\":" << (cfg.drop_collision ? "true" : "false")
      << ",\"class_weights\":[";
   for (std::size_t i = 0; i < weights.size(); ++i) os << (i ? "," : "") << weights[i];
-  os << "],\"class_weights_source\":" << quote(source) << "}\n";
+  os << "],\"class_weights_source\":" << quote(source)
+     << ",\"soft_targets\":" << quote(cfg.soft_targets)
+     << ",\"distill_alpha\":" << cfg.distill_alpha << "}\n";
   const std::string path = out_dir + "/config.json";
   std::ofstream f(path, std::ios::trunc);
   if (!f) throw std::runtime_error("trainer: 无法写 " + path);

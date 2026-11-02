@@ -632,9 +632,11 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             depth_hw = np.asarray(d, dtype=np.float32).reshape(h, w)
             if not isinstance(pose_before, dict) or yaw_before is None:
                 raise ValueError("缺少 pose_before/yaw_before")
+            if not isinstance(waypoint, dict):
+                raise ValueError("teacher-nn 需要 waypoint 作为特权输入（用 --task l1）")
             pose_xyz = (pose_before["x"], pose_before["y"], pose_before["z"])
             action = teacher_nn.act(rgb_hwc, depth_hw, pose_xyz, yaw_before,
-                                    text_ids)
+                                    (waypoint["x"], waypoint["y"]), text_ids)
         except Exception as e:  # noqa: BLE001 - 推理任何失败都算本步失败
             return None, f"teacher-nn 推理失败: {type(e).__name__}: {e}"
     else:  # policy == "forward": 盲策略（恒定前进），用于撞柱/基线对照

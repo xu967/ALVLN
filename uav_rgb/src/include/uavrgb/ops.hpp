@@ -69,6 +69,16 @@ float softmax_ce_loss_weighted(const Tensor& logits, const std::vector<int>& lab
 Tensor softmax_ce_grad_weighted(const Tensor& logits, const std::vector<int>& labels,
                                 const std::vector<float>& weights);
 
+// 蒸馏用的软标签交叉熵（教师 -> 学生）。q[i*C+j] 是教师对第 i 个样本给出的
+// 类别分布（须非负有限、每行和为 1），labels 是硬标签，alpha ∈ [0,1] 是软标签权重：
+//   L = α·(-Σ_i Σ_j q_ij·log p_ij / N) + (1-α)·(-Σ_i log p_i[y_i] / N)
+//   dlogits_ij = (α·(p_ij - q_ij) + (1-α)·(p_ij - 1[j==y_i])) / N
+// α=0 时与无权 softmax 交叉熵逐位一致（硬标签项同一表达式）。
+float softmax_ce_loss_soft(const Tensor& logits, const std::vector<int>& labels,
+                           const std::vector<float>& q, float alpha);
+Tensor softmax_ce_grad_soft(const Tensor& logits, const std::vector<int>& labels,
+                            const std::vector<float>& q, float alpha);
+
 // FP64 有限差分 gradcheck：对 Linear 的每个权重/偏置扰动，返回 max abs 误差。
 double gradcheck_linear(const Linear& m, const Tensor& x, const std::vector<int>& labels,
                         double eps = 1e-6);

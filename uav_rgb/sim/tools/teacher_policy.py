@@ -4,7 +4,7 @@
 输入口径与 teacher/dataset.py 完全对齐：
   rgb   [T,3,224,224]  [0,1] + ImageNet 归一化
   depth [T,1,224,224]  单位米（collect 的 R_FLOAT32 原始读数，不再 /65535）
-  pose  [T,6]          [x, y, z, yaw(rad), vx, vy]
+  pose  [T,8]          [x, y, z, yaw(rad), vx, vy, goal_fwd, goal_left]
   text  [9]            instruction.tokenize + PAD
 
 torch 惰性 import：解释器里没有（或装坏）torch 时抛带解释器建议的
@@ -25,7 +25,7 @@ TEACHER_DIR = os.path.join(REPO_ROOT, "teacher")
 
 TEXT_LEN = 9        # 与 teacher/dataset.py、src/include/uavrgb/text.hpp 一致
 TEXT_VOCAB = 22
-POSE_DIM = 6
+POSE_DIM = 8
 IMAGE_SIZE = 224
 NUM_ACTIONS = 4
 
@@ -84,7 +84,7 @@ class _FrameBuffer:
         self._frames = collections.deque(maxlen=self.seq_len)
         self._prev_xyz = None
 
-    def append(self, rgb_hwc, depth_m, pose_xyz, yaw_deg):
+    def append(self, rgb_hwc, depth_m, pose_xyz, yaw_deg, waypoint_xy):
         x, y, z = (float(v) for v in pose_xyz)
         if self._prev_xyz is None:
             vx = vy = 0.0
@@ -92,8 +92,12 @@ class _FrameBuffer:
             vx = (x - self._prev_xyz[0]) / _POSE_DT_S
             vy = (y - self._prev_xyz[1]) / _POSE_DT_S
         self._prev_xyz = (x, y, z)
-        pose = np.array([x, y, z, float(np.radians(yaw_deg)), vx, vy],
-                        dtype=np.float32)
+        yaw_rad = float(np.radians(yaw_deg))
+        # 机身系目标向量（前向/左向），与 dataset._pose_sequence 同口径。
+        dx, dy = float(waypoint_xy[0]) - x, float(waypoint_xy[1]) - y
+        c, s = np.cos(yaw_rad), np.sin(yaw_rad)
+        pose = np.array([x, y, z, yaw_rad, vx, vy,
+                         dx * c + dy * s, -dx * s + dy * c], dtype=np.float32)
         self._frames.append((_prep_rgb(rgb_hwc, self.image_size),
                              _prep_depth(depth_m, self.image_size), pose))
 
@@ -154,9 +158,9 @@ class TeacherPolicy:
         self.model = model
         self.buffer = _FrameBuffer(seq_len)
 
-    def act(self, rgb_hwc, depth_m, pose_xyz, yaw_deg, text_ids):
+    def act(self, rgb_hwc, depth_m, pose_xyz, yaw_deg, waypoint_xy, text_ids):
         """追加一帧观测并返回动作 int(0..3)。rgb_hwc 是 HWC uint8，depth_m 是 HxW 米。"""
-        self.buffer.append(rgb_hwc, depth_m, pose_xyz, yaw_deg)
+        self.buffer.append(rgb_hwc, depth_m, pose_xyz, yaw_deg, waypoint_xy)
         rgb, depth, pose, text = self.buffer.build(text_ids)
         torch = self.torch
         with torch.no_grad():

@@ -15,6 +15,7 @@ add_library(uavrgb_core
   tensor.cpp
   ops_cpu.cpp
   ops_weighted.cpp
+  ops_soft.cpp
   conv_cpu.cpp
   conv_gradcheck.cpp
   nn_cpu.cpp
@@ -104,6 +105,15 @@ add_test(NAME test_eval_only COMMAND test_eval_only)
 add_executable(test_weighted_loss tests/test_weighted_loss.cpp)
 target_link_libraries(test_weighted_loss PRIVATE uavrgb_core)
 add_test(NAME test_weighted_loss COMMAND test_weighted_loss)
+
+# 软标签（蒸馏）损失。
+add_executable(test_soft_loss tests/test_soft_loss.cpp)
+target_link_libraries(test_soft_loss PRIVATE uavrgb_core)
+add_test(NAME test_soft_loss COMMAND test_soft_loss)
+
+add_executable(test_soft_targets_train tests/test_soft_targets_train.cpp)
+target_link_libraries(test_soft_targets_train PRIVATE uavrgb_core)
+add_test(NAME test_soft_targets_train COMMAND test_soft_targets_train)
 
 add_executable(test_dataset_filter tests/test_dataset_filter.cpp)
 target_link_libraries(test_dataset_filter PRIVATE uavrgb_core)

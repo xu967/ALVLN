@@ -23,7 +23,7 @@ void usage() {
                "用法: uavrgb_train --data <dataset.uavr> --epochs N --batch B --lr L "
                "--out <run_dir> [--resume <ckpt>] [--seed S] [--max-grad-norm G] "
                "[--class-weights auto|<w0,w1,w2,w3>] [--drop-collision] "
-               "[--text-dim N]\n"
+               "[--text-dim N] [--soft-targets <bin> [--distill-alpha A]]\n"
                "  或: uavrgb_train --data <dataset.uavr> --eval-only <ckpt> --out "
                "<run_dir> [--batch B] [--split val|test|all] [--drop-collision]\n");
 }
@@ -64,6 +64,13 @@ int main(int argc, char** argv) {
       } else if (a == "--text-dim") {
         cfg.text_dim = std::stoi(next("--text-dim"));
         if (cfg.text_dim < 0) throw std::invalid_argument("--text-dim 不能为负");
+      } else if (a == "--soft-targets") {
+        cfg.soft_targets = next("--soft-targets");
+      } else if (a == "--distill-alpha") {
+        cfg.distill_alpha = std::stof(next("--distill-alpha"));
+        if (!(cfg.distill_alpha >= 0.0f) || !(cfg.distill_alpha <= 1.0f)) {
+          throw std::invalid_argument("--distill-alpha 必须在 [0,1]");
+        }
       } else if (a == "--eval-only") {
         eval_ckpt = next("--eval-only");
       } else if (a == "--split") {

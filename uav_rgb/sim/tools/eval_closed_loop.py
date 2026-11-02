@@ -293,6 +293,8 @@ def run_episode(seed, args, workdir, seen_gids):
                "--scene-id", str(seed), "--seed", str(seed),
                "--scene-meta", eval_meta_path, "--split", split,
                "--window-from", args.window_from]
+        if args.save_depth:
+            cmd += ["--save-depth"]
         if args.policy == "student":
             cmd += ["--student-ckpt", args.ckpt]
             if args.infer_bin:
@@ -380,6 +382,8 @@ def main():
     p.add_argument("--sim-timeout", type=float, default=120.0)
     p.add_argument("--episode-timeout", type=float, default=600.0)
     p.add_argument("--keep-work", action="store_true", help="保留 world/每集原始文件")
+    p.add_argument("--save-depth", action="store_true",
+                   help="保留每步 16 位深度 PNG（诊断闭环失败用；配合 --keep-work）")
     args = p.parse_args()
     if args.window_from is None:
         args.window_from = "observation"

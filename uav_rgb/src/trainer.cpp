@@ -35,6 +35,36 @@ std::string num(double v) {
   return b;
 }
 
+// 读蒸馏软标签：扁平 float32 [n*C]，字节数必须严格等于 n*C*4，否则说明数据集与
+// 软标签不是同一次采集/同一份预处理（错位会静默把样本 A 的教师分布喂给样本 B）。
+std::vector<float> load_soft_targets(const TrainConfig& cfg, const UavrDataset& ds) {
+  if (cfg.soft_targets.empty()) return {};
+  if (!cfg.class_weights.empty()) {
+    throw std::invalid_argument(
+        "trainer: --soft-targets 与 --class-weights 互斥（两种 loss 的归一化口径不同）");
+  }
+  if (!(cfg.distill_alpha >= 0.0f) || !(cfg.distill_alpha <= 1.0f)) {
+    throw std::invalid_argument("trainer: --distill-alpha 必须在 [0,1]");
+  }
+  const std::size_t c = ds.num_classes;
+  const std::size_t want = static_cast<std::size_t>(ds.n) * c * sizeof(float);
+  std::error_code ec;
+  const auto got = std::filesystem::file_size(cfg.soft_targets, ec);
+  if (ec) throw std::runtime_error("trainer: 读不到软标签文件 " + cfg.soft_targets);
+  if (got != want) {
+    throw std::runtime_error(
+        "trainer: 软标签大小 " + std::to_string(got) + " 字节，期望 " + std::to_string(want) +
+        "（n=" + std::to_string(ds.n) + " C=" + std::to_string(c) +
+        "）；软标签与数据集不是同一次采集");
+  }
+  std::vector<float> q(static_cast<std::size_t>(ds.n) * c);
+  std::ifstream f(cfg.soft_targets, std::ios::binary);
+  if (!f || !f.read(reinterpret_cast<char*>(q.data()), static_cast<std::streamsize>(want))) {
+    throw std::runtime_error("trainer: 读软标签内容失败 " + cfg.soft_targets);
+  }
+  return q;
+}
+
 // resume 的历史 best 必须能在新目录独立交付：同目录核对文件存在且状态一致；
 // 跨目录先核对再复制，绝不能让新 run 继承一个分数却没有对应权重文件。
 void carry_resume_best(const std::string& resume_path, const std::string& out_dir,
@@ -112,6 +142,7 @@ void Trainer::run() {
 
   class_weights_ = resolve_class_weights(cfg_.class_weights, ds);
   class_weights_source_ = class_weights_source(cfg_.class_weights);
+  soft_targets_ = load_soft_targets(cfg_, ds);
 
   if (cfg_.text_dim > 0 && ds.text_ids.empty()) {
     throw std::runtime_error(
@@ -189,9 +220,20 @@ void Trainer::run() {
       std::vector<std::uint8_t> text;
       if (cfg_.text_dim > 0) ds.load_text(part, text);
 
+      // 蒸馏批次：按全局样本下标 gather 教师分布，与 order/part 严格对齐。
+      std::vector<float> q;
+      if (!soft_targets_.empty()) {
+        q.resize(part.size() * ds.num_classes);
+        for (std::size_t i = 0; i < part.size(); ++i) {
+          const float* src = soft_targets_.data() + static_cast<std::size_t>(part[i]) * ds.num_classes;
+          std::copy(src, src + ds.num_classes, q.begin() + i * ds.num_classes);
+        }
+      }
+
       CnnCache cache;
       const Tensor logits = forward(model_, x, &cache, text.empty() ? nullptr : &text);
-      const float loss = class_weighted_loss(logits, y, class_weights_);
+      const float loss = q.empty() ? class_weighted_loss(logits, y, class_weights_)
+                                   : softmax_ce_loss_soft(logits, y, q, cfg_.distill_alpha);
       if (!std::isfinite(loss)) {
         metrics << metrics_json(make_error(Severity::kFatal, "TRAIN_NONFINITE_METRIC", step + 1,
                                            "训练 loss 非有限值，中止"))
@@ -201,7 +243,9 @@ void Trainer::run() {
       }
       const float acc = static_cast<float>(count_correct(logits, y)) /
                         static_cast<float>(part.size());
-      const Tensor dlogits = class_weighted_grad(logits, y, class_weights_);
+      const Tensor dlogits = q.empty()
+                                 ? class_weighted_grad(logits, y, class_weights_)
+                                 : softmax_ce_grad_soft(logits, y, q, cfg_.distill_alpha);
       CnnGrad g = backward(model_, cache, dlogits);
 
       std::vector<Tensor*> gts = cnn_grad_tensors(g);
@@ -219,7 +263,9 @@ void Trainer::run() {
       check_out(metrics, "metrics.jsonl");
 
       // results.csv 的 train_ce 必须与 dev_ce 同口径（都是无权 CE），否则两列不可比。
-      const float plain = class_weights_.empty() ? loss : softmax_ce_loss_cuda(logits, y);
+      const float plain = (class_weights_.empty() && soft_targets_.empty())
+                              ? loss
+                              : softmax_ce_loss_cuda(logits, y);
       ce_sum += static_cast<double>(plain) * static_cast<double>(part.size());
       seen += part.size();
     }

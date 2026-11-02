@@ -12,7 +12,7 @@ TEXT_LEN = 9        # 与 text.hpp kTextLen 一致
 TEXT_VOCAB = 22     # 与 text.hpp kTextVocab 一致
 VISUAL_DIM = 512
 DEPTH_DIM = 64
-POSE_DIM = 6        # [x, y, z, yaw, vx, vy]，由 dataset.py 组装
+POSE_DIM = 8        # [x, y, z, yaw, vx, vy, goal_fwd, goal_left]，由 dataset.py 组装
 NUM_ACTIONS = 4
 
 

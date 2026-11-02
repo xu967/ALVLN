@@ -30,6 +30,10 @@ struct TrainConfig {
   // >0 时启用文本分支：embedding[kTextVocab, text_dim] → 按位置拼接 → FiLM。
   // 需要 dataset 旁边有 instructions.jsonl 侧车（preprocess.py 写）。
   int text_dim = 0;
+  // 非空时启用蒸馏：扁平 float32 [n*C] 软标签（tools/join_soft_targets.py 产出），
+  // 第 k 行对应数据集第 k 个样本。与 --class-weights 互斥（两种 loss 归一化口径不同）。
+  std::string soft_targets;
+  float distill_alpha = 0.5f;  // 软标签项权重；0 = 退化为纯硬标签
 };
 
 // 一条 MetricsEvent 的 JSON 序列化（单行、无换行）。字段名与 event.hpp 一致。
@@ -78,6 +82,7 @@ class Trainer {
   TrainState state_;
   std::vector<float> class_weights_;          // 最终生效权重（同时写进 state_/checkpoint）
   std::string class_weights_source_ = "none";  // "none"/"auto"/"explicit"/"checkpoint"
+  std::vector<float> soft_targets_;  // [n*C]；空 = 不蒸馏
   double elapsed_sec_ = 0.0;
   double test_acc_ = -1.0;
   std::uint64_t samples_seen_ = 0;

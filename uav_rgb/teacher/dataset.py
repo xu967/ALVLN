@@ -25,7 +25,7 @@ import instruction  # noqa: E402
 TEXT_LEN = 9        # 与 src/include/uavrgb/text.hpp kTextLen 一致
 TEXT_VOCAB = 22     # 与 src/include/uavrgb/text.hpp kTextVocab 一致
 NUM_ACTIONS = 4
-POSE_DIM = 6        # [x, y, z, yaw(rad), vx, vy]
+POSE_DIM = 8        # [x, y, z, yaw(rad), vx, vy, goal_fwd, goal_left]
 IMAGE_SIZE = 224    # RGB/深度统一缩放到该边长
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -80,12 +80,15 @@ def _depth_path(ep_dir, manifest, row):
     return p if p.is_absolute() else ep_dir / p
 
 
-def _pose_sequence(rows):
-    """actions.jsonl 行 -> (T,6) 位姿；缺字段返回 None。
+def _pose_sequence(rows, waypoint):
+    """actions.jsonl 行 -> (T,8) 位姿+目标向量；缺字段返回 None。
 
     假设 pose_before 含 x/y/z，yaw_before 为角度；这里转弧度。
     vx/vy 用相邻帧 rgb_ts 差分，首帧为 0。
+    末两维是**机身系**的目标向量（前向/左向）：教师是特权模型，允许直接知道
+    终点在哪；否则它要从图像和指令里反推，等于把学生要学的难题也丢给教师。
     """
+    wx, wy = waypoint
     poses = []
     prev_xyz = None
     prev_ts = None
@@ -107,7 +110,9 @@ def _pose_sequence(rows):
             dt = (ts - prev_ts) / 1e9
             vx = (x - prev_xyz[0]) / dt
             vy = (y - prev_xyz[1]) / dt
-        poses.append([x, y, z, yaw_rad, vx, vy])
+        dx, dy = wx - x, wy - y
+        c, s = math.cos(yaw_rad), math.sin(yaw_rad)
+        poses.append([x, y, z, yaw_rad, vx, vy, dx * c + dy * s, -dx * s + dy * c])
         prev_xyz = (x, y, z)
         prev_ts = ts
     return np.asarray(poses, dtype=np.float32)
@@ -149,11 +154,13 @@ class EpisodeSequenceDataset(Dataset):
     """split 目录（train/val/test 之一）下每个 episode 目录一个序列样本。"""
 
     def __init__(self, split_dir, seq_len, image_size=IMAGE_SIZE,
-                 require_depth=True, stride=1):
+                 require_depth=True, stride=1, cache_frames=True):
         self.seq_len = int(seq_len)
         self.stride = max(1, int(stride))
         self.image_size = int(image_size)
         self.require_depth = bool(require_depth)
+        # 滑窗会重复读同一帧；本机内存充足，缓存解码后的数组（每帧约 0.6 MB）。
+        self._cache = {} if cache_frames else None
         if self.seq_len < 1:
             raise ValueError("seq_len 必须 >= 1")
         root = Path(split_dir)
@@ -197,6 +204,10 @@ class EpisodeSequenceDataset(Dataset):
             # 与 text.hpp 一致：超长不截断，整集跳过。
             _warn(f"跳过 {ep_dir}: 指令 {len(text_ids)} token > {TEXT_LEN}")
             return None
+        wp = manifest.get("waypoint")
+        if not isinstance(wp, dict) or "x" not in wp or "y" not in wp:
+            _warn(f"跳过 {ep_dir}: manifest 缺 waypoint（教师需要它作为特权输入）")
+            return None
         text_ids = text_ids + [instruction.PAD] * (TEXT_LEN - len(text_ids))
 
         actions_path = ep_dir / "actions.jsonl"
@@ -238,7 +249,7 @@ class EpisodeSequenceDataset(Dataset):
                     return None
                 depth_all.append(depth_path)
 
-        poses = _pose_sequence(rows)
+        poses = _pose_sequence(rows, (float(wp["x"]), float(wp["y"])))
         if poses is None:
             _warn(f"跳过 {ep_dir}: actions.jsonl 缺 pose_before/yaw_before")
             return None
@@ -252,7 +263,25 @@ class EpisodeSequenceDataset(Dataset):
         episode_id = str(manifest.get("episode_id", ep_dir.name))
         text_arr = np.asarray(text_ids, dtype=np.int64)
         depth_format = manifest.get("depth_format")
+        # 闭环 warm-up：推理前 seq_len-1 步缓冲还没填满，_FrameBuffer 用**首帧重复**
+        # 补齐。训练必须见过同样的拼接，否则闭环第 0/1 步（专家 70%/58% 是转向）
+        # 会被判成 FORWARD，一开局就直飞、之后再也回不来（2026-11-02 实测闭环
+        # 316 步 0 次转向、SR 0）。不受 stride 影响：闭环开头总会经过。
         out = []
+        for i in range(self.seq_len - 1):
+            idx = [0] * (self.seq_len - i - 1) + list(range(i + 1))
+            out.append({
+                "ep_dir": ep_dir,
+                "rgb_paths": [rgb_all[j] for j in idx],
+                "depth_paths": ([depth_all[j] for j in idx]
+                                if depth_all is not None else None),
+                "depth_format": depth_format,
+                "pose": poses[idx],
+                "text": text_arr,
+                "label": labels[i],
+                "episode_id": episode_id,
+                "step": i,
+            })
         for end in range(self.seq_len, len(rows) + 1, self.stride):
             lo = end - self.seq_len
             out.append({
@@ -271,21 +300,39 @@ class EpisodeSequenceDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def _rgb(self, path):
+        if self._cache is None:
+            return _load_rgb(path, self.image_size)
+        arr = self._cache.get(path)
+        if arr is None:
+            arr = _load_rgb(path, self.image_size)
+            self._cache[path] = arr
+        return arr
+
+    def _depth(self, path, fmt):
+        if self._cache is None:
+            return _load_depth(path, self.image_size, fmt)
+        key = ("depth", path)
+        arr = self._cache.get(key)
+        if arr is None:
+            arr = _load_depth(path, self.image_size, fmt)
+            self._cache[key] = arr
+        return arr
+
     def __getitem__(self, index):
         sample = self.samples[index]
-        rgb = np.stack([
-            _load_rgb(p, self.image_size) for p in sample["rgb_paths"]
-        ])
+        rgb = np.stack([self._rgb(p) for p in sample["rgb_paths"]])
         item = {
             "rgb": torch.from_numpy(rgb).permute(0, 3, 1, 2).contiguous(),
             "pose": torch.from_numpy(sample["pose"]),
             "text": torch.from_numpy(sample["text"]),
             "label": torch.tensor(sample["label"], dtype=torch.long),
             "episode_id": sample["episode_id"],
+            "step": int(sample["step"]),
         }
         if sample["depth_paths"] is not None:
             depth = np.stack([
-                _load_depth(p, self.image_size, sample.get("depth_format"))
+                self._depth(p, sample.get("depth_format"))
                 for p in sample["depth_paths"]
             ])
             item["depth"] = torch.from_numpy(depth).unsqueeze(1).contiguous()
