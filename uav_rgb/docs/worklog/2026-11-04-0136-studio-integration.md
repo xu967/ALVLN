@@ -115,3 +115,44 @@ gz topic -l | grep camera      # → /uav/camera /uav/chase_camera /uav/top_came
 - `install_desktop_entry.sh` 的 `$HOME/Desktop` 在本机不生效（桌面目录是 `$HOME/桌面`）。
 - 工作室作者未在真实 Gazebo 上验证的部分（三视角帧率、GPU 占用）本轮只验到「话题存在且出帧」，
   没有测长时间稳定性。
+
+## 更新 2026-11-04 01:50 — 提交、推送与界面实跑
+
+### 提交
+
+源仓库 `uav_rgb` 分三个主题提交：
+
+| 提交 | 内容 |
+| --- | --- |
+| `a4d769e` | `feat(campus)` 校园场景 + GPU 渲染 + UAVSOFT1（并发会话的工作，因 trainer/collect/eval 三处与本人修复互相纠缠而先落） |
+| `6ec6fe4` | `fix(trainer,collect,eval)` 审计四条缺陷 |
+| `f852582` | `feat(studio)` 桌面工作台接入 |
+
+镜像到 `../ALVLN` 后合并为 `a1d668f` 并推送：`d9e6d6a..a1d668f  main -> main`，
+推送后本地 HEAD 与 `ls-remote` 一致（均为 `a1d668f1ff77`）。
+
+### 可视化界面实跑（`DISPLAY=:20`，XFCE + selkies-gstreamer）
+
+```bash
+DISPLAY=:20 setsid /usr/bin/python3 ui/studio.py \
+  --run-dir /root/rivermind-data/uav_rgb/campus-paired-20261103/student-base &
+```
+
+- 窗口存在：`xwininfo -root -tree` 报
+  `"UAV Navigation Studio · RGB Navigation Research Workbench"` 1500×960，
+  class `tk`/`Tk`（X id `0x32000b9`）。
+- 四个页签（总览/训练/仿真/实验）都创建成功，深色主题渲染正常。
+- 载入真实 run 后 Dashboard 显示：训练轮数 20、Train CE 0.0948、Validation CE 1.1267、
+  **Best Val Macro-F1 0.521、Test Macro-F1 0.239、Test Balanced Acc 0.247**，
+  以及 loss 曲线、validation 三条曲线、`best checkpoint: epoch 20 macro_f1=0.52109996`、
+  test 混淆矩阵与每类召回（SAFE 0.029 / FORWARD 0.674 / LEFT 0.277 / RIGHT 0.008）。
+- 界面自己标注了「这是动作分类指标，不是闭环导航 SR」，口径没有被混淆。
+- 截屏方式：root 窗口在 dummy 驱动下抓出来是全黑，改用
+  `PIL.ImageGrab.grab(bbox=窗口几何, xdisplay=":20")` 才拿到内容。
+
+### 未能验证
+
+- 三个页签的**交互**（点「打开三视角仿真」「开始训练」）没有用自动化点进去，
+  只验证了窗口创建与数据渲染。
+- Simulation 页的三视角需要先起 Gazebo；本轮只验证了三路相机话题能出帧，
+  没在 Studio 里看到实时画面。
