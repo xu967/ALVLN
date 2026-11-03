@@ -262,7 +262,8 @@ def run_episode(seed, args, workdir, seen_gids):
     world = os.path.join(workdir, f"scene_{seed}.sdf")
     meta_path = os.path.join(workdir, f"scene_{seed}.json")
     cmd = [sys.executable, SCENE_GEN, "--seed", str(seed), "--scene-id", str(seed),
-           "--out", world, "--template", args.template, "--task", args.task]
+           "--out", world, "--template", args.template, "--task", args.task,
+           "--appearance", args.appearance]
     if args.task == "l1":
         # v5 关系任务要求两根同色柱横跨出生点，默认 spawn 在 y=0 时
         # assign_landmarks 找不到柱对会直接抛错（采集也是 random）。
@@ -381,6 +382,8 @@ def main():
                    help="L2 消融：keep=原指令；blank=空文本；shuffle=把 left/right 反过来")
     p.add_argument("--task", choices=("base", "l1"), default="base",
                    help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
+    p.add_argument("--appearance", choices=("legacy", "v1"), default="legacy",
+                   help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）")
     p.add_argument("--split", choices=("train", "val", "test"), default="test")
     p.add_argument("--base-seed", type=int, default=0)
     p.add_argument("--max-seeds", type=int, default=500,

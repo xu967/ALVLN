@@ -38,6 +38,7 @@ Chebyshev ≥1.3 m）最多只能放 3×3=9 根；10–12 根必然出现一对�
 import argparse
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -81,6 +82,14 @@ REPO_ROOT = os.path.dirname(SIM_DIR)
 DEFAULT_TEMPLATE = os.path.join(SIM_DIR, "worlds", "uav_rgb.sdf")
 START_MARK = "    <!-- tall pillars"
 END_MARK = "    <!-- X3-equivalent quadrotor"
+# 外观版本：只改材质/光照/固定地标，不动 pillars 几何 → geometry_gid 与旧数据都保留。
+# legacy（默认）与改动前逐字节一致；v1 删掉模板里 3 个固定纯色方块并随机化光照/天空。
+# 背景见 docs/worklog/2026-11-03-sim-scene-realism-proposal.md §1.1 G8/G9。
+APPEARANCE_LEGACY = "legacy"
+APPEARANCE_V1 = "v1"
+LANDMARK_MARK = "    <!-- colored landmarks in front of the spawn (forward = +X) -->"
+LIGHT_MARK = '    <light type="directional" name="sun">'
+LIGHT_END_MARK = "    </light>"
 
 
 def sha256(data):
@@ -240,11 +249,75 @@ def _pillar_xml(p):
     </model>"""
 
 
-def build_scene(template, seed, scene_id, spawn_mode="default", task="base"):
+def appearance_params(seed):
+    """v1 的光照/天空参数；独立 RNG 流，不扰动 sample_pillars/make_spawn。"""
+    rng = random.Random(seed ^ 0x4F0EA7)
+    az = math.radians(rng.uniform(-160.0, -20.0))   # 太阳方位（+X 前方为 0°）
+    el = math.radians(rng.uniform(25.0, 70.0))      # 太阳高度角
+    intensity = rng.uniform(0.60, 0.95)
+    warm = rng.uniform(-0.04, 0.04)                 # 正=偏暖（红多蓝少）
+    return {
+        "light_direction": [round(-math.cos(el) * math.cos(az), 4),
+                            round(-math.cos(el) * math.sin(az), 4),
+                            round(-math.sin(el), 4)],
+        "light_diffuse": [round(min(1.0, intensity * (1.0 + warm)), 4),
+                          round(intensity, 4),
+                          round(max(0.0, intensity * (1.0 - warm)), 4)],
+        "light_specular": round(rng.uniform(0.10, 0.30), 4),
+        "ambient": round(rng.uniform(0.25, 0.45), 4),
+        "background": [round(rng.uniform(0.45, 0.72), 4),
+                       round(rng.uniform(0.55, 0.78), 4),
+                       round(rng.uniform(0.70, 0.92), 4)],
+    }
+
+
+def _apply_appearance(prefix, seed, appearance):
+    """对柱子之前的世界头部做外观替换；legacy 原样返回（必须逐字节不变）。"""
+    if appearance == APPEARANCE_LEGACY:
+        return prefix, None
+    if appearance != APPEARANCE_V1:
+        raise ValueError(f"unknown appearance {appearance!r}")
+    for mark in (LANDMARK_MARK, LIGHT_MARK, LIGHT_END_MARK):
+        if prefix.count(mark) != 1:
+            raise ValueError(f"template marker {mark!r} count != 1")
+    p = appearance_params(seed)
+    # 1) 删掉 3 个固定纯色方块：它们不在 pillars/gid/教师真值里，学生却看得见（G9）。
+    prefix = prefix[:prefix.index(LANDMARK_MARK)]
+    # 2) 换掉固定方向光，并补 <scene>（ambient/background/shadows）。
+    i = prefix.index(LIGHT_MARK)
+    j = prefix.index(LIGHT_END_MARK, i) + len(LIGHT_END_MARK)
+    d, dif, bg = p["light_direction"], p["light_diffuse"], p["background"]
+    block = (
+        "    <scene>\n"
+        f"      <ambient>{p['ambient']:g} {p['ambient']:g} {p['ambient']:g} 1</ambient>\n"
+        f"      <background>{bg[0]:g} {bg[1]:g} {bg[2]:g} 1</background>\n"
+        "      <shadows>true</shadows>\n"
+        "    </scene>\n"
+        '    <light type="directional" name="sun">\n'
+        "      <cast_shadows>true</cast_shadows>\n"
+        "      <pose>0 0 10 0 0 0</pose>\n"
+        f"      <diffuse>{dif[0]:g} {dif[1]:g} {dif[2]:g} 1</diffuse>\n"
+        f"      <specular>{p['light_specular']:g} {p['light_specular']:g} "
+        f"{p['light_specular']:g} 1</specular>\n"
+        "      <attenuation>\n"
+        "        <range>1000</range>\n"
+        "        <constant>0.9</constant>\n"
+        "        <linear>0.01</linear>\n"
+        "        <quadratic>0.001</quadratic>\n"
+        "      </attenuation>\n"
+        f"      <direction>{d[0]:g} {d[1]:g} {d[2]:g}</direction>\n"
+        "    </light>"
+    )
+    return prefix[:i] + block + prefix[j:], p
+
+
+def build_scene(template, seed, scene_id, spawn_mode="default", task="base",
+                appearance=APPEARANCE_LEGACY):
     """返回 (world_text, meta)。template 只读，任何标记异常都直接报错。
 
     task="l1" 时额外给两根柱染同一色并写 relation/instruction/waypoint；
     task="base" 保持原几何与人任务无关的 meta 不变。
+    appearance="v1" 只改头部（删固定地标、随机光照/天空），pillars 几何与 gid 不变。
     """
     if task not in ("base", "l1"):
         raise ValueError(f"unknown task {task!r}")
@@ -265,7 +338,8 @@ def build_scene(template, seed, scene_id, spawn_mode="default", task="base"):
              f"pillars={len(pillars)}; generated, do not edit -->"]
     lines += [_pillar_xml(p) for p in pillars]
     lines.append("")
-    world = template[:start] + "\n".join(lines) + "\n" + template[end:]
+    head, appearance_used = _apply_appearance(template[:start], seed, appearance)
+    world = head + "\n".join(lines) + "\n" + template[end:]
     world = _apply_spawn(world, spawn)
     meta = {
         "schema": "navlab.scene.v1",
@@ -274,6 +348,9 @@ def build_scene(template, seed, scene_id, spawn_mode="default", task="base"):
         "generator": "sim/tools/scene_gen.py",
         # 数据版本：与 SPLIT_SALT 同源，preprocess/audit 用它拦住 v2/v3 混包。
         "geometry_version": GEOMETRY_VERSION,
+        # 外观不参与 geometry_gid：legacy 数据与 v1 数据几何可以互换，
+        # 但外观不同不能混在同一次训练里。
+        "appearance_version": appearance,
         "spawn": spawn,
         "template_sha256": sha256(template.encode("utf-8")),
         "world_sha256": sha256(world.encode("utf-8")),
@@ -297,6 +374,8 @@ def build_scene(template, seed, scene_id, spawn_mode="default", task="base"):
             "ok": True,
         },
     }
+    if appearance_used is not None:
+        meta["appearance"] = appearance_used
     if task == "l1":
         meta.update({
             # v2：goal-stop。waypoint 是最终目标，teacher 在半径内输出 SAFE。
@@ -341,6 +420,8 @@ def run_self_check(template_path, n_seeds):
         try:
             w1, m1 = build_scene(template, seed, seed)
             w2, _ = build_scene(template, seed, seed)
+            v1a, v1m = build_scene(template, seed, seed, appearance=APPEARANCE_V1)
+            v1b, _ = build_scene(template, seed, seed, appearance=APPEARANCE_V1)
         except (ValueError, RuntimeError) as e:
             bad.append((seed, str(e)))
             continue
@@ -348,6 +429,17 @@ def run_self_check(template_path, n_seeds):
         h2 = sha256(w2.encode("utf-8"))
         if h1 != h2:
             bad.append((seed, f"non-deterministic {h1} != {h2}"))
+        # v1 只准改外观：几何必须与 legacy 一致，固定地标必须消失，场景必须有天空。
+        if v1a != v1b:
+            bad.append((seed, "v1 non-deterministic"))
+        if v1m["pillars"] != m1["pillars"]:
+            bad.append((seed, "v1 changed pillar geometry"))
+        if 'name="landmark_' in v1a:
+            bad.append((seed, "v1 仍有固定地标"))
+        if "<scene>" not in v1a:
+            bad.append((seed, "v1 缺 <scene>"))
+        if '<light type="directional"' not in v1a:
+            bad.append((seed, "v1 缺方向光"))
         if not PILLAR_COUNT_RANGE[0] <= m1["pillar_count"] <= PILLAR_COUNT_RANGE[1]:
             bad.append((seed, f"pillar_count={m1['pillar_count']}"))
         counts[m1["pillar_count"]] = counts.get(m1["pillar_count"], 0) + 1
@@ -381,6 +473,9 @@ def main():
                    help="出生位姿：default=模板原点；random=y/yaw 随机")
     p.add_argument("--task", choices=("base", "l1"), default="base",
                    help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
+    p.add_argument("--appearance", choices=(APPEARANCE_LEGACY, APPEARANCE_V1),
+                   default=APPEARANCE_LEGACY,
+                   help="legacy=模板原样（默认，逐字节不变）；v1=删固定地标+随机光照/天空")
     p.add_argument("--template", default=DEFAULT_TEMPLATE,
                    help=f"模板 SDF（默认 {_rel(DEFAULT_TEMPLATE)}）")
     p.add_argument("--self-check", action="store_true",
@@ -398,7 +493,8 @@ def main():
     scene_id = args.seed if args.scene_id is None else args.scene_id
 
     template = _read_template(args.template)
-    world, meta = build_scene(template, args.seed, scene_id, args.spawn_mode, args.task)
+    world, meta = build_scene(template, args.seed, scene_id, args.spawn_mode, args.task,
+                              args.appearance)
     meta["template"] = _rel(os.path.abspath(args.template))
     out = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)

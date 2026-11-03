@@ -445,6 +445,8 @@ def main():
                    help="每个 episode 的出生位姿（random = y/yaw 随机化）")
     p.add_argument("--task", choices=("base", "l1"), default="base",
                    help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
+    p.add_argument("--appearance", choices=("legacy", "v1"), default="legacy",
+                   help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）")
     p.add_argument("--policy", choices=("teacher", "forward"), default="teacher")
     p.add_argument("--save-depth", action="store_true",
                    help="透传给 collect.py：每步另存 depth/depth_%%05d.png（16 位 PNG，毫米）")
@@ -546,7 +548,7 @@ def main():
                 [sys.executable, SCENE_GEN, "--seed", str(t.seed),
                  "--scene-id", str(t.scene_id), "--out", t.world,
                  "--spawn-mode", t.spawn_mode, "--template", args.template,
-                 "--task", args.task],
+                 "--task", args.task, "--appearance", args.appearance],
                 capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 print(r.stdout, flush=True)
