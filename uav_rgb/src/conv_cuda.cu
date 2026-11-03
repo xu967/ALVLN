@@ -1,6 +1,7 @@
 // 单层 Conv2d 的 CUDA 实现：前向 + 反向（dW/db/dx），NCHW、stride=1、pad 可配。
 // 只针对 sm_75（Turing）；不引入 cuBLAS/cuDNN，纯手写直接卷积 kernel，供 CPU/CUDA 对拍。
 #include "uavrgb/conv_cuda.hpp"
+#include "uavrgb/cuda_alloc.hpp"
 
 #include <cuda_runtime.h>
 
@@ -37,7 +38,9 @@ void check_after_kernel(const char* name) {
 struct DeviceBuf {
   float* p = nullptr;
   DeviceBuf() = default;
-  explicit DeviceBuf(std::size_t bytes) { CUDA_CHECK(cudaMalloc(&p, bytes)); }
+  explicit DeviceBuf(std::size_t bytes) {
+    if (cudaMalloc(&p, bytes) != cudaSuccess) throw_alloc_failure(bytes, __FILE__, __LINE__);
+  }
   ~DeviceBuf() {
     if (p) cudaFree(p);
   }

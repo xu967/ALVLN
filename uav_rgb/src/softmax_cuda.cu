@@ -1,6 +1,7 @@
 // softmax 交叉熵 loss/grad 的 CUDA 实现：行内 stable softmax + double atomicAdd 归约。
 // 只针对 sm_75（Turing）；纯手写 kernel，供 CPU/CUDA 对拍（doc 04 §6 N3）。
 #include "uavrgb/softmax_cuda.hpp"
+#include "uavrgb/cuda_alloc.hpp"
 
 #include <cuda_runtime.h>
 
@@ -40,7 +41,9 @@ template <typename T>
 struct DeviceBuf {
   T* p = nullptr;
   DeviceBuf() = default;
-  explicit DeviceBuf(std::size_t bytes) { CUDA_CHECK(cudaMalloc(&p, bytes)); }
+  explicit DeviceBuf(std::size_t bytes) {
+    if (cudaMalloc(&p, bytes) != cudaSuccess) throw_alloc_failure(bytes, __FILE__, __LINE__);
+  }
   ~DeviceBuf() {
     if (p) cudaFree(p);
   }

@@ -72,6 +72,11 @@ add_executable(test_softmax_cuda tests/test_softmax_cuda.cpp)
 target_link_libraries(test_softmax_cuda PRIVATE uavrgb_core)
 add_test(NAME test_softmax_cuda COMMAND test_softmax_cuda)
 
+# 显存分配失败的报错必须带 requested/free/total（2026-11-03 a50 OOM 复盘）。
+add_executable(test_cuda_alloc_errors tests/test_cuda_alloc_errors.cpp)
+target_link_libraries(test_cuda_alloc_errors PRIVATE uavrgb_core CUDA::cudart)
+add_test(NAME test_cuda_alloc_errors COMMAND test_cuda_alloc_errors)
+
 add_executable(test_nn_cuda tests/test_nn_cuda.cpp)
 target_link_libraries(test_nn_cuda PRIVATE uavrgb_core)
 add_test(NAME test_nn_cuda COMMAND test_nn_cuda)
