@@ -44,8 +44,8 @@ RGB 仍然是**动作前**的观测（M1：rgb_ts < action_start_ts），动作�
 碰撞真值（两种真实信号，任一触发即 collision=True）：
   1. /uav/contact 接触传感器（base_link + 四个旋翼的 contact sensor + 世界级
      gz-sim-contact-system）。该话题是稀疏/触发式的：只在接触时发布（实测无接触时
-     0 msg/s，接地/碰撞时 ~225 msg/s）。常驻订阅按 **接收序号** 判窗口内是否收到
-     非空 contact 列表——不用消息时间戳，也不用「最新帧」（缓冲里可能还是上一步的）。
+     0 msg/s，接地/碰撞时 ~225 msg/s）。常驻订阅锁存非空事件序号，连续检查从
+     离地到采集结束的事件，覆盖推理和步间漂移；地面接触在离地时排除。
   2. 位姿卡滞兜底：FORWARD_SLOW 指令下动作窗口位移 < STUCK_EPS 视为被挡。
 """
 import argparse
@@ -86,7 +86,7 @@ FRAME_WAIT = 2.0      # 每步等一帧新 RGB 的上限（相机 30 Hz；卡住
 POSE_WAIT = 0.5       # 等一帧「晚于 RGB」的位姿的上限（M1；位姿 45 Hz）
 READY_TIMEOUT = 10.0  # 启动时等 camera/depth/pose 首帧的上限
 DEPTH_STALE_NS = 100_000_000  # depth 与 RGB 的 sim-time 差上限；超过视为停更/不同步
-CONTACT_POLL = 0.02   # 动作窗口内轮询接触信号的间隔（接触时 225 Hz，缓冲覆盖 ~70 ms）
+CONTACT_POLL = 0.02   # 动作窗口内轮询接触锁存序号的间隔
 MIN_WINDOW_RTF = 0.05 # 动作窗口的墙钟兜底：仿真时间走不动时按此 RTF 折算等待上限
 
 # 动作 -> 速度指令。forward=+X，left=+Y，up=+Z；yaw 正 z = 左转（右手定则）。
@@ -388,7 +388,8 @@ def open_subs():
         subs["rgb"] = gz_io.TopicSub(CAMERA_TOPIC, buf=4)
         subs["depth"] = gz_io.TopicSub(DEPTH_TOPIC, buf=4)
         subs["pose"] = gz_io.TopicSub(POSE_TOPIC, buf=6, stamp_fn=_pose_stamp)
-        subs["contact"] = gz_io.TopicSub(CONTACT_TOPIC, buf=16)
+        subs["contact"] = gz_io.TopicSub(CONTACT_TOPIC, buf=16,
+                                          event_predicate=_contact_nonempty)
         subs["camera_info"] = gz_io.TopicSub(CAMERA_INFO_TOPIC, buf=4)
         return subs
     except BaseException:
@@ -493,14 +494,16 @@ def _contact_nonempty(msg):
 
 
 def _contact_seq(sub):
-    """当前已收到的最新一条接触消息的序号（作为动作窗口的基线）。"""
-    frames = sub.frames()
-    return frames[-1][0] if frames else 0
+    """已锁存的最新非空接触序号，跨越推理和帧缓冲淘汰仍保留。"""
+    if hasattr(sub, "event_seq"):
+        return sub.event_seq()
+    # 兼容纯函数测试中的轻量订阅器。
+    return max((seq for seq, msg in sub.frames() if _contact_nonempty(msg)), default=0)
 
 
 def _contact_since(sub, seq0):
     """序号 > seq0 的帧里是否出现过非空 contact 列表。"""
-    return any(seq > seq0 and _contact_nonempty(msg) for seq, msg in sub.frames())
+    return _contact_seq(sub) > seq0
 
 
 def take_off(pose_sub, publisher, contact_sub=None, z_target=Z_TARGET, timeout=120.0):
@@ -544,7 +547,8 @@ def take_off(pose_sub, publisher, contact_sub=None, z_target=Z_TARGET, timeout=1
             if last_z is not None and last_z >= z_target:
                 publish_blocking(publisher, SAFE_NEUTRAL, 0.0)
                 print(f"起飞完成: z={last_z:.2f} m", file=sys.stderr)
-                return
+                # 保留离地基线，不能吞掉最后一次检查到零速发布之间的接触。
+                return air_seq0
         time.sleep(0.1)
     publish_blocking(publisher, SAFE_NEUTRAL, 0.0)
     raise RuntimeError(f"起飞超时 {timeout:.0f}s：z={last_z}，目标 {z_target}")
@@ -556,11 +560,13 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 prev_action=None, prev_rgb_ts=0, pillars=None, student=None,
                 global_plan=True, window_from="dispatch", waypoint=None,
                 stop_at_waypoint=False, stop_radius=0.5, save_depth=False,
-                teacher_nn=None, text_ids=None):
+                teacher_nn=None, text_ids=None, contact_seq0=None):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。"""
     if window_from not in ("dispatch", "observation"):
         raise ValueError(f"window_from 无效: {window_from!r}")
     t_step = time.perf_counter()
+    if contact_seq0 is None:
+        contact_seq0 = _contact_seq(subs["contact"])
 
     # 1) 观测：以新的 RGB 帧为锚点，depth/pose 按 sim-time 配对
     rgb_msg = subs["rgb"].latest_after(prev_rgb_ts, timeout=FRAME_WAIT)
@@ -659,7 +665,6 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     # 这里只拒绝订阅进程退出。话题静默/插件不发布的检测需要额外心跳，见 D4 记录。
     if not subs["contact"].healthy():
         return None, "contact 订阅进程已退出"
-    contact_seq0 = _contact_seq(subs["contact"])
     action_handle = zero_handle = None
     action_wall = 0.0
     rgb_ok = False
@@ -743,15 +748,16 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             return None, "pose 停更：动作窗口后没有晚于 action_start 的位姿"
         if not subs["contact"].healthy():
             return None, "动作窗口后 contact 订阅进程已退出"
-        if not contact:
-            contact = _contact_since(subs["contact"], contact_seq0)
+        contact_seq_end = _contact_seq(subs["contact"])
+        contact = contact or contact_seq_end > contact_seq0
         t_end = time.perf_counter()
     finally:
         publisher.abort(action_handle)
         publisher.abort(zero_handle)
 
-    # 位移/偏航/sim_dt 用执行起点（派发位姿）；标签用的 pose_before 保持观测帧。
+    # sim_dt 保留动作窗口合同；性能单独按派发位姿起算，避免混入推理时间。
     sim_dt = (pose_ts - action_start_ns) / 1e9 if pose_ts and action_start_ns else 0.0
+    dispatch_sim_dt = (pose_ts - exec_ts) / 1e9
     dist = (_dist3(pose_exec, pose_after)
             if pose_exec and pose_after else None)
     dyaw = (_angle_diff(yaw_after, yaw_exec)
@@ -762,6 +768,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                  and dist < stuck_eps)
 
     return {
+        "contact_seq_end": contact_seq_end,
         "step": step_idx,
         "timestamp_ns": rgb_ts,        # 动作前 RGB 帧 sim-time（EpisodeStep）
         "rgb_ts": rgb_ts,
@@ -790,7 +797,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         # block=开始发动作到零速发布完成，tail=动作后位姿/接触/记账。
         "timing": {"io": t_io - t_step, "window": action_wall,
                    "block": t_block - t_action_start, "tail": t_end - t_block,
-                   "total": t_end - t_step},
+                   "total": t_end - t_step, "dispatch_sim_dt": dispatch_sim_dt},
     }, None
 
 
@@ -846,6 +853,33 @@ def action_row(r, save_depth=False):
     return row
 
 
+def performance_summary(timings):
+    """只统计已落盘步骤；RTF 按派发后的位姿时间段估算，不含启动和起飞。"""
+    if not timings:
+        return {"steps": 0}
+    wall = sum(t["window"] for t in timings)
+    sim = sum(t["dispatch_sim_dt"] for t in timings)
+    return {"steps": len(timings),
+            "rtf_basis": "dispatch_pose_to_after_pose",
+            "mean_step_s": {k: sum(t[k] for t in timings) / len(timings)
+                            for k in ("io", "window", "block", "tail", "total")},
+            "action_sim_s": sim, "action_wall_s": wall,
+            "action_rtf": sim / wall if wall > 0 and sim > 0 else None}
+
+
+def stopped_at_waypoint(row, waypoint, stop_radius):
+    """本步 SAFE 是否真的停在 waypoint 半径内。
+
+    教师只在半径内输出 SAFE，学生可能在任何位置喊 SAFE；只看动作会把
+    "3.4 m 外喊停"当成到达并提前截断 episode（2026-11-03 审计）。
+    """
+    pb = row.get("pose_before") or {}
+    if waypoint is None or not isinstance(pb, dict) or "x" not in pb or "y" not in pb:
+        return False
+    return math.hypot(pb["x"] - waypoint["x"],
+                      pb["y"] - waypoint["y"]) <= (stop_radius or 0.5)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--steps", type=int, default=sm.DEFAULT_STEPS)
@@ -865,7 +899,7 @@ def main():
     p.add_argument("--teacher-ckpt", default=None,
                    help="--policy teacher-nn 的 PrivilegedTeacher checkpoint")
     p.add_argument("--infer-bin", default=None,
-                   help="uavrgb_infer 路径（默认 src/build/uavrgb_infer）")
+                   help="uavrgb_infer 路径（默认 UAV_RGB_BUILD_DIR 或 build/check）")
     p.add_argument("--stop-on-collision", action="store_true",
                    help="碰撞后立即结束本 episode（闭环评测用）")
     p.add_argument("--scene-id", type=int, default=0, help="EpisodeMeta.scene_id（场景隔离关键字段）")
@@ -899,6 +933,7 @@ def main():
     scene_version = None
     instruction_text = target_color = relation = waypoint = task_version = None
     stop_radius = None
+    scene_meta_obj = {}
     if args.scene_meta:
         with open(args.scene_meta, "rb") as f:
             raw_meta = f.read()
@@ -920,7 +955,7 @@ def main():
         write_scene_meta(os.path.join(args.out, "scene.json"), raw_meta)
         # split 由几何组唯一决定；手传的 --split 与它不符会把同几何放进两个 split。
         scene_gid = sm.geometry_gid(pillars)
-        want_split = sm.split_for_gid(scene_gid)
+        want_split = sm.split_for_scene(scene_meta_obj)
         if args.split != want_split:
             p.error(f"--split {args.split} 与几何组 {scene_gid} 的固定 split={want_split} 不一致")
     # 标签来自哪个教师必须进 manifest：两种策略产出的数据长得一模一样，
@@ -997,9 +1032,10 @@ def main():
             text_ids = tokenize(instruction_text) if instruction_text else None
             teacher_nn = TeacherPolicy(args.teacher_ckpt)
 
+        contact_seq0 = _contact_seq(subs["contact"])
         if not args.no_takeoff:
             print("起飞中…", file=sys.stderr)
-            take_off(subs["pose"], publisher, subs["contact"])
+            contact_seq0 = take_off(subs["pose"], publisher, subs["contact"])
 
         stop_streak = 0
         goal_stop = bool(stop_radius)
@@ -1011,12 +1047,15 @@ def main():
                                     stop_at_waypoint=goal_stop,
                                     stop_radius=stop_radius or 0.5,
                                     save_depth=args.save_depth,
-                                    teacher_nn=teacher_nn, text_ids=text_ids)
+                                    teacher_nn=teacher_nn, text_ids=text_ids,
+                                    contact_seq0=contact_seq0)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
                 break
             prev_action = r["action_expert"]   # 下一步的滞回基准
+            # 只推进到本步已检查的序号，步间漂移产生的事件归下一步。
+            contact_seq0 = r["contact_seq_end"]
             prev_rgb_ts = r["rgb_ts"]
             gap_ns = r["rgb_ts"] - r["depth_ts"] if r["depth_ts"] else None
             # 配对残差用**观测帧**位姿（pose_before_ts），action_start_ns 是派发时刻。
@@ -1050,10 +1089,11 @@ def main():
                   f"pose_gap={'-' if pose_gap_ns is None else f'{pose_gap_ns/1e6:.0f}ms'} "
                   f"io={(r['timing']['io']):.2f}s step={(r['timing']['total']):.2f}s",
                   file=sys.stderr)
-            # goal-stop：连续 3 步 SAFE 说明已在目标 waypoint 停稳，提前结束，
+            # goal-stop：连续 3 步 SAFE **且在 waypoint 半径内**才算停稳，提前结束，
             # 避免后 20+ 步全是 SAFE 把类别分布拉偏。
             if goal_stop and r["action_executed"] == SAFE_NEUTRAL:
-                stop_streak += 1
+                stop_streak = (stop_streak + 1
+                               if stopped_at_waypoint(r, waypoint, stop_radius) else 0)
             else:
                 stop_streak = 0
             if goal_stop and stop_streak >= 3:
@@ -1125,6 +1165,7 @@ def main():
             "geometry_gid": scene_gid,
             # 几何语义版本：v2/v3 的 gid 天然不同，只查 gid 交集查不出混包。
             "geometry_version": scene_version,
+            **{key: scene_meta_obj.get(key) for key in sm.PROVENANCE_KEYS},
             # 标签由哪个教师产生：forward=盲策略对照，expert_action=深度反应式，
             # plan_action=柱子真值 carrot planner，teacher_nn=特权教师网络。
             # 缺这个字段就无法事后区分数据集。
@@ -1159,6 +1200,8 @@ def main():
                 "episode_executed": bool(completed and rows_written > 0),
             },
             "num_steps": rows_written,
+            "performance": performance_summary(timings),
+            "render_backend_requested": os.environ.get("UAVRGB_RENDER_BACKEND", "external"),
             "requested_steps": args.steps,
             # 评测集会在碰撞处提前结束；validity 仍按「跑满请求步数」严格填，
             # 下游据此区分「采集完整」与「评测终止」，不要混淆。

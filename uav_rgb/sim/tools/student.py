@@ -6,9 +6,12 @@
 """
 import json
 import os
+import select
 import subprocess
 import sys
 import tempfile
+import time
+import math
 
 from PIL import Image
 
@@ -16,7 +19,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import save_frame
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-DEFAULT_INFER = os.path.join(REPO_ROOT, "src", "build", "uavrgb_infer")
+DEFAULT_INFER = os.path.join(os.environ.get("UAV_RGB_BUILD_DIR") or
+                             os.path.join(REPO_ROOT, "build", "check"), "uavrgb_infer")
 RESAMPLE = (Image.Resampling.BILINEAR if hasattr(Image, "Resampling")
             else Image.BILINEAR)
 
@@ -24,11 +28,14 @@ RESAMPLE = (Image.Resampling.BILINEAR if hasattr(Image, "Resampling")
 class StudentPolicy:
     """推理进程只启动一次；每帧写 RGB 字节、读一行 JSON。"""
 
-    def __init__(self, ckpt, infer_bin=None, text_ids=None):
+    def __init__(self, ckpt, infer_bin=None, text_ids=None, timeout_s=30.0):
+        if not math.isfinite(timeout_s) or timeout_s <= 0:
+            raise ValueError("推理超时必须为有限正数")
+        self.timeout_s = timeout_s
         binary = infer_bin or DEFAULT_INFER
         if not os.path.isfile(binary):
             raise RuntimeError(
-                f"找不到推理程序 {binary}；先构建：cmake --build src/build --target uavrgb_infer")
+                f"找不到推理程序 {binary}；先运行 bash tools/check.sh（支持 UAV_RGB_BUILD_DIR）")
         if not os.path.isfile(ckpt):
             raise RuntimeError(f"找不到 checkpoint {ckpt}")
         # stderr 用临时文件而不是 PIPE：长采集时 CUDA/驱动警告写满 64 KiB 管道会让
@@ -39,8 +46,10 @@ class StudentPolicy:
             # L0：单集一条指令；L2 才把 token 送进文本编码器。
             cmd += ["--text", ",".join(str(int(t)) for t in text_ids)]
         self.proc = subprocess.Popen(
-            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._err)
-        line = self.proc.stdout.readline()
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._err, bufsize=0)
+        os.set_blocking(self.proc.stdin.fileno(), False)
+        os.set_blocking(self.proc.stdout.fileno(), False)
+        line = self._exchange(b"", "hello")
         if not line:
             self._abort_start(f"推理进程启动失败：{self._stderr()}")
         try:
@@ -68,9 +77,7 @@ class StudentPolicy:
 
         否则每集第一帧的推理要多花约 0.4 s，动作基于更旧的画面。
         """
-        self.proc.stdin.write(bytes(self.h * self.w * self.in_c))
-        self.proc.stdin.flush()
-        if not self.proc.stdout.readline():
+        if not self._exchange(bytes(self.h * self.w * self.in_c), "warmup"):
             self._abort_start(f"推理进程 warmup 失败：{self._stderr()}")
 
     def act(self, msg):
@@ -81,14 +88,39 @@ class StudentPolicy:
         mode = "RGB" if nch == 3 else "RGBA"
         im = Image.frombytes(mode, (w, h), rows).convert("RGB")
         im = im.resize((self.w, self.h), RESAMPLE)
-        self.proc.stdin.write(im.tobytes())
-        self.proc.stdin.flush()
-        line = self.proc.stdout.readline()
+        line = self._exchange(im.tobytes(), "act")
         if not line:
             raise RuntimeError(f"推理进程无输出：{self._stderr()}")
         obj = json.loads(line)
         self.frames += 1
         return int(obj["action"]), float(obj["infer_ms"]), obj["probs"]
+
+    def _exchange(self, payload, stage):
+        # 同时约束写入和读完整行：仅给 readline 加超时挡不住不消费 stdin 的进程。
+        deadline = time.monotonic() + self.timeout_s
+        pending = memoryview(payload)
+        reply = bytearray()
+        try:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    self._abort_start(f"推理 {stage} 超时（{self.timeout_s:g}s）")
+                readable, writable, _ = select.select(
+                    [] if pending else [self.proc.stdout],
+                    [self.proc.stdin] if pending else [], [], remaining)
+                if writable:
+                    pending = pending[os.write(self.proc.stdin.fileno(), pending):]
+                if readable:
+                    chunk = os.read(self.proc.stdout.fileno(), 4096)
+                    if not chunk:
+                        self._abort_start(f"推理 {stage} 输出中断：{self._stderr()}")
+                    reply.extend(chunk)
+                    if len(reply) > 65536:
+                        self._abort_start(f"推理 {stage} 响应超过 64 KiB")
+                    if reply.endswith(b"\n"):
+                        return bytes(reply)
+        except (OSError, ValueError) as exc:
+            self._abort_start(f"推理 {stage} I/O 失败：{exc}")
 
     def _abort_start(self, msg):
         """构造失败时杀掉已启动的推理进程，避免留下阻塞在 stdin 的孤儿。"""
@@ -100,6 +132,9 @@ class StudentPolicy:
                 proc.wait(timeout=5)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+            for stream in (proc.stdin, proc.stdout):
+                if stream:
+                    stream.close()
         if self._err is not None:
             self._err.close()
             self._err = None
@@ -118,10 +153,12 @@ class StudentPolicy:
             proc.kill()
             rc = proc.wait()
         err = self._stderr()
-        if rc != 0:
-            raise RuntimeError(f"推理进程退出码 {rc}：{err or '（空）'}")
+        if proc.stdout:
+            proc.stdout.close()
         self._err.close()
         self._err = None
+        if rc != 0:
+            raise RuntimeError(f"推理进程退出码 {rc}：{err or '（空）'}")
 
     def _stderr(self):
         if self._err is None:

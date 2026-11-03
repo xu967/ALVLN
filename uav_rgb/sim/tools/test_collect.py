@@ -237,7 +237,7 @@ def stale_pose_fails():
     return row, err
 
 
-def delayed_inference_window(window_from="dispatch"):
+def delayed_inference_window(window_from="dispatch", contact_phase=None):
     """推理期间仿真推进：dispatch 从派发时刻算，observation 保留旧语义。
 
     回归 R01：旧实现 action_start_ns=观测戳(10.2)，act 期间仿真到 11.2，
@@ -255,6 +255,8 @@ def delayed_inference_window(window_from="dispatch"):
     class Student:
         def act(self, msg):
             pose.current = pose_msg(11.2)   # 推理期间仿真走到 11.2
+            if contact_phase == "inference":
+                subs["contact"]._frames.append((1, {"contact": [{}]}))
             return 1, 500.0, [0.0, 1.0, 0.0, 0.0]
 
     class RecordingPub(FakePub):
@@ -264,19 +266,30 @@ def delayed_inference_window(window_from="dispatch"):
 
         def start(self, *args):
             self.sent.append((collect._pose_stamp(pose.latest()), args))
+            if len(self.sent) == 2 and contact_phase == "zero":
+                subs["contact"]._frames.append((1, {"contact": [{}]}))
             return super().start(*args)
 
     def advance(_secs):
         pose.current = pose_msg(12.2)       # 窗口走满 1 s
 
     pub = RecordingPub()
+    baseline = None
+    if contact_phase in ("between", "ground"):
+        subs["contact"]._frames.append((1, {"contact": [{}]}))
+        baseline = 0 if contact_phase == "between" else 1
     with tempfile.TemporaryDirectory() as d, \
             patch.object(collect, "write_rgb_png", return_value=(True, None)), \
             patch.object(collect.time, "sleep", side_effect=advance):
         row, err = collect.collect_one(d, 0, 1.0, "student", subs, pub,
-                                       student=Student(), window_from=window_from)
+                                       student=Student(), window_from=window_from,
+                                       contact_seq0=baseline)
     if err is not None or row is None:
         return False
+    if contact_phase is not None:
+        if contact_phase == "ground":
+            return "contact" not in row["src"] and row["contact_seq_end"] == 1
+        return "contact" in row["src"]
     if window_from == "dispatch":
         return (row["pose_before_ts"] == 10_200_000_000
                 and row["action_start_ns"] == 11_200_000_000
@@ -286,6 +299,27 @@ def delayed_inference_window(window_from="dispatch"):
             and row["action_start_ns"] == 10_200_000_000
             and row["sim_dt"] == 1.0
             and [s for s, _ in pub.sent] == [11_200_000_000, 11_200_000_000])
+
+
+def takeoff_contact_baseline():
+    """地面接触不算撞柱，但升空后零速发布期间的新接触不能被巡航基线吞掉。"""
+    contact_sub = FakeSub(frames=[(1, {"contact": [{}]})])
+
+    class RisingPose(FakeSub):
+        heights = iter((0.15, 0.6, 2.1))
+
+        def latest(self):
+            return pose_msg(1, z=next(self.heights))
+
+    class Pub(FakePub):
+        def start(self, *args):
+            if self.t > 0:
+                contact_sub._frames.append((2, {"contact": [{}]}))
+            return super().start(*args)
+
+    with patch.object(collect.time, "sleep"):
+        baseline = collect.take_off(RisingPose(), Pub(), contact_sub)
+    return baseline == 1 and collect._contact_since(contact_sub, baseline)
 
 
 def main():
@@ -336,6 +370,21 @@ def main():
     check("推理延迟不缩短执行窗口（dispatch）", delayed_inference_window("dispatch"))
     check("observation 语义保留旧行为（窗口被推理吃掉）",
           delayed_inference_window("observation"))
+    check("推理期间 contact 不漏报", delayed_inference_window(contact_phase="inference"))
+    check("零速发布后 contact 不漏报", delayed_inference_window(contact_phase="zero"))
+    check("步间漂移 contact 归下一步", delayed_inference_window(contact_phase="between"))
+    check("历史地面 contact 不污染巡航", delayed_inference_window(contact_phase="ground"))
+    check("起飞基线保留最后零速期间的新 contact", takeoff_contact_baseline())
+    # goal-stop 只数动作不看距离，会把学生在 3.4 m 外喊的 SAFE 当到达（2026-11-03 审计）。
+    wp = {"x": 4.0, "y": 1.5}
+    check("waypoint 半径内的 SAFE 算停稳",
+          collect.stopped_at_waypoint({"pose_before": {"x": 4.1, "y": 1.45}}, wp, 0.5))
+    check("半径外的 SAFE 不算停稳",
+          not collect.stopped_at_waypoint({"pose_before": {"x": 1.0, "y": 0.0}}, wp, 0.5))
+    check("缺位姿的 SAFE 不算停稳",
+          not collect.stopped_at_waypoint({"pose_before": None}, wp, 0.5))
+    check("没有 waypoint 时不算停稳",
+          not collect.stopped_at_waypoint({"pose_before": {"x": 4.0, "y": 1.5}}, None, 0.5))
 
     print(f"test_collect: {passed} 项通过")
     return 0

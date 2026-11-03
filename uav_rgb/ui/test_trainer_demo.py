@@ -184,7 +184,23 @@ with tempfile.TemporaryDirectory() as tmp:
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         encoding="utf-8", errors="replace")
     try:
-        time.sleep(0.5)
+        # Wait until the trainer has installed its SIGINT handler and flushed the
+        # first lifecycle event. A fixed 0.5 s sleep is flaky on loaded CI hosts:
+        # SIGINT can otherwise arrive during interpreter startup and take the
+        # default signal path (-2) instead of the documented clean exit 130.
+        metrics_path = os.path.join(run_dir, "metrics.jsonl")
+        deadline = time.monotonic() + 10.0
+        ready = False
+        while time.monotonic() < deadline and proc.poll() is None:
+            if os.path.isfile(metrics_path):
+                _, current_events = read_events(metrics_path)
+                if any(e.get("event") == "status" and
+                       str(e.get("message", "")).startswith("demo trainer start")
+                       for e in current_events):
+                    ready = True
+                    break
+            time.sleep(0.05)
+        check("SIGINT 测试等待 trainer ready", ready)
         proc.send_signal(signal.SIGINT)
         out, err = proc.communicate(timeout=10)
     finally:

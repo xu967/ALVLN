@@ -5,6 +5,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from student import StudentPolicy
@@ -88,6 +89,47 @@ def main():
         else:
             raise AssertionError("非四类模型未拒绝")
 
+    # 活进程无 hello、只有半行、warmup 后不回应，都必须有界失败并清理。
+    for stage, body in (
+        ("hello", "import time; time.sleep(60)"),
+        ("hello", "import sys,time; sys.stdout.write('{'); sys.stdout.flush(); time.sleep(60)"),
+        ("warmup", "import json,time; print(json.dumps({'in_h':2,'in_w':2,'in_c':3,'num_classes':4}),flush=True); time.sleep(60)"),
+    ):
+        with tempfile.TemporaryDirectory() as td:
+            fake = os.path.join(td, "hung.py")
+            with open(fake, "w") as f:
+                f.write("#!/usr/bin/env python3\n" + body + "\n")
+            os.chmod(fake, 0o700)
+            start = time.monotonic()
+            try:
+                # 进程冷启动在负载较高的桌面/CI 主机上可能超过 300 ms；
+                # 1.5 s 仍能验证 hello/warmup 阶段有界超时，同时避免误判启动抖动。
+                StudentPolicy(fake, fake, timeout_s=1.5)
+            except RuntimeError as exc:
+                assert stage in str(exc) and "超时" in str(exc), exc
+            else:
+                raise AssertionError("挂起进程未超时")
+            assert time.monotonic() - start < 5
+    with tempfile.TemporaryDirectory() as td:
+        fake = os.path.join(td, "act_hung.py")
+        with open(fake, "w") as f:
+            f.write(FAKE.replace("while True:", "for i in range(2):").replace(
+                "    b = sys.stdin.buffer.read(12)",
+                "    if i == 1:\n        import time; time.sleep(60)\n    b = sys.stdin.buffer.read(12)"))
+        os.chmod(fake, 0o700)
+        policy = StudentPolicy(fake, fake, timeout_s=1.5)
+        # hello/warmup 已完成后再缩短动作响应 deadline，专门覆盖 act 超时。
+        policy.timeout_s = 0.3
+        proc = policy.proc
+        try:
+            policy.act(gz_msg(4, 4, 3, bytes(48)))
+        except RuntimeError as exc:
+            assert "act" in str(exc) and "超时" in str(exc)
+            assert proc.poll() is not None and policy.proc is None
+        else:
+            raise AssertionError("act 挂起没有超时")
+        finally:
+            policy.close()
     print("test_student: PASS")
     return 0
 

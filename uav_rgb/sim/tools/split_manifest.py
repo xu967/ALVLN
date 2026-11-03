@@ -85,6 +85,30 @@ def split_for_gid(gid):
     return "val" if bucket < 90 else "test"
 
 
+PROVENANCE_KEYS = ("appearance_version", "map_id", "family", "split_policy",
+                   "world_sha256", "template_sha256", "resource_sha256",
+                   "camera_profile", "dynamics_profile", "success_criterion", "goal_radius")
+
+
+def split_for_scene(meta):
+    """旧柱阵按精确几何，新校园按整张地图；各外观/指令变体共用归属。"""
+    import campus
+    if meta.get("geometry_version") == campus.VERSION:
+        if (meta.get("map_id") != campus.map_id(meta["seed"]) or
+                meta.get("split_policy") != "campus_map_v1"):
+            raise ValueError("campus map_id / split_policy 与 seed 不符")
+        return campus.split_map(meta["map_id"])
+    gid = meta.get("geometry_gid") or geometry_gid(meta["pillars"])
+    return split_for_gid(gid)
+
+
+def split_for_seed(seed, task="base"):
+    if task == "campus":
+        import campus
+        return campus.split(seed)
+    return split_for_gid(geometry_gid(sg.sample_pillars(seed)[0]))
+
+
 def _file_sha(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()

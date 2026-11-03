@@ -122,13 +122,14 @@ def _body_hits_box(px, py, yaw_deg, pillar, half):
     a = 0.235 + 0.01
     cy, sy = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
     dx, dy = px - pillar["x"], py - pillar["y"]
+    hx, hy = (v / 2 for v in pillar.get("size", [half * 2, half * 2])[:2])
     # 世界 x/y 轴：机身投影半宽 = a*(|cos|+|sin|)
     body_w = a * (abs(cy) + abs(sy))
-    if abs(dx) > body_w + half or abs(dy) > body_w + half:
+    if abs(dx) > body_w + hx or abs(dy) > body_w + hy:
         return False
     # 机身局部 x/y 轴：柱框投影半宽 = half*(|cos|+|sin|)（轴同为正交旋转）
     for ux, uy in ((cy, sy), (-sy, cy)):
-        if abs(dx * ux + dy * uy) > a + half * (abs(ux) + abs(uy)):
+        if abs(dx * ux + dy * uy) > a + hx * abs(ux) + hy * abs(uy):
             return False
     return True
 
@@ -162,8 +163,9 @@ def ray_clear(x, y, th_deg, length, pillars, clearance, half=0.2, samples=33,
                 if _body_hits_box(px, py, yaw_deg, p, half):
                     return False
                 continue
-            dx = max(0.0, abs(px - p["x"]) - half)
-            dy = max(0.0, abs(py - p["y"]) - half)
+            hx, hy = (v / 2 for v in p.get("size", [half * 2, half * 2])[:2])
+            dx = max(0.0, abs(px - p["x"]) - hx)
+            dy = max(0.0, abs(py - p["y"]) - hy)
             if dx * dx + dy * dy < clearance * clearance:
                 return False
     return True
@@ -217,8 +219,9 @@ def plan_action(x, y, yaw_deg, pillars, lookahead=1.6, clearance=0.36,
 def _point_blocked(x, y, pillars, clearance):
     """点到柱方框的距离 < clearance 即不可走（用于 A* 栅格）。"""
     for p in pillars:
-        dx = max(0.0, abs(x - p["x"]) - 0.2)
-        dy = max(0.0, abs(y - p["y"]) - 0.2)
+        hx, hy = (v / 2 for v in p.get("size", [.4, .4])[:2])
+        dx = max(0.0, abs(x - p["x"]) - hx)
+        dy = max(0.0, abs(y - p["y"]) - hy)
         if dx * dx + dy * dy < clearance * clearance:
             return True
     return False

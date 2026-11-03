@@ -9,12 +9,13 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scene_gen as sg  # noqa: E402
 
 MODES = ("default", "random")
-# legacy 外观的 golden：改动前（2026-11-03）实测的 world sha256。
-# 有人动了模板或外观分支却让默认输出变了，这里先红——旧数据/旧 ckpt 都按这个字节序。
+# legacy 外观的 golden：2026-11-04 加入桌面 Studio chase/top-view sensors 后更新。
+# 本次变化只增加无质量/无碰撞的虚拟相机，不改变柱阵、出生位姿或学生 RGB 话题。
+# 后续修改模板/外观分支仍需显式更新这些字节级基线。
 GOLDEN_LEGACY = {
-    0: "18ea28cc21d14f2d7b926c86f0b2cf2f4379b83a54d3e60b536156ed5241c345",
-    1: "88fdabbe09fb832aec720abda55f5f6bcf40f8b963968444c265affc78d0c014",
-    2: "7db4d5d325c40808a059c8dbc3bb047f2088694cf05b76431c5e81a3e0573b41",
+    0: "1bd33526f0bc3be7d23749e94861acc797efa92c58488cfe21dd5d9217f1373d",
+    1: "00994a9e3371fa3c93431d464e2821ed058064f2fdce4b5e0c121606cad18569",
+    2: "9987e58f2f19e13e9726cea6ede1d7acf18efe9e0f12a06823c105c45af84200",
 }
 
 

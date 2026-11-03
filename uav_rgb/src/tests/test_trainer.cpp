@@ -31,6 +31,20 @@ void check(bool ok, const std::string& msg) {
   }
 }
 
+// 从 metrics.jsonl 取最后一条 split=test 的 action_accuracy（eval-only 不设 test_acc_）。
+double read_test_accuracy(const std::string& path) {
+  std::ifstream f(path);
+  std::string line;
+  double v = -1.0;
+  while (std::getline(f, line)) {
+    if (line.find("\"split\":\"test\"") == std::string::npos) continue;
+    const std::string key = "\"action_accuracy\":";
+    const std::size_t p = line.find(key);
+    if (p != std::string::npos) v = std::stod(line.substr(p + key.size()));
+  }
+  return v;
+}
+
 std::vector<std::string> read_lines(const std::string& path) {
   std::ifstream f(path);
   std::vector<std::string> out;
@@ -337,6 +351,77 @@ int main() {
     rejected = true;
   }
   check(rejected, "结构不符的 checkpoint 未被拒绝");
+
+  // 内联 test 必须评 ckpt_best，不是最后一轮：dev 宏 F1 峰值常早于末轮，评 model_
+  // 会报出与交付权重不符的数字（2026-11-03 审计）。用 eval-only 在同一份
+  // ckpt_best 上复算，两边的 test 准确率必须一致。
+  {
+    const std::string ds2 = root + "/ds_best.uavr";
+    const uavrgb_test::SynthDataset sd2 =
+        uavrgb_test::write_synthetic_uavr(ds2, 64, 120, 160, 48, 9, /*test_n=*/8);
+    TrainConfig c2;
+    c2.data_path = sd2.path;
+    c2.out_dir = root + "/run_best";
+    c2.epochs = 6;
+    c2.batch = 16;
+    c2.lr = 1e-3f;
+    c2.seed = 7;
+    Trainer t2(c2);
+    t2.run();
+    const double inline_test = t2.last_test_accuracy();
+
+    TrainConfig c2e = c2;
+    c2e.out_dir = root + "/run_best_eval";
+    Trainer ev(c2e);
+    ev.eval_only(c2.out_dir + "/ckpt_best.bin", /*eval_val=*/false, /*eval_test=*/true);
+    const double evalonly_test = read_test_accuracy(c2e.out_dir + "/metrics.jsonl");
+    std::cout << "内联 test acc=" << inline_test << "  ckpt_best 复算=" << evalonly_test
+              << "\n";
+    check(inline_test >= 0.0 && std::abs(inline_test - evalonly_test) < 1e-9,
+          "内联 test 与 ckpt_best 的 eval-only 结果不一致（评的不是交付权重）");
+  }
+
+  // 数据集带 text_ids 侧车却没给 --text-dim：必须报错，不能静默训成纯视觉模型。
+  {
+    const std::string ds3 = root + "/ds_sidecar.uavr";
+    const uavrgb_test::SynthDataset sd3 =
+        uavrgb_test::write_synthetic_uavr(ds3, 32, 120, 160, 16, 11, /*test_n=*/8);
+    {
+      // 侧车必须覆盖全部 episode（train 0..15 / val 16..23 / test 24..31）。
+      std::ofstream f(root + "/instructions.jsonl");
+      f << "{\"episode_id\": 1,\"instruction\": \"go to the red pillar on your left\", "
+           "\"sample_start\": 0, \"sample_count\": 16, \"text_ids\": [2, 3, 4]}\n"
+           "{\"episode_id\": 2,\"instruction\": \"go to the red pillar on your right\", "
+           "\"sample_start\": 16, \"sample_count\": 8, \"text_ids\": [2, 3, 5]}\n"
+           "{\"episode_id\": 3,\"instruction\": \"go to the blue pillar on your left\", "
+           "\"sample_start\": 24, \"sample_count\": 8, \"text_ids\": [2, 6, 4]}\n";
+    }
+    TrainConfig c3;
+    c3.data_path = sd3.path;
+    c3.out_dir = root + "/run_guard";
+    c3.epochs = 1;
+    c3.batch = 8;
+    bool threw = false;
+    try {
+      Trainer t3(c3);
+      t3.run();
+    } catch (const std::runtime_error&) {
+      threw = true;
+    }
+    check(threw, "带 instructions.jsonl 侧车但 text_dim=0 时必须报错（否则静默训纯视觉）");
+
+    c3.vision_only = true;
+    c3.out_dir = root + "/run_vision_only";
+    bool ok = true;
+    try {
+      Trainer t3(c3);
+      t3.run();
+    } catch (const std::exception& e) {
+      ok = false;
+      std::cerr << "  --vision-only 失败: " << e.what() << "\n";
+    }
+    check(ok, "--vision-only 应允许在带侧车的数据集上训纯视觉模型");
+  }
 
   fs::remove_all(root);
   if (g_failures == 0) {

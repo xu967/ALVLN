@@ -2,13 +2,10 @@
 
 本项目已实现自研 C++/CUDA CNN 训练器、Gazebo 专家采集、数据验收闸门、常驻推理进程和学生闭环评测。
 
-2026-10-30 当前进度：T5 599 集 / 23960 步（audit 11/11 PASS）；T6 best 权重离线 test
-`acc 0.9186 / macro_f1 0.8589 / bal_acc 0.8497`（多数类先验 macro_f1 0.1968）；
-T7 旧版闭环（observation 语义）`SR 0.90`；v1 当前环境复测（observation）`SR 0.90`
-（18/20）；T7-R（dispatch 语义）`SR 0.55`（11/20）；T5b dispatch 重采重训 `SR 0.60`
-（12/20），未达 v1−5pp，**不采纳**；v1 observation 是唯一 baseline。A/B 证明 R01
-窗口语义是主因（seed 49/57 observation 2/2 vs dispatch 0/2）。v1 与 dispatch 数字
-禁止混报。语言/GRU/STOP 尚未实现，闭环指标不能替代。
+当前交付模型是单帧 RGB + 有限词表 FiLM 的四动作策略；GRU 为实验原型，尚未验证真机部署。
+最新状态统一见 [HANDOFF](docs/HANDOFF.md)，评测判据见 [EVAL_STANDARD](docs/EVAL_STANDARD.md)。
+校园 pilot 用 `--task campus`，使用可见彩柱前安全区域、独立任务版本和拓扑留出；操作见
+[校园基线说明](docs/CAMPUS_BASELINE.md)。旧柱阵 `base/l1` 保留独立历史口径。
 
 ## 环境与一键检查
 
@@ -27,9 +24,9 @@ bash tools/check.sh                  # 构建 + CTest + Python 自检
 无卡时可显式执行 `bash tools/check.sh --python-only`，它会打印跳过 C++/CUDA 的说明。
 
 默认新构建目录为 `build/check`；可用 `UAV_RGB_BUILD_DIR` 覆盖。
-最近一次全量验证（2026-10-30）**20/20 CTest 通过**，编译产物仅 sm_75。
+最近一次全量验证（2026-11-03）**25/25 CTest 通过**，编译产物仅 sm_75。
 （接手开发先读 [`docs/HANDOFF.md`](docs/HANDOFF.md)；任务与验收见 [`docs/TASKS.md`](docs/TASKS.md)。）
-唯一有效构建目录是 `build/check`；`src/build` 保留给 `student.py` 的 `uavrgb_infer`，不要删。
+默认构建与推理统一使用 `build/check`；`UAV_RGB_BUILD_DIR` 可同时覆盖两者。旧 `src/build` 不再是默认推理入口，保留用于历史复现。
 `UAV_RGB_BUILD_JOBS` 默认 8。Python 工具用 `UAV_RGB_PYTHON`，Gazebo helper 用
 `UAVRGB_GZ_PYTHON`（默认系统 `/usr/bin/python3`），避免混用 conda 与系统绑定。
 
@@ -40,7 +37,7 @@ bash tools/check.sh                  # 构建 + CTest + Python 自检
 
 ```bash
 source env.sh
-# 默认 :20 的软件 GL 显示需已可用。
+# 默认 NVIDIA EGL 无界面渲染；软件对照显式设置 UAVRGB_RENDER_BACKEND=software。
 # 每次必须用新的输出目录：collect_parallel 和 uavrgb_train 都会拒绝复用非空目录
 # （uavrgb_train 的 RunOwner 只认 --resume），所以这里按时间戳建一个。
 RUN="$DATA_ROOT/uav_rgb/smoke/$(date +%Y%m%d-%H%M%S)"
@@ -59,22 +56,31 @@ DISPLAY=:20 /usr/bin/python3 ui/monitor.py --run-dir "$RUN/train"
 只有 train 时会明确输出 `DEV_SPLIT_EMPTY`，JSONL 的评测 `split=train`。
 `results.csv` 仍保留既有 `dev_*` 列名，因此必须结合事件判断评测数据来源。
 正式实验应提供按实际场景隔离的 train/val/test，并覆盖全部四类动作。
-UI 的默认启动命令是 DEMO；原生训练器目前用上面的 CLI 启动，UI 可以监视真实输出。
+旧 `ui/monitor.py` 保留用于兼容历史 DEMO/目录监控；新实验请使用 `ui/launch_studio.sh`，它会启动真实 C++/CUDA trainer，不会默认调用 DEMO。
 
-## 当前完成程度
+仿真采集与闭环已接入 RTX 2080 Ti 的 EGL 渲染；CUDA 可用与渲染可用分别验证。
+启动方式见 [仿真说明](sim/README.md)，实测与优化顺序见
+[GPU 仿真实验](docs/experiments/2026-11-03-gpu-rendering.md)。
 
-| 模块 | 实现与证据 | 尚缺 |
-| --- | --- | --- |
-| 数值核心与 CNN | CPU/CUDA 算子、gradcheck、Adam、100,388 参数 CNN、20 项 CTest、best-checkpoint（dev 宏 F1） | 设备常驻优化、更完整异常边界 |
-| 数据读写 | 320×240 → 160×120、NCHW、碰撞过滤、按几何组 split、11 条 audit 闸门 | 多场景族泛化 |
-| 仿真采集 | 常驻订阅/发布、随机世界、独立 UUID 分区、仿真时间窗口（D1）、depth/contact 停更门禁（D4） | 8 实例并发与更严格 RTF 门禁 |
-| 真实数据训练 | 599 集 / 23960 步，T6 best test macro_f1 0.8589 | 场景族与鲁棒性验证 |
-| 学生闭环评测 | 已实现；T7 20 seed（R01 前 SR 0.90）、p50/p95 | R01/D4 后复跑、失败模式分析 |
-| 硬件部署 | 四动作边界已定义 | 荔枝派型号、NPU 合同、ESP32 协议与安全联调 |
+## 桌面端工作台（新增）
 
-split 已改为按规范化几何组（`sim/tools/split_manifest.py`，几何 gid + salt），
-跨 split 交集为 0；旧的 `scene_id % 10` 划分已废弃。当前只有一种场景族，
-几何去重不等于泛化，见 `docs/HANDOFF.md §八`。
+在 Ubuntu 桌面会话运行：
+
+```bash
+bash ui/launch_studio.sh
+# 可选：安装 Ubuntu 应用菜单 / 桌面快捷方式
+bash ui/install_desktop_entry.sh
+```
+
+它会打开原生 Tkinter `UAV Navigation Studio`，不是网页 DEMO。支持真实 C++/CUDA 训练启动与监控、训练/测试指标曲线、原始日志、实验自动归档、Gazebo 三个实时渲染视角（第三人称 chase、原始第一人称 RGB、固定顶视相机）及辅助二维轨迹地图、当前仿真学生策略演示和独立闭环评测。详细说明见 [`ui/README_STUDIO.md`](ui/README_STUDIO.md)。
+
+**三视角说明**：模板 SDF 新增 `/uav/chase_camera` 虚拟追踪相机；原 `/uav/camera` 保持学生唯一 RGB 输入；顶视图从 `/model/x3/pose` 与 SDF 碰撞几何绘制。旧 world 文件需要按新模板重新生成，才包含 chase camera。
+
+## 能力边界
+
+已有数值核心、CNN/FiLM、数据读写与审计、常驻推理及闭环评测。
+校园pilot目前是三族低模、定高四动作任务；GRU、开放指令、真机部署与充分跨地图泛化尚未交付。
+`DeviceTrainState` / `BatchReader` 是未接入的实验基础设施，保留测试作为后续接入依据。
 
 ## 交接与证据
 

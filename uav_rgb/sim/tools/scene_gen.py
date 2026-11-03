@@ -319,6 +319,9 @@ def build_scene(template, seed, scene_id, spawn_mode="default", task="base",
     task="base" 保持原几何与人任务无关的 meta 不变。
     appearance="v1" 只改头部（删固定地标、随机光照/天空），pillars 几何与 gid 不变。
     """
+    if task == "campus":
+        import campus
+        return campus.build(template, seed, scene_id)
     if task not in ("base", "l1"):
         raise ValueError(f"unknown task {task!r}")
     for mark in (START_MARK, END_MARK):
@@ -351,6 +354,8 @@ def build_scene(template, seed, scene_id, spawn_mode="default", task="base",
         # 外观不参与 geometry_gid：legacy 数据与 v1 数据几何可以互换，
         # 但外观不同不能混在同一次训练里。
         "appearance_version": appearance,
+        "camera_profile": "rgb320x240_fov60_v1",
+        "dynamics_profile": "x3_v1",
         "spawn": spawn,
         "template_sha256": sha256(template.encode("utf-8")),
         "world_sha256": sha256(world.encode("utf-8")),
@@ -471,7 +476,7 @@ def main():
                    help="EpisodeMeta.scene_id（默认=seed）")
     p.add_argument("--spawn-mode", choices=("default", "random"), default="default",
                    help="出生位姿：default=模板原点；random=y/yaw 随机")
-    p.add_argument("--task", choices=("base", "l1"), default="base",
+    p.add_argument("--task", choices=("base", "l1", "campus"), default="base",
                    help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
     p.add_argument("--appearance", choices=(APPEARANCE_LEGACY, APPEARANCE_V1),
                    default=APPEARANCE_LEGACY,
@@ -508,11 +513,14 @@ def main():
     print(f"  meta  -> {meta_path}")
     for pillar in meta["pillars"]:
         print(f"  {pillar['name']}: x={pillar['x']:.3f} y={pillar['y']:.3f} "
-              f"size={PILLAR_SIZE:g}x{PILLAR_SIZE:g}x{PILLAR_HEIGHT:g}")
+              f"size={pillar['size']}")
     c = meta["clearance"]
-    print(f"  clearance: min_pair={c['min_pair_gap_m']:.3f} m "
-          f"min_boundary={c['min_boundary_gap_m']:.3f} m "
-          f"(required {c['min_gap_required_m']} m), attempts={meta['sampling_attempts']}")
+    if args.task == "campus":
+        print(f"  map={meta['map_id']} goal_radius={meta['goal_radius']} m ok={c['ok']}")
+    else:
+        print(f"  clearance: min_pair={c['min_pair_gap_m']:.3f} m "
+              f"min_boundary={c['min_boundary_gap_m']:.3f} m "
+              f"(required {c['min_gap_required_m']} m), attempts={meta['sampling_attempts']}")
     return 0
 
 

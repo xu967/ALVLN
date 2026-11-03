@@ -6,6 +6,7 @@
 #include "uavrgb/linear_cuda.hpp"
 #include "uavrgb/nn.hpp"
 #include "uavrgb/softmax_cuda.hpp"
+#include "uavrgb/soft_targets.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -33,36 +34,6 @@ std::string num(double v) {
   char b[40];
   std::snprintf(b, sizeof b, "%.9g", v);
   return b;
-}
-
-// 读蒸馏软标签：扁平 float32 [n*C]，字节数必须严格等于 n*C*4，否则说明数据集与
-// 软标签不是同一次采集/同一份预处理（错位会静默把样本 A 的教师分布喂给样本 B）。
-std::vector<float> load_soft_targets(const TrainConfig& cfg, const UavrDataset& ds) {
-  if (cfg.soft_targets.empty()) return {};
-  if (!cfg.class_weights.empty()) {
-    throw std::invalid_argument(
-        "trainer: --soft-targets 与 --class-weights 互斥（两种 loss 的归一化口径不同）");
-  }
-  if (!(cfg.distill_alpha >= 0.0f) || !(cfg.distill_alpha <= 1.0f)) {
-    throw std::invalid_argument("trainer: --distill-alpha 必须在 [0,1]");
-  }
-  const std::size_t c = ds.num_classes;
-  const std::size_t want = static_cast<std::size_t>(ds.n) * c * sizeof(float);
-  std::error_code ec;
-  const auto got = std::filesystem::file_size(cfg.soft_targets, ec);
-  if (ec) throw std::runtime_error("trainer: 读不到软标签文件 " + cfg.soft_targets);
-  if (got != want) {
-    throw std::runtime_error(
-        "trainer: 软标签大小 " + std::to_string(got) + " 字节，期望 " + std::to_string(want) +
-        "（n=" + std::to_string(ds.n) + " C=" + std::to_string(c) +
-        "）；软标签与数据集不是同一次采集");
-  }
-  std::vector<float> q(static_cast<std::size_t>(ds.n) * c);
-  std::ifstream f(cfg.soft_targets, std::ios::binary);
-  if (!f || !f.read(reinterpret_cast<char*>(q.data()), static_cast<std::streamsize>(want))) {
-    throw std::runtime_error("trainer: 读软标签内容失败 " + cfg.soft_targets);
-  }
-  return q;
 }
 
 // resume 的历史 best 必须能在新目录独立交付：同目录核对文件存在且状态一致；
@@ -147,6 +118,11 @@ void Trainer::run() {
   if (cfg_.text_dim > 0 && ds.text_ids.empty()) {
     throw std::runtime_error(
         "trainer: --text-dim>0 但数据集没有 instructions.jsonl 侧车（用新版 preprocess.py 重打包）");
+  }
+  if (cfg_.text_dim == 0 && !ds.text_ids.empty() && !cfg_.vision_only) {
+    throw std::runtime_error(
+        "trainer: 数据集有 instructions.jsonl 但 --text-dim 缺省为 0，会静默训成纯视觉模型；"
+        "要文本分支请传 --text-dim N，要纯视觉基线请显式传 --vision-only");
   }
   model_ = make_cnn(ds.h, ds.w, cfg_.seed, static_cast<int>(ds.num_classes), cfg_.text_dim);
   state_ = make_train_state(model_, cfg_.lr);
@@ -328,6 +304,12 @@ void Trainer::run() {
   }
 
   // test split 全程不参与训练和调参：只在最后评估一次，给出一个没被选择污染的数字。
+  // 但必须用交付的那份权重：dev 宏 F1 峰值常早于末轮，评 model_ 会报出与
+  // ckpt_best.bin 不符的数字（2026-11-03 审计）。
+  if (!ds.test_idx.empty() && !dev_is_train && std::filesystem::exists(best_ckpt_path)) {
+    TrainState best_state = state_;  // 只借用模型的权重布局校验，不回写训练状态
+    load_checkpoint(best_ckpt_path, model_, best_state);
+  }
   if (!ds.test_idx.empty()) {
     EvalStats test_stats;
     evaluate(ds, ds.test_idx, &test_stats);

@@ -8,7 +8,8 @@
 
 用法：
   python3 ui/trainer_native.py --data /tmp/bench_ds.uavr
-  UAVRGB_TRAIN_BIN=/path/to/uavrgb_train python3 ui/trainer_native.py --config cfg.json
+  UAV_RGB_TRAIN_BIN=/path/to/uavrgb_train python3 ui/trainer_native.py --config cfg.json
+  （兼容旧变量 UAVRGB_TRAIN_BIN）
 """
 import argparse
 import json
@@ -16,7 +17,10 @@ import os
 import sys
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_TRAINER = os.path.join(REPO_ROOT, "src", "build", "uavrgb_train")
+DEFAULT_TRAINER = os.path.expanduser(
+    os.environ.get("UAV_RGB_TRAIN_BIN") or os.environ.get("UAVRGB_TRAIN_BIN") or
+    os.path.join(os.environ.get("UAV_RGB_BUILD_DIR") or
+                 os.path.join(REPO_ROOT, "build", "check"), "uavrgb_train"))
 SCHEMA = "uavrgb.train.v1"
 
 
@@ -53,9 +57,9 @@ def main(argv=None):
         print("trainer_native: 缺数据集；请在控制台「训练命令」里写 --data <dataset.uavr>",
               file=sys.stderr)
         return 2
-    trainer = os.environ.get("UAVRGB_TRAIN_BIN", DEFAULT_TRAINER)
+    trainer = os.environ.get("UAV_RGB_TRAIN_BIN") or os.environ.get("UAVRGB_TRAIN_BIN") or DEFAULT_TRAINER
     if not os.access(trainer, os.X_OK):
-        print(f"trainer_native: 找不到可执行的 trainer: {trainer}（先构建 src/）",
+        print(f"trainer_native: 找不到可执行的 trainer: {trainer}（先运行 tools/check.sh 构建 build/check）",
               file=sys.stderr)
         return 2
     cmd = [trainer] + (["--data", str(data)] if data else []) + [

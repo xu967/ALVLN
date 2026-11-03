@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """audit_dataset.py 自检：干净数据全过，各类缺陷能被抓出来。"""
 import json
+import copy
+import hashlib
 import os
 import shutil
 import sys
@@ -118,7 +120,87 @@ def details(root):
 CLEAN = [0, 2, 1, 1, 3, 1] * 4
 
 
+def campus_contract_tests():
+    """真实 scene/manifest 读写后校验新合同；不把校园整体降为 SKIP。"""
+    import campus
+    import scene_gen
+    with open(scene_gen.DEFAULT_TEMPLATE, encoding="utf-8") as fp:
+        template = fp.read()
+    with tempfile.TemporaryDirectory(prefix="audit_campus_") as root:
+        facts = []
+        for seed in (0, 4, 8, 16):
+            _, meta = campus.build(template, seed, seed)
+            split = campus.split(seed)
+            extras = dict(meta, geometry_gid=sm.geometry_gid(meta["pillars"]), planner="astar")
+            write_ep(root, split, seed, [0, 0], pillars=meta["pillars"],
+                     instruction=meta["instruction"], scene_extra=meta, man_extra=extras)
+            ep = os.path.join(root, split, str(seed))
+            scene_path = os.path.join(ep, "scene.json")
+            man_path = os.path.join(ep, "episode_manifest.json")
+            man = ad.load_json(man_path)
+            with open(scene_path, "rb") as sf:
+                man["scene_meta_sha256"] = hashlib.sha256(sf.read()).hexdigest()
+            with open(man_path, "w", encoding="utf-8") as fp:
+                json.dump(man, fp)
+            wp = dict(meta["waypoint"], z=2.1)
+            for name in ("actions.jsonl", "oracle.jsonl"):
+                path = os.path.join(ep, name)
+                rows = ad.load_jsonl(path)
+                for row in rows:
+                    if name == "actions.jsonl":
+                        row.update(pose_before=wp, yaw_before=0., action_expert=0)
+                    else:
+                        row["pose_gt"] = wp
+                with open(path, "w", encoding="utf-8") as fp:
+                    fp.writelines(json.dumps(row) + "\n" for row in rows)
+            facts.append(ad.episode_facts(ep))
+
+        def checks(fs, excluded=()):
+            return {c["name"]: c for c in ad.audit(fs, pre_excluded=excluded)}
+
+        good = checks(facts)
+        for name in ("campus_identity", "campus_map_split", "campus_goal_geometry",
+                     "campus_teacher_reach", "geometry_version", "label_recompute"):
+            assert good[name]["status"] == "PASS", good[name]
+        assert good["label_recompute"]["covered_steps"] == 8, good
+        assert good["waypoint_side"]["status"] == "SKIP", good
+
+        # 同拓扑组换颜色/关系也不能换 split，排除碰撞集同样挡不住泄漏检查。
+        wrong = copy.deepcopy(facts[1])
+        wrong["split"] = "test" if facts[1]["split"] != "test" else "train"
+        assert checks(facts[:1], [wrong])["campus_map_split"]["status"] == "FAIL"
+        # 伪造 gid 或漏传任务身份不能放行，即使 scene 看起来正确。
+        for key in ("map_id", "goal_radius", "waypoint", "geometry_gid", "scene_meta_sha256"):
+            wrong = copy.deepcopy(facts[0])
+            wrong["manifest"].pop(key)
+            assert checks([wrong])["campus_identity"]["status"] == "FAIL", key
+        # 布局中新增堵住出生点的实体：即使 clearance.ok=True，也必须被几何检查拒绝。
+        wrong = copy.deepcopy(facts[0])
+        wrong["scene_metadata"]["pillars"].append(
+            dict(name="block", x=-.5, y=0., z=1.5, size=[1., 1., 3.]))
+        assert checks([wrong])["campus_goal_geometry"]["status"] == "FAIL"
+        # 目标路径可走不等于目标可见：细障碍只挡视线，独立可见性检查仍要失败。
+        wrong = copy.deepcopy(facts[0])
+        target = next(p for p in wrong["scene_metadata"]["pillars"] if p.get("color")
+                      and p["y"] > 0)
+        wrong["scene_metadata"]["pillars"].append(
+            dict(name="screen", x=1., y=target["y"] * 1.3 / (target["x"] + .3),
+                 z=1.5, size=[.2, .2, 3.]))
+        obstructed = checks([wrong])["campus_goal_geometry"]
+        assert obstructed["status"] == "FAIL" and "遮挡" in str(obstructed), obstructed
+        # 到达用0.5m真实半径，不沿用旧L1的1m/1.5m宽松口径。
+        wrong = copy.deepcopy(facts[0])
+        wrong["waypoint_min_dist"] = .6
+        assert checks([wrong])["campus_teacher_reach"]["status"] == "FAIL"
+        wrong = copy.deepcopy(facts[0])
+        wrong["steps"][0]["action_expert"] = 1
+        assert checks([wrong])["label_recompute"]["status"] == "FAIL"
+        wrong["steps"][0]["pose_before"] = None
+        assert checks([wrong])["campus_identity"]["status"] == "FAIL"
+
+
 def main():
+    campus_contract_tests()
     root = tempfile.mkdtemp(prefix="audit_test_")
     try:
         # 1) 干净数据：除 split（只有单个 split）与需新字段的两项外都 PASS

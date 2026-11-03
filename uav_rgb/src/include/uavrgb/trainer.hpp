@@ -30,6 +30,9 @@ struct TrainConfig {
   // >0 时启用文本分支：embedding[kTextVocab, text_dim] → 按位置拼接 → FiLM。
   // 需要 dataset 旁边有 instructions.jsonl 侧车（preprocess.py 写）。
   int text_dim = 0;
+  // 数据集带 instructions.jsonl 却显式要纯视觉基线时必须置位：默认 0 的 text_dim
+  // 会让"忘传 --text-dim"静默训成纯视觉模型，症状和训练失败一样（2026-11-03 审计）。
+  bool vision_only = false;
   // 非空时启用蒸馏：扁平 float32 [n*C] 软标签（tools/join_soft_targets.py 产出），
   // 第 k 行对应数据集第 k 个样本。与 --class-weights 互斥（两种 loss 归一化口径不同）。
   std::string soft_targets;

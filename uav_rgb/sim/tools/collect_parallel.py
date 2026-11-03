@@ -10,9 +10,8 @@
      调 scene_gen.py 生成各自世界（先全部生成，失败则不起 sim）。
   2. 每个 instance 一个 worker：顺序跑 E 个 episode；每个 episode 都新起一个
      `gz sim -s -r <world>`（collect.py 没有 episode reset，world 必须全新），
-     setsid 独立进程组，每个 episode 独立 GZ_PARTITION、DISPLAY=:20、LP_NUM_THREADS=1
-     （软件渲染限线程：6 实例并发实测 RTF 0.21→0.50；起飞 timeout 已从
-     30 s 提到 120 s，RTF 0.2 时爬升 1.95 m 要 ~60 s 墙钟）。
+     setsid 独立进程组，每个 episode 独立 GZ_PARTITION，默认 NVIDIA EGL
+     无界面渲染；UAVRGB_RENDER_BACKEND=software 显式启用旧的软件 GL 路径。
      某个 episode 失败会重启 sim 重试 1 次（collect.py 发布层偶发丢首条指令）。
   3. 并发跑 collect.py（子进程，各自 --scene-id/--seed/--split）。
   4. 全部结束后把 staging 汇总到 --out/<split>/<scene_id>/。
@@ -85,12 +84,25 @@ def _utc_now():
 
 def gz_env(partition):
     env = dict(os.environ)
-    env.update({"DISPLAY": DISPLAY_VALUE,
-                "XDG_RUNTIME_DIR": XDG_RUNTIME_DIR,
-                "GZ_PARTITION": partition,
-                # 软件渲染（llvmpipe）默认每进程开满线程，多实例并发时互相抢核，
-                # 实测 6 实例 RTF 0.21；限成 1 线程后 0.50（起飞 30 s 超时才够用）。
-                "LP_NUM_THREADS": "1"})
+    backend = env.get("UAVRGB_RENDER_BACKEND", "gpu")
+    if backend not in ("gpu", "software"):
+        raise ValueError("UAVRGB_RENDER_BACKEND 必须是 gpu 或 software")
+    env.update({"XDG_RUNTIME_DIR": XDG_RUNTIME_DIR, "GZ_PARTITION": partition,
+                "UAVRGB_RENDER_BACKEND": backend})
+    if backend == "gpu":
+        # CUDA 可用不代表 EGL 选到了 NVIDIA；GLVND 默认可能仍选 Mesa。
+        env["__EGL_VENDOR_LIBRARY_FILENAMES"] = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+        for key in ("DISPLAY", "LIBGL_ALWAYS_SOFTWARE", "MESA_LOADER_DRIVER_OVERRIDE",
+                    "GALLIUM_DRIVER", "LP_NUM_THREADS", "__GLX_VENDOR_LIBRARY_NAME"):
+            env.pop(key, None)
+    else:
+        # 不把 EGL vendor 强制成 Mesa：Ogre 枚举 NVIDIA DRM 设备时会崩溃。
+        # 此路径沿用 X11/GLX 软件显示；实际 renderer 以本次 Ogre 日志为准。
+        for key in ("__EGL_VENDOR_LIBRARY_FILENAMES", "LIBGL_ALWAYS_SOFTWARE",
+                    "__GLX_VENDOR_LIBRARY_NAME", "MESA_LOADER_DRIVER_OVERRIDE", "GALLIUM_DRIVER"):
+            env.pop(key, None)
+        env.update({"DISPLAY": env.get("DISPLAY") or DISPLAY_VALUE,
+                    "LP_NUM_THREADS": "1"})
     return env
 
 
@@ -104,66 +116,53 @@ def _unregister(proc):
         _PROC_GROUPS.pop(proc.pid, None)
 
 
+def _group_running(pgid):
+    """只判断指定组；zombie 已停止，交给其父进程回收，不反复发信号。"""
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    try:
+        result = subprocess.run(["ps", "-eo", "pgid=,stat="],
+                                capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        return True  # 无法确认已停止，保留登记以便重试。
+    if result.returncode != 0:
+        return True
+    found = False
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) != 2 or not fields[0].isdigit():
+            return True
+        if fields[0] == str(pgid):
+            found = True
+            if not fields[1].startswith("Z"):
+                return True
+    return not found  # 空快照不作退出证据，下一轮再用 killpg 确认。
+
+
 def stop_group(proc, label, term_timeout=8.0):
-    """对自己 setsid 起的进程组发 SIGTERM，超时 SIGKILL；返回是否已清空。"""
+    """终止自己 setsid 起的整个组；组长退出不代表子进程已退出。"""
     if proc is None:
         return True
     pgid = proc.pid
-    try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    try:
-        proc.wait(timeout=term_timeout)
-    except subprocess.TimeoutExpired:
+    for sig, timeout in ((signal.SIGTERM, term_timeout), (signal.SIGKILL, 5.0)):
         try:
-            os.killpg(pgid, signal.SIGKILL)
+            os.killpg(pgid, sig)
         except ProcessLookupError:
             pass
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
-    clean = False
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
-            clean = True
-            break
-        time.sleep(0.1)
-    if not clean:
-        print(f"警告: {label} 进程组 {pgid} 收尾后仍有残留", flush=True)
-    _unregister(proc)
-    return clean
-
-
-def _sweep_orphan_topics():
-    """杀掉父进程已死的 gz-transport-topic 订阅者。
-
-    collect.py 被 SIGKILL 时它起的 `gz topic -e` 子进程会掉到 init（ppid=1）并
-    继续订阅；实测 30+ 个残留把 4 实例 RTF 压到 0.1（10 s/步），清掉后 1.4 s/步。
-    只认 /uav/ 与 /model/x3 话题，避免误杀别的 gz topic。
-    """
-    try:
-        r = subprocess.run(["ps", "-eo", "pid,ppid,args", "--no-headers"],
-                           capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.TimeoutExpired):
-        return
-    for line in r.stdout.splitlines():
-        parts = line.split(None, 2)
-        if len(parts) < 3 or parts[1] != "1":
-            continue
-        pid_s, _ppid, cmd = parts
-        if "gz-transport-topic" not in cmd:
-            continue
-        if "/uav/" not in cmd and "/model/x3" not in cmd:
-            continue
-        try:
-            os.kill(int(pid_s), signal.SIGKILL)
-        except (ValueError, ProcessLookupError, PermissionError):
-            pass
+        deadline = time.monotonic() + timeout
+        while True:
+            proc.poll()  # 回收直接子进程；同组的其它成员可能仍存活。
+            if not _group_running(pgid):
+                proc.poll()  # 组长可能在上面的进程快照期间才退出，再收一次。
+                _unregister(proc)
+                return True
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
+    print(f"警告: {label} 进程组 {pgid} 收尾后仍有运行成员，保留登记待重试", flush=True)
+    return False
 
 
 def cleanup_all():
@@ -171,7 +170,6 @@ def cleanup_all():
         procs = list(_PROC_GROUPS.values())
     for proc in procs:
         stop_group(proc, "cleanup")
-    _sweep_orphan_topics()
 
 
 def _tail(path, n=20):
@@ -183,11 +181,22 @@ def _tail(path, n=20):
 
 
 def _start_sim(world, partition, log_path):
+    env = gz_env(partition)
+    vendor = env.get("__EGL_VENDOR_LIBRARY_FILENAMES")
+    if vendor and not os.path.isfile(vendor):
+        raise RuntimeError(f"渲染驱动清单不存在: {vendor}；请安装对应 EGL 驱动，"
+                           "或显式设置 UAVRGB_RENDER_BACKEND=software 使用软件渲染")
+    cmd = ["gz", "sim", "-s", "-r"]
+    if env["UAVRGB_RENDER_BACKEND"] == "gpu":
+        cmd.append("--headless-rendering")
+    cmd.append(world)
     log = open(log_path, "ab")  # 追加：重试时保留第一次失败的日志
     try:
+        log.write((json.dumps({"render_backend": env["UAVRGB_RENDER_BACKEND"],
+                               "egl_vendor_file": vendor, "command": cmd}) + "\n").encode())
+        log.flush()
         proc = subprocess.Popen(
-            ["gz", "sim", "-s", "-r", world],
-            env=gz_env(partition), stdout=log, stderr=subprocess.STDOUT,
+            cmd, env=env, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True)
     finally:
         log.close()
@@ -431,7 +440,7 @@ def main():
     p.add_argument("--hold", type=float, default=1.0,
                    help="每动作仿真时间秒（走满即发零速，与 RTF 无关）")
     p.add_argument("--window-from", choices=("dispatch", "observation"),
-                   default="observation",
+                   default=None,
                    help="动作窗口起点：observation=观测位姿（默认，唯一被采纳基线）；"
                         "dispatch=派发位姿（仅复现 T7-R，数字不可与 observation 混报）")
     p.add_argument("--out", required=True, help="汇总输出目录（必须为空/不存在）")
@@ -443,7 +452,7 @@ def main():
                    help="只采命中该 split 的几何组；seed 从 base-seed 起向后扫描")
     p.add_argument("--spawn-mode", choices=("default", "random"), default="default",
                    help="每个 episode 的出生位姿（random = y/yaw 随机化）")
-    p.add_argument("--task", choices=("base", "l1"), default="base",
+    p.add_argument("--task", choices=("base", "l1", "campus"), default="base",
                    help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
     p.add_argument("--appearance", choices=("legacy", "v1"), default="legacy",
                    help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）")
@@ -456,6 +465,8 @@ def main():
     p.add_argument("--episode-timeout", type=float, default=600.0)
     p.add_argument("--sim-timeout", type=float, default=120.0)
     args = p.parse_args()
+    if args.window_from is None:
+        args.window_from = "dispatch" if args.task == "campus" else "observation"
 
     if args.instances < 1:
         p.error("--instances must be >= 1")
@@ -481,7 +492,6 @@ def main():
     if os.path.isdir(out) and os.listdir(out):
         p.error(f"--out {out} 非空；请用新目录（或先清空）")
     os.makedirs(out, exist_ok=True)
-    _sweep_orphan_topics()   # 上一轮被 SIGKILL 的订阅者会拖垮本轮 RTF
     try:
         os.makedirs(XDG_RUNTIME_DIR, mode=0o700, exist_ok=True)
         os.chmod(XDG_RUNTIME_DIR, 0o700)
@@ -507,8 +517,7 @@ def main():
             scene_ids.extend(range(int(a), int(b) if b else int(a) + 1))
         if args.split:
             scene_ids = [s for s in scene_ids
-                         if sm.split_for_gid(sm.geometry_gid(
-                             sm.sg.sample_pillars(s)[0])) == args.split]
+                         if sm.split_for_seed(s, args.task) == args.split]
     elif args.split:
         # 只取目标 split：test 只占几何组的 ~10%，顺序取 base-seed 起的前 N 个
         # 会全是 train。这里按几何 gid 的固定 split 过滤，扫描上限防止写错 split
@@ -518,8 +527,7 @@ def main():
             if seed > args.base_seed + 100_000:
                 p.error(f"从 base-seed={args.base_seed} 扫了 100000 个 seed 仍凑不齐 "
                         f"{target} 个 split={args.split} 的场景")
-            pillars, _, _ = sm.sg.sample_pillars(seed)
-            if sm.split_for_gid(sm.geometry_gid(pillars)) == args.split:
+            if sm.split_for_seed(seed, args.task) == args.split:
                 scene_ids.append(seed)
             seed += 1
     else:
@@ -560,7 +568,7 @@ def main():
                 t.scene_meta = json.load(f)
             t.world_sha256 = sha256_file(t.world)
             # split 只能在世界生成后定：它取决于几何，不取决于 scene_id。
-            t.split = sm.split_for_gid(sm.geometry_gid(t.scene_meta["pillars"]))
+            t.split = sm.split_for_scene(t.scene_meta)
             print(f"[scene] scene_id={t.scene_id} split={t.split} "
                   f"pillars={t.scene_meta['pillar_count']} "
                   f"sha256={t.world_sha256[:16]}…", flush=True)
@@ -632,14 +640,15 @@ def main():
             "hold_s": args.hold,
             "window_from": args.window_from,
             "task": args.task,
-            "geometry_version": sm.SPLIT_SALT,
+            "geometry_version": ("campus.v1" if args.task == "campus" else sm.SPLIT_SALT),
+            "appearance_version": ("campus.v1" if args.task == "campus" else args.appearance),
             "policy": args.policy,
             "split": args.split,
             "seeds": args.seeds,
             "spawn_mode": args.spawn_mode,
             "unique_geometry": len({sm.geometry_gid(t.scene_meta["pillars"])
                                     for t in tasks if t.scene_meta}),
-            "split_policy": SPLIT_POLICY,
+            "split_policy": ("campus_map_v1" if args.task == "campus" else SPLIT_POLICY),
             "template": _rel(os.path.abspath(args.template)),
             "keep_worlds": bool(args.keep_worlds),
             "splits": splits,

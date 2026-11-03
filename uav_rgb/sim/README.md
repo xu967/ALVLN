@@ -14,26 +14,38 @@
 - `tools/collect_parallel.py` —— 多实例 `GZ_PARTITION` 隔离 + 并发 `collect.py` 的采集编排。
 - `evidence/*.png` —— 实测抓帧证据。
 
-## 0. 本容器关键事实（务必先读）
+## 0. 当前渲染路径（2026-11-03 更新）
 
-- **纯 headless 相机渲染跑不起来**。`gz sim -s -r`（不带 DISPLAY）时，
-  Ogre2 传感器渲染走 EGL-PBuffer，会去初始化无驱动的 NVIDIA 设备
-  `/dev/dri/card1`（容器没有 NVIDIA EGL），`eglInitialize failed` 后 segfault，
-  整个 server 崩溃，`/uav/camera` 不发布。报错原文见文末「附录 A」。
-- **workaround（已实测可用）**：server-only 模式显式带 `DISPLAY=:20`
-  （容器里已有 Xorg 软件 GL，llvmpipe/GL 4.5）。Ogre2 在 EGL 失败后回落到
-  X11/GLX 软件渲染，相机正常出图。所以命令一律写成：
-  `DISPLAY=:20 gz sim -s -r <world>`。
-- 物理本身（无相机）可以纯 headless 跑；只有相机传感器需要上面的 DISPLAY 工作区。
-- **不要用 `gz sim -r`（GUI 模式）**：GUI 的 3D 视图渲染线程在 Ogre2 EGL 初始化
-  时同样 segfault（见附录 A），整进程崩溃。用 `-s`（server-only）。
+- 本机 NVIDIA EGL 已可用。采集、校园 smoke 和闭环评测默认使用
+  `UAVRGB_RENDER_BACKEND=gpu`：指定 NVIDIA EGL vendor，移除 `DISPLAY` 和软件驱动覆盖，
+  启动 `gz sim -s -r --headless-rendering`。本轮真实相机日志确认 RTX 2080 Ti。
+- GPU 模式启动失败会报错，不自动降级。缺显卡/驱动时须显式使用
+  `UAVRGB_RENDER_BACKEND=software`；它沿用 X11/GLX 与 `LP_NUM_THREADS=1`，
+  显示取 `DISPLAY`，未设置时为 `:20`。需要已有显示服务，本机 `:20` 为 llvmpipe。
+  其他机器须检查实际 renderer；此选项不会把任意硬件 X server 变成软件显示。
+- 不要给软件路径强加 `LIBGL_ALWAYS_SOFTWARE` 或 Mesa EGL vendor：本机 Ogre
+  枚举 NVIDIA DRM 设备时会触发 Mesa 崩溃。历史 headless 失败原文保留在附录 A，
+  不再代表当前 NVIDIA EGL 能力。GUI 未在本轮验证，批处理用 `-s`。
+- `nvidia-smi` 只证明显卡可见。串行启动后的 `~/.gz/rendering/ogre2.log` 中
+  `GL_VENDOR` / `GL_RENDERER` 才是该次渲染的证据；该日志共享，不能用旧文件或
+  并发覆盖后的日志给各实例作证明。
+- 每集 `episode_manifest.json.performance` 保存平均步骤耗时和动作窗口 RTF；
+  `render_backend_requested` 只记录请求的路径，不冒充实际 renderer。
+  新统计用派发后的位姿时间段，`rtf_basis=dispatch_pose_to_after_pose`；
+  observation 模式也不把派发前推理时间计入 RTF。没有仿真时间推进的样本集合
+  返回 `action_rtf=null`，不会把立即停止解释为异常高倍速。
+  该比值仍是位姿采样估算，不是 Gazebo `/stats` 的精确同步测量。
+  最终 `eval.json` 的每集记录保留上述两个字段，即使未设置 `--keep-work`。
+  测量与后续优化见 [GPU 仿真实验](../docs/experiments/2026-11-03-gpu-rendering.md)。
 
 ## 1. 启动世界
 
 ```bash
 cd /root/claude-code-backup-20261028/code/uav_rgb
 mkdir -p /tmp/xdg && chmod 700 /tmp/xdg   # 消除 XDG_RUNTIME_DIR 报错
-DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg gz sim -s -r sim/worlds/uav_rgb.sdf
+env -u DISPLAY -u LIBGL_ALWAYS_SOFTWARE \
+  __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json \
+  XDG_RUNTIME_DIR=/tmp/xdg gz sim -s -r --headless-rendering sim/worlds/uav_rgb.sdf
 ```
 
 - `-s` server-only，`-r` 启动即运行（不暂停）。
@@ -50,8 +62,12 @@ DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg gz sim -s -r sim/worlds/uav_rgb.sdf
 
 ## 2. 读 RGB 相机（话题：`/uav/camera`，gz.msgs.Image，R8G8B8 320×240 @30Hz）
 
+桌面工作台另外订阅 `/uav/chase_camera`（第三人称追踪，640×360 @15Hz）和 `/uav/top_camera`（静态顶视相机，480×360 @10Hz）。两者都是纯展示 sensor，不改变 student 的 RGB observation；旧 world SDF 需用更新后的模板重新生成才包含这两个话题。
+
 ```bash
-gz topic -i -t /uav/camera                    # 类型/频率
+gz topic -i -t /uav/camera                    # 学生输入 RGB 类型/频率
+gz topic -i -t /uav/chase_camera              # 第三人称跟随相机
+gz topic -i -t /uav/top_camera                # 固定顶视相机
 gz topic -e -t /uav/camera                    # 连续打印（含 base64 data）
 gz topic -e -t /uav/camera -n 1 --json-output # 只取 1 帧，JSON（data 为 base64）
 ```
@@ -233,13 +249,11 @@ python3 sim/tools/collect_parallel.py --instances 4 --episodes-per-instance 1 \
 - `scene_id = seed = base_seed + instance*E + episode`；**每个 episode 一个新
   world**。`collect.py` 没有 episode reset，所以 `--episodes-per-instance>1` 时
   每个 episode 都重启一次 `gz sim`（同一实例内顺序执行，实例之间并行）。
-- 每个实例用 `setsid` 起独立进程组：`gz sim -s -r <world>`，环境
+- 每个实例用 `setsid` 起独立进程组，GPU 默认加 `--headless-rendering`，环境
   `GZ_PARTITION=uavrgb_<随机 UUID>`（每个 episode 独立，避免不同采集运行串台；
-  分区记录在 collection manifest 的 task 中）+ `DISPLAY=:20` +
-  `XDG_RUNTIME_DIR=/tmp/xdg` + **`LP_NUM_THREADS=1`**。最后一项很关键：
-  llvmpipe 默认每个 sim 进程开满渲染线程，6 实例并发时互相抢核，实测 sim
-  RTF 从 1.0 掉到 **0.21**，30 s 起飞超时会误报；限成 1 线程后
-  同一场景 RTF **0.50**（外部负载下实测 0.65），起飞 ~15–25 s 可完成。
+  分区记录在 collection manifest 的 task 中）+ `XDG_RUNTIME_DIR=/tmp/xdg`。
+  只有显式 software 模式使用显示服务和 `LP_NUM_THREADS=1`；历史六实例限线程
+  测量不代表 GPU 并发性能。
 - sim ready 后再稳 3 s 才启动 `collect.py`；某个 episode 失败会重启 sim
   重试 1 次（world 由 seed 确定性生成，不换场景）。这是对 `collect.py`
   常驻 publisher 偶发丢首条起飞指令的兜底，不影响数据语义。

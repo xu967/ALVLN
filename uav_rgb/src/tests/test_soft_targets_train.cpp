@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "synthetic_dataset.hpp"
+#include "soft_targets_fixture.hpp"
 #include "uavrgb/dataset.hpp"
 #include "uavrgb/trainer.hpp"
 
@@ -52,14 +53,13 @@ std::string read_file(const std::string& path) {
 }
 
 // 把 one-hot 软标签写成扁平 float32 [n*4]。
-void write_soft(const std::string& path, const std::vector<int>& labels, int rotate) {
+void write_soft(const std::string& path, const std::string& dataset,
+                const std::vector<int>& labels, int rotate) {
   std::vector<float> q(labels.size() * 4, 0.0f);
   for (std::size_t i = 0; i < labels.size(); ++i) {
     q[i * 4 + static_cast<std::size_t>((labels[i] + rotate) % 4)] = 1.0f;
   }
-  std::ofstream f(path, std::ios::binary | std::ios::trunc);
-  f.write(reinterpret_cast<const char*>(q.data()),
-          static_cast<std::streamsize>(q.size() * sizeof(float)));
+  uavrgb_test::write_soft(path, dataset, q);
 }
 
 double val_accuracy(const CnnModel& m, UavrDataset& ds) {
@@ -100,8 +100,8 @@ int main() {
 
   std::vector<int> all = train_labels;
   all.insert(all.end(), val_labels.begin(), val_labels.end());
-  write_soft(root + "/soft_ok.bin", all, 0);
-  write_soft(root + "/soft_rot.bin", all, 1);
+  write_soft(root + "/soft_ok.bin", sd.path, all, 0);
+  write_soft(root + "/soft_rot.bin", sd.path, all, 1);
 
   TrainConfig base;
   base.data_path = sd.path;

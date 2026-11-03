@@ -1,3 +1,11 @@
+# 当前实施状态（2026-11-04）
+
+本轮范围与验收见 `CAMPUS_BASELINE.md` / `experiments/2026-11-03-campus-baseline.md`。
+优先级：先让修复与校园pilot通过功能验收，再采集配对训练集和报告跨拓扑闭环。
+2026-11-04 新增桌面 Studio 任务：L1/UI 冒烟已通过，目标 Gazebo 8 三视角渲染和 GPU L3 仍待用户桌面环境验证。
+风、相机标定/成像扰动、实机参数拟合属于后续独立实验，不能由本轮纹理效果推断。
+下方为历史任务表，不能覆盖以上最新状态。
+
 # 任务板
 
 - 建立：2026-10-29 22:19
@@ -10,6 +18,7 @@
 
 | ID | P | 状态 | owner | 文件域 | 任务 | 验收 |
 | --- | --- | --- | --- | --- | --- | --- |
+| STUDIO-1 | P1 | **doing**（2026-11-04；代码与 UI 冒烟完成，Gazebo L3 待用户桌面验证） | 当前会话（用户授权） | `ui/`、`sim/worlds/uav_rgb.sdf`、`docs/` | 原生桌面训练/实验工作台：真实 trainer 监控、实验自动归档、三视角 Gazebo 展示、学生 live demo、闭环评测入口 | `ui/test_studio.py` 8 项；`test_monitor.py` 74 项 + 1 skip；`test_trainer_demo.py` 92 项；Xvfb UI/训练假后端/PNG/topdown 冒烟通过；无 `gz` 的当前容器无法完成真实相机 L3。见 `worklog/2026-11-04-uav-navigation-studio.md` |
 | T7-R | P0 | **done**（2026-10-31 00:00） | code-4b | `sim/tools/eval_closed_loop.py`、`docs/` | dispatch 语义 20 seed 复跑：SR 0.55（11/20），collision 0.45，false_forward 0.30；A/B observation 2/2 vs dispatch 0/2 | 见 `experiments/2026-10-31-t7-r01b-and-window-ab.md`；0.90 只适用于 observation 语义 |
 | C0 | P0 | done | code-3b + code-4b | git | 清 37 文件积压，按主题提交 | 工作树干净；5 个主题提交 |
 | E6-1 | P0 | done | code-4b | `src/infer_main.cpp`、`src/CMakeLists.txt`、`src/tests/` | 常驻推理进程：stdin 收 H×W RGB uint8，stdout 回 action/probs/infer_ms | 加载现有 ckpt；同帧 100 次输出一致；JSON 可解析（`2026-10-29-2226-infer-process.md`） |

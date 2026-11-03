@@ -103,13 +103,13 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False)
         die("%s: validity 缺失或未全 true（%r），不能打包" % (man_path, validity))
     # v2/v3 的 geometry_gid 天然不同，只查 gid 交集查不出两套几何混包。
     gver = man.get("geometry_version")
-    if gver != sm.SPLIT_SALT:
+    if gver not in (sm.SPLIT_SALT, "campus.v1"):
         die("%s: geometry_version=%r 与当前 %s 不一致（旧几何数据不能混进新数据集）"
             % (man_path, gver, sm.SPLIT_SALT))
     # 最后一道防泄漏门：split 必须等于几何 gid 应属的 split。只查「同 gid 跨 split」
     # 挡不住单集包内被改过的 manifest（没有对照集，一致性检查永远通过）。
     if gid is not None:
-        want = sm.split_for_gid(gid)
+        want = sm.split_for_scene(man)
         if split != want:
             die("%s: split=%s 与 geometry_gid=%s 应属的 split=%s 不一致（manifest 被改动？）"
                 % (man_path, split, gid, want))
@@ -181,6 +181,7 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False)
         "split": split,
         "geometry_gid": gid,
         "geometry_version": gver,
+        **{key: man.get(key) for key in sm.PROVENANCE_KEYS},
         "teacher": man.get("teacher"),
         "planner": man.get("planner"),
         "instruction": instruction,
@@ -237,7 +238,9 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False):
         die("没有可写样本")
     # 同一数据集不能混 observation/dispatch、不同 hold 或不同任务版本，否则
     # eval.json / 训练日志里的数字无法归因。缺字段的旧数据与有字段的数据也不能混。
-    for key in ("window_from", "hold_s", "task_version", "stop_radius"):
+    for key in ("window_from", "hold_s", "task_version", "stop_radius", "geometry_version",
+                "appearance_version", "split_policy", "camera_profile", "dynamics_profile",
+                "success_criterion", "goal_radius"):
         vals = {ep.get(key) for ep in episodes if ep.get(key) is not None}
         if len(vals) > 1:
             die("episode 的 %s 不一致: %s（不同口径不能混包）"
@@ -283,7 +286,10 @@ def build_meta(episodes, total, size, dropped=0):
                    "aspect": "preserve" if preserve else "squash"},
         "split_policy": "scene_id",
         # 口径字段：eval/训练/audit 从数据集本身就能看出 observation/dispatch 与任务版本。
-        "geometry_version": sm.SPLIT_SALT,
+        "geometry_version": _uniform(episodes, "geometry_version") or sm.SPLIT_SALT,
+        "appearance_version": _uniform(episodes, "appearance_version"),
+        "success_criterion": _uniform(episodes, "success_criterion"),
+        "goal_radius": _uniform(episodes, "goal_radius"),
         "window_from": _uniform(episodes, "window_from"),
         "hold_s": _uniform(episodes, "hold_s"),
         "task_version": _uniform(episodes, "task_version"),
@@ -308,6 +314,7 @@ def build_meta(episodes, total, size, dropped=0):
             "geometry_gid": ep["geometry_gid"],
             # airsim_to_uavr 直接构造 episode dict，没有这两键；必须用 get。
             "geometry_version": ep.get("geometry_version"),
+            **{key: ep.get(key) for key in sm.PROVENANCE_KEYS},
             "teacher": ep.get("teacher"),
             "task_version": ep.get("task_version"),
             "instruction": ep.get("instruction"),

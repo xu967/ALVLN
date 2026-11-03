@@ -1,3 +1,15 @@
+# 当前判据补充（2026-11-03）
+
+`--task campus` 使用 `visible_goal_reach_v1`：无contact且轨迹采样曾进入彩柱前0.5m目标区；
+不要求停稳。默认dispatch。整拓扑留出，源于校园v1元数据，不使用旧L1的1.5m半径。
+必须同时报告请求集成功率、完成比例、failed/skipped和共同有效场景的配对结果。
+新报告记录appearance_version、goal_radius、模板/资源/world哈希及固定请求seed清单。
+`stop_success` 仍仅为末位置诊断，不能称低速停稳成功。
+
+历史 `goal_reach`（19/47=0.4043）与重算 `goal_reach_ever`（0.574）不是模型提升。
+新碰撞事件修复意味着历史碰撞率也须复跑后才可直接比较。
+具体地图与可见性边界见 `CAMPUS_BASELINE.md`。下方历史任务定义保留用于复现。
+
 # 评测标准（公开口径）
 
 - 更新：2026-10-29
@@ -76,7 +88,7 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
 
 - AvoidBench 依赖 ROS noetic（ROS 1）+ Unity3D + Flightmare + catkin 构建。
 - 本项目**明令禁止引入 ROS 2**，本机也没有 ROS 1，且仿真栈是 Gazebo Harmonic。
-- 引入 Unity3D 渲染会推翻现有的软件 GL（llvmpipe，`DISPLAY=:20`）方案。
+- 引入 Unity3D 渲染需要替换现有 Gazebo/Ogre2 仿真链路（当前默认 NVIDIA EGL）。
 
 所以我们的做法是：**实现同一套定义，不跑同一套套件**。报数字时必须写明
 「指标定义沿用 AvoidBench (ICRA 2023)，评测环境为本仓库 Gazebo 场景，非 AvoidBench 套件」。

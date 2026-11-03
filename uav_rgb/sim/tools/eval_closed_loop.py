@@ -36,7 +36,7 @@ REPO_ROOT = os.path.dirname(SIM_DIR)
 SCENE_GEN = os.path.join(TOOLS, "scene_gen.py")
 COLLECT = os.path.join(TOOLS, "collect.py")
 DEFAULT_TEMPLATE = os.path.join(SIM_DIR, "worlds", "uav_rgb.sdf")
-DEFAULT_INFER_BIN = os.path.join(REPO_ROOT, "src", "build", "uavrgb_infer")
+from student import DEFAULT_INFER as DEFAULT_INFER_BIN
 ACTION_NAMES = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 WAYPOINT_RADIUS = 1.0
 # L1 goal-reach 的到达半径。上限由几何定死，不是调出来的：
@@ -103,7 +103,7 @@ def dedup_key(meta, task):
     所以还要带上关系词，否则 left/right 两个任务会被去重成一个。
     """
     gid = sm.geometry_gid(meta["pillars"])
-    if task != "l1":
+    if task not in ("l1", "campus"):
         return gid
     marks = tuple(sorted(
         (round(float(p["x"]), 3), round(float(p["y"]), 3), p.get("color"))
@@ -132,8 +132,10 @@ def override_instruction(meta, mode):
     if color not in ins.COLORS or relation not in ins.RELATIONS:
         raise ValueError(
             f"shuffle 需要 target_color/relation，实际 {color!r}/{relation!r}")
-    out["instruction"] = ins.make_instruction(
-        color, "right" if relation == "left" else "left")
+    maker = ins.make_instruction
+    if meta.get("task_version") == "campus.v1":
+        from campus import instruction as maker
+    out["instruction"] = maker(color, "right" if relation == "left" else "left")
     return out
 
 
@@ -161,7 +163,7 @@ def _src(a):
 
 
 def summarize_episode(actions, oracle, goal_x, waypoint=None,
-                      waypoint_radius=WAYPOINT_RADIUS, stop_radius=None):
+                      waypoint_radius=WAYPOINT_RADIUS, stop_radius=None, goal_radius=None):
     """单集指标；纯函数，便于单测。actions/oracle 是 jsonl 行。
 
     EVAL_STANDARD §5.1：stuck（FORWARD 位移 < 阈值）不是碰撞，碰撞率只看 contact。
@@ -206,10 +208,13 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
         # 2026-11-01 起不再要求末动作 SAFE_NEUTRAL：waypoint 在柱阵外侧 ±2.4 m，
         # 相机 60° 视场在真停止点上 40% 的帧一根柱子都看不到，"停"不可观测
         # （worklog 2026-11-01-2130-stop-point-unobservable.md）。改成"到达"。
+        radius = REACH_RADIUS if goal_radius is None else goal_radius
+        if not math.isfinite(radius) or radius <= 0:
+            raise ValueError("goal_radius 必须有限且为正")
         success = bool(not collision and wp_min is not None
-                       and wp_min <= REACH_RADIUS)
+                       and wp_min <= radius)
         stop_success = bool(not collision and wp_final is not None
-                            and wp_final <= REACH_RADIUS)
+                            and wp_final <= radius)
     else:
         reached = wp_min is None or wp_min <= waypoint_radius
         success = bool(not collision and max_x is not None and max_x >= goal_x and reached)
@@ -274,7 +279,7 @@ def run_episode(seed, args, workdir, seen_gids):
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
     gid = sm.geometry_gid(meta["pillars"])
-    split = sm.split_for_gid(gid)
+    split = sm.split_for_scene(meta)
     if split != args.split:
         return None, f"split={split}"
     # 在起 sim 之前去重：key 必须唯一标识「几何 + 彩色柱位置/颜色」，
@@ -335,13 +340,21 @@ def run_episode(seed, args, workdir, seen_gids):
     oracle_path = os.path.join(ep_dir, "oracle.jsonl")
     actions = load_jsonl(actions_path) if os.path.isfile(actions_path) else []
     oracle = load_jsonl(oracle_path) if os.path.isfile(oracle_path) else []
+    # 默认会删除临时采集目录，先将性能与请求后端带入持久报告。
+    # 旧集/采集失败没有这些字段时保留 null，不推断实际 renderer。
+    try:
+        with open(os.path.join(ep_dir, "episode_manifest.json"), encoding="utf-8") as f:
+            manifest = json.load(f)
+    except FileNotFoundError:
+        manifest = {}
     summary = summarize_episode(actions, oracle, goal_x, meta.get("waypoint"),
-                                WAYPOINT_RADIUS, meta.get("stop_radius"))
+                                WAYPOINT_RADIUS, meta.get("stop_radius"), meta.get("goal_radius"))
     summary.update({
         "seed": seed, "geometry_gid": gid, "split": split, "policy": args.policy,
         "task": args.task, "window_from": args.window_from,
         "text_mode": args.text_mode,
         "task_version": meta.get("task_version"),
+        **{key: meta.get(key) for key in sm.PROVENANCE_KEYS},
         "target_color": meta.get("target_color"),
         "instruction": eval_meta.get("instruction"),
         "waypoint": meta.get("waypoint"),
@@ -349,9 +362,14 @@ def run_episode(seed, args, workdir, seen_gids):
         "stop_radius": meta.get("stop_radius"),
         "pillars": meta.get("pillar_count"), "goal_x": goal_x,
         "collect_rc": rc, "wall_s": round(time.monotonic() - t0, 1),
+        "performance": manifest.get("performance"),
+        "render_backend_requested": manifest.get("render_backend_requested"),
         "actions": {},
         "stderr_tail": err.strip().splitlines()[-5:],
         "dedup_key": dedup,
+        # 地图标识与评测任务标识不是一回事：campus 每 8 个 seed 是同一张图，
+        # dedup_key 还含颜色/左右，不能拿来数地图覆盖。
+        "geometry_gid": sm.geometry_gid(meta["pillars"]),
     })
     for a in actions:
         k = int(a.get("action_executed", -1))
@@ -380,7 +398,7 @@ def main():
                         "dispatch=派发位姿（仅复现 T7-R，数字不可与 observation 混报）")
     p.add_argument("--text-mode", choices=TEXT_MODES, default="keep",
                    help="L2 消融：keep=原指令；blank=空文本；shuffle=把 left/right 反过来")
-    p.add_argument("--task", choices=("base", "l1"), default="base",
+    p.add_argument("--task", choices=("base", "l1", "campus"), default="base",
                    help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
     p.add_argument("--appearance", choices=("legacy", "v1"), default="legacy",
                    help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）")
@@ -402,8 +420,8 @@ def main():
                    help="保留每步 16 位深度 PNG（诊断闭环失败用；配合 --keep-work）")
     args = p.parse_args()
     if args.window_from is None:
-        args.window_from = "observation"
-    elif args.window_from == "dispatch":
+        args.window_from = "dispatch" if args.task == "campus" else "observation"
+    elif args.window_from == "dispatch" and args.task != "campus":
         print("警告: --window-from dispatch 不是被采纳的基线语义（唯一基线是 "
               "observation）；本次 SR/碰撞率不可与 observation 结果混报。",
               file=sys.stderr, flush=True)
@@ -466,8 +484,8 @@ def main():
             probe.close()
         if args.text_mode != "keep" and text_dim <= 0:
             p.error(f"ckpt text_dim={text_dim}，--text-mode {args.text_mode} 不会改变推理")
-        if args.text_mode != "keep" and args.task != "l1":
-            p.error("--text-mode 只对 --task l1 有意义")
+        if args.text_mode != "keep" and args.task not in ("l1", "campus"):
+            p.error("--text-mode 只对 --task l1/campus 有意义")
         args.infer_bin = infer_bin  # 让 run_episode 与 report 用同一个路径
     out = os.path.abspath(args.out)
     if os.path.isdir(out) and os.listdir(out):
@@ -509,7 +527,9 @@ def main():
             if summary["collect_rc"] != 0 or summary["steps"] == 0:
                 # 采集中途失败不是「学生飞得差」，不能计进 SR/碰撞率。
                 failures.append({"seed": seed, "rc": summary["collect_rc"],
-                                 "stderr_tail": summary["stderr_tail"]})
+                                 "stderr_tail": summary["stderr_tail"],
+                                 "performance": summary.get("performance"),
+                                 "render_backend_requested": summary.get("render_backend_requested")})
                 print(f"[seed {seed}] 采集失败 rc={summary['collect_rc']}，不计入指标",
                       flush=True)
                 continue
@@ -531,12 +551,21 @@ def main():
               # 1.5 m 且无碰撞」，旧数据是 route_choice「越过终点」。不写死会让新旧
               # SR 被直接混报。历史口径：2026-11-01 前是 goal_stop（含 SAFE 判定），
               # 2026-11-01~11-02 是 goal_reach（**末位姿**在 1.5 m 内），三者都不可比。
-              "success_criterion": ("goal_reach_ever" if stop_radius_used is not None
+              "success_criterion": ("visible_goal_reach_v1" if args.task == "campus" else
+                                    "goal_reach_ever" if stop_radius_used is not None
                                     else "route_choice"),
+              "appearance_version": ("campus.v1" if args.task == "campus" else args.appearance),
+              "goal_radius": (0.5 if args.task == "campus" else
+                              REACH_RADIUS if stop_radius_used is not None else None),
+              "template_sha256": sha256_file(args.template),
+              "requested_seeds": seed_list,
+              "completion_rate": len(results) / args.episodes,
+              "requested_success_rate": sum(e["success"] for e in results) / args.episodes,
+              "failed_count": len(failures),
               "goal_margin": args.goal_margin,
               "waypoint_radius": WAYPOINT_RADIUS,
               "stop_radius": stop_radius_used,
-              "geometry_version": sm.SPLIT_SALT,
+              "geometry_version": ("campus.v1" if args.task == "campus" else sm.SPLIT_SALT),
               "ckpt": os.path.abspath(args.ckpt) if args.ckpt else None,
               "ckpt_sha256": sha256_file(args.ckpt) if args.ckpt else None,
               "infer_bin": infer_bin,
@@ -545,6 +574,9 @@ def main():
               "split": args.split, "episodes_requested": args.episodes,
               "steps": args.steps, "hold_s": args.hold,
               "seeds": [e["seed"] for e in results],
+              # 集数不等于独立地图数：campus 每 8 个 seed 是同一张图，扫出来的
+              # 20 集可能只覆盖 3 张图（2026-11-03 审计）。不写出来会被当 20 个样本。
+              "unique_maps": len({e["geometry_gid"] for e in results}),
               "wall_s": round(time.monotonic() - started, 1),
               **agg, "failed": failures, "skipped": skips,
               "per_episode": [{k: v for k, v in e.items() if k != "infer_ms"}

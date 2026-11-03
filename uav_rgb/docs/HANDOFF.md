@@ -1,34 +1,24 @@
 # uav_rgb 交接文档
 
-- 更新时间：**2026-11-01 21:52**
-- **当前状态**：T1–T7 已完成（v1 observation baseline `SR 0.90`）。
-  语言线走到 **L1 任务 v4**：FiLM 文本分支 + 外侧 waypoint 任务，
-  离线 `macro_f1 0.7740`、文本探针 `follow 0.8090`，闭环 keep `SR 0.426` /
-  shuffle `0.000` / 盲前进 `0.000`。
-  **指令确实进决策了，但「停得准」做不到**——13 次碰撞全部落在距 waypoint
-  1.5 m 以内。原因已定位：v4 的停止点在柱阵外侧 ±2.4 m，相机 60° 视场在
-  真停止点上 40% 的帧一根柱子都看不到，「停」不可观测。
-  用户 2026-11-01 拍板方案 A（去掉「必须停」→ goal-reach），已实现；
-  **SR 0.426 仍未过 50% 验收线**。
-- **接手第一件事**：本文件 → **§4.5（当前任务 + 下一步命令）** →
-  `docs/EVAL_STANDARD.md` → `docs/TASKS.md` → `docs/ENGINEERING_RULES.md`
-- **口径唯一来源**：`docs/EVAL_STANDARD.md`。报任何数字前必读，违反口径的数字等于造假。
-  **2026-11-01 起 L1 闭环口径是 `goal_reach`（1.5 m、不看末动作），
-  与历史的 `goal_stop`（0.7 m + 末动作 SAFE）不可混报。**
-- ⚠️ **工作树有大量未提交改动**（含并发会话的），`ALVLN/uav_rgb` 仍是旧版。
-  提交前必须逐文件确认归属，见 §5「Git」。
+## 当前状态（2026-11-04，本节优先于下方历史交接）
 
-### 30 秒上手
+- 默认仿真已由固定 `:20` 软件 GL 改为 NVIDIA EGL 无界面渲染，真实日志确认 RTX 2080 Ti；
+  `UAVRGB_RENDER_BACKEND=software` 保留旧显示路径。每集新增 `performance`，
+  [GPU 仿真实验](experiments/2026-11-03-gpu-rendering.md) 记录对照和边界。
+- 已实现单帧 RGB + FiLM 文本分支、C++/CUDA 训练/推理、采集审计、闭环评测。
+- 本轮修复碰撞事件遗漏、推理超时/默认构建路径、蒸馏缺失/身份校验及过时教师测试。
+- 新增 `campus.v1` pilot：三族低模校园、程序化材质、可见彩柱前0.5米目标区；
+  building_lane/train、tree_road/val、plaza/test 按拓扑留出。默认 dispatch，历史 base/l1 仍默认 observation。
+- 历史 `goal_reach` 的19/47=0.4043与同轨迹 `goal_reach_ever` 的0.574是不同定义；
+  不代表模型改进，不能作为校园任务成绩。本轮性能以新结果记录为准。
+- 默认训练、推理和检查统一 `build/check`（或 `UAV_RGB_BUILD_DIR`）；裸软标签须重导出为 UAVSOFT1。
+- `DeviceTrainState` / `BatchReader` 尚未接入实际训练，属于实验基础设施；保留其测试，不宣称已经加速。
+- [使用说明](CAMPUS_BASELINE.md)、[验证结果](experiments/2026-11-03-campus-baseline.md)、
+  [过程记录](worklog/2026-11-03-1100-campus-baseline.md)。
+- 学生仍为四动作、定高、无时序记忆；无真实校园数据、无真机迁移结论。
+- 新增原生桌面 `ui/studio.py`：真实 C++/CUDA 训练启动/监控、实验摘要与报告、历史 run、三视角 Gazebo（`/uav/chase_camera`、`/uav/camera`、`/uav/top_camera`）及 pose+SDF 二维 top-down map、学生单集 live demo 和正式闭环评测入口。L1/UI 冒烟已通过；当前开发容器无 Gazebo，真实渲染 L3 待目标 Ubuntu 桌面验证。用法见 `ui/README_STUDIO.md`，过程见 `worklog/2026-11-04-uav-navigation-studio.md`。
 
-```bash
-cd /root/claude-code-backup-20261028/code/uav_rgb && source env.sh
-nvidia-smi -L          # 期望列出 RTX 2080 Ti；列不出就是无卡模式，见 §五
-bash tools/check.sh    # 期望最后 EXIT=0，CTest 21/21
-```
-
-三条都过，说明环境是活的；然后跳到 §4.5 看当前任务，再从 §七 看下一步。
-
----
+## 历史交接（用于溯源；“当前”“下一步”等措辞均指当时）
 
 ## 一、项目是什么
 
@@ -82,7 +72,7 @@ nvidia-smi -L                                   # 先判定 GPU 模式，别凭�
 | `src/` | C++/CUDA 训练推理栈：`train_main.cpp`（CLI）、`trainer.cpp` / `trainer_eval.cpp`、`infer_main.cpp`（常驻推理进程）、`dataset.cpp`、`checkpoint.cpp`（v4，best-checkpoint + text_dim）、`src/tests/`（**21 个 CTest**） |
 | `sim/tools/` | `scene_gen.py`（柱阵世界生成）、`collect.py` / `collect_parallel.py`（采集）、`teacher.py`（`plan_action` GT planner / `expert_action` 深度专家）、`audit_dataset.py`（**18 条数据验收闸门**）、`eval_closed_loop.py`（闭环评测）、`split_manifest.py`（几何 gid + split）、13 个 `test_*.py` |
 | `tools/` | `preprocess.py`（采集目录 → `.uavr`）、`airsim_to_uavr.py`（公开数据接入）、`check.sh`（**L2 全量验证**）、`doctor.py` |
-| `ui/` | Tkinter 训练监控台（**另一个会话维护，改前先确认**） |
+| `ui/` | 原生 Tkinter 桌面 Studio（训练、实验归档、Gazebo 三视角、闭环评测）；旧 `monitor.py` 保留兼容 |
 | `docs/` | `TASKS.md`（任务板，**唯一任务来源**）、`ENGINEERING_RULES.md`（执行细则）、`EVAL_STANDARD.md`（口径）、`worklog/`、`experiments/` |
 | 仓库外 | 数据与产物在 `/root/rivermind-data/uav_rgb/` |
 

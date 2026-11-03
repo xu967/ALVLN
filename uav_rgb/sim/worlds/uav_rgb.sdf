@@ -23,7 +23,9 @@
       -p "linear: {x: 0.3 y: 0 z: 0} angular: {z: 0}"     # forward
     gz topic -t "/X3/gazebo/command/twist" -m gz.msgs.Twist -p " "  # hover
 
-  Camera topic: /uav/camera (gz.msgs.Image, R8G8B8, 320x240 @ 30 Hz).
+  Camera topics: /uav/camera (student RGB, R8G8B8, 320x240 @ 30 Hz),
+  /uav/chase_camera (third-person chase, 640x360 @ 15 Hz),
+  /uav/top_camera (static rendered top-down, 480x360 @ 10 Hz).
   Pose/odometry: /model/x3/pose , /model/x3/odometry
 -->
 <sdf version="1.6">
@@ -71,6 +73,33 @@
             <specular>0.8 0.8 0.8 1</specular>
           </material>
         </visual>
+      </link>
+    </model>
+
+    <!-- Static overhead camera for the desktop Studio's rendered top-down view.
+         It is a visual-only sensor: no collision, mass or effect on UAV physics. -->
+    <model name="studio_top_camera">
+      <static>true</static>
+      <pose>3.5 0 18 0 1.57079632679 1.57079632679</pose>
+      <link name="camera_link">
+        <sensor name="top_camera" type="camera">
+          <pose>0 0 0 0 0 0</pose>
+          <always_on>1</always_on>
+          <update_rate>10</update_rate>
+          <topic>/uav/top_camera</topic>
+          <camera>
+            <horizontal_fov>1.3962634</horizontal_fov>
+            <image>
+              <width>480</width>
+              <height>360</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip>
+              <near>0.1</near>
+              <far>80</far>
+            </clip>
+          </camera>
+        </sensor>
       </link>
     </model>
 
@@ -177,6 +206,30 @@
           <plugin filename="gz-sim-camera-video-recorder-system" name="gz::sim::systems::CameraVideoRecorder">
             <service>uav/camera/record_video</service>
           </plugin>
+        </sensor>
+
+        <!-- Virtual third-person chase camera for the desktop Studio.
+             It is attached to base_link at a rear/up offset and looks forward/down
+             toward the vehicle. It has no mass or collision geometry and is not an
+             input to the student policy. The original /uav/camera remains the only
+             student RGB observation. -->
+        <sensor name="chase_camera" type="camera">
+          <pose>-2.5 0 1.2 0 0.45 0</pose>
+          <always_on>1</always_on>
+          <update_rate>15</update_rate>
+          <topic>/uav/chase_camera</topic>
+          <camera>
+            <horizontal_fov>1.3962634</horizontal_fov>
+            <image>
+              <width>640</width>
+              <height>360</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip>
+              <near>0.05</near>
+              <far>60</far>
+            </clip>
+          </camera>
         </sensor>
 
         <!-- depth camera: teacher-only privileged ground truth. Same pose/FOV/res as

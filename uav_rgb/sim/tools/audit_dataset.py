@@ -30,12 +30,18 @@
   label_recompute    用 pillars+动作前位姿复算标签    需 teacher=plan_action 且 actions
                                                      里有 pose_before；不一致率必须为 0
 
+campus.v1 用校园专用检查替代旧 waypoint_side/GEOM_CONST：地图拓扑组归属、
+scene/manifest/生成器身份、目标区净空与 A* 可达、彩柱视野/遮挡及真实轨迹到达。
+可见性为几何分析，不代替 Gazebo 渲染验收；不声称地面圆盘始终在前视相机中。
+
 反事实集（manifest.counterfactual_of 非空）复用原集 RGB/oracle/轨迹，只重写
 action 与 waypoint；teacher_waypoint/teacher_stop/forward_motion/transition_lag/
 yaw_direction/class_share 判 SKIP。label_recompute 照常执行。
 """
 import argparse
+import hashlib
 import json
+import math
 import os
 import re
 import statistics
@@ -45,9 +51,11 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import landmarks as lm  # noqa: E402
 import scene_gen as sg  # noqa: E402
+import campus  # noqa: E402
 from instruction import parse_target_color  # noqa: E402
 from split_manifest import SPLIT_SALT, geometry_gid  # noqa: E402
-from teacher import TEACHER_VERSION, plan_action, plan_action_global  # noqa: E402
+from teacher import (TEACHER_VERSION, plan_action, plan_action_global,
+                     astar_path, _point_blocked)  # noqa: E402
 
 # scene.json 里落盘的全局几何常量；与当前 scene_gen 不一致说明改了几何但没
 # bump GEOMETRY_VERSION，gid 会全变、别的闸门查不出新旧混包（A2）。
@@ -125,6 +133,7 @@ def episode_facts(ep_dir):
     clearance = None
     target_color = relation = waypoint = scene_spawn = stop_radius = None
     task_version = None
+    scene = {}
     scene_path = os.path.join(ep_dir, "scene.json")
     if os.path.exists(scene_path):
         try:
@@ -198,6 +207,8 @@ def episode_facts(ep_dir):
 
     return {
         "dir": ep_dir,
+        "manifest": man,
+        "scene_metadata": scene,
         "split": man.get("split"),
         "teacher": man.get("teacher"),
         "planner": man.get("planner"),
@@ -233,6 +244,106 @@ def check(name, status, detail, **extra):
     return {"name": name, "status": status, "detail": detail, **extra}
 
 
+def _is_campus(f):
+    return (f.get("geometry_version") == campus.VERSION
+            or f.get("task_version") == campus.VERSION
+            or f.get("scene_metadata", {}).get("geometry_version") == campus.VERSION)
+
+
+def campus_checks(facts):
+    """校园新任务用自己的地图/目标合同；旧柱阵的外侧绕行规则不适用。"""
+    failures = {name: [] for name in ("campus_identity", "campus_map_split",
+                                    "campus_goal_geometry", "campus_teacher_reach")}
+    map_splits = {}
+    for f in facts:
+        scene, man = f.get("scene_metadata", {}), f.get("manifest", {})
+        identity_checked = False
+        try:
+            seed = scene["seed"]
+            if type(seed) is not int or seed < 0:
+                raise ValueError("seed 必须是非负整数")
+            family, boxes, color, relation, wp = campus.layout(seed)
+            expected = {"geometry_version": campus.VERSION, "task_version": campus.VERSION,
+                        "map_id": campus.map_id(seed), "family": family,
+                        "split_policy": "campus_map_v1", "goal_radius": campus.RADIUS,
+                        "stop_radius": campus.RADIUS,
+                        "success_criterion": "visible_goal_reach_v1",
+                        "waypoint": wp, "target_color": color, "relation": relation,
+                        "instruction": campus.instruction(color, relation)}
+            wrong = [k for k, v in expected.items() if scene.get(k) != v or man.get(k) != v]
+            if scene.get("pillars") != boxes or man.get("geometry_gid") != geometry_gid(boxes):
+                wrong.append("pillars/geometry_gid")
+            with open(os.path.join(f["dir"], "scene.json"), "rb") as sf:
+                scene_digest = hashlib.sha256(sf.read()).hexdigest()
+            if man.get("scene_meta_sha256") != scene_digest:
+                wrong.append("scene_meta_sha256")
+            if (man.get("teacher") != "plan_action" or man.get("planner") != "astar"
+                    or man.get("teacher_version") != TEACHER_VERSION):
+                wrong.append("teacher/planner/version")
+            if any(not isinstance(s.get("pose_before"), dict)
+                   or any(k not in s["pose_before"] for k in ("x", "y"))
+                   or s.get("yaw_before") is None
+                   or s.get("action_expert") not in range(4) for s in f["steps"]):
+                wrong.append("label_recompute inputs")
+            if wrong:
+                failures["campus_identity"].append(f"{f['dir']}: {', '.join(wrong)}")
+            identity_checked = True
+            identity = scene.get("map_id")
+            map_splits.setdefault(identity, set()).add(f.get("split"))
+            if (identity != campus.map_id(seed) or f.get("split") != campus.split(seed)
+                    or man.get("map_id") != identity):
+                failures["campus_map_split"].append(f["dir"])
+            # 另做几何验证，不能只相信 clearance.ok 或生成器版本号。
+            spawn = scene["spawn"]
+            expected_spawn = dict(x=-.5, y=0., z=.15, yaw_deg=0., mode="default")
+            if spawn != expected_spawn:
+                raise ValueError("spawn 与 campus.v1 不一致")
+            pillars = scene["pillars"]
+            start = (spawn["x"], spawn["y"])
+            target = next(p for p in pillars if p.get("color") == color
+                          and (lm.lateral(p, spawn) > 0) == (relation == "left"))
+            if (_point_blocked(*start, pillars, .356)
+                    or _point_blocked(wp["x"], wp["y"], pillars, campus.RADIUS + .356)
+                    or not astar_path(pillars, start, (wp["x"], wp["y"]))):
+                raise ValueError("出生点/目标区净空不足或无 A* 路径")
+            if math.hypot(wp["x"] - start[0], wp["y"] - start[1]) <= campus.RADIUS:
+                raise ValueError("出生点已在目标区")
+            # 检查出生视野与目标区中心朝 +X 的巡航切片可见性；不宣称地面圆盘可见。
+            for pose in (spawn, dict(wp, yaw_deg=0.)):
+                if abs(lm.h_angle(target, pose)) > lm.HALF_FOV_DEG - lm.FOV_MARGIN_DEG:
+                    raise ValueError("目标彩柱超出相机水平视野")
+                cx, cy = pose["x"] + lm.CAMERA_FORWARD_M, pose["y"]
+                distance = math.hypot(target["x"] - cx, target["y"] - cy)
+                others = [p for p in pillars if p is not target
+                          and p["z"] - p["size"][2] / 2 <= sg.CRUISE_HEIGHT
+                          <= p["z"] + p["size"][2] / 2]
+                for i in range(1, max(2, int(distance / .02))):
+                    t = i / max(2, int(distance / .02))
+                    x, y = cx + t * (target["x"] - cx), cy + t * (target["y"] - cy)
+                    if any(abs(x - p["x"]) < p["size"][0] / 2
+                           and abs(y - p["y"]) < p["size"][1] / 2 for p in others):
+                        raise ValueError("目标彩柱被其他碰撞体遮挡")
+        except (KeyError, OSError, TypeError, ValueError, StopIteration) as e:
+            failures["campus_goal_geometry"].append(f"{f['dir']}: {e}")
+            if not identity_checked:
+                failures["campus_identity"].append(f"{f['dir']}: 身份未完整核验: {e}")
+        if (f.get("counterfactual_of") is not None
+                or f.get("waypoint_min_dist") is None
+                or f["waypoint_min_dist"] > campus.RADIUS
+                or any(s["collision"] for s in f["steps"])):
+            failures["campus_teacher_reach"].append(f["dir"])
+    for identity, splits in map_splits.items():
+        if len(splits) > 1:
+            failures["campus_map_split"].append(f"{identity}: {sorted(splits)}")
+    return [check(name, "FAIL" if bad else "PASS",
+                  f"{len(bad)} 个问题 / {len(facts)} 集；" + {
+                      "campus_identity": "scene、manifest、可复算教师与确定性布局一致",
+                      "campus_map_split": "地图组归属与 split 一致（含排除集）",
+                      "campus_goal_geometry": "净空、A*可达、彩柱水平视野与巡航切片无遮挡",
+                      "campus_teacher_reach": "无碰撞进入 0.5m 目标区；不要求末动作 SAFE",
+                  }[name], samples=bad[:5]) for name, bad in failures.items()]
+
+
 def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
     """把逐集事实折成检查项。status: PASS / FAIL / SKIP。
 
@@ -252,6 +363,7 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
     CF_SKIP = ("反事实集复用原集 RGB/oracle/轨迹，只重写 action 与 waypoint，"
                "动作类检查不适用")
     checks = []
+    campus_facts = [f for f in gate if _is_campus(f)]
 
     if bad:
         checks.append(check("read_episodes", "FAIL",
@@ -292,12 +404,16 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
 
     # 1c) L1：指令目标色/关系词 / 左右平衡 / teacher 是否经过 waypoint
     l1 = [f for f in gate if isinstance(f.get("instruction"), str)
-          and f["instruction"].strip()]
+          and f["instruction"].strip() and not _is_campus(f)]
+    if campus_facts:
+        checks.extend(campus_checks(campus_facts))
     if not l1:
-        checks.append(check("target_color", "SKIP", "无 instruction（非 L1 数据）"))
-        checks.append(check("relation_balance", "SKIP", "无 instruction（非 L1 数据）"))
-        checks.append(check("waypoint_side", "SKIP", "无 instruction（非 L1 数据）"))
-        checks.append(check("teacher_waypoint", "SKIP", "无 instruction（非 L1 数据）"))
+        reason = ("campus 使用 campus_identity/goal_geometry/teacher_reach 检查" if campus_facts
+                  else "无 instruction（非 L1 数据）")
+        checks.append(check("target_color", "SKIP", reason))
+        checks.append(check("relation_balance", "SKIP", reason))
+        checks.append(check("waypoint_side", "SKIP", reason))
+        checks.append(check("teacher_waypoint", "SKIP", reason))
     else:
         bad = []
         for f in l1:
@@ -574,6 +690,10 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
     elif len(present) > 1:
         checks.append(check("geometry_version", "FAIL",
                             f"混用多个几何版本：{sorted(present)}"))
+    elif present == {campus.VERSION}:
+        mismatch = next(c for c in checks if c["name"] == "campus_identity")
+        checks.append(check("geometry_version", mismatch["status"],
+                            "campus.v1 使用确定性地图布局合同；详见 campus_identity"))
     elif present != {SPLIT_SALT}:
         checks.append(check("geometry_version", "FAIL",
                             f"数据版本 {sorted(present)} != 当前 {SPLIT_SALT}"))
@@ -694,7 +814,7 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
             no_truth += len(f["steps"])
             continue
         # 旧几何/旧教师版本数据没有版本字段；用当前算法复算会假 FAIL。
-        if (f.get("geometry_version") != SPLIT_SALT or
+        if (f.get("geometry_version") not in (SPLIT_SALT, campus.VERSION) or
                 f.get("teacher_version") != TEACHER_VERSION):
             old_version += len(f["steps"])
             continue

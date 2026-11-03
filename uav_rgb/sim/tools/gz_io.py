@@ -63,13 +63,15 @@ class TopicSub:
     /model/x3/pose 是 Pose_V，时间戳在 pose[0].header.stamp，由调用方传入）。
     """
 
-    def __init__(self, topic, buf=4, stamp_fn=header_stamp_ns):
+    def __init__(self, topic, buf=4, stamp_fn=header_stamp_ns, event_predicate=None):
         self.topic = topic
         self._stamp = stamp_fn
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._frames = collections.deque(maxlen=buf)   # (seq, msg)，seq 单调递增
         self._seq = 0
+        self._event_predicate = event_predicate
+        self._event_seq = 0
         self._eof = False
         self._proc = subprocess.Popen(
             ["gz", "topic", "-e", "-t", topic, "--json-output"],
@@ -92,6 +94,9 @@ class TopicSub:
                 with self._cond:
                     self._seq += 1
                     self._frames.append((self._seq, msg))
+                    # 接触等稀疏事件不能随 latest-wins 缓冲淘汰，否则长推理会漏报。
+                    if self._event_predicate is not None and self._event_predicate(msg):
+                        self._event_seq = self._seq
                     self._cond.notify_all()
         finally:
             with self._cond:
@@ -111,6 +116,11 @@ class TopicSub:
         """缓冲快照 [(seq, msg), ...]，旧 -> 新。"""
         with self._lock:
             return list(self._frames)
+
+    def event_seq(self):
+        """最近一次命中 event_predicate 的序号；没有事件返回 0。"""
+        with self._lock:
+            return self._event_seq
 
     def latest_after(self, stamp_ns, timeout=0.0):
         """sim-time 戳严格大于 stamp_ns 的最新一帧；无数据最多等 timeout 秒。
@@ -345,7 +355,8 @@ def _self_check():
     orig = subprocess.Popen
     subprocess.Popen = lambda *a, **k: FakeProc(lines)
     try:
-        sub = TopicSub("/fake", buf=2, stamp_fn=lambda m: m["n"])
+        sub = TopicSub("/fake", buf=2, stamp_fn=lambda m: m["n"],
+                       event_predicate=lambda m: m["n"] == 1)
         try:
             import time as _time
             for _ in range(100):
@@ -359,6 +370,7 @@ def _self_check():
             assert sub.latest_after(4, timeout=0.2) is None      # 无新帧 -> 超时返回
             assert _time.monotonic() - t0 < 0.5
             assert [m["n"] for _, m in sub.frames()] == [3, 4]   # 只留最近 2 帧
+            assert sub.event_seq() == 1  # 事件原帧已淘汰，仍必须能检测到它。
             assert not sub.healthy()                             # EOF -> unhealthy
         finally:
             sub.close()

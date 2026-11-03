@@ -33,29 +33,15 @@ Python 环境并安装 `torch`、`torchvision`、`numpy`、`Pillow`；仓库不�
 - `sim/tools/instruction.py` 的 `VOCAB`（22 个 token）
 - `src/include/uavrgb/text.hpp` 的 `kTextLen = 9`、`kTextVocab = 22`
 
-**以下字段是脚本的假设，当前 `sim/tools/collect.py` 并不完全满足，运行前请确认：**
-
-1. **深度文件（最大风险）**：`collect.py` 只在内存里解码深度，**没有保存深度图**。
-   `dataset.py` 按以下顺序找每步深度，找不到就跳过该集并打印警告：
-   - `actions.jsonl` 行内 `depth_file` / `depth_frame`；
-   - manifest 的 `depth_ref` / `depth_dir`，支持 `{step}`、`%05d` 模板或目录名；
-   - 默认 `<episode>/depth_%05d.png`。
-   支持 8/16 位 PNG（按 255/65535 归一化）、浮点 PNG（mode F，取原值）和 `.npy`。
-2. **位姿**：假设 `actions.jsonl` 每行有 `pose_before: {x,y,z}` 和 `yaw_before`
-   （角度，与 `collect.py` 一致）。模型输入为 `[x, y, z, yaw(rad), vx, vy]`，
-   速度由相邻帧 `rgb_ts` 差分得到。缺这些字段的集会被跳过。
-3. **样本组织**：每个 episode 取**最后 `seq_len` 帧**组成一个序列样本，
-   标签取**最后一帧**的 `action_expert`（0..3）。
-4. **RGB**：用行内 `frame`，否则 `rgb_%05d.png`；统一缩放到 224×224 并做
-   ImageNet 归一化。
-5. **指令**：取 manifest 的 `instruction`，用 `sim/tools/instruction.py`
-   tokenize 后补 `<pad>` 到 9；超过 9 个 token 不截断，整集跳过。
-6. 任何缺 RGB/深度/位姿、帧数不足 `seq_len`、标签越界的 episode 都会跳过并告警，
-   不会中断扫描。因此**当前未补深度文件的数据集会得到 0 个样本**。
+当前采集支持 `--save-depth`，保存 `png16_mm` 深度，位姿包含机身系目标向量。
+数据读取采用滑动窗口并用首帧补齐早期窗口；逐窗口预测末帧动作。
+教师输入是特权信息，仅学生的 RGB+文本属于交付输入。数据与模型字段以
+`dataset.py` / `model.py` 为准。蒸馏标签必须完整覆盖，使用
+[`UAVSOFT1`](../tools/SOFT_TARGETS_FORMAT.md) 绑定数据/文本/概率，旧裸数组须重导出。
 
 ## 三条命令
 
-训练（按 val 准确率保存 `ckpt_best.pth`）：
+训练（按 val macro-F1 保存 `ckpt_best.pth`）：
 
 ```bash
 python3 teacher/train.py --data /root/rivermind-data/uav_rgb/<dataset> \

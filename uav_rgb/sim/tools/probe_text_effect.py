@@ -24,7 +24,7 @@ import instruction as ins  # noqa: E402
 import teacher  # noqa: E402
 from make_counterfactual import alt_target  # noqa: E402
 
-DEFAULT_INFER = os.path.join(REPO, "src", "build", "uavrgb_infer")
+from student import DEFAULT_INFER
 
 
 def load_rows(path):

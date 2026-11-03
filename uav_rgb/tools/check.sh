@@ -47,6 +47,8 @@ if [[ "${1:-}" != "--python-only" ]]; then
   cmake --build "$uav_check_build" --parallel "${UAV_RGB_BUILD_JOBS:-8}"
   # --no-tests=error：注册表为空时 ctest 默认 rc=0，会让「没跑测试」显示成 PASS。
   ctest --test-dir "$uav_check_build" --output-on-failure --no-tests=error
+  "$UAV_RGB_PYTHON" "$uav_check_root/tools/test_join_soft_targets.py" \
+    --native-check "$uav_check_build/test_soft_targets_identity"
 
   # UAVR 格式有三份实现：preprocess.py（写）、dataset.cpp（读）、synthetic_dataset.hpp
   # （测试夹具，另一份写）。CTest 只用夹具喂 C++ 读端，真正的 Python 产物没人校验——
@@ -63,6 +65,7 @@ if [[ "${1:-}" != "--python-only" ]]; then
   "$uav_check_fmt/read_dataset" "$uav_check_fmt/ds/dataset.uavr" --selfcheck >/dev/null
 else
   echo "SKIP: 用户指定 --python-only，未验证 C++/CUDA 构建和 GPU 测试。"
+  "$UAV_RGB_PYTHON" "$uav_check_root/tools/test_join_soft_targets.py"
 fi
 
 # 以下纯 Python 打包门禁负例在 --python-only 下也执行。
@@ -135,6 +138,7 @@ for uav_check_test in "$uav_check_root"/sim/tools/test_*.py; do
 done
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_monitor.py"
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_trainer_demo.py"
+"$UAV_RGB_PYTHON" "$uav_check_root/ui/test_studio.py"
 if [[ "${1:-}" == "--python-only" ]]; then
   echo "PASS（python-only）：C++/CUDA 构建、CTest、GPU 未验证；模拟采集、真实训练和学生闭环须独立验收。"
 else

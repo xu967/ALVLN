@@ -32,8 +32,8 @@ def _depth(value=2.0, size=8):
 
 def test_buffer():
     buf = tp._FrameBuffer(seq_len=4)
-    buf.append(_rgb(0), _depth(), (0.0, 0.0, 2.0), 0.0)
-    buf.append(_rgb(1), _depth(), (1.0, 0.0, 2.0), 90.0)
+    buf.append(_rgb(0), _depth(), (0.0, 0.0, 2.0), 0.0, (3.0, 1.0))
+    buf.append(_rgb(1), _depth(), (1.0, 0.0, 2.0), 90.0, (3.0, 1.0))
     rgb, depth, pose, text = buf.build([1, 2, 3])
 
     assert rgb.shape == (4, 3, tp.IMAGE_SIZE, tp.IMAGE_SIZE), rgb.shape
@@ -57,10 +57,12 @@ def test_buffer():
     assert abs(float(pose[0, 4])) < 1e-6, pose[0, 4]
     assert abs(float(pose[3, 4]) - 1.0) < 1e-6, pose[3, 4]
     assert abs(float(pose[3, 3]) - math.pi / 2) < 1e-6, pose[3, 3]
+    assert np.allclose(pose[0, 6:], [3.0, 1.0])
+    assert np.allclose(pose[3, 6:], [1.0, -2.0])
 
     # 缓冲满后只保留最后 seq_len 帧（deque maxlen 生效）。
     for i in range(3):
-        buf.append(_rgb(2), _depth(), (2.0 + i, 0.0, 2.0), 0.0)
+        buf.append(_rgb(2), _depth(), (2.0 + i, 0.0, 2.0), 0.0, (3.0, 1.0))
     rgb2, _, pose2, _ = buf.build([])
     assert rgb2.shape[0] == 4, rgb2.shape
     assert abs(float(pose2[-1, 4]) - 1.0) < 1e-6, pose2[-1, 4]
@@ -82,7 +84,7 @@ def torch_smoke():
         policy = tp.TeacherPolicy(ckpt, seq_len=2, device="cpu")
         for x in (0.0, 1.0):
             action = policy.act(_rgb(int(x) % 3), _depth(), (x, 0.0, 2.0),
-                                0.0, [1, 2, 3])
+                                0.0, (3.0, 1.0), [1, 2, 3])
             assert isinstance(action, int), action
             assert 0 <= action < tp.NUM_ACTIONS, action
     print("torch smoke: PASS（随机权重模型返回 0..3）")

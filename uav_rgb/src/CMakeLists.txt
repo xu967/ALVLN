@@ -16,6 +16,8 @@ add_library(uavrgb_core
   ops_cpu.cpp
   ops_weighted.cpp
   ops_soft.cpp
+  sha256.cpp
+  soft_targets.cpp
   conv_cpu.cpp
   conv_gradcheck.cpp
   nn_cpu.cpp
@@ -119,6 +121,10 @@ add_test(NAME test_soft_loss COMMAND test_soft_loss)
 add_executable(test_soft_targets_train tests/test_soft_targets_train.cpp)
 target_link_libraries(test_soft_targets_train PRIVATE uavrgb_core)
 add_test(NAME test_soft_targets_train COMMAND test_soft_targets_train)
+
+add_executable(test_soft_targets_identity tests/test_soft_targets_identity.cpp)
+target_link_libraries(test_soft_targets_identity PRIVATE uavrgb_core)
+add_test(NAME test_soft_targets_identity COMMAND test_soft_targets_identity)
 
 add_executable(test_dataset_filter tests/test_dataset_filter.cpp)
 target_link_libraries(test_dataset_filter PRIVATE uavrgb_core)

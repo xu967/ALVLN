@@ -23,7 +23,7 @@ void usage() {
                "用法: uavrgb_train --data <dataset.uavr> --epochs N --batch B --lr L "
                "--out <run_dir> [--resume <ckpt>] [--seed S] [--max-grad-norm G] "
                "[--class-weights auto|<w0,w1,w2,w3>] [--drop-collision] "
-               "[--text-dim N] [--soft-targets <bin> [--distill-alpha A]]\n"
+               "[--text-dim N | --vision-only] [--soft-targets <bin> [--distill-alpha A]]\n"
                "  或: uavrgb_train --data <dataset.uavr> --eval-only <ckpt> --out "
                "<run_dir> [--batch B] [--split val|test|all] [--drop-collision]\n");
 }
@@ -64,6 +64,9 @@ int main(int argc, char** argv) {
       } else if (a == "--text-dim") {
         cfg.text_dim = std::stoi(next("--text-dim"));
         if (cfg.text_dim < 0) throw std::invalid_argument("--text-dim 不能为负");
+      } else if (a == "--vision-only") {
+        cfg.vision_only = true;
+        cfg.text_dim = 0;
       } else if (a == "--soft-targets") {
         cfg.soft_targets = next("--soft-targets");
       } else if (a == "--distill-alpha") {
