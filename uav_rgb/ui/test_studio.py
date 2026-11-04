@@ -2,12 +2,21 @@
 """Headless regression tests for UAV Navigation Studio data/geometry helpers."""
 import hashlib
 import json
+import struct
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import studio
+
+
+def _write_uavr(path, meta):
+    """最小 UAVR：48 B 头 + meta JSON（0 样本，只测尾部 meta 读取）。"""
+    raw = json.dumps(meta).encode("utf-8")
+    header = struct.pack("<4sHHIHHBBBBQQQI", b"UAVR", 1, 48, 0, 120, 160, 3,
+                         1, 1, 0, 48, 48, 48, len(raw))
+    Path(path).write_bytes(header + raw)
 
 
 class StudioHelperTests(unittest.TestCase):
@@ -204,6 +213,127 @@ class StudioHelperTests(unittest.TestCase):
         self.assertIn("requested=未标注", context)
         self.assertIn("failed=未标注", context)
         self.assertIn("episodes=—/未标注", context)
+
+    def test_uavr_meta_infers_auto_eval_task_split_dynamics(self):
+        cases = [
+            ({"task_version": "campus.assets.v1"}, "campus_assets"),
+            ({"task_version": "campus.v2"}, "campus"),
+            ({"task_version": "l1.v4"}, "l1"),
+            ({"geometry_version": "uavrgb.geom.v5"}, "base"),
+            ({}, None),
+        ]
+        for meta, want in cases:
+            self.assertEqual(studio.video_cli.infer_task(meta), want, meta)
+        self.assertEqual(studio.video_cli.infer_dynamics({"dynamics_profile": "x3_v1"}),
+                         "x3_velocity")
+        self.assertEqual(studio.video_cli.infer_dynamics(
+            {"episodes": [{"dynamics_profile": "cf_stab_v1:tilt2"}]}), "cf_stab")
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "ds.uavr"
+            _write_uavr(path, {
+                "task_version": "campus.v2", "splits": {"train": 9, "val": 0, "test": 2},
+                "dynamics_profile": "x3_v1", "window_from": "dispatch", "hold_s": 1.0})
+            meta = studio.video_cli.read_uavr_meta(path)
+            params, reason = studio.video_cli.auto_eval_params(meta)
+            self.assertIsNone(reason)
+            self.assertEqual(params["task"], "campus")
+            self.assertEqual(params["split"], "test")
+            self.assertEqual(params["dynamics"], "x3_velocity")
+            self.assertEqual(params["window_from"], "dispatch")
+            self.assertEqual(params["hold_s"], 1.0)
+
+            # test=0 时回退 val；两者都空则跳过。
+            _write_uavr(path, {"task_version": "l1.v4",
+                               "splits": {"train": 1, "val": 4, "test": 0}})
+            params, _ = studio.video_cli.auto_eval_params(
+                studio.video_cli.read_uavr_meta(path))
+            self.assertEqual(params["split"], "val")
+            _write_uavr(path, {"task_version": "l1.v4",
+                               "splits": {"train": 1, "val": 0, "test": 0}})
+            params, reason = studio.video_cli.auto_eval_params(
+                studio.video_cli.read_uavr_meta(path))
+            self.assertIsNone(params)
+            self.assertIn("test/val", reason)
+
+    def test_run_data_path_prefers_trainer_config_and_falls_back(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            run.mkdir()
+            self.assertEqual(studio.run_data_path(run, {"data": "/fallback.uavr"}),
+                             Path("/fallback.uavr"))
+            (run / "config.json").write_text(json.dumps({"data": "/trainer.uavr"}),
+                                             encoding="utf-8")
+            self.assertEqual(studio.run_data_path(run, {"data": "/fallback.uavr"}),
+                             Path("/trainer.uavr"))
+
+    def test_report_links_closed_loop_videos_relative_to_run(self):
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            video = run / "closed_loop_eval_1" / "videos" / "seed_1.mp4"
+            video.parent.mkdir(parents=True)
+            video.write_bytes(b"mp4")
+            summary = {
+                "run_id": "r", "status": "finished", "return_code": 0,
+                "config": {}, "metrics": {}, "artifacts": {}, "live_demos": [],
+                "monitor_dir": str(run) + ".monitor",
+                "closed_loop_evaluations": [{
+                    "task": "campus", "split": "test", "success_rate": 0.5,
+                    "video_dir": str(video.parent), "videos": [str(video)]}],
+            }
+            studio.write_experiment_report(run, summary)
+            report = (run / "experiment_report.md").read_text(encoding="utf-8")
+        self.assertIn("[seed_1.mp4](closed_loop_eval_1/videos/seed_1.mp4)", report)
+
+    def test_auto_eval_command_is_non_blocking_and_skips_confirm(self):
+        """自动录像复用参数化入口：不弹确认框，命令带录像/推断参数。"""
+        class Widget:
+            def configure(self, **_kwargs):
+                pass
+
+        class Var:
+            def __init__(self):
+                self.value = None
+
+            def set(self, value):
+                self.value = value
+
+        class Proc:
+            pass
+
+        with tempfile.TemporaryDirectory() as d:
+            run = Path(d) / "run"
+            run.mkdir()
+            (run / "ckpt_best.bin").write_bytes(b"weights")
+            app = object.__new__(studio.StudioApp)
+            app.run_dir = run
+            app.eval_proc = None
+            app.eval_log = None
+            app.eval_out = None
+            app._eval_auto = False
+            app._sim_proc = None
+            app._sim_subs = {}
+            app.eval_btn = Widget()
+            app.eval_stop_btn = Widget()
+            app._eval_status_var = Var()
+            calls = []
+            old_popen = studio.subprocess.Popen
+            studio.subprocess.Popen = lambda cmd, **kwargs: calls.append(cmd) or Proc()
+            try:
+                started = app.start_closed_loop_eval(auto={
+                    "task": "campus", "split": "test", "dynamics": "cf_stab",
+                    "episodes": 1, "window_from": "dispatch", "hold_s": 0.2})
+            finally:
+                studio.subprocess.Popen = old_popen
+            self.assertTrue(started)
+            self.assertEqual(len(calls), 1)
+            cmd = calls[0]
+            self.assertIn("--record-video", cmd)
+            self.assertEqual(cmd[cmd.index("--episodes") + 1], "1")
+            self.assertEqual(cmd[cmd.index("--dynamics") + 1], "cf_stab")
+            self.assertEqual(cmd[cmd.index("--window-from") + 1], "dispatch")
+            self.assertIn("--text-mode", cmd)
+            self.assertTrue(app.eval_out.name.startswith("closed_loop_eval_"))
 
     def test_classify_episode_prioritises_success_then_failure_mode(self):
         self.assertEqual(studio.classify_episode({"success": True, "collision": True}), "成功")

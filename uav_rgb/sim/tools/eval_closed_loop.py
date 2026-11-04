@@ -49,7 +49,6 @@ REACH_RADIUS = 1.5
 METRIC_VERSION = "sim09.v1"
 # scene_gen/campus/asset_campus 目前都写死这个相机档；协议比对只用它做本次运行的实际值。
 CAMERA_PROFILE = "rgb320x240_fov60_v1"
-DYNAMICS_PROFILES = ("x3_velocity", "cf_stab", "cf_sil")
 PROTOCOL_KEYS = ("window_from", "hold_s", "steps", "task",
                  "appearance_version", "dynamics", "camera_profile")
 
@@ -59,6 +58,9 @@ import instruction as ins  # noqa: E402
 import split_manifest as sm  # noqa: E402
 import campus  # noqa: E402
 import asset_campus  # noqa: E402
+
+# 与 collect_parallel 共用同一份默认矩阵（cf_sil 已退出；cf_blackbox 只留名字）。
+DYNAMICS_PROFILES = cp.DYNAMICS_CHOICES
 
 
 def load_jsonl(path):
@@ -389,8 +391,6 @@ def run_episode(seed, args, workdir, seen_gids):
     cmd = [sys.executable, SCENE_GEN, "--seed", str(seed), "--scene-id", str(seed),
            "--out", world, "--template", args.template, "--task", args.task,
            "--appearance", args.appearance]
-    if args.dynamics == "cf_sil":
-        cmd.append("--no-velocity-control")
     if args.task == "l1":
         # v5 关系任务要求两根同色柱横跨出生点，默认 spawn 在 y=0 时
         # assign_landmarks 找不到柱对会直接抛错（采集也是 random）。
@@ -442,8 +442,6 @@ def run_episode(seed, args, workdir, seen_gids):
                "--scene-id", str(seed), "--seed", str(seed),
                "--scene-meta", eval_meta_path, "--split", split,
                "--window-from", args.window_from, "--dynamics", args.dynamics]
-        if args.dynamics == "cf_sil":
-            cmd += ["--cf-sil-params", args.cf_sil_params]
         if args.save_depth:
             cmd += ["--save-depth"]
         if args.policy == "student":
@@ -569,9 +567,10 @@ def main():
                    help="动作窗口起点：observation=观测位姿（默认，唯一被采纳基线）；"
                         "dispatch=派发位姿（仅复现 T7-R，数字不可与 observation 混报）")
     p.add_argument("--dynamics", choices=DYNAMICS_PROFILES, default="x3_velocity",
-                   help="透传给 collect.py：x3_velocity=旧行为（唯一历史基线）；cf_stab=CF-Drone 摇杆模型（建议配 --hold 0.1~0.2）；cf_sil=CF-Drone SIL 档（接受但由 collect 实现；数字不可与旧档混报）")
-    p.add_argument("--cf-sil-params", default=os.path.join(SIM_DIR, "dynamics", "cf_sil_v1.json"),
-                   help="cf_sil 参数 JSON（仅 --dynamics cf_sil）")
+                   help="透传给 collect.py：x3_velocity=旧行为（唯一历史基线）；"
+                        "cf_stab=CF-Drone 摇杆模型（建议配 --hold 0.1~0.2）；"
+                        "cf_blackbox=纯 Python 黑盒（3DGS collector 直接使用；Gazebo "
+                        "闭环会明确拒绝，不拿 x3 物理冒充）")
     p.add_argument("--protocol", default=None,
                    help="可选协议快照 JSON；比对 window_from/hold_s/steps/task/"
                         "appearance_version/dynamics/camera_profile，不一致写 ood=true 并警告")
@@ -645,6 +644,9 @@ def main():
         p.error("max-seeds >= episodes")
     if not (math.isfinite(args.hold) and args.hold > 0):
         p.error("--hold 必须是有限正数")
+    if args.dynamics == "cf_blackbox":
+        p.error("cf_blackbox 是纯 Python 模型档，Gazebo 闭环未接入；"
+                "请让 3DGS collector 直接调用 cf_blackbox，或改用 cf_stab/x3_velocity")
     for name in ("goal_margin", "sim_timeout", "episode_timeout"):
         value = getattr(args, name)
         if not (math.isfinite(value) and value > 0):

@@ -532,6 +532,17 @@ def main():
         check(f"cf_stab 采集窗口: {k}", v)
     check("cf_sil 在 DYNAMICS 且默认参数存在",
           "cf_sil" in collect.DYNAMICS and os.path.isfile(collect.DEFAULT_CF_SIL_PARAMS))
+    check("cf_sil 只保留为手动实验档", collect.DYNAMICS_EXPERIMENTAL == ("cf_sil",))
+    # 2026-11-05 决定：cf_sil 退出默认训练/评测矩阵，cf_blackbox 只留名字给 3DGS。
+    import collect_parallel as cp
+    check("编排器默认矩阵去掉 cf_sil", "cf_sil" not in cp.DYNAMICS_CHOICES)
+    check("编排器默认矩阵含 cf_blackbox",
+          "cf_blackbox" in cp.DYNAMICS_CHOICES
+          and "x3_velocity" in cp.DYNAMICS_CHOICES
+          and "cf_stab" in cp.DYNAMICS_CHOICES)
+    check("cf_blackbox 在 collect 且默认参数存在",
+          "cf_blackbox" in collect.DYNAMICS
+          and os.path.isfile(collect.DEFAULT_CF_BLACKBOX_PARAMS))
     for k, v in cf_sil_window().items():
         check(f"cf_sil 采集窗口: {k}", v)
     check("cf_sil 窗口超时 -> 停桨", cf_sil_stale_pose_zeroes())

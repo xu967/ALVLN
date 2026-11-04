@@ -1,0 +1,26 @@
+{
+  "_comment": "占位帧协议：等 real-drone/uart_protocol.md 提供真实字段后替换；当前未在任何固件上验证，不能用于真机飞行。",
+  "placeholder": true,
+  "device": "/dev/ttyS1",
+  "baud": 115200,
+  "heartbeat_hz": 10,
+  "ttl_ms": 300,
+  "heartbeat_action": 0,
+  "action_encoding": [0, 1, 2, 3],
+  "crc": {
+    "algorithm": "crc8",
+    "poly": 7,
+    "init": 0,
+    "xorout": 0,
+    "reflect": false
+  },
+  "frame": [
+    {"name": "magic", "kind": "const", "bytes": [170, 85]},
+    {"name": "version", "kind": "const", "size": 1, "value": 1},
+    {"name": "seq", "kind": "seq", "size": 1, "endian": "little"},
+    {"name": "action", "kind": "action", "size": 1, "endian": "little"},
+    {"name": "heartbeat", "kind": "heartbeat", "size": 1, "endian": "little"},
+    {"name": "ttl", "kind": "ttl", "size": 2, "endian": "little"},
+    {"name": "crc", "kind": "crc", "size": 1, "endian": "little"}
+  ]
+}

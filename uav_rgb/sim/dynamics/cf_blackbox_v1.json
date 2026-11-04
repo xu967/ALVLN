@@ -1,0 +1,22 @@
+{
+  "profile_version": "cf_blackbox_v1",
+  "calibrated": false,
+  "source": "placeholder: 2026-11-05 未实测；数值对齐 sim/dynamics/cf_blackbox_3dgs.json 的 3DGS pilot 占位（8° 倾角 -> g*tan8°≈1.3787 m/s²、45°/s、tau0.15、latency0.15），等真机 ULog 标定",
+  "notes": [
+    "纯 Python 黑盒模型：四动作 -> 整机水平/偏航响应；z 固定为 z_target_m，不做高度动力学。",
+    "SAFE_NEUTRAL 不主动刹车，只有线性阻力 drag_k 造成被动滑行。",
+    "FORWARD_SLOW 是机体系 +X 固定加速度 forward_accel_mps2，终端速度 = forward_accel_mps2 / drag_k。",
+    "YAW_LEFT/RIGHT 目标角速率 ±yaw_rate_rad_s，yaw_tau_s 是一阶滞后时间常数（0 表示瞬时响应）。",
+    "latency_s 是动作派发到生效的延迟；模型内置延迟队列，按生效时刻分段积分。",
+    "max_tilt_deg 是加速度的校准上限：forward_accel_mps2 不得超过 g*tan(max_tilt_deg)。",
+    "calibrated=false：没有 ULog / 实测数据时保持占位值，不能把本档数字当硬件性能结论。",
+    "参数唯一来源是本文件；sim/3dgs/dynamics.py 仍读 cf_blackbox_3dgs.json，teacher_predictive.py / rl_teacher/core.py 也有重复占位默认，均尚未收敛（见 docs/experiments/2026-11-05-cf-blackbox.md）。"
+  ],
+  "forward_accel_mps2": 1.3787,
+  "drag_k": 1.0,
+  "latency_s": 0.15,
+  "yaw_rate_rad_s": 0.785398,
+  "yaw_tau_s": 0.15,
+  "z_target_m": 2.0,
+  "max_tilt_deg": 30.0
+}

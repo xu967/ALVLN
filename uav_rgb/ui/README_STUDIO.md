@@ -31,7 +31,8 @@ $DATA_ROOT/uav_rgb/studio_runs/<timestamp>-<run-id>/
 1. 在「训练 Training」选择真实 `.uavr` 数据集。选择文件后，Studio 会根据同目录的 `instructions.jsonl` 自动把 Text dim 预设为 16 或 0。
 2. 按数据协议确认 `Text dim`：`0` 表示显式纯视觉，当前文本分支通常为 `16`；如果没有 instruction 侧车，Studio 会阻止以 `text_dim>0` 启动。
 3. 选择 Epochs、Batch、学习率、Seed、类别权重和是否剔除碰撞样本。
-4. 点击「开始真实训练」。程序调用 `ui/trainer_native.py`，再由它执行 `build/check/uavrgb_train`（或 `UAV_RGB_BUILD_DIR` / `UAV_RGB_TRAIN_BIN` 指定的可执行文件）。不会默认调用 `trainer_demo.py`。
+4. 「训练后保存视频（闭环 1 集）」默认勾选：训练成功且存在 `ckpt_best.bin` 时，Studio 在后台自动跑 1 集闭环录像评测，不阻塞界面。配置里的 `save_video` / `video_episodes` 只供 Studio 使用，`trainer_native.py` 会忽略这两个未知键。
+5. 点击「开始真实训练」。程序调用 `ui/trainer_native.py`，再由它执行 `build/check/uavrgb_train`（或 `UAV_RGB_BUILD_DIR` / `UAV_RGB_TRAIN_BIN` 指定的可执行文件）。不会默认调用 `trainer_demo.py`。
 
 运行期间实时读取：
 
@@ -47,6 +48,25 @@ $DATA_ROOT/uav_rgb/studio_runs/<timestamp>-<run-id>/
 - `$DATA_ROOT/uav_rgb/studio_runs/index.jsonl`：实验索引。
 
 离线 test accuracy / Macro-F1 / Balanced Accuracy 是动作分类指标，不等于闭环导航成功率。缺失的 test 指标保持 null/“—”。
+
+### 训练后自动录像
+
+勾选「训练后保存视频（闭环 1 集）」时，训练退出码为 0 且 `ckpt_best.bin` 存在后，Studio 会用训练数据集的 `.uavr` 尾部 meta 自动推导评测参数：
+
+- **task**：`task_version` 为 `campus.assets*` → `campus_assets`，`campus*` → `campus`，`l1*` → `l1`；没有 `task_version` 但 `geometry_version` 是 `uavrgb.geom.*` → `base`；
+- **split**：`splits.test > 0` 用 `test`，否则 `splits.val > 0` 用 `val`，两者都空则跳过；
+- **dynamics**：`x3_v1*` → `x3_velocity`，`cf_stab*` / `cf_sil*` / `cf_blackbox*` 保留原名；旧数据缺该字段按 `x3_velocity`。
+
+任务无法确定时跳过并写告警。录像评测命令为 `eval_closed_loop.py --policy student --record-video --episodes 1`，输出到 `<run>/closed_loop_eval_<UTCstamp>/`。视频合成依赖 `cv2`（`.venv-tools` 已安装 `opencv-python-headless`）；缺 cv2 时评测指标仍会保存，只是单集出现 `video_error`。评测失败只写入 `studio_summary.json` 的 `notes` 和训练日志，不会把训练状态改成失败。完成后 `studio_summary.json` 记录 `video_dir` / `videos`，`experiment_report.md` 追加视频相对链接。手动「运行正式闭环评测」的行为不变（仍会询问并读取界面参数）。
+
+也可以不打开桌面程序，直接用 CLI 包装训练并录像：
+
+```bash
+python3 tools/train_student_with_video.py --data <dataset.uavr> --out <run_dir> \
+    [uavrgb_train 参数...] [--dry-run]
+```
+
+`--dry-run` 只打印训练/评测命令，不执行。
 
 ## 三视角仿真
 

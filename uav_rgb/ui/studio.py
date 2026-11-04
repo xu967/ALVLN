@@ -64,9 +64,12 @@ ACTIONS = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 
 sys.path.insert(0, str(UI_DIR))
 sys.path.insert(0, str(SIM_TOOLS))
+sys.path.insert(0, str(REPO_ROOT / "tools"))
 import monitor as monitor_io  # noqa: E402
 import gz_io  # noqa: E402
 import save_frame  # noqa: E402
+# 复用 CLI 包装的 .uavr meta 推断，避免训练后自动评测与独立 CLI 两处规则漂移。
+import train_student_with_video as video_cli  # noqa: E402
 
 
 def now_iso() -> str:
@@ -544,6 +547,18 @@ def _tail_jsonl(path: Path, max_bytes=262144):
     return rows
 
 
+def run_data_path(run_dir, fallback_config=None):
+    """训练数据路径：优先 <run>/config.json（trainer 写），其次 Studio 的 job 配置。"""
+    try:
+        cfg = json.loads((Path(run_dir) / "config.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        cfg = {}
+    data = cfg.get("data") if isinstance(cfg, dict) else None
+    if not data:
+        data = (fallback_config or {}).get("data")
+    return Path(data).expanduser() if data else None
+
+
 def write_experiment_report(run_dir: Path, summary: dict):
     m = summary.get("metrics", {})
     c = summary.get("config", {})
@@ -603,6 +618,12 @@ def write_experiment_report(run_dir: Path, summary: dict):
                 f"episodes={ev.get('episodes_done') if ev.get('episodes_done') is not None else '—'}"
                 f"/{ev.get('episodes_requested') if ev.get('episodes_requested') is not None else '未标注'}, "
                 f"unique_maps={ev.get('unique_maps', ev.get('unique_geometry'))} (`{ev.get('eval_json')}`)")
+            for video in ev.get("videos") or []:
+                try:
+                    rel = os.path.relpath(str(video), str(run_dir)).replace(os.sep, "/")
+                except (TypeError, ValueError):
+                    rel = str(video)
+                lines.append(f"  - video: [{Path(str(video)).name}]({rel})")
     else:
         lines.append("- No formal closed-loop navigation evaluation has been attached to this run.")
     lines += ["", "## Live simulation demonstrations", ""]
@@ -701,6 +722,7 @@ class StudioApp:
         self.eval_proc = None
         self.eval_log = None
         self.eval_out: Path | None = None
+        self._eval_auto = False
         self._train_started_mono = None
         self._metric_sig = None
         self._events = deque(maxlen=300)  # validation/status/error/class-weight events only
@@ -996,6 +1018,10 @@ class StudioApp:
         self.text_dim_var = tk.StringVar(value="16")
         self.class_weights_var = tk.BooleanVar(value=True)
         self.drop_collision_var = tk.BooleanVar(value=True)
+        self.save_video_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(config, text="训练后保存视频（闭环 1 集）",
+                        variable=self.save_video_var).grid(
+            row=3, column=2, columnspan=2, sticky="w", pady=(6, 0))
         ttk.Label(config, text="训练数据集 (.uavr)").grid(row=0, column=0, sticky="w", pady=4)
         ttk.Entry(config, textvariable=self.data_var).grid(row=0, column=1, sticky="ew", padx=6)
         ttk.Button(config, text="选择数据集…", command=self.choose_dataset).grid(row=0, column=2)
@@ -1309,6 +1335,8 @@ class StudioApp:
             "epochs": epochs, "batch_size": batch, "lr": lr, "seed": seed,
             "text_dim": text_dim, "class_weights": "auto" if self.class_weights_var.get() else "none",
             "drop_collision": bool(self.drop_collision_var.get()),
+            # trainer_native 只读已知键，save_video/video_episodes 供 Studio 训练后自动评测。
+            "save_video": bool(self.save_video_var.get()), "video_episodes": 1,
         }
         extra = []
         if self.class_weights_var.get():
@@ -1425,8 +1453,54 @@ class StudioApp:
             self.refresh_run(force=True)
             self.refresh_history(force=True)
             self.tabs.select(self.dashboard_tab)
+            config = (self.run_meta or {}).get("config", {})
+            if rc == 0 and best_ckpt.is_file() and config.get("save_video"):
+                try:
+                    self._start_auto_eval(best_ckpt, config)
+                except Exception as exc:  # noqa: BLE001 - 自动录像不能影响训练结果
+                    self._eval_auto = False
+                    self._auto_eval_note(
+                        f"自动录像失败：{type(exc).__name__}: {exc}")
         self.start_train_btn.configure(state="normal")
         self.stop_train_btn.configure(state="disabled")
+
+    def _start_auto_eval(self, ckpt, config):
+        """训练成功后自动跑 1 集闭环录像；失败只写 note，不改训练状态。"""
+        data = run_data_path(self.run_dir, config)
+        if data is None:
+            self._auto_eval_note("自动录像跳过：run 配置里没有训练数据路径")
+            return
+        try:
+            meta = video_cli.read_uavr_meta(data)
+        except (OSError, ValueError) as exc:
+            self._auto_eval_note(f"自动录像跳过：读取 {data} 的 .uavr meta 失败（{exc}）")
+            return
+        params, reason = video_cli.auto_eval_params(meta)
+        if params is None:
+            self._auto_eval_note(f"自动录像跳过：{reason}")
+            return
+        params["episodes"] = 1
+        params["data"] = str(data)
+        if INFER_BIN.is_file():
+            params["infer_bin"] = str(INFER_BIN)
+        self._eval_auto = True
+        if not self.start_closed_loop_eval(auto=params):
+            self._eval_auto = False
+            self._auto_eval_note("自动录像未启动（已有评测在运行或参数无效）")
+
+    def _auto_eval_note(self, text):
+        """自动录像的失败只进 note 和训练日志，不把训练改成失败。"""
+        self._append_train_log(f"[studio] {text}")
+        if not self.run_dir:
+            return
+        path = self.run_dir / "studio_summary.json"
+        try:
+            summary = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        summary.setdefault("notes", []).append(text)
+        write_json_atomic(path, summary)
+        write_experiment_report(self.run_dir, summary)
 
     def _refresh_train_log(self):
         if not self.sidecar:
@@ -2299,41 +2373,52 @@ class StudioApp:
         self.live_stop_btn.configure(state="disabled")
 
     # --------------------------------------------------------------- evaluations
-    def start_closed_loop_eval(self):
+    def start_closed_loop_eval(self, auto=None):
+        """自动录像传 auto=params（跳过确认对话框）；手动调用 auto=None，行为不变。"""
         if self.eval_proc is not None:
-            return
-        if (self._sim_proc is not None and self._sim_proc.poll() is None) or self._sim_subs:
+            return False
+        if auto is None and ((self._sim_proc is not None and self._sim_proc.poll() is None)
+                             or self._sim_subs):
             proceed = messagebox.askyesno(
                 "闭环评测会启动独立仿真",
                 "正式闭环评测会启动独立的 headless Gazebo 实例，并与当前桌面仿真共享 GPU。\n\n仍要继续吗？")
             if not proceed:
-                return
+                return False
         if not self.run_dir:
-            messagebox.showerror("没有实验", "请先加载一个训练 run。")
-            return
+            if auto is None:
+                messagebox.showerror("没有实验", "请先加载一个训练 run。")
+            return False
         ckpt = self.run_dir / "ckpt_best.bin"
         if not ckpt.is_file():
-            messagebox.showerror("缺少 best checkpoint", f"找不到：{ckpt}")
-            return
-        try:
-            episodes = int(self.eval_episodes_var.get())
-            if episodes < 1 or episodes > 500:
-                raise ValueError
-        except ValueError:
-            messagebox.showerror("参数错误", "Episodes 必须在 1–500 之间。")
-            return
-        task = self.eval_task_var.get()
-        split = self.eval_split_var.get()
+            if auto is None:
+                messagebox.showerror("缺少 best checkpoint", f"找不到：{ckpt}")
+            return False
+        if auto is None:
+            try:
+                episodes = int(self.eval_episodes_var.get())
+                if episodes < 1 or episodes > 500:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("参数错误", "Episodes 必须在 1–500 之间。")
+                return False
+            task = self.eval_task_var.get()
+            split = self.eval_split_var.get()
         out = self.run_dir / ("closed_loop_eval_" + datetime.now().strftime("%Y%m%d-%H%M%S"))
         out.mkdir(parents=True, exist_ok=False)
         side = Path(str(out) + ".monitor")
         side.mkdir(parents=True, exist_ok=True)
         log = (side / "eval.log").open("ab", buffering=0)
-        cmd = [PYTHON_FOR_SIM, str(SIM_TOOLS / "eval_closed_loop.py"), "--policy", "student",
-               "--ckpt", str(ckpt), "--episodes", str(episodes), "--task", task,
-               "--split", split, "--out", str(out), "--text-mode", "keep"]
-        if task == "campus":
-            cmd += ["--appearance", self.eval_appearance_var.get()]
+        if auto is None:
+            cmd = [PYTHON_FOR_SIM, str(SIM_TOOLS / "eval_closed_loop.py"), "--policy", "student",
+                   "--ckpt", str(ckpt), "--episodes", str(episodes), "--task", task,
+                   "--split", split, "--out", str(out), "--text-mode", "keep"]
+            if task == "campus":
+                cmd += ["--appearance", self.eval_appearance_var.get()]
+        else:
+            cmd = video_cli.build_eval_command(
+                PYTHON_FOR_SIM, SIM_TOOLS / "eval_closed_loop.py", ckpt, out, auto)
+            if auto.get("renderer") != "3dgs":
+                cmd += ["--text-mode", "keep"]  # 自动录像不做文本消融
         env = os.environ.copy()
         # The evaluator owns its own isolated GZ_PARTITIONs; do not inherit the GUI demo partition.
         env.pop("GZ_PARTITION", None)
@@ -2345,11 +2430,17 @@ class StudioApp:
         except OSError as exc:
             log.close()
             self.eval_log = None
-            messagebox.showerror("评测启动失败", str(exc))
-            return
+            if auto is not None:
+                self._eval_auto = False
+                self._auto_eval_note(f"自动录像启动失败：{exc}")
+            else:
+                messagebox.showerror("评测启动失败", str(exc))
+            return False
         self.eval_btn.configure(state="disabled")
         self.eval_stop_btn.configure(state="normal")
-        self._eval_status_var.set(f"闭环评测运行中 · {out.name}")
+        self._eval_status_var.set(
+            f"{'闭环录像评测' if auto is not None else '闭环评测'}运行中 · {out.name}")
+        return True
 
     def stop_closed_loop_eval(self):
         if self.eval_proc is None:
@@ -2373,6 +2464,9 @@ class StudioApp:
             summary = summarize_run(self.run_dir, self.run_meta or {"run_id": self.run_dir.name},
                                     0, "finished")
         entries = summary.setdefault("closed_loop_evaluations", [])
+        video_dir = self.eval_out / "videos" if self.eval_out else None
+        videos = (sorted(str(p) for p in video_dir.glob("*.mp4"))
+                  if video_dir is not None and video_dir.is_dir() else [])
         entry = {"task": report.get("task"), "split": report.get("split"),
                  "success_rate": report.get("success_rate"),
                  "requested_success_rate": report.get("requested_success_rate"),
@@ -2389,6 +2483,8 @@ class StudioApp:
                  "dynamics": report.get("dynamics"),
                  "ckpt_sha256": report.get("ckpt_sha256"),
                  "eval_json": str(self.eval_out / "eval.json") if self.eval_out else None,
+                 "video_dir": str(video_dir) if video_dir is not None and video_dir.is_dir() else None,
+                 "videos": videos,
                  "return_code": return_code, "finished_at": now_iso()}
         entries.append(entry)
         write_json_atomic(summary_path, summary)
@@ -2867,6 +2963,8 @@ class StudioApp:
             if self.eval_proc is not None:
                 rc = self.eval_proc.poll()
                 if rc is not None:
+                    auto = self._eval_auto
+                    self._eval_auto = False
                     self.eval_proc = None
                     if self.eval_log:
                         self.eval_log.close()
@@ -2881,6 +2979,9 @@ class StudioApp:
                             pass
                     if report:
                         self._attach_eval_to_run(report, rc)
+                        if auto and rc != 0:
+                            self._auto_eval_note(
+                                f"自动录像评测 rc={rc}：部分或全部集失败，已附加可用结果")
                         self._eval_status_var.set(
                             f"闭环评测结束 rc={rc} · success={report.get('success_rate')} · "
                             f"requested={report.get('requested_success_rate')} · "
@@ -2890,6 +2991,9 @@ class StudioApp:
                             f"failed={report.get('failed_count')} · "
                             f"unique_maps={report.get('unique_maps', report.get('unique_geometry'))}")
                     else:
+                        if auto:
+                            self._auto_eval_note(
+                                f"自动录像评测失败 rc={rc}：未生成 eval.json（见 {self.eval_out}）")
                         self._eval_status_var.set(f"闭环评测结束 rc={rc} · 请检查 {self.eval_out}")
             if self._live_proc is not None:
                 self._update_live_action()

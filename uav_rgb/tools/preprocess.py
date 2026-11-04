@@ -136,7 +136,8 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
     # allow_frozen=True 用于对冻结数据做诊断（同族留出/重打包）：此时不再要求等于
     # 当前版本，改由 build_meta 断言全包版本一致——真正要守的是「不混包」，不是「必须最新」。
     if not allow_frozen and gver not in (sm.SPLIT_SALT, campus.VERSION,
-                                         asset_campus.VERSION):
+                                         asset_campus.VERSION) and not (
+            isinstance(gver, str) and gver.startswith("3dgs.")):
         die("%s: geometry_version=%r 与当前 %s 不一致（旧几何数据不能混进新数据集）"
             % (man_path, gver, sm.SPLIT_SALT))
     # 最后一道防泄漏门：split 必须等于几何 gid/地图按记录策略应属的 split。只查
@@ -232,6 +233,9 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
         "split_salt": man.get("split_salt"),
         "teacher": man.get("teacher"),
         "planner": man.get("planner"),
+        "renderer_backend": (man.get("renderer") or {}).get("backend"),
+        "scene_json": ("scene.json"
+                       if os.path.isfile(os.path.join(ep_dir, "scene.json")) else None),
         "instruction": instruction,
         "task_version": task_version,
         "target_color": target_color,
@@ -403,6 +407,9 @@ def build_meta(episodes, total, size, dropped=0, split_scheme=None,
         "goal_radius": _uniform(episodes, "goal_radius"),
         "window_from": _uniform(episodes, "window_from"),
         "hold_s": _uniform(episodes, "hold_s"),
+        # 3DGS 数据：记录渲染后端与每集 scene.json，自动评测据此走 eval_3dgs。
+        "renderer_backend": _uniform(episodes, "renderer_backend"),
+        "scene_json": _uniform(episodes, "scene_json"),
         "task_version": _uniform(episodes, "task_version"),
         "stop_radius": _uniform(episodes, "stop_radius"),
         # 逐样本碰撞标记（'1' = collision=true），供 C++ 读端 LoadOptions.drop_collision
@@ -615,6 +622,30 @@ def main():
     out_path, meta_bytes = write_dataset(args.out, episodes, total, args.size, dropped,
                                          split_scheme=split_scheme,
                                          collision_filter=collision_filter)
+    # 3DGS 数据集把 scene.json 放到 <out>/scene.json，自动评测/换机复现不必回找 episode。
+    scene_paths = [os.path.join(ep["dir"], "scene.json") for ep in episodes
+                   if ep.get("scene_json")]
+    if scene_paths and len(scene_paths) == len(episodes) and all(
+            os.path.isfile(p) for p in scene_paths):
+        shas = set()
+        for p in scene_paths:
+            with open(p, "rb") as f:
+                shas.add(hashlib.sha256(f.read()).hexdigest())
+        if len(shas) == 1:
+            with open(scene_paths[0], encoding="utf-8") as f:
+                scene = json.load(f)
+            for key in ("ply", "ply_path"):
+                ply = scene.get(key)
+                if isinstance(ply, str) and not os.path.isabs(ply):
+                    scene[key] = os.path.abspath(
+                        os.path.join(os.path.dirname(scene_paths[0]), ply))
+            dst = os.path.join(args.out, "scene.json")
+            with open(dst, "w", encoding="utf-8") as f:
+                json.dump(scene, f, ensure_ascii=False, indent=2)
+            print("wrote %s (3DGS scene)" % dst)
+        else:
+            print("警告: episodes 的 scene.json 不一致，未复制到数据集根目录",
+                  file=sys.stderr)
     if rows:
         ipath = write_instructions(args.out, rows)
         print("wrote %s (%d instructions)" % (ipath, len(rows)))

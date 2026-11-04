@@ -68,6 +68,7 @@ import gz_io
 import save_frame
 import split_manifest as sm
 import cf_sil
+import cf_blackbox
 
 TWIST_TOPIC = "/X3/gazebo/command/twist"
 CAMERA_TOPIC = "/uav/camera"
@@ -143,7 +144,10 @@ def altitude_vz(pose):
 # 倾角，水平加速度 g·tanθ，线性阻力 k；其余动作俯仰杆回中，靠阻力滑停（不刹车）。
 # 速度在世界系积分（转头时动量不随机头转），发指令前转回机体系；底层仍由
 # MulticopterVelocityControl 跟踪这条速度曲线。默认 x3_velocity 保持旧行为不变。
-DYNAMICS = ("x3_velocity", "cf_stab", "cf_sil")
+DYNAMICS = ("x3_velocity", "cf_stab", "cf_blackbox", "cf_sil")
+# cf_sil 已退出 collect_parallel / eval 的默认矩阵，只在 collect.py 保留手动入口；
+# 写进 manifest 的 experimental 位，提醒下游不要把它当默认训练档。
+DYNAMICS_EXPERIMENTAL = ("cf_sil",)
 CF_STAB_PROFILE = "cf_stab_v1"
 G = 9.81
 CF_MAX_TILT_DEG = 30.0  # CF-Drone/control.ino 的最大倾角
@@ -156,6 +160,9 @@ CF_LATENCY_S = 0.15     # 派发→生效。shortcut: 取 ALVLN/docs/09 的 P95�
 DEFAULT_CF_SIL_PARAMS = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "dynamics", "cf_sil_v1.json")
+# cf_blackbox 是纯 Python 模型（3DGS collector 直接 import），参数唯一来源是
+# sim/dynamics/cf_blackbox_v1.json；Gazebo collect 只做参数校验，不驱动它。
+DEFAULT_CF_BLACKBOX_PARAMS = cf_blackbox.DEFAULT_PARAMS_PATH
 
 
 class CfStab:
@@ -1122,8 +1129,10 @@ def main():
                    help="x3_velocity=旧行为（定速+每步刹停，唯一历史基线）；"
                         "cf_stab=CF-Drone 摇杆模型（倾角加速+阻力滑行+指令延迟，"
                         "高度仍真值定高；建议配 --hold 0.1~0.2；数字不可与旧档混报）；"
+                        "cf_blackbox=纯 Python 黑盒（3DGS collector 直接使用；"
+                        "Gazebo collect 只校验参数并明确拒绝，不拿 x3 物理冒充）；"
                         "cf_sil=直接驱动 4 个电机（串级 PID+混控，sim-only，"
-                        "高度假设 companion_hold；参数见 --cf-sil-params）")
+                        "已退出默认矩阵，仅手动参考；参数见 --cf-sil-params）")
     p.add_argument("--cf-sil-params", default=None,
                    help="cf_sil 参数 JSON（默认 sim/dynamics/cf_sil_v1.json）；"
                         "只能和 --dynamics cf_sil 一起用")
@@ -1173,6 +1182,21 @@ def main():
         p.error("新 Teacher 必须 --dynamics cf_stab 且提供 --scene-meta")
     if args.policy == "teacher-rl" and abs(args.hold - 0.2) > 1e-6:
         p.error("teacher-rl 的训练策略要求 --hold 0.2（5Hz）；其他时长需重新训练")
+    if args.dynamics == "cf_blackbox":
+        # 纯模型档只在这里做参数校验：Gazebo collect 没有它的状态闭环，
+        # 继续跑会拿 x3 物理冒充 cf_blackbox 数据。3DGS collector 直接 import 模型。
+        try:
+            blackbox_params = cf_blackbox.CfBlackboxParams.from_json(
+                DEFAULT_CF_BLACKBOX_PARAMS)
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            p.error(f"无法加载 cf_blackbox 参数: {e}")
+        if not blackbox_params.calibrated:
+            print("警告: cf_blackbox 参数 calibrated=false（占位值，不是实测标定）",
+                  file=sys.stderr)
+        p.error(
+            f"cf_blackbox 参数 {blackbox_params.profile()} 校验通过，但该档是纯 Python "
+            "模型，Gazebo collect 未接入；请让 3DGS collector 直接调用 cf_blackbox，"
+            "或改用 --dynamics cf_stab/x3_velocity")
     cf_sil_params = None
     if args.dynamics == "cf_sil":
         try:
@@ -1488,6 +1512,9 @@ def main():
             # preprocess 只比 dynamics_profile，据此拒绝混包。
             **({"dynamics_profile": dyn.profile(), "dynamics_params": dyn.params()}
                if dyn is not None else {}),
+            # cf_sil 已退出 collect_parallel / eval 默认矩阵，只在 collect.py 手动可用；
+            # 下游看到 experimental 就不要把它并进默认训练集。
+            "dynamics_experimental": args.dynamics in DYNAMICS_EXPERIMENTAL,
             **({"dynamics_profile": sil.params.profile(),
                 "dynamics_params": sil.params.manifest(),
                 "altitude_assumption": sil.params.altitude_assumption}

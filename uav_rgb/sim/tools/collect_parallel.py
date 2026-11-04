@@ -51,6 +51,10 @@ DEFAULT_TEMPLATE = os.path.join(SIM_DIR, "worlds", "uav_rgb.sdf")
 DISPLAY_VALUE = ":20"
 XDG_RUNTIME_DIR = os.environ.get("UAVRGB_XDG_RUNTIME_DIR", "/tmp/xdg")
 SIM_SETTLE_S = 3.0   # sim-ready 后再稳 3 s 才发首条起飞指令（发布层偶发丢首包）
+# 默认训练/评测矩阵：cf_sil 已退出（模块/测试保留作参考，只能手动跑 collect.py）。
+# cf_blackbox 是纯 Python 档，3DGS collector 直接 import；Gazebo 编排只保留名字，
+# 选了会在参数校验阶段明确失败，避免把 x3 物理写成 cf_blackbox 数据。
+DYNAMICS_CHOICES = ("x3_velocity", "cf_stab", "cf_blackbox")
 # 不写死几何版本号：salt 是 split_manifest.SPLIT_SALT，写死过一次就再也对不上。
 SPLIT_POLICY = ("geometry group: sha256(<SPLIT_SALT>:<gid>) % 100 -> "
                 "<80 train; <90 val; else test")
@@ -292,8 +296,6 @@ def _popen_collect(task, args, env, log_path):
            "--episode-id", str(task.scene_id), "--split", task.split,
            "--scene-meta", task.scene_meta_path,
            "--window-from", args.window_from, "--dynamics", args.dynamics]
-    if args.dynamics == "cf_sil":
-        cmd += ["--cf-sil-params", args.cf_sil_params]
     if args.policy != "teacher":
         cmd += ["--policy", args.policy]
     if args.teacher_planner != "astar":
@@ -456,10 +458,11 @@ def main():
                    default=None,
                    help="动作窗口起点：observation=观测位姿（默认，唯一被采纳基线）；"
                         "dispatch=派发位姿（仅复现 T7-R，数字不可与 observation 混报）")
-    p.add_argument("--dynamics", choices=("x3_velocity", "cf_stab", "cf_sil"), default="x3_velocity",
-                   help="透传给 collect.py：x3_velocity=旧行为（唯一历史基线）；cf_stab=CF-Drone 摇杆模型（建议配 --hold 0.1~0.2）；cf_sil=CF-Drone SIL 骨架（sim-only，参数未标定），数字不可与旧档混报")
-    p.add_argument("--cf-sil-params", default=os.path.join(SIM_DIR, "dynamics", "cf_sil_v1.json"),
-                   help="cf_sil 参数 JSON（仅 --dynamics cf_sil）")
+    p.add_argument("--dynamics", choices=DYNAMICS_CHOICES, default="x3_velocity",
+                   help="透传给 collect.py：x3_velocity=旧行为（唯一历史基线）；"
+                        "cf_stab=CF-Drone 摇杆模型（建议配 --hold 0.1~0.2）；"
+                        "cf_blackbox=纯 Python 黑盒（3DGS collector 直接使用；Gazebo "
+                        "编排会明确拒绝，不拿 x3 物理冒充）；数字不可与旧档混报")
     p.add_argument("--out", required=True, help="汇总输出目录（必须为空/不存在）")
     p.add_argument("--base-seed", type=int, default=0,
                    help="scene_id = seed = base_seed + 扫描序号；给 --split 时只取该 split 的 seed")
@@ -509,6 +512,9 @@ def main():
         p.error("新 Teacher 当前与 --hold 0.2s 配套")
     if args.policy == "teacher-rl" and not args.rl_checkpoint:
         p.error("teacher-rl 需要 --rl-checkpoint")
+    if args.dynamics == "cf_blackbox":
+        p.error("cf_blackbox 是纯 Python 模型档，Gazebo 并行采集未接入；"
+                "请让 3DGS collector 直接调用 cf_blackbox，或改用 cf_stab/x3_velocity")
     for path, name in ((SCENE_GEN, "scene_gen.py"), (COLLECT, "collect.py"),
                        (args.template, "template")):
         if not os.path.isfile(path):
@@ -582,8 +588,7 @@ def main():
                 [sys.executable, SCENE_GEN, "--seed", str(t.seed),
                  "--scene-id", str(t.scene_id), "--out", t.world,
                  "--spawn-mode", t.spawn_mode, "--template", args.template,
-                 "--task", args.task, "--appearance", args.appearance]
-                + (["--no-velocity-control"] if args.dynamics == "cf_sil" else []),
+                 "--task", args.task, "--appearance", args.appearance],
                 capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 print(r.stdout, flush=True)

@@ -139,6 +139,7 @@ done
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_monitor.py"
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_trainer_demo.py"
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_studio.py"
+"$UAV_RGB_PYTHON" "$uav_check_root/tools/test_train_student_with_video.py"
 if [[ "${1:-}" == "--python-only" ]]; then
   echo "PASS（python-only）：C++/CUDA 构建、CTest、GPU 未验证；模拟采集、真实训练和学生闭环须独立验收。"
 else

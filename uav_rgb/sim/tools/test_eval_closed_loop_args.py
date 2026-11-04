@@ -57,20 +57,22 @@ def main():
     else:
         raise AssertionError("缺 relation 的 shuffle 应报错，不能换成别的颜色")
 
-    # cf_sil 是允许的动力学档；控制器由 collect 实现，eval 只负责不拒绝。
-    assert "cf_sil" in ec.DYNAMICS_PROFILES, ec.DYNAMICS_PROFILES
+    # 2026-11-05 决定：cf_sil 退出默认评测矩阵，cf_blackbox 只留名字给 3DGS。
+    assert "cf_sil" not in ec.DYNAMICS_PROFILES, ec.DYNAMICS_PROFILES
+    assert "cf_blackbox" in ec.DYNAMICS_PROFILES, ec.DYNAMICS_PROFILES
     assert "x3_velocity" in ec.DYNAMICS_PROFILES and "cf_stab" in ec.DYNAMICS_PROFILES
+    assert ec.DYNAMICS_PROFILES == ec.cp.DYNAMICS_CHOICES
 
     # 协议绑定：只比较 protocol 中出现的键；未知键（如 protocol_id）忽略。
     actual = {"window_from": "observation", "hold_s": 0.2, "steps": 80,
-              "task": "l1", "appearance_version": "v1", "dynamics": "cf_sil",
+              "task": "l1", "appearance_version": "v1", "dynamics": "cf_blackbox",
               "camera_profile": ec.CAMERA_PROFILE}
     assert ec.protocol_mismatches(dict(actual), actual) == []
     assert ec.protocol_mismatches({"steps": 80, "hold_s": 0.2}, actual) == []
     assert ec.protocol_mismatches({"steps": 80.0}, actual) == []  # int/float 数值相等
     assert ec.protocol_mismatches({"steps": 81}, actual) == [("steps", 81, 80)]
     assert ec.protocol_mismatches({"protocol_id": "x", "dynamics": "cf_stab"}, actual) == [
-        ("dynamics", "cf_stab", "cf_sil")]
+        ("dynamics", "cf_stab", "cf_blackbox")]
     # 默认（非 strict）只记录 mismatch，不在这里抛错；严格模式由 main 判。
 
     with tempfile.TemporaryDirectory() as directory:
