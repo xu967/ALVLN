@@ -151,7 +151,9 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
 
     try:
         for i in range(steps):
-            rgb, depth, ms = renderer.render_pose(x, y, dyn.z, yaw)
+            rgb, depth, ms = renderer.render_pose(
+                x, y, dyn.z, yaw, pitch_deg=float(
+                    scene.get("camera", {}).get("pitch_deg", 0.0)))
             render_ms.append(ms)
             t_rgb = dyn.t
             rgb_ok = True
