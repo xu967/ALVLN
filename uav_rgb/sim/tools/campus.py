@@ -3,15 +3,18 @@ import hashlib
 import json
 import random
 from pathlib import Path
-from xml.sax.saxutils import escape
 
 from instruction import COLORS
 from landmarks import COLOR_RGB
 
-VERSION = "campus.v1"
+# v1 的 480 集已冻结：本文件改布局后同 seed 会生成不同地图，旧数据不得与新数据混包。
+# 自 v2 起 map_id/geometry_version/task_version 都带 campus.v2 前缀。
+VERSION = "campus.v2"
 FAMILIES = ("building_lane", "tree_road", "plaza")
 RADIUS = 0.5
-ASSETS = Path(__file__).resolve().parents[1] / "worlds" / "campus_textures"
+# 纹理放在 sim/assets 资源根下，SDF 只写 model:// URI；换机器/换目录不改字节。
+ASSETS = Path(__file__).resolve().parents[1] / "assets" / "campus_textures"
+TEXTURE_URI = "model://campus_textures/{}.png"
 
 
 def material(name):
@@ -20,7 +23,7 @@ def material(name):
         raise ValueError(f"缺校园纹理 {path}；运行 sim/tools/make_campus_textures.py")
     return ('<material><ambient>1 1 1 1</ambient><diffuse>1 1 1 1</diffuse>'
             '<pbr><metal><metalness>0</metalness><roughness>1</roughness>'
-            f'<albedo_map>{escape(str(path))}</albedo_map></metal></pbr></material>')
+            f'<albedo_map>{TEXTURE_URI.format(name)}</albedo_map></metal></pbr></material>')
 
 
 def map_id(seed):
@@ -59,8 +62,11 @@ def layout(seed):
         obstacles.append(p)
 
     # 场景布局随地图变，材质/语言变体不能改变几何。
-    x = round(rng.uniform(4.8, 5.4), 3)
-    y = round(rng.uniform(1.4, 1.65), 3)
+    # y 下限收到 1.55：目标柱与 y=0 中央障碍既要 ≥0.9 m 净空（原柱阵
+    # MIN_GAP 契约），又要从出生点看得见——y 太小时近处中央障碍会挡住
+    # 目标柱中心。x 下限取 3.6，保证目标中心仍在 28° 视野余量内。
+    x = round(rng.uniform(3.6, 6.5), 3)
+    y = round(rng.uniform(1.55, 2.0), 3)
     color = COLORS[seed % 4]
     relation = "left" if (seed // 4) % 2 == 0 else "right"
     for side in (-1, 1):
@@ -68,18 +74,24 @@ def layout(seed):
     if family == "building_lane":
         for side in (-1, 1):
             box(f"building_{side + 1}", 3.0, side * 4.2, 6., 2., 5.)
-        box("island", rng.uniform(2.0, 2.5), 0, .8, .8, 3.)
+        box("island", rng.uniform(2.0, 3.0), 0, .8, .8, 3.)
     elif family == "tree_road":
+        # 树排外移到 ±3.35：目标 |y| 上限 2.0 时，±3.1 的树与目标柱只剩
+        # 0.7 m 缝，低于原柱阵 0.9 m 净空契约。
         for i in range(3):
             for side in (-1, 1):
-                box(f"tree_{i}_{side + 1}", 1.5 + i * 2, side * 3.1,
+                box(f"tree_{i}_{side + 1}", 1.5 + i * 2, side * 3.35,
                     .4, .4, 4.)
-        box("tree_center", rng.uniform(2.0, 2.5), 0, .4, .4, 4.)
+        box("tree_center", rng.uniform(2.0, 3.0), 0, .4, .4, 4.)
     else:
         for i in range(3):
             box(f"plaza_edge_{i}", 1.2 + i * 1.9, -3.6, 1., .6, 3.)
-        box("building_back", 8., 0., 1., 9., 5.)
-        box("island", rng.uniform(2.0, 2.5), 0, .6, .6, 3.)
+        # 原 8 m 处的 1×9×5 大墙占满 60° 视场且逆光时把首帧压到 ~67 灰度。
+        # 后移到 14 m、高度压到 6 m 后，墙面在屏幕上的占比从 ~47% 降到 ~20%。
+        # 2026-11-04 真实渲染复核（seed 16/20/22/41）：均值 67.7 -> 79.4，
+        # 有改善但仍低于 train 的 102±8；静态估算给的 93-107 偏乐观，以实测为准。
+        box("building_back", 14., 0., 1., 12., 6.)
+        box("island", rng.uniform(2.0, 3.0), 0, .6, .6, 3.)
     waypoint = {"x": round(x - 1.1, 3), "y": y if relation == "left" else -y}
     return family, obstacles, color, relation, waypoint
 
@@ -109,15 +121,20 @@ def _ground_marks(x, y, color):
             '</visual></link></model>')
 
 
-def build(template, seed, scene_id):
+def build(template, seed, scene_id, appearance="v1"):
     import scene_gen as sg
     from teacher import astar_path
+    if appearance not in (sg.APPEARANCE_LEGACY, sg.APPEARANCE_V1):
+        raise ValueError(f"unknown appearance {appearance!r}")
     family, boxes, color, relation, wp = layout(seed)
     spawn = dict(x=-.5, y=0., z=.15, yaw_deg=0., mode="default")
     path = astar_path(boxes, (spawn["x"], spawn["y"]), (wp["x"], wp["y"]))
     if not path:
         raise ValueError("campus 地图无可行教师路径")
-    head, lighting = sg._apply_appearance(template[:template.index(sg.START_MARK)], seed, "v1")
+    # 校园任务固定用 v1 外观（legacy 的固定地标与校园语义冲突）；requested 如实记录。
+    # 已冻结的 campus.v1 数据只见过单侧太阳，这里保持 full_sun=False，避免静默换光照。
+    head, lighting = sg._apply_appearance(template[:template.index(sg.START_MARK)], seed, "v1",
+                                          full_sun=False)
     models = [_box_xml(p) for p in boxes]
     models += [_ground_marks(wp["x"], side * abs(wp["y"]), color) for side in (-1, 1)]
     world = head + "\n".join(models) + template[template.index(sg.END_MARK):]
@@ -131,6 +148,8 @@ def build(template, seed, scene_id):
                 generator="sim/tools/campus.py", geometry_version=VERSION,
                 task_version=VERSION, map_id=map_id(seed), family=family,
                 split_policy="campus_map_v1", appearance_version="campus.v1",
+                requested_appearance=appearance, effective_appearance=sg.APPEARANCE_V1,
+                appearance_schema_version=sg.APPEARANCE_SCHEMA_VERSION_FROZEN,
                 appearance=lighting, spawn=spawn, pillars=boxes, pillar_count=len(boxes),
                 template_sha256=sg.sha256(template.encode()), world_sha256=sg.sha256(world.encode()),
                 instruction=instruction(color, relation), target_color=color, relation=relation,

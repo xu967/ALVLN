@@ -13,6 +13,9 @@
 
 split 由每个 episode manifest 的 split 决定，并按 scene_id 强制隔离：
 同一 scene_id 不允许同时出现在 train/val/test（帧级随机拆分会造成泄漏）。
+打包时按 manifest 记录的 split_policy/geometry_version 复算并校验（冻结数据不回落
+当前 salt），实际策略/方案/salt/每 split 样本数/geometry gid 全部写进 meta 供审计。
+map-hash:* / diag* 诊断性划分默认拒绝，必须显式 --allow-diagnostic-split。
 
 碰撞步（actions.jsonl 的 collision=true）：默认保留，但把标记写进 meta 的
 collision_flags（N 个 '0'/'1'，C++ 读端用 LoadOptions.drop_collision 过滤）。
@@ -25,6 +28,7 @@ collision_flags（N 个 '0'/'1'，C++ 读端用 LoadOptions.drop_collision 过�
   python3 tools/preprocess.py --help
 """
 import argparse
+import hashlib
 import json
 import os
 import struct
@@ -35,6 +39,8 @@ from datetime import datetime, timezone
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "sim", "tools"))
 import split_manifest as sm  # noqa: E402
+import campus  # noqa: E402
+import asset_campus  # noqa: E402
 import instruction as instr  # noqa: E402
 
 # 必须与 src/include/uavrgb/text.hpp 的 kTextLen 一致：不足补 <pad>，超长由两端报错。
@@ -65,11 +71,25 @@ def die(msg):
     sys.exit("preprocess: %s" % msg)
 
 
-def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False):
+def diag_split(gid, salt):
+    """同族留出诊断用的 split：按 geometry_gid 的哈希切成 70/15/15。
+
+    只用于回答「模型在同族留出地图上能不能学」，**不是常规划分**：
+    它无视拓扑族归属，会把同一族的图分到 train/val/test 三边。常规训练仍用
+    split_for_scene，混用会让「跨族」结论失效。
+    """
+    h = int(hashlib.sha256(("%s:%s" % (salt, gid)).encode()).hexdigest()[:8], 16)
+    bucket = h % 100
+    return "train" if bucket < 70 else ("val" if bucket < 85 else "test")
+
+
+def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
+                 split_salt=None, allow_frozen=False, allow_diagnostic=False):
     """读 manifest + actions.jsonl，只建立样本索引，不碰像素（内存友好）。
 
     exclude_collision_episodes=True 时，只要该集有 collision=true 就返回 None
     （整集丢弃）。碰撞后的专家标签不可信，T2 的 SAFE 硬约束也不允许 SAFE+碰撞。
+    split_salt 非空 = --split-by-map 诊断构建；allow_diagnostic 才允许 map-hash/diag*。
     """
     man_path = os.path.join(ep_dir, "episode_manifest.json")
     try:
@@ -81,6 +101,14 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False)
     split = man.get("split")
     if split not in SPLITS:
         die("%s: split=%r 非法（应为 %s）" % (man_path, split, "/".join(SPLITS)))
+    policy = man.get("split_policy")
+    if policy is not None and policy not in sm.SPLIT_POLICIES:
+        if not sm.is_diagnostic_scheme(policy):
+            die("%s: split_policy=%r 未知（支持 %s）"
+                % (man_path, policy, "/".join(sm.SPLIT_POLICIES)))
+        if not allow_diagnostic:
+            die("%s: split_policy=%r 是诊断性划分，需显式 --allow-diagnostic-split"
+                % (man_path, policy))
     scene_id = man.get("scene_id")
     if scene_id is None:
         die("%s: 缺 scene_id（scene 隔离 split 必需）" % man_path)
@@ -103,16 +131,34 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False)
         die("%s: validity 缺失或未全 true（%r），不能打包" % (man_path, validity))
     # v2/v3 的 geometry_gid 天然不同，只查 gid 交集查不出两套几何混包。
     gver = man.get("geometry_version")
-    if gver not in (sm.SPLIT_SALT, "campus.v1"):
+    # 只认当前 campus 版本或资产校园版本：v1 的 480 集已冻结并打包，改布局后同
+    # seed 是另一张图，允许 v1 通过等于允许两套几何混包。（2026-11-04 升 v2）
+    # allow_frozen=True 用于对冻结数据做诊断（同族留出/重打包）：此时不再要求等于
+    # 当前版本，改由 build_meta 断言全包版本一致——真正要守的是「不混包」，不是「必须最新」。
+    if not allow_frozen and gver not in (sm.SPLIT_SALT, campus.VERSION,
+                                         asset_campus.VERSION):
         die("%s: geometry_version=%r 与当前 %s 不一致（旧几何数据不能混进新数据集）"
             % (man_path, gver, sm.SPLIT_SALT))
-    # 最后一道防泄漏门：split 必须等于几何 gid 应属的 split。只查「同 gid 跨 split」
-    # 挡不住单集包内被改过的 manifest（没有对照集，一致性检查永远通过）。
+    # 最后一道防泄漏门：split 必须等于几何 gid/地图按记录策略应属的 split。只查
+    # 「同 gid 跨 split」挡不住单集包内被改过的 manifest（没有对照集，一致性检查
+    # 永远通过）。同族留出诊断会按 gid 哈希重新划分，这条门按定义不成立，显式跳过；
+    # 下方 scan() 的 gid->split 唯一性检查仍然生效，不会让同图跨 split。
     if gid is not None:
-        want = sm.split_for_scene(man)
-        if split != want:
-            die("%s: split=%s 与 geometry_gid=%s 应属的 split=%s 不一致（manifest 被改动？）"
-                % (man_path, split, gid, want))
+        if split_salt:
+            split = diag_split(gid, split_salt)
+        elif sm.is_diagnostic_scheme(policy):
+            pass  # 诊断 manifest 自带 split，没有可复算的标准方案
+        else:
+            try:
+                want = sm.split_for_scene(man)
+            except ValueError as exc:
+                die("%s: 无法按记录的策略复算 split：%s" % (man_path, exc))
+            if split != want:
+                die("%s: split=%s 与 geometry_gid=%s 按记录策略应属的 split=%s 不一致（manifest 被改动？）"
+                    % (man_path, split, gid, want))
+    elif split_salt:
+        die("%s: --split-by-map 需要每集都有 geometry_gid（诊断划分按 gid 哈希）"
+            % man_path)
     # 标签只能来自教师。forward=盲策略对照、student=学生自采，它们的标签是
     # 「被测对象」而不是监督信号；这类集 validity 也全 true，不拦就会静默进训练集，
     # 而 audit 的 label_recompute 只复算 plan_action，不会发现。
@@ -182,6 +228,8 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False)
         "geometry_gid": gid,
         "geometry_version": gver,
         **{key: man.get(key) for key in sm.PROVENANCE_KEYS},
+        # 记录型 salt：冻结数据重打包必须按它复算，不能回落当前 SPLIT_SALT。
+        "split_salt": man.get("split_salt"),
         "teacher": man.get("teacher"),
         "planner": man.get("planner"),
         "instruction": instruction,
@@ -198,7 +246,8 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False)
     }
 
 
-def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False):
+def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
+         split_salt=None, allow_frozen=False, allow_diagnostic=False):
     """加载全部 episode 索引，并检查 scene_id 的 split 唯一性。"""
     episodes, scene_split, gid_split, total, dropped = [], {}, {}, 0, 0
     skipped = 0
@@ -209,7 +258,8 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False):
         if real in seen_dirs:
             die("重复的 episode 目录：%s（同一集只能打包一次）" % real)
         seen_dirs.add(real)
-        ep = load_episode(d, drop_collision, exclude_collision_episodes)
+        ep = load_episode(d, drop_collision, exclude_collision_episodes, split_salt,
+                          allow_frozen, allow_diagnostic)
         if ep is None:
             skipped += 1
             continue
@@ -239,8 +289,8 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False):
     # 同一数据集不能混 observation/dispatch、不同 hold 或不同任务版本，否则
     # eval.json / 训练日志里的数字无法归因。缺字段的旧数据与有字段的数据也不能混。
     for key in ("window_from", "hold_s", "task_version", "stop_radius", "geometry_version",
-                "appearance_version", "split_policy", "camera_profile", "dynamics_profile",
-                "success_criterion", "goal_radius"):
+                "appearance_version", "split_policy", "split_salt", "camera_profile",
+                "dynamics_profile", "success_criterion", "goal_radius"):
         vals = {ep.get(key) for ep in episodes if ep.get(key) is not None}
         if len(vals) > 1:
             die("episode 的 %s 不一致: %s（不同口径不能混包）"
@@ -252,7 +302,7 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False):
     if any(have) and not all(have):
         die("instruction 只覆盖部分 episode（%d/%d 集缺）"
             % (have.count(False), len(have)))
-    return episodes, total, dropped
+    return episodes, total, dropped, skipped
 
 
 def _uniform(episodes, key):
@@ -261,7 +311,50 @@ def _uniform(episodes, key):
     return next(iter(vals)) if len(vals) == 1 else None
 
 
-def build_meta(episodes, total, size, dropped=0):
+def _require_uniform(episodes, key):
+    """同 _uniform，但发现不一致直接 die。
+
+    allow_frozen 放开了「必须等于当前版本」这道门，防止混包就落在这里：
+    一个包里只能有一种几何版本，不管是哪一版。
+    """
+    vals = {ep.get(key) for ep in episodes if ep.get(key) is not None}
+    if len(vals) > 1:
+        die("%s 不一致：%s（一个数据集只能含一种几何，冻结版本也不行）"
+            % (key, sorted(vals)))
+    return next(iter(vals)) if vals else None
+
+
+def split_facts(episodes, split_scheme=None):
+    """返回 (split_policy, split_scheme, split_salt)：记录实际用的划分。
+
+    split_scheme 非空 = --split-by-map 诊断构建；否则按 manifest 记录的策略/版本
+    推导。salt 取记录值，冻结数据不能回落当前 SPLIT_SALT（会改 split）。
+    """
+    if split_scheme:
+        return split_scheme, split_scheme, split_scheme.partition(":")[2] or None
+    policy = _uniform(episodes, "split_policy")
+    gver = _require_uniform(episodes, "geometry_version")
+    recorded_salt = _uniform(episodes, "split_salt")
+    if sm.is_diagnostic_scheme(policy):
+        return policy, policy, recorded_salt
+    all_gids = all(ep.get("geometry_gid") for ep in episodes)
+    if policy == "campus_map_v1":
+        scheme = "campus_map_v1"
+    elif policy == "campus_assets_map_v1":
+        scheme = "campus_assets_map_v1"
+    elif policy == "geometry_gid" or (policy is None and gver and all_gids):
+        scheme = "geometry_gid"
+    else:
+        scheme = "scene_id"
+    salt = None
+    if scheme != "scene_id":
+        salt = recorded_salt or sm.split_salt_for(
+            {"split_policy": policy, "geometry_version": gver})
+    return policy or scheme, scheme, salt
+
+
+def build_meta(episodes, total, size, dropped=0, split_scheme=None,
+               collision_filter=None):
     src_w, src_h = episodes[0]["src_w"], episodes[0]["src_h"]
     out_w, out_h = size
     preserve = out_w * src_h == out_h * src_w  # 交叉相乘判断目标是否与原图同纵横比
@@ -274,6 +367,15 @@ def build_meta(episodes, total, size, dropped=0):
     scenes = {}
     for ep in episodes:
         scenes[ep["scene_id"]] = ep["split"]
+    groups = {}
+    for ep in episodes:
+        gid = ep.get("geometry_gid")
+        if not gid:
+            continue
+        if groups.setdefault(gid, ep["split"]) != ep["split"]:
+            die("几何组 %s 跨 split（%s 与 %s）"
+                % (gid, groups[gid], ep["split"]))
+    split_policy, split_scheme, split_salt = split_facts(episodes, split_scheme)
     meta = {
         "schema": "uavrgb.dataset.v1",
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -284,9 +386,18 @@ def build_meta(episodes, total, size, dropped=0):
         "resize": {"method": "bilinear", "from": [src_w, src_h],
                    "to": [out_w, out_h],
                    "aspect": "preserve" if preserve else "squash"},
-        "split_policy": "scene_id",
+        "split_policy": split_policy,
+        # 实际使用的分配函数；map-hash:* / diag* 是诊断构建，读端默认拒绝。
+        "split_scheme": split_scheme,
+        # 复算 split 用的 salt（campus 按固定地图族归属，没有 salt）。
+        "split_salt": split_salt,
+        # 每 split 样本数（splits）之外，再落一份几何组归属，审计不必重跑哈希。
+        "split_groups": [{"geometry_gid": gid, "split": sp}
+                         for gid, sp in sorted(groups.items())],
+        # 碰撞过滤会改变各 split 的样本集（尤其 test）：记录策略，跨 run 才可解释。
+        "collision_filter": collision_filter,
         # 口径字段：eval/训练/audit 从数据集本身就能看出 observation/dispatch 与任务版本。
-        "geometry_version": _uniform(episodes, "geometry_version") or sm.SPLIT_SALT,
+        "geometry_version": _require_uniform(episodes, "geometry_version") or sm.SPLIT_SALT,
         "appearance_version": _uniform(episodes, "appearance_version"),
         "success_criterion": _uniform(episodes, "success_criterion"),
         "goal_radius": _uniform(episodes, "goal_radius"),
@@ -364,12 +475,13 @@ def load_frame(path, src_w, src_h, size, crop=None, src_expected=None):
 
 
 def write_dataset(out_dir, episodes, total, size, dropped=0, crop=None,
-                  src_expected=None):
+                  src_expected=None, split_scheme=None, collision_filter=None):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "dataset.uavr")
     out_w, out_h = size
 
-    meta_bytes = json.dumps(build_meta(episodes, total, size, dropped),
+    meta_bytes = json.dumps(build_meta(episodes, total, size, dropped, split_scheme,
+                                       collision_filter),
                             ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     images_off = HEADER_SIZE
     images_len = total * OBS_C * out_h * out_w
@@ -469,11 +581,28 @@ def main():
                    help="跳过 collision=true 的步（专家撞墙后的标签本身是错的）")
     p.add_argument("--exclude-collision-episodes", action="store_true",
                    help="整集丢弃含 collision 步的 episode（T2 硬约束）")
+    p.add_argument("--allow-frozen-geometry", action="store_true",
+                   help="【诊断专用】允许冻结版本（如 campus.v1）打包；仍强制全包版本一致")
+    p.add_argument("--split-by-map", metavar="SALT", default=None,
+                   help="【诊断专用】按 geometry_gid 哈希 70/15/15 重划 split，"
+                        "无视拓扑族归属。只用于回答「同族留出能不能学」，"
+                        "混进常规实验会让跨族结论失效；必须配 --allow-diagnostic-split")
+    p.add_argument("--allow-diagnostic-split", action="store_true",
+                   help="显式允许 map-hash:*/diag* 诊断性划分（读端默认拒绝）")
     p.add_argument("episodes", nargs="+", help="一个或多个 collect.py episode 目录")
     args = p.parse_args()
+    if args.split_by_map and not args.allow_diagnostic_split:
+        p.error("--split-by-map 生成 map-hash:* 诊断划分，需显式 --allow-diagnostic-split")
 
-    episodes, total, dropped = scan(args.episodes, args.drop_collision,
-                                    args.exclude_collision_episodes)
+    episodes, total, dropped, skipped = scan(
+        args.episodes, args.drop_collision, args.exclude_collision_episodes,
+        args.split_by_map, args.allow_frozen_geometry, args.allow_diagnostic_split)
+    split_scheme = "map-hash:%s" % args.split_by_map if args.split_by_map else None
+    collision_filter = {
+        "drop_collision_steps": bool(args.drop_collision),
+        "exclude_collision_episodes": bool(args.exclude_collision_episodes),
+        "excluded_episodes": skipped,
+    }
     # 先校验侧车内容，再替换 dataset.uavr；有指令时先删旧侧车。
     # 这样侧车写失败时结果是「新数据集、没有侧车」（文本模型会显式报错），
     # 而不是「新数据集 + 旧侧车」被 C++ 按同集区间静默绑定。
@@ -483,7 +612,9 @@ def main():
     stale = os.path.join(args.out, "instructions.jsonl")
     if rows and os.path.exists(stale):
         os.remove(stale)
-    out_path, meta_bytes = write_dataset(args.out, episodes, total, args.size, dropped)
+    out_path, meta_bytes = write_dataset(args.out, episodes, total, args.size, dropped,
+                                         split_scheme=split_scheme,
+                                         collision_filter=collision_filter)
     if rows:
         ipath = write_instructions(args.out, rows)
         print("wrote %s (%d instructions)" % (ipath, len(rows)))
@@ -499,6 +630,8 @@ def main():
           % (len(episodes), total, len(meta["scenes"])))
     print("splits: train=%d val=%d test=%d"
           % (meta["splits"]["train"], meta["splits"]["val"], meta["splits"]["test"]))
+    print("split: policy=%s scheme=%s salt=%s"
+          % (meta["split_policy"], meta["split_scheme"], meta["split_salt"]))
     for split in SPLITS:
         cc = meta["class_counts"][split]
         print("  %-5s %s" % (split, dict(zip(ACTION_NAMES, cc))))

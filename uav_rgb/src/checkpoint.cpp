@@ -13,7 +13,7 @@ namespace uavrgb {
 namespace {
 
 constexpr char kMagic[8] = {'U', 'A', 'V', 'R', 'C', 'K', '0', '1'};
-constexpr std::uint32_t kVersion = 4;     // v4 追加 text_dim（0 = 无文本分支）
+constexpr std::uint32_t kVersion = 5;     // v5 追加固定长度训练契约
 constexpr std::uint32_t kMinVersion = 2;  // v2 没有 best_macro_f1，读回 -1
 
 [[noreturn]] void bad(const std::string& msg) {
@@ -47,7 +47,6 @@ void get_dims(std::ifstream& f, const std::string& name, std::vector<std::int64_
   out_dims.assign(nd, 0);
   for (std::uint32_t i = 0; i < nd; ++i) get<std::int64_t>(f, out_dims[i], "dims");
 }
-
 void get_floats(std::ifstream& f, Tensor& t, const std::string& name) {
   f.read(reinterpret_cast<char*>(t.data()),
          static_cast<std::streamsize>(t.numel() * sizeof(float)));
@@ -55,7 +54,10 @@ void get_floats(std::ifstream& f, Tensor& t, const std::string& name) {
     bad(name + ": 数据不足");
   }
 }
-
+void get_sha(std::ifstream& f, Sha256& h, const char* what) {
+  f.read(reinterpret_cast<char*>(h.data()), 32);
+  if (f.gcount() != 32) bad(std::string("读取不足: ") + what);
+}
 void check_shape(const std::string& name, const Tensor& t, const std::vector<std::int64_t>& dims) {
   if (t.dims() != dims) bad(name + ": 形状与模型不符");
 }
@@ -142,6 +144,15 @@ void save_checkpoint(const std::string& path, const CnnModel& model, const Train
   for (float w : st.class_weights) put<float>(f, w);
   put<float>(f, st.best_macro_f1);
   put<std::int32_t>(f, model.text_dim);  // v4 追加，放在 best 之后：旧版本读端不受影响
+  // v5 训练契约（固定 113 B）：全部定长，续训比较不需要解析字符串。
+  f.write(reinterpret_cast<const char*>(st.contract.dataset_sha256.data()), 32);
+  put<std::uint8_t>(f, st.contract.drop_collision ? 1 : 0);
+  f.write(reinterpret_cast<const char*>(st.contract.soft_targets_sha256.data()), 32);
+  put<float>(f, st.contract.distill_alpha);
+  put<float>(f, st.contract.lr);
+  put<std::uint32_t>(f, static_cast<std::uint32_t>(st.contract.seed));
+  put<std::int32_t>(f, st.contract.batch);
+  f.write(reinterpret_cast<const char*>(st.contract.split_scheme_sha256.data()), 32);
 
   for (std::size_t i = 0; i < ps.size(); ++i) {
     check_finite("param[" + std::to_string(i) + "]", *ps[i]);
@@ -225,6 +236,23 @@ void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
   if (ck_text_dim != model.text_dim) {
     bad("text_dim 与模型不符（ckpt " + std::to_string(ck_text_dim) + " vs 模型 " +
         std::to_string(model.text_dim) + "）");
+  }
+  if (version >= 5) {
+    CheckpointContract& c = st.contract;
+    get_sha(f, c.dataset_sha256, "dataset_sha256");
+    std::uint8_t flags = 0;
+    get<std::uint8_t>(f, flags, "contract_flags");
+    c.drop_collision = (flags & 1u) != 0;
+    get_sha(f, c.soft_targets_sha256, "soft_targets_sha256");
+    get<float>(f, c.distill_alpha, "distill_alpha");
+    get<float>(f, c.lr, "contract_lr");
+    std::uint32_t seed = 0;
+    get<std::uint32_t>(f, seed, "contract_seed");
+    c.seed = static_cast<unsigned>(seed);
+    get<std::int32_t>(f, c.batch, "contract_batch");
+    get_sha(f, c.split_scheme_sha256, "split_scheme_sha256");
+    if (!std::isfinite(c.distill_alpha) || !std::isfinite(c.lr)) bad("训练契约含非有限值");
+    st.contract_present = true;
   }
 
   std::vector<std::int64_t> dims;

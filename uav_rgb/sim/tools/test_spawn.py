@@ -9,13 +9,14 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scene_gen as sg  # noqa: E402
 
 MODES = ("default", "random")
-# legacy 外观的 golden：2026-11-04 加入桌面 Studio chase/top-view sensors 后更新。
-# 本次变化只增加无质量/无碰撞的虚拟相机，不改变柱阵、出生位姿或学生 RGB 话题。
+# legacy 外观的 golden：2026-11-04 加 chase/top-view sensors 后更新。
+# 本次（同日）再把顶视相机高度 18 m → 6 m：18 m 下柱阵只占画面 4%，几乎全空。
+# 两次变化都只动无质量/无碰撞的虚拟相机，不改变柱阵、出生位姿或学生 RGB 话题。
 # 后续修改模板/外观分支仍需显式更新这些字节级基线。
 GOLDEN_LEGACY = {
-    0: "1bd33526f0bc3be7d23749e94861acc797efa92c58488cfe21dd5d9217f1373d",
-    1: "00994a9e3371fa3c93431d464e2821ed058064f2fdce4b5e0c121606cad18569",
-    2: "9987e58f2f19e13e9726cea6ede1d7acf18efe9e0f12a06823c105c45af84200",
+    0: "670685c3c3a40bd73c492e54051ce44cf455e2152caf2aa66c357533062b0212",
+    1: "ee2e4af1f604bfd0ae68edc6c7ae36768832f696a72f6fb60023436523060f00",
+    2: "6f0506e60b38d74c5babf43904236157f39d6cffd3aa1a906450bd5fda9411d1",
 }
 
 

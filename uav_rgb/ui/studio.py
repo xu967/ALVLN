@@ -31,9 +31,9 @@ from pathlib import Path
 
 try:
     import tkinter as tk
-    from tkinter import filedialog, messagebox, ttk
+    from tkinter import filedialog, font as tkfont, messagebox, ttk
 except ImportError:  # pragma: no cover - headless CI
-    tk = ttk = filedialog = messagebox = None
+    tk = ttk = filedialog = messagebox = tkfont = None
 
 try:  # Optional: resize camera frames to fit smaller desktop windows.
     from PIL import Image, ImageTk
@@ -58,6 +58,7 @@ CAMERA_TOPIC = "/uav/camera"
 CHASE_TOPIC = "/uav/chase_camera"
 TOP_TOPIC = "/uav/top_camera"
 POSE_TOPIC = "/model/x3/pose"
+SIM_STALE_S = 1.0  # 相机/位姿 header stamp 落后当前仿真时间超过此值即标 STALE
 ACTION_NAMES = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 ACTIONS = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 
@@ -94,6 +95,20 @@ def sha256_file(path: Path, chunk_size=4 << 20):
         for chunk in iter(lambda: f.read(chunk_size), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+_CKPT_SHA_CACHE = {}
+
+
+def sha256_file_cached(path: Path):
+    """ckpt 可能几十 MB，Dashboard 每秒刷新不能反复整文件哈希。"""
+    st = path.stat()
+    key = (str(path), st.st_mtime_ns, st.st_size)
+    if key not in _CKPT_SHA_CACHE:
+        if len(_CKPT_SHA_CACHE) > 16:
+            _CKPT_SHA_CACHE.clear()
+        _CKPT_SHA_CACHE[key] = sha256_file(path)
+    return _CKPT_SHA_CACHE[key]
 
 
 def read_jsonl(path: Path, max_lines=200000):
@@ -337,6 +352,198 @@ def summarize_run(run_dir: Path, run_meta: dict, return_code, state):
     return summary
 
 
+RUN_MARKERS = ("metrics.jsonl", "results.csv", "eval.json", "studio_summary.json")
+SKIP_RUN_NAMES = {"simulation_logs"}
+
+
+def _is_run_dir(path: Path):
+    return path.is_dir() and any((path / name).is_file() for name in RUN_MARKERS)
+
+
+def _skip_scan_dir(path: Path):
+    name = path.name
+    return (name in SKIP_RUN_NAMES or name.startswith(".") or name.startswith("ep_")
+            or name.endswith(".monitor"))
+
+
+def discover_runs(roots):
+    """两层扫描 $DATA_ROOT/uav_rgb：<group>/<run> 和 <run>。纯函数，不读内容。"""
+    found = {}
+    for root in roots:
+        root = Path(root)
+        if not root.is_dir():
+            continue
+        try:
+            entries = list(root.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if not entry.is_dir() or _skip_scan_dir(entry):
+                continue
+            if _is_run_dir(entry):
+                found[entry.resolve()] = entry
+                continue
+            try:
+                children = list(entry.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if _is_run_dir(child) and not _skip_scan_dir(child):
+                    found[child.resolve()] = child
+    return sorted(found.values(), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _skip_scan_path(path: Path):
+    return any(part.startswith(".") or part.endswith(".monitor") or part.startswith("ep_")
+               or part in SKIP_RUN_NAMES for part in path.parts)
+
+
+def eval_ckpt_state(run_dir: Path, report: dict):
+    """eval 的 ckpt_sha256 与当前 run 的 ckpt_best.bin 是否一致。
+
+    'current' / 'stale' / 'unlabeled'。旧 eval 没有 sha 时不能判定，保留为未标注，
+    不拿“路径相同”冒充同一份权重。
+    """
+    reported = report.get("ckpt_sha256")
+    if not reported:
+        return "unlabeled"
+    ckpt = Path(run_dir) / "ckpt_best.bin"
+    if not ckpt.is_file():
+        return "stale"
+    try:
+        return "current" if sha256_file_cached(ckpt) == str(reported) else "stale"
+    except OSError:
+        return "stale"
+
+
+def eval_display_fields(report: dict):
+    """实验表展示字段；旧 eval 缺字段时写“未标注”，不从别的字段推断。"""
+    def text(key):
+        value = report.get(key)
+        return str(value) if value not in (None, "") else "未标注"
+    dynamics = report.get("dynamics") or report.get("dynamics_profile")
+    return {"task": text("task"), "criterion": text("success_criterion"),
+            "window_from": text("window_from"),
+            "dynamics": str(dynamics) if dynamics not in (None, "") else "未标注"}
+
+
+def eval_rate_context(report: dict):
+    """卡片副标题：判据与三个分母/失败数；缺失字段写“未标注”，不推断。"""
+    def shown(key):
+        value = safe_float(report.get(key))
+        return f"{value:.3f}" if value is not None else "未标注"
+    done = report.get("episodes_done")
+    if done is None and isinstance(report.get("per_episode"), list):
+        done = len(report["per_episode"])
+    requested = report.get("episodes_requested")
+    failed = report.get("failed_count")
+    return (f"criterion={report.get('success_criterion') or '未标注'} · "
+            f"requested={shown('requested_success_rate')} · "
+            f"completion={shown('completion_rate')} · "
+            f"failed={failed if failed is not None else '未标注'} · "
+            f"episodes={done if done is not None else '—'}/"
+            f"{requested if requested is not None else '未标注'}")
+
+
+def eval_fields_for_latest(paths):
+    """实验表用：取 mtime 最新的 eval.json 的 task/criterion/window/dynamics。"""
+    if not paths:
+        return eval_display_fields({})
+    try:
+        path = max(paths, key=lambda p: Path(p).stat().st_mtime)
+        report = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return eval_display_fields({})
+    return eval_display_fields(report if isinstance(report, dict) else {})
+
+
+def eval_index(roots):
+    """按 eval.json 的 ckpt 反查 run 目录。
+
+    返回 (run_dir -> [当前 ckpt 的 eval...], 无 ckpt 的独立评测, 旧 checkpoint 的评测)。
+    第三类不挂到新 run 上，由实验表单独标成“旧评测”。
+    """
+    index, standalone, stale = {}, [], []
+    for root in roots:
+        root = Path(root)
+        if not root.is_dir():
+            continue
+        try:
+            paths = list(root.rglob("eval.json"))
+        except OSError:
+            continue
+        for path in paths:
+            if _skip_scan_path(path):
+                continue
+            try:
+                report = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, RecursionError):
+                continue
+            if not isinstance(report, dict):
+                continue
+            ckpt = report.get("ckpt")
+            run_dir = Path(ckpt).parent.resolve() if ckpt else None
+            if run_dir is not None and run_dir.is_dir():
+                if eval_ckpt_state(run_dir, report) == "stale":
+                    stale.append(path.resolve())
+                else:
+                    index.setdefault(run_dir, []).append(path.resolve())
+            else:
+                standalone.append(path.resolve())
+    for paths in index.values():
+        paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    standalone.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    stale.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return index, standalone, stale
+
+
+def classify_episode(ep):
+    """逐集失败归类；success 优先，其次假前进/碰撞/卡住，全 false 即未到达。
+
+    false_forward 必须先于 collision：eval 里假前进一定同时带 collision=True，
+    顺序反了会让“假前进”标签和计数恒为 0。
+    """
+    if not isinstance(ep, dict):
+        return "未到达"
+    if ep.get("success"):
+        return "成功"
+    if ep.get("false_forward"):
+        return "假前进"
+    if ep.get("collision"):
+        return "碰撞"
+    if ep.get("stuck"):
+        return "卡住"
+    return "未到达"
+
+
+def _tail_jsonl(path: Path, max_bytes=262144):
+    """只读文件尾部（历史 run 的 metrics.jsonl 可能很大），用于取最终 test 事件。"""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            start = max(0, size - max_bytes)
+            f.seek(start)
+            data = f.read()
+    except OSError:
+        return []
+    lines = data.decode("utf-8", "replace").splitlines()
+    if start > 0 and lines:
+        lines = lines[1:]  # 首行可能被截断
+    rows = []
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            item = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
+
+
 def write_experiment_report(run_dir: Path, summary: dict):
     m = summary.get("metrics", {})
     c = summary.get("config", {})
@@ -378,12 +585,24 @@ def write_experiment_report(run_dir: Path, summary: dict):
         "Only a separately executed closed-loop evaluation with a saved `eval.json` may be reported as navigation SR.",
         "Missing metrics are retained as null rather than converted to zero.",
         f"- Monitor logs and lifecycle metadata: `{summary.get('monitor_dir')}`", "",
-        "## Closed-loop navigation evaluations", "",
+        "## Closed-loop evaluations", "",
     ]
     evals = summary.get("closed_loop_evaluations", [])
     if evals:
         for ev in evals:
-            lines.append(f"- {ev.get('task')} / {ev.get('split')}: SR={ev.get('success_rate')}, collision={ev.get('collision_rate')}, episodes={ev.get('episodes_done')}/{ev.get('episodes_requested')}, unique_maps={ev.get('unique_maps', ev.get('unique_geometry'))} (`{ev.get('eval_json')}`)")
+            def shown(key):
+                value = ev.get(key)
+                return value if value not in (None, "") else "未标注"
+            failed = ev.get("failed_count")
+            lines.append(
+                f"- task={shown('task')} / split={shown('split')} / criterion={shown('success_criterion')} / "
+                f"window_from={shown('window_from')} / dynamics={shown('dynamics')}: "
+                f"success={shown('success_rate')}, requested_success={shown('requested_success_rate')}, "
+                f"completion={shown('completion_rate')}, "
+                f"failed={failed if failed is not None else '未标注'}, "
+                f"episodes={ev.get('episodes_done') if ev.get('episodes_done') is not None else '—'}"
+                f"/{ev.get('episodes_requested') if ev.get('episodes_requested') is not None else '未标注'}, "
+                f"unique_maps={ev.get('unique_maps', ev.get('unique_geometry'))} (`{ev.get('eval_json')}`)")
     else:
         lines.append("- No formal closed-loop navigation evaluation has been attached to this run.")
     lines += ["", "## Live simulation demonstrations", ""]
@@ -406,15 +625,22 @@ def write_experiment_report(run_dir: Path, summary: dict):
 def _draw_chart(canvas, series, title, percent=False):
     canvas.delete("all")
     w, h = max(1, canvas.winfo_width()), max(1, canvas.winfo_height())
-    if w < 80 or h < 60:
+    if w < 80 or h < 80:
         return
-    pl, pr, pt, pb = 48, 12, 26, 28
+    # 标题在 (12,6)，图例在 y=32，绘图区从 y=52 开始：三者不再重叠。
+    pl, pr, pt, pb = 48, 14, 52, 32
     points = [(x, y) for s in series for x, y in s.get("points", [])
               if x is not None and y is not None and math.isfinite(y)]
-    canvas.create_text(12, 7, text=title, anchor="nw", fill="#E5E7EB",
-                       font=("TkDefaultFont", 10, "bold"))
+    canvas.create_text(12, 6, text=title, anchor="nw", fill="#E5E7EB",
+                       font=("TkDefaultFont", 9, "bold"))
+    for i, s in enumerate(series):
+        lx = pl + 8 + 118 * i
+        canvas.create_rectangle(lx, 32, lx + 9, 41, fill=s["color"], outline="")
+        canvas.create_text(lx + 13, 36, text=s["name"], anchor="w", fill="#CBD5E1",
+                           font=("TkDefaultFont", 8))
     if not points:
-        canvas.create_text(w / 2, h / 2, text="等待真实训练指标…", fill="#94A3B8")
+        canvas.create_text(w / 2, (pt + h - pb) / 2, text="等待真实训练指标…",
+                           fill="#94A3B8")
         return
     xs, ys = [p[0] for p in points], [p[1] for p in points]
     xmin, xmax = min(xs), max(xs)
@@ -425,7 +651,7 @@ def _draw_chart(canvas, series, title, percent=False):
         delta = max(0.05, abs(ymin) * 0.08)
         ymin, ymax = ymin - delta, ymax + delta
     if percent:
-        ymin, ymax = max(0.0, min(ymin, 0.0)), min(1.0, max(ymax, 1.0))
+        ymin, ymax = 0.0, 1.0
     def X(x): return pl + (x - xmin) / (xmax - xmin) * (w - pl - pr)
     def Y(y): return h - pb - (y - ymin) / (ymax - ymin) * (h - pt - pb)
     for i in range(5):
@@ -434,7 +660,15 @@ def _draw_chart(canvas, series, title, percent=False):
         canvas.create_line(pl, yy, w - pr, yy, fill="#263449")
         label = f"{y * 100:.0f}%" if percent else f"{y:.3f}"
         canvas.create_text(pl - 6, yy, text=label, anchor="e", fill="#94A3B8",
-                           font=("TkDefaultFont", 8))
+                           font=("TkDefaultFont", 9))
+    # x 轴 5 个刻度
+    for i in range(5):
+        x = xmin + (xmax - xmin) * i / 4
+        xx = X(x)
+        canvas.create_line(xx, h - pb, xx, h - pb + 4, fill="#475569")
+        label = f"{x:.0f}" if xmax - xmin >= 4 else f"{x:.1f}"
+        canvas.create_text(xx, h - pb + 7, text=label, anchor="n", fill="#94A3B8",
+                           font=("TkDefaultFont", 9))
     canvas.create_line(pl, pt, pl, h - pb, fill="#64748B")
     canvas.create_line(pl, h - pb, w - pr, h - pb, fill="#64748B")
     for s in series:
@@ -450,11 +684,6 @@ def _draw_chart(canvas, series, title, percent=False):
         elif len(seg) > 1:
             canvas.create_line(*[v for p in seg for v in p], fill=s["color"], width=2,
                                smooth=False)
-        canvas.create_rectangle(pl + 8 + 130 * series.index(s), 15,
-                                pl + 18 + 130 * series.index(s), 25,
-                                fill=s["color"], outline="")
-        canvas.create_text(pl + 24 + 130 * series.index(s), 20, text=s["name"],
-                           anchor="w", fill="#CBD5E1", font=("TkDefaultFont", 8))
 
 
 class StudioApp:
@@ -484,6 +713,8 @@ class StudioApp:
         self._resize_after = None
         self._sim_subs = {}
         self._sim_last_seq = {"fpv": 0, "chase": 0, "top": 0}
+        self._sim_frame_stamps = {"fpv": None, "chase": None, "top": None}
+        self._cam_status_vars = {}
         self._sim_photos = {}
         self._sim_pose = None
         self._sim_path = deque(maxlen=3000)
@@ -508,6 +739,12 @@ class StudioApp:
         self._sim_status_var = tk.StringVar(value="仿真未连接")
         self._training_status_var = tk.StringVar(value="空闲")
         self._eval_status_var = tk.StringVar(value="未运行闭环评测")
+        self._scan_sig = None
+        self._scan_cache = None
+        self._eval_index = {}
+        self._standalone_evals = []
+        self._eval_report = None
+        self._eval_episodes = []
 
         self._configure_style()
         self.root.title("UAV Navigation Studio · RGB Navigation Research Workbench")
@@ -518,9 +755,10 @@ class StudioApp:
         self._build_header()
         self._build_tabs()
         self._build_statusbar()
+        # 先扫描一次，Dashboard 才能从 eval.json 读到闭环 SR；扫描只在启动/按钮时发生。
+        self.refresh_history(force=True)
         if self.run_dir:
             self.load_run(self.run_dir)
-        self.refresh_history()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(200, self._tick)
         self.root.after(300, self._sim_tick)
@@ -531,31 +769,82 @@ class StudioApp:
             style.theme_use("clam")
         except tk.TclError:
             pass
+        # 正文 10pt，等宽日志保持 9pt；降低默认控件尺寸。
+        if tkfont is not None:
+            for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont"):
+                try:
+                    tkfont.nametofont(name).configure(size=10)
+                except tk.TclError:
+                    pass
+            try:
+                tkfont.nametofont("TkFixedFont").configure(size=9)
+            except tk.TclError:
+                pass
         self.root.configure(background="#0B1220")
+        self.root.option_add("*TCombobox*Listbox.background", "#0F1A2B")
+        self.root.option_add("*TCombobox*Listbox.foreground", "#E2E8F0")
+        self.root.option_add("*TCombobox*Listbox.selectBackground", "#2563EB")
+        self.root.option_add("*TCombobox*Listbox.selectForeground", "#FFFFFF")
         style.configure("TFrame", background="#0B1220")
         style.configure("Card.TFrame", background="#111C2E")
         style.configure("TLabel", background="#0B1220", foreground="#E2E8F0")
         style.configure("Muted.TLabel", background="#0B1220", foreground="#94A3B8")
+        style.configure("CardMuted.TLabel", background="#111C2E", foreground="#94A3B8",
+                        font=("TkDefaultFont", 9))
         style.configure("Title.TLabel", background="#0B1220", foreground="#F8FAFC",
                         font=("TkDefaultFont", 16, "bold"))
         style.configure("CardTitle.TLabel", background="#111C2E", foreground="#94A3B8",
                         font=("TkDefaultFont", 9, "bold"))
-        style.configure("Metric.TLabel", background="#111C2E", foreground="#F8FAFC",
-                        font=("TkDefaultFont", 18, "bold"))
+        style.configure("Hero.TLabel", background="#111C2E", foreground="#F8FAFC",
+                        font=("TkDefaultFont", 28, "bold"))
+        style.configure("HeroSub.TLabel", background="#111C2E", foreground="#94A3B8",
+                        font=("TkDefaultFont", 9))
+        style.configure("Chip.TLabel", background="#111C2E", foreground="#F8FAFC",
+                        font=("TkDefaultFont", 15, "bold"))
         style.configure("TNotebook", background="#0B1220", borderwidth=0)
         style.configure("TNotebook.Tab", background="#172338", foreground="#CBD5E1",
-                        padding=(16, 9))
+                        padding=(14, 6))
         style.map("TNotebook.Tab", background=[("selected", "#2563EB")],
                   foreground=[("selected", "#FFFFFF")])
         style.configure("TLabelframe", background="#0B1220", foreground="#CBD5E1")
-        style.configure("TLabelframe.Label", background="#0B1220", foreground="#93C5FD")
-        style.configure("TButton", padding=(9, 5))
+        style.configure("TLabelframe.Label", background="#0B1220", foreground="#93C5FD",
+                        font=("TkDefaultFont", 9, "bold"))
+        style.configure("TButton", background="#1E293B", foreground="#E2E8F0",
+                        bordercolor="#334155", lightcolor="#1E293B", darkcolor="#1E293B",
+                        padding=(8, 3))
+        style.map("TButton", background=[("pressed", "#0F1A2B"), ("active", "#263449")],
+                  foreground=[("disabled", "#64748B")])
+        style.configure("TEntry", fieldbackground="#0F1A2B", foreground="#E2E8F0",
+                        insertcolor="#E2E8F0", bordercolor="#334155",
+                        lightcolor="#334155", darkcolor="#334155", padding=(4, 2))
+        style.map("TEntry", fieldbackground=[("readonly", "#0F1A2B"), ("disabled", "#0B1220")],
+                  foreground=[("disabled", "#64748B")])
+        style.configure("TCombobox", fieldbackground="#0F1A2B", background="#1E293B",
+                        foreground="#E2E8F0", arrowcolor="#E2E8F0", bordercolor="#334155",
+                        padding=(4, 2))
+        style.map("TCombobox",
+                  fieldbackground=[("readonly", "#0F1A2B"), ("disabled", "#0B1220")],
+                  background=[("active", "#263449")],
+                  selectbackground=[("readonly", "#1E293B")],
+                  selectforeground=[("readonly", "#E2E8F0")])
+        style.configure("TCheckbutton", background="#0B1220", foreground="#E2E8F0",
+                        indicatorbackground="#0F1A2B", indicatorforeground="#E2E8F0",
+                        padding=(2, 2))
+        style.map("TCheckbutton", background=[("active", "#0B1220")],
+                  indicatorbackground=[("selected", "#2563EB")])
+        for orient in ("Vertical", "Horizontal"):
+            style.configure(f"{orient}.TScrollbar", background="#334155",
+                            troughcolor="#0B1220", bordercolor="#0B1220",
+                            arrowcolor="#94A3B8", relief="flat")
         style.configure("Treeview", background="#111C2E", fieldbackground="#111C2E",
-                        foreground="#E2E8F0", rowheight=25)
-        style.configure("Treeview.Heading", background="#1E293B", foreground="#E2E8F0")
+                        foreground="#E2E8F0", rowheight=26, bordercolor="#263449")
+        style.configure("Treeview.Heading", background="#1E293B", foreground="#E2E8F0",
+                        font=("TkDefaultFont", 9, "bold"), padding=(4, 3))
+        style.map("Treeview", background=[("selected", "#1E3A5F")],
+                  foreground=[("selected", "#F8FAFC")])
 
     def _build_header(self):
-        header = ttk.Frame(self.root, padding=(16, 12))
+        header = ttk.Frame(self.root, padding=(16, 8))
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)
         ttk.Label(header, text="UAV NAVIGATION STUDIO", style="Title.TLabel").grid(
@@ -593,11 +882,17 @@ class StudioApp:
         ttk.Label(bar, text="  ·  ", style="Muted.TLabel").pack(side="left")
         ttk.Label(bar, textvariable=self._eval_status_var).pack(side="left")
 
-    def _metric_card(self, parent, title, var, col):
-        frame = ttk.Frame(parent, style="Card.TFrame", padding=12)
-        frame.grid(row=0, column=col, sticky="nsew", padx=4)
+    def _hero_card(self, parent, title, var, sub_var):
+        frame = ttk.Frame(parent, style="Card.TFrame", padding=(10, 6))
         ttk.Label(frame, text=title, style="CardTitle.TLabel").pack(anchor="w")
-        ttk.Label(frame, textvariable=var, style="Metric.TLabel").pack(anchor="w", pady=(6, 0))
+        ttk.Label(frame, textvariable=var, style="Hero.TLabel").pack(anchor="w")
+        ttk.Label(frame, textvariable=sub_var, style="HeroSub.TLabel").pack(anchor="w")
+        return frame
+
+    def _chip_card(self, parent, title, var):
+        frame = ttk.Frame(parent, style="Card.TFrame", padding=(8, 5))
+        ttk.Label(frame, text=title, style="CardTitle.TLabel").pack(anchor="w")
+        ttk.Label(frame, textvariable=var, style="Chip.TLabel").pack(anchor="w")
         return frame
 
     def _build_dashboard(self):
@@ -606,27 +901,44 @@ class StudioApp:
         tab.rowconfigure(2, weight=1)
         self.run_title_var = tk.StringVar(value="尚未选择实验")
         title_bar = ttk.Frame(tab)
-        title_bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        title_bar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         title_bar.columnconfigure(0, weight=1)
         ttk.Label(title_bar, textvariable=self.run_title_var, style="Title.TLabel").grid(
             row=0, column=0, sticky="w")
         ttk.Button(title_bar, text="打开三视角仿真 →",
                    command=lambda: self.tabs.select(self.sim_tab)).grid(row=0, column=1, sticky="e")
+        # 指标两级：2 张 hero 卡（各 50%）+ 5 个 chip（各 20%）。
         cards = ttk.Frame(tab)
-        cards.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        for i in range(7):
-            cards.columnconfigure(i, weight=1)
+        cards.grid(row=1, column=0, sticky="ew", pady=(0, 6))
         self.card_vars = {k: tk.StringVar(value="—") for k in
-                          ("epoch", "train_ce", "dev_ce", "dev_macro", "test_macro", "test_bal", "closed_loop_sr")}
-        titles = [("训练轮数", "epoch"), ("Train CE", "train_ce"), ("Validation CE", "dev_ce"),
-                  ("Best Val Macro-F1", "dev_macro"), ("Test Macro-F1", "test_macro"),
-                  ("Test Balanced Acc", "test_bal"), ("闭环导航 SR", "closed_loop_sr")]
-        for i, (title, key) in enumerate(titles):
-            self._metric_card(cards, title, self.card_vars[key], i)
+                          ("epoch", "train_ce", "dev_ce", "dev_macro",
+                           "test_macro", "test_bal", "closed_loop_sr")}
+        self.hero_sub = {"test_macro": tk.StringVar(value="test split · 离线动作分类"),
+                         "closed_loop_sr": tk.StringVar(value="尚无闭环评测")}
+        hero = ttk.Frame(cards)
+        hero.grid(row=0, column=0, sticky="ew")
+        hero.columnconfigure(0, weight=1, uniform="hero")
+        hero.columnconfigure(1, weight=1, uniform="hero")
+        self._hero_card(hero, "Test Macro-F1 · 离线", self.card_vars["test_macro"],
+                        self.hero_sub["test_macro"]).grid(row=0, column=0, sticky="nsew", padx=(0, 4))
+        self._hero_card(hero, "闭环评测成功率 · 判据见副标题", self.card_vars["closed_loop_sr"],
+                        self.hero_sub["closed_loop_sr"]).grid(row=0, column=1, sticky="nsew",
+                                                              padx=(4, 0))
+        chips = ttk.Frame(cards)
+        chips.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        chip_titles = [("Best Val Macro-F1 @ep", "dev_macro"), ("训练轮数", "epoch"),
+                       ("Test Balanced Acc", "test_bal"), ("Train CE", "train_ce"),
+                       ("Validation CE", "dev_ce")]
+        for i, (title, key) in enumerate(chip_titles):
+            chips.columnconfigure(i, weight=1, uniform="chip")
+            self._chip_card(chips, title, self.card_vars[key]).grid(
+                row=0, column=i, sticky="nsew",
+                padx=(0 if i == 0 else 3, 0 if i == len(chip_titles) - 1 else 3))
         body = ttk.Frame(tab)
         body.grid(row=2, column=0, sticky="nsew")
-        body.columnconfigure(0, weight=3)
-        body.columnconfigure(1, weight=2)
+        body.columnconfigure(0, weight=1)
+        # 右列固定为请求宽度：event_text 不再用 80 字符宽把图表列挤窄。
+        body.columnconfigure(1, weight=0)
         body.rowconfigure(0, weight=1)
         charts = ttk.Frame(body)
         charts.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
@@ -643,25 +955,31 @@ class StudioApp:
         self.acc_canvas.bind("<Configure>", self._redraw_charts)
         right = ttk.Frame(body)
         right.grid(row=0, column=1, sticky="nsew")
-        right.rowconfigure(1, weight=1)
+        right.rowconfigure(5, weight=1)
         right.columnconfigure(0, weight=1)
-        ttk.Label(right, text="训练事件与诊断", style="Title.TLabel").grid(
-            row=0, column=0, sticky="w", pady=(0, 6))
-        self.event_text = tk.Text(right, bg="#111C2E", fg="#CBD5E1", insertbackground="#fff",
-                                  relief="flat", wrap="word", font=("TkFixedFont", 9), height=20)
-        self.event_text.grid(row=1, column=0, sticky="nsew")
-        sb = ttk.Scrollbar(right, command=self.event_text.yview)
-        sb.grid(row=1, column=1, sticky="ns")
-        self.event_text.configure(yscrollcommand=sb.set)
+        # 诊断区放在事件日志上面：最该先看的结论不被日志压到下面。
+        ttk.Label(right, text="离线诊断 · test split", style="Title.TLabel").grid(
+            row=0, column=0, sticky="w", pady=(0, 4))
         self.test_summary_var = tk.StringVar(value="尚无 test split 离线评测记录。")
         ttk.Label(right, textvariable=self.test_summary_var, style="Muted.TLabel",
-                  wraplength=420, justify="left").grid(row=2, column=0, sticky="ew", pady=(8, 0))
-        self.confusion_var = tk.StringVar(value="Test confusion matrix：—")
-        ttk.Label(right, textvariable=self.confusion_var, style="Muted.TLabel",
-                  wraplength=420, justify="left").grid(row=3, column=0, sticky="ew", pady=(5, 0))
-        self.per_class_var = tk.StringVar(value="Per-class Recall：—")
-        ttk.Label(right, textvariable=self.per_class_var, style="Muted.TLabel",
-                  wraplength=420, justify="left").grid(row=4, column=0, sticky="ew", pady=(4, 0))
+                  wraplength=400, justify="left").grid(row=1, column=0, sticky="ew")
+        self.confusion_canvas = tk.Canvas(right, bg="#111C2E", highlightthickness=0, height=200)
+        self.confusion_canvas.grid(row=2, column=0, sticky="ew", pady=(6, 0))
+        self.recall_canvas = tk.Canvas(right, bg="#111C2E", highlightthickness=0, height=104)
+        self.recall_canvas.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        self._confusion_matrix = None
+        self._recalls = []
+        self.confusion_canvas.bind("<Configure>", lambda _e: self._draw_confusion())
+        self.recall_canvas.bind("<Configure>", lambda _e: self._draw_recall())
+        ttk.Label(right, text="训练事件", style="CardTitle.TLabel").grid(
+            row=4, column=0, sticky="w", pady=(8, 4))
+        self.event_text = tk.Text(right, bg="#111C2E", fg="#CBD5E1", insertbackground="#fff",
+                                  relief="flat", wrap="word", font=("TkFixedFont", 9),
+                                  width=1, height=8)
+        self.event_text.grid(row=5, column=0, sticky="nsew")
+        sb = ttk.Scrollbar(right, command=self.event_text.yview)
+        sb.grid(row=5, column=1, sticky="ns")
+        self.event_text.configure(yscrollcommand=sb.set)
 
     def _build_training(self):
         tab = self.training_tab
@@ -736,6 +1054,7 @@ class StudioApp:
         ttk.Entry(controls, textvariable=self.meta_var).grid(row=1, column=1, sticky="ew", padx=5)
         ttk.Button(controls, text="选择…", command=self.choose_scene_meta).grid(row=1, column=2)
         ttk.Label(controls, text="GZ_PARTITION（空=default；启动时自动隔离）").grid(row=2, column=0, sticky="w", pady=3)
+        # 按钮实际启动 gz sim -s（headless server）；容器内无 NVIDIA EGL，GUI 必失败。
         ttk.Entry(controls, textvariable=self.partition_var, width=28).grid(
             row=2, column=1, sticky="w", padx=5)
         self.scene_task_var = tk.StringVar(value="campus")
@@ -750,7 +1069,7 @@ class StudioApp:
         ttk.Button(gen_row, text="生成 SDF + metadata", command=self.generate_scene).pack(side="left", padx=8)
         row = ttk.Frame(controls)
         row.grid(row=0, column=3, rowspan=4, sticky="ns", padx=(12, 0))
-        ttk.Button(row, text="启动 Gazebo GUI", command=self.start_gazebo).pack(fill="x", pady=2)
+        ttk.Button(row, text="启动 Gazebo（headless）", command=self.start_gazebo).pack(fill="x", pady=2)
         ttk.Button(row, text="连接当前仿真", command=self.connect_sim).pack(fill="x", pady=2)
         ttk.Button(row, text="断开视角", command=self.disconnect_sim).pack(fill="x", pady=2)
         ttk.Button(row, text="停止本程序启动的 Gazebo", command=self.stop_gazebo).pack(fill="x", pady=2)
@@ -781,32 +1100,39 @@ class StudioApp:
         views.grid(row=2, column=0, sticky="nsew")
         views.columnconfigure(0, weight=1)
         views.columnconfigure(1, weight=1)
-        views.rowconfigure(0, weight=1)
-        views.rowconfigure(1, weight=1)
-        self.chase_panel, self.chase_label = self._camera_panel(views, "第三人称跟随视角 · CHASE CAMERA")
+        # 上排 3:2 下排：Canvas 的 height=300 请求高度会把上排挤成标题条。
+        views.rowconfigure(0, weight=3)
+        views.rowconfigure(1, weight=2)
+        self.chase_panel, self.chase_label = self._camera_panel(
+            views, "第三人称跟随视角 · CHASE CAMERA", "chase")
         self.chase_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 4))
-        self.fpv_panel, self.fpv_label = self._camera_panel(views, "第一人称视角 · RGB INPUT")
+        self.fpv_panel, self.fpv_label = self._camera_panel(
+            views, "第一人称视角 · RGB INPUT", "fpv")
         self.fpv_panel.grid(row=0, column=1, sticky="nsew", padx=(4, 0), pady=(0, 4))
-        self.topcam_panel, self.topcam_label = self._camera_panel(views, "顶视相机 · RENDERED TOP CAMERA")
+        self.topcam_panel, self.topcam_label = self._camera_panel(
+            views, "顶视相机 · RENDERED TOP CAMERA", "top")
         self.topcam_panel.grid(row=1, column=0, sticky="nsew", padx=(0, 4), pady=(4, 0))
         top = ttk.LabelFrame(views, text="轨迹分析地图 · TOP-DOWN MAP", padding=4)
         top.grid(row=1, column=1, sticky="nsew", padx=(4, 0), pady=(4, 0))
         top.columnconfigure(0, weight=1)
         top.rowconfigure(0, weight=1)
-        self.top_canvas = tk.Canvas(top, bg="#0B1422", highlightthickness=0, height=300)
+        self.top_canvas = tk.Canvas(top, bg="#0B1422", highlightthickness=0, height=1)
         self.top_canvas.grid(row=0, column=0, sticky="nsew")
         self.top_canvas.bind("<Configure>", lambda _e: self._draw_topdown())
         self.sim_info_var = tk.StringVar(value="等待 Gazebo 位姿数据")
         ttk.Label(top, textvariable=self.sim_info_var, style="Muted.TLabel").grid(
             row=1, column=0, sticky="w", pady=(4, 0))
 
-    def _camera_panel(self, parent, title):
+    def _camera_panel(self, parent, title, key):
         frame = ttk.LabelFrame(parent, text=title, padding=5)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
         label = tk.Label(frame, text="等待相机数据…", bg="#0B1422", fg="#94A3B8",
-                         font=("TkDefaultFont", 12), anchor="center")
+                         font=("TkDefaultFont", 10), anchor="center")
         label.grid(row=0, column=0, sticky="nsew")
+        self._cam_status_vars[key] = tk.StringVar(value="等待相机数据…")
+        ttk.Label(frame, textvariable=self._cam_status_vars[key],
+                  style="Muted.TLabel", anchor="w").grid(row=1, column=0, sticky="ew")
         return frame, label
 
     def _build_experiments(self):
@@ -815,32 +1141,38 @@ class StudioApp:
         tab.rowconfigure(1, weight=1)
         toolbar = ttk.Frame(tab)
         toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        ttk.Button(toolbar, text="刷新实验列表", command=self.refresh_history).pack(side="left")
+        ttk.Button(toolbar, text="刷新实验列表",
+                   command=lambda: self.refresh_history(force=True)).pack(side="left")
         ttk.Button(toolbar, text="加载选中实验", command=self.load_selected_history).pack(
             side="left", padx=6)
         ttk.Button(toolbar, text="打开实验目录", command=self.open_selected_history).pack(side="left")
         ttk.Button(toolbar, text="打开实验报告", command=self.open_report).pack(side="left", padx=6)
-        table = ttk.Treeview(tab, columns=("status", "epochs", "macro", "test", "sr", "started"),
-                             show="tree headings", height=12)
-        table.heading("#0", text="Run ID")
-        for col, label in (("status", "状态"), ("epochs", "Epochs"),
-                           ("macro", "Test Macro-F1"), ("test", "Test Balanced Acc"),
-                           ("sr", "Closed-loop SR"), ("started", "开始时间")):
+        cols = ("path", "kind", "status", "task", "criterion", "window_from", "dynamics",
+                "epochs", "macro", "test", "sr", "started")
+        table = ttk.Treeview(tab, columns=cols, show="headings", height=9)
+        for col, label, width, anchor in (
+                ("path", "实验路径（相对 DATA_ROOT）", 300, "w"),
+                ("kind", "类型", 65, "center"),
+                ("status", "状态", 105, "w"),
+                ("task", "Task", 60, "center"),
+                ("criterion", "Success criterion", 125, "w"),
+                ("window_from", "Window from", 80, "center"),
+                ("dynamics", "Dynamics", 70, "center"),
+                ("epochs", "Epochs", 55, "e"),
+                ("macro", "Test Macro-F1", 105, "e"),
+                ("test", "Test Balanced Acc", 115, "e"),
+                ("sr", "Success rate", 95, "e"),
+                ("started", "开始时间", 135, "w")):
             table.heading(col, text=label)
-        table.column("#0", width=330)
-        table.column("status", width=90, anchor="center")
-        table.column("epochs", width=90, anchor="e")
-        table.column("macro", width=120, anchor="e")
-        table.column("test", width=140, anchor="e")
-        table.column("sr", width=110, anchor="e")
-        table.column("started", width=190)
+            table.column(col, width=width, anchor=anchor)
         table.grid(row=1, column=0, sticky="nsew")
         sb = ttk.Scrollbar(tab, command=table.yview)
         sb.grid(row=1, column=1, sticky="ns")
         table.configure(yscrollcommand=sb.set)
+        table.bind("<Double-1>", lambda _e: self.load_selected_history(show_dashboard=False))
         self.history_tree = table
-        eval_box = ttk.LabelFrame(tab, text="独立 Gazebo 闭环评测（训练分类指标 ≠ 导航成功率）", padding=10)
-        eval_box.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        eval_box = ttk.LabelFrame(tab, text="独立 Gazebo 闭环评测（训练分类指标 ≠ 导航成功率）", padding=8)
+        eval_box.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self.eval_task_var = tk.StringVar(value="base")
         self.eval_split_var = tk.StringVar(value="test")
         self.eval_episodes_var = tk.StringVar(value="20")
@@ -865,7 +1197,55 @@ class StudioApp:
         self.eval_stop_btn.pack(side="left", padx=4)
         ttk.Button(eval_box, text="打开评测目录", command=self.open_eval_dir).pack(side="left")
         ttk.Label(tab, textvariable=self._eval_status_var, style="Muted.TLabel").grid(
-            row=3, column=0, sticky="w", pady=(8, 0))
+            row=3, column=0, sticky="w", pady=(6, 0))
+        # 逐集评测明细：失败模式（尤其“未到达”）必须可见，不能只留一行状态栏。
+        detail = ttk.LabelFrame(tab, text="评测明细（双击历史行自动加载最新 eval.json）", padding=6)
+        detail.grid(row=4, column=0, sticky="nsew", pady=(6, 0))
+        self.eval_detail_box = detail
+        detail.columnconfigure(0, weight=1)
+        chips = ttk.Frame(detail)
+        chips.grid(row=0, column=0, sticky="ew")
+        self.eval_chip_vars = {k: tk.StringVar(value="—") for k in
+                               ("sr", "collision", "stuck", "false_forward",
+                                "unreached", "maps", "p95")}
+        for i, (label, key) in enumerate((("SR", "sr"), ("碰撞", "collision"),
+                                          ("卡住", "stuck"), ("假前进", "false_forward"),
+                                          ("未到达", "unreached"), ("maps", "maps"),
+                                          ("p95", "p95"))):
+            ttk.Label(chips, text=label, style="CardTitle.TLabel").grid(row=0, column=i * 2,
+                                                                        sticky="w", padx=(0, 4))
+            ttk.Label(chips, textvariable=self.eval_chip_vars[key]).grid(
+                row=0, column=i * 2 + 1, sticky="w", padx=(0, 16))
+        filter_row = ttk.Frame(detail)
+        filter_row.grid(row=1, column=0, sticky="ew", pady=(6, 4))
+        ttk.Label(filter_row, text="筛选").pack(side="left")
+        self.eval_filter_var = tk.StringVar(value="全部")
+        self.eval_filter_combo = ttk.Combobox(
+            filter_row, textvariable=self.eval_filter_var, width=10, state="readonly",
+            values=("全部", "仅失败", "碰撞", "卡住", "假前进", "未到达", "成功"))
+        self.eval_filter_combo.pack(side="left", padx=6)
+        self.eval_filter_combo.bind("<<ComboboxSelected>>", lambda _e: self._fill_episode_table())
+        self.eval_count_var = tk.StringVar(value="显示 0/0")
+        ttk.Label(filter_row, textvariable=self.eval_count_var,
+                  style="Muted.TLabel").pack(side="left", padx=8)
+        ep_cols = ("idx", "seed", "result", "steps", "max_x", "wp_min", "actions", "instruction")
+        self.eval_tree = ttk.Treeview(detail, columns=ep_cols, show="headings", height=8)
+        for col, label, width, anchor in (
+                ("idx", "#", 40, "e"), ("seed", "Seed", 70, "e"),
+                ("result", "结果", 80, "center"), ("steps", "Steps", 60, "e"),
+                ("max_x", "Max x", 75, "e"), ("wp_min", "WP min dist", 95, "e"),
+                ("actions", "Actions(SN/FS/YL/YR)", 160, "w"),
+                ("instruction", "指令", 420, "w")):
+            self.eval_tree.heading(col, text=label)
+            self.eval_tree.column(col, width=width, anchor=anchor)
+        self.eval_tree.grid(row=2, column=0, sticky="nsew")
+        ep_sb = ttk.Scrollbar(detail, command=self.eval_tree.yview)
+        ep_sb.grid(row=2, column=1, sticky="ns")
+        self.eval_tree.configure(yscrollcommand=ep_sb.set)
+        for tag, fg, bg in (("成功", "#34D399", "#0F2A1E"), ("碰撞", "#F87171", "#2A1416"),
+                            ("卡住", "#FBBF24", "#2A2310"), ("假前进", "#C084FC", "#231530"),
+                            ("未到达", "#94A3B8", "#1A2233")):
+            self.eval_tree.tag_configure(tag, foreground=fg, background=bg)
 
     # ------------------------------------------------------------------ training
     def choose_dataset(self):
@@ -877,7 +1257,13 @@ class StudioApp:
             self.text_dim_var.set("16" if sidecar.is_file() else "0")
 
     def _new_run_dir(self):
-        RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+        try:
+            RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("数据目录不可用",
+                                 f"无法创建 run 目录：\n{RUNS_ROOT}\n\n{exc}\n\n"
+                                 "请检查 DATA_ROOT 环境变量是否指向可写目录。")
+            return None
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         return RUNS_ROOT / f"{stamp}-{uuid.uuid4().hex[:8]}"
 
@@ -913,6 +1299,8 @@ class StudioApp:
                                  f"当前 text_dim={text_dim}，但数据集目录没有 instructions.jsonl：\n{text_sidecar}\n\n如果这是纯 RGB 数据，请把 Text dim 设为 0。")
             return
         run_dir = self._new_run_dir()
+        if run_dir is None:
+            return
         run_dir.mkdir(parents=True, exist_ok=False)
         sidecar = Path(str(run_dir) + ".monitor")
         sidecar.mkdir(parents=True, exist_ok=True)
@@ -955,7 +1343,7 @@ class StudioApp:
             write_json_atomic(run_dir / "studio_summary.json", failed_summary)
             write_experiment_report(run_dir, failed_summary)
             self.run_dir, self.sidecar = run_dir, sidecar
-            self.refresh_history()
+            self.refresh_history(force=True)
             self.run_title_var.set(f"当前实验：{run_dir.name}（启动失败）")
             self._training_status_var.set("训练启动失败；失败记录已保存")
             messagebox.showerror("启动失败", str(exc))
@@ -980,7 +1368,7 @@ class StudioApp:
         self.tabs.select(self.dashboard_tab)
         self.run_title_var.set(f"当前实验：{run_dir.name}")
         self._append_train_log(f"[studio] started: {shlex.join(command)}")
-        self.refresh_history()
+        self.refresh_history(force=True)
 
     def stop_detached_training(self):
         pid = self._detached_pid
@@ -1035,7 +1423,7 @@ class StudioApp:
                 self.ckpt_var.set(str(best_ckpt))
             self._append_train_log(f"[studio] training {state}, rc={rc}")
             self.refresh_run(force=True)
-            self.refresh_history()
+            self.refresh_history(force=True)
             self.tabs.select(self.dashboard_tab)
         self.start_train_btn.configure(state="normal")
         self.stop_train_btn.configure(state="disabled")
@@ -1096,6 +1484,70 @@ class StudioApp:
         self._update_dashboard()
         self._update_event_text()
 
+    def _run_eval_paths(self, run_dir):
+        """只读缓存索引，不做目录扫描；1 条数值、多条只报数量，避免混口径。"""
+        if not run_dir:
+            return []
+        run_dir = Path(run_dir).resolve()
+        paths = list(self._eval_index.get(run_dir, []))
+        own = run_dir / "eval.json"
+        if own.is_file() and own not in paths:
+            try:
+                report = json.loads(own.read_text(encoding="utf-8"))
+            except (OSError, ValueError, RecursionError):
+                report = None
+            # 旧 checkpoint 的 eval.json 不挂到当前 run；它由实验表“旧评测”行展示。
+            if not isinstance(report, dict) or eval_ckpt_state(run_dir, report) != "stale":
+                paths.append(own)
+        paths.sort(key=lambda p: Path(p).stat().st_mtime, reverse=True)
+        return paths
+
+    @staticmethod
+    def _report_maps(report):
+        if not isinstance(report, dict):
+            return None
+        value = report.get("unique_maps", report.get("unique_geometry"))
+        if value is not None:
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                pass
+        gids = {ep.get("geometry_gid") for ep in report.get("per_episode") or []
+                if isinstance(ep, dict) and ep.get("geometry_gid")}
+        return len(gids) if gids else None
+
+    def _update_sr_card(self):
+        paths = self._run_eval_paths(self.run_dir)
+        var, sub = self.card_vars["closed_loop_sr"], self.hero_sub["closed_loop_sr"]
+        if not paths:
+            var.set("—")
+            sub.set("尚无闭环评测 · 训练分类指标 ≠ 闭环成功率")
+            return
+        if len(paths) > 1:
+            var.set(f"多评测({len(paths)})")
+            detail = "多评测未合并，口径可能不同；在 Experiments 页选择具体报告"
+            try:
+                latest = json.loads(Path(paths[0]).read_text(encoding="utf-8"))
+                maps = self._report_maps(latest)
+                detail = (f"最新：{eval_rate_context(latest)} · "
+                          f"{maps if maps is not None else '—'} 张图 · " + detail)
+            except (OSError, ValueError, RecursionError):
+                pass
+            sub.set(detail)
+            return
+        try:
+            report = json.loads(Path(paths[0]).read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            var.set("—")
+            sub.set("eval.json 无法读取")
+            return
+        sr = safe_float(report.get("success_rate"))
+        maps = self._report_maps(report)
+        var.set(f"{sr:.3f}" if sr is not None else "未标注")
+        # 报告必须同时给出判据、请求集成功率、完成率和失败数：三者分母不同，
+        # 只报 success_rate 会让“被跳过的集”看起来像成功。
+        sub.set(f"{eval_rate_context(report)} · {maps if maps is not None else '—'} 张图")
+
     def _update_dashboard(self):
         rows = self._rows
         valid = [r for r in rows if r.get("epoch") is not None]
@@ -1111,39 +1563,99 @@ class StudioApp:
         self.card_vars["epoch"].set(str(len(valid)))
         self.card_vars["train_ce"].set(f"{last['train_ce']:.4f}" if last.get("train_ce") is not None else "—")
         self.card_vars["dev_ce"].set(f"{last['dev_ce']:.4f}" if last.get("dev_ce") is not None else "—")
-        self.card_vars["dev_macro"].set(f"{safe_float(best.get('macro_f1')):.3f}" if best and safe_float(best.get("macro_f1")) is not None else "—")
+        best_f1 = safe_float(best.get("macro_f1")) if best else None
+        self.card_vars["dev_macro"].set(f"{best_f1:.3f}" if best_f1 is not None else "—")
         self.card_vars["test_macro"].set(f"{safe_float(test.get('macro_f1')):.3f}" if test and safe_float(test.get("macro_f1")) is not None else "—")
         self.card_vars["test_bal"].set(f"{safe_float(test.get('balanced_accuracy')):.3f}" if test and safe_float(test.get("balanced_accuracy")) is not None else "—")
-        latest_sr = None
-        try:
-            run_summary = json.loads((self.run_dir / "studio_summary.json").read_text(encoding="utf-8"))
-            evals = run_summary.get("closed_loop_evaluations", [])
-            if evals:
-                latest_sr = safe_float(evals[-1].get("success_rate"))
-        except (OSError, ValueError, TypeError):
-            pass
-        self.card_vars["closed_loop_sr"].set(f"{latest_sr:.3f}" if latest_sr is not None else "—")
+        self._update_sr_card()
         if test:
             self.test_summary_var.set(
-                f"离线 test：Acc={test.get('action_accuracy')} · Macro-F1={test.get('macro_f1')} · "
-                f"Balanced Acc={test.get('balanced_accuracy')}。这是动作分类指标，不是闭环导航 SR。")
+                f"test：Acc={test.get('action_accuracy')} · Macro-F1={test.get('macro_f1')} · "
+                f"Bal={test.get('balanced_accuracy')}（动作分类，不是导航 SR）")
         else:
             self.test_summary_var.set("当前没有 test split validation 事件；缺失指标保持 —，不会用训练准确率代替。")
         confusion = test.get("confusion") if test else None
         if isinstance(confusion, list) and len(confusion) == 16:
-            matrix = [confusion[i:i + 4] for i in range(0, 16, 4)]
-            self.confusion_var.set("Test confusion matrix（行=真值，列=预测；SAFE_NEUTRAL/FORWARD_SLOW/YAW_LEFT/YAW_RIGHT）：\n" +
-                                   "\n".join("  " + "  ".join(str(v) for v in row) for row in matrix))
-            recalls = []
-            for i, row in enumerate(matrix):
-                total = sum(safe_float(v) or 0.0 for v in row)
-                diagonal = safe_float(row[i])
-                recalls.append(f"{ACTION_NAMES[i]}={diagonal / total:.3f}" if total > 0 and diagonal is not None else f"{ACTION_NAMES[i]}=—")
-            self.per_class_var.set("Per-class Recall：" + " · ".join(recalls))
+            self._confusion_matrix = [[safe_float(v) or 0.0 for v in confusion[i:i + 4]]
+                                      for i in range(0, 16, 4)]
+            self._recalls = []
+            for i, row in enumerate(self._confusion_matrix):
+                total = sum(row)
+                self._recalls.append({"class": ACTION_NAMES[i],
+                                      "recall": (row[i] / total) if total > 0 else None})
         else:
-            self.confusion_var.set("Test confusion matrix：—（当前 run 未提供有效 test confusion）")
-            self.per_class_var.set("Per-class Recall：—")
+            self._confusion_matrix = None
+            self._recalls = []
+        self._draw_confusion()
+        self._draw_recall()
         self._redraw_charts()
+
+    def _draw_confusion(self):
+        if not hasattr(self, "confusion_canvas"):
+            return
+        c = self.confusion_canvas
+        c.delete("all")
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        matrix = self._confusion_matrix
+        if not matrix:
+            c.create_text(w / 2, h / 2, text="Test confusion matrix：—（当前 run 无有效 test confusion）",
+                          fill="#64748B", font=("TkDefaultFont", 9))
+            return
+        short = ("SN", "FS", "YL", "YR")
+        left, top = 30, 20
+        cell = max(8, min((w - left - 6) / 4, (h - top - 22) / 4))
+        def mix(t):
+            a, b = (0x16, 0x23, 0x3A), (0x25, 0x63, 0xEB)
+            return "#%02X%02X%02X" % tuple(round(x + (y - x) * t) for x, y in zip(a, b))
+        for j, name in enumerate(short):
+            c.create_text(left + cell * (j + 0.5), top - 8, text=name, anchor="s",
+                          fill="#94A3B8", font=("TkDefaultFont", 9, "bold"))
+        for i, row in enumerate(matrix):
+            total = sum(row) or 1.0
+            c.create_text(left - 7, top + cell * (i + 0.5), text=short[i], anchor="e",
+                          fill="#94A3B8", font=("TkDefaultFont", 9, "bold"))
+            for j, value in enumerate(row):
+                x0, y0 = left + cell * j, top + cell * i
+                c.create_rectangle(x0, y0, x0 + cell, y0 + cell, fill=mix(value / total),
+                                   outline="#0B1220")
+                if i == j:
+                    c.create_rectangle(x0 + 1, y0 + 1, x0 + cell - 1, y0 + cell - 1,
+                                       outline="#34D399", width=2)
+                c.create_text(x0 + cell / 2, y0 + cell / 2, text=str(int(value)),
+                              fill="#F8FAFC", font=("TkDefaultFont", 9))
+        c.create_text(left, top + cell * 4 + 6,
+                      text="行=真值，列=预测 · SN/FS/YL/YR · 颜色=行内占比",
+                      anchor="nw", fill="#94A3B8", font=("TkDefaultFont", 8))
+
+    def _draw_recall(self):
+        if not hasattr(self, "recall_canvas"):
+            return
+        c = self.recall_canvas
+        c.delete("all")
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        if not self._recalls:
+            c.create_text(w / 2, h / 2, text="Per-class Recall：—", fill="#64748B",
+                          font=("TkDefaultFont", 9))
+            return
+        row_h = 25
+        short = ("SN", "FS", "YL", "YR")
+        for i, item in enumerate(self._recalls[:4]):
+            y0 = i * row_h
+            value = item.get("recall")
+            c.create_text(0, y0 + row_h / 2, text=short[i], anchor="w",
+                          fill="#94A3B8", font=("TkDefaultFont", 9))
+            bar_x, bar_w = 26, max(10, w - 26 - 42)
+            c.create_rectangle(bar_x, y0 + 7, bar_x + bar_w, y0 + row_h - 7,
+                               fill="#16233A", outline="")
+            if value is not None:
+                color = "#F87171" if value < 0.4 else ("#F59E0B" if value < 0.7 else "#34D399")
+                c.create_rectangle(bar_x, y0 + 7, bar_x + bar_w * min(1.0, value),
+                                   y0 + row_h - 7, fill=color, outline="")
+                c.create_text(w - 2, y0 + row_h / 2, text=f"{value:.2f}", anchor="e",
+                              fill="#CBD5E1", font=("TkDefaultFont", 9))
+            else:
+                c.create_text(w - 2, y0 + row_h / 2, text="—", anchor="e", fill="#64748B",
+                              font=("TkDefaultFont", 9))
 
     def _update_event_text(self):
         lines = []
@@ -1277,7 +1789,7 @@ class StudioApp:
             self.world_var.set(str(out))
             self.meta_var.set(str(meta) if meta.is_file() else "")
             self._load_world_geometry()
-            self._sim_status_var.set(f"场景已生成 · {out.name}；现在可以启动 Gazebo GUI")
+            self._sim_status_var.set(f"场景已生成 · {out.name}；现在可以启动 Gazebo")
         else:
             self._sim_status_var.set(f"场景生成失败 rc={rc} · 查看 {out}")
 
@@ -1299,16 +1811,39 @@ class StudioApp:
         existing_resources = os.environ.get("GZ_SIM_RESOURCE_PATH", "")
         resources = [worlds_resource] + [x for x in existing_resources.split(os.pathsep) if x]
         os.environ["GZ_SIM_RESOURCE_PATH"] = os.pathsep.join(dict.fromkeys(resources))
-        env = os.environ.copy()
-        env["GZ_PARTITION"] = partition
+        try:
+            # 复用采集脚本的 EGL/XDG 环境；容器里 GUI 渲染会失败，统一走 headless server。
+            import collect_parallel
+            env = collect_parallel.gz_env(partition)
+            xdg = env.get("XDG_RUNTIME_DIR")
+            if xdg:
+                os.environ["XDG_RUNTIME_DIR"] = xdg  # 同步回本进程，后续 gz 命令共用
+                try:
+                    Path(xdg).mkdir(mode=0o700, parents=True, exist_ok=True)
+                except OSError:
+                    pass
+        except (ImportError, ValueError, OSError) as exc:
+            self._sim_status_var.set(f"Gazebo 环境准备失败：{exc}")
+            messagebox.showerror("Gazebo 环境准备失败", str(exc))
+            return
+        env["GZ_SIM_RESOURCE_PATH"] = os.environ["GZ_SIM_RESOURCE_PATH"]
         log_dir = RUNS_ROOT / "simulation_logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / (datetime.now().strftime("%Y%m%d-%H%M%S") + "-gazebo.log")
-        self._sim_log_handle = log_path.open("ab", buffering=0)
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / (datetime.now().strftime("%Y%m%d-%H%M%S") + "-gazebo.log")
+            self._sim_log_handle = log_path.open("ab", buffering=0)
+        except OSError as exc:
+            self._sim_status_var.set(f"Gazebo 日志无法写入：{exc}")
+            messagebox.showerror("数据目录不可用", f"无法写入仿真日志：\n{log_dir}\n\n{exc}")
+            return
         self._sim_world_path = world
         self._sim_world_sha256 = sha256_file(world)
+        cmd = ["gz", "sim", "-s", "-r"]
+        if env.get("UAVRGB_RENDER_BACKEND") == "gpu":
+            cmd.append("--headless-rendering")
+        cmd.append(str(world))
         try:
-            self._sim_proc = subprocess.Popen(["gz", "sim", "-r", str(world)], cwd=str(REPO_ROOT),
+            self._sim_proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT),
                                               env=env, stdin=subprocess.DEVNULL,
                                               stdout=self._sim_log_handle, stderr=subprocess.STDOUT,
                                               start_new_session=True)
@@ -1320,7 +1855,7 @@ class StudioApp:
             self.disconnect_sim()
             self._sim_status_var.set(f"Gazebo 启动失败：{exc}")
             return
-        self._sim_status_var.set(f"Gazebo GUI 启动中 · partition={partition}")
+        self._sim_status_var.set(f"Gazebo headless 启动中 · partition={partition}")
         self._load_world_geometry()
         self.root.after(3500, self.connect_sim)
 
@@ -1347,7 +1882,11 @@ class StudioApp:
             self._sim_status_var.set(f"订阅失败：{exc}")
             return
         self._sim_last_seq = {"fpv": 0, "chase": 0, "top": 0}
+        self._sim_frame_stamps = {"fpv": None, "chase": None, "top": None}
         self._sim_path.clear()
+        self._sim_pose = None
+        self._sim_last_pose_wall = None
+        self.sim_info_var.set("等待 Gazebo 位姿数据")
         self._sim_status_var.set("已连接 Gazebo Transport · 等待相机帧")
         self._load_world_geometry()
 
@@ -1358,6 +1897,15 @@ class StudioApp:
             except Exception:
                 pass
         self._sim_subs = {}
+        self._sim_last_seq = {"fpv": 0, "chase": 0, "top": 0}
+        self._sim_frame_stamps = {"fpv": None, "chase": None, "top": None}
+        self._sim_pose = None
+        self._sim_path.clear()
+        self._sim_last_pose_wall = None
+        try:
+            self.sim_info_var.set("等待 Gazebo 位姿数据")
+        except (tk.TclError, AttributeError):
+            pass
         for key, label in (("fpv", self.fpv_label), ("chase", self.chase_label),
                            ("top", self.topcam_label)):
             try:
@@ -1365,6 +1913,11 @@ class StudioApp:
             except (tk.TclError, AttributeError):
                 pass
             self._sim_photos.pop(key, None)
+            status = self._cam_status_vars.get(key)
+            if status is not None:
+                status.set("视角已断开")
+        if hasattr(self, "top_canvas"):
+            self._draw_topdown()
         if self._sim_partition_active is not None:
             if self._sim_partition_old is None:
                 os.environ.pop("GZ_PARTITION", None)
@@ -1391,11 +1944,11 @@ class StudioApp:
             w, h, nch, png = save_frame.png_bytes(msg)
             label = {"fpv": self.fpv_label, "chase": self.chase_label,
                      "top": self.topcam_label}[key]
+            label.update_idletasks()
+            max_w = max(1, label.winfo_width() - 12)
+            max_h = max(1, label.winfo_height() - 12)
             if Image is not None and ImageTk is not None:
                 image = Image.open(io.BytesIO(png)).convert("RGB")
-                label.update_idletasks()
-                max_w = max(320, label.winfo_width() - 12)
-                max_h = max(220, label.winfo_height() - 12)
                 scale = min(1.0, max_w / max(1, w), max_h / max(1, h))
                 if scale < 0.999:
                     resampling = getattr(Image, "Resampling", Image)
@@ -1404,9 +1957,15 @@ class StudioApp:
                 photo = ImageTk.PhotoImage(image)
             else:
                 photo = tk.PhotoImage(data=base64.b64encode(png).decode("ascii"), format="png")
+                factor = max(1, math.ceil(max(w / max_w, h / max_h)))
+                if factor > 1:  # 无 PIL 时至少整数降采样，避免超出面板被裁切
+                    photo = photo.subsample(factor, factor)
             label.configure(image=photo, text="")
             self._sim_photos[key] = photo
             self._sim_frames_seen[key] += 1
+            stamp = gz_io.header_stamp_ns(msg)
+            if stamp:
+                self._sim_frame_stamps[key] = stamp
         except Exception as exc:
             label = {"fpv": self.fpv_label, "chase": self.chase_label,
                      "top": self.topcam_label}[key]
@@ -1430,6 +1989,9 @@ class StudioApp:
                 pose = parse_pose_msg(pose_msg) if pose_msg else None
                 if pose:
                     x, y, z, yaw, sim_ns = pose
+                    prev_ns = self._sim_pose[4] if self._sim_pose else None
+                    if sim_ns != prev_ns:
+                        self._sim_last_pose_wall = time.monotonic()
                     self._sim_pose = pose
                     if not self._sim_path or math.hypot(x - self._sim_path[-1][0], y - self._sim_path[-1][1]) > 0.005:
                         self._sim_path.append((x, y))
@@ -1438,11 +2000,28 @@ class StudioApp:
                         f"Yaw={math.degrees(yaw):.1f}°    Sim time={sim_ns / 1e9:.2f} s    "
                         f"Path points={len(self._sim_path)}")
                     self._draw_topdown()
+                now_ns = self._sim_pose[4] if self._sim_pose else None
+                pose_stale = (self._sim_pose is not None and
+                              self._sim_last_pose_wall is not None and
+                              time.monotonic() - self._sim_last_pose_wall > SIM_STALE_S)
                 statuses = []
-                for key, topic in (("fpv", CAMERA_TOPIC), ("chase", CHASE_TOPIC),
-                                   ("top", TOP_TOPIC), ("pose", POSE_TOPIC)):
+                for key in ("fpv", "chase", "top"):
                     sub = self._sim_subs.get(key)
-                    statuses.append(f"{key}:{'OK' if sub and sub.healthy() and sub.frames() else 'WAIT'}")
+                    stamp = self._sim_frame_stamps.get(key)
+                    if pose_stale and stamp:
+                        statuses.append(f"{key}:STALE")
+                    elif not sub or not sub.healthy() or not stamp or now_ns is None:
+                        statuses.append(f"{key}:WAIT")
+                    else:
+                        age = (now_ns - stamp) / 1e9
+                        statuses.append(f"{key}:{'STALE %.1fs' % age if age > SIM_STALE_S else 'OK'}")
+                    self._cam_status_vars[key].set(self._camera_age_text(key, now_ns))
+                if self._sim_pose is None:
+                    statuses.append("pose:WAIT")
+                elif pose_stale:
+                    statuses.append("pose:STALE")
+                else:
+                    statuses.append("pose:OK")
                 self._sim_status_var.set("Gazebo " + " · ".join(statuses))
             if self._live_proc is not None:
                 rc = self._live_proc.poll()
@@ -1466,6 +2045,19 @@ class StudioApp:
         finally:
             if not self._closing:
                 self.root.after(80, self._sim_tick)
+
+    def _camera_age_text(self, key, now_ns):
+        stamp = self._sim_frame_stamps.get(key)
+        if not stamp:
+            return "等待相机数据…"
+        if now_ns is None:
+            return f"last sim {stamp / 1e9:.2f} s · 等待 pose"
+        age = max(0.0, (now_ns - stamp) / 1e9)
+        stale = age > SIM_STALE_S
+        if (self._sim_last_pose_wall is not None and
+                time.monotonic() - self._sim_last_pose_wall > SIM_STALE_S):
+            stale = True
+        return f"last sim {stamp / 1e9:.2f} s · age {age:.2f} s" + (" · STALE" if stale else "")
 
     def _draw_topdown(self):
         if not hasattr(self, "top_canvas"):
@@ -1701,7 +2293,7 @@ class StudioApp:
                     "return_code": rc, "finished_at": summary["finished_at"]})
                 write_json_atomic(summary_path, run_summary)
                 write_experiment_report(self.run_dir, run_summary)
-                self.refresh_history()
+                self.refresh_history(force=True)
             self.live_action_var.set(f"学生策略演示结束 rc={rc} · steps={len(actions)} · collision_steps={collisions} · 结果：{self._live_out}")
         self.live_btn.configure(state="normal")
         self.live_stop_btn.configure(state="disabled")
@@ -1783,6 +2375,9 @@ class StudioApp:
         entries = summary.setdefault("closed_loop_evaluations", [])
         entry = {"task": report.get("task"), "split": report.get("split"),
                  "success_rate": report.get("success_rate"),
+                 "requested_success_rate": report.get("requested_success_rate"),
+                 "completion_rate": report.get("completion_rate"),
+                 "failed_count": report.get("failed_count"),
                  "collision_rate": report.get("collision_rate"),
                  "stuck_rate": report.get("stuck_rate"),
                  "false_forward_rate": report.get("false_forward_rate"),
@@ -1790,12 +2385,15 @@ class StudioApp:
                  "episodes_requested": report.get("episodes_requested"),
                  "unique_maps": report.get("unique_maps", report.get("unique_geometry")),
                  "success_criterion": report.get("success_criterion"),
+                 "window_from": report.get("window_from"),
+                 "dynamics": report.get("dynamics"),
+                 "ckpt_sha256": report.get("ckpt_sha256"),
                  "eval_json": str(self.eval_out / "eval.json") if self.eval_out else None,
                  "return_code": return_code, "finished_at": now_iso()}
         entries.append(entry)
         write_json_atomic(summary_path, summary)
         write_experiment_report(self.run_dir, summary)
-        self.refresh_history()
+        self.refresh_history(force=True)
         self.refresh_run(force=True)
 
     def open_eval_dir(self):
@@ -1861,52 +2459,298 @@ class StudioApp:
                                           "finished_at": summary["finished_at"],
                                           "recovered_by_studio": True})
 
-    def refresh_history(self):
+    @staticmethod
+    def _rel_path(path: Path):
+        try:
+            return str(Path(path).resolve().relative_to(DATA_ROOT))
+        except (ValueError, OSError):
+            return str(path)
+
+    def _run_metrics(self, run_dir):
+        """历史 run 的轻量指标：优先 studio_summary，否则只读 metrics.jsonl 尾部。"""
+        summary_path = run_dir / "studio_summary.json"
+        if summary_path.is_file():
+            try:
+                s = json.loads(summary_path.read_text(encoding="utf-8"))
+                m = s.get("metrics", {}) or {}
+                return (m.get("epochs_completed"), m.get("test_macro_f1"),
+                        m.get("test_balanced_accuracy"), s.get("status", "—"),
+                        s.get("started_at"))
+            except (OSError, ValueError, RecursionError, TypeError):
+                pass
+        epochs = len(read_training_rows(run_dir))
+        tests = [e for e in _tail_jsonl(run_dir / "metrics.jsonl")
+                 if e.get("event") == "validation" and e.get("split") == "test"]
+        test = tests[-1] if tests else {}
+        return (epochs or None, test.get("macro_f1"), test.get("balanced_accuracy"),
+                "—", None)
+
+    @staticmethod
+    def _sr_text(eval_paths):
+        n = len(eval_paths)
+        if n == 0:
+            return "—"
+        if n > 1:
+            return f"多评测({n})"
+        try:
+            report = json.loads(Path(eval_paths[0]).read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            return "—"
+        sr = safe_float(report.get("success_rate"))
+        return f"{sr:.3f}" if sr is not None else "未标注"
+
+    def _scan_runs(self, force=False):
+        """扫描 DATA_ROOT/uav_rgb（两层）并缓存；_tick 每秒刷新绝不触发这里。"""
+        root = DATA_ROOT / "uav_rgb"
+        sig = []
+        try:
+            sig.append((str(root), root.stat().st_mtime_ns))
+            for top in sorted(root.iterdir()):
+                if top.is_dir():
+                    sig.append((top.name, top.stat().st_mtime_ns))
+        except OSError:
+            sig.append(("missing", 0))
+        sig = tuple(sig)
+        # shortcut: 深层 eval.json 内容变化不一定改动顶层 mtime；刷新按钮会 force 重扫。
+        if not force and self._scan_cache is not None and self._scan_sig == sig:
+            return self._scan_cache
+        runs = discover_runs([root])
+        index, standalone, stale = eval_index([root])
+        entries = []
+        run_set = {p.resolve() for p in runs}
+        for run_dir in runs:
+            resolved = run_dir.resolve()
+            evals = list(index.get(resolved, []))
+            own = run_dir / "eval.json"
+            if own.is_file() and own not in evals:
+                try:
+                    report = json.loads(own.read_text(encoding="utf-8"))
+                except (OSError, ValueError, RecursionError):
+                    report = None
+                if not isinstance(report, dict) or eval_ckpt_state(resolved, report) != "stale":
+                    evals.append(own)
+            has_training = any((run_dir / name).is_file()
+                               for name in ("metrics.jsonl", "results.csv", "studio_summary.json"))
+            kind = "训练" if has_training else "独立评测"
+            epochs, macro, bal, status, started = self._run_metrics(run_dir)
+            if not started:
+                try:
+                    started = datetime.fromtimestamp(run_dir.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+                except OSError:
+                    started = "—"
+            entries.append({"path": run_dir, "kind": kind, "evals": evals,
+                            "status": status, "epochs": epochs, "macro": macro,
+                            "bal": bal, "sr": self._sr_text(evals), "started": started,
+                            **eval_fields_for_latest(evals)})
+        for ev in standalone:
+            # 已在 run 行里出现过的目录不再重复列。
+            if ev.parent.resolve() in run_set:
+                continue
+            try:
+                report = json.loads(ev.read_text(encoding="utf-8"))
+            except (OSError, ValueError, RecursionError):
+                continue
+            if not isinstance(report, dict):
+                continue
+            sr = safe_float(report.get("success_rate"))
+            entries.append({"path": ev, "kind": "独立评测", "evals": [ev], "status": "—",
+                            "epochs": None, "macro": None, "bal": None,
+                            "sr": f"{sr:.3f}" if sr is not None else "未标注",
+                            "started": datetime.fromtimestamp(ev.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                            **eval_display_fields(report)})
+        for ev in stale:
+            # ckpt_sha256 与当前 ckpt_best.bin 不一致：单独列出，不挂到新 run。
+            try:
+                report = json.loads(ev.read_text(encoding="utf-8"))
+            except (OSError, ValueError, RecursionError):
+                continue
+            if not isinstance(report, dict):
+                continue
+            sr = safe_float(report.get("success_rate"))
+            entries.append({"path": ev, "kind": "旧评测", "evals": [ev],
+                            "status": "旧 checkpoint/旧评测",
+                            "epochs": None, "macro": None, "bal": None,
+                            "sr": f"{sr:.3f}" if sr is not None else "未标注",
+                            "started": datetime.fromtimestamp(ev.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                            **eval_display_fields(report)})
+        def _mtime(entry):
+            try:
+                return entry["path"].stat().st_mtime
+            except OSError:
+                return 0.0
+        entries.sort(key=_mtime, reverse=True)
+        self._scan_sig = sig
+        self._scan_cache = entries
+        self._eval_index = index
+        self._standalone_evals = standalone
+        return entries
+
+    def refresh_history(self, force=False):
         if not hasattr(self, "history_tree"):
             return
-        self.history_tree.delete(*self.history_tree.get_children())
-        RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+        # DATA_ROOT 配错时不能让界面启动即崩。
+        try:
+            RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            if messagebox is not None:
+                messagebox.showerror("数据目录不可用",
+                                     f"无法创建 {RUNS_ROOT}：\n{exc}\n\n"
+                                     "请检查 DATA_ROOT 环境变量是否指向可写目录。")
+            return
         self._recover_detached_runs()
-        run_dirs = sorted((p for p in RUNS_ROOT.iterdir() if p.is_dir() and p.name != "simulation_logs"),
-                          key=lambda p: p.stat().st_mtime, reverse=True)
-        for run_dir in run_dirs[:300]:
-            summary_path = run_dir / "studio_summary.json"
-            try:
-                if summary_path.exists():
-                    s = json.loads(summary_path.read_text(encoding="utf-8"))
-                else:
-                    sidecar = Path(str(run_dir) + ".monitor")
-                    life = json.loads((sidecar / "lifecycle.json").read_text(encoding="utf-8"))
-                    job = json.loads((sidecar / "job.json").read_text(encoding="utf-8"))
-                    s = {"run_id": run_dir.name, "status": "running_detached",
-                         "started_at": job.get("started_at"), "metrics": {
-                             "epochs_completed": len(read_training_rows(run_dir)),
-                             "test_macro_f1": None, "test_balanced_accuracy": None}}
-                    if not self._run_pid_alive(life.get("pid") or job.get("pid"), run_dir):
-                        continue
-            except (OSError, ValueError, KeyError):
-                continue
-            m = s.get("metrics", {})
-            evals = s.get("closed_loop_evaluations", [])
-            latest_sr = evals[-1].get("success_rate") if evals else None
-            self.history_tree.insert("", "end", iid=str(run_dir),
-                                     text=s.get("run_id", run_dir.name),
-                                     values=(s.get("status", "—"), m.get("epochs_completed", "—"),
-                                             m.get("test_macro_f1") if m.get("test_macro_f1") is not None else "—",
-                                             m.get("test_balanced_accuracy") if m.get("test_balanced_accuracy") is not None else "—",
-                                             latest_sr if latest_sr is not None else "—",
-                                             s.get("started_at", "—")))
+        entries = self._scan_runs(force)
+        self.history_tree.delete(*self.history_tree.get_children())
+        for item in entries[:300]:
+            path = item["path"]
+            self.history_tree.insert(
+                "", "end", iid=str(path),
+                values=(self._rel_path(path if path.name != "eval.json" else path.parent),
+                        item["kind"], item["status"] or "—",
+                        item["task"], item["criterion"], item["window_from"],
+                        item["dynamics"],
+                        item["epochs"] if item["epochs"] is not None else "—",
+                        f"{item['macro']:.4f}" if isinstance(item["macro"], (int, float)) else "—",
+                        f"{item['bal']:.4f}" if isinstance(item["bal"], (int, float)) else "—",
+                        item["sr"], item["started"] or "—"))
 
-    def load_selected_history(self):
+    def _pick_eval(self, run_dir):
+        """按任务约定：closed_loop_eval_* 最新 mtime > run_dir/eval.json > 反查索引。
+
+        ckpt_sha256 与当前 ckpt_best.bin 不一致的旧评测不自动选中；它们仍在
+        Experiments 表里以“旧评测”单独列出。
+        """
+        run_dir = Path(run_dir)
+        def current(path):
+            try:
+                report = json.loads(Path(path).read_text(encoding="utf-8"))
+            except (OSError, ValueError, RecursionError):
+                return False
+            return isinstance(report, dict) and eval_ckpt_state(run_dir, report) != "stale"
+        candidates = sorted(run_dir.glob("closed_loop_eval_*/eval.json"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+        for path in candidates:
+            if current(path):
+                return path
+        own = run_dir / "eval.json"
+        if own.is_file() and current(own):
+            return own
+        paths = [p for p in self._run_eval_paths(run_dir) if current(p)]
+        return max(paths, key=lambda p: p.stat().st_mtime) if paths else None
+
+    def load_selected_history(self, show_dashboard=True):
         sel = self.history_tree.selection()
-        if sel:
-            self.load_run(Path(sel[0]))
+        if not sel:
+            return
+        path = Path(sel[0])
+        if path.name == "eval.json":
+            self.load_run(path.parent)
+            self._load_eval_report(path)
+        else:
+            self.load_run(path)
+            ev = self._pick_eval(path)
+            if ev:
+                self._load_eval_report(ev)
+        if show_dashboard:
             self.tabs.select(self.dashboard_tab)
+
+    @staticmethod
+    def _format_actions(actions):
+        if not isinstance(actions, dict):
+            return "—"
+        short = ("SN", "FS", "YL", "YR")
+        counts = [0, 0, 0, 0]
+        for key, value in actions.items():
+            try:
+                idx = int(key)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= idx < len(counts):
+                counts[idx] = value
+        return " ".join(f"{short[i]}={counts[i]}" for i in range(4))
+
+    def _load_eval_report(self, path):
+        try:
+            report = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            return
+        if not isinstance(report, dict):
+            return
+        self._eval_report = report
+        episodes = [ep for ep in report.get("per_episode") or [] if isinstance(ep, dict)]
+        self._eval_episodes = episodes
+        total = len(episodes)
+        results = [classify_episode(ep) for ep in episodes]
+        # chip 用 eval.json 的原始布尔字段计数，与报告里的 collision_rate/
+        # false_forward_rate 同口径；false_forward 同时满足 collision，互斥标签
+        # 会把它从“碰撞”里扣掉，也会让“假前进”恒为 0。
+        def rate(field, report_key):
+            if total and all(field in ep for ep in episodes):
+                return f"{sum(1 for ep in episodes if ep.get(field)) / total * 100:.0f}%"
+            value = safe_float(report.get(report_key))
+            return f"{value * 100:.0f}%" if value is not None else "未标注"
+        has_success = total and all("success" in ep for ep in episodes)
+        sr = safe_float(report.get("success_rate"))
+        if sr is None and has_success:
+            sr = sum(1 for ep in episodes if ep.get("success")) / total
+        maps = self._report_maps(report)
+        p95 = safe_float((report.get("inference_ms") or {}).get("p95"))
+        self.eval_chip_vars["sr"].set(f"{sr * 100:.0f}%" if sr is not None else "未标注")
+        self.eval_chip_vars["collision"].set(rate("collision", "collision_rate"))
+        self.eval_chip_vars["stuck"].set(rate("stuck", "stuck_rate"))
+        self.eval_chip_vars["false_forward"].set(rate("false_forward", "false_forward_rate"))
+        flags = ("success", "collision", "stuck", "false_forward")
+        if total and all(any(k in ep for k in flags) for ep in episodes):
+            self.eval_chip_vars["unreached"].set(
+                f"{results.count('未到达') / total * 100:.0f}%")
+        else:
+            self.eval_chip_vars["unreached"].set("未标注")
+        self.eval_chip_vars["maps"].set(str(maps) if maps is not None else "未标注")
+        self.eval_chip_vars["p95"].set(f"{p95:.1f} ms" if p95 is not None else "未标注")
+        criterion = report.get("success_criterion") or "口径未标注"
+        try:
+            rel = self._rel_path(path)
+        except (TypeError, ValueError):
+            rel = str(path)
+        self.eval_detail_box.configure(text=f"评测明细 · {rel} · {criterion}")
+        self._fill_episode_table()
+
+    def _fill_episode_table(self):
+        if not hasattr(self, "eval_tree"):
+            return
+        self.eval_tree.delete(*self.eval_tree.get_children())
+        choice = self.eval_filter_var.get()
+        field_filter = {"碰撞": "collision", "卡住": "stuck", "假前进": "false_forward"}
+        episodes = self._eval_episodes
+        shown = 0
+        for i, ep in enumerate(episodes, 1):
+            result = classify_episode(ep)
+            # 失败筛选用原始字段，避免“碰撞但假前进”被互斥标签挡在“碰撞”之外；
+            # “未到达”仍是互斥分类里没有其它 flag 的集。
+            if choice == "仅失败" and ep.get("success"):
+                continue
+            if choice == "成功" and not ep.get("success"):
+                continue
+            if choice in field_filter and not ep.get(field_filter[choice]):
+                continue
+            if choice == "未到达" and result != "未到达":
+                continue
+            shown += 1
+            max_x = safe_float(ep.get("max_x"))
+            wp_min = safe_float(ep.get("waypoint_min_dist"))
+            self.eval_tree.insert(
+                "", "end", tags=(result,),
+                values=(i, ep.get("seed", "—"), result, ep.get("steps", "—"),
+                        f"{max_x:.2f}" if max_x is not None else "—",
+                        f"{wp_min:.2f}" if wp_min is not None else "—",
+                        self._format_actions(ep.get("actions")),
+                        ep.get("instruction", "—")))
+        self.eval_count_var.set(f"显示 {shown}/{len(episodes)}")
 
     def open_selected_history(self):
         sel = self.history_tree.selection()
         if sel:
-            self._open_path(Path(sel[0]))
+            self._open_path(Path(sel[0]).parent if Path(sel[0]).name == "eval.json"
+                            else Path(sel[0]))
 
     def open_report(self):
         if self.run_dir:
@@ -1968,7 +2812,11 @@ class StudioApp:
             self._training_status_var.set(f"已加载实验 · {path}")
 
     def open_data_root(self):
-        RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+        try:
+            RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            messagebox.showerror("数据目录不可用", f"无法创建 {RUNS_ROOT}：\n{exc}")
+            return
         self._open_path(DATA_ROOT / "uav_rgb")
 
     def _open_path(self, path: Path):
@@ -2007,7 +2855,7 @@ class StudioApp:
                 if not summary_path.exists():
                     self._recover_detached_runs()
                     if summary_path.exists():
-                        self.refresh_history()
+                        self.refresh_history(force=True)
                         self._detached_pid = None
                         self.start_train_btn.configure(state="normal")
                         self.stop_detached_btn.configure(state="disabled")
@@ -2034,9 +2882,13 @@ class StudioApp:
                     if report:
                         self._attach_eval_to_run(report, rc)
                         self._eval_status_var.set(
-                            f"闭环评测结束 rc={rc} · SR={report.get('success_rate')} · collision={report.get('collision_rate')} · "
+                            f"闭环评测结束 rc={rc} · success={report.get('success_rate')} · "
+                            f"requested={report.get('requested_success_rate')} · "
+                            f"collision={report.get('collision_rate')} · "
                             f"episodes={report.get('episodes_done')}/{report.get('episodes_requested')} · "
-                            f"completion={report.get('completion_rate')} · unique_maps={report.get('unique_maps', report.get('unique_geometry'))}")
+                            f"completion={report.get('completion_rate')} · "
+                            f"failed={report.get('failed_count')} · "
+                            f"unique_maps={report.get('unique_maps', report.get('unique_geometry'))}")
                     else:
                         self._eval_status_var.set(f"闭环评测结束 rc={rc} · 请检查 {self.eval_out}")
             if self._live_proc is not None:

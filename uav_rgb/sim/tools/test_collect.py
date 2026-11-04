@@ -7,6 +7,7 @@
 import base64
 import contextlib
 import io
+import math
 import os
 import struct
 import subprocess
@@ -166,6 +167,28 @@ def stale_depth_fails():
     return row, err
 
 
+def depth_gap_step(extra_ns):
+    """depth/RGB 配对边界：刚好 100 ms 放行，超过 100 ms 该步失败。
+
+    audit_dataset.py 的 depth 阈值依赖这个 `>` 语义（等于阈值算通过）。
+    """
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    dep = _fresh_depth(w, h, sec=10)
+    dep["header"] = {"stamp": {"sec": 10, "nsec": extra_ns}}
+    pose = ClockPoseSub(pose_msg(10.5))
+    subs = {"rgb": FakeSub(after=rgb), "depth": FakeSub(frames=[(1, dep)]),
+            "pose": pose, "contact": FakeSub()}
+
+    def advance(_secs):
+        pose.current = pose_msg(11.5)      # 动作窗口走满 1 s
+
+    with tempfile.TemporaryDirectory() as d, \
+            patch.object(collect, "write_rgb_png", return_value=(True, None)), \
+            patch.object(collect.time, "sleep", side_effect=advance):
+        return collect.collect_one(d, 0, 1.0, "teacher", subs, FakePub())
+
+
 def dead_depth_fails():
     """depth 订阅进程退出：即使缓冲里还有旧帧也必须失败。"""
     w, h = 4, 6
@@ -322,7 +345,197 @@ def takeoff_contact_baseline():
     return baseline == 1 and collect._contact_since(contact_sub, baseline)
 
 
+def cf_stab_model():
+    """CfStab 解析解：终端速度、延迟、滑行、分段积分一致、机体系换算。"""
+    S = 1_000_000_000
+    out = {}
+    d = collect.CfStab(tilt_deg=10.0, drag_k=1.0, latency_s=0.0)
+    d.dispatch(collect.FORWARD_SLOW, 0)
+    d.step(0, 0.0)
+    vx, _, _ = d.step(20 * S, 0.0)
+    out["terminal"] = abs(vx - 9.81 * math.tan(math.radians(10)) / 1.0) < 1e-6
+    a = collect.CfStab(latency_s=0.0)
+    b = collect.CfStab(latency_s=0.0)
+    for m in (a, b):
+        m.dispatch(collect.FORWARD_SLOW, 0)
+        m.step(0, 0.0)
+    for k in range(1, 11):
+        a.step(k * S // 10, 0.0)
+    b.step(S, 0.0)
+    out["split_exact"] = abs(a.vx - b.vx) < 1e-9 and abs(a.path_m - b.path_m) < 1e-9
+    lat = collect.CfStab(latency_s=0.15)
+    lat.dispatch(collect.FORWARD_SLOW, 0)
+    v_early = lat.step(S // 10, 0.0)[0]
+    v_late = lat.step(S // 5, 0.0)[0]
+    out["latency"] = v_early == 0.0 and v_late > 0.0
+    c = collect.CfStab(latency_s=0.0)
+    c.dispatch(collect.FORWARD_SLOW, 0)
+    c.step(0, 0.0)
+    v0 = c.step(5 * S, 0.0)[0]
+    c.dispatch(collect.SAFE_NEUTRAL, 5 * S)
+    v1 = c.step(6 * S, 0.0)[0]
+    out["coast"] = abs(v1 - v0 * math.exp(-collect.CF_DRAG_K)) < 1e-9 and v1 > 0
+    bx, by, _ = c.step(6 * S, 90.0)   # 机头转到 +Y，动量仍沿世界 +X -> 机体右侧(-Y)
+    out["body_frame"] = abs(bx) < 1e-9 and abs(by + v1) < 1e-9
+    y = collect.CfStab(latency_s=0.0)
+    y.dispatch(collect.YAW_LEFT, 0)
+    out["yaw"] = y.step(0, 0.0)[2] == collect.SPEED_YAW
+    try:
+        collect.CfStab(tilt_deg=31.0)
+        out["tilt_cap"] = False
+    except ValueError:
+        out["tilt_cap"] = True
+    out["profile"] = collect.CfStab().profile().startswith(collect.CF_STAB_PROFILE + ":")
+    return out
+
+
+class FakeSil:
+    """collect_one 的 cf_sil 后端替身：记录派发/停桨，不碰 Gazebo。"""
+
+    def __init__(self, error=None):
+        self.actions = []
+        self.zeroed = 0
+        self.failed = error
+
+    def dispatch(self, action, t_ns):
+        self.actions.append((action, t_ns))
+
+    def error(self):
+        return self.failed
+
+    def zero_now(self):
+        self.zeroed += 1
+
+
+def cf_sil_window():
+    """collect_one + cf_sil：动作交给 sil，不走 twist，也不误判卡滞。"""
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    pose = ClockPoseSub(pose_msg(10.02))
+    subs = {"rgb": FakeSub(after=rgb), "depth": FakeSub(frames=[(1, _fresh_depth(w, h))]),
+            "pose": pose, "contact": FakeSub()}
+
+    class RecordingPub(FakePub):
+        def __init__(self):
+            super().__init__()
+            self.sent = []
+
+        def start(self, *args):
+            self.sent.append(args)
+            return super().start(*args)
+
+    t = [10.02]
+
+    def advance(_secs):
+        t[0] = round(t[0] + 0.05, 3)
+        pose.current = pose_msg(t[0])
+
+    pub, sil = RecordingPub(), FakeSil()
+    with tempfile.TemporaryDirectory() as d, \
+            patch.object(collect, "write_rgb_png", return_value=(True, None)), \
+            patch.object(collect.time, "sleep", side_effect=advance):
+        row, err = collect.collect_one(d, 0, 0.2, "forward", subs, pub, sil=sil)
+    return {
+        "ran": row is not None and err is None,
+        "dispatched": sil.actions == [(collect.FORWARD_SLOW, 10_020_000_000)],
+        "no_twist": pub.sent == [],
+        "no_false_stuck": row is not None and row["src"] is None,
+        "action_unchanged": row is not None
+                            and row["action_executed"] == collect.FORWARD_SLOW,
+    }
+
+
+def cf_sil_stale_pose_zeroes():
+    """cf_sil 动作窗口超时：必须让 sil 停桨，而不是只发 twist 零速。"""
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    pose = ClockPoseSub(pose_msg(10.02))
+    subs = {"rgb": FakeSub(after=rgb), "depth": FakeSub(frames=[(1, _fresh_depth(w, h))]),
+            "pose": pose, "contact": FakeSub()}
+    sil = FakeSil()
+    with tempfile.TemporaryDirectory() as d, \
+            patch.object(collect, "write_rgb_png", return_value=(True, None)):
+        row, err = collect.collect_one(d, 0, 0.01, "teacher", subs, FakePub(), sil=sil)
+    return (row is None and "动作窗口超时" in (err or "")
+            and sil.zeroed > 0 and len(sil.actions) == 1)
+
+
+def cf_sil_error_fails():
+    """后台线程报错后，本步必须失败并停桨。"""
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    pose = ClockPoseSub(pose_msg(10.02))
+    subs = {"rgb": FakeSub(after=rgb), "depth": FakeSub(frames=[(1, _fresh_depth(w, h))]),
+            "pose": pose, "contact": FakeSub()}
+    sil = FakeSil(error="boom")
+    with tempfile.TemporaryDirectory() as d, \
+            patch.object(collect, "write_rgb_png", return_value=(True, None)):
+        row, err = collect.collect_one(d, 0, 0.2, "forward", subs, FakePub(), sil=sil)
+    return (row is None and "cf_sil 执行器故障" in (err or "")
+            and sil.zeroed > 0)
+
+
+def cf_stab_window(cruise=False):
+    """collect_one + cf_stab：窗口内逐帧更新指令、窗口末不刹停、卡滞判定。
+
+    假位姿只走时间不动位置。cruise=False 从静止起步：预测位移 < STUCK_EPS，不能判卡滞
+    （X3 跟踪滞后时起步必误报）；cruise=True 先把模型推到巡航速度：贴柱不动必须判卡滞。
+    """
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    pose = ClockPoseSub(pose_msg(10.02))   # 位姿必须晚于 RGB(10 s)
+    subs = {"rgb": FakeSub(after=rgb), "depth": FakeSub(frames=[(1, _fresh_depth(w, h))]),
+            "pose": pose, "contact": FakeSub()}
+
+    class RecordingPub(FakePub):
+        def __init__(self):
+            super().__init__()
+            self.sent = []
+
+        def start(self, *args):
+            self.sent.append(args)
+            return super().start(*args)
+
+    t = [10.02]
+
+    def advance(_secs):
+        t[0] = round(t[0] + 0.05, 3)
+        pose.current = pose_msg(t[0])
+
+    pub = RecordingPub()
+    dyn = collect.CfStab(latency_s=0.0)
+    if cruise:
+        dyn.dispatch(collect.FORWARD_SLOW, 0)
+        dyn.step(0, 0.0)
+        dyn.step(10_020_000_000, 0.0)
+    with tempfile.TemporaryDirectory() as d, \
+            patch.object(collect, "write_rgb_png", return_value=(True, None)), \
+            patch.object(collect.time, "sleep", side_effect=advance):
+        row, err = collect.collect_one(d, 0, 0.2, "forward", subs, pub, dyn=dyn)
+    ran = "ran_cruise" if cruise else "ran"
+    if err is not None or row is None:
+        return {ran: False}
+    vxs = [s[0] for s in pub.sent]
+    if cruise:
+        return {ran: True, "stuck_at_cruise": row["src"] == "stuck"}
+    return {"ran": True,
+            "updates": len(pub.sent) >= 4 and vxs == sorted(vxs),
+            "no_brake": vxs[-1] > 0.0,
+            "no_false_stuck_from_rest": row["src"] is None}
+
+
 def main():
+    m = cf_stab_model()
+    for k, v in m.items():
+        check(f"cf_stab 模型: {k}", v)
+    for k, v in (cf_stab_window() | cf_stab_window(cruise=True)).items():
+        check(f"cf_stab 采集窗口: {k}", v)
+    check("cf_sil 在 DYNAMICS 且默认参数存在",
+          "cf_sil" in collect.DYNAMICS and os.path.isfile(collect.DEFAULT_CF_SIL_PARAMS))
+    for k, v in cf_sil_window().items():
+        check(f"cf_sil 采集窗口: {k}", v)
+    check("cf_sil 窗口超时 -> 停桨", cf_sil_stale_pose_zeroes())
+    check("cf_sil 执行器故障 -> 该步失败并停桨", cf_sil_error_fails())
     contact("contact 有元素 -> True", b'{"contact":[{}]}', want=True)
     contact("contact 空列表 -> False", b'{"contact":[]}')
     contact("接触 JSON null -> False", b'null')
@@ -358,6 +571,10 @@ def main():
     check("pose 停更 -> 该步失败", row is None and "动作窗口超时" in (err or ""))
     row, err = stale_depth_fails()
     check("depth 停更 -> 该步失败", row is None and "depth 停更" in (err or ""))
+    row, err = depth_gap_step(100_000_000)
+    check("depth gap 恰好 100 ms -> 放行", row is not None and err is None)
+    row, err = depth_gap_step(101_000_000)
+    check("depth gap 101 ms -> 该步失败", row is None and "depth 停更" in (err or ""))
     row, err = dead_depth_fails()
     check("depth 订阅退出 -> 该步失败", row is None and "depth 订阅进程已退出" in (err or ""))
     row, err = dead_contact_fails()

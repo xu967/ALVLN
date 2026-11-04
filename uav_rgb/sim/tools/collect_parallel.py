@@ -61,6 +61,8 @@ _PROC_GROUPS = {}   # pgid -> Popen，收尾时兜底 kill
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import split_manifest as sm  # noqa: E402  （路径插在常量之后，所以放这里）
+import campus  # noqa: E402
+import asset_campus  # noqa: E402
 
 
 def sha256_file(path):
@@ -89,6 +91,11 @@ def gz_env(partition):
         raise ValueError("UAVRGB_RENDER_BACKEND 必须是 gpu 或 software")
     env.update({"XDG_RUNTIME_DIR": XDG_RUNTIME_DIR, "GZ_PARTITION": partition,
                 "UAVRGB_RENDER_BACKEND": backend})
+    # Local, vendored assets: no network lookups or per-run downloads.
+    assets_root = os.path.join(SIM_DIR, "assets")
+    old = env.get("GZ_SIM_RESOURCE_PATH", "")
+    env["GZ_SIM_RESOURCE_PATH"] = os.pathsep.join(
+        p for p in (assets_root, old) if p)
     if backend == "gpu":
         # CUDA 可用不代表 EGL 选到了 NVIDIA；GLVND 默认可能仍选 Mesa。
         env["__EGL_VENDOR_LIBRARY_FILENAMES"] = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
@@ -284,9 +291,15 @@ def _popen_collect(task, args, env, log_path):
            "--scene-id", str(task.scene_id), "--seed", str(task.seed),
            "--episode-id", str(task.scene_id), "--split", task.split,
            "--scene-meta", task.scene_meta_path,
-           "--window-from", args.window_from]
+           "--window-from", args.window_from, "--dynamics", args.dynamics]
+    if args.dynamics == "cf_sil":
+        cmd += ["--cf-sil-params", args.cf_sil_params]
     if args.policy != "teacher":
         cmd += ["--policy", args.policy]
+    if args.teacher_planner != "astar":
+        cmd += ["--teacher-planner", args.teacher_planner]
+    if args.policy == "teacher-rl":
+        cmd += ["--rl-checkpoint", args.rl_checkpoint]
     if args.save_depth:
         cmd.append("--save-depth")
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
@@ -443,6 +456,10 @@ def main():
                    default=None,
                    help="动作窗口起点：observation=观测位姿（默认，唯一被采纳基线）；"
                         "dispatch=派发位姿（仅复现 T7-R，数字不可与 observation 混报）")
+    p.add_argument("--dynamics", choices=("x3_velocity", "cf_stab", "cf_sil"), default="x3_velocity",
+                   help="透传给 collect.py：x3_velocity=旧行为（唯一历史基线）；cf_stab=CF-Drone 摇杆模型（建议配 --hold 0.1~0.2）；cf_sil=CF-Drone SIL 骨架（sim-only，参数未标定），数字不可与旧档混报")
+    p.add_argument("--cf-sil-params", default=os.path.join(SIM_DIR, "dynamics", "cf_sil_v1.json"),
+                   help="cf_sil 参数 JSON（仅 --dynamics cf_sil）")
     p.add_argument("--out", required=True, help="汇总输出目录（必须为空/不存在）")
     p.add_argument("--base-seed", type=int, default=0,
                    help="scene_id = seed = base_seed + 扫描序号；给 --split 时只取该 split 的 seed")
@@ -452,11 +469,13 @@ def main():
                    help="只采命中该 split 的几何组；seed 从 base-seed 起向后扫描")
     p.add_argument("--spawn-mode", choices=("default", "random"), default="default",
                    help="每个 episode 的出生位姿（random = y/yaw 随机化）")
-    p.add_argument("--task", choices=("base", "l1", "campus"), default="base",
+    p.add_argument("--task", choices=("base", "l1", "campus", "campus_assets"), default="base",
                    help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
-    p.add_argument("--appearance", choices=("legacy", "v1"), default="legacy",
-                   help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）")
-    p.add_argument("--policy", choices=("teacher", "forward"), default="teacher")
+    p.add_argument("--appearance", choices=("legacy", "v1"), default="v1",
+                   help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）；旧数据复现请显式 legacy")
+    p.add_argument("--policy", choices=("teacher", "forward", "teacher-rl"), default="teacher")
+    p.add_argument("--teacher-planner", choices=("astar", "predictive"), default="astar")
+    p.add_argument("--rl-checkpoint", default="")
     p.add_argument("--save-depth", action="store_true",
                    help="透传给 collect.py：每步另存 depth/depth_%%05d.png（16 位 PNG，毫米）")
     p.add_argument("--template", default=DEFAULT_TEMPLATE)
@@ -466,7 +485,7 @@ def main():
     p.add_argument("--sim-timeout", type=float, default=120.0)
     args = p.parse_args()
     if args.window_from is None:
-        args.window_from = "dispatch" if args.task == "campus" else "observation"
+        args.window_from = "dispatch" if args.task in ("campus", "campus_assets") else "observation"
 
     if args.instances < 1:
         p.error("--instances must be >= 1")
@@ -483,6 +502,13 @@ def main():
     # 等到生成世界才失败会白跑一轮，命令行阶段就拒绝。
     if args.task == "l1" and args.spawn_mode != "random":
         p.error("--task l1 必须配 --spawn-mode random")
+    if (args.teacher_planner == "predictive" or args.policy == "teacher-rl") and (
+            args.dynamics != "cf_stab" or args.task not in ("campus", "campus_assets")):
+        p.error("新 Teacher 需要 --dynamics cf_stab 和校园场景")
+    if (args.teacher_planner == "predictive" or args.policy == "teacher-rl") and abs(args.hold-0.2)>1e-6:
+        p.error("新 Teacher 当前与 --hold 0.2s 配套")
+    if args.policy == "teacher-rl" and not args.rl_checkpoint:
+        p.error("teacher-rl 需要 --rl-checkpoint")
     for path, name in ((SCENE_GEN, "scene_gen.py"), (COLLECT, "collect.py"),
                        (args.template, "template")):
         if not os.path.isfile(path):
@@ -556,7 +582,8 @@ def main():
                 [sys.executable, SCENE_GEN, "--seed", str(t.seed),
                  "--scene-id", str(t.scene_id), "--out", t.world,
                  "--spawn-mode", t.spawn_mode, "--template", args.template,
-                 "--task", args.task, "--appearance", args.appearance],
+                 "--task", args.task, "--appearance", args.appearance]
+                + (["--no-velocity-control"] if args.dynamics == "cf_sil" else []),
                 capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 print(r.stdout, flush=True)
@@ -639,16 +666,22 @@ def main():
             "steps": args.steps,
             "hold_s": args.hold,
             "window_from": args.window_from,
+            "dynamics": args.dynamics,
             "task": args.task,
-            "geometry_version": ("campus.v1" if args.task == "campus" else sm.SPLIT_SALT),
-            "appearance_version": ("campus.v1" if args.task == "campus" else args.appearance),
+            "geometry_version": (campus.VERSION if args.task == "campus" else
+                                 asset_campus.VERSION if args.task == "campus_assets" else sm.SPLIT_SALT),
+            "appearance_version": ("campus.v1" if args.task == "campus" else
+                                    asset_campus.VERSION if args.task == "campus_assets" else args.appearance),
             "policy": args.policy,
+            "teacher_planner": args.teacher_planner,
+            "rl_checkpoint": args.rl_checkpoint if args.policy == "teacher-rl" else None,
             "split": args.split,
             "seeds": args.seeds,
             "spawn_mode": args.spawn_mode,
             "unique_geometry": len({sm.geometry_gid(t.scene_meta["pillars"])
                                     for t in tasks if t.scene_meta}),
-            "split_policy": ("campus_map_v1" if args.task == "campus" else SPLIT_POLICY),
+            "split_policy": ("campus_map_v1" if args.task == "campus" else
+                             "campus_assets_map_v1" if args.task == "campus_assets" else SPLIT_POLICY),
             "template": _rel(os.path.abspath(args.template)),
             "keep_worlds": bool(args.keep_worlds),
             "splits": splits,

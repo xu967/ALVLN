@@ -22,6 +22,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import scene_gen as sg  # noqa: E402
 
 SPLITS = ("train", "val", "test")
+# 数据里可审计的划分策略。scene_id = 旧版只按场景隔离；其余见 split_for_scene。
+SPLIT_POLICIES = ("scene_id", "geometry_gid", "campus_map_v1", "campus_assets_map_v1")
+# 已冻结、但重打包仍要能按记录复算的校园版本；新增版本时只加当前版本，不删旧值。
+FROZEN_CAMPUS_VERSIONS = ("campus.v1",)
+# asset_campus.split_key 写死的 salt（split_key 内部不接受参数）。
+ASSET_SPLIT_SALT = "asset-campus-split-v1"
 # v3：T1 把车道缝从 0.902 m 放宽到 1.2 m（LANE_SEP 1.302→1.6），几何语义变了，
 #     必须换 salt；旧 v2 数据不能与 v3 混用，见 docs/experiments/2026-10-30-t1-lane-geometry.md。
 # v2：v1 把 -0.0 格式化成 "-0.000"，同几何不同符号会得到不同 gid（seed 337/3651）。
@@ -77,12 +83,38 @@ def family_id(template_sha):
     return hashlib.sha256(sig.encode("utf-8")).hexdigest()[:12]
 
 
-def split_for_gid(gid):
-    h = hashlib.sha256((SPLIT_SALT + ":" + gid).encode("utf-8")).hexdigest()
+def split_for_gid(gid, salt=None):
+    h = hashlib.sha256(((salt or SPLIT_SALT) + ":" + gid).encode("utf-8")).hexdigest()
     bucket = int(h[:8], 16) % 100
     if bucket < 80:
         return "train"
     return "val" if bucket < 90 else "test"
+
+
+def is_diagnostic_scheme(name):
+    """诊断性划分（map-hash:* / diag*）默认拒绝：它们无视地图/拓扑族归属。"""
+    return bool(name) and (name.startswith("map-hash:") or name.startswith("diag"))
+
+
+def split_salt_for(meta):
+    """该 manifest 实际使用的 salt；按记录的 split_salt/版本分派，不回落当前值。
+
+    历史约定 SPLIT_SALT == GEOMETRY_VERSION，所以 v3/v4 等冻结柱阵数据能用
+    geometry_version 原样复算。campus 按固定地图族归属，没有 gid salt。
+    """
+    if meta.get("split_salt"):
+        return meta["split_salt"]
+    policy = meta.get("split_policy")
+    if policy == "campus_assets_map_v1":
+        return ASSET_SPLIT_SALT
+    if policy == "campus_map_v1":
+        return None
+    gver = meta.get("geometry_version")
+    if not gver:
+        return SPLIT_SALT
+    if gver.startswith("uavrgb.geom."):
+        return gver
+    raise ValueError("无法复算 split_salt：未知 geometry_version %r" % (gver,))
 
 
 PROVENANCE_KEYS = ("appearance_version", "map_id", "family", "split_policy",
@@ -91,21 +123,50 @@ PROVENANCE_KEYS = ("appearance_version", "map_id", "family", "split_policy",
 
 
 def split_for_scene(meta):
-    """旧柱阵按精确几何，新校园按整张地图；各外观/指令变体共用归属。"""
+    """按 manifest 记录的策略/版本复算 split；冻结数据不回落当前 salt。"""
     import campus
-    if meta.get("geometry_version") == campus.VERSION:
-        if (meta.get("map_id") != campus.map_id(meta["seed"]) or
-                meta.get("split_policy") != "campus_map_v1"):
-            raise ValueError("campus map_id / split_policy 与 seed 不符")
-        return campus.split_map(meta["map_id"])
+    import asset_campus
+    policy = meta.get("split_policy")
+    gver = meta.get("geometry_version") or ""
+    map_id = meta.get("map_id") or ""
+    # 身份自洽：map_id 声称资产校园时，geometry_version 必须同名。
+    if map_id.startswith(asset_campus.VERSION + "/") and gver != asset_campus.VERSION:
+        raise ValueError("asset campus map_id with mismatched geometry_version")
+    if policy == "campus_assets_map_v1" or gver.startswith("campus.assets."):
+        if gver != asset_campus.VERSION:
+            raise ValueError("asset campus map_id with mismatched geometry_version")
+        expected_key = asset_campus.map_key(meta["seed"])
+        if map_id != expected_key:
+            raise ValueError("asset campus map_id 与 seed 不符")
+        return asset_campus.split_key(expected_key)
+    if policy == "campus_map_v1" or gver.startswith("campus."):
+        if gver not in (campus.VERSION,) + FROZEN_CAMPUS_VERSIONS:
+            raise ValueError("未知 campus geometry_version %r" % (gver,))
+        prefix = gver + "/"
+        if not map_id.startswith(prefix):
+            raise ValueError("campus map_id 与 geometry_version 不符")
+        family = map_id[len(prefix):]
+        if family not in campus.FAMILIES:
+            raise ValueError("未知 campus 地图族 %r" % (family,))
+        if meta.get("seed") is not None:
+            want = campus.FAMILIES[(int(meta["seed"]) // 8) % len(campus.FAMILIES)]
+            if family != want:
+                raise ValueError("campus map_id 与 seed 不符")
+        # 三族→split 本身是冻结合同；campus.split_map 只认当前版本前缀，借用它的表。
+        return campus.split_map("%s/%s" % (campus.VERSION, family))
     gid = meta.get("geometry_gid") or geometry_gid(meta["pillars"])
-    return split_for_gid(gid)
+    return split_for_gid(gid, split_salt_for(meta))
 
 
 def split_for_seed(seed, task="base"):
     if task == "campus":
         import campus
         return campus.split(seed)
+    if task == "campus_assets":
+        import asset_campus
+        return asset_campus.split_key(asset_campus.map_key(seed))
+    if task not in ("base", "l1"):
+        raise ValueError(f"unknown task {task!r}")
     return split_for_gid(geometry_gid(sg.sample_pillars(seed)[0]))
 
 
@@ -170,12 +231,22 @@ def summarize(man):
     return out
 
 
-def cross_split_groups(pairs):
+def group_id_for_task(seed, task):
+    """按任务返回几何组身份；base/l1 用精确几何，校园用 map 身份。"""
+    if task == "campus_assets":
+        import asset_campus
+        return asset_campus.map_key(seed)
+    if task == "campus":
+        import campus
+        return campus.map_id(seed)
+    return geometry_gid(sg.sample_pillars(seed)[0])
+
+
+def cross_split_groups(pairs, task="base"):
     """pairs = [(seed, split)]；返回跨 split 的几何组 {gid: [splits]}。"""
     seen = {}
     for seed, split in pairs:
-        pillars, _, _ = sg.sample_pillars(seed)
-        seen.setdefault(geometry_gid(pillars), set()).add(split)
+        seen.setdefault(group_id_for_task(seed, task), set()).add(split)
     return {gid: sorted(s) for gid, s in seen.items() if len(s) > 1}
 
 
@@ -199,15 +270,17 @@ def main(argv=None):
     p.add_argument("--count", type=int, default=None, help="配合 --base-seed 使用")
     p.add_argument("--out", default="", help="写出 split_manifest.json")
     p.add_argument("--verify", default="", help="检查 collection_manifest.json 是否跨 split 重复")
+    p.add_argument("--verify-task", choices=("base", "l1", "campus", "campus_assets"),
+                   default="base", help="--verify 使用的几何组身份函数")
     args = p.parse_args(argv)
 
     if args.verify:
         pairs = pairs_from_collection(args.verify)
-        bad = cross_split_groups(pairs)
+        bad = cross_split_groups(pairs, args.verify_task)
         print("seed 数 %d，跨 split 的几何组 %d" % (len(pairs), len(bad)))
         for gid, sp in bad.items():
             seeds = [s for s, sp2 in pairs if sp2 in sp and
-                     geometry_gid(sg.sample_pillars(s)[0]) == gid]
+                     group_id_for_task(s, args.verify_task) == gid]
             print("  %s  splits=%s  seeds=%s" % (gid, ",".join(sp), seeds))
         return 1 if bad else 0
 

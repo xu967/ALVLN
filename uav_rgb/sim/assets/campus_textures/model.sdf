@@ -1,0 +1,2 @@
+<sdf version="1.10"><model name="campus_textures"><static>true</static>
+<link name="texture_holder"/></model></sdf>

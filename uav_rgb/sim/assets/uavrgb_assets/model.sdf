@@ -1,0 +1,2 @@
+<sdf version="1.10"><model name="uavrgb_assets"><static>true</static>
+<link name="asset_holder"/></model></sdf>

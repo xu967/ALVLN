@@ -5,6 +5,7 @@
 #include "uavrgb/class_weights.hpp"
 #include "uavrgb/linear_cuda.hpp"
 #include "uavrgb/nn.hpp"
+#include "uavrgb/sha256.hpp"
 #include "uavrgb/softmax_cuda.hpp"
 #include "uavrgb/soft_targets.hpp"
 
@@ -12,9 +13,13 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -34,6 +39,190 @@ std::string num(double v) {
   char b[40];
   std::snprintf(b, sizeof b, "%.9g", v);
   return b;
+}
+
+std::string quote(const std::string& s) {
+  std::string o = "\"";
+  for (unsigned char ch : s) {
+    if (ch == '"' || ch == '\\') {
+      o += '\\';
+      o += static_cast<char>(ch);
+    } else if (ch == '\n') {
+      o += "\\n";
+    } else if (ch < 0x20) {
+      char b[7];
+      std::snprintf(b, sizeof b, "\\u%04x", static_cast<unsigned>(ch));
+      o += b;
+    } else {
+      o += static_cast<char>(ch);
+    }
+  }
+  return o + '"';
+}
+
+std::string hex_sha(const Sha256& h) {
+  static const char* d = "0123456789abcdef";
+  std::string s;
+  for (unsigned char b : h) { s += d[b >> 4]; s += d[b & 15]; }
+  return s;
+}
+
+std::string file_sha256_hex_impl(const std::string& path) { return hex_sha(sha256_file(path)); }
+
+Sha256 sha_text(const std::string& s) {
+  std::istringstream in(s);
+  return sha256(in);
+}
+
+// 扁平 JSON 里取 "key": 后的标量（字符串去引号）；"null"/缺失返回空。
+std::string json_scalar(const std::string& js, const std::string& key) {
+  const std::string pat = "\"" + key + "\":";
+  std::size_t p = js.find(pat);
+  if (p == std::string::npos) return {};
+  std::size_t b = p + pat.size();
+  while (b < js.size() && (js[b] == ' ' || js[b] == '\t')) ++b;
+  if (b < js.size() && js[b] == '"') {
+    const std::size_t e = js.find('"', b + 1);
+    return e == std::string::npos ? std::string{} : js.substr(b + 1, e - b - 1);
+  }
+  std::size_t e = b;
+  while (e < js.size() && js[e] != ',' && js[e] != '}' && js[e] != '\n') ++e;
+  std::string v = js.substr(b, e - b);
+  return v == "null" ? std::string{} : v;
+}
+
+struct DatasetFacts {
+  std::string split_scheme, window_from, hold_s;
+};
+
+// 从 .uavr 尾部 meta 取 config 需要的口径字段；读不到时留空（config 写 null）。
+DatasetFacts read_dataset_facts(const std::string& path) {
+  std::ifstream f(path, std::ios::binary);
+  if (!f) return {};
+  unsigned char h[48]{};
+  f.read(reinterpret_cast<char*>(h), sizeof h);
+  if (f.gcount() != static_cast<std::streamsize>(sizeof h)) return {};
+  std::uint64_t off = 0;
+  std::uint32_t len = 0;
+  std::memcpy(&off, h + 36, 8);
+  std::memcpy(&len, h + 44, 4);
+  if (len > (64u << 20)) return {};  // meta 异常大：不猜，宁可不记录
+  std::string meta(len, '\0');
+  f.seekg(static_cast<std::streamoff>(off));
+  f.read(meta.data(), static_cast<std::streamsize>(len));
+  if (f.gcount() != static_cast<std::streamsize>(len)) return {};
+  DatasetFacts d;
+  d.split_scheme = json_scalar(meta, "split_scheme");
+  if (d.split_scheme.empty()) d.split_scheme = json_scalar(meta, "split_policy");
+  d.window_from = json_scalar(meta, "window_from");
+  d.hold_s = json_scalar(meta, "hold_s");
+  return d;
+}
+
+// join_soft_targets.py 把教师来源写在 <soft>.json；缺文件 = 旧软标签，来源不可审计。
+struct SoftFacts {
+  std::string teacher_ckpt_sha256, teacher_select_split;
+};
+
+SoftFacts read_soft_facts(const std::string& soft_path) {
+  std::filesystem::path p(soft_path);
+  p.replace_extension(".json");
+  std::ifstream f(p);
+  if (!f) return {};
+  std::ostringstream os;
+  os << f.rdbuf();
+  const std::string js = os.str();
+  return {json_scalar(js, "teacher_ckpt_sha256"), json_scalar(js, "teacher_select_split")};
+}
+
+// 运行目录附近的 git 提交（可选事实）。优先环境变量，便于离线/打包环境显式注入。
+std::string detect_git_sha() {
+  if (const char* e = std::getenv("UAVRGB_SOURCE_GIT")) return e;
+  std::error_code ec;
+  std::filesystem::path p = std::filesystem::current_path(ec);
+  for (int i = 0; i < 8 && !ec && !p.empty(); ++i, p = p.parent_path()) {
+    std::ifstream head(p / ".git" / "HEAD");
+    std::string line;
+    if (!std::getline(head, line)) continue;
+    if (line.rfind("ref: ", 0) == 0) {
+      std::ifstream ref(p / ".git" / line.substr(5));
+      if (std::getline(ref, line) && !line.empty()) return line;
+      return {};
+    }
+    return line;
+  }
+  return {};
+}
+
+CheckpointContract make_contract(const TrainConfig& cfg) {
+  CheckpointContract c;
+  c.dataset_sha256 = sha256_file(cfg.data_path);
+  c.drop_collision = cfg.drop_collision;
+  if (!cfg.soft_targets.empty()) c.soft_targets_sha256 = sha256_file(cfg.soft_targets);
+  c.distill_alpha = cfg.distill_alpha;
+  c.lr = cfg.lr;
+  c.seed = cfg.seed;
+  c.batch = cfg.batch;
+  if (!cfg.split_scheme.empty()) c.split_scheme_sha256 = sha_text(cfg.split_scheme);
+  return c;
+}
+
+bool is_zero(const Sha256& h) { return h == Sha256{}; }
+
+// 数据集/超参/蒸馏来源不一致时默认拒绝续训；旧 checkpoint 无契约字段时只告警。
+void check_resume_contract(const TrainConfig& cfg, const TrainState& st) {
+  const CheckpointContract& c = st.contract;
+  // 非 trainer 写出的 v5（如测试直接 save_checkpoint）字段全零：按未记录处理。
+  if (!st.contract_present || (c.lr == 0.0f && c.batch == 0 && is_zero(c.dataset_sha256))) {
+    std::fprintf(stderr,
+                 "警告: resume checkpoint 无训练契约字段（旧格式），跳过数据/超参一致性校验\n");
+    return;
+  }
+  std::vector<std::string> diff;
+  if (!is_zero(c.dataset_sha256) && hex_sha(c.dataset_sha256) != cfg.dataset_sha256) {
+    diff.push_back("dataset_sha256");
+  }
+  if (c.drop_collision != cfg.drop_collision) diff.push_back("drop_collision");
+  const Sha256 soft = cfg.soft_targets.empty() ? Sha256{} : sha256_file(cfg.soft_targets);
+  if (!(c.soft_targets_sha256 == soft)) diff.push_back("soft_targets_sha256");
+  if (c.distill_alpha != cfg.distill_alpha) diff.push_back("distill_alpha");
+  if (c.lr != cfg.lr) diff.push_back("lr");
+  if (c.seed != cfg.seed) diff.push_back("seed");
+  if (c.batch != cfg.batch) diff.push_back("batch");
+  const Sha256 scheme = cfg.split_scheme.empty() ? Sha256{} : sha_text(cfg.split_scheme);
+  if (!(c.split_scheme_sha256 == scheme)) diff.push_back("split_scheme");
+  if (diff.empty()) return;
+  std::string msg = "resume: checkpoint 训练契约与本次不一致:";
+  for (const std::string& d : diff) msg += " " + d;
+  if (!cfg.allow_resume_mismatch) {
+    throw std::invalid_argument(msg + "（确需续训请显式加 --allow-resume-mismatch）");
+  }
+  std::fprintf(stderr, "警告: %s（已由 --allow-resume-mismatch 放行）\n", msg.c_str());
+}
+
+// resume 时把源 run 的 config.json 当作缺省 CLI；显式传入的仍以 CLI 为准。
+void merge_resume_config(TrainConfig* cfg) {
+  const std::filesystem::path rp(cfg->resume);
+  const std::string dir = (rp.has_parent_path() ? rp.parent_path() : std::filesystem::path("."))
+                              .string();
+  RunConfigSnapshot snap;
+  if (!read_run_config(dir, &snap)) {
+    std::fprintf(stderr, "警告: resume 源目录 %s 无 config.json，未补全 CLI（旧 run）\n",
+                 dir.c_str());
+    return;
+  }
+  if (!cfg->lr_set && snap.has_lr) cfg->lr = snap.lr;
+  if (!cfg->batch_set && snap.has_batch) cfg->batch = snap.batch;
+  if (!cfg->seed_set && snap.has_seed) cfg->seed = snap.seed;
+  if (!cfg->drop_collision_set && snap.has_drop_collision) cfg->drop_collision = snap.drop_collision;
+  if (!cfg->soft_targets_set && snap.has_soft_targets) cfg->soft_targets = snap.soft_targets;
+  if (!cfg->distill_alpha_set && snap.has_distill_alpha) cfg->distill_alpha = snap.distill_alpha;
+  if (!cfg->text_dim_set && snap.has_text_dim) cfg->text_dim = snap.text_dim;
+  if (!cfg->text_dim_set && snap.has_vision_only && snap.vision_only) cfg->vision_only = true;
+  if (!(std::isfinite(cfg->lr) && cfg->lr > 0.0f && cfg->lr <= 1.0f)) {
+    throw std::invalid_argument("resume: 源 config 的 lr 非法（" + num(cfg->lr) + "）");
+  }
+  if (cfg->batch <= 0) throw std::invalid_argument("resume: 源 config 的 batch 非法");
 }
 
 // resume 的历史 best 必须能在新目录独立交付：同目录核对文件存在且状态一致；
@@ -91,6 +280,40 @@ std::uint64_t count_correct(const Tensor& logits, const std::vector<int>& labels
 
 }  // namespace
 
+std::string file_sha256_hex(const std::string& path) { return file_sha256_hex_impl(path); }
+
+void append_test_eval_record(const std::string& out_dir, const std::string& origin,
+                             const std::string& ckpt_path, const std::string& data_path,
+                             const std::string& dataset_sha256, bool drop_collision,
+                             std::size_t samples) {
+  std::size_t count = 0;
+  {
+    std::ifstream in(out_dir + "/test_eval.jsonl");
+    std::string line;
+    while (std::getline(in, line)) {
+      if (!line.empty()) ++count;
+    }
+  }
+  const auto now = std::chrono::system_clock::now();
+  const std::time_t tt = std::chrono::system_clock::to_time_t(now);
+  std::tm tm{};
+  gmtime_r(&tt, &tm);
+  char utc[32] = {};
+  std::strftime(utc, sizeof utc, "%Y-%m-%dT%H:%M:%SZ", &tm);
+  const std::string run_id =
+      std::string(utc) + "-" + std::to_string(now.time_since_epoch().count() % 1000000);
+  std::ofstream f(out_dir + "/test_eval.jsonl", std::ios::app);
+  if (!f) throw std::runtime_error("trainer: 无法追加写 test_eval.jsonl");
+  f << "{\"schema\":\"uavrgb.test_eval.v1\",\"run_id\":" << quote(run_id)
+    << ",\"utc\":" << quote(utc) << ",\"origin\":" << quote(origin)
+    << ",\"ckpt\":" << quote(ckpt_path) << ",\"data\":" << quote(data_path)
+    << ",\"dataset_sha256\":" << quote(dataset_sha256)
+    << ",\"drop_collision\":" << (drop_collision ? "true" : "false")
+    << ",\"samples\":" << samples << ",\"split\":\"test\",\"eval_count\":" << (count + 1)
+    << "}\n";
+  if (!f) throw std::runtime_error("trainer: 写 test_eval.jsonl 失败");
+}
+
 void Trainer::write_csv_header_if_needed() const {
   const std::string p = cfg_.out_dir + "/results.csv";
   std::error_code ec;
@@ -104,12 +327,37 @@ void Trainer::write_csv_header_if_needed() const {
 }
 
 void Trainer::run() {
+  if (!cfg_.resume.empty()) merge_resume_config(&cfg_);
   if (cfg_.epochs <= 0 || cfg_.batch <= 0) {
     throw std::invalid_argument("trainer: epochs/batch 必须为正");
   }
   UavrDataset ds = load_uavr(cfg_.data_path, LoadOptions{cfg_.drop_collision});
   if (ds.train_idx.empty()) throw std::runtime_error("trainer: 数据集没有 train split");
   std::filesystem::create_directories(cfg_.out_dir);
+
+  // 事实字段：写进 config.json，也是 resume 契约的比较基准。
+  cfg_.dataset_sha256 = file_sha256_hex_impl(cfg_.data_path);
+  const DatasetFacts facts = read_dataset_facts(cfg_.data_path);
+  cfg_.split_scheme = facts.split_scheme;
+  cfg_.window_from = facts.window_from;
+  cfg_.hold_s = facts.hold_s;
+  cfg_.source_git = detect_git_sha();
+  if (!cfg_.soft_targets.empty()) {
+    cfg_.soft_targets_sha256 = file_sha256_hex_impl(cfg_.soft_targets);
+    const SoftFacts sf = read_soft_facts(cfg_.soft_targets);
+    cfg_.teacher_ckpt_sha256 = sf.teacher_ckpt_sha256;
+    cfg_.teacher_select_split = sf.teacher_select_split;
+    if (sf.teacher_ckpt_sha256.empty()) {
+      std::fprintf(stderr, "警告: 软标签缺教师来源元信息（%s.json），蒸馏来源不可审计\n",
+                   cfg_.soft_targets.c_str());
+    }
+    if (sf.teacher_select_split == "val") {
+      const std::string msg =
+          "教师用 val split 选模，与 student val 重叠，蒸馏指标可能偏乐观";
+      if (cfg_.strict_distill) throw std::runtime_error(msg + "（--strict-distill）");
+      std::fprintf(stderr, "警告: %s\n", msg.c_str());
+    }
+  }
 
   class_weights_ = resolve_class_weights(cfg_.class_weights, ds);
   class_weights_source_ = class_weights_source(cfg_.class_weights);
@@ -128,10 +376,17 @@ void Trainer::run() {
   state_ = make_train_state(model_, cfg_.lr);
   if (!cfg_.resume.empty()) {
     load_checkpoint(cfg_.resume, model_, state_);
+    check_resume_contract(cfg_, state_);
     class_weights_source_ = merge_resume_weights(cfg_.class_weights, class_weights_,
                                                  state_.class_weights);
   }
   state_.class_weights = class_weights_;
+  // 本次运行的事实写入之后的所有 checkpoint（含 ckpt_best.bin）。
+  state_.contract = make_contract(cfg_);
+  state_.contract_present = true;
+  cfg_.adam_beta1 = state_.adam[0].beta1;
+  cfg_.adam_beta2 = state_.adam[0].beta2;
+  cfg_.adam_eps = state_.adam[0].eps;
   if (!cfg_.resume.empty()) {
     carry_resume_best(cfg_.resume, cfg_.out_dir, ds.h, ds.w, cfg_.seed,
                       static_cast<int>(ds.num_classes), cfg_.text_dim, cfg_.lr, state_);
@@ -320,6 +575,11 @@ void Trainer::run() {
     tev.balanced_accuracy = static_cast<float>(test_stats.balanced_acc);
     tev.confusion.assign(test_stats.confusion.begin(), test_stats.confusion.end());
     metrics << metrics_json(tev) << '\n';
+    // 训练末尾的 test 评估照旧，但单独留痕（不改历史 metrics），便于审计「test 被看过几次」。
+    append_test_eval_record(cfg_.out_dir, "train_inline",
+                            std::filesystem::exists(best_ckpt_path) ? best_ckpt_path : ckpt_path,
+                            cfg_.data_path, cfg_.dataset_sha256, cfg_.drop_collision,
+                            ds.test_idx.size());
   }
 
   elapsed_sec_ = since(t0);

@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <exception>
+#include <filesystem>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -23,7 +24,8 @@ void usage() {
                "用法: uavrgb_train --data <dataset.uavr> --epochs N --batch B --lr L "
                "--out <run_dir> [--resume <ckpt>] [--seed S] [--max-grad-norm G] "
                "[--class-weights auto|<w0,w1,w2,w3>] [--drop-collision] "
-               "[--text-dim N | --vision-only] [--soft-targets <bin> [--distill-alpha A]]\n"
+               "[--text-dim N | --vision-only] [--soft-targets <bin> [--distill-alpha A]] "
+               "[--allow-resume-mismatch] [--strict-distill]\n"
                "  或: uavrgb_train --data <dataset.uavr> --eval-only <ckpt> --out "
                "<run_dir> [--batch B] [--split val|test|all] [--drop-collision]\n");
 }
@@ -47,33 +49,45 @@ int main(int argc, char** argv) {
         cfg.epochs = std::stoi(next("--epochs"));
       } else if (a == "--batch") {
         cfg.batch = std::stoi(next("--batch"));
+        cfg.batch_set = true;
       } else if (a == "--lr") {
         cfg.lr = std::stof(next("--lr"));
+        cfg.lr_set = true;
       } else if (a == "--out") {
         cfg.out_dir = next("--out");
       } else if (a == "--resume") {
         cfg.resume = next("--resume");
       } else if (a == "--seed") {
         cfg.seed = static_cast<unsigned>(std::stoul(next("--seed")));
+        cfg.seed_set = true;
       } else if (a == "--max-grad-norm") {
         cfg.max_grad_norm = std::stof(next("--max-grad-norm"));
       } else if (a == "--class-weights") {
         cfg.class_weights = next("--class-weights");
       } else if (a == "--drop-collision") {
         cfg.drop_collision = true;
+        cfg.drop_collision_set = true;
       } else if (a == "--text-dim") {
         cfg.text_dim = std::stoi(next("--text-dim"));
         if (cfg.text_dim < 0) throw std::invalid_argument("--text-dim 不能为负");
+        cfg.text_dim_set = true;
       } else if (a == "--vision-only") {
         cfg.vision_only = true;
         cfg.text_dim = 0;
+        cfg.text_dim_set = true;
       } else if (a == "--soft-targets") {
         cfg.soft_targets = next("--soft-targets");
+        cfg.soft_targets_set = true;
       } else if (a == "--distill-alpha") {
         cfg.distill_alpha = std::stof(next("--distill-alpha"));
         if (!(cfg.distill_alpha >= 0.0f) || !(cfg.distill_alpha <= 1.0f)) {
           throw std::invalid_argument("--distill-alpha 必须在 [0,1]");
         }
+        cfg.distill_alpha_set = true;
+      } else if (a == "--allow-resume-mismatch") {
+        cfg.allow_resume_mismatch = true;
+      } else if (a == "--strict-distill") {
+        cfg.strict_distill = true;
       } else if (a == "--eval-only") {
         eval_ckpt = next("--eval-only");
       } else if (a == "--split") {
@@ -110,9 +124,38 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "%s\n", e.what());
       return 2;
     }
+    // 碰撞过滤是数据身份的一部分：eval-only 默认继承训练 run 的 drop_collision，
+    // 显式传入但与训练 config 不一致时拒绝（否则同权重同数据的指标对不上）。
+    {
+      const std::filesystem::path ckpt_dir =
+          std::filesystem::path(eval_ckpt).parent_path().empty()
+              ? std::filesystem::path(".")
+              : std::filesystem::path(eval_ckpt).parent_path();
+      uavrgb::RunConfigSnapshot snap;
+      if (uavrgb::read_run_config(ckpt_dir.string(), &snap) && snap.has_drop_collision) {
+        if (cfg.drop_collision_set && cfg.drop_collision != snap.drop_collision) {
+          std::fprintf(stderr,
+                       "eval-only: --drop-collision 与训练 config 不一致（训练 %s）；"
+                       "碰撞步去留不同会让指标不可比\n",
+                       snap.drop_collision ? "true" : "false");
+          return 2;
+        }
+        cfg.drop_collision = snap.drop_collision;
+      } else {
+        std::fprintf(stderr,
+                     "警告: %s 的 config 无 drop_collision，无法继承（按命令行值）\n",
+                     ckpt_dir.string().c_str());
+      }
+    }
     try {
       uavrgb::Trainer tr(cfg);
       tr.eval_only(eval_ckpt, eval_split != "test", eval_split != "val");
+      // test 评估单独留痕：查询次数/日期/数据身份，不改历史 metrics。
+      if (eval_split != "val") {
+        uavrgb::append_test_eval_record(cfg.out_dir, "eval_only", eval_ckpt, cfg.data_path,
+                                        uavrgb::file_sha256_hex(cfg.data_path),
+                                        cfg.drop_collision, 0);
+      }
     } catch (const std::exception& e) {
       std::fprintf(stderr, "评估失败: %s\n", e.what());
       return 1;

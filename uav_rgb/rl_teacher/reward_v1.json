@@ -1,0 +1,15 @@
+{
+  "gamma": 0.99,
+  "potential_scale": 1.0,
+  "success": 20.0,
+  "collision": -20.0,
+  "timeout": -8.0,
+  "time_per_second": 0.02,
+  "risk": 0.08,
+  "action_change": 0.01,
+  "safety_distance": 0.35,
+  "goal_radius": 0.5,
+  "goal_speed": 0.12,
+  "goal_dwell_s": 0.6,
+  "max_steps": 250
+}

@@ -37,7 +37,50 @@ struct TrainConfig {
   // 第 k 行对应数据集第 k 个样本。与 --class-weights 互斥（两种 loss 归一化口径不同）。
   std::string soft_targets;
   float distill_alpha = 0.5f;  // 软标签项权重；0 = 退化为纯硬标签
+  // CLI 是否显式给出：resume 时只有未显式给出的项才从源 run 的 config.json 继承。
+  bool lr_set = false;
+  bool batch_set = false;
+  bool seed_set = false;
+  bool drop_collision_set = false;
+  bool soft_targets_set = false;
+  bool distill_alpha_set = false;
+  bool text_dim_set = false;
+  // checkpoint 训练契约不一致时默认拒绝；显式放行才继续（会打警告）。
+  bool allow_resume_mismatch = false;
+  // 教师选模 split 与 student val 重叠时默认只警告；strict 直接失败。
+  bool strict_distill = false;
+  // 以下由 trainer 在 run() 里按实际数据/环境补齐，再落进 config.json。
+  std::string dataset_sha256, split_scheme, window_from, hold_s;
+  std::string soft_targets_sha256, teacher_ckpt_sha256, teacher_select_split, source_git;
+  float adam_beta1 = 0.9f, adam_beta2 = 0.999f, adam_eps = 1e-8f;
 };
+
+// 从 <run_dir>/config.json 读回的续训事实；没有文件时返回 false（旧 run 兼容）。
+struct RunConfigSnapshot {
+  bool has_lr = false, has_batch = false, has_seed = false, has_drop_collision = false;
+  bool has_soft_targets = false, has_distill_alpha = false, has_text_dim = false;
+  bool has_vision_only = false;
+  float lr = 0.0f;
+  int batch = 0;
+  unsigned seed = 0;
+  bool drop_collision = false;
+  std::string soft_targets;
+  float distill_alpha = 0.0f;
+  int text_dim = 0;
+  bool vision_only = false;
+  std::string dataset_sha256;
+};
+bool read_run_config(const std::string& run_dir, RunConfigSnapshot* out);
+
+// 文件 SHA256 的小写十六进制；文件不可读时抛 std::runtime_error。
+std::string file_sha256_hex(const std::string& path);
+
+// 追加 <out_dir>/test_eval.jsonl 一行：记录每次 test 评估（eval_count/时间/数据身份），
+// 不改写历史 metrics.jsonl。samples=0 表示调用方未提供样本数。
+void append_test_eval_record(const std::string& out_dir, const std::string& origin,
+                             const std::string& ckpt_path, const std::string& data_path,
+                             const std::string& dataset_sha256, bool drop_collision,
+                             std::size_t samples);
 
 // 一条 MetricsEvent 的 JSON 序列化（单行、无换行）。字段名与 event.hpp 一致。
 std::string metrics_json(const MetricsEvent& e);

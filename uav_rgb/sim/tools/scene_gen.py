@@ -9,6 +9,9 @@
 障碍段落；四旋翼 / RGB 相机 / 深度相机 / contact 插件原样保留。同 seed 两次
 生成字节级一致（sha256 相同）。
 
+外观默认 v1（删除模板里 3 个固定纯色地标 + 随机光照/天空）；`--appearance legacy`
+显式复现旧世界。外观不改变 pillars 几何/gid/split。
+
 随机化契约：
   - 障碍 8–9 根，0.4×0.4×3 m，z∈[0,3]，挡住 z≈2.3 m 巡航高度；
     x∈[1.5, 5.0] 均匀递增（实测每步仅前进 0.105 m，穿完这段要 68–76 步；默认
@@ -83,10 +86,18 @@ DEFAULT_TEMPLATE = os.path.join(SIM_DIR, "worlds", "uav_rgb.sdf")
 START_MARK = "    <!-- tall pillars"
 END_MARK = "    <!-- X3-equivalent quadrotor"
 # 外观版本：只改材质/光照/固定地标，不动 pillars 几何 → geometry_gid 与旧数据都保留。
-# legacy（默认）与改动前逐字节一致；v1 删掉模板里 3 个固定纯色方块并随机化光照/天空。
+# legacy 显式复现改动前逐字节输出（含 3 个固定纯色方块）；v1 删掉它们并随机化光照/天空。
+# 2026-11-04 起新场景默认 v1：固定地标是每集重复的捷径，且不在教师真值里。
 # 背景见 docs/worklog/2026-11-03-sim-scene-realism-proposal.md §1.1 G8/G9。
 APPEARANCE_LEGACY = "legacy"
 APPEARANCE_V1 = "v1"
+APPEARANCE_DEFAULT = APPEARANCE_V1
+# v1 世界内容版本：本次把 base/l1 新默认 v1 的太阳方位从单侧 [-160,-20]
+# 改为全圆 [-180,180]，旧 v1 世界不能按 seed 逐字节复现。appearance_version
+# 仍写开关值（保持与 test_spawn/preprocess 的既有口径兼容），另写 schema 字段
+# 标识内容版本。校园任务有已冻结的数据，仍用单侧太阳（FROZEN 版本）。
+APPEARANCE_SCHEMA_VERSION = "uavrgb.appearance.v2"
+APPEARANCE_SCHEMA_VERSION_FROZEN = "uavrgb.appearance.v1"
 LANDMARK_MARK = "    <!-- colored landmarks in front of the spawn (forward = +X) -->"
 LIGHT_MARK = '    <light type="directional" name="sun">'
 LIGHT_END_MARK = "    </light>"
@@ -249,10 +260,17 @@ def _pillar_xml(p):
     </model>"""
 
 
-def appearance_params(seed):
-    """v1 的光照/天空参数；独立 RNG 流，不扰动 sample_pillars/make_spawn。"""
+def appearance_params(seed, full_sun=True):
+    """v1 的光照/天空参数；独立 RNG 流，不扰动 sample_pillars/make_spawn。
+
+    full_sun=False 冻结 2026-11-03 的单侧太阳，供已冻结的校园/资产校园数据复现。
+    """
     rng = random.Random(seed ^ 0x4F0EA7)
-    az = math.radians(rng.uniform(-160.0, -20.0))   # 太阳方位（+X 前方为 0°）
+    if full_sun:
+        # 全圆方位：-180..180 覆盖左右两侧，避免所有场景太阳都从同一侧来。
+        az = math.radians(rng.uniform(-180.0, 180.0))   # 太阳方位（+X 前方为 0°）
+    else:
+        az = math.radians(rng.uniform(-160.0, -20.0))   # 冻结版本：只有右侧受光
     el = math.radians(rng.uniform(25.0, 70.0))      # 太阳高度角
     intensity = rng.uniform(0.60, 0.95)
     warm = rng.uniform(-0.04, 0.04)                 # 正=偏暖（红多蓝少）
@@ -268,10 +286,14 @@ def appearance_params(seed):
         "background": [round(rng.uniform(0.45, 0.72), 4),
                        round(rng.uniform(0.55, 0.78), 4),
                        round(rng.uniform(0.70, 0.92), 4)],
+        # 落盘可复核的太阳参数；方向向量的 y 分量符号即受光侧。
+        "sun_azimuth_deg": round(math.degrees(az), 2),
+        "sun_elevation_deg": round(math.degrees(el), 2),
+        "shadows": True,
     }
 
 
-def _apply_appearance(prefix, seed, appearance):
+def _apply_appearance(prefix, seed, appearance, full_sun=True):
     """对柱子之前的世界头部做外观替换；legacy 原样返回（必须逐字节不变）。"""
     if appearance == APPEARANCE_LEGACY:
         return prefix, None
@@ -280,7 +302,7 @@ def _apply_appearance(prefix, seed, appearance):
     for mark in (LANDMARK_MARK, LIGHT_MARK, LIGHT_END_MARK):
         if prefix.count(mark) != 1:
             raise ValueError(f"template marker {mark!r} count != 1")
-    p = appearance_params(seed)
+    p = appearance_params(seed, full_sun)
     # 1) 删掉 3 个固定纯色方块：它们不在 pillars/gid/教师真值里，学生却看得见（G9）。
     prefix = prefix[:prefix.index(LANDMARK_MARK)]
     # 2) 换掉固定方向光，并补 <scene>（ambient/background/shadows）。
@@ -311,6 +333,17 @@ def _apply_appearance(prefix, seed, appearance):
     return prefix[:i] + block + prefix[j:], p
 
 
+def strip_velocity_control(world):
+    """cf_sil 用：删掉 MulticopterVelocityControl，避免它的 Actuators component
+    覆盖 transport 电机指令。只删这一个 plugin，保留 odometry/motor model。"""
+    out, n = re.subn(
+        r'\n\s*<plugin filename="gz-sim-multicopter-control-system".*?</plugin>',
+        "", world, flags=re.S)
+    if n != 1:
+        raise ValueError(f"template 里 MulticopterVelocityControl 匹配到 {n} 处，应为 1")
+    return out
+
+
 def build_scene(template, seed, scene_id, spawn_mode="default", task="base",
                 appearance=APPEARANCE_LEGACY):
     """返回 (world_text, meta)。template 只读，任何标记异常都直接报错。
@@ -318,10 +351,17 @@ def build_scene(template, seed, scene_id, spawn_mode="default", task="base",
     task="l1" 时额外给两根柱染同一色并写 relation/instruction/waypoint；
     task="base" 保持原几何与人任务无关的 meta 不变。
     appearance="v1" 只改头部（删固定地标、随机光照/天空），pillars 几何与 gid 不变。
+    Python API 默认仍是 legacy 以复现旧调用；命令行 --appearance 默认已改为 v1，
+    新代码请显式传 APPEARANCE_DEFAULT。
     """
+    if appearance not in (APPEARANCE_LEGACY, APPEARANCE_V1):
+        raise ValueError(f"unknown appearance {appearance!r}")
     if task == "campus":
         import campus
-        return campus.build(template, seed, scene_id)
+        return campus.build(template, seed, scene_id, appearance)
+    if task == "campus_assets":
+        import asset_campus
+        return asset_campus.build(template, seed, scene_id, appearance)
     if task not in ("base", "l1"):
         raise ValueError(f"unknown task {task!r}")
     for mark in (START_MARK, END_MARK):
@@ -354,6 +394,9 @@ def build_scene(template, seed, scene_id, spawn_mode="default", task="base",
         # 外观不参与 geometry_gid：legacy 数据与 v1 数据几何可以互换，
         # 但外观不同不能混在同一次训练里。
         "appearance_version": appearance,
+        # requested=调用方要的，effective=实际落进 SDF 的（campus 任务强制 v1）。
+        "requested_appearance": appearance,
+        "effective_appearance": appearance,
         "camera_profile": "rgb320x240_fov60_v1",
         "dynamics_profile": "x3_v1",
         "spawn": spawn,
@@ -381,6 +424,7 @@ def build_scene(template, seed, scene_id, spawn_mode="default", task="base",
     }
     if appearance_used is not None:
         meta["appearance"] = appearance_used
+        meta["appearance_schema_version"] = APPEARANCE_SCHEMA_VERSION
     if task == "l1":
         meta.update({
             # v2：goal-stop。waypoint 是最终目标，teacher 在半径内输出 SAFE。
@@ -417,6 +461,7 @@ def run_self_check(template_path, n_seeds):
     bad = []
     counts = {}
     example = None
+    sun_sides = set()
     # T1 契约：横向车道缝必须 ≥1.2 m（机体外接直径 0.711 m，单侧余量 ≥0.24 m）。
     lane_gap = LANE_SEP - PILLAR_SIZE
     if lane_gap < 1.2:
@@ -425,8 +470,11 @@ def run_self_check(template_path, n_seeds):
         try:
             w1, m1 = build_scene(template, seed, seed)
             w2, _ = build_scene(template, seed, seed)
-            v1a, v1m = build_scene(template, seed, seed, appearance=APPEARANCE_V1)
-            v1b, _ = build_scene(template, seed, seed, appearance=APPEARANCE_V1)
+            # 新场景默认外观必须是 v1；legacy 仅用于显式复现旧数据。
+            v1a, v1m = build_scene(template, seed, seed,
+                                   appearance=APPEARANCE_DEFAULT)
+            v1b, _ = build_scene(template, seed, seed,
+                                 appearance=APPEARANCE_DEFAULT)
         except (ValueError, RuntimeError) as e:
             bad.append((seed, str(e)))
             continue
@@ -434,6 +482,8 @@ def run_self_check(template_path, n_seeds):
         h2 = sha256(w2.encode("utf-8"))
         if h1 != h2:
             bad.append((seed, f"non-deterministic {h1} != {h2}"))
+        if m1["requested_appearance"] != APPEARANCE_LEGACY:
+            bad.append((seed, "legacy 显式复现的 requested_appearance 不是 legacy"))
         # v1 只准改外观：几何必须与 legacy 一致，固定地标必须消失，场景必须有天空。
         if v1a != v1b:
             bad.append((seed, "v1 non-deterministic"))
@@ -445,11 +495,24 @@ def run_self_check(template_path, n_seeds):
             bad.append((seed, "v1 缺 <scene>"))
         if '<light type="directional"' not in v1a:
             bad.append((seed, "v1 缺方向光"))
+        # requested/effective 与内容版本必须落盘，否则数据身份不可追溯。
+        if (v1m["requested_appearance"] != APPEARANCE_DEFAULT or
+                v1m["effective_appearance"] != APPEARANCE_DEFAULT):
+            bad.append((seed, "v1 requested/effective_appearance 不一致"))
+        if v1m.get("appearance_schema_version") != APPEARANCE_SCHEMA_VERSION:
+            bad.append((seed, "v1 缺 appearance_schema_version"))
+        light = v1m.get("appearance") or {}
+        if not light.get("shadows") or "background" not in light:
+            bad.append((seed, "v1 光照参数缺 shadows/background"))
+        # 太阳方位要覆盖左右两侧：direction 的 y 分量符号两向都出现。
+        sun_sides.add((light.get("light_direction") or [0, 0, 0])[1] > 0)
         if not PILLAR_COUNT_RANGE[0] <= m1["pillar_count"] <= PILLAR_COUNT_RANGE[1]:
             bad.append((seed, f"pillar_count={m1['pillar_count']}"))
         counts[m1["pillar_count"]] = counts.get(m1["pillar_count"], 0) + 1
         if seed == 0:
             example = (h1, h2, m1["pillar_count"])
+    if sun_sides != {True, False}:
+        bad.append((-1, f"太阳方位未覆盖左右两侧: {sorted(sun_sides)}"))
     print(f"scene_gen self-check: {n_seeds - len(bad)}/{n_seeds} seeds OK, "
           f"pillar count distribution {dict(sorted(counts.items()))}")
     if example:
@@ -476,13 +539,15 @@ def main():
                    help="EpisodeMeta.scene_id（默认=seed）")
     p.add_argument("--spawn-mode", choices=("default", "random"), default="default",
                    help="出生位姿：default=模板原点；random=y/yaw 随机")
-    p.add_argument("--task", choices=("base", "l1", "campus"), default="base",
+    p.add_argument("--task", choices=("base", "l1", "campus", "campus_assets"), default="base",
                    help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
     p.add_argument("--appearance", choices=(APPEARANCE_LEGACY, APPEARANCE_V1),
-                   default=APPEARANCE_LEGACY,
-                   help="legacy=模板原样（默认，逐字节不变）；v1=删固定地标+随机光照/天空")
+                   default=APPEARANCE_DEFAULT,
+                   help="v1=删固定地标+随机光照/天空（默认）；legacy=模板原样，仅用于复现旧数据")
     p.add_argument("--template", default=DEFAULT_TEMPLATE,
                    help=f"模板 SDF（默认 {_rel(DEFAULT_TEMPLATE)}）")
+    p.add_argument("--no-velocity-control", action="store_true",
+                   help="删除 MulticopterVelocityControl（cf_sil 用；保留电机模型/odometry）")
     p.add_argument("--self-check", action="store_true",
                    help="确定性 + 障碍数量 + 缝隙契约自检，不写文件")
     p.add_argument("--check-seeds", type=int, default=100,
@@ -500,6 +565,11 @@ def main():
     template = _read_template(args.template)
     world, meta = build_scene(template, args.seed, scene_id, args.spawn_mode, args.task,
                               args.appearance)
+    if args.no_velocity_control:
+        world = strip_velocity_control(world)
+        meta["velocity_control"] = "removed"
+    else:
+        meta["velocity_control"] = "template"
     meta["template"] = _rel(os.path.abspath(args.template))
     out = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
@@ -515,7 +585,7 @@ def main():
         print(f"  {pillar['name']}: x={pillar['x']:.3f} y={pillar['y']:.3f} "
               f"size={pillar['size']}")
     c = meta["clearance"]
-    if args.task == "campus":
+    if args.task in ("campus", "campus_assets"):
         print(f"  map={meta['map_id']} goal_radius={meta['goal_radius']} m ok={c['ok']}")
     else:
         print(f"  clearance: min_pair={c['min_pair_gap_m']:.3f} m "

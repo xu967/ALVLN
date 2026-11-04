@@ -62,6 +62,17 @@ def main():
         assert not out.exists(), "缺失标签留下了半成品"
         np.savez(soft, **logits)
         run(cmd, True)
+        # 教师来源元信息必须原样进 <out>.json（student config 会读回）。
+        np.savez(soft, teacher_ckpt_sha256=np.asarray("a" * 64),
+                 select_split=np.asarray("val"), train_data_sha256=np.asarray("b" * 64),
+                 **logits)
+        run(cmd, True)
+        meta = json.loads(out.with_suffix(".json").read_text())
+        assert meta["teacher_ckpt_sha256"] == "a" * 64
+        assert meta["teacher_select_split"] == "val"
+        assert meta["teacher_train_data_sha256"] == "b" * 64
+        np.savez(soft, **logits)
+        run(cmd, True)
         original = out.read_bytes()
         fields = HEADER.unpack(original[:HEADER.size])
         assert fields[:4] == (b"UAVSOFT1", 3, 4, 1)

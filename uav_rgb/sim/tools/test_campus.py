@@ -42,6 +42,19 @@ def main():
         assert shuffled["instruction"] != meta["instruction"]
     assert len(groups) == 3 and all(len(v) == 1 for v in groups.values())
     assert {next(iter(v)) for v in groups.values()} == {"train", "val", "test"}
+    # 布局随机化必须真的铺开：40 张 train 地图不能退回 0.6 m 内的窄抖动。
+    xs, ys, islands = [], [], []
+    for seed in range(960):
+        family, pillars, _, _, waypoint = campus.layout(seed)
+        if family != "building_lane":
+            continue
+        target = next(p for p in pillars if p.get("color") and p["y"] == waypoint["y"])
+        xs.append(target["x"])
+        ys.append(abs(target["y"]))
+        islands.append(next(p["x"] for p in pillars if p["name"] == "island"))
+    assert max(xs) - min(xs) > 1.5, (min(xs), max(xs))
+    assert max(ys) - min(ys) > 0.4, (min(ys), max(ys))
+    assert max(islands) - min(islands) > 0.8, (min(islands), max(islands))
     forged = dict(meta, map_id="campus.v1/building_lane")
     try:
         sm.split_for_scene(forged)
@@ -80,5 +93,41 @@ def main():
     print("test_campus: PASS（48 scenes / 3 topology holdouts / goal / collision geometry）")
 
 
+def test_default_appearance_and_portable_assets():
+    """新默认外观无固定地标；校园纹理只写 model://，不写绝对路径。"""
+    template = sg._read_template(sg.DEFAULT_TEMPLATE)
+    world, meta = sg.build_scene(template, 16, 16, task="campus",
+                                 appearance=sg.APPEARANCE_DEFAULT)
+    assert meta["requested_appearance"] == "v1", meta
+    assert meta["effective_appearance"] == "v1", meta
+    assert meta["appearance_schema_version"] == sg.APPEARANCE_SCHEMA_VERSION_FROZEN
+    assert str(sg.REPO_ROOT) not in world
+    assert str(campus.ASSETS) not in world
+    root = ET.fromstring(world)
+    uris = [e.text for e in root.findall(".//albedo_map")]
+    campus_uris = [u for u in uris if u.startswith("model://campus_textures/")]
+    assert campus_uris, uris
+    for uri in campus_uris:
+        assert (campus.ASSETS / uri.rsplit("/", 1)[-1]).is_file(), uri
+    # 默认 base 场景：3 个固定地标消失，collision/visual 尺寸仍一致。
+    with tempfile.TemporaryDirectory() as tmp:
+        out = Path(tmp) / "base.sdf"
+        subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "scene_gen.py"),
+                        "--seed", "0", "--out", str(out)], check=True,
+                       capture_output=True)
+        base = out.read_text()
+        bmeta = json.loads(out.with_suffix(".json").read_text())
+        assert bmeta["requested_appearance"] == bmeta["effective_appearance"] == "v1"
+        assert 'name="landmark_' not in base
+        broot = ET.fromstring(base)
+        for model in broot.find("world").findall("model"):
+            if not model.attrib["name"].startswith("pillar_"):
+                continue
+            sizes = [e.text.split() for e in model.findall(".//size")]
+            assert len(sizes) == 2 and sizes[0] == sizes[1], (model.attrib, sizes)
+    print("test_campus: 默认外观/纹理可移植性 PASS")
+
+
 if __name__ == "__main__":
     main()
+    test_default_appearance_and_portable_assets()

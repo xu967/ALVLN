@@ -45,9 +45,15 @@ bash tools/check.sh
   --text-mode keep --keep-work --out "$DATA_ROOT/uav_rgb/campus-eval-new"
 ```
 
-`--task campus` 固定使用校园材质/随机光照；`--appearance` 是历史柱阵的开关。
-资产在 `sim/worlds/campus_textures`，由 `make_campus_textures.py` 确定性生成，
-无需网络或用户照片。模板哈希覆盖相机和动力学，材质哈希与各集 world 哈希随产物落盘。
+`--task campus` 固定使用校园材质/随机光照。自 2026-11-04 起 base/l1 的
+`--appearance` 默认是 `v1`（删除模板里 3 个固定纯色地标、随机化光照/天空）；
+`--appearance legacy` 才逐字节复现带固定地标的旧场景。旧 legacy 数据与新 v1 数据
+不能混包（`appearance_version` 不同）。
+运行时副本在 `sim/assets/campus_textures`，SDF 写 `model://campus_textures/...`；
+`GZ_SIM_RESOURCE_PATH` 指向 `sim/assets`，不再写开发机绝对路径。
+纹理由 `make_campus_textures.py` 确定性生成（当前仍输出到 `sim/worlds/campus_textures`，
+需要同步复制到运行时目录），无需网络或用户照片。
+模板哈希覆盖相机和动力学，材质哈希与各集 world 哈希随产物落盘。
 外观、几何、任务、动作窗口、相机/动力学版本不一致的 episode 拒绝混包。
 
 ## 工程修复与兼容性

@@ -15,6 +15,7 @@
 --data 指向 split 目录本身（train/ 或 val/ 或 test/），不是它的上级。
 """
 import argparse
+import hashlib
 import sys
 from pathlib import Path
 
@@ -44,6 +45,11 @@ def main():
     ckpt = torch.load(args.ckpt, map_location="cpu")
     state = ckpt.get("model") or ckpt.get("model_state_dict") or ckpt
     seq_len = args.seq_len or int(ckpt.get("seq_len") or 8)
+    # 来源审计：教师 ckpt 的哈希 + 教师选模 split + 教师训练数据指纹。
+    with open(args.ckpt, "rb") as f:
+        teacher_ckpt_sha256 = hashlib.file_digest(f, "sha256").hexdigest()
+    select_split = str(ckpt.get("select_split") or "unknown")
+    train_data_sha256 = str(ckpt.get("train_data_sha256") or "")
     dataset = EpisodeSequenceDataset(args.data, seq_len=seq_len)
     if len(dataset) == 0:
         sys.exit(f"{args.data} 没有可用样本（缺 depth/pose 的集会被跳过）。")
@@ -87,11 +93,17 @@ def main():
     payload["episode_ids"] = np.asarray(episode_ids)
     payload["steps"] = np.asarray(steps, dtype=np.int64)
     payload["seq_len"] = np.asarray(seq_len)
+    # 标量字符串元信息；join_soft_targets.py 会原样写进 <out>.json。
+    payload["teacher_ckpt_sha256"] = np.asarray(teacher_ckpt_sha256)
+    payload["select_split"] = np.asarray(select_split)
+    payload["train_data_sha256"] = np.asarray(train_data_sha256)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(out_path, **payload)
     print(f"导出 {len(episode_ids)} 条滑窗样本（{len({*episode_ids})} 个 episode）"
           f" -> {out_path}", file=sys.stderr)
+    print(f"teacher ckpt sha256={teacher_ckpt_sha256} select_split={select_split}",
+          file=sys.stderr)
 
 
 if __name__ == "__main__":

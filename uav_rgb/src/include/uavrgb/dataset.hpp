@@ -17,6 +17,9 @@ struct LoadOptions {
   // true：按 meta.collision_flags 丢掉碰撞步。标记由新版 preprocess.py 写入；缺失时
   // 直接报错而不是静默不过滤——碰撞步的专家标签本身是错的，静默保留会污染训练。
   bool drop_collision = false;
+  // true：允许 split_scheme 为 map-hash:*/diag* 的诊断性划分。默认拒绝：这类
+  // 划分无视地图/拓扑族归属，混进常规训练会让跨族结论失效。
+  bool allow_diagnostic_split = false;
 };
 
 struct UavrDataset {
@@ -27,6 +30,10 @@ struct UavrDataset {
   std::uint32_t num_classes = 4;
   std::uint64_t images_off = 0;
   std::uint64_t labels_off = 0;
+  // meta 记录的划分事实（旧数据可能为空），供训练/评测日志留痕；不参与切分。
+  std::string split_policy;
+  std::string split_scheme;
+  std::string split_salt;
   std::vector<std::uint8_t> labels;         // [n]，已校验 0..num_classes-1
   // 语言侧车 instructions.jsonl 里的 token id，展开后 [n * kTextLen]，缺位补 <pad>(0)。
   // 没有侧车时为空——此时只能训练无文本模型。

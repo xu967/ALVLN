@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """几何组 / 冻结 split 的回归用例（不启动 Gazebo，纯 CPU）。"""
+import json
+import os
 import unittest
+from pathlib import Path
 
 import split_manifest as sm
+
+DATA_ROOT = Path(os.environ.get("DATA_ROOT", "/root/rivermind-data")) / "uav_rgb"
 
 
 def pillars_of(seed):
@@ -67,6 +72,75 @@ class SplitAssignmentTests(unittest.TestCase):
                  for s in range(2000)]
         self.assertEqual(len(sm.cross_split_groups(pairs)), 291)
         self.assertEqual(len({sm.geometry_gid(pillars_of(s)) for s in range(2000)}), 759)
+
+
+class RecordedSplitTests(unittest.TestCase):
+    """重打包必须按记录的 salt/策略/版本复算，不能回落当前 SPLIT_SALT。"""
+
+    def test_frozen_v3_uses_recorded_version(self):
+        # t5 test/200561 的真实 gid：v3→test，当前 v5→train（35% 不符的来源之一）。
+        meta = {"geometry_version": "uavrgb.geom.v3",
+                "geometry_gid": "0226c6cbd9d1a7e5"}
+        self.assertEqual(sm.split_for_scene(meta), "test")
+        self.assertEqual(sm.split_for_gid(meta["geometry_gid"]), "train")
+
+    def test_recorded_split_salt_wins(self):
+        meta = {"geometry_version": sm.SPLIT_SALT, "geometry_gid": "x",
+                "split_salt": "uavrgb.geom.v3"}
+        self.assertEqual(sm.split_for_scene(meta),
+                         sm.split_for_gid("x", "uavrgb.geom.v3"))
+
+    def test_campus_v1_frozen_map_dispatch(self):
+        import campus
+        meta = {"seed": 822, "geometry_version": "campus.v1",
+                "map_id": "campus.v1/building_lane",
+                "split_policy": "campus_map_v1"}
+        self.assertEqual(sm.split_for_scene(meta), "train")
+        # 版本与 map_id 不一致必须 fail-closed（当前 v2 meta + v1 map_id）。
+        with self.assertRaises(ValueError):
+            sm.split_for_scene(dict(meta, geometry_version=campus.VERSION))
+
+    def test_unknown_campus_version_fails_closed(self):
+        meta = {"seed": 0, "geometry_version": "campus.v99",
+                "map_id": "campus.v99/building_lane",
+                "split_policy": "campus_map_v1"}
+        with self.assertRaises(ValueError):
+            sm.split_for_scene(meta)
+
+    def test_asset_campus_version_dispatch(self):
+        import asset_campus
+        key = asset_campus.map_key(9)
+        meta = {"seed": 9, "geometry_version": asset_campus.VERSION,
+                "map_id": key, "split_policy": "campus_assets_map_v1"}
+        self.assertEqual(sm.split_for_scene(meta), asset_campus.split_key(key))
+
+
+class FrozenDataRegressionTests(unittest.TestCase):
+    """只读 $DATA_ROOT 下真实冻结 manifest；机器上没有就跳过（不写数据）。"""
+
+    def _check(self, base, pattern):
+        root = DATA_ROOT / base
+        paths = sorted(root.glob(pattern))
+        if not paths:
+            self.skipTest("缺少冻结数据 %s" % root)
+        bad = []
+        for path in paths:
+            man = json.loads(path.read_text(encoding="utf-8"))
+            try:
+                got = sm.split_for_scene(man)
+            except ValueError as exc:
+                bad.append((str(path), str(exc)))
+                continue
+            if got != man["split"]:
+                bad.append((str(path), got, man["split"]))
+        self.assertEqual(bad, [])
+
+    def test_t5_frozen_manifests(self):
+        # t5 = uavrgb.geom.v3；当前 v5 salt 会改掉其中约 35% 的 split。
+        self._check("t5-full-1155", "*/*/episode_manifest.json")
+
+    def test_campus_v1_frozen_manifests(self):
+        self._check("campus-paired-20261103", "*/*/*/episode_manifest.json")
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@
 
 #include "synthetic_dataset.hpp"
 #include "uavrgb/checkpoint.hpp"
+#include "uavrgb/sha256.hpp"
 #include "uavrgb/trainer.hpp"
 
 namespace fs = std::filesystem;
@@ -23,6 +24,21 @@ using namespace uavrgb;
 namespace {
 
 int g_failures = 0;
+
+// v5 checkpoint 在 text_dim 之后的固定训练契约长度。
+constexpr std::size_t kContractBytes = 32 + 1 + 32 + 4 + 4 + 4 + 4 + 32;
+
+std::string hex_sha(const Sha256& h) {
+  static const char* d = "0123456789abcdef";
+  std::string s;
+  for (unsigned char b : h) { s += d[b >> 4]; s += d[b & 15]; }
+  return s;
+}
+
+std::string read_file(const std::string& path) {
+  std::ifstream f(path);
+  return std::string((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+}
 
 void check(bool ok, const std::string& msg) {
   if (!ok) {
@@ -219,11 +235,27 @@ int main() {
   check_results_csv(cfg.out_dir + "/results.csv", cfg.epochs);
 
   // 文本分支必须能从 run 目录复现：config.json 要记录 text_dim（L2 的 A/B 全靠它）。
+  // 事实字段（数据 SHA/口径/优化器超参）也必须在场，旧字段保持原样。
   {
     std::ifstream cf(cfg.out_dir + "/config.json");
     const std::string cjs((std::istreambuf_iterator<char>(cf)),
                           std::istreambuf_iterator<char>());
     check(cjs.find("\"text_dim\":0") != std::string::npos, "config.json 缺 text_dim 字段");
+    check(cjs.find("\"dataset_sha256\":\"" + hex_sha(sha256_file(sd.path)) + "\"") !=
+              std::string::npos,
+          "config.json 的 dataset_sha256 与数据文件不符");
+    check(cjs.find("\"split_scheme\":\"scene_id\"") != std::string::npos,
+          "config.json 缺 split_scheme（合成集为 scene_id）");
+    check(cjs.find("\"drop_collision\":false") != std::string::npos,
+          "config.json 缺 drop_collision");
+    check(cjs.find("\"soft_targets_sha256\":\"\"") != std::string::npos,
+          "config.json 缺 soft_targets_sha256（未蒸馏应为空）");
+    check(cjs.find("\"beta1\":") != std::string::npos &&
+              cjs.find("\"beta2\":") != std::string::npos &&
+              cjs.find("\"eps\":") != std::string::npos,
+          "config.json 缺 Adam beta/eps");
+    check(cjs.find("\"seed\":42") != std::string::npos, "config.json 缺 seed");
+    check(cjs.find("\"batch\":32") != std::string::npos, "config.json 缺 batch");
   }
 
   // 5) best-checkpoint：记录值必须等于 dev 宏 F1 峰值，且文件能读回。
@@ -281,8 +313,13 @@ int main() {
   check(st2.epoch == tr.state().epoch && st2.epoch == cfg.epochs, "checkpoint epoch 数不符");
   check(st2.best_macro_f1 == tr.state().best_macro_f1,
         "checkpoint best_macro_f1 读回不一致");
+  check(st2.contract_present && st2.contract.lr == cfg.lr && st2.contract.seed == cfg.seed &&
+            st2.contract.batch == cfg.batch,
+        "v5 checkpoint 未保存训练契约（lr/seed/batch）");
+  check(hex_sha(st2.contract.dataset_sha256) == hex_sha(sha256_file(sd.path)),
+        "v5 checkpoint 的 dataset_sha256 不符");
 
-  // v3 -> v2 兼容：旧 checkpoint 没有 best_macro_f1 字段，读回应为 -1。
+  // v2 兼容：旧 checkpoint 没有 best_macro_f1/text_dim/训练契约，读回应为 -1 且无契约。
   const std::string v2 = root + "/ckpt_v2.bin";
   {
     std::ifstream in(ckpt, std::ios::binary);
@@ -293,7 +330,8 @@ int main() {
     check(nw == 0, "v2 兼容用例假设 checkpoint 无类别权重");
     const std::uint32_t two = 2;
     std::memcpy(&bytes[8], &two, 4);
-    // 去掉 v3 的 best_macro_f1 和 v4 的 text_dim（各 4 B），还原成 v2 布局。
+    // 去掉 v5 契约、v3 best_macro_f1、v4 text_dim，还原成 v2 布局。
+    bytes.erase(bytes.begin() + 52, bytes.begin() + 52 + kContractBytes);
     bytes.erase(bytes.begin() + 44, bytes.begin() + 52);
     std::ofstream out(v2, std::ios::binary);
     out.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
@@ -302,6 +340,29 @@ int main() {
   TrainState st4 = make_train_state(m4, cfg.lr);
   load_checkpoint(v2, m4, st4);
   check(st4.best_macro_f1 == -1.0f, "v2 checkpoint 的 best_macro_f1 应为 -1");
+  check(!st4.contract_present, "v2 checkpoint 不应有训练契约");
+
+  // 旧 checkpoint 缺契约字段：resume 按旧行为放行（告警），不能拒绝。
+  {
+    const std::string v2src = root + "/v2src";
+    fs::create_directories(v2src);
+    fs::copy_file(v2, v2src + "/ckpt.bin");
+    TrainConfig vc = cfg;
+    vc.out_dir = root + "/run_resume_v2";
+    vc.resume = v2src + "/ckpt.bin";
+    vc.epochs = 1;
+    bool ok = true;
+    try {
+      Trainer t(vc);
+      t.run();
+    } catch (const std::exception& e) {
+      ok = false;
+      std::cerr << "  v2 resume 失败: " << e.what() << "\n";
+    }
+    check(ok, "旧 v2 checkpoint 无训练契约字段时 resume 应按旧行为放行");
+    check(fs::exists(vc.out_dir + "/config.resume.json"),
+          "旧 run resume 也要写 config.resume.json 留痕");
+  }
   const auto pc = cnn_params(m4);
   bool v2_same = true;
   for (std::size_t i = 0; i < pa.size(); ++i) v2_same = v2_same && same_bits(*pa[i], *pc[i]);
@@ -315,8 +376,9 @@ int main() {
     std::vector<char> bytes((std::istreambuf_iterator<char>(in)),
                             std::istreambuf_iterator<char>());
     std::uint32_t ndim = 0;
-    std::memcpy(&ndim, &bytes[52], 4);  // 参数 0 的 ndim（v4 头部 52 B 之后）
-    const std::size_t off = 52 + 4 + static_cast<std::size_t>(ndim) * 8;
+    const std::size_t tensor_off = 52 + kContractBytes;  // v5 头部之后的第一个参数
+    std::memcpy(&ndim, &bytes[tensor_off], 4);
+    const std::size_t off = tensor_off + 4 + static_cast<std::size_t>(ndim) * 8;
     check(off + 4 <= bytes.size(), "NaN 注入点超出 checkpoint 文件大小");
     if (off + 4 > bytes.size()) {
       std::cerr << "RESULT: FAIL（NaN 注入越界）\n";
@@ -379,6 +441,100 @@ int main() {
               << "\n";
     check(inline_test >= 0.0 && std::abs(inline_test - evalonly_test) < 1e-9,
           "内联 test 与 ckpt_best 的 eval-only 结果不一致（评的不是交付权重）");
+
+    // test 评估留痕：训练末尾的自动 test 也要记录次数/时间/数据身份。
+    const auto rec = read_lines(c2.out_dir + "/test_eval.jsonl");
+    check(rec.size() == 1 && rec[0].find("\"origin\":\"train_inline\"") != std::string::npos &&
+              rec[0].find("\"eval_count\":1") != std::string::npos &&
+              rec[0].find("\"split\":\"test\"") != std::string::npos &&
+              rec[0].find("\"dataset_sha256\":\"" + hex_sha(sha256_file(sd2.path)) + "\"") !=
+                  std::string::npos,
+          "训练末尾 test 评估未写 test_eval.jsonl（次数/数据身份）");
+
+    // resume 严格化：未显式传入的 lr/seed/batch 从源 run 的 config.json 继承；
+    // 同目录续训只写 config.resume.json，绝不截断原 config.json。
+    {
+      const std::string cfg_before = read_file(c2.out_dir + "/config.json");
+      TrainConfig rr = c2;
+      rr.out_dir = c2.out_dir;
+      rr.resume = c2.out_dir + "/ckpt.bin";
+      rr.epochs = 1;
+      rr.seed = 1234;  // 非源值，但 seed_set=false：应从 config 继承 7
+      rr.batch = 64;
+      bool ok = true;
+      try {
+        Trainer t3(rr);
+        t3.run();
+      } catch (const std::exception& e) {
+        ok = false;
+        std::cerr << "  resume 继承失败: " << e.what() << "\n";
+      }
+      check(ok, "未显式传 seed/batch 的 resume 应继承源 config（否则契约不一致）");
+      check(read_file(c2.out_dir + "/config.json") == cfg_before,
+            "resume 截断了原 config.json");
+      const std::string rjs = read_file(c2.out_dir + "/config.resume.json");
+      check(rjs.find("\"seed\":7") != std::string::npos &&
+                rjs.find("\"batch\":16") != std::string::npos,
+            "config.resume.json 未记录继承后的 seed/batch");
+      check(rjs.find("\"resume\":") != std::string::npos,
+            "config.resume.json 缺 resume 来源");
+    }
+
+    // 契约不一致：显式换 seed 必须拒绝；--allow-resume-mismatch 才放行。
+    {
+      TrainConfig bad = c2;
+      bad.out_dir = root + "/run_resume_bad";
+      bad.resume = c2.out_dir + "/ckpt.bin";
+      bad.epochs = 1;
+      bad.seed = 99;
+      bad.seed_set = true;
+      bool rejected = false;
+      try {
+        Trainer t4(bad);
+        t4.run();
+      } catch (const std::invalid_argument& e) {
+        rejected = std::string(e.what()).find("契约") != std::string::npos;
+      }
+      check(rejected, "resume 与 checkpoint 训练契约不一致时必须拒绝");
+      bad.allow_resume_mismatch = true;
+      bad.out_dir = root + "/run_resume_allow";
+      bool allowed = true;
+      try {
+        Trainer t5(bad);
+        t5.run();
+      } catch (const std::exception& e) {
+        allowed = false;
+        std::cerr << "  --allow-resume-mismatch 失败: " << e.what() << "\n";
+      }
+      check(allowed, "--allow-resume-mismatch 应放行契约不一致");
+    }
+
+    // 旧 config 缺事实字段（dataset_sha256/split_scheme/...）也能续训：
+    // 只补全它能给出的 lr/seed/batch，其余按当前数据集/默认值走。
+    {
+      const std::string oldsrc = root + "/oldsrc";
+      fs::create_directories(oldsrc);
+      fs::copy_file(c2.out_dir + "/ckpt.bin", oldsrc + "/ckpt.bin");
+      fs::copy_file(c2.out_dir + "/ckpt_best.bin", oldsrc + "/ckpt_best.bin");
+      std::ofstream(oldsrc + "/config.json")
+          << "{\"schema\":\"uavrgb.train_config.v1\",\"batch\":16,\"lr\":0.001,"
+             "\"seed\":7,\"drop_collision\":false}\n";
+      TrainConfig oc = c2;
+      oc.out_dir = root + "/run_oldcfg";
+      oc.resume = oldsrc + "/ckpt.bin";
+      oc.epochs = 1;
+      oc.seed = 1234;  // 未显式给出：应被旧 config 的 7 覆盖
+      oc.batch = 64;
+      bool ok = true;
+      try {
+        Trainer t6(oc);
+        t6.run();
+      } catch (const std::exception& e) {
+        ok = false;
+        std::cerr << "  旧 config resume 失败: " << e.what() << "\n";
+      }
+      check(ok, "旧 config 缺新字段时应兼容续训");
+    }
   }
 
   // 数据集带 text_ids 侧车却没给 --text-dim：必须报错，不能静默训成纯视觉模型。

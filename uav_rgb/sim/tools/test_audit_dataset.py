@@ -160,7 +160,8 @@ def campus_contract_tests():
 
         good = checks(facts)
         for name in ("campus_identity", "campus_map_split", "campus_goal_geometry",
-                     "campus_teacher_reach", "geometry_version", "label_recompute"):
+                     "campus_teacher_reach", "campus_no_collision",
+                     "geometry_version", "label_recompute"):
             assert good[name]["status"] == "PASS", good[name]
         assert good["label_recompute"]["covered_steps"] == 8, good
         assert good["waypoint_side"]["status"] == "SKIP", good
@@ -192,6 +193,14 @@ def campus_contract_tests():
         wrong = copy.deepcopy(facts[0])
         wrong["waypoint_min_dist"] = .6
         assert checks([wrong])["campus_teacher_reach"]["status"] == "FAIL"
+        # 到达了 waypoint 但整集有碰撞：reach PASS、no_collision FAIL。
+        # 两条检查必须独立，否则「到点」会被碰撞语义一起判死。
+        wrong = copy.deepcopy(facts[0])
+        assert wrong["waypoint_min_dist"] <= campus.RADIUS
+        wrong["steps"][0]["collision"] = True
+        split = checks([wrong])
+        assert split["campus_teacher_reach"]["status"] == "PASS", split["campus_teacher_reach"]
+        assert split["campus_no_collision"]["status"] == "FAIL", split["campus_no_collision"]
         wrong = copy.deepcopy(facts[0])
         wrong["steps"][0]["action_expert"] = 1
         assert checks([wrong])["label_recompute"]["status"] == "FAIL"
@@ -277,13 +286,31 @@ def main():
         assert st8["status"] == "SKIP", st8
         shutil.rmtree(root8)
 
-        # 9) --exclude-collision-episodes 排除前统计到的 SAFE+碰撞必须让检查 FAIL，
-        #    不能因为排除后看不到 collision 步就恒 PASS。
+        # 9) quarantine 记账：审计集里的 SAFE+碰撞 FAIL；同一集作为隔离集时
+        #    不参与 FAIL，单独记入 quarantined，且不能重复计入审计集。
         root9 = tempfile.mkdtemp(prefix="audit_test_")
-        write_plan_ep(root9, "train", 1)
-        facts9 = [ad.episode_facts(os.path.join(root9, "train", "1"))]
-        c9 = {c["name"]: c for c in ad.audit(facts9, pre_safe_collisions=1)}
+        write_ep(root9, "train", 1, [0, 0])
+        bad_path = os.path.join(root9, "train", "1", "actions.jsonl")
+        with open(bad_path, encoding="utf-8") as f:
+            bad_rows = [json.loads(x) for x in f if x.strip()]
+        for r in bad_rows:
+            r["collision"] = True
+        with open(bad_path, "w", encoding="utf-8") as f:
+            f.writelines(json.dumps(r) + "\n" for r in bad_rows)
+        bad = ad.episode_facts(os.path.join(root9, "train", "1"))
+        c9 = {c["name"]: c for c in ad.audit([bad])}
         assert c9["safe_collision"]["status"] == "FAIL", c9["safe_collision"]
+        assert c9["safe_collision"]["quarantined"]["safe_collision_steps"] == 0
+        assert "已排除" not in c9["safe_collision"]["detail"], c9["safe_collision"]
+
+        write_ep(root9, "train", 2, CLEAN)
+        good = ad.episode_facts(os.path.join(root9, "train", "2"))
+        c9b = {c["name"]: c for c in ad.audit(
+            [good], pre_excluded=[bad], quarantined=[bad])}
+        assert c9b["safe_collision"]["status"] == "PASS", c9b["safe_collision"]
+        assert c9b["safe_collision"]["quarantined"] == {
+            "episodes": 1, "safe_collision_steps": 2}, c9b["safe_collision"]
+        assert "隔离集 2 步" in c9b["safe_collision"]["detail"], c9b["safe_collision"]
         shutil.rmtree(root9)
 
         # 10b) 反向偏航接续步：上一步反向 YAW 时 net dyaw 可能≈0（惯性），
@@ -406,6 +433,30 @@ def main():
         c13b = details(root13)["time_pairing"]
         assert c13b["status"] == "SKIP", c13b
         shutil.rmtree(root13)
+
+        # 13b) pose/depth 阈值分开，且等于阈值算通过（与 collect.py 的 `>` 一致）。
+        import collect
+        assert ad.MAX_DEPTH_GAP_NS == collect.DEPTH_STALE_NS
+        root13b = tempfile.mkdtemp(prefix="audit_test_")
+        write_ep(root13b, "train", 1, CLEAN)
+        p13b = os.path.join(root13b, "train", "1", "actions.jsonl")
+        with open(p13b, encoding="utf-8") as f:
+            rows13b = [json.loads(x) for x in f if x.strip()]
+
+        def write_gaps(depth, pose):
+            for r in rows13b:
+                r["depth_rgb_gap_ns"], r["pose_rgb_gap_ns"] = depth, pose
+            with open(p13b, "w", encoding="utf-8") as f:
+                f.writelines(json.dumps(r) + "\n" for r in rows13b)
+
+        write_gaps(100_000_000, 50_000_000)
+        assert details(root13b)["time_pairing"]["status"] == "PASS"
+        write_gaps(100_000_001, 50_000_000)
+        assert details(root13b)["time_pairing"]["status"] == "FAIL"
+        write_gaps(100_000_000, 50_000_001)
+        c13c = details(root13b)["time_pairing"]
+        assert c13c["status"] == "FAIL" and "pose_gap" in c13c["detail"], c13c
+        shutil.rmtree(root13b)
 
         # 14) scene.json 带 clearance 但与当前 scene_gen 常量不一致 -> FAIL。
         root14 = tempfile.mkdtemp(prefix="audit_test_")
@@ -536,6 +587,24 @@ def main():
         assert d19["waypoint_side"]["status"] == "PASS", d19["waypoint_side"]
         assert d19["label_recompute"]["status"] == "PASS", d19["label_recompute"]
         shutil.rmtree(root19)
+
+        # 19b) cf_stab 集：定速判据不适用，前进位移不足也不能假 FAIL。
+        root19b = tempfile.mkdtemp(prefix="audit_test_")
+        #     偏航头两步（延迟+跟踪滞后）不验，同向连续第 3 步起照常验。
+        stab = {"dynamics_profile": "cf_stab_v1:tilt2:k1:lat0.15"}
+        write_ep(root19b, "train", 1, CLEAN, man_extra=stab)
+        d19b = details(root19b)
+        for name in ("forward_motion", "transition_lag"):
+            assert d19b[name]["status"] == "SKIP", (name, d19b[name])
+            assert "cf_stab" in d19b[name]["detail"], (name, d19b[name])
+        assert d19b["yaw_direction"]["status"] == "SKIP", d19b["yaw_direction"]
+        shutil.rmtree(root19b)
+        root19c = tempfile.mkdtemp(prefix="audit_test_")
+        write_ep(root19c, "train", 1, [1, 2, 2, 2, 1, 3, 3, 3] * 2, man_extra=stab)
+        d19c = details(root19c)["yaw_direction"]
+        assert d19c["status"] == "PASS" and "0/4 " in d19c["detail"], d19c
+        assert "起始步 8 个未验" in d19c["detail"], d19c
+        shutil.rmtree(root19c)
 
         # 20) provenance：teacher_version 有值必须统一；task_version 全缺视为同代。
         root20 = tempfile.mkdtemp(prefix="audit_test_")

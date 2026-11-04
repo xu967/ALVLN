@@ -13,6 +13,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -100,7 +101,55 @@ std::string quote(const std::string& s) {
   return o + '"';
 }
 
+// config.json 是扁平对象：取 "key": 后的标量 token（字符串去掉引号）。
+// 找不到返回空串；调用方用空串表示「旧 run 没记录该字段」。
+std::string raw_field(const std::string& js, const std::string& key) {
+  const std::string pat = "\"" + key + "\":";
+  const std::size_t p = js.find(pat);
+  if (p == std::string::npos) return {};
+  const std::size_t b = p + pat.size();
+  if (b < js.size() && js[b] == '"') {
+    const std::size_t e = js.find('"', b + 1);
+    return e == std::string::npos ? std::string{} : js.substr(b + 1, e - b - 1);
+  }
+  std::size_t e = b;
+  while (e < js.size() && js[e] != ',' && js[e] != '}' && js[e] != '\n') ++e;
+  return js.substr(b, e - b);
+}
+
+std::string quote_or_null(const std::string& s) { return s.empty() ? "null" : quote(s); }
+
 }  // namespace
+
+bool read_run_config(const std::string& run_dir, RunConfigSnapshot* out) {
+  // 同目录续训会把最新事实写在 config.resume.json（原 config.json 不动）；
+  // 二次续训应读最新那份，否则覆盖过的 CLI 会退回原始值。
+  std::ifstream f(run_dir + "/config.resume.json");
+  if (!f) f.open(run_dir + "/config.json");
+  if (!f) return false;
+  std::ostringstream os;
+  os << f.rdbuf();
+  const std::string js = os.str();
+  auto str = [&](const char* k) { return raw_field(js, k); };
+  out->has_lr = !str("lr").empty();
+  if (out->has_lr) out->lr = std::stof(str("lr"));
+  out->has_batch = !str("batch").empty();
+  if (out->has_batch) out->batch = std::stoi(str("batch"));
+  out->has_seed = !str("seed").empty();
+  if (out->has_seed) out->seed = static_cast<unsigned>(std::stoul(str("seed")));
+  out->has_drop_collision = !str("drop_collision").empty();
+  if (out->has_drop_collision) out->drop_collision = str("drop_collision") == "true";
+  out->soft_targets = str("soft_targets");
+  out->has_soft_targets = !out->soft_targets.empty();
+  out->has_distill_alpha = !str("distill_alpha").empty();
+  if (out->has_distill_alpha) out->distill_alpha = std::stof(str("distill_alpha"));
+  out->has_text_dim = !str("text_dim").empty();
+  if (out->has_text_dim) out->text_dim = std::stoi(str("text_dim"));
+  out->has_vision_only = !str("vision_only").empty();
+  out->vision_only = str("vision_only") == "true";
+  out->dataset_sha256 = str("dataset_sha256");
+  return true;
+}
 
 std::vector<float> resolve_class_weights(const std::string& spec, const UavrDataset& ds) {
   if (spec.empty()) return {};
@@ -161,18 +210,43 @@ void write_run_config(const std::string& out_dir, const TrainConfig& cfg,
   os << "{\"schema\":\"uavrgb.train_config.v1\",\"data\":" << quote(cfg.data_path)
      << ",\"epochs\":" << cfg.epochs << ",\"batch\":" << cfg.batch << ",\"lr\":" << cfg.lr
      << ",\"seed\":" << cfg.seed << ",\"text_dim\":" << cfg.text_dim
+     << ",\"vision_only\":" << (cfg.vision_only ? "true" : "false")
      << ",\"max_grad_norm\":" << cfg.max_grad_norm
      << ",\"drop_collision\":" << (cfg.drop_collision ? "true" : "false")
      << ",\"class_weights\":[";
   for (std::size_t i = 0; i < weights.size(); ++i) os << (i ? "," : "") << weights[i];
   os << "],\"class_weights_source\":" << quote(source)
      << ",\"soft_targets\":" << quote(cfg.soft_targets)
-     << ",\"distill_alpha\":" << cfg.distill_alpha << "}\n";
-  const std::string path = out_dir + "/config.json";
-  std::ofstream f(path, std::ios::trunc);
-  if (!f) throw std::runtime_error("trainer: 无法写 " + path);
-  f << os.str();
-  if (!f) throw std::runtime_error("trainer: 写入失败 " + path);
+     << ",\"distill_alpha\":" << cfg.distill_alpha
+     // 以下为事实字段：旧字段不动，只在末尾追加，旧 parser 忽略即可。
+     << ",\"dataset_sha256\":" << quote(cfg.dataset_sha256)
+     << ",\"split_scheme\":" << quote_or_null(cfg.split_scheme)
+     << ",\"window_from\":" << quote_or_null(cfg.window_from)
+     << ",\"hold_s\":" << (cfg.hold_s.empty() ? "null" : cfg.hold_s)
+     << ",\"soft_targets_sha256\":" << quote(cfg.soft_targets_sha256)
+     << ",\"teacher_ckpt_sha256\":" << quote(cfg.teacher_ckpt_sha256)
+     << ",\"teacher_select_split\":" << quote(cfg.teacher_select_split)
+     << ",\"beta1\":" << cfg.adam_beta1 << ",\"beta2\":" << cfg.adam_beta2
+     << ",\"eps\":" << cfg.adam_eps << ",\"source_git\":" << quote(cfg.source_git);
+  if (!cfg.resume.empty()) os << ",\"resume\":" << quote(cfg.resume);
+  os << "}\n";
+  auto write_to = [&](const std::string& path) {
+    std::ofstream f(path, std::ios::trunc);
+    if (!f) throw std::runtime_error("trainer: 无法写 " + path);
+    f << os.str();
+    if (!f) throw std::runtime_error("trainer: 写入失败 " + path);
+  };
+  const std::string cfg_path = out_dir + "/config.json";
+  const std::string resume_path = out_dir + "/config.resume.json";
+  std::error_code ec;
+  if (cfg.resume.empty()) {
+    write_to(cfg_path);
+    return;
+  }
+  // 续训不截断原 config.json：同目录续跑只写 config.resume.json；跨目录新 run
+  // 没有旧 config，才把同一份事实同时写成主配置。
+  if (!std::filesystem::exists(cfg_path, ec)) write_to(cfg_path);
+  write_to(resume_path);
 }
 
 }  // namespace uavrgb

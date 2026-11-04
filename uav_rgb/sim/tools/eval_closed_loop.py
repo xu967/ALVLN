@@ -35,6 +35,7 @@ SIM_DIR = os.path.dirname(TOOLS)
 REPO_ROOT = os.path.dirname(SIM_DIR)
 SCENE_GEN = os.path.join(TOOLS, "scene_gen.py")
 COLLECT = os.path.join(TOOLS, "collect.py")
+RECORD = os.path.join(TOOLS, "record_views.py")
 DEFAULT_TEMPLATE = os.path.join(SIM_DIR, "worlds", "uav_rgb.sdf")
 from student import DEFAULT_INFER as DEFAULT_INFER_BIN
 ACTION_NAMES = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
@@ -44,11 +45,20 @@ WAYPOINT_RADIUS = 1.0
 #   对 keep 和 shuffle 都算成功，反事实就失效了；
 #   必须 < 出生点到 waypoint 的最小距离 2.50 m，否则原地不动也算成功。
 REACH_RADIUS = 1.5
+# 新指标合同版本（SIM-09）。旧 success 定义不变，新字段单独按此版本解释。
+METRIC_VERSION = "sim09.v1"
+# scene_gen/campus/asset_campus 目前都写死这个相机档；协议比对只用它做本次运行的实际值。
+CAMERA_PROFILE = "rgb320x240_fov60_v1"
+DYNAMICS_PROFILES = ("x3_velocity", "cf_stab", "cf_sil")
+PROTOCOL_KEYS = ("window_from", "hold_s", "steps", "task",
+                 "appearance_version", "dynamics", "camera_profile")
 
 sys.path.insert(0, TOOLS)
 import collect_parallel as cp  # noqa: E402
 import instruction as ins  # noqa: E402
 import split_manifest as sm  # noqa: E402
+import campus  # noqa: E402
+import asset_campus  # noqa: E402
 
 
 def load_jsonl(path):
@@ -103,14 +113,14 @@ def dedup_key(meta, task):
     所以还要带上关系词，否则 left/right 两个任务会被去重成一个。
     """
     gid = sm.geometry_gid(meta["pillars"])
-    if task not in ("l1", "campus"):
+    if task not in ("l1", "campus", "campus_assets"):
         return gid
     marks = tuple(sorted(
         (round(float(p["x"]), 3), round(float(p["y"]), 3), p.get("color"))
         for p in meta["pillars"] if p.get("color")))
     if not marks:
         raise ValueError("L1 scene 没有彩色柱，无法确定评测任务")
-    return (gid, marks, meta.get("relation"))
+    return (gid, marks, meta.get("relation"), meta.get("target_name"))
 
 
 TEXT_MODES = ("keep", "blank", "shuffle")
@@ -133,7 +143,8 @@ def override_instruction(meta, mode):
         raise ValueError(
             f"shuffle 需要 target_color/relation，实际 {color!r}/{relation!r}")
     maker = ins.make_instruction
-    if meta.get("task_version") == "campus.v1":
+    # 按前缀判，不按具体版本：v1 与 v2 的指令生成器相同，旧数据仍要能评测。
+    if str(meta.get("task_version", "")).startswith("campus."):
         from campus import instruction as maker
     out["instruction"] = maker(color, "right" if relation == "left" else "left")
     return out
@@ -157,13 +168,48 @@ def episode_target(episodes, seed_list):
     return episodes if episodes is not None else (len(seed_list) or 3)
 
 
+def appearance_version_for(task, appearance):
+    return ("campus.v1" if task == "campus" else
+            asset_campus.VERSION if task == "campus_assets" else appearance)
+
+
+def load_protocol(path):
+    """读协议快照 JSON；必须是对象，坏文件直接报错而不是静默忽略。"""
+    with open(path, "r", encoding="utf-8") as f:
+        protocol = json.load(f)
+    if not isinstance(protocol, dict):
+        raise ValueError("protocol JSON 顶层必须是对象")
+    return protocol
+
+
+def protocol_mismatches(protocol, actual):
+    """协议中出现的字段与本次实际参数逐项比对，返回 (key, expected, got)。
+
+    未知字段忽略：协议文件可以带 protocol_id 等备注，不能因此判 OOD。
+    """
+    return [(key, protocol[key], actual.get(key)) for key in PROTOCOL_KEYS
+            if key in protocol and protocol[key] != actual.get(key)]
+
+
+def wilson_ci(successes, n, z=1.96):
+    """Wilson 95% 区间；n=0 返回 None。用于 requested 与 done-set 两个分母。"""
+    if not n:
+        return None
+    p = successes / n
+    denom = 1.0 + z * z / n
+    center = (p + z * z / (2.0 * n)) / denom
+    half = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n)) / denom
+    return [max(0.0, center - half), min(1.0, center + half)]
+
+
 def _src(a):
     """collision 来源；旧 episode 没有 src 字段时返回空串（按 contact 处理，保持旧口径）。"""
     return a.get("src") or ""
 
 
 def summarize_episode(actions, oracle, goal_x, waypoint=None,
-                      waypoint_radius=WAYPOINT_RADIUS, stop_radius=None, goal_radius=None):
+                      waypoint_radius=WAYPOINT_RADIUS, stop_radius=None, goal_radius=None,
+                      timed_out=False):
     """单集指标；纯函数，便于单测。actions/oracle 是 jsonl 行。
 
     EVAL_STANDARD §5.1：stuck（FORWARD 位移 < 阈值）不是碰撞，碰撞率只看 contact。
@@ -180,12 +226,28 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
     对照与历史可比，不再作为主指标。
     两者都不要求末动作 SAFE_NEUTRAL（原因见下方分支注释）；`stopped` 仍是诊断字段。
     旧 route-choice 数据仍走“max_x≥goal 且经过 waypoint”的旧口径，保持历史结果可复现。
+
+    SIM-09 起另写一组字段（旧 success/stop_success 逐位不变）：
+      reach_ever = 无 contact 且轨迹曾进入 goal_radius_reach（1.5 m）
+      final_in_radius = 无 contact 且末位姿在 goal_radius_stop（scene.meta.stop_radius）
+      stop_action_issued = 最近 waypoint 点前后各 2 步内出现过 SAFE_NEUTRAL；
+        不只看最后一步。没有可靠速度数据，因此不用速度阈值。
+      task_success = reach_ever + final_in_radius + stop_action_issued + 无 contact + 未超时；
+        stable_termination 固定为 None（不知道，不等于通过）。
     """
+    goal_radius_stop = float(stop_radius) if stop_radius is not None else None
     if not actions:
         return {"steps": 0, "collision": False, "stuck": False, "false_forward": False,
                 "success": False, "stop_success": False, "max_x": None,
                 "waypoint_min_dist": None, "final_waypoint_dist": None,
-                "stopped": False, "infer_ms": []}
+                "stopped": False, "infer_ms": [],
+                "reach_ever": False, "final_in_radius": False,
+                "stop_action_issued": False, "collision_free": True,
+                "stuck_free": True, "task_success": False,
+                "stable_termination": None, "timed_out": bool(timed_out),
+                "metric_version": METRIC_VERSION,
+                "goal_radius_reach": REACH_RADIUS,
+                "goal_radius_stop": goal_radius_stop}
     collision = any(bool(a.get("collision")) and _src(a) != "stuck" for a in actions)
     stuck = any(bool(a.get("collision")) and "stuck" in _src(a) for a in actions)
     false_forward = any(bool(a.get("collision")) and _src(a) != "stuck" and
@@ -194,16 +256,26 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
           if isinstance(o.get("pose_gt"), dict) and "x" in o["pose_gt"]]
     max_x = max(xs) if xs else None
     wp_min = wp_final = None
+    nearest_i = None
     if isinstance(waypoint, dict):
         ds = []
-        for o in oracle:
+        best = None
+        for i, o in enumerate(oracle):
             pg = o.get("pose_gt")
             if isinstance(pg, dict) and "x" in pg and "y" in pg:
-                ds.append(((pg["x"] - waypoint["x"]) ** 2 +
-                           (pg["y"] - waypoint["y"]) ** 2) ** 0.5)
+                d = ((pg["x"] - waypoint["x"]) ** 2 +
+                     (pg["y"] - waypoint["y"]) ** 2) ** 0.5
+                ds.append(d)
+                if best is None or d < best:
+                    best, nearest_i = d, i
         wp_min = min(ds) if ds else None
         wp_final = ds[-1] if ds else None
     stopped = int(actions[-1].get("action_executed", -1)) == 0
+    # 最近点前后各 2 步：SAFE 常出现在到达点前一两步，只看末步会把「到点后继续飞走」
+    # 全判成没停。窗口按 actions 行与 oracle 行一一对应取索引。
+    stop_action_issued = bool(nearest_i is not None and any(
+        int(a.get("action_executed", -1)) == 0
+        for a in actions[max(0, nearest_i - 2):nearest_i + 3]))
     if stop_radius is not None:
         # 2026-11-01 起不再要求末动作 SAFE_NEUTRAL：waypoint 在柱阵外侧 ±2.4 m，
         # 相机 60° 视场在真停止点上 40% 的帧一根柱子都看不到，"停"不可观测
@@ -219,17 +291,43 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
         reached = wp_min is None or wp_min <= waypoint_radius
         success = bool(not collision and max_x is not None and max_x >= goal_x and reached)
         stop_success = success
+    collision_free = not collision
+    reach_ever = bool(collision_free and wp_min is not None
+                      and wp_min <= REACH_RADIUS)
+    final_in_radius = bool(collision_free and wp_final is not None
+                           and goal_radius_stop is not None
+                           and wp_final <= goal_radius_stop)
+    task_success = bool(reach_ever and final_in_radius and stop_action_issued
+                        and collision_free and not timed_out)
     infer = [float(a["infer_ms"]) for a in actions if a.get("infer_ms") is not None]
     return {"steps": len(actions), "collision": collision, "stuck": stuck,
             "false_forward": false_forward, "success": success,
             "stop_success": stop_success,
             "max_x": max_x, "waypoint_min_dist": wp_min,
-            "final_waypoint_dist": wp_final, "stopped": stopped, "infer_ms": infer}
+            "final_waypoint_dist": wp_final, "stopped": stopped, "infer_ms": infer,
+            "reach_ever": reach_ever, "final_in_radius": final_in_radius,
+            "stop_action_issued": stop_action_issued,
+            "collision_free": collision_free, "stuck_free": not stuck,
+            "task_success": task_success,
+            # 没有可靠速度/姿态窗口数据，只能报未知；None 不等于通过。
+            "stable_termination": None, "timed_out": bool(timed_out),
+            "metric_version": METRIC_VERSION,
+            "goal_radius_reach": REACH_RADIUS,
+            "goal_radius_stop": goal_radius_stop}
 
 
-def aggregate(episodes):
+def aggregate(episodes, requested=None, attempted=None, failed_count=0, skipped_count=0):
+    """汇总。分母写清楚：
+    - success_rate / 新指标率 = episodes_done；
+    - requested_success_rate = episodes_requested（固定请求集，含 failed/skipped 的非成功）；
+    - completion_rate = 实际尝试数（done+failed，skipped 不算）；
+    - execution_rate = episodes_done / episodes_requested（skipped 表现为未执行）。
+    比率都落在 [0,1]：失败后补扫 seed 不会把 execution_rate 推过 1。
+    """
     done = [e for e in episodes if e.get("steps", 0) > 0]
     n = len(done)
+    if attempted is None:
+        attempted = n
     infer_all = [ms for e in done for ms in e["infer_ms"]]
     infer_warm = [ms for e in done for ms in e["infer_ms"][1:]]  # 首帧含 CUDA 初始化
     dist = {name: 0 for name in ACTION_NAMES}
@@ -239,13 +337,35 @@ def aggregate(episodes):
                 dist[ACTION_NAMES[k]] += v
 
     def rate(key):
-        return (sum(1 for e in done if e[key]) / n) if n else None
+        return (sum(1 for e in done if e.get(key)) / n) if n else None
 
+    successes = sum(1 for e in done if e.get("success"))
     return {
         "episodes_done": n,
         "success_rate": rate("success"),
+        "requested_success_rate": (successes / requested) if requested else None,
+        # skipped 不进 completion 分母：只看真正尝试过的集（失败算尝试）。
+        "completion_rate": (n / attempted) if attempted else None,
+        "execution_rate": (n / requested) if requested else None,
+        "failed_count": failed_count,
+        "skipped_count": skipped_count,
+        "unique_gids": len({e["geometry_gid"] for e in done
+                            if e.get("geometry_gid") is not None}),
+        "wilson_ci": {
+            "success": wilson_ci(successes, n),
+            "requested": wilson_ci(successes, requested) if requested else None,
+        },
         # 旧「末位姿在 1.5 m 内」口径，保留对照；主指标改看 success_rate。
         "stop_success_rate": rate("stop_success"),
+        # SIM-09 新口径：分别报告，旧 success_rate 不动。
+        "reach_ever_rate": rate("reach_ever"),
+        "final_in_radius_rate": rate("final_in_radius"),
+        "stop_action_issued_rate": rate("stop_action_issued"),
+        "task_success_rate": rate("task_success"),
+        "collision_free_rate": rate("collision_free"),
+        "stuck_free_rate": rate("stuck_free"),
+        # 无可靠速度/姿态数据：只能报未知，不能报通过率。
+        "stable_termination_rate": None,
         "collision_rate": rate("collision"),
         # stuck 是「被挡住没动」而非接触；EVAL_STANDARD 要求单列，不能混进碰撞率。
         "stuck_rate": rate("stuck"),
@@ -269,6 +389,8 @@ def run_episode(seed, args, workdir, seen_gids):
     cmd = [sys.executable, SCENE_GEN, "--seed", str(seed), "--scene-id", str(seed),
            "--out", world, "--template", args.template, "--task", args.task,
            "--appearance", args.appearance]
+    if args.dynamics == "cf_sil":
+        cmd.append("--no-velocity-control")
     if args.task == "l1":
         # v5 关系任务要求两根同色柱横跨出生点，默认 spawn 在 y=0 时
         # assign_landmarks 找不到柱对会直接抛错（采集也是 random）。
@@ -302,16 +424,26 @@ def run_episode(seed, args, workdir, seen_gids):
     os.makedirs(ep_dir, exist_ok=True)
     sim = cp._start_sim(world, partition, log_path)
     t0 = time.monotonic()
+    rec = None
+    frames_dir = os.path.join(args.video_dir, f".frames_{seed}") if args.record_video else None
     try:
         cp.wait_ready(sim, partition, log_path, args.sim_timeout)
         time.sleep(cp.SIM_SETTLE_S)
+        if frames_dir:
+            # 录像与 collect 并行订阅相机；只读话题，不影响动作窗口（窗口按仿真时间计）。
+            rec = subprocess.Popen([sys.executable, RECORD, "record", "--out", frames_dir],
+                                   env=cp.gz_env(partition), stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL, start_new_session=True)
+            cp._register(rec)
         cmd = [sys.executable, COLLECT, "--out", ep_dir,
                "--steps", str(args.steps), "--hold", str(args.hold),
                "--policy", args.policy,
                "--stop-on-collision",
                "--scene-id", str(seed), "--seed", str(seed),
                "--scene-meta", eval_meta_path, "--split", split,
-               "--window-from", args.window_from]
+               "--window-from", args.window_from, "--dynamics", args.dynamics]
+        if args.dynamics == "cf_sil":
+            cmd += ["--cf-sil-params", args.cf_sil_params]
         if args.save_depth:
             cmd += ["--save-depth"]
         if args.policy == "student":
@@ -320,6 +452,10 @@ def run_episode(seed, args, workdir, seen_gids):
                 cmd += ["--infer-bin", args.infer_bin]
         elif args.policy == "teacher-nn":
             cmd += ["--teacher-ckpt", args.teacher_ckpt]
+        elif args.policy == "teacher-rl":
+            cmd += ["--rl-checkpoint", args.rl_checkpoint]
+        if args.policy == "teacher" and args.teacher_planner != "astar":
+            cmd += ["--teacher-planner", args.teacher_planner]
         env = cp.gz_env(partition)
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -334,6 +470,7 @@ def run_episode(seed, args, workdir, seen_gids):
         finally:
             cp.stop_group(proc, f"eval collect seed {seed}")
     finally:
+        cp.stop_group(rec, f"eval recorder seed {seed}")
         cp.stop_group(sim, f"eval seed {seed}")
 
     actions_path = os.path.join(ep_dir, "actions.jsonl")
@@ -348,13 +485,17 @@ def run_episode(seed, args, workdir, seen_gids):
     except FileNotFoundError:
         manifest = {}
     summary = summarize_episode(actions, oracle, goal_x, meta.get("waypoint"),
-                                WAYPOINT_RADIUS, meta.get("stop_radius"), meta.get("goal_radius"))
+                                WAYPOINT_RADIUS, meta.get("stop_radius"), meta.get("goal_radius"),
+                                timed_out=(rc == "timeout"))
     summary.update({
         "seed": seed, "geometry_gid": gid, "split": split, "policy": args.policy,
         "task": args.task, "window_from": args.window_from,
+        "dynamics": args.dynamics,
         "text_mode": args.text_mode,
         "task_version": meta.get("task_version"),
         **{key: meta.get(key) for key in sm.PROVENANCE_KEYS},
+        # 场景只写 x3_v1；cf_stab 的真实档名在采集 manifest 里。
+        "dynamics_profile": manifest.get("dynamics_profile") or meta.get("dynamics_profile"),
         "target_color": meta.get("target_color"),
         "instruction": eval_meta.get("instruction"),
         "waypoint": meta.get("waypoint"),
@@ -374,17 +515,48 @@ def run_episode(seed, args, workdir, seen_gids):
     for a in actions:
         k = int(a.get("action_executed", -1))
         summary["actions"][k] = summary["actions"].get(k, 0) + 1
+    if frames_dir:
+        _write_video(summary, frames_dir, ep_dir, world, args, seed, goal_x, meta)
     return summary, None
+
+
+def _write_video(summary, frames_dir, ep_dir, world, args, seed, goal_x, meta):
+    """三视图视频 -> <out>/videos/seed_<seed>.mp4。失败只记 video_error，不影响评测结论。"""
+    import record_views
+    result = ("SUCCESS" if summary.get("success") else
+              "COLLISION" if summary.get("collision") else
+              "STUCK" if summary.get("stuck") else "NOT REACHED")
+    if args.task in ("campus", "campus_assets"):
+        criterion, goal_radius = "visible_goal_reach_v1", summary.get("goal_radius_stop")
+    elif meta.get("stop_radius") is not None:
+        criterion, goal_radius = "goal_reach_ever", summary.get("goal_radius_reach")
+    else:
+        criterion, goal_radius = "route_choice", None
+    path = os.path.join(args.video_dir, f"seed_{seed}.mp4")
+    try:
+        n = record_views.compose(frames_dir, ep_dir, world, path,
+                                 title=f"{args.policy} | {args.dynamics} | seed {seed}",
+                                 result=result, goal_x=goal_x, waypoint=meta.get("waypoint"),
+                                 success_criterion=criterion, goal_radius=goal_radius)
+        summary["video"] = os.path.relpath(path, os.path.dirname(args.video_dir))
+        summary["video_frames"] = n
+    except Exception as e:  # noqa: BLE001 - 视频是诊断产物，不能让评测失败
+        summary["video_error"] = f"{type(e).__name__}: {e}"
+    if not args.keep_work:
+        shutil.rmtree(frames_dir, ignore_errors=True)
 
 
 def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt", default=None, help="学生 checkpoint（--policy student 必填）")
-    p.add_argument("--policy", choices=("student", "forward", "teacher-nn"),
+    p.add_argument("--policy", choices=("student", "forward", "teacher-nn", "teacher", "teacher-rl"),
                    default="student",
                    help="student=模型闭环；forward=盲前进基线（T7）；"
-                        "teacher-nn=特权教师网络闭环（可解性闸门）")
+                        "teacher-nn=特权教师网络闭环（可解性闸门）；"
+                        "teacher=柱子真值 A* 专家闭环（新动力学下的可解性上界）")
+    p.add_argument("--teacher-planner", choices=("astar", "predictive"), default="astar")
+    p.add_argument("--rl-checkpoint", default="")
     p.add_argument("--teacher-ckpt", default=None,
                    help="PrivilegedTeacher checkpoint（--policy teacher-nn 必填）")
     p.add_argument("--episodes", type=int, default=None,
@@ -396,12 +568,21 @@ def main():
                    default=None,
                    help="动作窗口起点：observation=观测位姿（默认，唯一被采纳基线）；"
                         "dispatch=派发位姿（仅复现 T7-R，数字不可与 observation 混报）")
+    p.add_argument("--dynamics", choices=DYNAMICS_PROFILES, default="x3_velocity",
+                   help="透传给 collect.py：x3_velocity=旧行为（唯一历史基线）；cf_stab=CF-Drone 摇杆模型（建议配 --hold 0.1~0.2）；cf_sil=CF-Drone SIL 档（接受但由 collect 实现；数字不可与旧档混报）")
+    p.add_argument("--cf-sil-params", default=os.path.join(SIM_DIR, "dynamics", "cf_sil_v1.json"),
+                   help="cf_sil 参数 JSON（仅 --dynamics cf_sil）")
+    p.add_argument("--protocol", default=None,
+                   help="可选协议快照 JSON；比对 window_from/hold_s/steps/task/"
+                        "appearance_version/dynamics/camera_profile，不一致写 ood=true 并警告")
+    p.add_argument("--strict-protocol", action="store_true",
+                   help="协议与本次参数不一致时直接失败（默认只警告，保证旧 run 可复现）")
     p.add_argument("--text-mode", choices=TEXT_MODES, default="keep",
                    help="L2 消融：keep=原指令；blank=空文本；shuffle=把 left/right 反过来")
-    p.add_argument("--task", choices=("base", "l1", "campus"), default="base",
+    p.add_argument("--task", choices=("base", "l1", "campus", "campus_assets"), default="base",
                    help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
-    p.add_argument("--appearance", choices=("legacy", "v1"), default="legacy",
-                   help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）")
+    p.add_argument("--appearance", choices=("legacy", "v1"), default="v1",
+                   help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）；旧数据复现请显式 legacy")
     p.add_argument("--split", choices=("train", "val", "test"), default="test")
     p.add_argument("--base-seed", type=int, default=0)
     p.add_argument("--max-seeds", type=int, default=500,
@@ -416,15 +597,40 @@ def main():
     p.add_argument("--sim-timeout", type=float, default=120.0)
     p.add_argument("--episode-timeout", type=float, default=600.0)
     p.add_argument("--keep-work", action="store_true", help="保留 world/每集原始文件")
+    p.add_argument("--record-video", action="store_true",
+                   help="每集录 机载/追尾/顶视 三视图视频到 <out>/videos/seed_<seed>.mp4"
+                        "（原始帧约 10 MB/仿真秒，暂存 <out>/videos/.frames_*，合成后删除）")
     p.add_argument("--save-depth", action="store_true",
                    help="保留每步 16 位深度 PNG（诊断闭环失败用；配合 --keep-work）")
     args = p.parse_args()
     if args.window_from is None:
-        args.window_from = "dispatch" if args.task == "campus" else "observation"
-    elif args.window_from == "dispatch" and args.task != "campus":
+        args.window_from = "dispatch" if args.task in ("campus", "campus_assets") else "observation"
+    elif args.window_from == "dispatch" and args.task not in ("campus", "campus_assets"):
         print("警告: --window-from dispatch 不是被采纳的基线语义（唯一基线是 "
               "observation）；本次 SR/碰撞率不可与 observation 结果混报。",
               file=sys.stderr, flush=True)
+
+    actual_protocol = {
+        "window_from": args.window_from, "hold_s": args.hold, "steps": args.steps,
+        "task": args.task,
+        "appearance_version": appearance_version_for(args.task, args.appearance),
+        "dynamics": args.dynamics, "camera_profile": CAMERA_PROFILE,
+    }
+    protocol, mismatches = None, []
+    if args.protocol:
+        try:
+            protocol = load_protocol(args.protocol)
+        except (OSError, ValueError) as e:
+            p.error(f"--protocol 无法读取: {e}")
+        mismatches = protocol_mismatches(protocol, actual_protocol)
+        if mismatches:
+            detail = "; ".join(f"{k}: protocol={v!r} actual={g!r}"
+                               for k, v, g in mismatches)
+            if args.strict_protocol:
+                p.error(f"protocol 与本次参数不一致: {detail}")
+            print(f"警告: protocol 不一致（本次结果 ood=true）: {detail}",
+                  file=sys.stderr, flush=True)
+    ood = bool(mismatches)
 
     try:
         seed_list = parse_seeds(args.seeds) if args.seeds else []
@@ -459,6 +665,12 @@ def main():
         if not torch_ok:
             p.error("teacher-nn 需要带 torch 的解释器，例如 "
                     "$DATA_ROOT/uav_rgb/teacher-venv/bin/python")
+    if (args.teacher_planner == "predictive" or args.policy == "teacher-rl") and (
+            args.dynamics != "cf_stab" or args.task not in ("campus", "campus_assets")
+            or abs(args.hold-0.2)>1e-6):
+        p.error("新 Teacher 需要 --dynamics cf_stab --hold 0.2 --task campus_assets/campus")
+    if args.policy == "teacher-rl" and not args.rl_checkpoint:
+        p.error("teacher-rl 需要 --rl-checkpoint")
     if args.text_mode != "keep" and args.policy != "student":
         p.error("--text-mode 只对 --policy student 有意义")
     infer_bin = None
@@ -484,13 +696,16 @@ def main():
             probe.close()
         if args.text_mode != "keep" and text_dim <= 0:
             p.error(f"ckpt text_dim={text_dim}，--text-mode {args.text_mode} 不会改变推理")
-        if args.text_mode != "keep" and args.task not in ("l1", "campus"):
+        if args.text_mode != "keep" and args.task not in ("l1", "campus", "campus_assets"):
             p.error("--text-mode 只对 --task l1/campus 有意义")
         args.infer_bin = infer_bin  # 让 run_episode 与 report 用同一个路径
     out = os.path.abspath(args.out)
     if os.path.isdir(out) and os.listdir(out):
         p.error(f"--out {out} 非空；请用新目录")
     os.makedirs(out, exist_ok=True)
+    args.video_dir = os.path.join(out, "videos")
+    if args.record_video:
+        os.makedirs(args.video_dir, exist_ok=True)
     try:
         os.makedirs(cp.XDG_RUNTIME_DIR, mode=0o700, exist_ok=True)
         os.chmod(cp.XDG_RUNTIME_DIR, 0o700)
@@ -506,6 +721,7 @@ def main():
 
     signal.signal(signal.SIGTERM, _term)
     results, seen_gids, failures, skips = [], set(), [], []
+    scanned_seeds, attempted_seeds = [], []
     if not seed_list:
         seed_list = list(range(args.base_seed, args.base_seed + args.max_seeds))
     started = time.monotonic()
@@ -513,10 +729,12 @@ def main():
         for seed in seed_list:
             if len(results) >= args.episodes:
                 break
+            scanned_seeds.append(seed)
             try:
                 summary, skip = run_episode(seed, args, workdir, seen_gids)
             except Exception as e:  # noqa: BLE001 - 单集失败要记录，不能拖垮整轮
                 print(f"[seed {seed}] 失败: {type(e).__name__}: {e}", flush=True)
+                attempted_seeds.append(seed)
                 failures.append({"seed": seed,
                                  "error": f"{type(e).__name__}: {e}"})
                 continue
@@ -524,6 +742,7 @@ def main():
                 print(f"[seed {seed}] 跳过: {skip}", flush=True)
                 skips.append({"seed": seed, "reason": skip})
                 continue
+            attempted_seeds.append(seed)
             if summary["collect_rc"] != 0 or summary["steps"] == 0:
                 # 采集中途失败不是「学生飞得差」，不能计进 SR/碰撞率。
                 failures.append({"seed": seed, "rc": summary["collect_rc"],
@@ -541,31 +760,48 @@ def main():
     finally:
         cp.cleanup_all()
 
-    agg = aggregate(results)
+    agg = aggregate(results, requested=args.episodes,
+                    attempted=len(attempted_seeds),
+                    failed_count=len(failures), skipped_count=len(skips))
     stop_radius_used = next((e.get("stop_radius") for e in results
                              if e.get("stop_radius") is not None), None)
     report = {"schema": "uavrgb.eval.v1", "policy": args.policy,
+              "teacher_planner": args.teacher_planner,
+              "rl_checkpoint": args.rl_checkpoint if args.policy == "teacher-rl" else None,
               "task": args.task, "window_from": args.window_from,
+              "dynamics": args.dynamics,
               "text_mode": args.text_mode, "text_dim": text_dim,
+              # 新指标合同（SIM-09）；旧 success/stop_success 定义不变。
+              "metric_version": METRIC_VERSION,
               # 成功语义跟着数据走：L1 是 goal_reach_ever「轨迹上曾进入 waypoint
               # 1.5 m 且无碰撞」，旧数据是 route_choice「越过终点」。不写死会让新旧
               # SR 被直接混报。历史口径：2026-11-01 前是 goal_stop（含 SAFE 判定），
               # 2026-11-01~11-02 是 goal_reach（**末位姿**在 1.5 m 内），三者都不可比。
-              "success_criterion": ("visible_goal_reach_v1" if args.task == "campus" else
+              "success_criterion": ("visible_goal_reach_v1" if args.task in ("campus", "campus_assets") else
                                     "goal_reach_ever" if stop_radius_used is not None
                                     else "route_choice"),
-              "appearance_version": ("campus.v1" if args.task == "campus" else args.appearance),
-              "goal_radius": (0.5 if args.task == "campus" else
+              "appearance_version": appearance_version_for(args.task, args.appearance),
+              "goal_radius": (0.5 if args.task in ("campus", "campus_assets") else
                               REACH_RADIUS if stop_radius_used is not None else None),
+              # L1 训练目标是 0.5 m 停、评测按 1.5 m 到达：两个半径同时写。
+              "goal_radius_reach": REACH_RADIUS,
+              "goal_radius_stop": stop_radius_used,
               "template_sha256": sha256_file(args.template),
-              "requested_seeds": seed_list,
-              "completion_rate": len(results) / args.episodes,
-              "requested_success_rate": sum(e["success"] for e in results) / args.episodes,
-              "failed_count": len(failures),
+              # requested_seeds 只含真正尝试过的 seed；扫描过的另存，避免把未处理
+              # 的扫描尾巴当成已请求集。
+              "requested_seeds": list(attempted_seeds),
+              "scanned_seeds": scanned_seeds,
+              "attempted_seeds": list(attempted_seeds),
+              "protocol": protocol,
+              "protocol_mismatches": [{"key": k, "protocol": v, "actual": g}
+                                      for k, v, g in mismatches],
+              "ood": ood,
+              "strict_protocol": args.strict_protocol,
               "goal_margin": args.goal_margin,
               "waypoint_radius": WAYPOINT_RADIUS,
               "stop_radius": stop_radius_used,
-              "geometry_version": ("campus.v1" if args.task == "campus" else sm.SPLIT_SALT),
+              "geometry_version": (campus.VERSION if args.task == "campus" else
+                                   asset_campus.VERSION if args.task == "campus_assets" else sm.SPLIT_SALT),
               "ckpt": os.path.abspath(args.ckpt) if args.ckpt else None,
               "ckpt_sha256": sha256_file(args.ckpt) if args.ckpt else None,
               "infer_bin": infer_bin,
@@ -585,12 +821,27 @@ def main():
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
 
-    print("\n== 闭环评测 ==")
-    print(f"episodes={agg['episodes_done']}/{args.episodes}  "
-          f"SR={agg['success_rate']}  "
+    successes = sum(1 for e in results if e.get("success"))
+    # 首行先报 requested（分母 = 本次请求集数），再报 done-set（分母 = 完成集数）。
+    print(f"requested: SR={agg['requested_success_rate']} "
+          f"({successes}/{args.episodes}); "
+          f"completion={agg['completion_rate']} "
+          f"({agg['episodes_done']}/{len(attempted_seeds)} attempted); "
+          f"execution={agg['execution_rate']} "
+          f"({agg['episodes_done']}/{args.episodes} requested); "
+          f"failed={agg['failed_count']} skipped={agg['skipped_count']} "
+          f"ood={ood}")
+    print(f"done-set: SR={agg['success_rate']} ({successes}/{agg['episodes_done']}); "
           f"SR_stop={agg['stop_success_rate']}  collision={agg['collision_rate']}  "
           f"stuck={agg['stuck_rate']}  "
           f"false_forward={agg['false_forward_rate']}")
+    print(f"new ({METRIC_VERSION}): reach_ever={agg['reach_ever_rate']} "
+          f"final_in_radius={agg['final_in_radius_rate']} "
+          f"stop_action={agg['stop_action_issued_rate']} "
+          f"task_success={agg['task_success_rate']}  "
+          f"radii reach={REACH_RADIUS}m stop={stop_radius_used}m")
+    print(f"wilson95: success={agg['wilson_ci']['success']} "
+          f"requested={agg['wilson_ci']['requested']}")
     im = agg["inference_ms"]
     print(f"inference p50={im['p50']}ms p95={im['p95']}ms "
           f"(warm n={im['n_warm']}; cold first={im['cold_first_ms']})")

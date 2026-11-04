@@ -606,6 +606,7 @@ if gui_ok:
             os.makedirs(made)
             try:
                 check("GUI 默认目录跳过已存在", app._default_run_dir() != made)
+                check("GUI 默认目录在数据盘", made.startswith(monitor.RUNS_ROOT))
             finally:
                 os.rmdir(made)
 

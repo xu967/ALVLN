@@ -77,10 +77,12 @@
     </model>
 
     <!-- Static overhead camera for the desktop Studio's rendered top-down view.
-         It is a visual-only sensor: no collision, mass or effect on UAV physics. -->
+         It is a visual-only sensor: no collision, mass or effect on UAV physics.
+         高度 6 m：80° 水平视场下地面覆盖约 10 m，柱阵（x 1.3-5.2、y ±1.85）
+         约占画面 40%。18 m 时只占 4%，画面几乎全空（2026-11-04 实测）。 -->
     <model name="studio_top_camera">
       <static>true</static>
-      <pose>3.5 0 18 0 1.57079632679 1.57079632679</pose>
+      <pose>2.5 0 6 0 1.57079632679 1.57079632679</pose>
       <link name="camera_link">
         <sensor name="top_camera" type="camera">
           <pose>0 0 0 0 0 0</pose>

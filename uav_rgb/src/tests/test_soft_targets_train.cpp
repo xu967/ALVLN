@@ -151,7 +151,37 @@ int main() {
     check(throws_any([&] { Trainer(both).run(); }), "软标签与类别权重同用未抛异常");
   }
 
-  // ---- 4) config.json 落盘 ----
+  // ---- 4) config.json 落盘 + 蒸馏来源审计 ----
+  // 教师来源元信息由 join_soft_targets.py 写在 <soft>.json；student 必须原样落盘。
+  {
+    std::ofstream meta(root + "/soft_ok.json");
+    meta << "{\"teacher_ckpt_sha256\":\"abc123\",\"teacher_select_split\":\"train\"}\n";
+  }
+  {
+    TrainConfig tc = base;
+    tc.out_dir = root + "/run_meta";
+    tc.soft_targets = root + "/soft_ok.bin";
+    tc.epochs = 1;
+    Trainer t(tc);
+    t.run();
+    const std::string cfg = read_file(root + "/run_meta/config.json");
+    check(cfg.find("\"soft_targets_sha256\":\"\"") == std::string::npos,
+          "config.json 未记录 soft_targets_sha256");
+    check(cfg.find("\"teacher_ckpt_sha256\":\"abc123\"") != std::string::npos,
+          "config.json 未记录 teacher_ckpt_sha256");
+    check(cfg.find("\"teacher_select_split\":\"train\"") != std::string::npos,
+          "config.json 未记录 teacher_select_split");
+    // 教师用 val 选模 + --strict-distill：必须失败，不能静默训练。
+    std::ofstream meta2(root + "/soft_ok.json", std::ios::trunc);
+    meta2 << "{\"teacher_ckpt_sha256\":\"abc123\",\"teacher_select_split\":\"val\"}\n";
+    meta2.close();
+    TrainConfig strict = tc;
+    strict.out_dir = root + "/run_strict";
+    strict.strict_distill = true;
+    check(throws_any([&] { Trainer(strict).run(); }),
+          "--strict-distill 时教师 val 选模与 student val 重叠必须失败");
+  }
+
   const std::string cfg = read_file(root + "/run_ok/config.json");
   check(cfg.find("\"soft_targets\":\"") != std::string::npos, "config.json 未记录 soft_targets");
   check(cfg.find("\"distill_alpha\":1") != std::string::npos, "config.json 未记录 distill_alpha");

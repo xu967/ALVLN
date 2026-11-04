@@ -67,6 +67,7 @@ from teacher import (expert_action, plan_action, plan_action_global,
 import gz_io
 import save_frame
 import split_manifest as sm
+import cf_sil
 
 TWIST_TOPIC = "/X3/gazebo/command/twist"
 CAMERA_TOPIC = "/uav/camera"
@@ -134,6 +135,93 @@ def altitude_vz(pose):
     if abs(err) < Z_DEADBAND:
         return 0.0
     return Z_KP * err
+
+
+# ---------------------------------------------------------------- cf_stab 动力学档
+# CF-Drone 固件只有 STAB/ACRO（control.ino），没有速度环；高度按 2026-11-04 决定继续
+# 用真值定高（altitude_vz）。cf_stab 把四动作当真机摇杆：FORWARD_SLOW=俯仰杆保持固定
+# 倾角，水平加速度 g·tanθ，线性阻力 k；其余动作俯仰杆回中，靠阻力滑停（不刹车）。
+# 速度在世界系积分（转头时动量不随机头转），发指令前转回机体系；底层仍由
+# MulticopterVelocityControl 跟踪这条速度曲线。默认 x3_velocity 保持旧行为不变。
+DYNAMICS = ("x3_velocity", "cf_stab", "cf_sil")
+CF_STAB_PROFILE = "cf_stab_v1"
+G = 9.81
+CF_MAX_TILT_DEG = 30.0  # CF-Drone/control.ino 的最大倾角
+CF_FWD_TILT_DEG = 2.0   # shortcut: 占位值（终端速度≈0.34 m/s，接近旧 SPEED_FWD），等 FORWARD_SLOW 对应的真机摇杆量实测后替换
+CF_DRAG_K = 1.0         # 1/s。shortcut: 占位值，等松杆滑行实测阻力后替换
+CF_LATENCY_S = 0.15     # 派发→生效。shortcut: 取 ALVLN/docs/09 的 P95≤150 ms 目标，等端到端实测后替换
+
+# cf_sil：直接驱动 4 个 MotorModel 的串级 PID 载具（sim-only）。参数档默认在
+# sim/dynamics/cf_sil_v1.json；profile 带参数 sha8，换参数后旧包不能混进来。
+DEFAULT_CF_SIL_PARAMS = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "dynamics", "cf_sil_v1.json")
+
+
+class CfStab:
+    """cf_stab 状态：世界系水平速度 + 带延迟的动作队列。时间一律是仿真 ns。"""
+
+    def __init__(self, tilt_deg=CF_FWD_TILT_DEG, drag_k=CF_DRAG_K, latency_s=CF_LATENCY_S):
+        if not 0.0 <= tilt_deg <= CF_MAX_TILT_DEG:
+            raise ValueError(f"cf_stab 倾角 {tilt_deg} 超出固件上限 {CF_MAX_TILT_DEG}°")
+        if not (drag_k > 0 and latency_s >= 0):
+            raise ValueError(f"cf_stab 参数无效: drag_k={drag_k} latency_s={latency_s}")
+        self.tilt_deg, self.k, self.latency_s = tilt_deg, drag_k, latency_s
+        self.accel = G * math.tan(math.radians(tilt_deg))
+        self.vx = self.vy = 0.0
+        self.active = SAFE_NEUTRAL
+        self.pending = []        # [(生效 ns, action)]，派发时刻单调递增
+        self.t_ns = None
+        self.path_m = 0.0        # 模型预测的累计水平路程（卡滞判定用）
+
+    def profile(self):
+        """参数编进档名：preprocess 只比 dynamics_profile，换实测参数后旧包不能混进来。"""
+        return (f"{CF_STAB_PROFILE}:tilt{self.tilt_deg:g}:k{self.k:g}"
+                f":lat{self.latency_s:g}")
+
+    def params(self):
+        return {"profile": self.profile(), "fwd_tilt_deg": self.tilt_deg, "drag_k": self.k,
+                "latency_s": self.latency_s, "max_tilt_deg": CF_MAX_TILT_DEG,
+                "altitude": "ground_truth_hold"}
+
+    def dispatch(self, action, t_ns):
+        self.pending.append((t_ns + int(self.latency_s * 1e9), action))
+
+    def _advance(self, dt, yaw):
+        a = self.accel if self.active == FORWARD_SLOW else 0.0
+        ax, ay = a * math.cos(yaw) / self.k, a * math.sin(yaw) / self.k   # 终端速度
+        e = math.exp(-self.k * dt)
+        # v' = a − k·v 的解析解；位移是它对时间的积分
+        dx = ax * dt + (self.vx - ax) * (1 - e) / self.k
+        dy = ay * dt + (self.vy - ay) * (1 - e) / self.k
+        self.vx, self.vy = ax + (self.vx - ax) * e, ay + (self.vy - ay) * e
+        self.path_m += math.hypot(dx, dy)
+
+    def step(self, t_ns, yaw_deg):
+        """推进到仿真时刻 t_ns，返回机体系 (vx, vy, wz)。"""
+        if yaw_deg is None:
+            raise ValueError("cf_stab 需要偏航真值才能把世界系速度转回机体系")
+        yaw = math.radians(yaw_deg)
+        if self.t_ns is None:
+            self.t_ns = t_ns
+        while self.pending and self.pending[0][0] <= t_ns:
+            t_eff, action = self.pending.pop(0)
+            if t_eff > self.t_ns:
+                self._advance((t_eff - self.t_ns) / 1e9, yaw)
+                self.t_ns = t_eff
+            self.active = action
+        if t_ns > self.t_ns:
+            self._advance((t_ns - self.t_ns) / 1e9, yaw)
+            self.t_ns = t_ns
+        wz = {YAW_LEFT: SPEED_YAW, YAW_RIGHT: -SPEED_YAW}.get(self.active, 0.0)
+        c, s = math.cos(yaw), math.sin(yaw)
+        return c * self.vx + s * self.vy, -s * self.vx + c * self.vy, wz
+
+
+def dyn_twist(dyn, t_ns, yaw_deg, pose):
+    """cf_stab 指令：水平/偏航来自摇杆模型，垂直仍是真值定高。"""
+    vx, vy, wz = dyn.step(t_ns, yaw_deg)
+    return vx, vy, max(-Z_MAX, min(Z_MAX, altitude_vz(pose))), wz
 
 
 def _gz(*args, timeout=GZ_TIMEOUT):
@@ -206,6 +294,18 @@ def _try_zero(publisher):
     except Exception as e:  # noqa: BLE001 - 安全网自身失败只能告警
         print(f"警告: CLI 零速也失败: {e}", file=sys.stderr)
         return False
+
+
+def stop_executor(publisher, sil=None):
+    """安全网：cf_sil 停桨；其他档发零速。从不抛 Exception。"""
+    if sil is not None:
+        try:
+            sil.zero_now()
+            return True
+        except Exception as e:  # noqa: BLE001 - 安全网自身失败只能告警
+            print(f"警告: cf_sil 停桨失败: {e}", file=sys.stderr)
+            return False
+    return _try_zero(publisher)
 
 
 def echo_json(topic):
@@ -554,14 +654,69 @@ def take_off(pose_sub, publisher, contact_sub=None, z_target=Z_TARGET, timeout=1
     raise RuntimeError(f"起飞超时 {timeout:.0f}s：z={last_z}，目标 {z_target}")
 
 
+def take_off_cf_sil(pose_sub, sil, contact_sub=None, z_target=None, timeout=120.0):
+    """cf_sil 起飞：SAFE_NEUTRAL 的伴飞定高会自动爬升到 altitude_target。
+
+    不发布 twist：cf_sil 的电机由后台线程直接驱动，MulticopterVelocityControl 已停用。
+    """
+    z_target = sil.params.altitude_target if z_target is None else z_target
+    def pose_now():
+        msg = pose_sub.latest()
+        return _pose_parts(msg) if msg else (None, 0, None)
+
+    pos, _, _ = pose_now()
+    z0 = pos.get("z") if isinstance(pos, dict) else None
+    if z0 is not None and z0 > 0.5:
+        raise RuntimeError(
+            f"world 未复位：起飞前 z={z0:.2f} m > 0.5；请重启 gz sim 或换新 world")
+    if contact_sub is not None and not contact_sub.healthy():
+        raise RuntimeError("contact 订阅进程已退出")
+    if sil.error():
+        raise RuntimeError(f"cf_sil 执行器故障: {sil.error()}")
+
+    sil.set_action(SAFE_NEUTRAL)
+    air_seq0 = None
+    deadline = time.monotonic() + timeout
+    last_z = None
+    while time.monotonic() < deadline:
+        if sil.error():
+            sil.zero_now()
+            raise RuntimeError(f"起飞阶段 cf_sil 执行器故障: {sil.error()}")
+        if contact_sub is not None and not contact_sub.healthy():
+            sil.zero_now()
+            raise RuntimeError("起飞阶段 contact 订阅进程已退出")
+        pos, _, _ = pose_now()
+        if isinstance(pos, dict):
+            last_z = pos.get("z")
+            if contact_sub is not None and last_z is not None and last_z > 0.5:
+                if air_seq0 is None:
+                    air_seq0 = _contact_seq(contact_sub)
+                elif _contact_since(contact_sub, air_seq0):
+                    sil.zero_now()
+                    raise RuntimeError("起飞阶段检测到 contact（spawn 太近或撞柱）")
+            if last_z is not None and last_z >= z_target:
+                print(f"起飞完成: z={last_z:.2f} m", file=sys.stderr)
+                return air_seq0
+        time.sleep(0.1)
+    sil.zero_now()
+    raise RuntimeError(f"起飞超时 {timeout:.0f}s：z={last_z}，目标 {z_target}")
+
+
 # ---------------------------------------------------------------- 单步
 
 def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 prev_action=None, prev_rgb_ts=0, pillars=None, student=None,
                 global_plan=True, window_from="dispatch", waypoint=None,
                 stop_at_waypoint=False, stop_radius=0.5, save_depth=False,
-                teacher_nn=None, text_ids=None, contact_seq0=None):
-    """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。"""
+                teacher_nn=None, text_ids=None, contact_seq0=None, dyn=None,
+                predictive_teacher=None, rl_teacher=None, sil=None):
+    """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。
+
+    dyn=None 为 x3_velocity 旧行为（定速 + 窗口末刹停）；给 CfStab 时按摇杆模型
+    在窗口内逐帧更新速度，窗口末不刹停，最后一条指令一直保持到下一步派发。
+    给 sil（CfSilMotorThread）时不发 twist：后台线程按动作直接驱动 4 个电机，
+    窗口末也不刹停，最后一条动作保持到下一步派发。
+    """
     if window_from not in ("dispatch", "observation"):
         raise ValueError(f"window_from 无效: {window_from!r}")
     t_step = time.perf_counter()
@@ -608,7 +763,12 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             if not pose_before:
                 return None, "carrot planner 需要位姿真值，但该步 pose 缺 position"
             # safe 出生用局部规划（要保留真正的 SAFE 标签）；普通集用 A* 全局路径。
-            if global_plan:
+            if predictive_teacher is not None:
+                if dyn is None:
+                    return None, "predictive teacher 需要 cf_stab 动力学档"
+                action = predictive_teacher.act(pose_before["x"], pose_before["y"],
+                    yaw_before, dyn.vx, dyn.vy, active=dyn.active, latency=dyn.latency_s)
+            elif global_plan:
                 action = plan_action_global(pose_before["x"], pose_before["y"],
                                             yaw_before, pillars, waypoint=waypoint,
                                             stop_at_waypoint=stop_at_waypoint,
@@ -619,6 +779,25 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         else:
             # 没有真值就退回深度反应式专家（传 prev_action 启用滞回）。
             action = expert_action(d, w, h, prev_action=prev_action)
+    elif policy == "teacher-rl":
+        if rl_teacher is None or dyn is None or not pose_before or yaw_before is None:
+            return None, "teacher-rl 需要 checkpoint、cf_stab、有效位姿与 scene-meta"
+        try:
+            from pathlib import Path
+            repo_root = str(Path(__file__).resolve().parents[2])
+            if repo_root not in sys.path: sys.path.insert(0, repo_root)
+            from rl_teacher.core import Phys, state_vector
+            state = Phys(x=pose_before["x"], y=pose_before["y"],
+                         yaw=math.radians(yaw_before), vx=dyn.vx, vy=dyn.vy,
+                         action=dyn.active, last_action=dyn.active,
+                         delay_remaining=max(0., dyn.latency_s))
+            import numpy as np
+            obs = np.asarray(state_vector(state, (waypoint["x"], waypoint["y"]),
+                                          pillars), dtype=np.float32)
+            result, _ = rl_teacher.predict(obs, deterministic=True)
+            action = int(result)
+        except Exception as e:
+            return None, f"teacher-rl 推理失败: {type(e).__name__}: {e}"
     elif policy == "student":
         if student is None:
             return None, "student 策略未初始化"
@@ -675,11 +854,22 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         pose_for_action = pose_before if window_from == "observation" else pose_exec
         t_action_start = time.perf_counter()
         try:
-            action_handle = publisher.start(
-                *twist_fields(action, altitude_vz(pose_for_action)))
+            if sil is not None:
+                # 动作交给后台电机线程；不建 twist publisher，也不发 twist。
+                sil.dispatch(action, exec_ts)
+                action_handle = None
+                path0 = 0.0
+            elif dyn is None:
+                action_handle = publisher.start(
+                    *twist_fields(action, altitude_vz(pose_for_action)))
+            else:
+                dyn.dispatch(action, exec_ts)
+                twist0 = dyn_twist(dyn, exec_ts, yaw_exec, pose_exec)
+                path0 = dyn.path_m          # 实际位移也从 pose_exec 起算
+                action_handle = publisher.start(*twist0)
         except Exception:
             # 动作没发出去也要确认没有旧指令在飞；失败原因继续上抛。
-            _try_zero(publisher)
+            stop_executor(publisher, sil)
             raise
 
         # PNG 落盘落在 hold 窗口内（RGB 已在发指令前抓到，M1 不受影响）。
@@ -689,7 +879,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             # 深度图与 RGB 同 step 编号；写失败不能让 jsonl 指向不存在的文件。
             if not write_depth_png(d, w, h,
                                    os.path.join(out_dir, DEPTH_REF % step_idx)):
-                _try_zero(publisher)
+                stop_executor(publisher, sil)
                 return None, "深度图写盘失败"
 
         contact = False
@@ -700,17 +890,23 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         wall_cap = t_action_start + hold / MIN_WINDOW_RTF   # 位姿停更时不死等
         while True:
             if not subs["contact"].healthy():
-                _try_zero(publisher)
+                stop_executor(publisher, sil)
                 return None, "动作窗口内 contact 订阅进程已退出"
+            if sil is not None and sil.error():
+                stop_executor(publisher, sil)
+                return None, f"cf_sil 执行器故障: {sil.error()}"
             msg = subs["pose"].latest()
             if msg is not None and _pose_stamp(msg) >= hold_end_ns:
                 break
+            if dyn is not None and msg is not None and _pose_stamp(msg) > dyn.t_ns:
+                pos_m, ts_m, yaw_m = _pose_parts(msg)
+                publisher.start(*dyn_twist(dyn, ts_m, yaw_m, pos_m))
             if not subs["pose"].healthy():
                 # 订阅进程已死：不必等满墙钟兜底，也能给出比「RTF 过低」准确的诊断。
-                _try_zero(publisher)
+                stop_executor(publisher, sil)
                 return None, "动作窗口内 pose 订阅进程已退出"
             if time.perf_counter() >= wall_cap:
-                _try_zero(publisher)   # 动作还在生效，先刹车再报错
+                stop_executor(publisher, sil)   # 动作还在生效，先刹车再报错
                 return None, (f"动作窗口超时：{hold / MIN_WINDOW_RTF:.1f}s 墙钟内"
                               f"仿真时间没走满 hold={hold}s（位姿停更或 RTF 过低）")
             time.sleep(CONTACT_POLL)
@@ -718,19 +914,32 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 contact = _contact_since(subs["contact"], contact_seq0)
 
         # M2：hold 到点立刻发零速，并等它真正发布完成才继续（不丢零速）。
-        try:
-            zero_handle = publisher.start(*twist_fields(SAFE_NEUTRAL, 0.0))
-            # 先收动作的发布完成时刻：若先等零速再等动作，动作的完成时刻
-            # 会被记晚而误判。
-            action_pub_wall = publisher.wait(action_handle)
-            zero_pub_wall = publisher.wait(zero_handle)
-        except Exception:
-            _try_zero(publisher)
-            raise
+        # cf_stab 不刹停：发窗口末的模型速度，保持到下一步派发。
+        # cf_sil 也不刹停：后台电机线程继续执行最后一条动作，直到下一步 dispatch。
+        # shortcut: cf_stab 步间这条指令是常量，模型的阻力衰减要到下一步派发才补上；
+        # 步间隔远大于 0.1 s 仿真时间时要改成后台线程持续发布（cf_sil 已是后台线程）。
+        if sil is not None:
+            action_pub_wall = t_action_start
+            zero_pub_wall = time.perf_counter()
+        else:
+            try:
+                if dyn is None:
+                    end_twist = twist_fields(SAFE_NEUTRAL, 0.0)
+                else:
+                    pos_m, ts_m, yaw_m = _pose_parts(msg)
+                    end_twist = dyn_twist(dyn, ts_m, yaw_m, pos_m)
+                zero_handle = publisher.start(*end_twist)
+                # 先收动作的发布完成时刻：若先等零速再等动作，动作的完成时刻
+                # 会被记晚而误判。
+                action_pub_wall = publisher.wait(action_handle)
+                zero_pub_wall = publisher.wait(zero_handle)
+            except Exception:
+                stop_executor(publisher, sil)
+                raise
         action_wall = zero_pub_wall - action_pub_wall
         if action_wall <= 0:
             # 零速比动作先发布 => 动作可能一直生效；先补零速再失败。
-            _try_zero(publisher)
+            stop_executor(publisher, sil)
             raise RuntimeError("zero twist overtook action twist (hold too small)")
         t_block = time.perf_counter()
 
@@ -752,8 +961,9 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         contact = contact or contact_seq_end > contact_seq0
         t_end = time.perf_counter()
     finally:
-        publisher.abort(action_handle)
-        publisher.abort(zero_handle)
+        if publisher is not None:
+            publisher.abort(action_handle)
+            publisher.abort(zero_handle)
 
     # sim_dt 保留动作窗口合同；性能单独按派发位姿起算，避免混入推理时间。
     sim_dt = (pose_ts - action_start_ns) / 1e9 if pose_ts and action_start_ns else 0.0
@@ -763,9 +973,26 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     dyaw = (_angle_diff(yaw_after, yaw_exec)
             if yaw_after is not None and yaw_exec is not None else None)
     # 低 RTF 时动作窗口的 sim 时间会变短，卡滞阈值跟着缩放，避免误报。
-    stuck_eps = min(STUCK_EPS, 0.5 * SPEED_FWD * sim_dt)
+    if dyn is None and sil is None:
+        stuck_eps = min(STUCK_EPS, 0.5 * SPEED_FWD * sim_dt)
+        armed = True
+    elif sil is not None:
+        # cf_sil：hold < 0.5 s 时从静止起步的位移本身就小于 STUCK_EPS，不启用卡滞
+        # 兜底（碰撞以 contact 为主）。长窗口按本步 FORWARD 设定点折算期望位移。
+        # shortcut: 忽略步前已有速度，期望位移偏保守；换 hold/速度设定点后要重测。
+        expected_m = SPEED_FWD * sim_dt if action == FORWARD_SLOW else 0.0
+        stuck_eps = min(STUCK_EPS, 0.25 * expected_m)
+        armed = sim_dt >= 0.5 and expected_m >= 2 * STUCK_EPS
+    else:
+        # cf_stab：X3 底层跟踪模型曲线滞后约 0.4 s（2026-11-04 实测加速初段实际/预测
+        # 低至 0.3），按 0.5×预测会把起步误判成卡滞。只在模型预测已走满 STUCK_EPS 时判，
+        # 且实际不到预测的 1/4 才算被挡（贴柱时实际≈0）。
+        # shortcut: 单窗口阈值，靠 X3 跟踪滞后的实测值定；换底层控制器或改 hold 后要重测误报率。
+        expected_m = dyn.path_m - path0
+        stuck_eps = 0.25 * expected_m
+        armed = expected_m >= STUCK_EPS
     stuck = bool(action == FORWARD_SLOW and sim_dt > 0 and dist is not None
-                 and dist < stuck_eps)
+                 and armed and dist < stuck_eps)
 
     return {
         "contact_seq_end": contact_seq_end,
@@ -889,9 +1116,26 @@ def main():
     p.add_argument("--window-from", choices=("dispatch", "observation"),
                    default="observation",
                    help="动作窗口起点：observation=观测位姿（默认，唯一被采纳基线）；"
-                        "dispatch=派发位姿（R01，仅复现 T7-R，数字不可与 observation 混报）")
+                        "dispatch=派发位姿（R01，仅复现 T7-R，数字不可与 observation 混报）；"
+                        "cf_sil 建议用 dispatch，窗口才和电机线程的派发时刻对齐")
+    p.add_argument("--dynamics", choices=DYNAMICS, default="x3_velocity",
+                   help="x3_velocity=旧行为（定速+每步刹停，唯一历史基线）；"
+                        "cf_stab=CF-Drone 摇杆模型（倾角加速+阻力滑行+指令延迟，"
+                        "高度仍真值定高；建议配 --hold 0.1~0.2；数字不可与旧档混报）；"
+                        "cf_sil=直接驱动 4 个电机（串级 PID+混控，sim-only，"
+                        "高度假设 companion_hold；参数见 --cf-sil-params）")
+    p.add_argument("--cf-sil-params", default=None,
+                   help="cf_sil 参数 JSON（默认 sim/dynamics/cf_sil_v1.json）；"
+                        "只能和 --dynamics cf_sil 一起用")
+    p.add_argument("--flight-log", default=None,
+                   help="cf_sil 参数辨识用 ULog(.ulg)；需要 pyulog，未安装时先导出 CSV")
+    p.add_argument("--flight-log-csv", default=None,
+                   help="cf_sil 参数辨识用 CSV（t,qw/qx/qy/qz,wx/wy/wz,thrust/motor,x/y/z）")
     p.add_argument("--no-takeoff", action="store_true")
-    p.add_argument("--policy", choices=("teacher", "forward", "student", "teacher-nn"),
+    p.add_argument("--teacher-planner", choices=("astar", "predictive"), default="astar",
+                   help="--policy teacher 的 T0/T1 规划器；predictive 需要 cf_stab + scene-meta")
+    p.add_argument("--rl-checkpoint", default="", help="teacher-rl 离线 PPO 模型路径")
+    p.add_argument("--policy", choices=("teacher", "forward", "student", "teacher-nn", "teacher-rl"),
                    default="teacher",
                    help="teacher=专家策略；forward=盲策略（恒定前进）；student=模型闭环；"
                         "teacher-nn=特权教师网络闭环")
@@ -922,6 +1166,37 @@ def main():
         p.error("--policy student 需要 --student-ckpt")
     if args.policy == "teacher-nn" and not args.teacher_ckpt:
         p.error("--policy teacher-nn 需要 --teacher-ckpt")
+    if args.policy == "teacher-rl" and not args.rl_checkpoint:
+        p.error("--policy teacher-rl 需要 --rl-checkpoint")
+    if (args.teacher_planner == "predictive" or args.policy == "teacher-rl") and (
+            args.dynamics != "cf_stab" or not args.scene_meta):
+        p.error("新 Teacher 必须 --dynamics cf_stab 且提供 --scene-meta")
+    if args.policy == "teacher-rl" and abs(args.hold - 0.2) > 1e-6:
+        p.error("teacher-rl 的训练策略要求 --hold 0.2（5Hz）；其他时长需重新训练")
+    cf_sil_params = None
+    if args.dynamics == "cf_sil":
+        try:
+            cf_sil_params = cf_sil.CfSilParams.from_json(
+                args.cf_sil_params or DEFAULT_CF_SIL_PARAMS)
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            p.error(f"无法加载 cf_sil 参数: {e}")
+        if not cf_sil_params.calibrated:
+            print("警告: cf_sil 参数 calibrated=false（固件默认+占位值，不是实测标定）",
+                  file=sys.stderr)
+    elif args.cf_sil_params:
+        p.error("--cf-sil-params 只能和 --dynamics cf_sil 一起用")
+    if args.flight_log and args.flight_log_csv:
+        p.error("--flight-log 和 --flight-log-csv 只能二选一")
+    log_path = args.flight_log or args.flight_log_csv
+    if log_path:
+        if args.dynamics != "cf_sil":
+            p.error("--flight-log/--flight-log-csv 只用于 --dynamics cf_sil")
+        try:
+            summary = cf_sil.load_flight_log(log_path)
+        except Exception as e:  # noqa: BLE001 - 参数校验失败直接退出
+            p.error(f"飞行日志读取失败: {e}")
+        print(f"飞行日志（仅接口校验/摘要，未做参数辨识）: {summary}",
+              file=sys.stderr)
     if os.path.isdir(args.out) and os.listdir(args.out):
         p.error(f"--out {args.out} 不是空目录；请换新目录（或先清空）")
     os.makedirs(args.out, exist_ok=True)
@@ -964,12 +1239,14 @@ def main():
         teacher_kind, planner_kind = "forward", None
     elif args.policy == "student":
         teacher_kind, planner_kind = "student", None
+    elif args.policy == "teacher-rl":
+        teacher_kind, planner_kind = "teacher_rl", "ppo_discrete4"
     elif args.policy == "teacher-nn":
         # 标签来自训练好的特权教师网络，必须与 plan_action/expert_action 区分。
         teacher_kind, planner_kind = "teacher_nn", None
     elif pillars:
         teacher_kind = "plan_action"
-        planner_kind = "astar"
+        planner_kind = args.teacher_planner
     else:
         teacher_kind, planner_kind = "expert_action", None
         print("警告: 没给 --scene-meta，退回深度反应式专家；manifest.teacher=expert_action",
@@ -983,6 +1260,13 @@ def main():
     publisher = None
     student = None
     teacher_nn = None
+    predictive_teacher = None
+    rl_teacher = None
+    if args.policy == "teacher" and args.teacher_planner == "predictive":
+        if not pillars or not isinstance(waypoint, dict):
+            p.error("predictive teacher 需要 scene-meta 的 pillars/waypoint")
+        from teacher_predictive import PredictiveTeacher
+        predictive_teacher = PredictiveTeacher(pillars, waypoint)
     text_ids = None
     cam_info = None
     rows_written = 0
@@ -995,6 +1279,9 @@ def main():
     prev_action = None
     prev_rgb_ts = 0
     timings = []
+    dyn = CfStab() if args.dynamics == "cf_stab" else None
+    sil = (cf_sil.CfSilMotorThread(cf_sil_params)
+           if cf_sil_params is not None else None)
     try:
         subs = open_subs()
         not_ready = wait_ready(subs)
@@ -1009,15 +1296,20 @@ def main():
         else:
             print("警告: 没读到 /uav/camera_info 的 RGB 内参，manifest 里 fx/fy/cx/cy 保持 null",
                   file=sys.stderr)
-        try:
-            publisher = gz_io.open_twist_publisher(TWIST_TOPIC)
-            if getattr(publisher, "warning", None):
-                print(f"警告: {publisher.warning}", file=sys.stderr)
-            print(f"指令发布: {publisher.mode}", file=sys.stderr)
-        except Exception as e:  # noqa: BLE001 - 任何建不起来都直接失败
-            raise RuntimeError(
-                f"常驻 twist publisher 不可用（{e}）；定量采集不做 gz topic -p CLI"
-                f" 回退（每条指令约 +1.0 s，动作窗口会失真）") from e
+        if sil is None:
+            try:
+                publisher = gz_io.open_twist_publisher(TWIST_TOPIC)
+                if getattr(publisher, "warning", None):
+                    print(f"警告: {publisher.warning}", file=sys.stderr)
+                print(f"指令发布: {publisher.mode}", file=sys.stderr)
+            except Exception as e:  # noqa: BLE001 - 任何建不起来都直接失败
+                raise RuntimeError(
+                    f"常驻 twist publisher 不可用（{e}）；定量采集不做 gz topic -p CLI"
+                    f" 回退（每条指令约 +1.0 s，动作窗口会失真）") from e
+        else:
+            print(f"cf_sil 执行器: {sil.params.profile()}（calibrated="
+                  f"{sil.params.calibrated}，altitude={sil.params.altitude_assumption}）",
+                  file=sys.stderr)
 
         if args.policy == "student":
             from instruction import tokenize
@@ -1025,6 +1317,10 @@ def main():
             print("学生策略: 启动推理进程…", file=sys.stderr)
             text_ids = tokenize(instruction_text) if instruction_text else None
             student = StudentPolicy(args.student_ckpt, args.infer_bin, text_ids=text_ids)
+        elif args.policy == "teacher-rl":
+            from stable_baselines3 import PPO
+            rl_teacher = PPO.load(args.rl_checkpoint, device="cpu")
+            print("警告: teacher-rl 是轻量物理仿真训练的实验策略，Gazebo 效果尚未验证", file=sys.stderr)
         elif args.policy == "teacher-nn":
             from instruction import tokenize
             from teacher_policy import TeacherPolicy
@@ -1033,7 +1329,25 @@ def main():
             teacher_nn = TeacherPolicy(args.teacher_ckpt)
 
         contact_seq0 = _contact_seq(subs["contact"])
-        if not args.no_takeoff:
+        if sil is not None:
+            print("cf_sil: 停用 MulticopterVelocityControl 并启动电机线程…",
+                  file=sys.stderr)
+            sil.start()
+            if args.no_takeoff:
+                # --no-takeoff 在 cf_sil 下表示「保持当前高度」，不是关电机。
+                pos0 = _pose_parts(subs["pose"].latest())[0] \
+                    if subs["pose"].latest() is not None else None
+                if isinstance(pos0, dict) and pos0.get("z") is not None:
+                    sil.set_altitude_target(pos0["z"])
+                    sil.set_action(SAFE_NEUTRAL)   # 上电并保持当前高度
+                    print(f"cf_sil --no-takeoff: 保持当前高度 z={pos0['z']:.2f} m",
+                          file=sys.stderr)
+            else:
+                print("起飞中…", file=sys.stderr)
+                contact_seq0 = take_off_cf_sil(
+                    subs["pose"], sil, subs["contact"],
+                    z_target=sil.params.altitude_target)
+        elif not args.no_takeoff:
             print("起飞中…", file=sys.stderr)
             contact_seq0 = take_off(subs["pose"], publisher, subs["contact"])
 
@@ -1048,7 +1362,9 @@ def main():
                                     stop_radius=stop_radius or 0.5,
                                     save_depth=args.save_depth,
                                     teacher_nn=teacher_nn, text_ids=text_ids,
-                                    contact_seq0=contact_seq0)
+                                    contact_seq0=contact_seq0, dyn=dyn,
+                                    predictive_teacher=predictive_teacher,
+                                    rl_teacher=rl_teacher, sil=sil)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -1131,13 +1447,15 @@ def main():
         error = f"{type(e).__name__}: {e}"
         raise
     finally:
-        # M3: 无论正常结束、深度失败、异常还是 Ctrl-C，先发零速悬停再收尾
+        # M3: 无论正常结束、深度失败、异常还是 Ctrl-C，先发零速/停桨再收尾
         # （不能等订阅关闭，否则中断时可能带着最后一条动作指令多飞几秒）。
         try:
-            _try_zero(publisher)
+            stop_executor(publisher, sil)
         finally:
             if publisher is not None:
                 publisher.close()
+            if sil is not None:
+                sil.stop()
         close_subs(subs)
         if student is not None:
             try:
@@ -1166,17 +1484,30 @@ def main():
             # 几何语义版本：v2/v3 的 gid 天然不同，只查 gid 交集查不出混包。
             "geometry_version": scene_version,
             **{key: scene_meta_obj.get(key) for key in sm.PROVENANCE_KEYS},
+            # 动力学由采集器决定而非场景：cf_stab/cf_sil 覆盖 scene 的 x3_v1，
+            # preprocess 只比 dynamics_profile，据此拒绝混包。
+            **({"dynamics_profile": dyn.profile(), "dynamics_params": dyn.params()}
+               if dyn is not None else {}),
+            **({"dynamics_profile": sil.params.profile(),
+                "dynamics_params": sil.params.manifest(),
+                "altitude_assumption": sil.params.altitude_assumption}
+               if sil is not None else {}),
+            # 飞行日志只做接口校验/摘要，不参与本次控制参数；留路径供事后追溯。
+            **({"flight_log": os.path.abspath(log_path)} if log_path else {}),
             # 标签由哪个教师产生：forward=盲策略对照，expert_action=深度反应式，
             # plan_action=柱子真值 carrot planner，teacher_nn=特权教师网络。
             # 缺这个字段就无法事后区分数据集。
             "teacher": teacher_kind,
             # 教师实现版本：改规划参数/前向安全门后必须能区分新旧标签。
-            "teacher_version": (TEACHER_VERSION if teacher_kind in ("plan_action",
-                                                                    "expert_action")
-                                else None),
+            "teacher_version": ("uavrgb.predictive_teacher.v1" if planner_kind == "predictive"
+                                else "uavrgb.rlteacher.v1" if teacher_kind == "teacher_rl"
+                                else TEACHER_VERSION if teacher_kind in ("plan_action",
+                                                                    "expert_action") else None),
             # plan_action 的具体实现：astar=全局路径（普通集），plan_action=局部
             # （safe 出生集，保留真 SAFE 标签）。audit 复算必须按这个字段选。
             "planner": planner_kind,
+            "rl_checkpoint": (os.path.abspath(args.rl_checkpoint) if args.policy == "teacher-rl" else None),
+            "experimental_policy": args.policy == "teacher-rl" or planner_kind == "predictive",
             # hold 是**仿真时间**秒（D1 起）：窗口按位姿戳走满这个数才发零速，
             # 与 RTF 无关。同 scene 的 0.5 与 1.0 两批数据仍靠它区分。
             "hold_s": args.hold,

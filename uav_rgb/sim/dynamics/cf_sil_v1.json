@@ -1,0 +1,98 @@
+{
+  "profile_version": "cf_sil_v1",
+  "calibrated": false,
+  "altitude_assumption": "companion_hold",
+  "motor_command_units": "rad/s",
+  "sim_plant_source": "sim/worlds/uav_rgb.sdf X3（OpenRobotics X3 UAV 等价模型）",
+  "notes": [
+    "sim-only 载具骨架，不是 CF-Drone SIL；速度环/高度环在伴飞电脑，不在 STM32 固件里。",
+    "顶层 mass/inertia/arm_length/kf/km/max_rpm/rotors/drag 是 Gazebo X3 仿真被控对象值，不是 118mm 真机参数。",
+    "altitude_assumption=companion_hold：高度用 Gazebo 真值 odometry 的位置 PID，不能当成 CF 固件能力。",
+    "firmware_default 的 PID/限幅/油门来自 CF-Drone/control.ino（只读预填）；hardware 里缺的实测项全部保持 null，calibrated=false。",
+    "归一化油门 u∈[0,1]；本骨架按 omega = u * max_omega 线性映射到 Gazebo。真机 ESC 油门->转速/推力曲线未实测，hardware.thrust_curve=null。",
+    "kf 单位 N/(rad/s)^2；km 单位 m（drag torque = km * thrust），与 Gazebo MulticopterMotorModel 的 motorConstant/momentConstant 一致。",
+    "max_rpm 是机械转速；SDF maxRotVelocity=800 rad/s 对应 7639.437 rpm。",
+    "motor_tau_up/down 是 SDF 里 MotorModel 的一阶滤波时间常数，由 Gazebo 物理本体执行；控制器只发目标转速，不重复滤波。",
+    "pid.pos/pid.vel 是伴飞电脑侧的占位参数；pid.att/pid.rate 是 control.ino 固件默认值。",
+    "latency_s、forward_speed/yaw_rate、max_climb_rate、pid.pos/vel 仍是占位值，等真机/实测数据替换。"
+  ],
+  "mass": 1.5,
+  "inertia": [0.0347563, 0.07, 0.0977],
+  "arm_length": 0.2556,
+  "rotors": [
+    {"name": "rotor_0", "position": [0.13, -0.22, 0.023], "turning": "ccw", "actuator": 0},
+    {"name": "rotor_1", "position": [-0.13, 0.20, 0.023], "turning": "ccw", "actuator": 1},
+    {"name": "rotor_2", "position": [0.13, 0.22, 0.023], "turning": "cw", "actuator": 2},
+    {"name": "rotor_3", "position": [-0.13, -0.20, 0.023], "turning": "cw", "actuator": 3}
+  ],
+  "kf": 8.54858e-06,
+  "km": 0.016,
+  "motor_tau_up": 0.0125,
+  "motor_tau_down": 0.025,
+  "max_rpm": 7639.437,
+  "drag": 8.06428e-05,
+  "firmware_default": {
+    "source": "CF-Drone/control.ino",
+    "imu_hz": 1000,
+    "rate_pid": {
+      "roll":  {"kp": 0.06, "ki": 0.1, "kd": 0.001, "i_lim": 0.3},
+      "pitch": {"kp": 0.06, "ki": 0.1, "kd": 0.001, "i_lim": 0.3},
+      "yaw":   {"kp": 0.3,  "ki": 0.01, "kd": 0.01, "i_lim": 0.3}
+    },
+    "att_pid": {
+      "roll":  {"kp": 6, "ki": 0, "kd": 0},
+      "pitch": {"kp": 6, "ki": 0, "kd": 0},
+      "yaw":   {"kp": 3, "ki": 0, "kd": 0}
+    },
+    "rate_max_deg_s": [360, 360, 300],
+    "max_tilt_deg": 30,
+    "throttle": {
+      "mot_thr_min": 0.10,
+      "mot_thr_max": 0.90,
+      "arm_throttle_limit": 0.05
+    },
+    "rates_d_lpf_alpha": 0.2,
+    "rates_d_lpf_cutoff_hz_approx": 40
+  },
+  "pid_source": {
+    "pos": "companion_placeholder",
+    "vel": "companion_placeholder",
+    "att": "CF-Drone/control.ino firmware_default",
+    "rate": "CF-Drone/control.ino firmware_default"
+  },
+  "pid": {
+    "pos": {"kp": 0.8, "ki": 0.05, "kd": 0.25, "i_lim": 0.3},
+    "vel": {"kp": 2.5, "ki": 0.4, "kd": 0.0, "i_lim": 2.0},
+    "att": {
+      "roll":  {"kp": 6, "ki": 0, "kd": 0},
+      "pitch": {"kp": 6, "ki": 0, "kd": 0},
+      "yaw":   {"kp": 3, "ki": 0, "kd": 0}
+    },
+    "rate": {
+      "roll":  {"kp": 0.06, "ki": 0.1, "kd": 0.001, "i_lim": 0.3},
+      "pitch": {"kp": 0.06, "ki": 0.1, "kd": 0.001, "i_lim": 0.3},
+      "yaw":   {"kp": 0.3,  "ki": 0.01, "kd": 0.01, "i_lim": 0.3}
+    }
+  },
+  "max_tilt_deg": 30.0,
+  "max_rate_rad_s": [6.283185, 6.283185, 5.235988],
+  "control_hz": 250.0,
+  "latency_s": 0.02,
+  "forward_speed_mps": 0.3,
+  "yaw_rate_rad_s": 0.6,
+  "max_climb_rate_mps": 0.6,
+  "max_vertical_accel_mps2": 3.0,
+  "altitude_target_m": 2.1,
+  "hardware": {
+    "source": "CF-Drone GitHub + OSHWHub 硬件页",
+    "wheelbase_m": 0.118,
+    "mass_kg": null,
+    "inertia_kg_m2": null,
+    "props": null,
+    "motors": null,
+    "thrust_curve": null,
+    "battery": null,
+    "hover_throttle": null,
+    "notes": "仅轴距 118mm 已知；其余未实测，不要用 sim_plant 值冒充真机，calibrated=false。"
+  }
+}

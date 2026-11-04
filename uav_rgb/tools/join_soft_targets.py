@@ -119,12 +119,21 @@ def main():
 
     soft = {}
     seq_len = None
+    provenance = {}
     for path in args.soft:
         with np.load(path, allow_pickle=False) as z:
             if "seq_len" in z:
                 if seq_len is not None and seq_len != int(z["seq_len"]):
                     die("软标签 seq_len 不一致")
                 seq_len = int(z["seq_len"])
+            # export_soft_targets.py 写入的教师来源；多份 npz 必须一致。
+            for key in ("teacher_ckpt_sha256", "select_split", "train_data_sha256"):
+                if key not in z.files:
+                    continue
+                value = str(z[key].item())
+                if key in provenance and provenance[key] != value:
+                    die(f"教师来源元信息不一致: {key}（{provenance[key]} vs {value}）")
+                provenance[key] = value
             for key in z.files:
                 if key.endswith("/logits"):
                     if key in soft:
@@ -196,7 +205,11 @@ def main():
             "filled": int(filled.sum()), "missing": int(missing),
             "seq_len": seq_len, "temperature": t,
             "uavr_sha256": data_hash.hex(), "instructions_sha256": text_hash.hex(),
-            "payload_sha256": payload_hash.hex()}
+            "payload_sha256": payload_hash.hex(),
+            # 教师来源（旧 npz 没有这些键时为 null）；student config 会读回再落盘。
+            "teacher_ckpt_sha256": provenance.get("teacher_ckpt_sha256"),
+            "teacher_select_split": provenance.get("select_split"),
+            "teacher_train_data_sha256": provenance.get("train_data_sha256")}
     with open(meta_path, "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
     print(f"写出 {args.out}（{HEADER.size + out.nbytes} 字节）", file=sys.stderr)

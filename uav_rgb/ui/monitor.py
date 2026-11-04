@@ -26,6 +26,9 @@ except ImportError:  # 无 Tk 的解释器仍可导入解析层做自检
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(APP_DIR)
+# 训练产物一律放数据盘（根分区只有 30G），与 studio.py 的 DATA_ROOT 同源。
+RUNS_ROOT = os.path.join(os.path.expanduser(os.environ.get("DATA_ROOT", "~/rivermind-data")),
+                         "uav_rgb", "monitor_runs")
 DEFAULT_RUN_DIR = os.path.join(APP_DIR, "demo")
 
 # 曲线配色：train 蓝、dev 橙、accuracy 绿。
@@ -712,12 +715,12 @@ class MonitorApp:
 
     def _default_run_dir(self):
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        path = os.path.join(REPO_ROOT, "logs", "runs", stamp + "-demo")
+        path = os.path.join(RUNS_ROOT, stamp + "-demo")
         n = 1
         # 同一整秒内开始又结束的跑会算出同名目录；跳过已存在的，重试时不用手改。
         while os.path.exists(path):
             n += 1
-            path = os.path.join(REPO_ROOT, "logs", "runs", f"{stamp}-{n}-demo")
+            path = os.path.join(RUNS_ROOT, f"{stamp}-{n}-demo")
         return path
 
     def _choose_train_dir(self):

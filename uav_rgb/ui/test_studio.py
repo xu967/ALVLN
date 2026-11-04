@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Headless regression tests for UAV Navigation Studio data/geometry helpers."""
+import hashlib
 import json
 import tempfile
 import unittest
@@ -128,6 +129,94 @@ class StudioHelperTests(unittest.TestCase):
             p.write_text('{"event":"ok"}\nnot-json\n{"event":"done"}\n', encoding="utf-8")
             rows = studio.read_jsonl(p)
         self.assertEqual([x["event"] for x in rows], ["ok", "done"])
+
+    def test_discover_runs_two_levels_and_skip_rules(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "group" / "run-a").mkdir(parents=True)
+            (root / "group" / "run-a" / "metrics.jsonl").write_text("", encoding="utf-8")
+            (root / "run-b").mkdir()
+            (root / "run-b" / "results.csv").write_text("epoch\n1\n", encoding="utf-8")
+            (root / "group" / "not-a-run").mkdir()
+            (root / "group" / "not-a-run" / "readme.txt").write_text("x", encoding="utf-8")
+            for skipped in ("ep_0001", "simulation_logs", ".hidden"):
+                (root / skipped).mkdir()
+                (root / skipped / "eval.json").write_text("{}", encoding="utf-8")
+            found = {p.name for p in studio.discover_runs([root])}
+        self.assertEqual(found, {"run-a", "run-b"})
+
+    def test_eval_index_maps_ckpt_parent_and_keeps_standalone(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            run = root / "group" / "run-a"
+            run.mkdir(parents=True)
+            ckpt = run / "ckpt_best.bin"
+            ckpt.write_bytes(b"weights")
+            attached = root / "group" / "eval-1" / "eval.json"
+            attached.parent.mkdir(parents=True)
+            attached.write_text(json.dumps({"ckpt": str(ckpt), "success_rate": 0.5}),
+                                encoding="utf-8")
+            standalone = root / "teacher-eval" / "eval.json"
+            standalone.parent.mkdir()
+            standalone.write_text(json.dumps({"success_rate": 0.9}), encoding="utf-8")
+            index, loose, stale = studio.eval_index([root])
+        self.assertEqual(index[run.resolve()], [attached.resolve()])
+        self.assertEqual(loose, [standalone.resolve()])
+        self.assertEqual(stale, [])
+
+    def test_eval_index_separates_stale_checkpoint(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            run = root / "run-a"
+            run.mkdir()
+            ckpt = run / "ckpt_best.bin"
+            ckpt.write_bytes(b"new weights")
+            good = run / "eval-good" / "eval.json"
+            good.parent.mkdir()
+            good.write_text(json.dumps({
+                "ckpt": str(ckpt),
+                "ckpt_sha256": hashlib.sha256(b"new weights").hexdigest(),
+                "success_rate": 0.5}), encoding="utf-8")
+            stale = run / "eval-old" / "eval.json"
+            stale.parent.mkdir()
+            stale.write_text(json.dumps({
+                "ckpt": str(ckpt),
+                "ckpt_sha256": hashlib.sha256(b"old weights").hexdigest(),
+                "success_rate": 0.9}), encoding="utf-8")
+            # 旧 eval 没有 sha 时不能判定为 stale，保持挂载但显示“未标注”。
+            unlabeled = run / "eval-unlabeled" / "eval.json"
+            unlabeled.parent.mkdir()
+            unlabeled.write_text(json.dumps({
+                "ckpt": str(ckpt), "success_rate": 0.7}), encoding="utf-8")
+            index, loose, stale_paths = studio.eval_index([root])
+        self.assertEqual(set(index[run.resolve()]),
+                         {good.resolve(), unlabeled.resolve()})
+        self.assertEqual(loose, [])
+        self.assertEqual(stale_paths, [stale.resolve()])
+
+    def test_eval_display_fields_do_not_invent_missing_values(self):
+        fields = studio.eval_display_fields({"task": "l1", "dynamics": "x3_v1"})
+        self.assertEqual(fields["task"], "l1")
+        self.assertEqual(fields["dynamics"], "x3_v1")
+        self.assertEqual(fields["criterion"], "未标注")
+        self.assertEqual(fields["window_from"], "未标注")
+        context = studio.eval_rate_context({"success_criterion": "goal_reach_ever"})
+        self.assertIn("requested=未标注", context)
+        self.assertIn("failed=未标注", context)
+        self.assertIn("episodes=—/未标注", context)
+
+    def test_classify_episode_prioritises_success_then_failure_mode(self):
+        self.assertEqual(studio.classify_episode({"success": True, "collision": True}), "成功")
+        # eval 的 false_forward 一定同时 collision=True，必须归为假前进。
+        self.assertEqual(studio.classify_episode({"collision": True, "false_forward": True}), "假前进")
+        self.assertEqual(studio.classify_episode({"collision": True, "stuck": True}), "碰撞")
+        self.assertEqual(studio.classify_episode({"stuck": True, "false_forward": True}), "假前进")
+        self.assertEqual(studio.classify_episode({"stuck": True}), "卡住")
+        # 实测 20 集里 13 集所有 flag 全 false，必须归为“未到达”而不是静默成功。
+        self.assertEqual(studio.classify_episode({"success": False, "collision": False,
+                                                  "stuck": False, "false_forward": False}),
+                         "未到达")
+        self.assertEqual(studio.classify_episode({}), "未到达")
 
 
 if __name__ == "__main__":

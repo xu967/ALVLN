@@ -1,0 +1,100 @@
+{
+  "schema": "uavrgb.delivery.v1",
+  "source_archive": "code_code_only_20261104 (2).zip",
+  "artifact": "UAV_Gazebo_RealAssets_TeacherRL_20261104.zip",
+  "notes": "Historical core preserved; new opt-in asset-campus + experimental teachers. No pre-trained RL weights. No external real mesh downloaded. | synced 2026-11-04: 9 sha256 entries updated to the integrated tree after review fixes (mtllib/build_demo_assets guards, split_manifest task identity + fail-closed, rl_teacher optional deps, doc notes); this file now records the integrated code/ tree, not the original ZIP bytes. All relative_path values are relative to code/.",
+  "changed": [
+    {
+      "relative_path": "uav_rgb/sim/tools/scene_gen.py",
+      "sha256": "c3897e189d50f68ae0a6d9d5f037b170553e22c939d492e21ac5ab7950eff74e"
+    },
+    {
+      "relative_path": "uav_rgb/sim/tools/split_manifest.py",
+      "sha256": "92cc18f487a808bb06de6aa9b8cea4844889596ab1058ffcf4549e6dfe192ff4"
+    },
+    {
+      "relative_path": "uav_rgb/sim/tools/collect.py",
+      "sha256": "83207a39d609d8948a5750ce87e8a44cb3f225d7cce9d870fe9e421075ce3448"
+    },
+    {
+      "relative_path": "uav_rgb/sim/tools/collect_parallel.py",
+      "sha256": "f61eb19d952b2f01ba8204ee6c212d3be2284460a6272a1a6cd1241c311cc375"
+    },
+    {
+      "relative_path": "uav_rgb/sim/tools/eval_closed_loop.py",
+      "sha256": "378e088b1de4093f2941fb96aaeb19d80149555ef5b1eb29fda0843b2a36cf10"
+    },
+    {
+      "relative_path": "uav_rgb/sim/tools/asset_campus.py",
+      "sha256": "de315ae01ba4bff53611bf098bfcd1aa1f05654aa52ad1f8d6df4e988885f28f"
+    },
+    {
+      "relative_path": "uav_rgb/sim/tools/teacher_predictive.py",
+      "sha256": "3eb77cd29da4d64cb74dc22e3ac395d1ffdf92f542184b812a42197046800fd8"
+    },
+    {
+      "relative_path": "uav_rgb/sim/tools/build_demo_assets.py",
+      "sha256": "0825d6062d96035ca35e2699f089986daa33b8dc006e3830a8884490e445bfff"
+    },
+    {
+      "relative_path": "uav_rgb/sim/tools/import_asset.py",
+      "sha256": "bbd72c57f1f00ad8b308e76414dcb8e4dbcfe6a7dd425877d81ed7b9c3b7966f"
+    },
+    {
+      "relative_path": "uav_rgb/sim/tools/register_ground_texture.py",
+      "sha256": "5b7e5794d68f53a77a41c4bbd25a3ae7161ea4948f2297b41c0dafa95b04f704"
+    },
+    {
+      "relative_path": "uav_rgb/sim/tools/test_asset_campus.py",
+      "sha256": "71e1ed24a803b31c14d8c1c3269bd471f0c1435c3f8a961bd3121b5a5b332b35"
+    },
+    {
+      "relative_path": "uav_rgb/teacher/dataset.py",
+      "sha256": "bda033deff7d2472b074db601a76cc09be72ced35349fb8afc7f6b9c952525ce"
+    },
+    {
+      "relative_path": "uav_rgb/teacher/test_dataset_step_gap.py",
+      "sha256": "350e92199a634400ecb962a6aa28a048b9cc0724cf50a6f0cf28b4e9614410c0"
+    },
+    {
+      "relative_path": "uav_rgb/rl_teacher/__init__.py",
+      "sha256": "3c148e77253c670f0e01b0705d34d882be06ed6329305fcc5bbaec16023d34b5"
+    },
+    {
+      "relative_path": "uav_rgb/rl_teacher/core.py",
+      "sha256": "79866b7e619b88087eb5acd8e3c1381dd44bc755a3107c176d69a65d3d1302f0"
+    },
+    {
+      "relative_path": "uav_rgb/rl_teacher/gym_env.py",
+      "sha256": "e196609358bf680634ac310d47209d0e7019ca6a7cb69ebc691c91a6936a226f"
+    },
+    {
+      "relative_path": "uav_rgb/rl_teacher/train_ppo.py",
+      "sha256": "e2e8e30483e533a09e586af56ec1e37a7aefe34e8d29c31c88a8b577b616327a"
+    },
+    {
+      "relative_path": "uav_rgb/rl_teacher/evaluate.py",
+      "sha256": "b3192ef8e9e4cba117555f5a6747fb11062997ba651dadf87e35eff747283863"
+    },
+    {
+      "relative_path": "uav_rgb/rl_teacher/test_core.py",
+      "sha256": "6275f78b4c52c1579ce5e1281e1e336c86def6ad1dea560ff13a6a6d6e8a17d3"
+    },
+    {
+      "relative_path": "uav_rgb/rl_teacher/reward_v1.json",
+      "sha256": "892a20e5457f0d5763ffb9787a69eee45aa9623a428d909f55354e31e544ed0b"
+    },
+    {
+      "relative_path": "uav_rgb/docs/realism_rl_v1/README.md",
+      "sha256": "0ee7a749d76560a19ff0192f95ac3a6439ad828974cb0c49e221926662c6d8ab"
+    },
+    {
+      "relative_path": "uav_rgb/docs/realism_rl_v1/VALIDATION.md",
+      "sha256": "0031e28e058e4ab737570bba114eb4986e59de00a9426bf1c0fe465e57e9d220"
+    },
+    {
+      "relative_path": "uav_rgb/README.md",
+      "sha256": "a6144b7efc386ebf2bf3470da271932bb6ba7a68d1bef2cd8791ea8b5a54ad92"
+    }
+  ]
+}

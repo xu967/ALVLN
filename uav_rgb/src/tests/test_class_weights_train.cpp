@@ -196,6 +196,9 @@ int main() {
   check(read_file(rcfg.out_dir + "/config.json").find("\"class_weights_source\":\"checkpoint\"") !=
             std::string::npos,
         "resume 的 config.json 标记来源 checkpoint");
+  check(read_file(rcfg.out_dir + "/config.resume.json").find("\"class_weights_source\"") !=
+            std::string::npos,
+        "resume 必须另写 config.resume.json");
   // 跨目录 resume 必须把源 run 的历史 best 一并交付，不能只继承分数。
   check(fs::exists(rcfg.out_dir + "/ckpt_best.bin"),
         "跨目录 resume 输出目录必须包含历史 ckpt_best.bin");

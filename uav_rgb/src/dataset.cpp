@@ -50,6 +50,7 @@ struct EpisodeSpan {
   std::string split;
   std::int64_t scene = 0;
   std::string id;  // episode_id 原样（字符串或数字）；旧数据可能缺省
+  std::string gid; // geometry_gid；旧数据没有，空串
 };
 
 // 取标量原值（字符串去引号，数字原样）；缺字段返回空串。用于 episode_id 绑定，
@@ -71,6 +72,12 @@ std::string scalar_field(const std::string& obj, const char* key) {
     ++e;
   }
   return obj.substr(b, e - b);
+}
+
+// 可选标量：缺字段与 JSON null 都返回空串（preprocess 对无 gid 的集写 null）。
+std::string opt_field(const std::string& obj, const char* key) {
+  std::string v = scalar_field(obj, key);
+  return v == "null" ? std::string() : v;
 }
 
 std::string str_field(const std::string& obj, const char* key) {
@@ -122,6 +129,7 @@ std::vector<EpisodeSpan> parse_episodes(const std::string& meta) {
     s.split = str_field(obj, "split");
     s.scene = int_field(obj, "scene_id");
     s.id = scalar_field(obj, "episode_id");
+    s.gid = opt_field(obj, "geometry_gid");
     out.push_back(std::move(s));
     i = e;
   }
@@ -129,13 +137,70 @@ std::vector<EpisodeSpan> parse_episodes(const std::string& meta) {
   return out;
 }
 
-void assign_split(UavrDataset& ds, const std::vector<EpisodeSpan>& eps) {
+// ---- split 事实 ----
+// preprocess 现在落 split_policy/split_scheme/split_salt；旧数据只有 scene_id。
+// 诊断划分默认拒绝，旧数据缺新字段时保持旧行为但打 warning。
+struct SplitMeta {
+  std::string policy;
+  std::string scheme;
+  std::string salt;
+};
+
+bool is_diagnostic_split(const std::string& name) {
+  return name.rfind("map-hash:", 0) == 0 || name.rfind("diag", 0) == 0;
+}
+
+SplitMeta read_split_meta(const std::string& meta, const LoadOptions& opts) {
+  SplitMeta s;
+  s.policy = opt_field(meta, "split_policy");
+  s.scheme = opt_field(meta, "split_scheme");
+  s.salt = opt_field(meta, "split_salt");
+  if (s.policy.empty()) fail("meta 缺 split_policy");
+  if (is_diagnostic_split(s.policy) || is_diagnostic_split(s.scheme)) {
+    if (!opts.allow_diagnostic_split) {
+      fail("诊断性 split（" + (s.scheme.empty() ? s.policy : s.scheme) +
+           "）默认拒绝；确需读取请设 LoadOptions.allow_diagnostic_split");
+    }
+    return s;
+  }
+  if (s.scheme.empty()) {
+    // 旧 .uavr：只有 split_policy=scene_id，没有方案/salt/gid。
+    if (s.policy != "scene_id") {
+      fail("旧 meta 缺 split_scheme 但 split_policy 不是 scene_id: " + s.policy);
+    }
+    std::fprintf(stderr,
+                 "警告: 数据集 meta 缺 split_scheme/split_salt（旧格式），"
+                 "按旧行为只校验 scene_id 隔离\n");
+    return s;
+  }
+  if (s.policy != s.scheme) {
+    fail("split_policy 与 split_scheme 不一致: " + s.policy + " vs " + s.scheme);
+  }
+  if (s.scheme != "scene_id" && s.scheme != "geometry_gid" &&
+      s.scheme != "campus_map_v1" && s.scheme != "campus_assets_map_v1") {
+    fail("未知 split_scheme: " + s.scheme);
+  }
+  return s;
+}
+
+void assign_split(UavrDataset& ds, const std::vector<EpisodeSpan>& eps,
+                  const std::string& scheme) {
   std::vector<bool> assigned(static_cast<std::size_t>(ds.n), false);
   std::map<std::int64_t, std::string> scenes;
+  std::map<std::string, std::string> gids;
+  const bool need_gid = scheme == "geometry_gid";
   for (const EpisodeSpan& e : eps) {
     const auto inserted = scenes.emplace(e.scene, e.split);
     if (!inserted.second && inserted.first->second != e.split) {
       fail("scene_id 跨 split（scene_id=" + std::to_string(e.scene) + "）");
+    }
+    if (e.gid.empty()) {
+      if (need_gid) fail("split_scheme=geometry_gid 但 episode 缺 geometry_gid");
+    } else {
+      const auto gi = gids.emplace(e.gid, e.split);
+      if (!gi.second && gi.first->second != e.split) {
+        fail("geometry_gid 跨 split（gid=" + e.gid + "）");
+      }
     }
     if (static_cast<std::uint64_t>(e.start) + e.count > static_cast<std::uint64_t>(ds.n)) {
       fail("episode 区间越界（sample_start=" + std::to_string(e.start) + ", sample_count=" +
@@ -420,9 +485,12 @@ UavrDataset load_uavr(const std::string& path, const LoadOptions& opts) {
 
   std::string meta(meta_len, '\0');
   read_exact(ds.file, meta_off, meta.data(), meta.size(), "meta 区");
-  if (str_field(meta, "split_policy") != "scene_id") fail("split_policy 必须为 scene_id");
+  const SplitMeta split_meta = read_split_meta(meta, opts);
+  ds.split_policy = split_meta.policy;
+  ds.split_scheme = split_meta.scheme;
+  ds.split_salt = split_meta.salt;
   const std::vector<EpisodeSpan> eps = parse_episodes(meta);
-  assign_split(ds, eps);
+  assign_split(ds, eps, split_meta.scheme);
   if (opts.drop_collision) {
     drop_collision_samples(ds, meta);
   } else {

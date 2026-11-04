@@ -221,6 +221,12 @@ class EpisodeSequenceDataset(Dataset):
             return None
         rows = [r for r in rows if isinstance(r, dict) and r.get("rgb_ok", True)]
         rows.sort(key=lambda r: int(r.get("step") or 0))
+        if any(r.get("step") is None for r in rows):
+            _warn(f"跳过 {ep_dir}: step 缺失，无法核对原始帧编号")
+            return None
+        if len({int(r["step"]) for r in rows}) != len(rows):
+            _warn(f"跳过 {ep_dir}: step 编号重复")
+            return None
         if len(rows) < self.seq_len:
             _warn(f"跳过 {ep_dir}: 有效帧 {len(rows)} < seq_len {self.seq_len}")
             return None
@@ -269,6 +275,8 @@ class EpisodeSequenceDataset(Dataset):
         # 316 步 0 次转向、SR 0）。不受 stride 影响：闭环开头总会经过。
         out = []
         for i in range(self.seq_len - 1):
+            if any(int(rows[j+1]["step"]) != int(rows[j]["step"])+1 for j in range(i)):
+                continue  # 断帧后不能假装是连续历史帧
             idx = [0] * (self.seq_len - i - 1) + list(range(i + 1))
             out.append({
                 "ep_dir": ep_dir,
@@ -280,10 +288,14 @@ class EpisodeSequenceDataset(Dataset):
                 "text": text_arr,
                 "label": labels[i],
                 "episode_id": episode_id,
-                "step": i,
+                # Preserve the SOURCE step ID; filtered arrays may have gaps.
+                "step": int(rows[i]["step"]),
             })
         for end in range(self.seq_len, len(rows) + 1, self.stride):
             lo = end - self.seq_len
+            if any(int(rows[j+1]["step"]) != int(rows[j]["step"])+1
+                   for j in range(lo,end-1)):
+                continue  # 过滤坏帧导致的间隙不可拼接为相邻时序
             out.append({
                 "ep_dir": ep_dir,
                 "rgb_paths": rgb_all[lo:end],
@@ -293,7 +305,7 @@ class EpisodeSequenceDataset(Dataset):
                 "text": text_arr,
                 "label": labels[end - 1],
                 "episode_id": episode_id,
-                "step": end - 1,
+                "step": int(rows[end - 1]["step"]),
             })
         return out
 

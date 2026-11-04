@@ -12,7 +12,8 @@
 
   manifest_validity  每集 validity 三项全 true      训练集必须是逐集跑满的
   instruction_coverage 每集 instruction 非空/无坐标 旧数据无字段 SKIP；部分缺 FAIL
-  time_pairing       每步 depth/pose 与 RGB 的 |gap| > 50 ms 说明观测不同步
+  time_pairing       每步 pose 与 RGB 的 |gap| > 50 ms、depth > 100 ms
+                     说明观测不同步（阈值与 collect.py 对齐；等于阈值算通过）
   window_semantics   每集 manifest.window_from       必须全包唯一；混用
                                                      dispatch/observation 结论不可比
   action_window      动作窗口 sim_dt 的变异系数       > 5% 说明 hold 随 RTF 漂移
@@ -31,7 +32,8 @@
                                                      里有 pose_before；不一致率必须为 0
 
 campus.v1 用校园专用检查替代旧 waypoint_side/GEOM_CONST：地图拓扑组归属、
-scene/manifest/生成器身份、目标区净空与 A* 可达、彩柱视野/遮挡及真实轨迹到达。
+scene/manifest/生成器身份、目标区净空与 A* 可达、彩柱视野/遮挡、真实轨迹到达
+（campus_teacher_reach）与整集无碰撞（campus_no_collision）分开判定。
 可见性为几何分析，不代替 Gazebo 渲染验收；不声称地面圆盘始终在前视相机中。
 
 反事实集（manifest.counterfactual_of 非空）复用原集 RGB/oracle/轨迹，只重写
@@ -75,7 +77,9 @@ GEOM_CONST = {
 
 NAMES = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 SPEED_FWD = 0.3              # 与 collect.py 一致
-MAX_GAP_NS = 50_000_000
+MAX_POSE_GAP_NS = 50_000_000
+# 与 collect.py 的 DEPTH_STALE_NS 一致：那边用 `>` 判超限，等于阈值算通过。
+MAX_DEPTH_GAP_NS = 100_000_000
 MAX_WINDOW_CV = 0.05
 FWD_MIN_V = 0.4 * SPEED_FWD
 MAX_FWD_FAIL_SHARE = 0.01
@@ -170,7 +174,6 @@ def episode_facts(ep_dir):
                 disp = _dist3(orc["pose_gt"], oracle[i - 1]["pose_gt"])
             depth_gap = row.get("depth_rgb_gap_ns")
             pose_gap = row.get("pose_rgb_gap_ns")
-            gap_covered = depth_gap is not None and pose_gap is not None
             steps.append({
                 "action": row["action_executed"],
                 "prev_action": rows[i - 1]["action_executed"] if i else None,
@@ -180,10 +183,9 @@ def episode_facts(ep_dir):
                 "disp_approx": row.get("displacement_m") is None,
                 "dyaw": row.get("dyaw_deg"),
                 # depth 可以晚于 RGB（_pick_depth 按 |Δt| 取最近帧），有符号 gap
-                # 会被恒正的 pose_gap 盖住，必须取绝对值。缺字段记 None，
-                # 不能按 0 算 PASS（A1）。
-                "gap": max(abs(depth_gap), abs(pose_gap)) if gap_covered else None,
-                "gap_covered": gap_covered,
+                # 必须取绝对值。缺字段记 None，不能按 0 算 PASS（A1）。
+                "depth_gap": abs(depth_gap) if depth_gap is not None else None,
+                "pose_gap": abs(pose_gap) if pose_gap is not None else None,
                 "has_pose_before": "pose_before" in row,
                 "pose_before": row.get("pose_before"),
                 "yaw_before": row.get("yaw_before"),
@@ -216,6 +218,7 @@ def episode_facts(ep_dir):
         "geometry_version": man.get("geometry_version"),
         # make_counterfactual.py 写进 manifest 的标记；非空说明标签是重算的。
         "counterfactual_of": man.get("counterfactual_of"),
+        "dynamics_profile": man.get("dynamics_profile"),
         # 动作窗口语义：collect.py 只写进 episode_manifest.json，actions.jsonl 行里没有。
         "window_from": man.get("window_from"),
         "gid": gid,
@@ -250,10 +253,16 @@ def _is_campus(f):
             or f.get("scene_metadata", {}).get("geometry_version") == campus.VERSION)
 
 
-def campus_checks(facts):
-    """校园新任务用自己的地图/目标合同；旧柱阵的外侧绕行规则不适用。"""
+def campus_checks(facts, quarantined=()):
+    """校园新任务用自己的地图/目标合同；旧柱阵的外侧绕行规则不适用。
+
+    quarantined：已隔离整集的目录。到达/碰撞是轨迹属性，隔离集单独记账，
+    不参与这两条的 FAIL 判定。
+    """
+    qdirs = set(quarantined)
     failures = {name: [] for name in ("campus_identity", "campus_map_split",
-                                    "campus_goal_geometry", "campus_teacher_reach")}
+                                    "campus_goal_geometry", "campus_teacher_reach",
+                                    "campus_no_collision")}
     map_splits = {}
     for f in facts:
         scene, man = f.get("scene_metadata", {}), f.get("manifest", {})
@@ -327,30 +336,43 @@ def campus_checks(facts):
             failures["campus_goal_geometry"].append(f"{f['dir']}: {e}")
             if not identity_checked:
                 failures["campus_identity"].append(f"{f['dir']}: 身份未完整核验: {e}")
-        if (f.get("counterfactual_of") is not None
-                or f.get("waypoint_min_dist") is None
-                or f["waypoint_min_dist"] > campus.RADIUS
-                or any(s["collision"] for s in f["steps"])):
-            failures["campus_teacher_reach"].append(f["dir"])
+        if f["dir"] not in qdirs:
+            # 「到过目标区」与「整集无碰撞」是两件事，分开判定，避免到点但蹭到
+            # island 的集把到达语义一起判死。
+            if (f.get("counterfactual_of") is not None
+                    or f.get("waypoint_min_dist") is None
+                    or f["waypoint_min_dist"] > campus.RADIUS):
+                failures["campus_teacher_reach"].append(f["dir"])
+            if any(s["collision"] for s in f["steps"]):
+                failures["campus_no_collision"].append(f["dir"])
     for identity, splits in map_splits.items():
         if len(splits) > 1:
             failures["campus_map_split"].append(f"{identity}: {sorted(splits)}")
-    return [check(name, "FAIL" if bad else "PASS",
-                  f"{len(bad)} 个问题 / {len(facts)} 集；" + {
-                      "campus_identity": "scene、manifest、可复算教师与确定性布局一致",
-                      "campus_map_split": "地图组归属与 split 一致（含排除集）",
-                      "campus_goal_geometry": "净空、A*可达、彩柱水平视野与巡航切片无遮挡",
-                      "campus_teacher_reach": "无碰撞进入 0.5m 目标区；不要求末动作 SAFE",
-                  }[name], samples=bad[:5]) for name, bad in failures.items()]
+    checks = []
+    for name, bad in failures.items():
+        detail = f"{len(bad)} 个问题 / {len(facts)} 集；" + {
+            "campus_identity": "scene、manifest、可复算教师与确定性布局一致",
+            "campus_map_split": "地图组归属与 split 一致（含排除集）",
+            "campus_goal_geometry": "净空、A*可达、彩柱水平视野与巡航切片无遮挡",
+            "campus_teacher_reach": "到过 0.5m 目标区（waypoint_min_dist ≤ goal_radius）",
+            "campus_no_collision": "整集轨迹无 collision",
+        }[name]
+        extra = {}
+        if qdirs and name in ("campus_teacher_reach", "campus_no_collision"):
+            detail += f"；隔离 {len(qdirs)} 集不参与"
+            extra["quarantined"] = len(qdirs)
+        checks.append(check(name, "FAIL" if bad else "PASS", detail,
+                            samples=bad[:5], **extra))
+    return checks
 
 
-def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
+def audit(facts, pre_excluded=(), quarantined=()):
     """把逐集事实折成检查项。status: PASS / FAIL / SKIP。
 
-    pre_safe_collisions：在 --exclude-collision-episodes 排除之前统计到的
-    SAFE+碰撞步数。排除后 audit 看不到它们，必须单独传入，否则硬约束恒 PASS。
     pre_excluded：被排除的整集 facts。版本混包/validity/split 泄漏必须对
     **排除前**的全部集成立，否则排除碰撞集会把这些检查一起洗成 PASS。
+    quarantined：其中被隔离的碰撞集。它们的 SAFE+碰撞步单独记入
+    safe_collision 的 quarantined 计数，不参与 FAIL 判定，也不重复计入审计集。
     """
     ok = [f for f in facts if not f.get("error")]
     bad = [f for f in facts if f.get("error")]
@@ -364,6 +386,9 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
                "动作类检查不适用")
     checks = []
     campus_facts = [f for f in gate if _is_campus(f)]
+    quarantine_dirs = [f["dir"] for f in quarantined if not f.get("error")]
+    q_safe_steps = [s for f in quarantined if not f.get("error")
+                    for s in f["steps"] if s["action"] == 0 and s["collision"]]
 
     if bad:
         checks.append(check("read_episodes", "FAIL",
@@ -406,7 +431,7 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
     l1 = [f for f in gate if isinstance(f.get("instruction"), str)
           and f["instruction"].strip() and not _is_campus(f)]
     if campus_facts:
-        checks.extend(campus_checks(campus_facts))
+        checks.extend(campus_checks(campus_facts, quarantine_dirs))
     if not l1:
         reason = ("campus 使用 campus_identity/goal_geometry/teacher_reach 检查" if campus_facts
                   else "无 instruction（非 L1 数据）")
@@ -540,19 +565,24 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
                     f"{cf_note}", samples=bad[:5]))
 
     # 2) 时间配对（缺 gap 字段的步单列；部分缺失不能让检查按 0 放过）
-    covered = [s["gap"] for s in steps if s["gap"] is not None]
+    covered = [s for s in steps
+               if s["depth_gap"] is not None and s["pose_gap"] is not None]
     uncovered = len(steps) - len(covered)
     if not covered:
         checks.append(check("time_pairing", "SKIP",
                             f"{len(steps)} 步都缺 depth/pose gap 字段，无法核验"))
     else:
-        over = sum(1 for g in covered if g > MAX_GAP_NS)
-        detail = (f"max_gap={max(covered)/1e6:.1f} ms，超 {MAX_GAP_NS/1e6:.0f} ms "
-                  f"的步 {over}/{len(covered)}")
+        over_depth = sum(1 for s in covered if s["depth_gap"] > MAX_DEPTH_GAP_NS)
+        over_pose = sum(1 for s in covered if s["pose_gap"] > MAX_POSE_GAP_NS)
+        detail = (f"max_depth_gap={max(s['depth_gap'] for s in covered)/1e6:.1f} ms，"
+                  f"超 {MAX_DEPTH_GAP_NS/1e6:.0f} ms 的步 {over_depth}/{len(covered)}；"
+                  f"max_pose_gap={max(s['pose_gap'] for s in covered)/1e6:.1f} ms，"
+                  f"超 {MAX_POSE_GAP_NS/1e6:.0f} ms 的步 {over_pose}/{len(covered)}")
         if uncovered:
             detail += f"；{uncovered}/{len(steps)} 步缺 gap 字段，未覆盖"
-        checks.append(check("time_pairing", "FAIL" if (over or uncovered) else "PASS",
-                            detail))
+        checks.append(check(
+            "time_pairing",
+            "FAIL" if (over_depth or over_pose or uncovered) else "PASS", detail))
 
     # 3) 动作窗口稳定
     dts = [s["dt"] for s in steps if s["dt"] > 0]
@@ -570,9 +600,17 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
     #    两群混在一起会得出「13% 动作没生效」的误判。
     approx = "（位移由位姿差近似，窗口错位 ±60 ms）" if any(
         s["disp_approx"] for s in traj_steps) else ""
-    steady = [s for s in traj_steps if s["action"] == 1 and s["prev_action"] == 1
+    # 4/4b 按 x3 定速 SPEED_FWD 判定；cf_stab 是倾角加速+滑行，没有固定速度，不适用。
+    cf_stab = [f for f in norm_ok
+               if str(f.get("dynamics_profile") or "").startswith("cf_stab")]
+    stab_ids = {id(f) for f in cf_stab}
+    fixed_v = [s for f in norm_ok if id(f) not in stab_ids for s in f["steps"]]
+    STAB_SKIP = (f"cf_stab 动力学没有固定前进速度，定速判据不适用（{len(cf_stab)} 集）")
+    steady = [s for s in fixed_v if s["action"] == 1 and s["prev_action"] == 1
               and s["disp"] is not None]
-    if cf_ok and not norm_ok:
+    if cf_stab and not fixed_v:
+        checks.append(check("forward_motion", "SKIP", STAB_SKIP))
+    elif cf_ok and not norm_ok:
         checks.append(check("forward_motion", "SKIP",
                             f"{CF_SKIP}（{len(cf_ok)} 集）"))
     elif not steady:
@@ -586,9 +624,11 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
                             f"{approx}"))
 
     # 4b) 偏航→前进的过渡步几乎不动
-    trans = [s for s in traj_steps if s["action"] == 1 and s["prev_action"] in (2, 3)
+    trans = [s for s in fixed_v if s["action"] == 1 and s["prev_action"] in (2, 3)
              and s["disp"] is not None and s["dt"] > 0]
-    if cf_ok and not norm_ok:
+    if cf_stab and not fixed_v:
+        checks.append(check("transition_lag", "SKIP", STAB_SKIP))
+    elif cf_ok and not norm_ok:
         checks.append(check("transition_lag", "SKIP",
                             f"{CF_SKIP}（{len(cf_ok)} 集）"))
     elif not trans:
@@ -610,7 +650,14 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
     def is_reversal(s):
         return (s["prev_action"], s["action"]) in ((3, 2), (2, 3))
 
-    checked = [s for s in yaw if not is_reversal(s)]
+    # cf_stab：0.15 s 指令延迟 + X3 偏航跟踪滞后，偏航头两步的 0.2 s 窗口里机体还没转起来
+    # （2026-11-04 实测 14/14 个异常步都是头两步）；只核验同向连续第 3 步起。
+    onset = {id(st) for f in cf_stab for i, st in enumerate(f["steps"])
+             if st["action"] in (2, 3) and not (
+                 i >= 2 and f["steps"][i - 1]["action"] == st["action"]
+                 == f["steps"][i - 2]["action"])}
+    checked = [s for s in yaw if not is_reversal(s) and id(s) not in onset]
+    onset_note = f"；cf_stab 偏航起始步 {len(onset)} 个未验" if onset else ""
     if cf_ok and not norm_ok:
         checks.append(check("yaw_direction", "SKIP",
                             f"{CF_SKIP}（{len(cf_ok)} 集）"))
@@ -622,7 +669,7 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
     elif not checked:
         # 「全部是反转步」和「没有 dyaw」是两件事，不能共用同一个误导性文案。
         checks.append(check("yaw_direction", "SKIP",
-                            f"全部 {len(yaw)} 个偏航步都是反向接续步，"
+                            f"全部 {len(yaw)} 个偏航步都是反向接续步或 cf_stab 起始步，"
                             "方向受惯性影响不可测，无法离线核验"))
     else:
         wrong = [s for s in checked
@@ -630,8 +677,8 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
                  or (s["action"] == 3 and s["dyaw"] >= -YAW_MIN_DEG)]
         checks.append(check("yaw_direction", "FAIL" if wrong else "PASS",
                             f"{len(wrong)}/{len(checked)} 个偏航步转向与标签相反或过小"
-                            f"（跳过 {len(yaw) - len(checked)} 个反向接续步；"
-                            f"另有 {len(yaw_all) - len(yaw)} 步 dyaw=null 未验）"))
+                            f"（跳过 {sum(map(is_reversal, yaw))} 个反向接续步；"
+                            f"另有 {len(yaw_all) - len(yaw)} 步 dyaw=null 未验{onset_note}）"))
 
     # 6) 类别分布（附 per-split 计数：T3 要确认 val/test 里 SAFE 有 support）
     if cf_ok and not norm_ok:
@@ -661,19 +708,27 @@ def audit(facts, pre_safe_collisions=0, pre_safe_samples=(), pre_excluded=()):
                             distribution=dist, per_split=per_split))
 
     # 6b) SAFE 步必须无碰撞：碰撞步的「停」标签不可信（T2 硬约束）。
-    # 已排除的碰撞集也要计入，否则 --exclude-collision-episodes 会把这条检查洗成 PASS。
+    # 审计集里的命中才判 FAIL；已隔离（quarantine）的集单独记账，不重复计入。
     safe_hits = [s for s in steps if s["action"] == 0 and s["collision"]]
     safe_total = sum(1 for s in steps if s["action"] == 0)
-    if safe_hits or pre_safe_collisions:
+    q_note = (f"；隔离集 {len(q_safe_steps)} 步单独记账，不参与判定"
+              if q_safe_steps else "")
+    q_extra = {"quarantined": {"episodes": len(quarantine_dirs),
+                               "safe_collision_steps": len(q_safe_steps)}}
+    if safe_hits:
         checks.append(check("safe_collision", "FAIL",
                             f"审计集 {len(safe_hits)}/{safe_total} 个 SAFE 步带 collision；"
-                            f"另有已排除集 {pre_safe_collisions} 步；应为 0",
-                            samples=list(pre_safe_samples)[:5]))
+                            f"应为 0{q_note}",
+                            samples=[f["dir"] for f in ok
+                                     if any(s["action"] == 0 and s["collision"]
+                                            for s in f["steps"])][:5],
+                            **q_extra))
     elif safe_total == 0:
-        checks.append(check("safe_collision", "SKIP", "审计集没有 SAFE 步，无法核验"))
+        checks.append(check("safe_collision", "SKIP", "审计集没有 SAFE 步，无法核验",
+                            **q_extra))
     else:
         checks.append(check("safe_collision", "PASS",
-                            f"0/{safe_total} 个 SAFE 步带 collision"))
+                            f"0/{safe_total} 个 SAFE 步带 collision{q_note}", **q_extra))
 
     # 6c) 几何版本一致性：v2/v3 混包时 gid 交集查不出来。
     #     必须含被排除的集，否则「排除碰撞集」会把旧版本集一起洗掉。
@@ -918,12 +973,6 @@ def main(argv=None):
         p.error(f"{args.dataset} 下没有 episode_manifest.json")
 
     facts = [episode_facts(e) for e in eps]
-    # 排除前先统计 SAFE+碰撞：排除后 audit 看不到这些步，硬约束会恒 PASS。
-    pre_safe_collisions = sum(
-        1 for f in facts if not f.get("error")
-        for s in f["steps"] if s["action"] == 0 and s["collision"])
-    pre_safe_samples = [f["dir"] for f in facts if not f.get("error") and any(
-        s["action"] == 0 and s["collision"] for s in f["steps"])]
     excluded = []
     excluded_facts = []
     if args.exclude_collision_episodes:
@@ -935,7 +984,9 @@ def main(argv=None):
             else:
                 kept.append(f)
         facts = kept
-    checks = audit(facts, pre_safe_collisions, pre_safe_samples, excluded_facts)
+    # 隔离集单独传给 quarantined，只记账、不参与 FAIL；同时仍作为 pre_excluded
+    # 参与版本/validity/几何隔离等必须对排除前全集成立的检查。
+    checks = audit(facts, pre_excluded=excluded_facts, quarantined=excluded_facts)
     failed = [c for c in checks if c["status"] == "FAIL"]
 
     result = {

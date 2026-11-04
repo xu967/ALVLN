@@ -224,11 +224,48 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
 - **终止条件补充**：L1 v2 的 teacher 采集在连续 3 步 `SAFE_NEUTRAL` 后提前结束。
   （v4 起 safe 出生模式已删除，`safe_full_length` 闸门随之移除。）
 
+### 5.2 SIM-09 指标合同（`metric_version="sim09.v1"`，2026-11-04）
+
+旧 `success` / `stop_success` 的定义和数值**逐位不变**；下表字段是另写的诊断口径，
+不得覆盖或重命名旧字段。per-episode 与 `eval.json` 顶层都写 `metric_version`。
+
+| 字段 | 定义 | 分母 |
+| --- | --- | --- |
+| `reach_ever` | 无 contact 且 `waypoint_min_dist ≤ goal_radius_reach`（1.5 m） | 每集 |
+| `final_in_radius` | 无 contact 且 `final_waypoint_dist ≤ goal_radius_stop` | 每集 |
+| `stop_action_issued` | 最近 waypoint 点**前后各 2 步**内出现过 `SAFE_NEUTRAL`；不只看末步 | 每集 |
+| `collision_free` / `stuck_free` | 无 contact / 无 stuck | 每集 |
+| `task_success` | `reach_ever` + `final_in_radius` + `stop_action_issued` + `collision_free` + 未超时 | 每集 |
+| `stable_termination` | 固定 `None`（未知）。没有可靠速度/姿态窗口数据时不得声称通过 | — |
+
+- **半径**：L1 训练目标是 0.5 m 停、评测按 1.5 m 到达。`goal_radius_reach` 固定 1.5 m；
+  `goal_radius_stop` 取 scene/meta 的 `stop_radius`（L1 为 0.5 m，campus 为 0.5 m）。
+  `eval.json` 同时写 `goal_radius_reach` / `goal_radius_stop`，旧的 `goal_radius` 保留。
+- **汇总分母**：`success_rate` 等旧率 = `episodes_done`；`requested_success_rate` =
+  `episodes_requested`（固定请求集，skipped/failed 都算非成功）；`completion_rate` =
+  实际尝试数（done+failed，**skipped 不进分母**）；`execution_rate` = `episodes_done` /
+  `episodes_requested`（skipped 表现为未执行）。`failed_count` 与 `skipped_count` 分开。
+  `requested_seeds` 只含实际尝试过的 seed；扫描范围与尝试清单另存
+  `scanned_seeds` / `attempted_seeds`。`unique_gids` 是完成集的独立几何数。
+- **Wilson 95%**：`wilson_ci.success` 用完成集分母，`wilson_ci.requested` 用请求集分母。
+- **false_forward / stuck**：`false_forward` 只算 contact 碰撞且动作 `FORWARD_SLOW`；
+  `stuck` 不算 collision，两者在 per-episode 与汇总里分开。
+- **协议绑定**：`--protocol <json>` 可比对 `window_from/hold_s/steps/task/
+  appearance_version/dynamics/camera_profile`。不一致时 `eval.json` 写 `ood=true`、
+  `protocol_mismatches` 并打印警告；`--strict-protocol` 直接失败。默认不失败，
+  保证旧 run 可复现。示例：`{"window_from":"observation","hold_s":0.2,"steps":80,
+  "task":"l1","appearance_version":"v1","dynamics":"cf_sil",
+  "camera_profile":"rgb320x240_fov60_v1"}`；未知键（如 `protocol_id`）忽略。
+- **动力学档**：`--dynamics` 接受 `x3_velocity` / `cf_stab` / `cf_sil`；
+  `cf_sil` 的控制器由 collect 实现，eval 只透传并记录，未实现前不得当作已验证档。
+- **报告规则**：`task_success` / `reach_ever` 与旧 `success` 不可混报；
+  没有速度证据时 `stable_termination` 只能报未知。
+
 ## 6. 下一步（按优先级）
 
 1. 补 `d_min`（A\* 最短自由路径）→ 才能算 PO / MP / AGV（SR 已实现）。
-2. `SimulatorEval` 已在 `eval_closed_loop.py` 落地；后续补终止原因落盘和
-   `failed`/`skipped` 的完整对账。
+2. `SimulatorEval` 已在 `eval_closed_loop.py` 落地；`failed`/`skipped` 已分开计数
+   （2026-11-04），新指标合同见 §5.2。
 3. 处理时间 p50/p95 —— 板端（LicheePi）未定，先报本机 GPU 的数，注明不是板端。
 4. 修 §5 的 1 与 2，否则闭环指标本身不可信。
 

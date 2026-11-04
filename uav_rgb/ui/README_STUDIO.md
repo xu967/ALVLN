@@ -50,11 +50,11 @@ $DATA_ROOT/uav_rgb/studio_runs/<timestamp>-<run-id>/
 
 ## 三视角仿真
 
-「仿真 Simulation」页面提供三个同步的 Gazebo 渲染视角，并额外提供一张二维轨迹分析地图：
+「仿真 Simulation」页面提供三路独立的 Gazebo 渲染相机流（各自有更新率和 header stamp，**不是同步采样的同一时刻**），并额外提供一张二维轨迹分析地图：
 
-1. **第三人称跟随视角**：订阅 `/uav/chase_camera`。这是新增的虚拟追踪相机，挂在 X3 的 `base_link` 后上方（相对位姿约 `(-2.5, 0, 1.2 m)`），随无人机运动；不参与学生模型输入。
-2. **第一人称 RGB**：订阅原有 `/uav/camera`，320×240 RGB，仍是学生策略的真实视觉输入。
-3. **真实顶视相机**：订阅 `/uav/top_camera`。这是固定在世界坐标 `(3.5, 0, 18 m)` 上方的 Gazebo camera sensor，输出 480×360 渲染图像；当前 base/campus 场景覆盖范围适用。更大地图需要调整 SDF 中的相机高度、中心点或 FOV；它只用于观察整个场景，不参与学生模型输入。
+1. **第三人称跟随视角**：订阅 `/uav/chase_camera`。这是新增的虚拟追踪相机，刚体固定在 X3 的 `base_link` 后上方（相对位姿 `(-2.5, 0, 1.2 m)`），随无人机运动和姿态一起倾斜，不是稳定云台；不参与学生模型输入。
+2. **第一人称 RGB**：订阅原有 `/uav/camera`，原始输出 320×240 RGB；学生模型实际输入为预处理后的 160×120。
+3. **真实顶视相机**：订阅 `/uav/top_camera`。这是固定在世界坐标 `(2.5, 0, 6 m)` 的 Gazebo camera sensor，输出 480×360 渲染图像；80° HFOV 在 z=0 地面覆盖约 10.1×7.6 m。更大地图需要调整 SDF 中的相机高度、中心点或 FOV；它只用于观察整个场景，不参与学生模型输入。
 4. **二维轨迹分析地图（补充）**：订阅 `/model/x3/pose`，并从当前 SDF 的 collision 几何提取障碍物俯视轮廓，绘制无人机航迹、朝向和可用的 waypoint。
 
 操作：
@@ -65,7 +65,7 @@ $DATA_ROOT/uav_rgb/studio_runs/<timestamp>-<run-id>/
 - 旧的 world SDF 不包含新增 chase/top cameras。需要用更新后的 `sim/worlds/uav_rgb.sdf` 重新生成/启动场景，`/uav/chase_camera` 和 `/uav/top_camera` 才会出现；Studio 启动 Gazebo 时会把 `sim/worlds` 加入 `GZ_SIM_RESOURCE_PATH`；
 - 如果连接的是外部已运行的 Gazebo，Studio 无法从 Transport 反查其磁盘 world 文件，因此用户需要确保当前仿真确实由所选 SDF 启动。
 
-第三人称画面是随无人机刚体运动的虚拟 chase sensor，不是额外的物理无人机。真实顶视相机是固定在世界坐标中的静态 Gazebo sensor；二维地图则是基于碰撞几何的辅助投影。三路 RGB 都来自 Gazebo 实时渲染，不使用预录视频。
+第三人称画面是刚体固定在 `base_link`、随姿态倾斜的 chase sensor，不是额外的物理无人机，也不是云台稳定画面。真实顶视相机是固定在世界坐标中的静态 Gazebo sensor；二维地图则是基于碰撞几何的辅助投影。三路 RGB 来自 Gazebo 的三路独立渲染流，不是同步帧，也不使用预录视频。
 
 ### 学生策略实时演示
 
@@ -75,7 +75,7 @@ $DATA_ROOT/uav_rgb/studio_runs/<timestamp>-<run-id>/
 
 ### 正式闭环评测
 
-「实验 Experiments」页可以启动 `sim/tools/eval_closed_loop.py`，默认评测 best checkpoint，使用独立 headless Gazebo 分区，结果写入该 run 下的 `closed_loop_eval_<timestamp>/eval.json`。完成后会把 SR、碰撞率、stuck、false-forward、episode 数和 unique geometry 追加到 `studio_summary.json` 与 `experiment_report.md`。
+「实验 Experiments」页可以启动 `sim/tools/eval_closed_loop.py`，默认评测 best checkpoint，使用独立 headless Gazebo 分区，结果写入该 run 下的 `closed_loop_eval_<timestamp>/eval.json`。完成后会把 success rate、`success_criterion`、`requested_success_rate`、`completion_rate`、`failed_count`、碰撞率、stuck、false-forward、episode 数和 unique geometry 追加到 `studio_summary.json` 与 `experiment_report.md`。主卡显示的是**该判据下的成功率**，不同 `task`/`success_criterion` 之间不可直接比较。
 
 评测 Task 必须与训练任务/数据协议匹配；不要为了得到更高 SR 随意切换 task、split、window 语义或 appearance。闭环评测可能持续较长时间并占用 GPU。
 

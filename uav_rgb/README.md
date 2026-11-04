@@ -74,7 +74,7 @@ bash ui/install_desktop_entry.sh
 
 它会打开原生 Tkinter `UAV Navigation Studio`，不是网页 DEMO。支持真实 C++/CUDA 训练启动与监控、训练/测试指标曲线、原始日志、实验自动归档、Gazebo 三个实时渲染视角（第三人称 chase、原始第一人称 RGB、固定顶视相机）及辅助二维轨迹地图、当前仿真学生策略演示和独立闭环评测。详细说明见 [`ui/README_STUDIO.md`](ui/README_STUDIO.md)。
 
-**三视角说明**：模板 SDF 新增 `/uav/chase_camera` 虚拟追踪相机；原 `/uav/camera` 保持学生唯一 RGB 输入；顶视图从 `/model/x3/pose` 与 SDF 碰撞几何绘制。旧 world 文件需要按新模板重新生成，才包含 chase camera。
+**三视角说明**：模板 SDF 新增 `/uav/chase_camera` 虚拟追踪相机；原 `/uav/camera` 保持学生唯一 RGB 输入（原始 320×240，模型输入 160×120）；`/uav/top_camera` 是固定在世界坐标 `(2.5, 0, 6 m)` 的渲染顶视，80° HFOV 在地面覆盖约 10.1×7.6 m。三路是独立相机流，不是同步帧；二维轨迹地图另由 `/model/x3/pose` 与 SDF 碰撞几何绘制。旧 world 文件需要按新模板重新生成，才包含 chase/top cameras。
 
 ## 能力边界
 
@@ -93,3 +93,11 @@ bash ui/install_desktop_entry.sh
 
 本轮原始采集、stdout、环境 JSON、SHA256、训练和恢复产物位于
 `/root/rivermind-data/uav_rgb/review-sim-20261029-115357/`。
+
+## 2026-11-04 可选实验路线：写实 Gazebo + T1/T2 Teacher
+
+详见 [`docs/realism_rl_v1/README.md`](docs/realism_rl_v1/README.md)。
+新增 `campus_assets`、`--teacher-planner predictive`、可选 PPO Teacher 训练及测试。
+旧默认场景与旧 Teacher 不受影响；PPO 无附带已训练 checkpoint。
+本路线未运行 Gazebo 闭环/真机验证、未训练 PPO；上文 25/25 CTest 与 EGL 渲染结论属历史基线，
+不适用于新实验路线，也不能据离线单测宣称导航性能提升。
