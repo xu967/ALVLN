@@ -210,3 +210,15 @@
 - 未重采/重训正式数据；旧 SR 与新 metric_version 不可混报。
 - checkpoint v5 旧二进制不兼容；`src/dataset.cpp`/`src/trainer.cpp` 超过
   280 行文件约束，需后续拆分。
+
+### Pilot 运行（2026-11-04 22:15，数据盘）
+
+- 输出根：`$DATA_ROOT/uav_rgb/cf_sil-pilot-20261104/`
+- `collect/`：8/8 episodes、64/64 steps；train 6 / val 1 / test 1；
+  4 实例端到端 38.3 s，cf_sil 起飞 2.13 m。
+- `ds/dataset.uavr`：64 samples；split policy=geometry_gid，train 48/val 8/test 8。
+- `run/`：2 epochs、96 samples、1.9 s；ckpt v5 + config + test_eval.jsonl。
+  test acc 0.875 仅链路验证，不是研究结论（SAFE_NEUTRAL 训练样本为 0）。
+- `eval/`：student + cf_sil，1 集/8 步，SR 0；输出 eval.json 与
+  `videos/seed_1.mp4`（91 帧 1280×720），证明 eval+录像链路。
+- 日志：`collect.log`、`preprocess.log`、`train.log`、`eval.log`。
