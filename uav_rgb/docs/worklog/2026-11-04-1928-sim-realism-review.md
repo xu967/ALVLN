@@ -173,3 +173,40 @@
 - 真机质量、惯量、桨/电机、推力曲线、控制延迟均未实测；`cf_stab` 参数是占位值。
 - 真实资产许可/可得性、gz-sim8 对 normal/roughness map 支持有限。
 - 旧数据/旧 checkpoint/旧 SR 不可与新协议混报。
+
+## 实施记录（同日 21:xx，Phase 2）
+
+用户拍板：四项全做；真机路线选 C（先只做仿真研究）；有完整参数/日志待放入
+`$DATA_ROOT/uav_rgb/real-drone/`；允许清盘、重采/重训、改代码和推送 GitHub。
+
+已完成并验证：
+
+- 代码提交（uav_rgb）：
+  - `c0f77c2` eval/UI：sim09 指标、false-forward、视频 contact/stuck、STALE。
+  - `5884789` sim：cf_sil 骨架、默认 v1 外观、可移植资产。
+  - `03ee62e` data：split 可审计、冻结重打包、诊断 split 门禁。
+  - `4314961` trainer：checkpoint v5、严格 resume、蒸馏来源、视频回归。
+  - `6241c3f` docs：审计/交付文档。
+- 测试：
+  - `bash tools/check.sh` 全量 PASS；CTest 25/25；Python 全套 PASS。
+  - `cf_sil` 真实 Gazebo 冒烟：起飞 z=2.13 m，3/3 步采集成功；
+    `/tmp/cf_sil_smoke3`。
+  - `cf_sil` eval + 录像冒烟：`/tmp/cf_sil_eval/videos/seed_1.mp4`。
+  - `teacher/train.py --record-video` 命令回归通过；
+    真实 teacher-nn 1 集视频保存到
+    `$DATA_ROOT/uav_rgb/teacher-video-check-20261104/videos/seed_1.mp4`
+    （该集 1 步 stuck，只证明保存链路，不是质量 demo）。
+- 关键修复：cf_sil 需要从 world 删除 `MulticopterVelocityControl`，否则其
+  Actuators component 会覆盖 transport 电机指令；vm 无 gz 时用
+  `/usr/bin/python3` helper 发布。
+- GitHub：`ALVLN` 镜像提交 `5a673d5` 已 push；`origin/main` 一致。
+
+未完成/待用户：
+
+- 真机 `.ulg` 与 BOM 尚未放入 `real-drone/`，cf_sil 仍 `calibrated=false`，
+  固件 PID 直接搬到 250 Hz 未在 Gazebo 调参。
+- 真实 CC0 资产未下载；磁盘盘点完成但未删除，数据盘 88G 可用、根分区约
+  659M；是否删 730M 安全项/3.5G pubdata/977M cudnn9 需用户确认。
+- 未重采/重训正式数据；旧 SR 与新 metric_version 不可混报。
+- checkpoint v5 旧二进制不兼容；`src/dataset.cpp`/`src/trainer.cpp` 超过
+  280 行文件约束，需后续拆分。
