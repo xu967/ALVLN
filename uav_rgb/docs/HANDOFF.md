@@ -2,6 +2,9 @@
 
 ## 当前状态（2026-11-04，本节优先于下方历史交接）
 
+- **2026-11-05 新增 3DGS 在线仿真/默认视频/UART 骨架**，入口见
+  [`HANDOFF_3DGS_20261105.md`](HANDOFF_3DGS_20261105.md)。本节下方仍是
+  Gazebo 主线的历史状态，3DGS 与真机边界以新文档为准。
 - 默认仿真已由固定 `:20` 软件 GL 改为 NVIDIA EGL 无界面渲染，真实日志确认 RTX 2080 Ti；
   `UAVRGB_RENDER_BACKEND=software` 保留旧显示路径。每集新增 `performance`，
   [GPU 仿真实验](experiments/2026-11-03-gpu-rendering.md) 记录对照和边界。
