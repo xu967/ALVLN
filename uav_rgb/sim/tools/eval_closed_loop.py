@@ -52,6 +52,12 @@ METRIC_VERSION = "sim09.v1"
 COAST_WINDOW_S = {"cf_sitl": 1.0}
 # stable_termination：末步真值速度 < 0.05 m/s（只有 oracle 带 speed_mps 的档能算，其余 None）。
 STABLE_SPEED_MPS = 0.05
+# SPL（Anderson 2018）的 l_i = 教师 A*（teacher.astar_path）参考路径长。base 任务的目标是验收线
+# x=goal_x 上的任意点，A* 只认点目标，所以沿 y 每 SPL_GOAL_Y_STEP 取一个候选终点取最短
+# （0.2 m：30 个候选 0.85 s/集；0.1 m 只少算 <1 cm）。只在整张障碍图就是 pillars 的任务上算，
+# campus 的建筑不在 pillars 里，算出来会错，留 None。
+SPL_GOAL_Y_STEP = 0.2
+SPL_TASKS = ("base", "l1", "forest_e1")
 # scene_gen/campus/asset_campus 目前都写死这个相机档；协议比对只用它做本次运行的实际值。
 CAMERA_PROFILE = "rgb320x240_fov60_v1"
 PROTOCOL_KEYS = ("window_from", "hold_s", "steps", "task",
@@ -63,6 +69,7 @@ import instruction as ins  # noqa: E402
 import split_manifest as sm  # noqa: E402
 import campus  # noqa: E402
 import asset_campus  # noqa: E402
+import teacher  # noqa: E402
 
 # 与 collect_parallel 共用同一份默认矩阵（cf_sil 已退出；cf_blackbox 只留名字）。
 DYNAMICS_PROFILES = cp.DYNAMICS_CHOICES
@@ -237,9 +244,158 @@ def coast_false_forward(actions, window_s):
     return False
 
 
+def trajectory_xy(oracle):
+    """oracle 里带 x/y 的 pose_gt 序列 -> [(x, y), ...]。p_i 与 l_i 的起点都取它的首点。"""
+    return [(float(o["pose_gt"]["x"]), float(o["pose_gt"]["y"])) for o in oracle
+            if isinstance(o, dict) and isinstance(o.get("pose_gt"), dict)
+            and "x" in o["pose_gt"] and "y" in o["pose_gt"]]
+
+
+def path_length_m(points):
+    """折线长（xy 平面；z 固定高度飞行，不计起飞段）。少于 2 点为 0。"""
+    return sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(points, points[1:]))
+
+
+def shortcut_path(path, segment_free):
+    """视线抽捷径（string pulling）：从当前点起，沿路径往后看，直线段不穿障碍就继续往后，到第一段穿障碍为止跳过去。
+
+    8 邻接栅格 A* 只有 0°/45° 两种走向，阶梯路径比欧氏最短路最长多 8%（octile/欧氏）；不抽的话多数成功集
+    p_i < l_i，SPL 全被 max(p_i, l_i) 截成 1，列就白加了。抽完仍只走原路径经过的自由区，不会穿墙。
+    """
+    if len(path) < 3:
+        return list(path)
+    out, i = [path[0]], 0
+    while i < len(path) - 1:
+        j = i + 1
+        while j + 1 < len(path) and segment_free(path[i], path[j + 1]):
+            j += 1
+        out.append(path[j])
+        i = j
+    return out
+
+
+def _pillar_segment_free(pillars, clearance, sample_m=0.05):
+    """线段 p->q 每 sample_m 采一点，全部离柱表面 >= clearance 才算通（与 A* 栅格同一个 _point_blocked）。"""
+    def free(p, q):
+        n = max(2, int(math.ceil(math.hypot(q[0] - p[0], q[1] - p[1]) / sample_m)) + 1)
+        for k in range(n):
+            t = k / (n - 1)
+            if teacher._point_blocked(p[0] + t * (q[0] - p[0]), p[1] + t * (q[1] - p[1]), pillars, clearance):
+                return False
+        return True
+    return free
+
+
+def teacher_shortest_path_m(pillars, start, goal_x=None, waypoint=None, clearance=None,
+                            step=0.1, goal_y_step=SPL_GOAL_Y_STEP, radius=None):
+    """SPL 的 l_i：教师 A*（teacher.astar_path，柱方框膨胀 clearance）从 start 到目标的路径，抽捷径后的长度；无路返回 None。
+
+    waypoint 任务（l1）目标是 waypoint 点，radius 给了就把路径截到进入半径那一点（与 p_i 同口径，
+    见 truncate_at_goal）；base/forest 目标是验收线 x=goal_x 上的任意点，对 y 每 goal_y_step 取候选终点、
+    取栅格路径最短的那条再抽捷径（A* 边界与 astar_path 内部同一算式）。
+    这不是几何最短路：膨胀用的是教师规划余量（E1 base 0.40 m，机身半宽只有 0.10 m），所以 l_i 是
+    「教师参考路径」；学生贴柱抄近路时 p_i < l_i 仍可能出现，SPL 公式的 max(p_i, l_i) 把它截成 S_i。
+    """
+    if not pillars:
+        return None
+    if clearance is None:
+        clearance = teacher.ASTAR_CLEARANCE_M
+    if waypoint is not None:
+        goals = [(float(waypoint["x"]), float(waypoint["y"]))]
+    else:
+        if goal_x is None:
+            return None
+        y1 = max(2.8, max(abs(float(p["y"])) for p in pillars) + 1.5)
+        n = int((2.0 * y1) / goal_y_step)
+        goals = [(float(goal_x), -y1 + goal_y_step * (k + 1)) for k in range(n)
+                 if -y1 + goal_y_step * (k + 1) < y1 - goal_y_step / 2]
+    best = None
+    for goal in goals:
+        path = teacher.astar_path(pillars, start, goal, clearance=clearance, step=step)
+        if path is None:
+            continue
+        if best is None or path_length_m(path) < path_length_m(best):
+            best = path
+    if best is None:
+        return None
+    pulled = shortcut_path(best, _pillar_segment_free(pillars, clearance))
+    if waypoint is not None and radius is not None:
+        pulled = truncate_at_goal(pulled, waypoint=waypoint, radius=radius)
+    return path_length_m(pulled)
+
+
+def _crossing_t(a, b, goal_x=None, waypoint=None, radius=None):
+    """线段 a->b 上第一次进入目标区的参数 t∈[0,1]；整段都在区外返回 None（a 已在区内返回 0）。
+
+    目标区：waypoint 任务 = 以 waypoint 为心、radius 为半径的圆盘；验收线任务 = 半平面 x >= goal_x。
+    """
+    if isinstance(waypoint, dict) and radius is not None:
+        cx, cy, r = float(waypoint["x"]), float(waypoint["y"]), float(radius)
+        fx, fy = a[0] - cx, a[1] - cy
+        if math.hypot(fx, fy) <= r:
+            return 0.0
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        qa, qb, qc = dx * dx + dy * dy, 2.0 * (fx * dx + fy * dy), fx * fx + fy * fy - r * r
+        if qa <= 0.0:
+            return None
+        disc = qb * qb - 4.0 * qa * qc
+        if disc < 0.0:
+            return None
+        t = (-qb - math.sqrt(disc)) / (2.0 * qa)      # 较小根 = 进入圆的那一点
+        return t if 0.0 <= t <= 1.0 else None
+    if goal_x is None:
+        return None
+    gx = float(goal_x)
+    if a[0] >= gx:
+        return 0.0
+    if b[0] < gx or b[0] == a[0]:
+        return None
+    return (gx - a[0]) / (b[0] - a[0])
+
+
+def truncate_at_goal(points, goal_x=None, waypoint=None, radius=None):
+    """折线截到**第一次进入目标区**的那个点（线性插值到边界）；从未进入则原样返回。
+
+    p_i 与 l_i 都用它截：两边都量到「目标区边界」，否则 waypoint 任务里 p_i 在半径 r 处就停、
+    l_i 却量到圆心，p_i 系统性短 r，SPL 全被 max(p_i, l_i) 截成 1（3DGS r=2.0 m 对 11 m 路线差 18%）。
+    """
+    if len(points) < 2:
+        return list(points)
+    for i, (a, b) in enumerate(zip(points, points[1:])):
+        t = _crossing_t(a, b, goal_x, waypoint, radius)
+        if t is not None:
+            out = list(points[:i + 1])
+            if t > 0.0:
+                out.append((a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])))
+            return out
+    return list(points)
+
+
+def goal_path_length_m(traj, goal_x=None, waypoint=None, radius=None):
+    """SPL 的 p_i：轨迹从首点到**第一次进入目标区**（插值到边界）的折线长；从未到达则整条轨迹长。
+
+    到达条件和 success 同一口径：waypoint 任务 = 到 waypoint 的欧氏距离 <= radius；
+    验收线任务（base/forest）= x >= goal_x。截断的原因：harness 到线不停（base 没有 goal-stop，
+    SAFE 在 E1 上是滑行），整条轨迹会把过线后继续飞的那段也算进分母，教师走直线也只剩 0.7。
+    """
+    if not traj:
+        return None
+    return path_length_m(truncate_at_goal(traj, goal_x, waypoint, radius))
+
+
+def spl_of(success, path_m, shortest_m):
+    """单集 SPL：S_i · l_i / max(p_i, l_i)；缺任一长度为 None。两长度都为 0 时退化成 S_i。"""
+    if path_m is None or shortest_m is None:
+        return None
+    denom = max(float(path_m), float(shortest_m))
+    if denom <= 0.0:
+        return float(bool(success))
+    return float(bool(success)) * float(shortest_m) / denom
+
+
 def summarize_episode(actions, oracle, goal_x, waypoint=None,
                       waypoint_radius=WAYPOINT_RADIUS, stop_radius=None, goal_radius=None,
-                      timed_out=False, coast_window_s=None):
+                      timed_out=False, coast_window_s=None, shortest_path_m=None):
     """单集指标；纯函数，便于单测。actions/oracle 是 jsonl 行。
 
     EVAL_STANDARD §5.1：stuck（FORWARD 位移 < 阈值）不是碰撞，碰撞率只看 contact。
@@ -267,6 +423,9 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
         否则 None（不知道，不等于通过）。
     coast_window_s（cf_sitl）：false_forward 改为「碰撞前该窗口内下过 FORWARD」，
     metric_version 加后缀 .coast<N>s。
+    shortest_path_m（2026-11-07 起，只加不改）：调用方算好的 l_i（teacher_shortest_path_m /
+    3DGS planner.route_check）；写 path_length_m（oracle xy 折线，截到首次到达，见 goal_path_length_m）、
+    shortest_path_m、spl = success · l_i / max(p_i, l_i)。没给 l_i 时 spl 为 None，旧字段逐位不变。
     """
     goal_radius_stop = float(stop_radius) if stop_radius is not None else None
     metric_version = (METRIC_VERSION if coast_window_s is None
@@ -282,7 +441,8 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
                 "stable_termination": None, "timed_out": bool(timed_out),
                 "metric_version": metric_version,
                 "goal_radius_reach": REACH_RADIUS,
-                "goal_radius_stop": goal_radius_stop}
+                "goal_radius_stop": goal_radius_stop,
+                "path_length_m": None, "shortest_path_m": shortest_path_m, "spl": None}
     collision = any(bool(a.get("collision")) and _src(a) != "stuck" for a in actions)
     stuck = any(bool(a.get("collision")) and "stuck" in _src(a) for a in actions)
     if coast_window_s is None:
@@ -340,6 +500,11 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
                            and wp_final <= goal_radius_stop)
     task_success = bool(reach_ever and final_in_radius and stop_action_issued
                         and collision_free and not timed_out)
+    # p_i 截到第一次到达（与 success 同口径）：waypoint 任务用 success 用的那个 radius，验收线任务用 goal_x。
+    p_i = goal_path_length_m(trajectory_xy(oracle), goal_x=goal_x,
+                             waypoint=waypoint if stop_radius is not None else None,
+                             radius=(REACH_RADIUS if goal_radius is None else goal_radius)
+                             if stop_radius is not None else None)
     infer = [float(a["infer_ms"]) for a in actions if a.get("infer_ms") is not None]
     return {"steps": len(actions), "collision": collision, "stuck": stuck,
             "false_forward": false_forward, "success": success,
@@ -354,7 +519,10 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
             "stable_termination": stable_termination, "timed_out": bool(timed_out),
             "metric_version": metric_version,
             "goal_radius_reach": REACH_RADIUS,
-            "goal_radius_stop": goal_radius_stop}
+            "goal_radius_stop": goal_radius_stop,
+            # SPL 三件：p_i（oracle xy 折线，截到首次到达）、l_i（调用方给的教师参考路长）、S_i·l_i/max(p_i,l_i)。
+            "path_length_m": p_i, "shortest_path_m": shortest_path_m,
+            "spl": spl_of(success, p_i, shortest_path_m)}
 
 
 def aggregate(episodes, requested=None, attempted=None, failed_count=0, skipped_count=0):
@@ -381,9 +549,15 @@ def aggregate(episodes, requested=None, attempted=None, failed_count=0, skipped_
         return (sum(1 for e in done if e.get(key)) / n) if n else None
 
     successes = sum(1 for e in done if e.get("success"))
+    # SPL 只在算出 l_i 的集上平均（A* 无路 / 旧 eval.json 没有该字段的集不进分母，spl_n 单列）；
+    # requested_spl 与 requested_success_rate 同口径：失败/跳过集记 0，只有全部完成集都有 spl 时才给。
+    spls = [float(e["spl"]) for e in done if e.get("spl") is not None]
     return {
         "episodes_done": n,
         "success_rate": rate("success"),
+        "spl": (sum(spls) / len(spls)) if spls else None,
+        "spl_n": len(spls),
+        "requested_spl": (sum(spls) / requested) if requested and spls and len(spls) == n else None,
         "requested_success_rate": (successes / requested) if requested else None,
         # skipped 不进 completion 分母：只看真正尝试过的集（失败算尝试）。
         "completion_rate": (n / attempted) if attempted else None,
@@ -424,6 +598,28 @@ def aggregate(episodes, requested=None, attempted=None, failed_count=0, skipped_
         },
         "action_distribution": dist,
     }
+
+
+def spl_clearance(vehicle, task):
+    """l_i 用的 A* 膨胀余量 = 该 (载具, 任务) 的教师 A* 余量（teacher.CLEARANCE_BY_VEHICLE 的第一项）。"""
+    return teacher.CLEARANCE_BY_VEHICLE.get(
+        (vehicle, task), teacher.CLEARANCE_BY_VEHICLE[(vehicle, "base")])[0]
+
+
+def episode_shortest_path_m(args, meta, oracle, goal_x):
+    """SPL 的 l_i：从轨迹首点到任务目标的教师 A* 路长；非 SPL_TASKS / 无轨迹 / 无路时 None。"""
+    traj = trajectory_xy(oracle)
+    if args.task not in SPL_TASKS or not traj:
+        return None
+    vehicle = getattr(args, "vehicle", None) or "x3"
+    waypoint = meta.get("waypoint") if meta.get("stop_radius") is not None else None
+    # 到达半径与 summarize_episode 判 success 用的同一个：meta.goal_radius 没给就是 REACH_RADIUS。
+    radius = (REACH_RADIUS if meta.get("goal_radius") is None else float(meta["goal_radius"])) \
+        if waypoint is not None else None
+    return teacher_shortest_path_m(meta.get("pillars") or [], traj[0],
+                                   goal_x=None if waypoint is not None else goal_x,
+                                   waypoint=waypoint, clearance=spl_clearance(vehicle, args.task),
+                                   radius=radius)
 
 
 def run_episode(seed, args, workdir, seen_gids):
@@ -529,7 +725,8 @@ def run_episode(seed, args, workdir, seen_gids):
     summary = summarize_episode(actions, oracle, goal_x, meta.get("waypoint"),
                                 WAYPOINT_RADIUS, meta.get("stop_radius"), meta.get("goal_radius"),
                                 timed_out=(rc == "timeout"),
-                                coast_window_s=COAST_WINDOW_S.get(args.dynamics))
+                                coast_window_s=COAST_WINDOW_S.get(args.dynamics),
+                                shortest_path_m=episode_shortest_path_m(args, meta, oracle, goal_x))
     summary.update({
         "seed": seed, "geometry_gid": gid, "split": split, "policy": args.policy,
         "task": args.task, "window_from": args.window_from,
@@ -873,6 +1070,14 @@ def main():
               # L1 训练目标是 0.5 m 停、评测按 1.5 m 到达：两个半径同时写。
               "goal_radius_reach": REACH_RADIUS,
               "goal_radius_stop": stop_radius_used,
+              # SPL 口径（EVAL_STANDARD §5.3）：l_i 的来源与膨胀余量写死在报告里，免得跨载具混报。
+              "spl_reference": (None if args.task not in SPL_TASKS else {
+                  "l_i": "teacher.astar_path + LOS shortcut, truncated at goal region", "step_m": 0.1,
+                  "clearance_m": spl_clearance(args.vehicle or "x3", args.task),
+                  # SPL_TASKS 里只有 l1 走 waypoint 分支，到达半径就是 REACH_RADIUS（campus 不算 SPL）。
+                  "goal": (f"disk r={REACH_RADIUS:g} around waypoint" if stop_radius_used is not None
+                           else f"line x=max_pillar_x+{args.goal_margin:g} (y step {SPL_GOAL_Y_STEP:g})"),
+                  "p_i": "oracle pose_gt xy polyline, first pose -> first entry into goal region"}),
               "template_sha256": sha256_file(args.template),
               # requested_seeds 只含真正尝试过的 seed；扫描过的另存，避免把未处理
               # 的扫描尾巴当成已请求集。
@@ -926,7 +1131,8 @@ def main():
           f"final_in_radius={agg['final_in_radius_rate']} "
           f"stop_action={agg['stop_action_issued_rate']} "
           f"task_success={agg['task_success_rate']}  "
-          f"radii reach={REACH_RADIUS}m stop={stop_radius_used}m")
+          f"radii reach={REACH_RADIUS}m stop={stop_radius_used}m  "
+          f"spl={agg['spl']} (n={agg['spl_n']})")
     print(f"wilson95: success={agg['wilson_ci']['success']} "
           f"requested={agg['wilson_ci']['requested']}")
     im = agg["inference_ms"]

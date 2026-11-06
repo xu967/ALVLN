@@ -261,6 +261,58 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
 - **报告规则**：`task_success` / `reach_ever` 与旧 `success` 不可混报；
   没有速度证据时 `stable_termination` 只能报未知。
 
+### 5.3 SPL / CR / task_success / IQM 口径（2026-11-07，只加列，旧字段逐位不变）
+
+本节只定义**新增输出列**和论文报表的统计方法；§5.1/§5.2 的字段定义与数值不变
+（用 925 集历史 episode（base / L1 waypoint / campus / 3DGS / cf_sil）逐字段回归，
+新旧 `summarize_episode` 与 `aggregate` 的旧键 0 处不一致，见 worklog `2026-11-07-*-eval-matrix.md`）。
+
+| 字段 | 定义 | 分母 / 备注 |
+| --- | --- | --- |
+| `path_length_m`（p_i） | oracle `pose_gt` 的 xy 折线长，从首个位姿起、**截到第一次进入目标区**的那一点（线性插值到区边界）；从未到达则整条轨迹 | 每集；只有带 xy 的 oracle 才有，旧数据 None |
+| `shortest_path_m`（l_i） | **教师参考路径长**，不是几何最短路。Gazebo：`teacher.astar_path`（0.1 m 栅格，柱方框按教师余量 `CLEARANCE_BY_VEHICLE[(vehicle, task)][0]` 膨胀，E1 base 0.40 m）再做视线抽捷径（string pulling，只走原路径经过的自由区）；3DGS：`sim.3dgs.planner.route_check` 的 A* 路径（软余量 0.4 m / 代价 4.0）在硬栅格∪软余量上抽捷径。waypoint 任务同样**截到目标区边界**（与 p_i 同口径） | 每集；来源与膨胀余量写在 `eval.json` 顶层 `spl_reference`，不同载具/任务不得混报 |
+| `spl` | `S_i · l_i / max(p_i, l_i)`，S_i = 该集旧 `success`（Anderson et al. 2018） | 每集；p_i 或 l_i 缺一个就是 None |
+| 汇总 `spl` / `spl_n` | 有 `spl` 的完成集平均 / 个数 | `requested_spl` 只在全部完成集都有 spl 时给（请求集分母，skipped/failed 计 0） |
+| CR | 就是已有的 `collision_rate`（contact 碰撞集比例）；**不新增字段**。stuck / 超时不算碰撞 | `episodes_done` |
+| task_success | 已在 §5.2 定义：`reach_ever` + `final_in_radius` + `stop_action_issued` + `collision_free` + 未超时；不另造 | `episodes_done` |
+
+- **目标区与 success 同口径**：waypoint 任务 = 以 waypoint 为心、`goal_radius` 为半径的圆盘
+  （Gazebo L1 1.5 m，3DGS `reach_radius_m` 2.0 m）；验收线任务（base / forest_e1）= 半平面 `x ≥ goal_x`。
+  p_i 与 l_i **都量到目标区边界**。截断的原因有两条：① base 没有 goal-stop，机体过线后继续飞到步数
+  用完，整条轨迹会把这段算进分母，教师走直线 SPL 也只剩 0.7；② waypoint 任务里机体一进圆盘就算
+  到达，若 l_i 量到圆心，p_i 系统性短一个半径（3DGS 2.0 m 对 11 m 路线差 18%），所有成功集都被
+  `max(p_i, l_i)` 截成 1，这一列就没有区分度。实测：E1 base 教师采集集 12 集，成功 10 集的 SPL
+  0.88–0.99（p_i 6.0–7.0 m，l_i 5.9–6.1 m）；3DGS Callinstrasse route_3 的 astar 教师 3 集 SPL
+  0.994–1.000（p_i 9.3–9.9 m，l_i 9.2–9.8 m）。
+- **为什么 l_i 是教师参考路径**：膨胀余量 0.40 m 比机身半宽 0.10 m 大得多，学生贴柱抄近路时
+  p_i < l_i 会出现，公式里的 `max(p_i, l_i)` 把它截成 S_i；因此 SPL=1 的含义是「不比教师绕」，
+  不是「几何最优」。栅格 A* 只有 0°/45° 两种走向，不抽捷径时阶梯路径最多长 8%，几乎所有成功集
+  都会被截成 1，这一列就没有区分度，所以必须抽。
+- **哪些任务有 SPL**：`SPL_TASKS = (base, l1, forest_e1)` 和 3DGS 路线；campus 的建筑不在 `pillars`
+  里，A* 算出来是错的，留 None。
+- **历史 eval.json 不能补算 SPL**：`eval_closed_loop.py` 不带 `--keep-work` 时每集 oracle 随工作目录
+  删除，`per_episode` 里没有轨迹。要能复算，评测时加 `--keep-work`。
+- **E1 的 SAFE 是滑行不是停**（DATA 报告 2026-11-07 §结论 3）：cf_sitl 杆量回中后首步仍滑行
+  中位 0.065 m、最大 0.208 m，悬停漂移 0.012–0.027 m/步。所以 E1 上 `stop_action_issued` 只说明
+  「下过 SAFE」，`final_in_radius` / `task_success` 不能当「停稳」报；`stable_termination` 有
+  `speed_mps` 时才算，且 < 0.05 m/s 的门槛在滑行机体上通常不满足。写论文时 task_success 一列对 E1
+  要标注这一点，或等执行器实现位置保持后复跑。
+- **统计方法**（`tools/stats_report.py`，纯 numpy/标准库；单测 `tools/test_stats_report.py`）：
+  - 二值指标（SR / CR / false_forward / task_success / stuck）：比例 + **Wilson 95%**，分母 =
+    `episodes_done`；请求集口径另报 `requested_success_rate`。
+  - 连续指标（SPL）：均值 + 百分位 bootstrap 95%（B=2000，seed 固定）。
+  - 同一 (方法, 场景) 多个训练种子 run：**IQM**（去掉两端各 25% 后的均值，Agarwal et al. 2021 定义，
+    与 `scipy.stats.trim_mean(x, 0.25)` 一致）+ **分层 bootstrap**（每个任务/run 内重采样）95%。
+    多 run 的格不做配对检验。
+  - 两方法同一 seed 集：**McNemar**（不一致对 b+c < 25 用精确二项，否则带连续性校正的卡方）；
+    ≥3 方法先 **Cochran's Q**，显著再两两 McNemar + **Holm** 校正。配对只用共同 seed。
+  - 样本量：两比例功效估算（正态近似，另给 Fleiss 连续性校正）。0.80 vs 0.90、α=0.05、功效 0.8
+    每臂约 199 集（校正后 219）；配对设计可更少。n < 20 的格只算 pilot。
+- **seed ≠ 几何**：请求集按 seed 给，完成集按 `geometry_gid` 去重。base 任务 0..2999 内双盐
+  （v3 & v5）都是 test 的 53 个 seed 只有 15 个独立几何，固定 20 seed 的请求集实际只跑出 11 个
+  几何、9 个 skipped，`requested_success_rate` 的分母因此偏大。论文表的 n 以独立几何数为准，
+  请求集要直接用独立几何 seed 清单（`tools/compare_datasets.py` CFG 里的 15 个）。
+
 ## 6. 下一步（按优先级）
 
 1. 补 `d_min`（A\* 最短自由路径）→ 才能算 PO / MP / AGV（SR 已实现）。

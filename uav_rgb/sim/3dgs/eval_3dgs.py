@@ -28,6 +28,7 @@ import time
 
 from . import collision as collision_mod
 from . import collect_3dgs
+from . import planner as planner_mod
 from . import renderer as renderer_mod
 from . import scene as scene_mod
 from .collect_3dgs import StudentAdapter
@@ -36,10 +37,17 @@ from .dynamics import CfBlackboxParams, CfSitlParams
 TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
-from eval_closed_loop import REACH_RADIUS, aggregate, summarize_episode  # noqa: E402
+from eval_closed_loop import (REACH_RADIUS, aggregate, path_length_m, shortcut_path,  # noqa: E402
+                              summarize_episode, trajectory_xy, truncate_at_goal)
 
 METRIC_VERSION = "3dgs.pilot.v2"
 SUCCESS_CRITERION = "reach_waypoint_euclid_no_collision_v2"
+# SPL 的 l_i 来源（EVAL_STANDARD §5.3）：占据代理 A*（软余量代价）从轨迹首点到 waypoint 的路径（route_check 的 path），
+# 在 硬栅格∪软余量 上视线抽捷径、再截到 reach_radius_m 圆盘边界的长度。与 astar 教师走的是同一片自由区，不是几何最短路。
+SPL_REFERENCE = {"l_i": "sim.3dgs.planner.route_check path, LOS-shortcut on hard|soft mask, truncated at reach_radius_m",
+                 "p_i": "oracle pose_gt xy polyline, first pose -> first entry into reach_radius_m",
+                 "margin_m": planner_mod.MARGIN_M, "margin_cost": planner_mod.MARGIN_COST,
+                 "goal": "disk reach_radius_m around waypoint"}
 
 
 def reach_radius_of(scene):
@@ -49,11 +57,12 @@ def reach_radius_of(scene):
     return float(r)
 
 
-def summarize_3dgs_episode(actions, oracle, scene, timed_out=False):
+def summarize_3dgs_episode(actions, oracle, scene, timed_out=False, shortest_path_m=None):
     """单集指标：到达 = 轨迹上任一点到 waypoint 的欧氏距离 <= reach_radius_m。
 
     以前传 stop_radius=None 走 route-choice 老口径（max_x >= waypoint.x 且经过 1.0 m），
     离目标同为 0.5 m 时 x=-0.5 判失败、x=+0.5 判成功（AUDIT #10）。
+    shortest_path_m：route_shortest_path_m 算出的 l_i，透传给 summarize_episode 产出 spl（缺省 None）。
     """
     wp = scene.get("waypoint")
     if not isinstance(wp, dict):
@@ -62,10 +71,30 @@ def summarize_3dgs_episode(actions, oracle, scene, timed_out=False):
     # stop_radius 非空 -> summarize_episode 走欧氏半径分支（x,y 平面；3DGS 里 z 固定），
     # goal_x 在该分支不参与 success 判定，只为保持调用签名。
     s = summarize_episode(actions, oracle, goal_x=float(wp["x"]), waypoint=wp,
-                          goal_radius=radius, stop_radius=radius, timed_out=timed_out)
+                          goal_radius=radius, stop_radius=radius, timed_out=timed_out,
+                          shortest_path_m=shortest_path_m)
     s["reach_radius_m"] = radius
     s["metric_version"] = METRIC_VERSION
     return s
+
+
+def route_shortest_path_m(occ_planner, oracle, scene):
+    """SPL 的 l_i：占据代理 A*（planner.route_check）从轨迹首点到 waypoint 的路径，在 硬栅格∪软余量 上抽捷径后的长度。
+
+    无规划器 / 无轨迹 / 无路（含 waypoint 出栅格）时 None。抽捷径的原因见 eval_closed_loop.shortcut_path。
+    """
+    traj = trajectory_xy(oracle)
+    if occ_planner is None or not traj:
+        return None
+    first = oracle[0].get("pose_gt") or {}
+    spawn = {"x": traj[0][0], "y": traj[0][1], "z": first.get("z", 2.0), "yaw_deg": first.get("yaw_deg", 0.0)}
+    path = planner_mod.route_check(occ_planner, spawn, scene["waypoint"]).get("path")
+    if not path:
+        return None
+    mask = occ_planner.hard | occ_planner.soft
+    pulled = shortcut_path(path, lambda p, q: occ_planner.line_free(mask, p, q))
+    # 与 p_i 同口径：量到进入 reach_radius_m 圆盘的那一点，不量到圆心（否则 p_i 系统性短 r，SPL 恒 1）。
+    return path_length_m(truncate_at_goal(pulled, waypoint=scene["waypoint"], radius=reach_radius_of(scene)))
 
 
 def read_hold_from_data(path):
@@ -179,6 +208,12 @@ def main():
     # （split_manifest 的 diag* 约定）：preprocess 默认拒绝，评测产物不会混进训练数据。
     identity = collect_3dgs.scene_identity(scene)
     split_policy = "diag-eval-fixed-test"
+    # SPL 的 l_i 规划器：占据栅格为空（mock 场景）时不算 SPL，不让评测因此失败。
+    try:
+        occ_planner = planner_mod.OccPlanner(occ)
+    except ValueError as e:
+        occ_planner = None
+        print(f"警告: 无法构建占据 A* 规划器（{e}），spl 记 None", file=sys.stderr)
     student = None
     if args.policy == "student":
         from student import StudentPolicy
@@ -219,7 +254,8 @@ def main():
                 continue
             actions = _read_jsonl(os.path.join(ep_dir, "actions.jsonl"))
             oracle = _read_jsonl(os.path.join(ep_dir, "oracle.jsonl"))
-            summary = summarize_3dgs_episode(actions, oracle, scene, timed_out=False)
+            summary = summarize_3dgs_episode(actions, oracle, scene, timed_out=False,
+                                             shortest_path_m=route_shortest_path_m(occ_planner, oracle, scene))
             summary.update({
                 "seed": args.seed + ep, "episode": ep,
                 "dir": os.path.basename(ep_dir),
@@ -265,6 +301,7 @@ def main():
         "metric_version": METRIC_VERSION,
         "success_criterion": SUCCESS_CRITERION,
         "reach_radius_m": reach_radius_of(scene),
+        "spl_reference": SPL_REFERENCE if occ_planner is not None else None,
         # 任务身份：同一 PLY 改了 waypoint/spawn 就是另一个任务；以前 eval.json 只有 PLY 指纹，
         # 目标从 -6 挪到 -7.5 的两次评测在报告层面完全一样（AUDIT #17）。
         "scene": {"name": scene.get("name"), "path": scene["path"],
@@ -309,7 +346,7 @@ def main():
         json.dump(report, f, ensure_ascii=False, indent=2)
     print(f"done-set SR={agg['success_rate']} "
           f"({sum(1 for e in results if e.get('success'))}/{agg['episodes_done']}) "
-          f"collision={agg['collision_rate']} failed={len(failures)}")
+          f"collision={agg['collision_rate']} spl={agg['spl']} failed={len(failures)}")
     im = agg["inference_ms"]
     print(f"inference p50={im['p50']}ms p95={im['p95']}ms n_warm={im['n_warm']}")
     # AUDIT #4：任何一集失败都列出来并以非零退出，调用方（训练驱动/CI）不能当成功。

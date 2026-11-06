@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
-"""两数据集对比（骨架）：A=Gazebo 柱阵+森林、B=3DGS 转弯路线、AB=合并 → 训 3 个学生 → 两域测试集交叉闭环 → summary.md。
+"""两数据集对比流水线：A=Gazebo 柱阵（E1 固件在环采集）、B=3DGS Callinstrasse 路线、AB=并集 → 同结构同超参各训一个学生
+→ 两域测试集交叉闭环（teacher / forward / 旧 X3 学生 / S_A / S_B / S_AB）→ tools/stats_report 汇总成论文表。
 
-矩阵见 docs/experiments/2026-11-07-dataset-compare-plan.md §2：行 = {teacher, forward, student-x3-old, S_A, S_B, S_AB}，
-列 = {gazebo（20 个固定 seed）, 3dgs（留出路线）}。学生同结构同超参，只换训练集。
+矩阵：docs/experiments/2026-11-07-dataset-compare-plan.md §2；口径：docs/EVAL_STANDARD.md §5.3；
+表模板：docs/experiments/PAPER_TABLES_TEMPLATE.md（表 4 跨场景泛化）。
 
-运行（仓库根，先 source env.sh；守护进程，与 e1_pipeline 同一套约定）：
+运行（仓库根；守护进程，与 e1_pipeline 同一套约定；Gazebo 评测要核，E1 流水线结束后再起）：
+  export UAV_RGB_PYTHON=/root/claude-code-backup-20261028/code/uav_rgb/.venv-tools/bin/python
   OUT=$DATA_ROOT/uav_rgb/compare-$(date +%Y%m%d-%H%M); mkdir -p "$OUT"
   setsid nohup "$UAV_RGB_PYTHON" tools/compare_datasets.py --out "$OUT" > "$OUT/run.log" 2>&1 < /dev/null &
-  echo $! > "$OUT/run.pid"
-看进度：tail -f $OUT/run.log；每步状态 $OUT/status.json；结束落 $OUT/DONE。续跑 --from train。--dry-run 只打印命令。
+  echo $! > "$OUT/run.pid"; ps -o pid,pgid,etime,cmd -p $(cat "$OUT/run.pid")
+看进度：tail -f $OUT/run.log；每步状态 $OUT/status.json；结束落 $OUT/DONE（rc + 最后一步）；停：kill -- -<PGID>。
+续跑 --from train / eval / summary（已有 ckpt / eval.json 的项自动跳过）。--dry-run 全链只打印命令、不写文件。
 改参数只改 CFG，不改函数。
 
-骨架状态（2026-11-07）：只保证 --dry-run 能把全部命令打印出来；真跑前要确认：
-  ① CFG["sources"] 里 A/B 的 episode 目录（B 放量后的目录名）；
-  ② 3DGS 评测的 teacher 组 CLI（eval_3dgs 现只有 student/forward；教师组数字要从 collect_3dgs --policy teacher 的统计取）；
-  ③ hold：A 1.0 s、B pilot 0.5 s，preprocess 拒绝混 hold（AB 打包会停），B 放量要用 hold 1.0。
+已知前提（2026-11-07 EVAL agent 补完时）：
+  ① A 与 B 的口径不同（A hold 1.0 s / window_from observation；B pilot v3 hold 0.5 s / render_observation），
+     preprocess 拒绝混包。pack 前先读 manifest 预检：hold_s 或 window_from 不唯一的数据集标 blocked、跳过它的学生组、
+     summary 写明原因；B 放量改成 hold 1.0 + observation（并补 camera_profile）后 AB 才成立（DATA 报告待确认 6）。
+     跨域评测时两域 hold 不同也会在 summary 里标出（学生面对的每步位移不同：0.25 m vs 0.12 m）。
+  ② 3DGS 教师组：eval_3dgs 没有 teacher 策略，用 collect_3dgs --policy astar（占据栅格 A*，与 B 采集同一教师）
+     + --stop-on-collision 采，再按 eval_3dgs.summarize_3dgs_episode / aggregate 写成同格式 eval.json。
+  ③ Gazebo 固定 seed：0–2999 中 v3/v5 双 salt 都是 test 的 seed 只有 15 个独立几何；e1-demo-plan 的 20 个里 9 个与别的
+     同几何，eval 会 dedup 跳过，requested_SR 的分母被虚增成 20。这里直接请求 15 个独立几何（请求数 = 完成数）。
 """
 import argparse
 import glob
+import importlib
 import json
 import os
 import subprocess
@@ -28,37 +37,57 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_ROOT = os.environ.get("DATA_ROOT", "/root/rivermind-data")
 BUILD = os.environ.get("UAV_RGB_BUILD_DIR", os.path.join(REPO, "build", "check"))
 PY = sys.executable
+sys.path.insert(0, os.path.join(REPO, "tools"))
+sys.path.insert(0, REPO)
+import stats_report  # noqa: E402
 
 # ───────────────────────────── 配置区（改这里） ─────────────────────────────
 CFG = dict(
-    # 数据来源：每个集合 = 若干「含 train/val/test 子目录的采集目录」或「直接是 episode 目录的 glob」。
-    # A 的 base 与森林是两个 geometry_version、B 是 3dgs.*：同一 .uavr 里混族必须显式 --allow-mixed-geometry。
+    # 数据来源：每个集合 = 若干 episode 目录 glob（{a,b} 在 Python 里展开）。目录里要有 episode_manifest.json。
     sources=dict(
-        A=[f"{DATA_ROOT}/uav_rgb/e1-pipeline-20261107-0417/collection/{{train,val,test}}/*/",       # 柱阵 base 300 集
-           f"{DATA_ROOT}/uav_rgb/tmp/agent-forest/teacher3/{{sparse,medium,dense}}/{{train,val,test}}/*/"],  # 森林三档（教师能过的档位）
-        B=[f"{DATA_ROOT}/uav_rgb/datasets/e1-3dgs-callinstrasse-pilot/route_*/ep_*/"],              # ② 放量后换目录
+        A=[f"{DATA_ROOT}/uav_rgb/e1-pipeline-20261107-0417/collection/{{train,val,test}}/*/"],
+        #   柱阵 base 300 集：tools/e1_pipeline.py 04:17 产出，E1 固件在环 / hold 1.0 / observation / 教师 v5（余量 0.40/0.30 + 脱困 v2）；
+        #   audit 除 class_share、safe_collision（任务结构，见 DATA 报告）外全 PASS。
+        #   f"{DATA_ROOT}/uav_rgb/tmp/agent-forest/teacher3/{{sparse,medium,dense}}/train/*/",
+        #   森林三档 18 集：旧 0.20/0.15 方框教师、Gazebo 未验证（DATA 报告待确认 4），先不进 A；接入时 preprocess 自动加 --allow-mixed-geometry。
+        B=[f"{DATA_ROOT}/uav_rgb/datasets/e1-3dgs-callinstrasse-pilot-v3-fov60/route_*/ep_*/"],
+        #   3DGS Callinstrasse pilot v3（60° FOV、6 路线、22 集、hold 0.5 / render_observation / teacher_occ.v1）：只够链路验证。
+        #   放量后换目录，例如 f"{DATA_ROOT}/uav_rgb/datasets/e1-3dgs-callinstrasse-v4-hold1/route_*/ep_*/"（名字由 3DGS agent 定）。
     ),
-    datasets=dict(A=("A",), B=("B",), AB=("A", "B")),   # 三个训练集 = 来源集合的并
-    drop_collision=True,     # 与 e1_pipeline 一致：擦柱后的标签不进训练
+    datasets=dict(A=("A",), B=("B",), AB=("A", "B")),   # 三个训练集 = 来源集合的并；口径不一致的集合在 pack 预检被标 blocked
+    collision_filter="drop_steps",   # drop_steps = --drop-collision（与 e1_pipeline 同）；exclude_episodes = --exclude-collision-episodes
+                                     # （DATA 报告建议：连带丢掉碰撞集里余量内的 SAFE/左右反转标签，丢 16/245 集 = 6.5%）
     # 训练（与 tools/e1_pipeline.py CFG 相同，学生只换数据）
-    epochs=30, batch=128, lr=1e-3, seed=0, class_weights="auto", text_dim=0,
-    old_x3_ckpt=f"{DATA_ROOT}/uav_rgb/t6-full-1640/run/ckpt_best.bin",   # 旧 X3 学生（载具迁移差距）
-    # 评测域
-    gazebo=dict(   # E1 机体、observation、hold 1.0，20 个双 salt 都是 test 的 seed（同 e1_pipeline）
+    epochs=30, batch=128, lr=1e-3, class_weights="auto", text_dim=0,
+    train_seeds=(0,),        # 论文用 (0, 1, 2)：同一数据三个训练种子，stats_report 报 IQM + 分层 bootstrap；每个 ≈2 min（E1 流水线 30 轮 112 s）
+    old_x3_ckpt=f"{DATA_ROOT}/uav_rgb/t6-full-1640/run/ckpt_best.bin",   # 旧 X3 学生（T6 best，X3/x3_velocity/hold 1.0 训的）：载具迁移差距
+    # 评测域 1：Gazebo 柱阵、E1 机体、observation、hold 1.0
+    gazebo=dict(
         dynamics="cf_sitl", vehicle="e1_mini", hold=1.0, window_from="observation",
-        seeds="180,206,250,485,503,555,586,708,715,721,799,855,932,992,1113,1116,1123,1145,1246,1282",
+        seeds="180,250,485,555,586,708,721,992,1113,1116,1145,1654,1873,2087,2506",
+        #   0–2999 中 v3 与 v5 两个 salt 下都是 test 且几何互不相同的全部 15 个 seed（见文件头 ③；复算脚本见 EVAL 报告）。
+        #   只要新 E1 学生、不要旧 X3 学生时可换 v5-only 的 71 个独立几何里的前 20 个（旧 X3 学生见过其中一部分）。
         steps=80, sim_timeout=120.0, episode_timeout=600.0,
+        parallel=4,          # 同时起几个 gz（各 1 实例）：4 实例 6.8 核（cgroup 12 核）；用户 YOLO 占 2 核
         env={"UAVRGB_RENDER_BACKEND": "software", "DISPLAY": ":20", "XDG_RUNTIME_DIR": "/tmp/xdg",
              "UAVRGB_CF_SITL_PLUGIN_DIR": f"{DATA_ROOT}/uav_rgb/tmp/build-cf-sitl/gz"},
     ),
-    gs=dict(       # 3DGS 留出路线：scene.json 带 routes[]，--route 选留出路线（split=test 的）
+    # 评测域 2：3DGS Callinstrasse 路线（GPU 渲染，串行）
+    gs=dict(
+        python=f"{DATA_ROOT}/uav_rgb/3dgs-venv/bin/python",   # torch/gsplat 在这个 venv；跑前 unset TORCH_CUDA_ARCH_LIST（BRIEF §1）
         scene=f"{DATA_ROOT}/uav_rgb/3dgs-scenes/callinstrasse/scene.json",
-        routes=(3,),           # ② 留出路线编号，等 3DGS agent 定
-        episodes_per_route=10, steps=80, hold=1.0, dynamics="cf_sitl",
-        dynamics_params=f"{REPO}/sim/dynamics/e1_mini.json",
+        routes=(3,),         # 评测路线。pilot v3 六条路线都进了训练集，这里还是「域内路线」；留出路线（split=test）等 3DGS agent 在 scene.routes 标出后改
+        episodes_per_route=10,
+        steps=None,          # None = 路线自带 max_steps（planner.route_check 的步数预算）；给数字则覆盖
+        hold=0.5,            # 与 B pilot v3 采集一致（学生按 0.5 s 窗口训的）；B 放量改 hold 1.0 后同步改。与 gazebo 1.0 不同 → summary 自动标注
+        dynamics="cf_sitl", dynamics_params=f"{REPO}/sim/dynamics/e1_mini.json",
+        spawn_jitter=0.0,    # 同一路线多集靠出生扰动区分；0 = 每集同出生点（只在 pilot 口径）
+        env={"TORCH_CUDA_ARCH_LIST": ""},
     ),
+    metrics=("SR", "CR", "false_forward", "SPL", "task_success"),   # 表列（stats_report.METRICS 的键）
+    n_boot=2000,
 )
-# 评测组：(名字, policy, ckpt 来源)。ckpt 来源 None=无模型；"old_x3_ckpt"=CFG 里的路径；"S_A" 等=本脚本训出的学生。
+# 评测组：(名字, policy, ckpt 来源)。None=无模型；"old_x3_ckpt"=CFG 里的路径；"A"/"B"/"AB"=本脚本训出的学生（每个训练种子一个 run）。
 GROUPS = (
     ("teacher", "teacher", None),
     ("forward", "forward", None),
@@ -89,10 +118,15 @@ def run(cmd, env_extra=None, log_path=None):
     return subprocess.run(cmd, env=env).returncode
 
 
-def sh(cmd, env_extra=None):
-    rc = run(cmd, env_extra)
+def sh(cmd, env_extra=None, log_path=None):
+    rc = run(cmd, env_extra, log_path)
     if rc != 0:
-        raise RuntimeError(f"退出码 {rc}: {' '.join(cmd[:3])}")
+        raise RuntimeError(f"退出码 {rc}: {' '.join(cmd[:3])}" + (f"，看 {log_path}" if log_path else ""))
+
+
+def read_json(path):
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 def write_json(path, obj):
@@ -106,14 +140,18 @@ def mark(out, step, state, **extra):
     if DRY:
         return
     path = os.path.join(out, "status.json")
-    status = json.load(open(path, encoding="utf-8")) if os.path.isfile(path) else {}
+    status = read_json(path) if os.path.isfile(path) else {}
     status[step] = dict(state=state, at=time.strftime("%F %T"), **extra)
     write_json(path, status)
 
 
 def need(path, hint):
-    if not DRY and not os.path.exists(path):
+    """真跑缺就停；dry-run 只提醒，让主会话在起守护进程前知道还缺什么。"""
+    if os.path.exists(path):
+        return
+    if not DRY:
         raise RuntimeError(f"缺 {path}（{hint}）")
+    log(f"[dry] 缺 {path}（{hint}）")
 
 
 def expand_braces(pattern):
@@ -134,45 +172,115 @@ def episode_dirs(source_names):
     return eps
 
 
+def dataset_protocol(eps):
+    """读每集 manifest 的口径键：hold_s / window_from 必须各只有一个值，否则 preprocess 会拒绝混包（①）。"""
+    keys = ("hold_s", "window_from", "geometry_version", "dynamics", "camera_profile")
+    seen = {k: set() for k in keys}
+    for d in eps:
+        m = read_json(os.path.join(d, "episode_manifest.json"))
+        for k in keys:
+            seen[k].add(json.dumps(m.get(k), ensure_ascii=False))
+    proto = {k: sorted(v) for k, v in seen.items()}
+    proto["n_episodes"] = len(eps)
+    proto["blocked_by"] = [k for k in ("hold_s", "window_from") if len(proto[k]) > 1]
+    return proto
+
+
+def ds_dir(out, ds_name):
+    return os.path.join(out, "ds", ds_name)
+
+
+_BLOCKED = {}   # 本进程 pack 预检的结果（dry-run 不落盘也要让后面的步骤知道）
+
+
+def blocked_reason(out, ds_name):
+    """pack 预检写的 BLOCKED.json（口径不一致）；没有则 None。"""
+    if ds_name in _BLOCKED:
+        return _BLOCKED[ds_name]
+    path = os.path.join(ds_dir(out, ds_name), "BLOCKED.json")
+    return read_json(path)["reason"] if os.path.isfile(path) else None
+
+
 # ───────────────────────────── 四个步骤，按顺序 ─────────────────────────────
 def pack(out):
-    """三个 .uavr。AB（以及 A 自身的柱阵+森林）跨族，必须显式 --allow-mixed-geometry；hold/window 不一致仍会停（③）。"""
+    """每个训练集一个 .uavr。先预检口径（hold/window），不一致的标 blocked 并继续别的集；跨族（几何版本不同）显式 --allow-mixed-geometry。"""
+    blocked = {}
     for ds_name, srcs in CFG["datasets"].items():
-        ds = os.path.join(out, "ds", ds_name)
+        ds = ds_dir(out, ds_name)
         eps = episode_dirs(srcs)
-        if not DRY and not eps:
-            raise RuntimeError(f"{ds_name}: {srcs} 下没有 episode 目录")
-        cmd = [PY, f"{REPO}/tools/preprocess.py", "--out", ds, "--allow-mixed-geometry"]
-        if CFG["drop_collision"]:
-            cmd.append("--drop-collision")
-        sh(cmd + (eps or [f"<{'+'.join(srcs)} 的 episode 目录>"]))
+        if not eps:
+            if DRY:
+                log(f"[dry] {ds_name}: {srcs} 下现在没有 episode 目录，命令按占位符打印")
+                proto = {"blocked_by": [], "geometry_version": ["?"]}
+            else:
+                raise RuntimeError(f"{ds_name}: {srcs} 下没有 episode 目录")
+        else:
+            proto = dataset_protocol(eps)
+            log(f"{ds_name}: {proto['n_episodes']} 集；hold_s={proto['hold_s']} window_from={proto['window_from']} "
+                f"geometry_version={proto['geometry_version']} camera_profile={proto['camera_profile']}")
+        if proto["blocked_by"]:
+            reason = (f"{ds_name} 的 {proto['blocked_by']} 不唯一（{[proto[k] for k in proto['blocked_by']]}），"
+                      "preprocess 会拒绝混包；B 放量统一 hold 1.0 / window_from observation 后再打包")
+            log(f"!! blocked: {reason}")
+            blocked[ds_name] = _BLOCKED[ds_name] = reason
+            if not DRY:
+                os.makedirs(ds, exist_ok=True)
+                write_json(os.path.join(ds, "BLOCKED.json"), {"reason": reason, "protocol": proto})
+            continue
+        if os.path.isfile(os.path.join(ds, "dataset.uavr")):
+            log(f"跳过 pack {ds_name}：已有 dataset.uavr")
+            continue
+        cmd = [PY, f"{REPO}/tools/preprocess.py", "--out", ds]
+        if len(proto["geometry_version"]) > 1:
+            cmd.append("--allow-mixed-geometry")
+        cmd.append({"drop_steps": "--drop-collision", "exclude_episodes": "--exclude-collision-episodes"}
+                   [CFG["collision_filter"]])
+        sh(cmd + (eps or [f"<{'+'.join(srcs)} 的 episode 目录>"]), log_path=None if DRY else os.path.join(out, f"pack-{ds_name}.log"))
+    mark(out, "pack", "ok" if not blocked else "partial", blocked=blocked)
+    return blocked
+
+
+def train_runs(out, ds_name):
+    """(run 标签, run 目录) 列表；一个训练种子一个 run。"""
+    return [(f"s{seed}", os.path.join(out, "run", ds_name, f"s{seed}")) for seed in CFG["train_seeds"]]
 
 
 def train(out):
     for ds_name in CFG["datasets"]:
-        ds, run_dir = os.path.join(out, "ds", ds_name, "dataset.uavr"), os.path.join(out, "run", ds_name)
+        if blocked_reason(out, ds_name):
+            log(f"跳过 train {ds_name}：{blocked_reason(out, ds_name)}")
+            continue
+        ds = os.path.join(ds_dir(out, ds_name), "dataset.uavr")
         need(ds, f"先跑 pack（{ds_name}）")
-        if os.path.isdir(run_dir) and os.listdir(run_dir):
-            raise RuntimeError(f"{run_dir} 非空：uavrgb_train 拒绝复用；删掉或换 --out")
-        cmd = [f"{BUILD}/uavrgb_train", "--data", ds, "--out", run_dir,
-               "--epochs", str(CFG["epochs"]), "--batch", str(CFG["batch"]), "--lr", repr(float(CFG["lr"])),
-               "--seed", str(CFG["seed"]), "--class-weights", CFG["class_weights"]]
-        if CFG["drop_collision"]:
-            cmd.append("--drop-collision")
-        if CFG["text_dim"] > 0:
-            cmd += ["--text-dim", str(CFG["text_dim"])]
-        elif os.path.isfile(os.path.join(out, "ds", ds_name, "instructions.jsonl")):
-            cmd.append("--vision-only")
-        sh(cmd)
-        need(f"{run_dir}/ckpt_best.bin", "训练结束但没有 best ckpt")
+        for label, run_dir in train_runs(out, ds_name):
+            if os.path.isfile(os.path.join(run_dir, "ckpt_best.bin")):
+                log(f"跳过 train {ds_name}/{label}：已有 ckpt_best.bin")
+                continue
+            if os.path.isdir(run_dir) and os.listdir(run_dir):
+                raise RuntimeError(f"{run_dir} 非空且没有 ckpt_best.bin：uavrgb_train 拒绝复用，删掉后重跑")
+            seed = int(label[1:])
+            cmd = [f"{BUILD}/uavrgb_train", "--data", ds, "--out", run_dir,
+                   "--epochs", str(CFG["epochs"]), "--batch", str(CFG["batch"]), "--lr", repr(float(CFG["lr"])),
+                   "--seed", str(seed), "--class-weights", CFG["class_weights"]]
+            if CFG["collision_filter"] == "drop_steps":
+                cmd.append("--drop-collision")
+            if CFG["text_dim"] > 0:
+                cmd += ["--text-dim", str(CFG["text_dim"])]
+            elif os.path.isfile(os.path.join(ds_dir(out, ds_name), "instructions.jsonl")):
+                cmd.append("--vision-only")
+            sh(cmd, log_path=None if DRY else os.path.join(out, f"train-{ds_name}-{label}.log"))
+            need(f"{run_dir}/ckpt_best.bin", "训练结束但没有 best ckpt，看 run/metrics.jsonl")
 
 
-def ckpt_of(out, key):
+def ckpts_of(out, key):
+    """ckpt 来源 -> [(run 后缀, ckpt 路径)]。无模型 [("", None)]；blocked 数据集 []（该组整行缺）。"""
     if key is None:
-        return None
+        return [("", None)]
     if key == "old_x3_ckpt":
-        return CFG["old_x3_ckpt"]
-    return os.path.join(out, "run", key, "ckpt_best.bin")
+        return [("", CFG["old_x3_ckpt"])]
+    if blocked_reason(out, key):
+        return []
+    return [(f"-{label}", os.path.join(run_dir, "ckpt_best.bin")) for label, run_dir in train_runs(out, key)]
 
 
 def eval_gazebo_cmd(out, name, policy, ckpt):
@@ -190,98 +298,184 @@ def eval_gazebo_cmd(out, name, policy, ckpt):
 
 
 def eval_3dgs_cmd(out, name, policy, ckpt, route):
+    """student/forward 走 eval_3dgs；teacher 走 collect_3dgs --policy astar（②），之后由 teacher_3dgs_eval_json 补 eval.json。"""
     g = CFG["gs"]
     edir = os.path.join(out, "eval-3dgs", f"{name}-route{route}")
+    common = ["--scene", g["scene"], "--route", str(route), "--episodes", str(g["episodes_per_route"]),
+              "--hold", str(g["hold"]), "--dynamics", g["dynamics"], "--dynamics-params", g["dynamics_params"],
+              "--spawn-jitter", str(g["spawn_jitter"]), "--out", edir]
+    if g["steps"] is not None:
+        common += ["--steps", str(g["steps"])]
     if policy == "teacher":
-        # ② eval_3dgs 没有 teacher 策略；教师组用采集器的到达/碰撞统计（collect_3dgs --policy teacher）。
-        cmd = [PY, "-m", "sim.3dgs.collect_3dgs", "--scene", g["scene"], "--route", str(route),
-               "--policy", "teacher", "--episodes", str(g["episodes_per_route"]), "--steps", str(g["steps"]),
-               "--hold", str(g["hold"]), "--dynamics", g["dynamics"], "--dynamics-params", g["dynamics_params"],
-               "--out", edir]
-        return cmd, {}, edir
-    cmd = [PY, "-m", "sim.3dgs.eval_3dgs", "--scene", g["scene"], "--route", str(route), "--policy", policy,
-           "--episodes", str(g["episodes_per_route"]), "--steps", str(g["steps"]), "--hold", str(g["hold"]),
-           "--dynamics", g["dynamics"], "--dynamics-params", g["dynamics_params"], "--out", edir]
-    if ckpt:
-        cmd += ["--ckpt", ckpt, "--infer-bin", f"{BUILD}/uavrgb_infer"]
-    return cmd, {}, edir
+        cmd = [g["python"], "-m", "sim.3dgs.collect_3dgs", "--policy", "astar", "--stop-on-collision", "--split", "test"] + common
+    else:
+        cmd = [g["python"], "-m", "sim.3dgs.eval_3dgs", "--policy", policy] + common
+        if ckpt:
+            cmd += ["--ckpt", ckpt, "--infer-bin", f"{BUILD}/uavrgb_infer"]
+    return cmd, g["env"], edir
+
+
+def teacher_3dgs_eval_json(edir, route):
+    """把 collect_3dgs --policy astar 的采集目录按 eval_3dgs 的格式写成 eval.json（同一套 summarize/aggregate，含 SPL）。"""
+    scene_mod = importlib.import_module("sim.3dgs.scene")
+    collision = importlib.import_module("sim.3dgs.collision")
+    planner = importlib.import_module("sim.3dgs.planner")
+    ev = importlib.import_module("sim.3dgs.eval_3dgs")
+    run_meta = read_json(os.path.join(edir, "run.json"))
+    scene = scene_mod.apply_route(scene_mod.load_scene(CFG["gs"]["scene"]), route)
+    occ_planner = planner.OccPlanner(collision.from_scene(scene))
+    results, failures = [], list(run_meta.get("failures") or [])
+    for ep in run_meta.get("episodes") or []:
+        d = os.path.join(edir, ep["dir"])
+        if ep.get("error"):
+            failures.append({"episode": ep["episode"], "error": ep["error"], "dir": ep["dir"]})
+            continue
+        actions, oracle = ev._read_jsonl(os.path.join(d, "actions.jsonl")), ev._read_jsonl(os.path.join(d, "oracle.jsonl"))
+        s = ev.summarize_3dgs_episode(actions, oracle, scene, shortest_path_m=ev.route_shortest_path_m(occ_planner, oracle, scene))
+        s.update({"seed": read_json(os.path.join(d, "episode_manifest.json")).get("seed", ep["episode"]),
+                  "episode": ep["episode"], "dir": ep["dir"], "policy": "teacher", "actions": {}})
+        for a in actions:
+            k = int(a.get("action_executed", -1))
+            s["actions"][k] = s["actions"].get(k, 0) + 1
+        results.append(s)
+    n_req = len(run_meta.get("episodes") or []) + len(run_meta.get("failures") or [])
+    agg = ev.aggregate(results, requested=n_req, attempted=n_req, failed_count=len(failures))
+    report = {"schema": "uavrgb.eval.v1", "policy": "teacher", "teacher": "astar_occ (sim.3dgs.planner)",
+              "source": "collect_3dgs --policy astar --stop-on-collision，由 tools/compare_datasets.teacher_3dgs_eval_json 汇总",
+              "metric_version": ev.METRIC_VERSION, "success_criterion": ev.SUCCESS_CRITERION,
+              "reach_radius_m": ev.reach_radius_of(scene), "spl_reference": ev.SPL_REFERENCE,
+              "scene": {"name": scene.get("name"), "path": scene["path"], "route": scene.get("route"),
+                        "waypoint": scene.get("waypoint"), "spawn": scene.get("spawn"), "split": "test"},
+              "dynamics": run_meta.get("dynamics"), "dynamics_profile": run_meta.get("dynamics_profile"),
+              "episodes_requested": n_req, "steps": run_meta.get("steps"), "hold_s": run_meta.get("hold_s"),
+              "seeds": [r["seed"] for r in results], "per_episode": results, "failed": failures, **agg}
+    write_json(os.path.join(edir, "eval.json"), report)
+    return report
+
+
+def eval_jobs(out, check_ckpt=True):
+    """所有 (域, 组名, 后缀, 命令, env, 目录, route)。blocked 数据集的学生组不出现；summary 阶段不查 ckpt。"""
+    jobs = []
+    for name, policy, key in GROUPS:
+        for suffix, ckpt in ckpts_of(out, key):
+            if ckpt and check_ckpt:
+                need(ckpt, f"{name}{suffix} 的 ckpt")
+            if "gazebo" in EVAL_DOMAINS:
+                cmd, env, edir = eval_gazebo_cmd(out, name + suffix, policy, ckpt)
+                jobs.append(("gazebo", name, suffix, cmd, env, edir, None))
+            if "3dgs" in EVAL_DOMAINS:
+                for route in CFG["gs"]["routes"]:
+                    cmd, env, edir = eval_3dgs_cmd(out, name + suffix, policy, ckpt, route)
+                    jobs.append(("3dgs", name, suffix, cmd, env, edir, route))
+    return jobs
 
 
 def evaluate(out):
-    """gazebo 域 6 组并行各 1 个 gz（采集已结束，核是空的）；3dgs 域串行（共用一块 GPU 渲染）。"""
-    for _name, _policy, key in GROUPS:
-        if key:
-            need(ckpt_of(out, key), f"{key} 的 ckpt")
-    procs = []
-    if "gazebo" in EVAL_DOMAINS:
-        for name, policy, key in GROUPS:
-            cmd, env, edir = eval_gazebo_cmd(out, name, policy, ckpt_of(out, key))
-            if os.path.isfile(os.path.join(edir, "eval.json")):
-                log(f"跳过 gazebo/{name}：已有 eval.json")
-                continue
-            log_path = os.path.join(out, f"eval-gazebo-{name}.log")
+    """gazebo 域按 CFG.gazebo.parallel 并行（各 1 个 gz）；3dgs 域串行（共用一块 GPU）。已有 eval.json 的跳过。"""
+    jobs = eval_jobs(out)
+    pending = []
+    for domain, name, suffix, cmd, env, edir, route in jobs:
+        if os.path.isfile(os.path.join(edir, "eval.json")):
+            log(f"跳过 {domain}/{name}{suffix}" + (f" route {route}" if route is not None else "") + "：已有 eval.json")
+            continue
+        pending.append((domain, name, suffix, cmd, env, edir, route))
+    gz = [j for j in pending if j[0] == "gazebo"]
+    par = max(1, int(CFG["gazebo"]["parallel"]))
+    for i in range(0, len(gz), par):
+        procs = []
+        for _d, name, suffix, cmd, env, edir, _r in gz[i:i + par]:
+            log_path = os.path.join(out, f"eval-gazebo-{name}{suffix}.log")
             log("$ " + " ".join(cmd) + f"  > {log_path}")
             if not DRY:
-                os.makedirs(os.path.dirname(log_path), exist_ok=True)
-                procs.append((name, subprocess.Popen(cmd, env=dict(os.environ, **env),
-                                                     stdout=open(log_path, "ab"), stderr=subprocess.STDOUT)))
-    if "3dgs" in EVAL_DOMAINS:
-        for name, policy, key in GROUPS:
-            for route in CFG["gs"]["routes"]:
-                cmd, env, edir = eval_3dgs_cmd(out, name, policy, ckpt_of(out, key), route)
-                if os.path.isfile(os.path.join(edir, "eval.json")):
-                    log(f"跳过 3dgs/{name} route {route}：已有 eval.json")
-                    continue
-                run(cmd, env, log_path=os.path.join(out, f"eval-3dgs-{name}-route{route}.log"))
-    for name, proc in procs:
-        rc = proc.wait()
-        log(f"eval-gazebo/{name} rc={rc}" + ("（有失败/跳过集，见 eval.json 的 failed）" if rc else ""))
+                procs.append((name + suffix, edir, subprocess.Popen(cmd, env=dict(os.environ, **env),
+                                                                 stdout=open(log_path, "ab"), stderr=subprocess.STDOUT)))
+        for label, edir, proc in procs:
+            rc = proc.wait()
+            log(f"eval-gazebo/{label} rc={rc}" + ("（有失败/跳过集，见 eval.json 的 failed/skipped）" if rc else ""))
+            need(os.path.join(edir, "eval.json"), f"{label} 没写出 eval.json，看 {out}/eval-gazebo-{label}.log")
+    for _d, name, suffix, cmd, env, edir, route in [j for j in pending if j[0] == "3dgs"]:
+        log_path = os.path.join(out, f"eval-3dgs-{name}{suffix}-route{route}.log")
+        rc = run(cmd, env, log_path=log_path)
+        if rc != 0:
+            log(f"eval-3dgs/{name}{suffix} route {route} rc={rc}（有失败集或采集错误，见 {log_path}）")
+        if name == "teacher":
+            if DRY:
+                log(f"[dry] 之后由 teacher_3dgs_eval_json 把 {edir} 汇总成 eval.json")
+            else:
+                need(os.path.join(edir, "run.json"), f"教师采集没写 run.json，看 {log_path}")
+                rep = teacher_3dgs_eval_json(edir, route)
+                log(f"eval-3dgs/teacher route {route}: SR={rep['success_rate']} CR={rep['collision_rate']} "
+                    f"spl={rep['spl']} n={rep['episodes_done']}")
+        if not DRY:
+            need(os.path.join(edir, "eval.json"), f"{name}{suffix} route {route} 没写出 eval.json，看 {log_path}")
 
 
 def summary(out):
-    """每域每组一行：SR（分母=请求集）、碰撞、stuck、false_forward、n、Wilson95。3DGS 的 eval.json 字段以 eval_3dgs 实际输出为准（②）。"""
-    rows = []
-    for domain in EVAL_DOMAINS:
-        for name, _policy, key in GROUPS:
-            paths = ([os.path.join(out, "eval-gazebo", name, "eval.json")] if domain == "gazebo" else
-                     [os.path.join(out, "eval-3dgs", f"{name}-route{r}", "eval.json") for r in CFG["gs"]["routes"]])
-            for path in paths:
-                if not os.path.isfile(path):
-                    rows.append((domain, name, os.path.basename(os.path.dirname(path)), None))
-                    continue
-                e = json.load(open(path, encoding="utf-8"))
-                rows.append((domain, name, os.path.basename(os.path.dirname(path)), {
-                    "SR": e.get("requested_success_rate", e.get("success_rate")),
-                    "coll": e.get("collision_rate"), "stuck": e.get("stuck_rate"),
-                    "ffwd": e.get("false_forward_rate"), "n": e.get("episodes_done"),
-                    "wilson95": (e.get("wilson_ci") or {}).get("requested"),
-                    "metric_version": e.get("metric_version")}))
-    fmt = "%-7s %-15s %-22s %6s %6s %6s %6s %4s"
-    lines = [fmt % ("domain", "group", "run", "SR", "coll", "stuck", "ffwd", "n")]
-    f = lambda v, d=2: "-" if v is None else f"{v:.{d}f}"   # noqa: E731
-    for domain, name, run_name, r in rows:
-        lines.append(fmt % ((domain, name, run_name) + (("缺", "", "", "", "") if r is None else
-                            (f(r["SR"]), f(r["coll"]), f(r["stuck"]), f(r["ffwd"]), r["n"]))))
-    lines.append("口径：SR 分母 = 请求集；gazebo 域 E1 机体 cf_sitl / observation / hold 1.0，20 个双 salt test seed；"
-                 "3dgs 域留出路线，hold 以 eval.json 的 hold_s 为准（A/B hold 不同时表里必须标注）；详见 docs/EVAL_STANDARD.md")
-    for line in lines:
+    """stats_report：行 = 组，列 = 域(×路线) × 指标，Wilson/bootstrap/IQM + 两两 McNemar（同 seed）+ Cochran's Q；写 summary.md/json。"""
+    entries, missing = [], []
+    for domain, name, suffix, _cmd, _env, edir, route in eval_jobs(out, check_ckpt=False):
+        scene = "gazebo" if domain == "gazebo" else f"3dgs-r{route}"
+        path = os.path.join(edir, "eval.json")
+        if os.path.isfile(path):
+            entries.append((name, scene, path))   # 同名多 run（训练种子）→ stats_report 报 IQM
+        else:
+            missing.append(f"{name}{suffix} @ {scene}")
+    blocked = {ds: blocked_reason(out, ds) for ds in CFG["datasets"] if blocked_reason(out, ds)}
+    notes = [f"- 训练集 {ds} 未打包：{reason}；组 {[g for g, _p, k in GROUPS if k == ds]} 整行缺。" for ds, reason in blocked.items()]
+    if missing:
+        notes.append(f"- 缺 eval.json：{missing}")
+    notes.append(f"- 域口径：gazebo hold {CFG['gazebo']['hold']} s / {CFG['gazebo']['window_from']} / "
+                 f"{len(CFG['gazebo']['seeds'].split(','))} 个独立几何 seed（请求数 = seed 数）；"
+                 f"3dgs hold {CFG['gs']['hold']} s / 路线 {list(CFG['gs']['routes'])}（pilot v3 路线都在训练集里，不是留出路线）。")
+    if abs(CFG["gazebo"]["hold"] - CFG["gs"]["hold"]) > 1e-9:
+        notes.append(f"- **两域 hold 不同（gazebo {CFG['gazebo']['hold']} s vs 3dgs {CFG['gs']['hold']} s）**：学生每步位移不同，跨域列不可与域内列直接比，"
+                     "报告里必须标注（dataset-compare-plan §5）。")
+    notes.append("- E1 外径 0.20 m vs X3 0.71 m：旧 X3 学生那一行是载具迁移差距，不是同机体对照。")
+    if not entries:
+        log("summary: 还没有任何 eval.json" + ("（dry-run）" if DRY else ""))
+        for n in notes:
+            log(n)
+        return
+    rep = stats_report.build_report(entries, metrics=CFG["metrics"], pair_metrics=("SR",), n_boot=CFG["n_boot"],
+                                    title="数据集对比（A=Gazebo 柱阵，B=3DGS 路线，AB=并集）")
+    rep["blocked_datasets"] = blocked
+    rep["notes"] = notes
+    rep["cfg"] = CFG
+    md = stats_report.to_markdown(rep) + "\n## 备注\n\n" + "\n".join(notes) + "\n"
+    for line in md.splitlines():
         log(line)
     if not DRY:
-        write_json(os.path.join(out, "summary.json"), {"cfg": CFG, "groups": GROUPS, "rows": rows})
-        with open(os.path.join(out, "summary.md"), "w", encoding="utf-8") as fp:
-            fp.write("```\n" + "\n".join(lines) + "\n```\n")
+        with open(os.path.join(out, "summary.md"), "w", encoding="utf-8") as f:
+            f.write(md)
+        write_json(os.path.join(out, "summary.json"), rep)
 
 
 RUN = dict(pack=pack, train=train, eval=evaluate, summary=summary)
 
 
-def preflight():
-    need(f"{BUILD}/uavrgb_train", "先 bash tools/check.sh 构建，或设 UAV_RGB_BUILD_DIR")
-    need(f"{BUILD}/uavrgb_infer", "同上")
-    need(CFG["old_x3_ckpt"], "旧 X3 学生 ckpt")
+def preflight(steps):
+    """只查这次要跑的步骤用得到的东西：`--from summary` 只读 eval.json，不该因为没编译二进制而停。"""
+    if "train" in steps or "eval" in steps:
+        need(f"{BUILD}/uavrgb_train", "先 bash tools/check.sh 构建，或设 UAV_RGB_BUILD_DIR")
+        need(f"{BUILD}/uavrgb_infer", "同上")
+    if "eval" in steps:
+        need(CFG["old_x3_ckpt"], "旧 X3 学生 ckpt")
+        if "gazebo" in EVAL_DOMAINS:
+            need(CFG["gazebo"]["env"]["UAVRGB_CF_SITL_PLUGIN_DIR"], "cf_sitl Gazebo 插件目录（sim/cf_sitl/gz/README）")
+        if "3dgs" in EVAL_DOMAINS:
+            need(CFG["gs"]["python"], "3DGS venv（torch/gsplat）")
+            need(CFG["gs"]["scene"], "3DGS scene.json")
+            if CFG["gs"]["dynamics"] == "cf_sitl":
+                need(os.environ.get("CF_SITL_PROC", f"{DATA_ROOT}/uav_rgb/tmp/build-cf-sitl/cf_sitl_proc"),
+                     "cf_sitl_proc（3DGS 侧固件在环子进程）")
+    if CFG["collision_filter"] not in ("drop_steps", "exclude_episodes"):
+        raise RuntimeError(f"CFG.collision_filter={CFG['collision_filter']!r} 不认识")
     for name, _p, key in GROUPS:
         if key not in (None, "old_x3_ckpt") and key not in CFG["datasets"]:
             raise RuntimeError(f"GROUPS 里 {name} 的 ckpt 来源 {key} 不在 CFG.datasets")
+    for m in CFG["metrics"]:
+        if m not in stats_report.METRICS:
+            raise RuntimeError(f"CFG.metrics 里 {m} 不在 stats_report.METRICS")
 
 
 def main():
@@ -303,14 +497,15 @@ def main():
             os.remove(os.path.join(out, "DONE"))
     rc, last = 0, None
     try:
-        preflight()
+        preflight(STEPS[STEPS.index(a.start):])
         for step in STEPS[STEPS.index(a.start):]:
             last = step
             log(f"==== {step} 开始")
             mark(out, step, "running")
             t0 = time.monotonic()
             RUN[step](out)
-            mark(out, step, "ok", seconds=round(time.monotonic() - t0, 1))
+            if step != "pack":   # pack 自己按 blocked 情况标 ok/partial
+                mark(out, step, "ok", seconds=round(time.monotonic() - t0, 1))
             log(f"==== {step} 完成 {time.monotonic() - t0:.0f}s")
     except Exception as e:   # noqa: BLE001
         rc = 1

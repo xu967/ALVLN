@@ -406,6 +406,38 @@ class TestReachEuclid(unittest.TestCase):
         with self.assertRaises(ValueError):
             eval_mod.summarize_3dgs_episode(a, o, {"waypoint": {"x": 0, "y": 0}, "reach_radius_m": 0})
 
+    def test_spl_columns(self):
+        """SPL（2026-11-07 只加列）：l_i 来自占据代理 A*，p_i 是 oracle xy 折线截到进入 reach 圆盘；不给 l_i 时 spl 为 None。"""
+        import numpy as np
+        collision = importlib.import_module("sim.3dgs.collision")
+        planner = importlib.import_module("sim.3dgs.planner")
+        scene = {"waypoint": {"x": 8.0, "y": 0.0}, "reach_radius_m": 1.0}
+        a, o = self._episode([2.0, 4.0, 6.0, 7.5])
+        self.assertIsNone(eval_mod.summarize_3dgs_episode(a, o, scene)["spl"])
+        s = eval_mod.summarize_3dgs_episode(a, o, scene, shortest_path_m=4.5)
+        self.assertTrue(s["success"])
+        self.assertAlmostEqual(s["path_length_m"], 5.0)      # x=2 起飞，x=7 进 1.0 m 圆盘，7.5 那半米不算
+        self.assertAlmostEqual(s["spl"], 4.5 / 5.0)
+        # 一堵 x=5、y∈[-3,1] 的墙（planner 自检同款）：直线被挡，l_i 必须大于直线距离 6 m。
+        ys = np.linspace(-3.0, 1.0, 21)
+        occ = collision.Occupancy(np.array([(5.0, y, 2.0) for y in ys]), np.tile([0.01, 0.2, 0.3], (len(ys), 1)),
+                                  None, np.full(len(ys), 0.95), z_range=(1.65, 2.35), voxel_m=0.1,
+                                  body_radius_m=0.102, body_half_height_m=0.028, pad_m=4.0)
+        pl = planner.OccPlanner(occ)
+        start = [{"pose_gt": {"x": 2.0, "y": 0.0, "z": 2.0, "yaw_deg": 0.0}}]
+        l_i = eval_mod.route_shortest_path_m(pl, start, scene)
+        # 绕墙：直线 6 m 被挡，绕到 y>1 再回来；量到 1.0 m 圆盘边界后仍明显长于 5 m 直线。
+        self.assertGreater(l_i, 5.5)
+        # 圆盘越大 l_i 越短；两次截点之间的弧长至少是半径差 1 m（末段不是正对圆心时更长），但不会离谱。
+        l_big = eval_mod.route_shortest_path_m(pl, start, dict(scene, reach_radius_m=2.0))
+        self.assertLess(l_big, l_i)
+        self.assertGreaterEqual(l_i - l_big, 1.0 - 1e-6)
+        self.assertLess(l_i - l_big, 2.0)
+        self.assertIsNone(eval_mod.route_shortest_path_m(None, o, scene))
+        self.assertIsNone(eval_mod.route_shortest_path_m(pl, [], scene))
+        # 目标在墙里：无路 -> None，评测不崩。
+        self.assertIsNone(eval_mod.route_shortest_path_m(pl, o, {"waypoint": {"x": 5.0, "y": 0.0}}))
+
 
 class TestEpisodeFailureExit(unittest.TestCase):
     """AUDIT #4：单集异常必须进 failed 列表并让 eval 以非零退出，而不是只写进 summary。"""

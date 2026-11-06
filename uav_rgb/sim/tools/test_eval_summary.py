@@ -167,6 +167,29 @@ def main():
     s = l1(actions, one_m, stop_radius=0.5, goal_radius=0.5)
     assert not s["success"] and s["reach_ever"] and not s["final_in_radius"], s
 
+    # SPL（2026-11-07）：S_i 用的是该口径的 success（L1 = goal_reach_ever）；p_i 量到第一次进入 1.5 m 圆盘。
+    # 先绕远再进圆：(0,1)->(0,-3) 全程离 WP >= 2 m 不进圆，(0,-3)->(2,1) 长 √20，在离 WP 1.5 m 处进圆。
+    oracle_detour = [{"pose_gt": {"x": 0.0, "y": 1.0}}, {"pose_gt": {"x": 0.0, "y": -3.0}},
+                     {"pose_gt": {"x": 2.0, "y": 1.0}}]
+    p_detour = 4.0 + (20.0 ** 0.5 - 1.5)
+    s = ec.summarize_episode([{"collision": False, "action_executed": 1}] * 3, oracle_detour, 6.0, WP,
+                             stop_radius=0.5, shortest_path_m=2.0)
+    assert s["success"] and abs(s["path_length_m"] - p_detour) < 1e-9 and abs(s["spl"] - 2.0 / p_detour) < 1e-12, s
+    s = ec.summarize_episode([{"collision": True, "src": "contact", "action_executed": 1}] * 3, oracle_detour,
+                             6.0, WP, stop_radius=0.5, shortest_path_m=2.0)
+    assert not s["success"] and s["spl"] == 0.0 and abs(s["path_length_m"] - p_detour) < 1e-9, s
+    # 进圆后飞过头再回来：过头那段不进 p_i（与 success=goal_reach_ever 同口径，不考停的时机）。
+    oracle_over = [{"pose_gt": {"x": 0.0, "y": 1.0}}, {"pose_gt": {"x": 4.0, "y": 1.0}},
+                   {"pose_gt": {"x": 2.0, "y": 1.0}}]
+    s = ec.summarize_episode([{"collision": False, "action_executed": 1}] * 3, oracle_over, 6.0, WP,
+                             stop_radius=0.5, shortest_path_m=0.5)
+    assert s["success"] and abs(s["path_length_m"] - 0.5) < 1e-12 and abs(s["spl"] - 1.0) < 1e-12, s
+    # campus 的 goal_radius 决定 success，spl 跟着它：到过 1.5 m 内但没进 0.5 m -> success 假 -> spl 0。
+    s = l1(actions, one_m, stop_radius=0.5, goal_radius=0.5)
+    assert s["spl"] is None, "没给 l_i 时不得给 spl"
+    s = ec.summarize_episode(actions, one_m, 6.0, WP, stop_radius=0.5, goal_radius=0.5, shortest_path_m=1.0)
+    assert s["spl"] == 0.0 and s["reach_ever"], s
+
     print("test_eval_summary: PASS")
     return 0
 
