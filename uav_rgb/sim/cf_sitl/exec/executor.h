@@ -27,6 +27,7 @@ typedef struct {
 	float takeoff_climb_rate_mps;                 // 起飞时高度参考的爬升速率
 	float ready_height_tol_m, ready_vz_tol_mps, ready_hold_s; // 到达目标高度的判据
 	float tof_timeout_s;                          // 飞行中 ToF 连续无效超过此时长 → FAILSAFE
+	float tof_airborne_m;                         // 高度估计曾 ≥ 此值才算离地，之后 ToF 超时才判 FAILSAFE（地面附近读数在最小量程边缘抖动）
 	float arm_yaw_stick;                          // 解锁手势的偏航杆（固件要求 > 0.95，control.ino:121）
 } cf_exec_params;
 
@@ -50,6 +51,7 @@ typedef struct {
 	float target_height_m, height_ref_m;
 	float height_est_m, vz_est_mps;   // g-h 观测器状态
 	int height_valid;                 // 起飞后收到过有效 ToF（之前 ToF 在最小量程内，按高度 0 处理）
+	int airborne;                     // 高度估计曾 ≥ tof_airborne_m；ToF 超时失效保护只在这之后生效
 	float last_tof_valid_s;
 	float hover_stick;                // 悬停油门杆：前馈 + 积分
 	float flow_vel[2];                // 最近一帧光流换算速度（未滤波）

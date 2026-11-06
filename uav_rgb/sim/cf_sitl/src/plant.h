@@ -102,6 +102,7 @@ struct Params {
 		e.takeoff_climb_rate_mps = (float)numf(ex, "takeoff_climb_rate_mps");
 		e.ready_height_tol_m = (float)numf(ex, "ready_height_tol_m"); e.ready_vz_tol_mps = (float)numf(ex, "ready_vz_tol_mps");
 		e.ready_hold_s = (float)numf(ex, "ready_hold_s"); e.tof_timeout_s = (float)numf(ex, "tof_timeout_s");
+		e.tof_airborne_m = (float)numf(ex, "tof_airborne_m");
 		e.arm_yaw_stick = (float)numf(ex, "arm_yaw_stick");
 		return P;
 	}

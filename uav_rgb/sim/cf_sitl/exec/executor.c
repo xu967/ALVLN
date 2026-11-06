@@ -58,6 +58,7 @@ static void observe(cf_exec *e, const cf_exec_input *in) {
 			if (ts > 0.0f) e->vz_est_mps += p->height_filter_beta * r / ts;
 		}
 		e->last_tof_valid_s = in->t_s;
+		if (e->height_est_m >= p->tof_airborne_m) e->airborne = 1;
 	}
 	// 速度 = (光流角速率 − 陀螺分量)·高度；无效帧当作 0（开环悬停），积分同时冻结
 	if (in->flow_new) {
@@ -109,9 +110,11 @@ void cf_exec_tick(cf_exec *e, const cf_exec_input *in) {
 	cf_exec_sticks s = {0.0f, 0.0f, 0.0f, 0.0f};
 	observe(e, in);
 
-	// ToF 失效：只在离地后（收到过有效 ToF）判定；地面上 ToF 在最小量程内本来就无效
+	// ToF 失效：只在离地后判定。地面上读数在最小量程（4 cm）边缘：机体原点离地 2 cm 时噪声偶尔越过量程下限
+	// 给出一个"有效"样本，之后又连续无效——若只看 height_valid 会在起飞前误判 FAILSAFE（Gazebo 冒烟实测）。
+	// 所以要求高度估计曾 ≥ tof_airborne_m（真离地）后，ToF 超时才算失效。
 	const int flying = e->state == CF_EXEC_TAKEOFF || e->state == CF_EXEC_READY || e->state == CF_EXEC_ACTING;
-	if (flying && e->height_valid && in->t_s - e->last_tof_valid_s > p->tof_timeout_s) e->state = CF_EXEC_FAILSAFE;
+	if (flying && e->airborne && in->t_s - e->last_tof_valid_s > p->tof_timeout_s) e->state = CF_EXEC_FAILSAFE;
 
 	switch (e->state) {
 	case CF_EXEC_DISARMED:

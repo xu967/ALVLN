@@ -87,6 +87,7 @@
       "ready_vz_tol_mps": 0.1,
       "ready_hold_s": 1.0,
       "tof_timeout_s": 0.5,
+      "tof_airborne_m": 0.15,
       "arm_yaw_stick": 1.0
     },
     "unit": "见键名后缀；kp/kd/ki 的单位：高度环 杆量/m、杆量/(m/s)、杆量/(m·s)；速度环 rad/(m/s)、rad/m",
@@ -103,6 +104,7 @@
       "takeoff_climb_rate_mps": "避免 2 m 阶跃让油门饱和、积分卷绕；4 s 爬到 2 m，留 ~10 s 给稳定与 READY 判据",
       "ready_height_tol_m|ready_vz_tol_mps|ready_hold_s": "HANDOVER：误差 <0.1 m 且 |vz| 小持续 1 s → READY；vz 阈值取与高度阈值同量级",
       "tof_timeout_s": "HANDOVER：ToF 无效超过 0.5 s → FAILSAFE（15 个 ToF 样本）",
+      "tof_airborne_m": "ToF 失效保护的生效门槛：高度估计曾 ≥ 0.15 m（tof_range_min 0.04 的 3.75 倍）才算离地。机体原点离地约 2 cm 时 ToF 读数在量程下限边缘，噪声偶尔给出一个有效样本后又连续无效，只看 height_valid 会在起飞前误判 FAILSAFE（2026-11-07 Gazebo 冒烟 noaux_unthrottled 实测）",
       "arm_yaw_stick": "固件解锁手势要求偏航杆 > 0.95（control.ino:121），取满杆"
     }
   },
