@@ -41,6 +41,20 @@ GEOMETRY_VERSION = "3dgs.v1"
 # FORWARD 下沿航向后退超过这个距离判执行器失控（见 run_episode 注释）；cf_sitl 悬停漂移实测 1–2 cm/步，
 # FORWARD 首步也至少 +3 cm，5 cm 留出两倍余量。
 ANOMALY_BACK_M = 0.05
+# 低质量帧阈值：渲染帧灰度 4 邻域拉普拉斯方差（320x240）。Callinstrasse pilot 1306 帧（2026-11-07）
+# 双峰：朝未观测植被背面的"雾墙"帧 1–30（18 帧，全在 route 1/4 出生点），30–60 一帧没有，正常帧 ≥100
+# （p5=150，中位 415）。取空带上沿 60：只标雾帧，不碰 60–100 的 6 帧轻微糊。只标记不丢帧，丢不丢由
+# preprocess 决定；分辨率/FOV 变了阈值要重标（tmp/agent3-3dgs/lapvar_hist.py）。
+FRAME_LAPVAR_MIN = 60.0
+
+
+def frame_quality(rgb, depth):
+    """单帧质量：lapvar（灰度 4 邻域拉普拉斯方差）、hole_frac（alpha<0.05 即 depth==0 的像素占比）、low（雾/糊）。"""
+    gray = np.asarray(rgb, dtype=np.float64).mean(axis=2)
+    lap = 4.0 * gray[1:-1, 1:-1] - gray[:-2, 1:-1] - gray[2:, 1:-1] - gray[1:-1, :-2] - gray[1:-1, 2:]
+    lapvar = float(lap.var())
+    hole = float(np.mean(np.asarray(depth) <= 0.0))
+    return {"lapvar": round(lapvar, 1), "hole_frac": round(hole, 4), "low": bool(lapvar < FRAME_LAPVAR_MIN)}
 
 
 def _sha256(path):
@@ -212,9 +226,12 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
     wp = scene.get("waypoint") or {}
     stop_streak, stopped_on_goal = 0, False
     anomaly = None
+    n_low_quality = 0
     error = None
     if hasattr(policy, "prev"):        # 每集重置教师滞回
         policy.prev = None
+    if hasattr(policy, "n_plan_fail"):   # A* 教师的规划失败计数是实例级的，按集归零才能落进本集 manifest
+        policy.n_plan_fail = 0
     t_wall = time.perf_counter()
 
     try:
@@ -227,6 +244,8 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
                         scene.get("camera", {}).get("pitch_deg", 0.0)))
             render_ms.append(ms)
             t_rgb = dyn.t
+            quality = frame_quality(rgb, depth)
+            n_low_quality += int(quality["low"])
             rgb_ok = True
             try:
                 _write_png(os.path.join(out_dir, "rgb_%05d.png" % i), rgb)
@@ -280,6 +299,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
                 "infer_ms": infer_ms,
                 "render_ms": ms,
                 "clearance_m": occ.clearance(x, y, state["z"]),
+                "frame_quality": quality,       # lapvar / hole_frac / low（阈值 FRAME_LAPVAR_MIN）；只标记不丢帧
                 "depth_file": ("depth/depth_%05d.npy" % i) if save_depth else None,
                 "pose_gt": {"x": x, "y": y, "z": state["z"],
                             "yaw_deg": yaw},
@@ -374,8 +394,17 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
                                                   renderer.fov_deg)[0, 0],
                        "fy": scene_mod.intrinsics(renderer.width, renderer.height,
                                                   renderer.fov_deg)[1, 1],
-                       "cx": renderer.width / 2.0, "cy": renderer.height / 2.0},
+                       "cx": renderer.width / 2.0, "cy": renderer.height / 2.0,
+                       # 水平 FOV 与安装：cf_sitl 用 e1_mini.json camera_mount（含 xyz 偏移、pitch），
+                       # cf_blackbox 只有 scene.camera.pitch_deg；写进 manifest 便于和 Gazebo 相机对账。
+                       "fov_deg": renderer.fov_deg,
+                       "mount": (dyn.params.camera_mount if dynamics == "cf_sitl"
+                                 else {"xyz": [0.0, 0.0, 0.0],
+                                       "pitch_deg": float(scene.get("camera", {}).get("pitch_deg", 0.0))})},
             "camera_source": "gsplat",
+            # 低质量帧统计（阈值见 FRAME_LAPVAR_MIN）；每帧明细在 actions.jsonl 的 frame_quality。
+            "frame_quality": {"lapvar_min": FRAME_LAPVAR_MIN, "n_low": n_low_quality,
+                              "low_frac": round(n_low_quality / rows_ok, 4) if rows_ok else None},
             "renderer": renderer.stats(),
             "collision_proxy": occ.summary(),
             "validity": {
@@ -397,6 +426,9 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
             "stopped_on_collision": stopped,
             "stop_radius": stop_radius,            # 教师 goal-stop 半径（深度教师/forward 为 None）
             "stopped_on_goal": stopped_on_goal,
+            # A* 教师 fail-closed 输出 SAFE 的步数（被围死 / waypoint 在占据里）：这些 SAFE 在画面里没有
+            # 悬停依据，>0 的集不该进训练集，demo_3dgs_routes 的健康检查按它标红。非 A* 教师为 None。
+            "planner_failures": getattr(policy, "n_plan_fail", None),
             "error": error,
             "notes": [
                 ("3DGS 在线渲染，无 Gazebo；位姿由 E1 MINI 固件在环（cf_sitl_proc）推进，"

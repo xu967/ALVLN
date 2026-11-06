@@ -114,6 +114,7 @@ class TestCollect3dgs(unittest.TestCase):
             self.assertEqual(m["requested_steps"], 4)            # 没给 --steps 时用 routes[1].max_steps
             self.assertEqual((m["teacher"], m["planner"], m["stop_radius"]), ("plan_action", "astar_occ", 0.5))
             self.assertEqual(m["teacher_version"], "uavrgb.teacher_occ.v1")
+            self.assertEqual(m["planner_failures"], 0)            # 走廊畅通：A* 没有 fail-closed 过
             with open(os.path.join(out, "ep_00000", "actions.jsonl")) as f:
                 rows = [json.loads(x) for x in f]
             self.assertEqual(rows[0]["action_executed"], 3)      # YAW_RIGHT：航向 +y，目标在 +x
@@ -123,6 +124,7 @@ class TestCollect3dgs(unittest.TestCase):
             self.assertEqual(r0.returncode, 0, r0.stderr[-2000:])
             m0 = _load(os.path.join(tmp, "r0", "ep_00000", "episode_manifest.json"))
             self.assertEqual(m0["route"]["index"], 0)
+            self.assertIsNone(m0["planner_failures"])            # forward 策略没有规划器
             self.assertEqual(m0["scene"]["spawn"], scene["spawn"])
             self.assertNotEqual(m0["task_id"], m["task_id"])
             self.assertEqual(m0["geometry_gid"], m["geometry_gid"])
@@ -130,6 +132,30 @@ class TestCollect3dgs(unittest.TestCase):
                         "--mock-renderer", "--route", "2", "--steps", "1"])
             self.assertNotEqual(bad.returncode, 0)
             self.assertIn("route 2", bad.stderr)
+
+    def test_frame_quality_marked_not_dropped(self):
+        """每帧 frame_quality（lapvar / hole_frac / low）写进 actions.jsonl、manifest 汇总 n_low；雾帧只标不丢。"""
+        import numpy as np
+        flat = np.full((240, 320, 3), 128, np.uint8)                  # 纯雾：lapvar 0
+        q = collect.frame_quality(flat, np.zeros((240, 320), np.float32))
+        self.assertEqual((q["lapvar"], q["hole_frac"], q["low"]), (0.0, 1.0, True))
+        noisy = np.random.default_rng(0).integers(0, 255, (240, 320, 3), np.uint8)
+        self.assertFalse(collect.frame_quality(noisy, np.ones((240, 320), np.float32))["low"])
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_dir = os.path.join(tmp, "scene")
+            scene_mod.make_corridor(scene_dir, seed=2, length=12.0)
+            out = os.path.join(tmp, "ep")
+            r = _collect(os.path.join(scene_dir, "scene.json"), out, "--policy", "forward")
+            self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+            m = _load(os.path.join(out, "ep_00000", "episode_manifest.json"))
+            with open(os.path.join(out, "ep_00000", "actions.jsonl")) as f:
+                rows = [json.loads(x) for x in f]
+            self.assertEqual(len(rows), 3)                              # 不丢帧
+            self.assertTrue(all(set(x["frame_quality"]) == {"lapvar", "hole_frac", "low"} for x in rows))
+            self.assertEqual(m["frame_quality"]["lapvar_min"], collect.FRAME_LAPVAR_MIN)
+            self.assertEqual(m["frame_quality"]["n_low"], sum(x["frame_quality"]["low"] for x in rows))
+            self.assertEqual(m["camera"]["fov_deg"], 60.0)              # 合成场景 scene.camera.fov_deg
+            self.assertEqual(m["camera"]["mount"]["pitch_deg"], 0.0)
 
 
 class TestSceneIdentity(unittest.TestCase):
