@@ -11,6 +11,8 @@
 - CF-Drone 本地 36 文件改动只是 CRLF（`git diff --ignore-all-space` 为空），固件与 e7f507f 一致。
 - 05:25 建 5 个 worktree（`$DATA_ROOT/uav_rgb/tmp/wt-{sitl,viz,data,3dgs,src}-20261107`，分支同名），公共简报 `tmp/phase3-20261107/BRIEF.md`，报告目录 `tmp/phase3-20261107/reports/`。理由：流水线逐集起新进程读主工作树的 `sim/tools/*.py`、`e1_mini.json`，并 mmap `tmp/build-cf-sitl/*.so`、用 `build/check/` 二进制；agent 直接改主目录会让数据集前后集不一致。
 - 05:28 派出 5 个并行 agent（上限 6）：SITL（固件在环保真度、倒飞/悬停漂移根因、`build-cf-sitl-s3`）、VIZ（看真实视频帧找可视化 bug）、DATA（教师/采集/评测/审计/preprocess，森林膨胀按 (vehicle,task)、preprocess 跨族打包、compare_datasets 骨架）、3DGS（pilot 重跑守护进程 + 真实场景评估 + 相机一致性）、SRC（C++/CUDA 读审 + B4 输入一致性对拍，`build-src-s3`）。都不 commit，不起 Gazebo，`--parallel 2`。
+- 05:50 用户拍板：相机参数按老实验（60°/320×240，Gazebo 与 3DGS 统一；Callinstrasse scene.json 的 64.9° 待 3DGS pilot 结束后改回并重跑 pilot）；排期同意；论文机器人/视觉并齐；用户团队将实地自采 3DGS（规范 `docs/DATASET_3DGS_SELF_CAPTURE.md`）；视频优先。
+- 05:55 v0 demo 短片：`$DATA_ROOT/uav_rgb/demo-e1-20261107/reel/demo_reel_v0.mp4`（296 s，`tools/make_demo_reel.py`，3DGS 6 路线 + 森林）。SRC 分支已审并合并（752fd9f）；GitHub 到 45336a4。
 - 待办：收 5 份报告 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
 
 ---
