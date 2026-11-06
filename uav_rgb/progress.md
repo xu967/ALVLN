@@ -16,6 +16,7 @@
 - 06:00 ALGO / 3DGS / DATA 三份报告收齐（`tmp/phase3-20261107/reports/`）。SRC(752fd9f)、DATA(9edf915)、3DGS(6842cab) 已合并进 main 并推送；VIZ 已在分支 fabecb3 落提交，等流水线 DONE 再合并（它改 E1 模板，会影响正在跑的评测）。
 - 3DGS P0：Callinstrasse 之前把相机平面当地面，nav z=2 实际离地 3.7 m，已修（nav_to_world t_z −1.6）。按用户决定 FOV 改回 60°（备份 scene.json.bak-20261107-0605-fov649），v3 路线+pilot 守护进程 PID/PGID 607752（`demo-e1-20261107/3dgs-callinstrasse-routes-v3-fov60/run.log`，pilot 输出 `datasets/e1-3dgs-callinstrasse-pilot-v3-fov60`，停：`kill -- -607752`）。
 - 06:10 规划 v2 算法定稿：P1 信念边际化 kino cost-to-go 软标签 + DAgger（主）、P2 双帧 + 深度分带辅助头、P3 探索；RL 教师改为 P1 后的 RL 微调；场景清单与评测协议进 `docs/PLAN_2026-11-07_demo_and_paper.md`。
+- 06:20 第四阶段派出 5 个开发 agent（+SITL 共 6）：TEACHER-P1（`plan_costs` + `teacher_belief.py` + 3DGS `--policy student` + `dagger_pipeline.py`，Callinstrasse 小规模硬/软标签对照）、STUDENT-P2（UAVR 升版双帧/prev-action/深度分带、`in_c=6`、辅助头、逐格 CE 算子、checkpoint v6、infer 协议）、SCENE-A（Wanderland 调研下载接入 + 碰撞代理 v3 网格真值对照）、SCENE-B（Mip-NeRF 360 garden/bicycle 接入 + `tools/scene_probe_quality.py`）、EVAL（SPL/CR/task_success 列、`tools/stats_report.py`、compare_datasets 补全、论文表模板、四组对照表）。worktree `tmp/wt-{teacher-p1,student-p2,scene-wanderland,scene-mipnerf,eval-matrix}`，简报 `tmp/phase3-20261107/BRIEF4.md`。
 - 待办：收 SITL 报告 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
 
 ---
