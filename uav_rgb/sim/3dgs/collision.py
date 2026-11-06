@@ -11,6 +11,13 @@
 
 仍是**近似代理**：高斯椭球不是真实表面，玻璃/薄叶/背面都可能漏；不能当 Gazebo
 contact 或真实碰撞真值。
+
+v3（2026-11-07）：同一套 Occupancy 接口多两条**真值几何**输入路径，给带 LiDAR/网格的场景
+（Wanderland）当碰撞真值、也给高斯代理做对照：
+  from_points()：米制点云（LiDAR raw_pcd.ply / COLMAP points3D）按体素计数占据，min_points 滤掉
+      空中噪点；from_mesh()：三角网格按 <= 半体素间距在面上撒点后走同一条路。
+  scene.json collision.source = "gaussians"（默认，v2）| "points" | "mesh"，collision.geometry 给文件
+  （相对 scene.json 目录），from_scene() 按它切换，collect_3dgs / planner / video 不用改。
 """
 import json
 import math
@@ -42,6 +49,142 @@ DEFAULT_MAX_SCALE_M = scene_mod.RENDER_DEFAULTS["max_scale_m"]   # 与渲染端�
 # "看得见就算实体"的 0.3 口径；1σ（0.61）会让相邻高斯之间留缝，3σ（0.01）把薄墙画成 3 倍厚。
 DEFAULT_SIGMA_K = 1.5
 PROXY_VERSION = "3dgs.occ.v2"
+# 真值几何路径的版本串（summary().proxy_version 按 source 取；高斯路径保持 v2 串，旧 manifest 可比）。
+TRUTH_VERSION = {"points": "3dgs.occ.v3.points", "mesh": "3dgs.occ.v3.mesh"}
+# min_points=3：LiDAR 稠密云里 0.1–0.2 m 体素内真实表面有几十到上千个点，1–2 个点的体素多是
+# 行人/多路径回波之类的空中噪声。Wanderland 1MlUucug 实测（0.2 m 体素、飞行层 1.8–2.2 m、抽稀 2）：
+# 19% 的占据格只有 1–2 个点，其中 84% 紧贴 ≥3 点的格（表面边缘，滤掉不影响障碍形状），其余孤立格
+# 离路线 >3 m；取 3 后路线最小净空不变。COLMAP 稀疏点云（每格常只有 1 个点）用 1。
+DEFAULT_MIN_POINTS = 3
+
+_PLY_TYPES = {"char": "i1", "int8": "i1", "uchar": "u1", "uint8": "u1", "short": "i2", "int16": "i2",
+              "ushort": "u2", "uint16": "u2", "int": "i4", "int32": "i4", "uint": "u4", "uint32": "u4",
+              "float": "f4", "float32": "f4", "double": "f8", "float64": "f8"}
+
+
+def read_ply_vertices(path, stride=1):
+    """通用 PLY：读顶点 x/y/z（任意数值类型）与三角面（若有 element face）。
+
+    返回 {"xyz": float64 [N,3], "faces": int64 [M,3] 或 None, "n_vertices": 文件内顶点数}。
+    其它顶点属性（颜色/法线）忽略；stride>1 时每 stride 个顶点取 1（有 faces 时不允许抽稀）。
+    支持 binary_little_endian / binary_big_endian / ascii；面列表只接受三角形（LiDAR 网格导出
+    都是三角面；四边形请先三角化）。
+    """
+    stride = int(stride)
+    if stride < 1:
+        raise ValueError("stride 必须 >= 1")
+    elements = []          # [(name, count, [(prop_name, dtype_str) | ("list", count_t, item_t, name)])]
+    with open(path, "rb") as f:
+        if f.readline().strip() != b"ply":
+            raise ValueError(f"{path} 不是 PLY")
+        fmt = None
+        while True:
+            line = f.readline()
+            if not line:
+                raise ValueError(f"{path} PLY 头不完整")
+            parts = line.decode("ascii", "replace").split()
+            if not parts or parts[0] == "comment" or parts[0] == "obj_info":
+                continue
+            if parts[0] == "format":
+                fmt = parts[1]
+            elif parts[0] == "element":
+                elements.append((parts[1], int(parts[2]), []))
+            elif parts[0] == "property":
+                if parts[1] == "list":
+                    elements[-1][2].append(("list", _PLY_TYPES[parts[2]], _PLY_TYPES[parts[3]], parts[4]))
+                else:
+                    elements[-1][2].append((parts[2], _PLY_TYPES[parts[1]]))
+            elif parts[0] == "end_header":
+                break
+        if fmt not in ("binary_little_endian", "binary_big_endian", "ascii"):
+            raise ValueError(f"{path}: 不支持的 PLY 格式 {fmt!r}")
+        endian = ">" if fmt == "binary_big_endian" else "<"
+        xyz, faces, n_vertices = None, None, 0
+        for name, count, props in elements:
+            if name == "vertex":
+                n_vertices = count
+                names = [p[0] for p in props]
+                if any(p[0] == "list" for p in props) or not {"x", "y", "z"} <= set(names):
+                    raise ValueError(f"{path}: vertex 元素必须有标量 x/y/z")
+                dt = np.dtype([(p[0], endian + p[1]) for p in props])
+                if fmt == "ascii":
+                    rows = np.loadtxt(_ascii_lines(f, count), dtype=np.float64, ndmin=2)
+                    if rows.shape[0] != count:
+                        raise ValueError(f"{path}: ascii 顶点行数与头不一致")
+                    cols = [names.index(k) for k in ("x", "y", "z")]
+                    xyz = rows[::stride][:, cols]
+                else:
+                    table = np.fromfile(f, dtype=dt, count=count)
+                    if len(table) != count:
+                        raise ValueError(f"{path}: 顶点数据不足（文件截断？）")
+                    table = table[::stride]
+                    xyz = np.stack([table["x"], table["y"], table["z"]], axis=1).astype(np.float64)
+            elif name == "face":
+                lists = [p for p in props if p[0] == "list"]
+                if len(props) != 1 or not lists:
+                    raise ValueError(f"{path}: 只支持单个 list 属性的 face 元素")
+                _, count_t, item_t, _ = lists[0]
+                if fmt == "ascii":
+                    tri = []
+                    for line in _ascii_lines(f, count):
+                        v = line.split()
+                        if int(v[0]) != 3:
+                            raise ValueError(f"{path}: 面不是三角形（{v[0]} 顶点）")
+                        tri.append([int(v[1]), int(v[2]), int(v[3])])
+                    faces = np.asarray(tri, dtype=np.int64).reshape(-1, 3)
+                else:
+                    dt = np.dtype([("n", endian + count_t), ("idx", endian + item_t, (3,))])
+                    table = np.fromfile(f, dtype=dt, count=count)
+                    if len(table) != count or (table["n"] != 3).any():
+                        raise ValueError(f"{path}: 面数据不足或含非三角形（只支持全三角网格）")
+                    faces = table["idx"].astype(np.int64)
+            else:
+                raise ValueError(f"{path}: 不支持的元素 {name!r}")
+        if xyz is None:
+            raise ValueError(f"{path}: 没有 vertex 元素")
+        if faces is not None:
+            if stride != 1:
+                raise ValueError("带 faces 的 PLY 不能 stride 抽稀（索引会错位）")
+            if len(faces) and (faces.min() < 0 or faces.max() >= n_vertices):
+                raise ValueError(f"{path}: 面索引越界")
+    return {"xyz": xyz, "faces": faces, "n_vertices": n_vertices}
+
+
+def _ascii_lines(f, count):
+    out = []
+    while len(out) < count:
+        line = f.readline()
+        if not line:
+            raise ValueError("ascii PLY 数据行不足")
+        if line.strip():
+            out.append(line.decode("ascii", "replace"))
+    return out
+
+
+def sample_mesh_surface(xyz, faces, spacing, seed=0):
+    """三角网格 -> 面上均匀撒点（含原顶点），相邻点间距约 <= spacing（米）。
+
+    每个三角形撒 ceil(面积 / spacing²) 个点（单位面积点数 1/spacing²，再加三个顶点），
+    用固定种子的重心坐标采样，结果可复现；只用于占据体素化，不是表面重建。
+    """
+    xyz = np.asarray(xyz, dtype=np.float64)
+    faces = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
+    if spacing <= 0:
+        raise ValueError("spacing 必须为正")
+    if len(faces) == 0:
+        return xyz.copy()
+    a, b, c = xyz[faces[:, 0]], xyz[faces[:, 1]], xyz[faces[:, 2]]
+    area = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
+    n_per = np.ceil(area / (spacing * spacing)).astype(np.int64)
+    n_per = np.where(area > 0, np.maximum(n_per, 1), 0)
+    total = int(n_per.sum())
+    rng = np.random.default_rng(seed)
+    tri = np.repeat(np.arange(len(faces)), n_per)
+    u, v = rng.random(total), rng.random(total)
+    flip = u + v > 1.0                       # 把单位正方形折成三角形，重心坐标均匀
+    u[flip], v[flip] = 1.0 - u[flip], 1.0 - v[flip]
+    pts = a[tri] + u[:, None] * (b[tri] - a[tri]) + v[:, None] * (c[tri] - a[tri])
+    return np.concatenate([xyz, pts], axis=0)
 
 
 def load_body_envelope(path=None):
@@ -104,7 +247,8 @@ class Occupancy:
                  nav_to_world=None, z_range=(1.65, 2.35), voxel_m=0.1,
                  body_radius_m=0.102, body_half_height_m=0.028, inflate_m=0.0,
                  opacity_min=DEFAULT_OPACITY_MIN, max_scale_m=DEFAULT_MAX_SCALE_M,
-                 sigma_k=DEFAULT_SIGMA_K, ground_z=0.0, pad_m=1.0):
+                 sigma_k=DEFAULT_SIGMA_K, ground_z=0.0, pad_m=1.0,
+                 min_points=1, source="gaussians"):
         pts = np.asarray(means, dtype=np.float64)
         if pts.ndim != 2 or pts.shape[1] < 3:
             raise ValueError("means 必须是 Nx3")
@@ -112,6 +256,8 @@ class Occupancy:
             raise ValueError("z_range/voxel/inflate 参数无效")
         if not (body_radius_m > 0 and body_half_height_m > 0 and sigma_k > 0):
             raise ValueError("机体包络与 sigma_k 必须为正")
+        if int(min_points) < 1 or (int(min_points) > 1 and scales is not None):
+            raise ValueError("min_points 必须 >= 1，且只对纯点输入（scales=None）有意义")
         self.z_range = (float(z_range[0]), float(z_range[1]))
         self.voxel = float(voxel_m)
         self.body_radius = float(body_radius_m)
@@ -121,6 +267,9 @@ class Occupancy:
         self.max_scale = None if max_scale_m is None else float(max_scale_m)
         self.sigma_k = float(sigma_k)
         self.ground_z = float(ground_z)
+        self.min_points = int(min_points)
+        self.source = str(source)
+        self.proxy_version = TRUTH_VERSION.get(self.source, PROXY_VERSION)
         self.n_points = len(pts)
         self.n_kept = 0
         self.n_in_range = 0
@@ -193,12 +342,21 @@ class Occupancy:
     def _rasterize(self, occ, pts, half, rot, sc):
         """(c) 椭球落体素：对每个高斯轴对齐包围盒内的体素中心做马氏距离 <= k 测试。
 
-        均值所在体素总是占据（再小的高斯也至少占一格）。
+        均值所在体素总是占据（再小的高斯也至少占一格）。纯点输入（rot None）按体素计数，
+        点数 >= min_points 的体素才占据（v3 真值点云的噪点过滤）。
         """
         c0 = self._cell(pts)
-        self._mark(occ, c0)
         if rot is None:
+            if self.min_points > 1:
+                shape = np.array(self.shape)
+                ok = (c0 >= 0).all(axis=1) & (c0 < shape).all(axis=1)
+                flat = np.ravel_multi_index(c0[ok].T, self.shape)
+                uniq, cnt = np.unique(flat, return_counts=True)
+                occ.reshape(-1)[uniq[cnt >= self.min_points]] = True
+            else:
+                self._mark(occ, c0)
             return
+        self._mark(occ, c0)
         ncell = np.ceil(half / self.voxel - 1e-9).astype(int)    # 每轴半宽体素数
         nmax = ncell.max(axis=1)
         inv_s = 1.0 / sc
@@ -313,7 +471,14 @@ class Occupancy:
         return float(min(ground, d))
 
     def summary(self):
-        return {"proxy_version": PROXY_VERSION,
+        if self.source == "gaussians":
+            note = ("approximate proxy: opacity-filtered Gaussian ellipsoids in nav frame, "
+                    "swept along segments; not collision ground truth")
+        else:
+            note = (f"metric {self.source} geometry voxelised in nav frame (min_points={self.min_points}), "
+                    "swept along segments; sensor-grade truth, not a physics contact")
+        return {"proxy_version": self.proxy_version, "source": self.source,
+                "geometry": getattr(self, "geometry_source", None),
                 "n_points": self.n_points, "n_kept": self.n_kept,
                 "n_in_z_range": self.n_in_range, "n_occupied_cells": self.n_occupied,
                 "z_range": list(self.z_range), "voxel_m": self.voxel,
@@ -322,9 +487,8 @@ class Occupancy:
                 "envelope_source": getattr(self, "envelope_source", None),
                 "margin_m": self.inflate, "dilation_cells": list(self.dilation_cells),
                 "opacity_min": self.opacity_min, "max_scale_m": self.max_scale,
-                "sigma_k": self.sigma_k, "ground_z": self.ground_z,
-                "note": "approximate proxy: opacity-filtered Gaussian ellipsoids in nav frame, "
-                        "swept along segments; not collision ground truth"}
+                "sigma_k": self.sigma_k, "min_points": self.min_points, "ground_z": self.ground_z,
+                "note": note}
 
 
 def resolve_envelope(spec):
@@ -340,12 +504,33 @@ def resolve_envelope(spec):
     raise ValueError(f"collision.envelope 无效: {spec!r}")
 
 
-def from_scene(scene, envelope=None, gaussians=None):
+def from_points(points, *, nav_to_world=None, z_range=(1.65, 2.35), voxel_m=0.1,
+                body_radius_m=0.102, body_half_height_m=0.028, inflate_m=0.0,
+                min_points=DEFAULT_MIN_POINTS, ground_z=0.0, source="points"):
+    """米制点云（世界系，LiDAR / COLMAP points3D）-> 体素占据真值；接口与高斯代理同。"""
+    return Occupancy(points, None, None, None, nav_to_world=nav_to_world, z_range=z_range,
+                     voxel_m=voxel_m, body_radius_m=body_radius_m,
+                     body_half_height_m=body_half_height_m, inflate_m=inflate_m,
+                     max_scale_m=None, ground_z=ground_z, min_points=min_points, source=source)
+
+
+def from_mesh(xyz, faces, *, voxel_m=0.1, seed=0, **kw):
+    """三角网格（世界系，米）-> 面上按半体素间距撒点 -> from_points；min_points 固定 1
+    （撒点密度由我们控制，不存在噪点）。"""
+    pts = sample_mesh_surface(xyz, faces, spacing=0.5 * float(voxel_m), seed=seed)
+    kw.pop("min_points", None)
+    return from_points(pts, voxel_m=voxel_m, min_points=1, source="mesh", **kw)
+
+
+def from_scene(scene, envelope=None, gaussians=None, source=None):
     """按 scene.json 的 collision 段建占据；机体包络默认 E1 MINI（e1_mini.json）。
 
     collision 段键：z_slice（栅格高度范围）、voxel_m、margin_m（机体半径外的余量，默认 0）、
     opacity_min、sigma_k、envelope（"e1_mini" | "x3" | {"radius_m","half_height_m"}）、
-    max_scale_m（默认跟 render.max_scale_m 同值）。
+    max_scale_m（默认跟 render.max_scale_m 同值）；
+    v3：source（"gaussians" 默认 | "points" | "mesh"）、geometry（点云/网格 PLY，相对 scene.json
+    目录；与 3DGS 同一世界系，nav_to_world 一并作用）、min_points（points 的体素计数阈值，默认 3）、
+    geometry_stride（点云抽稀步长，默认 1）。参数 source 覆盖 scene.json，对照脚本用。
     v1 的 inflate_m / drone_radius_m 把机体尺寸混在膨胀里，v2 一律忽略并提示。
     gaussians 可传 read_gaussian_ply 的结果，避免渲染端已读过的 511 MB PLY 再读一遍。
     """
@@ -356,18 +541,34 @@ def from_scene(scene, envelope=None, gaussians=None):
         print(f"collision: 忽略 v1 键 {legacy}；v2 机体包络来自 collision.envelope"
               "（默认 E1 MINI），余量用 margin_m", file=sys.stderr)
     env = resolve_envelope(envelope if envelope is not None else c.get("envelope"))
-    g = gaussians or scene_mod.read_gaussian_ply(scene["ply_path"])
-    occ = Occupancy(g["means"], g["scales"], g["quats"], g["opacities"],
-                    nav_to_world=scene.get("_nav_to_world"),
-                    z_range=c.get("z_slice", (1.65, 2.35)),
-                    voxel_m=c.get("voxel_m", 0.1),
-                    body_radius_m=env["radius_m"], body_half_height_m=env["half_height_m"],
-                    inflate_m=c.get("margin_m", 0.0),
-                    opacity_min=c.get("opacity_min", DEFAULT_OPACITY_MIN),
-                    max_scale_m=c.get("max_scale_m",
-                                      scene_mod.render_options(scene)["max_scale_m"]),
-                    sigma_k=c.get("sigma_k", DEFAULT_SIGMA_K),
-                    ground_z=scene.get("ground_z", 0.0))
+    src = source if source is not None else c.get("source", "gaussians")
+    if src not in ("gaussians", "points", "mesh"):
+        raise ValueError(f"collision.source 无效: {src!r}（gaussians | points | mesh）")
+    common = dict(nav_to_world=scene.get("_nav_to_world"),
+                  z_range=c.get("z_slice", (1.65, 2.35)), voxel_m=c.get("voxel_m", 0.1),
+                  body_radius_m=env["radius_m"], body_half_height_m=env["half_height_m"],
+                  inflate_m=c.get("margin_m", 0.0), ground_z=scene.get("ground_z", 0.0))
+    if src == "gaussians":
+        g = gaussians or scene_mod.read_gaussian_ply(scene["ply_path"])
+        occ = Occupancy(g["means"], g["scales"], g["quats"], g["opacities"],
+                        opacity_min=c.get("opacity_min", DEFAULT_OPACITY_MIN),
+                        max_scale_m=c.get("max_scale_m",
+                                          scene_mod.render_options(scene)["max_scale_m"]),
+                        sigma_k=c.get("sigma_k", DEFAULT_SIGMA_K), **common)
+        occ.geometry_source = scene.get("ply")
+    else:
+        if not c.get("geometry"):
+            raise ValueError(f"collision.source={src} 需要 collision.geometry（点云/网格 PLY 路径）")
+        path = os.path.join(scene["dir"], c["geometry"])
+        if src == "points":
+            ply = read_ply_vertices(path, stride=int(c.get("geometry_stride", 1)))
+            occ = from_points(ply["xyz"], min_points=int(c.get("min_points", DEFAULT_MIN_POINTS)), **common)
+        else:
+            ply = read_ply_vertices(path)
+            if ply["faces"] is None:
+                raise ValueError(f"{path} 没有 face 元素，不是网格；点云请用 source=points")
+            occ = from_mesh(ply["xyz"], ply["faces"], **common)
+        occ.geometry_source = c["geometry"]
     occ.envelope_source = env.get("source")
     return occ
 

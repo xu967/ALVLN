@@ -211,5 +211,161 @@ class TestEnvelopeAndScene(unittest.TestCase):
             self.assertGreaterEqual(occ_x3.grid.sum(), occ.grid.sum())
 
 
+def _write_ply(path, xyz, faces=None, fmt="binary_little_endian", rgb=False):
+    """写测试用 PLY：double xyz（Open3D/MetaCam 风格）+ 可选 uchar rgb + 可选三角面。"""
+    n = len(xyz)
+    head = [f"ply", f"format {fmt} 1.0", f"element vertex {n}",
+            "property double x", "property double y", "property double z"]
+    if rgb:
+        head += ["property uchar red", "property uchar green", "property uchar blue"]
+    if faces is not None:
+        head += [f"element face {len(faces)}", "property list uchar int vertex_indices"]
+    head += ["end_header"]
+    with open(path, "wb") as f:
+        f.write(("\n".join(head) + "\n").encode("ascii"))
+        if fmt == "ascii":
+            for i, p in enumerate(xyz):
+                row = " ".join(f"{v:.6f}" for v in p) + (" 10 20 30" if rgb else "")
+                f.write((row + "\n").encode("ascii"))
+            for fc in (faces if faces is not None else []):
+                f.write(("3 " + " ".join(str(int(v)) for v in fc) + "\n").encode("ascii"))
+        else:
+            e = "<" if fmt == "binary_little_endian" else ">"
+            vt = [("x", e + "f8"), ("y", e + "f8"), ("z", e + "f8")] + ([("r", "u1"), ("g", "u1"), ("b", "u1")] if rgb else [])
+            arr = np.zeros(n, dtype=np.dtype(vt))
+            arr["x"], arr["y"], arr["z"] = xyz[:, 0], xyz[:, 1], xyz[:, 2]
+            f.write(arr.tobytes())
+            if faces is not None:
+                ft = np.dtype([("n", "u1"), ("i", e + "i4", (3,))])
+                fa = np.zeros(len(faces), dtype=ft)
+                fa["n"], fa["i"] = 3, np.asarray(faces)
+                f.write(fa.tobytes())
+
+
+class TestTruthFromPoints(unittest.TestCase):
+    """v3：米制点云 / 网格 -> 同一 Occupancy 接口。"""
+
+    def wall_points(self, n_per_cell=5, noise=0):
+        # x=5 的墙：y∈[-1,1] 每 0.1 m 一簇 n_per_cell 个点（同 xy，z 在 2.0±0.03 同一层内），
+        # 这样每簇落在同一个体素里，min_points 的计数是确定的；再撒 noise 个孤立噪点
+        ys = np.repeat(np.arange(-1.0, 1.0, 0.1) + 0.05, n_per_cell)
+        zs = 2.0 + np.tile(np.linspace(-0.03, 0.03, n_per_cell), len(ys) // n_per_cell)
+        pts = np.stack([np.full(len(ys), 5.0), ys, zs], 1)
+        if noise:
+            # 孤立噪点放在 x∈[1,3] 的空域，彼此相距 > 0.3 m（一格一个）
+            nx = np.linspace(1.0, 3.0, noise)
+            pts = np.vstack([pts, np.stack([nx, np.zeros(noise), np.full(noise, 2.0)], 1)])
+        return pts
+
+    def test_wall_blocks_and_version(self):
+        occ = col.from_points(self.wall_points(), voxel_m=0.1, **E1)
+        self.assertEqual(occ.summary()["proxy_version"], col.TRUTH_VERSION["points"])
+        self.assertEqual(occ.summary()["source"], "points")
+        self.assertFalse(occ.collides(4.6, 0.0, 2.0))
+        hit, pt = occ.sweep((4.6, 0.0, 2.0), (5.4, 0.0, 2.0))
+        self.assertTrue(hit)
+        self.assertLess(abs(pt[0] - 4.9), 0.11, pt)
+        self.assertEqual(occ.sweep((4.5, -1.0, 2.0), (4.5, 1.0, 2.0)), (False, None))
+
+    def test_min_points_filters_isolated_noise(self):
+        pts = self.wall_points(noise=5)
+        noisy = col.from_points(pts, voxel_m=0.1, min_points=1, **E1)
+        clean = col.from_points(pts, voxel_m=0.1, min_points=3, **E1)
+        self.assertTrue(noisy.collides(2.0, 0.0, 2.0))         # 单点就算占据：噪点成了障碍
+        self.assertFalse(clean.collides(2.0, 0.0, 2.0))        # 每格 <3 点的孤立噪点被滤掉
+        self.assertTrue(clean.collides(5.0, 0.0, 2.0))         # 墙（每格 5 点）保留
+        self.assertEqual(noisy.raw.sum() - clean.raw.sum(), 5)
+
+    def test_min_points_only_for_pure_points(self):
+        m, s, q, o = thin_wall()
+        with self.assertRaises(ValueError):
+            col.Occupancy(m, s, q, o, min_points=3, **E1)
+        with self.assertRaises(ValueError):
+            col.from_points(self.wall_points(), min_points=0, **E1)
+
+    def test_points_outside_z_slice_ignored(self):
+        pts = self.wall_points()
+        pts[:, 2] = 1.0                                        # 全部压到 1 m：飞行层 1.65–2.35 外
+        occ = col.from_points(pts, voxel_m=0.1, **E1)
+        self.assertEqual(occ.n_in_range, 0)
+        self.assertFalse(occ.collides(5.0, 0.0, 2.0))
+
+    def test_nav_to_world_applied(self):
+        # 世界系 y-down（Wanderland/COLMAP）：nav z=up 对应世界 -y；墙放在世界系，查询用导航系
+        R = np.array([[0, 1, 0], [0, 0, -1], [-1, 0, 0]], dtype=np.float64)   # 列 = nav 轴在世界系
+        T = np.eye(4)
+        T[:3, :3] = R
+        T[:3, 3] = [0.0, 1.0, 0.0]
+        nav_pts = self.wall_points()
+        world_pts = nav_pts @ R.T + T[:3, 3]
+        occ = col.from_points(world_pts, nav_to_world=T, voxel_m=0.1, **E1)
+        ref = col.from_points(nav_pts, voxel_m=0.1, **E1)
+        self.assertEqual(occ.n_in_range, ref.n_in_range)
+        self.assertTrue(occ.collides(5.0, 0.0, 2.0))
+        self.assertFalse(occ.collides(4.0, 0.0, 2.0))
+
+    def test_mesh_surface_sampling_and_from_mesh(self):
+        # 两个三角形拼成 x=5、y∈[-1,1]、z∈[1.5,2.5] 的方形墙；只有 4 个顶点，靠撒点填满
+        xyz = np.array([[5, -1, 1.5], [5, 1, 1.5], [5, 1, 2.5], [5, -1, 2.5]], dtype=np.float64)
+        faces = np.array([[0, 1, 2], [0, 2, 3]])
+        pts = col.sample_mesh_surface(xyz, faces, spacing=0.05)
+        self.assertGreater(len(pts), 2.0 * 1.0 / 0.05 ** 2 * 0.8)             # ≈ 面积/间距²
+        self.assertTrue(np.allclose(pts[:, 0], 5.0))
+        occ = col.from_mesh(xyz, faces, voxel_m=0.1, **E1)
+        self.assertEqual(occ.summary()["proxy_version"], col.TRUTH_VERSION["mesh"])
+        self.assertEqual(occ.min_points, 1)
+        # 墙在 y∈[-1,1] 每 0.1 m 格都占据（顶点稀疏时 from_points 直接用顶点会漏）
+        for y in np.arange(-0.95, 1.0, 0.1):
+            self.assertTrue(occ.collides(5.0, y, 2.0), y)
+        self.assertFalse(occ.collides(5.0, 1.5, 2.0))
+        sparse = col.from_points(xyz, voxel_m=0.1, min_points=1, **E1)
+        self.assertFalse(sparse.collides(5.0, 0.0, 2.0))      # 对照：只用 4 个顶点中间是空的
+
+    def test_read_ply_vertices_formats(self):
+        xyz = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=np.float64) + 0.25
+        faces = np.array([[0, 1, 2], [0, 2, 3]])
+        with tempfile.TemporaryDirectory() as tmp:
+            for fmt in ("binary_little_endian", "binary_big_endian", "ascii"):
+                p = os.path.join(tmp, f"{fmt}.ply")
+                _write_ply(p, xyz, faces, fmt=fmt, rgb=True)
+                r = col.read_ply_vertices(p)
+                self.assertEqual(r["n_vertices"], 4, fmt)
+                self.assertTrue(np.allclose(r["xyz"], xyz), fmt)
+                self.assertTrue(np.array_equal(r["faces"], faces), fmt)
+            p = os.path.join(tmp, "pts.ply")
+            _write_ply(p, np.tile(xyz, (25, 1)), None, rgb=False)
+            r = col.read_ply_vertices(p, stride=4)
+            self.assertEqual(len(r["xyz"]), 25)
+            self.assertIsNone(r["faces"])
+            with self.assertRaises(ValueError):
+                col.read_ply_vertices(os.path.join(tmp, "ascii.ply"), stride=2)   # 带面不能抽稀
+
+    def test_from_scene_source_switch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_mod.make_corridor(tmp, seed=1, length=10.0)
+            scene = scene_mod.load_scene(os.path.join(tmp, "scene.json"))
+            g_occ = col.from_scene(scene)                        # 默认高斯代理
+            # 用高斯中心本身当「点云真值」：每个中心一个点，min_points=1
+            g = scene_mod.read_gaussian_ply(scene["ply_path"])
+            _write_ply(os.path.join(tmp, "truth.ply"), g["means"], None)
+            scene["collision"].update({"source": "points", "geometry": "truth.ply", "min_points": 1})
+            p_occ = col.from_scene(scene)
+            self.assertEqual(p_occ.source, "points")
+            self.assertEqual(p_occ.summary()["proxy_version"], col.TRUTH_VERSION["points"])
+            self.assertEqual(p_occ.summary()["geometry"], "truth.ply")
+            self.assertTrue(p_occ.collides(3.0, 3.9, 2.0))      # 墙
+            self.assertFalse(p_occ.collides(3.0, 0.0, 2.0))
+            # 同一 scene 强制回到高斯代理，结果与默认相同
+            back = col.from_scene(scene, source="gaussians")
+            self.assertEqual(back.summary()["proxy_version"], col.PROXY_VERSION)
+            self.assertEqual(back.raw.sum(), g_occ.raw.sum())
+            scene["collision"]["source"] = "lidar"
+            with self.assertRaises(ValueError):
+                col.from_scene(scene)
+            scene["collision"]["source"] = "mesh"
+            with self.assertRaises(ValueError):                 # 点云文件没有面，不能当网格
+                col.from_scene(scene)
+
+
 if __name__ == "__main__":
     unittest.main()
