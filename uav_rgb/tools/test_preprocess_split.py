@@ -14,6 +14,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "sim" / "tools"))
 import asset_campus  # noqa: E402
+import scene_forest as sf  # noqa: E402
 import split_manifest as sm  # noqa: E402
 
 PY = sys.executable
@@ -30,10 +31,10 @@ def read_meta(path):
         return json.loads(f.read(meta_len))
 
 
-def gid_for(split, tag="g"):
+def gid_for(split, tag="g", salt=None):
     for i in range(10000):
         gid = "%s%d" % (tag, i)
-        if sm.split_for_gid(gid) == split:
+        if sm.split_for_gid(gid, salt) == split:
             return gid
     raise AssertionError("找不到 %s split 的 gid" % split)
 
@@ -202,6 +203,94 @@ class PreprocessSplitTests(unittest.TestCase):
         self.assertEqual(meta["splits"]["test"], 4)
         self.assertTrue(meta["collision_filter"]["drop_collision_steps"])
         self.assertEqual(meta["collision_dropped"], 1)
+
+    def test_forest_version_accepted_without_frozen_flag(self):
+        # forest_e1 与柱阵同约定「版本串 = salt」；episode manifest 不带 split_salt，按 geometry_version 复算。
+        man = self.man(self.eps[0])
+        man.update(split="train", geometry_version=sf.GEOMETRY_VERSION_FOREST,
+                   geometry_gid=gid_for("train", "forest", sf.GEOMETRY_VERSION_FOREST))
+        self.save(self.eps[0], man)
+        r = self.run_pre(self.tmp / "ds_forest", [self.eps[0]])
+        self.assertEqual(r.returncode, 0, r.stderr)
+        meta = read_meta(self.tmp / "ds_forest" / "dataset.uavr")
+        self.assertEqual(meta["geometry_version"], sf.GEOMETRY_VERSION_FOREST)
+        self.assertEqual(meta["split_scheme"], "geometry_gid")
+        self.assertEqual(meta["split_salt"], sf.GEOMETRY_VERSION_FOREST)
+        self.assertFalse(meta["mixed_geometry"])
+        self.assertEqual(list(meta["geometry_versions"]), [sf.GEOMETRY_VERSION_FOREST])
+        self.assertEqual(meta["geometry_versions"][sf.GEOMETRY_VERSION_FOREST]["n_episodes"], 1)
+
+    def _make_three_families(self):
+        """ep1 柱阵、ep2 森林、ep3 3DGS，各按本族 salt 取 gid；hold/window 一致（混包只放开族身份键）。"""
+        base, forest, gs = self.eps
+        for ep, gver, policy, recorded_salt, split in (
+                (base, sm.SPLIT_SALT, None, None, "train"),
+                (forest, sf.GEOMETRY_VERSION_FOREST, None, None, "train"),
+                (gs, "3dgs.v1", "geometry_gid", "3dgs.v1", "val")):
+            man = self.man(ep)
+            man.update(split=split, geometry_version=gver, hold_s=1.0, window_from="observation",
+                       geometry_gid=gid_for(split, ep.name, recorded_salt or gver))
+            if policy:
+                man.update(split_policy=policy, split_salt=recorded_salt, task_version="3dgs.pilot.v1",
+                           stop_radius=0.5)
+            self.save(ep, man)
+
+    def test_mixed_geometry_requires_flag_and_records_families(self):
+        self._make_three_families()
+        r = self.run_pre(self.tmp / "ds_mixed", self.eps)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("geometry_version", r.stderr)
+        self.assertIn("--allow-mixed-geometry", r.stderr)
+        r = self.run_pre(self.tmp / "ds_mixed", self.eps, "--allow-mixed-geometry")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        meta = read_meta(self.tmp / "ds_mixed" / "dataset.uavr")
+        self.assertTrue(meta["mixed_geometry"])
+        self.assertTrue(meta["geometry_version"].startswith("mixed:"), meta["geometry_version"])
+        # C++ 读端只认 split_policy == split_scheme ∈ 四种方案；三族都按 geometry_gid 划分才能混。
+        self.assertEqual(meta["split_policy"], "geometry_gid")
+        self.assertEqual(meta["split_scheme"], "geometry_gid")
+        self.assertIsNone(meta["split_salt"])   # 三族 salt 不同，顶层留空、逐族在 geometry_versions
+        fams = meta["geometry_versions"]
+        self.assertEqual(sorted(fams), sorted([sm.SPLIT_SALT, sf.GEOMETRY_VERSION_FOREST, "3dgs.v1"]))
+        self.assertEqual({v: f["n_episodes"] for v, f in fams.items()},
+                         {sm.SPLIT_SALT: 1, sf.GEOMETRY_VERSION_FOREST: 1, "3dgs.v1": 1})
+        self.assertEqual({v: f["family_split_salt"] for v, f in fams.items()},
+                         {sm.SPLIT_SALT: sm.SPLIT_SALT, sf.GEOMETRY_VERSION_FOREST: sf.GEOMETRY_VERSION_FOREST,
+                          "3dgs.v1": "3dgs.v1"})
+        self.assertEqual(sum(f["n_samples"] for f in fams.values()), meta["num_samples"])
+        # C++ 读端按子串找 "episodes" 数组、取 split_* 的第一次出现：逐族表不能带 "episodes" 键，
+        # 顶层 split_* 必须排在 episodes 数组之前（episode 项里本来就带 split_policy）。
+        raw = (self.tmp / "ds_mixed" / "dataset.uavr").read_bytes()
+        self.assertEqual(raw.count(b'"episodes":'), 1)
+        for key in ("split_policy", "split_scheme", "split_salt"):
+            self.assertLess(raw.find(('"%s":' % key).encode()), raw.find(b'"episodes":'), key)
+        self.assertEqual(meta["splits"], {"train": 10, "val": 5, "test": 0})
+        self.assertIsNone(meta["task_version"])   # 族间不一致的口径字段顶层为空
+
+    def test_mixed_geometry_keeps_hold_and_camera_strict(self):
+        self._make_three_families()
+        man = self.man(self.eps[2])
+        man["hold_s"] = 0.5   # 3DGS 历史口径：每步位移不同，混包也不放行
+        self.save(self.eps[2], man)
+        r = self.run_pre(self.tmp / "ds_hold", self.eps, "--allow-mixed-geometry")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("hold_s", r.stderr)
+        self._make_three_families()
+        for ep, prof in ((self.eps[0], "rgb320x240_fov60_v1"), (self.eps[1], "rgb320x240_fov60_v1")):
+            man = self.man(ep)
+            man["camera_profile"] = prof
+            self.save(ep, man)
+        # 一族缺 camera_profile（3DGS pilot 没写）：混包放行但打警告。
+        r = self.run_pre(self.tmp / "ds_cam", self.eps, "--allow-mixed-geometry")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("camera_profile", r.stderr)
+        # 两种不同的相机口径仍不能混。
+        man = self.man(self.eps[2])
+        man["camera_profile"] = "rgb640x480_fov90_v1"
+        self.save(self.eps[2], man)
+        r = self.run_pre(self.tmp / "ds_cam2", self.eps, "--allow-mixed-geometry")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("camera_profile", r.stderr)
 
     def test_legacy_episodes_record_scene_id_scheme(self):
         r = self.run_pre(self.tmp / "ds_legacy", self.eps)

@@ -237,22 +237,33 @@ def summarize(man):
     return out
 
 
-def group_id_for_task(seed, task):
-    """按任务返回几何组身份；base/l1 用精确几何，校园用 map 身份。"""
+def group_id_for_task(seed, task, density=None):
+    """按任务返回几何组身份；base/l1 用精确几何，校园用 map 身份，forest_e1 用该 density 下的树干几何。
+
+    与 split_for_seed 同一套任务表：未知任务 fail-closed。旧版对任何非校园任务都回落到柱阵几何，
+    forest_e1 的集会被按同 seed 的柱阵 gid 查重——查的是另一片几何，森林集跨 split 查不出来。
+    """
     if task == "campus_assets":
         import asset_campus
         return asset_campus.map_key(seed)
     if task == "campus":
         import campus
         return campus.map_id(seed)
+    if task == "forest_e1":
+        import scene_forest
+        if density is None:
+            raise ValueError("forest_e1 的几何随 density 变，必须给 density")
+        return geometry_gid(scene_forest.sample_trunks(seed, density)[0])
+    if task not in ("base", "l1"):
+        raise ValueError(f"unknown task {task!r}")
     return geometry_gid(sg.sample_pillars(seed)[0])
 
 
-def cross_split_groups(pairs, task="base"):
+def cross_split_groups(pairs, task="base", density=None):
     """pairs = [(seed, split)]；返回跨 split 的几何组 {gid: [splits]}。"""
     seen = {}
     for seed, split in pairs:
-        seen.setdefault(group_id_for_task(seed, task), set()).add(split)
+        seen.setdefault(group_id_for_task(seed, task, density), set()).add(split)
     return {gid: sorted(s) for gid, s in seen.items() if len(s) > 1}
 
 
@@ -261,6 +272,13 @@ def pairs_from_collection(path):
     with open(path, encoding="utf-8") as f:
         man = json.load(f)
     return [(seed, split) for split, seeds in man["splits"].items() for seed in seeds]
+
+
+def task_density_from_collection(path):
+    """collection_manifest.json 里 collect_parallel 记下的 (task, density)；旧清单没有 task 时按 base。"""
+    with open(path, encoding="utf-8") as f:
+        man = json.load(f)
+    return man.get("task") or "base", man.get("density")
 
 
 def parse_seeds(spec):
@@ -276,17 +294,25 @@ def main(argv=None):
     p.add_argument("--count", type=int, default=None, help="配合 --base-seed 使用")
     p.add_argument("--out", default="", help="写出 split_manifest.json")
     p.add_argument("--verify", default="", help="检查 collection_manifest.json 是否跨 split 重复")
-    p.add_argument("--verify-task", choices=("base", "l1", "campus", "campus_assets"),
-                   default="base", help="--verify 使用的几何组身份函数")
+    p.add_argument("--verify-task", choices=("base", "l1", "campus", "campus_assets", "forest_e1"),
+                   default=None, help="--verify 使用的几何组身份函数；缺省取清单记录的 task（旧清单按 base）")
+    p.add_argument("--verify-density", choices=("sparse", "medium", "dense"), default=None,
+                   help="forest_e1 的密度档；缺省取清单记录的 density")
     args = p.parse_args(argv)
 
     if args.verify:
         pairs = pairs_from_collection(args.verify)
-        bad = cross_split_groups(pairs, args.verify_task)
-        print("seed 数 %d，跨 split 的几何组 %d" % (len(pairs), len(bad)))
+        rec_task, rec_density = task_density_from_collection(args.verify)
+        task = args.verify_task or rec_task
+        density = args.verify_density or rec_density
+        if task != rec_task:
+            print("警告: --verify-task %s 与清单记录的 task %s 不同" % (task, rec_task))
+        bad = cross_split_groups(pairs, task, density)
+        print("seed 数 %d（task=%s%s），跨 split 的几何组 %d"
+              % (len(pairs), task, f" density={density}" if density else "", len(bad)))
         for gid, sp in bad.items():
             seeds = [s for s, sp2 in pairs if sp2 in sp and
-                     group_id_for_task(s, args.verify_task) == gid]
+                     group_id_for_task(s, task, density) == gid]
             print("  %s  splits=%s  seeds=%s" % (gid, ",".join(sp), seeds))
         return 1 if bad else 0
 

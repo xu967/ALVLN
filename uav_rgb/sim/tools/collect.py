@@ -63,7 +63,7 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from teacher import (expert_action, plan_action, plan_action_global,
                      SAFE_NEUTRAL, FORWARD_SLOW, YAW_LEFT, YAW_RIGHT, ACTIONS,
-                     TEACHER_VERSION)
+                     teacher_version, task_of_scene)
 import gz_io
 import save_frame
 import split_manifest as sm
@@ -1384,9 +1384,12 @@ def main():
     if vehicle != DEFAULT_VEHICLE and not need_vehicle:
         p.error(f"--vehicle {vehicle} 只能配 --dynamics "
                 f"{[d for d, v in DYNAMICS_VEHICLE.items() if v == vehicle]}（当前 {args.dynamics}）")
-    # 教师只换脱困段的机身碰撞盒半宽（x3 0.235 / e1_mini 0.102），规划几何不变。
+    # 教师按 (载具, 任务档位) 切机身半宽/规划余量：柱阵任务走 base 档（x3 0.5/0.36、e1_mini 0.40/0.30），
+    # forest_e1 走 0.20/0.15 + 圆柱圆判定；档位由 scene.json 的 family/geometry_version 推断，
+    # manifest.teacher_version 也按档位写（forest_e1 与 base 的标签算法不同，版本必须能区分）。
     import teacher as _teacher
-    _teacher.set_vehicle(vehicle)
+    teacher_task = task_of_scene(scene_meta_obj)
+    _teacher.set_vehicle(vehicle, teacher_task)
     # 标签来自哪个教师必须进 manifest：两种策略产出的数据长得一模一样，
     # 事后只能靠这个字段区分（旧版没有任何记录）。
     if args.policy == "forward":
@@ -1675,8 +1678,8 @@ def main():
             # 教师实现版本：改规划参数/前向安全门后必须能区分新旧标签。
             "teacher_version": ("uavrgb.predictive_teacher.v1" if planner_kind == "predictive"
                                 else "uavrgb.rlteacher.v1" if teacher_kind == "teacher_rl"
-                                else TEACHER_VERSION if teacher_kind in ("plan_action",
-                                                                    "expert_action") else None),
+                                else teacher_version(teacher_task) if teacher_kind in ("plan_action",
+                                                                                   "expert_action") else None),
             # plan_action 的具体实现：astar=全局路径（普通集），plan_action=局部
             # （safe 出生集，保留真 SAFE 标签）。audit 复算必须按这个字段选。
             "planner": planner_kind,

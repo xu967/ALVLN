@@ -94,6 +94,25 @@ class SplitAuditTaskTests(unittest.TestCase):
     def test_unknown_task_fails_closed(self):
         with self.assertRaisesRegex(ValueError, 'unknown task'):
             sm.split_for_seed(0, task='totally_unknown')
+        # group_id_for_task 同一套任务表：旧版对未知任务回落柱阵几何（fail-open）。
+        with self.assertRaisesRegex(ValueError, 'unknown task'):
+            sm.group_id_for_task(0, 'totally_unknown')
+
+    def test_forest_group_identity_uses_trunks(self):
+        import scene_forest
+        gid = sm.group_id_for_task(7, 'forest_e1', 'sparse')
+        self.assertEqual(gid, sm.geometry_gid(scene_forest.sample_trunks(7, 'sparse')[0]))
+        # 旧版把森林集按同 seed 的柱阵 gid 查重，查的是另一片几何。
+        self.assertNotEqual(gid, sm.group_id_for_task(7, 'base'))
+        self.assertNotEqual(gid, sm.group_id_for_task(7, 'forest_e1', 'dense'))
+        with self.assertRaisesRegex(ValueError, 'density'):
+            sm.group_id_for_task(7, 'forest_e1')
+        # 同 seed 同 density 跨 split 必须被查出来；换 density 就是另一组。
+        bad = sm.cross_split_groups([(7, 'train'), (7, 'test')], task='forest_e1', density='sparse')
+        self.assertEqual(len(bad), 1)
+        # forest 的 split 复算与 group 身份用同一个 salt 下的 gid。
+        self.assertEqual(sm.split_for_seed(7, 'forest_e1', 'sparse'),
+                         sm.split_for_gid(gid, scene_forest.GEOMETRY_VERSION_FOREST))
 
     def test_asset_campus_version_mismatch_fails_closed(self):
         meta = {'seed': 0, 'map_id': asset_campus.map_key(0),

@@ -41,18 +41,21 @@ CFG = dict(
     # 集数取 instances 整数倍；T6 学生用了 599 集 / 23960 步，300 集 ≈ 12000 步。seed 段互不重叠、都避开 pilot 3000–3019。
     collect_sets=(
         ("base", 300, 3100),             # 旧柱阵 + E1 机体：当前唯一默认集
-        # ("forest_e1:sparse", 150, 4100),   # E1 随机圆柱森林稀疏档（缝 0.45 m）。启用前要先解决：教师 E1 膨胀 0.40 会绕林不穿林、
-        #                                    # preprocess.py 拒绝 base/forest 两个 geometry_version 混包（见 worklog 2026-11-07 forest-e1-pipeline）
+        # ("forest_e1:sparse", 150, 4100),   # E1 随机圆柱森林稀疏档（缝 0.45 m）。教师按 (e1_mini, forest_e1) 档 0.20/0.15 + 圆判定
+        #                                    # （teacher.py v6 档，离线 sparse 20/20 穿林）；多集合时 preprocess 自动加 --allow-mixed-geometry。
+        #                                    # 启用前仍要：Gazebo 实测森林教师 SR（旧 0.20/0.15 方框试跑 19/20 擦柱）、评测加 forest 域（evaluate 现只跑 base）
     ),
-    steps=40,                # 每集步数：A* 每步约 0.27 m，29–38 步过柱区；80 步会让一半帧在柱区外原地转
+    steps=40,                # 每集步数：A* 每步约 0.27 m（X3）/ E1 实测前飞 0.25 m，29–38 步过柱区；80 步会让一半帧在柱区外原地转
     instances=4,             # gz agent 实测：4 实例 6.8 核 0.55 s/步；6 实例 8.6 核吞吐只多 10%（cgroup 12 核）
     no_aux_cameras=True,     # 采集不要 chase/top 相机：RTF 锁 1.0 时每步快 17%；录像只在评测时开
     collect_min_ok=0.95,     # 偶发丢首条起飞指令属正常（collect_parallel 自带重试一次）；低于 95% 说明环境坏了，停
     # 审计
     audit_ignore=("class_share", "safe_collision"),
                              # 其余任一 FAIL 即停。这两项是 X3 口径、E1 上放行（pilot 2 轮实测）：E1 教师脱困 v2 后几乎不再 SAFE 死锁，
-                             # SAFE 只占 3.9% (<5%)；仍有 ~15% 集在柱旁左右摆后擦柱，擦柱步 preprocess --drop-collision 会丢掉，
-                             # 擦柱前的标签仍是对的。教师真实 SR 由评测 teacher 组报，不靠这里兜
+                             # SAFE 只占 3.9% (<5%)；仍有 ~15% 集在柱旁左右摆后擦柱，擦柱步 preprocess --drop-collision 会丢掉。
+                             # 注意（2026-11-07 DATA 复核 .staging 245 集）：base 任务没有 waypoint，教师只在被围死时 SAFE，SAFE 结构性 <5%；
+                             # 擦柱前的标签能复算对上（0/9800 不一致），但多是余量内悬停 SAFE / 左右反转，不是想教学生的东西；
+                             # 要干净训练集用 --exclude-collision-episodes（丢 6.5% 集）。教师真实 SR 由评测 teacher 组报，不靠这里兜
     # 打包 / 训练（uavrgb_train；没列的 flag 用 trainer.hpp 默认：max-grad-norm 5.0，A/B 开关全关）
     drop_collision=True,     # 专家撞柱后的标签本身是错的；T6 起一直开。打包与训练同步传
     epochs=30,               # T6 best 落在 epoch 8，20 轮后 dev F1 不再涨；30 轮给 best-ckpt 余量
@@ -219,6 +222,8 @@ def preprocess(out):
     cmd = [PY, f"{REPO}/tools/preprocess.py", "--out", ds]
     if CFG["drop_collision"]:
         cmd.append("--drop-collision")
+    if len(CFG["collect_sets"]) > 1:
+        cmd.append("--allow-mixed-geometry")   # 柱阵 + 森林是两个 geometry_version；hold/window 仍由 preprocess 严格校验
     sh(cmd + (eps or [f"{col}/{{train,val,test}}/*/" for col in cols]))   # 集目录在 Python 里枚举，不依赖 shell 展开
 
 

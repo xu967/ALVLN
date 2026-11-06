@@ -646,9 +646,15 @@ def main():
         with open(sf.DEFAULT_TEMPLATE, encoding="utf-8") as fp:
             _w, forest = sf.build_scene(fp.read(), 0, 0, "sparse")
         root21 = tempfile.mkdtemp(prefix="audit_test_")
+        # forest_e1 档：余量 0.20/0.15 + 圆柱圆判定，版本与 base 档不同；采集按 (e1_mini, forest_e1) 算标签，
+        # audit 复算时按 manifest.vehicle + scene.json 的 family 切到同一档。
+        assert ad.task_of_scene(forest) == "forest_e1", forest.get("family")
+        forest_ver = ad.teacher_version("forest_e1")
+        assert forest_ver != TEACHER_VERSION, forest_ver
         forest_man = {"geometry_version": sf.GEOMETRY_VERSION_FOREST, "vehicle": "e1_mini",
-                      "dynamics": "cf_sitl", "dynamics_profile": "cf_sitl_v1:deadbeef"}
-        ad.set_vehicle("e1_mini")   # 标签按采集载具算，audit 复算时也按 manifest.vehicle 切
+                      "dynamics": "cf_sitl", "dynamics_profile": "cf_sitl_v1:deadbeef",
+                      "teacher_version": forest_ver}
+        ad.set_vehicle("e1_mini", "forest_e1")
         try:
             write_plan_ep(root21, "train", 1, pillars=forest["pillars"], scene_extra=forest,
                           man_extra=forest_man)
@@ -659,6 +665,17 @@ def main():
         assert sf.GEOMETRY_VERSION_FOREST in d21["geometry_version"]["detail"], d21["geometry_version"]
         assert d21["label_recompute"]["status"] == "PASS", d21["label_recompute"]
         assert d21["label_recompute"]["covered_steps"] == 12, d21["label_recompute"]
+        # 旧森林集（manifest 写 base 档的 v5、标签按 0.40/0.30 方框算）不能被 forest 档算法复算：SKIP 而不是假 FAIL。
+        root21o = tempfile.mkdtemp(prefix="audit_test_")
+        ad.set_vehicle("e1_mini")
+        try:
+            write_plan_ep(root21o, "train", 1, pillars=forest["pillars"], scene_extra=forest,
+                          man_extra=dict(forest_man, teacher_version=TEACHER_VERSION))
+        finally:
+            ad.set_vehicle("x3")
+        c21o = details(root21o)["label_recompute"]
+        assert c21o["status"] == "SKIP" and "旧几何或教师版本 12 步" in c21o["detail"], c21o
+        shutil.rmtree(root21o)
         ad.set_vehicle("x3")   # audit 按 manifest.vehicle 切过载具，旧柱阵集的标签按 x3 算
         write_plan_ep(root21, "test", 2)   # 旧柱阵集混进来
         c21 = details(root21)["geometry_version"]

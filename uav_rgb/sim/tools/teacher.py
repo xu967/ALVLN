@@ -23,6 +23,34 @@ ACTIONS = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 # collect 写进 manifest，audit 只对同版本数据做 label_recompute，避免用新算法
 # 复算旧标签造成假 FAIL。
 TEACHER_VERSION = "uavrgb.teacher.v5"  # v5：goal-stop（waypoint 作为最终目标）
+# 版本按任务档位分开：forest_e1 档的动作选择（余量 0.20/0.15 + 圆柱按圆判定）与 v5 不同，
+# 旧森林集（manifest 仍写 v5、按 0.40/0.30 方框算的标签）不能被新算法复算。base 档
+# （柱阵 base/l1/safe/campus…）的动作选择一字未改、标签逐字节同 v5，所以不 bump——
+# bump 会让 audit 对 E1 流水线正在产出的 v5 集全部跳过 label_recompute。
+# 已知口径问题：5af664a 把 e1_mini 的 base 余量从 0.5/0.36 改到 0.40/0.30 并加脱困 v2 却没 bump，
+# 0357 与 0417 两次 pilot 都写 v5；此前的 e1 集只能靠采集时间区分。
+TEACHER_VERSION_BY_TASK = {"base": TEACHER_VERSION, "forest_e1": "uavrgb.teacher.v6"}
+
+
+def teacher_version(task=None):
+    """当前（或指定）任务档位的教师版本；未单列的任务都走 base 档。"""
+    return TEACHER_VERSION_BY_TASK.get(task if task is not None else TEACHER_TASK, TEACHER_VERSION)
+
+
+def task_of_scene(scene_meta):
+    """从 scene.json 推断教师任务档位：forest_e1 族 → "forest_e1"，其余 → "base"。
+
+    forest_e1 的 scene.json 没有 task 字段，只有 family / geometry_version 前缀；collect 和 audit
+    都用这一个函数推断，避免两边各写一份判断。
+    """
+    if not isinstance(scene_meta, dict):
+        return "base"
+    if scene_meta.get("family") == "forest_e1":
+        return "forest_e1"
+    gver = scene_meta.get("geometry_version")
+    if isinstance(gver, str) and gver.startswith("uavrgb.forest_e1."):
+        return "forest_e1"
+    return "base"
 
 # 只取竖直方向的中间带（正前方走廊），比例范围 [0.4, 0.6)。
 BAND_LO, BAND_HI = 0.4, 0.6
@@ -117,12 +145,22 @@ def expert_action(depth, w, h, turn_dist=1.5, emergency=0.8, prev_action=None,
 # collision_envelope.radius_from_center 0.102（按方框半宽用，角部比圆保守 0.042 m）。
 BODY_HALF_BY_VEHICLE = {"x3": 0.235, "e1_mini": 0.102}
 BODY_HALF_M = BODY_HALF_BY_VEHICLE["x3"]
-# 规划余量（m）：(A* 栅格膨胀, 局部射线/前向检查净空)。x3 0.5/0.36 是历史默认（标签逐字节不变）。
+# 规划余量（m）：(A* 栅格膨胀, 局部射线/前向检查净空)，按 (载具, 任务档位) 取；未单列的任务走 (载具, "base")。
+# x3 0.5/0.36 是历史默认（标签逐字节不变）。
 # E1 沿用 X3 余量时 1.2 m 缝隙的可行走廊只剩 0.2 m：一步 0.25 m 带 20° 航向偏差就出走廊，
 # 进余量后 A* 起点四邻全堵、局部脱困也找不到 1.6 m 净空射线 → 永远 SAFE，悬停漂移 2.4 cm/s 撞柱
 # （E1 pilot 20 集 8 集这样失败）。E1 按「机身半宽差 0.133 m」缩，再各留 0.03/0.07 给漂移。
-CLEARANCE_BY_VEHICLE = {"x3": (0.5, 0.36), "e1_mini": (0.40, 0.30)}
-ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M = CLEARANCE_BY_VEHICLE["x3"]
+# forest_e1：缝只有 0.45/0.35/0.28 m，0.40 膨胀下 A* 把整片森林当墙、从带外绕（离线 20 seed：sparse 20/20 绕）。
+# 0.20 时 sparse 20/20 穿过、medium 10/20、dense 3/20；0.15 时 medium 20/20、dense 9/20
+# （tmp/agent-forest/offline_astar.json，2026-11-06）。取 A* 0.20 / 局部 0.15：局部 0.15 = E1 半径 0.102 + 0.048，
+# 比森林走廊自身的 clearance 0.127 略宽。medium/dense 仍会部分绕行，是已知口径（见报告待确认）。
+CLEARANCE_BY_VEHICLE = {
+    ("x3", "base"): (0.5, 0.36),
+    ("e1_mini", "base"): (0.40, 0.30),
+    ("e1_mini", "forest_e1"): (0.20, 0.15),
+}
+TEACHER_TASK = "base"
+ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M = CLEARANCE_BY_VEHICLE[("x3", "base")]
 # 脱困阶段 (前这么多米只查机身方框, 射线长度 None=lookahead)：已漂进余量时按顺序试，第一阶段有解就停。
 # x3 只有历史那一档。E1 多一档短射线：柱阵里离柱 0.26 m 时 1.6 m 全净空的射线几乎不存在
 # （pilot 实测 142/173 个 SAFE 步在新余量下仍无解），0.6 m 够离开余量后让 A* 重新接手。
@@ -134,15 +172,23 @@ ESCAPE_STAGES = ESCAPE_STAGES_BY_VEHICLE["x3"]
 ESCAPE_V2 = False
 
 
-def set_vehicle(name):
-    """按载具切换机身半宽、规划余量与脱困策略；未知载具报错。collect.py 在解析 --vehicle 后调用一次。"""
-    global BODY_HALF_M, ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M, ESCAPE_STAGES, ESCAPE_V2
+def set_vehicle(name, task="base"):
+    """按 (载具, 任务档位) 切换机身半宽、规划余量与脱困策略；未知载具报错。
+
+    collect.py 在解析 --vehicle 与 scene.json 后调用一次；audit 复算每集前按 manifest.vehicle +
+    task_of_scene(scene.json) 调。任务没有单列余量时用该载具的 base 档（l1/safe/campus 都是柱阵）。
+    """
+    global BODY_HALF_M, ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M, ESCAPE_STAGES, ESCAPE_V2, TEACHER_TASK
     if name not in BODY_HALF_BY_VEHICLE:
         raise ValueError(f"未知载具 {name!r}，可选 {sorted(BODY_HALF_BY_VEHICLE)}")
+    if not isinstance(task, str) or not task:
+        raise ValueError(f"任务档位必须是非空字符串，得到 {task!r}")
     BODY_HALF_M = BODY_HALF_BY_VEHICLE[name]
-    ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M = CLEARANCE_BY_VEHICLE[name]
+    ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M = CLEARANCE_BY_VEHICLE.get(
+        (name, task), CLEARANCE_BY_VEHICLE[(name, "base")])
     ESCAPE_STAGES = ESCAPE_STAGES_BY_VEHICLE[name]
     ESCAPE_V2 = name != "x3"
+    TEACHER_TASK = task
     return BODY_HALF_M
 
 
@@ -152,10 +198,16 @@ def _body_hits_box(px, py, yaw_deg, pillar, half):
     X3 为 0.47 m 方。机身随 yaw 旋转。按轴向包围盒会把 45° 机身的半宽当成 0.245 m，
     实际方角伸到 0.332 m，角部漏判；膨胀到外接圆又会在斜向误报、把脱困路径挡死。
     两条方框的分离轴只有 4 条：世界 x/y 与机身局部 x/y。
+    带 radius 的圆柱（forest_e1 树干）：把柱心转到机身系，夹到方框上取最近点，距离 ≤ 半径即重叠。
     """
     a = BODY_HALF_M + 0.01
     cy, sy = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
     dx, dy = px - pillar["x"], py - pillar["y"]
+    r = pillar.get("radius")
+    if r is not None:
+        lx, ly = -dx * cy - dy * sy, dx * sy - dy * cy   # 柱心在机身系的坐标
+        qx, qy = max(-a, min(a, lx)), max(-a, min(a, ly))
+        return (lx - qx) ** 2 + (ly - qy) ** 2 <= float(r) * float(r)
     hx, hy = (v / 2 for v in pillar.get("size", [half * 2, half * 2])[:2])
     # 世界 x/y 轴：机身投影半宽 = a*(|cos|+|sin|)
     body_w = a * (abs(cy) + abs(sy))
@@ -166,6 +218,23 @@ def _body_hits_box(px, py, yaw_deg, pillar, half):
         if abs(dx * ux + dy * uy) > a + hx * abs(ux) + hy * abs(uy):
             return False
     return True
+
+
+def _pillar_blocked(px, py, pillar, clearance, half=0.2):
+    """点 (px,py) 到柱**表面**的距离 < clearance 即堵。
+
+    带 radius 的圆柱（forest_e1 树干，scene_forest 同时落盘外接方框 size=[2r,2r]）按圆：
+    圆心距 < r + clearance。按外接方框判会把 45° 方向多算 0.41r 的障碍（r=0.15 时 6 cm），
+    0.28–0.45 m 的缝会被判死。没有 radius 的方柱保持原来的方框算式（x3/E1 柱阵标签逐字节不变）。
+    """
+    r = pillar.get("radius")
+    if r is not None:
+        lim = float(r) + clearance
+        return (px - pillar["x"]) ** 2 + (py - pillar["y"]) ** 2 < lim * lim
+    hx, hy = (v / 2 for v in pillar.get("size", [half * 2, half * 2])[:2])
+    dx = max(0.0, abs(px - pillar["x"]) - hx)
+    dy = max(0.0, abs(py - pillar["y"]) - hy)
+    return dx * dx + dy * dy < clearance * clearance
 
 
 def ray_clear(x, y, th_deg, length, pillars, clearance, half=0.2, samples=33,
@@ -197,10 +266,7 @@ def ray_clear(x, y, th_deg, length, pillars, clearance, half=0.2, samples=33,
                 if _body_hits_box(px, py, yaw_deg, p, half):
                     return False
                 continue
-            hx, hy = (v / 2 for v in p.get("size", [half * 2, half * 2])[:2])
-            dx = max(0.0, abs(px - p["x"]) - hx)
-            dy = max(0.0, abs(py - p["y"]) - hy)
-            if dx * dx + dy * dy < clearance * clearance:
+            if _pillar_blocked(px, py, p, clearance, half):
                 return False
     return True
 
@@ -259,12 +325,9 @@ def plan_action(x, y, yaw_deg, pillars, lookahead=1.6, clearance=None,
 
 
 def _point_blocked(x, y, pillars, clearance):
-    """点到柱方框的距离 < clearance 即不可走（用于 A* 栅格）。"""
+    """点到柱表面（方框；带 radius 时按圆）的距离 < clearance 即不可走（用于 A* 栅格）。"""
     for p in pillars:
-        hx, hy = (v / 2 for v in p.get("size", [.4, .4])[:2])
-        dx = max(0.0, abs(x - p["x"]) - hx)
-        dy = max(0.0, abs(y - p["y"]) - hy)
-        if dx * dx + dy * dy < clearance * clearance:
+        if _pillar_blocked(x, y, p, clearance):
             return True
     return False
 
@@ -394,7 +457,8 @@ def plan_action_global(x, y, yaw_deg, pillars, clearance=None, step=0.1,
     if err < -tol:
         return YAW_RIGHT
     # 航向已对准也不能盲目前进：机体有惯性，A* 路径的余量（x3 0.5 m）会被一步
-    # 0.27 m 的漂移吃掉。前向 0.4 m 若进机身余量（x3 0.36 m），先转再走。
+    # 0.27 m 的漂移吃掉（X3 实测；E1 cf_sitl hold 1.0 s 前飞稳态 0.25 m/步、首步 0.12 m，
+    # SAFE 后还要滑行 0.07–0.21 m）。前向 0.4 m 若进机身余量（x3 0.36 m），先转再走。
     if not ray_clear(x, y, yaw_deg, 0.4, pillars, LOCAL_CLEARANCE_M):
         # 已经在余量内时这条检查对任何航向都不过，按 err 换向会左右摆到漂进柱子
         # （E1 pilot 实测 "LRLRLR…"）；交给局部规划的脱困阶段先离开余量。
@@ -591,6 +655,64 @@ if __name__ == "__main__":
     ok = ok and got_stop == SAFE_NEUTRAL and got_go != SAFE_NEUTRAL
     print(f"  {'ok' if got_stop == SAFE_NEUTRAL and got_go != SAFE_NEUTRAL else 'FAIL'}  "
           f"goal-stop: 半径内={ACTIONS[got_stop]}, 半径外={ACTIONS[got_go]}")
+
+    # forest_e1 档：(载具, 任务) 余量与版本。base 档一字不改（x3 / e1_mini 标签逐字节同 v5）。
+    try:
+        ok_prof = set_vehicle("x3") == 0.235 and (ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M) == (0.5, 0.36)
+        ok_prof = ok_prof and teacher_version() == TEACHER_VERSION == "uavrgb.teacher.v5"
+        set_vehicle("e1_mini")
+        ok_prof = ok_prof and (ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M) == (0.40, 0.30)
+        ok_prof = ok_prof and teacher_version() == TEACHER_VERSION
+        set_vehicle("e1_mini", "l1")   # 未单列的任务走 base 档
+        ok_prof = ok_prof and (ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M) == (0.40, 0.30)
+        ok_prof = ok_prof and teacher_version() == TEACHER_VERSION
+        set_vehicle("e1_mini", "forest_e1")
+        ok_prof = ok_prof and (ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M) == (0.20, 0.15)
+        ok_prof = ok_prof and teacher_version() != TEACHER_VERSION and teacher_version("forest_e1") == teacher_version()
+        ok_prof = ok_prof and task_of_scene({"family": "forest_e1"}) == "forest_e1"
+        ok_prof = ok_prof and task_of_scene({"geometry_version": "uavrgb.forest_e1.v1"}) == "forest_e1"
+        ok_prof = ok_prof and task_of_scene({"geometry_version": "uavrgb.geom.v5"}) == "base"
+        ok_prof = ok_prof and task_of_scene(None) == "base"
+        try:
+            set_vehicle("e1_mini", "")
+        except ValueError:
+            pass
+        else:
+            ok_prof = False
+        ok = ok and ok_prof
+        print(f"  {'ok' if ok_prof else 'FAIL'}  (载具, 任务) 档位：forest_e1 0.20/0.15 + 独立版本，其余走 base 档")
+
+        # 圆柱按圆判定：45° 方向上外接方框会多算 0.41r。r=0.15 的柱在 (0,0)，点 (0.28,0.28) 到圆面 0.246 m、
+        # 到外接方框 0.184 m；余量 0.2 下圆判空、方框判堵。轴向上两者一致（0.34,0 → 0.19 m 都堵）。
+        cyl = [{"x": 0.0, "y": 0.0, "z": 1.5, "radius": 0.15, "shape": "cylinder", "size": [0.3, 0.3, 3.0]}]
+        box = [{"x": 0.0, "y": 0.0, "z": 1.5, "size": [0.3, 0.3, 3.0]}]
+        ok_c = (not _point_blocked(0.28, 0.28, cyl, 0.2)) and _point_blocked(0.28, 0.28, box, 0.2)
+        ok_c = ok_c and _point_blocked(0.34, 0.0, cyl, 0.2) and _point_blocked(0.34, 0.0, box, 0.2)
+        ok_c = ok_c and ray_clear(0.28, 0.28, 90.0, 1.0, cyl, 0.2) and not ray_clear(0.28, 0.28, 90.0, 1.0, box, 0.2)
+        # 脱困段的机身碰撞盒也按圆：E1 机身半宽 0.112，机身中心在 (0.21,0.21) 时柱心到机身方框 0.139 < 0.15 → 撞；
+        # (0.26,0.26) 时 0.209 > 0.15 → 不撞，而外接方框（0.26 ≤ 0.112+0.15）仍判撞。
+        ok_c = ok_c and _body_hits_box(0.21, 0.21, 0.0, cyl[0], 0.15) and not _body_hits_box(0.26, 0.26, 0.0, cyl[0], 0.15)
+        ok_c = ok_c and _body_hits_box(0.26, 0.26, 0.0, box[0], 0.15)
+        ok = ok and ok_c
+        print(f"  {'ok' if ok_c else 'FAIL'}  圆柱按圆判定（45° 方向不再多算外接方框的角）")
+
+        # forest_e1 档能穿过两根树干之间 0.6 m 的缝（圆面距），base 档（0.40 膨胀）A* 无路。
+        pair = [{"x": 1.5, "y": 0.45, "z": 1.5, "radius": 0.15, "size": [0.3, 0.3, 3.0]},
+                {"x": 1.5, "y": -0.45, "z": 1.5, "radius": 0.15, "size": [0.3, 0.3, 3.0]}]
+        ok_f = astar_path(pair, (0.0, 0.0), (3.0, 0.0), clearance=ASTAR_CLEARANCE_M) is not None
+        got = plan_action_global(0.0, 0.0, 0.0, pair)
+        ok_f = ok_f and got == FORWARD_SLOW
+        # 走廊外没有墙：A* 的边界是柱子派生的，目标在 (max_x+2, 0)；穿缝比绕 0.45+0.15+0.2 的柱更短，
+        # 路径里 |y| 应留在缝内。
+        path = astar_path(pair, (0.0, 0.0), (3.5, 0.0), clearance=ASTAR_CLEARANCE_M)
+        ok_f = ok_f and path is not None and max(abs(py) for _px, py in path) < 0.3
+        set_vehicle("e1_mini")   # base 档 0.40 膨胀：缝被判死，A* 只能从柱对外侧绕（离线 20/20 绕行的机理）
+        path = astar_path(pair, (0.0, 0.0), (3.5, 0.0), clearance=ASTAR_CLEARANCE_M)
+        ok_f = ok_f and path is not None and max(abs(py) for _px, py in path) > 0.6
+        ok = ok and ok_f
+        print(f"  {'ok' if ok_f else 'FAIL'}  forest_e1 档穿 0.6 m 缝（{ACTIONS[got]}），base 档 0.40 膨胀只能绕行")
+    finally:
+        set_vehicle("x3")
 
     print("teacher: " + ("全部通过" if ok else "有失败"))
     raise SystemExit(0 if ok else 1)

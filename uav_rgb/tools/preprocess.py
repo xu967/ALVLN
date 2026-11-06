@@ -42,6 +42,21 @@ import split_manifest as sm  # noqa: E402
 import campus  # noqa: E402
 import asset_campus  # noqa: E402
 import instruction as instr  # noqa: E402
+import scene_forest  # noqa: E402
+
+# 当前允许打包的几何族版本（不加 --allow-frozen-geometry 时）。3dgs.* 按前缀放行（collect_3dgs 写）。
+# 旧柱阵版本（v3/v4）、campus.v1 要显式 --allow-frozen-geometry。
+KNOWN_GEOMETRY_VERSIONS = (sm.SPLIT_SALT, campus.VERSION, asset_campus.VERSION,
+                           scene_forest.GEOMETRY_VERSION_FOREST)
+# 口径键：任何模式下一个包只能有一种值（含「部分缺」也不行）。hold/窗口语义/动力学不同意味着
+# 同一个动作标签对应的位移不同（Gazebo hold 1.0 前飞 0.25 m/步，3DGS hold 0.5 约 0.12 m），混了无法归因。
+STRICT_KEYS = ("window_from", "hold_s", "dynamics_profile")
+# 族身份键：默认同样必须一致；--allow-mixed-geometry（跨族合并实验，如柱阵+森林、Gazebo+3DGS）才放开，
+# meta 按族记录计数/salt/口径，各族仍按各自的 split_salt 复算 split（同几何同 split 的泄漏门照常）。
+FAMILY_KEYS = ("geometry_version", "appearance_version", "split_policy", "split_salt",
+               "task_version", "stop_radius", "success_criterion", "goal_radius")
+# 相机口径：混包时允许「部分集缺字段」（3DGS pilot 没写），但两种不同的非空值仍不能混。
+CAMERA_KEY = "camera_profile"
 
 # 必须与 src/include/uavrgb/text.hpp 的 kTextLen 一致：不足补 <pad>，超长由两端报错。
 TEXT_LEN = 9
@@ -135,11 +150,10 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
     # seed 是另一张图，允许 v1 通过等于允许两套几何混包。（2026-11-04 升 v2）
     # allow_frozen=True 用于对冻结数据做诊断（同族留出/重打包）：此时不再要求等于
     # 当前版本，改由 build_meta 断言全包版本一致——真正要守的是「不混包」，不是「必须最新」。
-    if not allow_frozen and gver not in (sm.SPLIT_SALT, campus.VERSION,
-                                         asset_campus.VERSION) and not (
+    if not allow_frozen and gver not in KNOWN_GEOMETRY_VERSIONS and not (
             isinstance(gver, str) and gver.startswith("3dgs.")):
-        die("%s: geometry_version=%r 与当前 %s 不一致（旧几何数据不能混进新数据集）"
-            % (man_path, gver, sm.SPLIT_SALT))
+        die("%s: geometry_version=%r 不在当前族版本 %s 内（旧几何数据不能混进新数据集）"
+            % (man_path, gver, list(KNOWN_GEOMETRY_VERSIONS) + ["3dgs.*"]))
     # 最后一道防泄漏门：split 必须等于几何 gid/地图按记录策略应属的 split。只查
     # 「同 gid 跨 split」挡不住单集包内被改过的 manifest（没有对照集，一致性检查
     # 永远通过）。同族留出诊断会按 gid 哈希重新划分，这条门按定义不成立，显式跳过；
@@ -250,8 +264,35 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
     }
 
 
+def _check_uniform_keys(episodes, allow_mixed=False):
+    """同一数据集不能混 observation/dispatch、不同 hold 或不同任务版本，否则
+    eval.json / 训练日志里的数字无法归因。缺字段的旧数据与有字段的数据也不能混。
+
+    allow_mixed=True 只放开族身份键（FAMILY_KEYS）；口径键（STRICT_KEYS）仍必须一致，
+    camera_profile 允许部分缺、不允许两种值。
+    """
+    for key in STRICT_KEYS + (CAMERA_KEY,) + FAMILY_KEYS:
+        vals = {ep.get(key) for ep in episodes if ep.get(key) is not None}
+        missing = any(ep.get(key) is None for ep in episodes)
+        if allow_mixed and key in FAMILY_KEYS:
+            continue
+        if len(vals) > 1:
+            die("episode 的 %s 不一致: %s（不同口径不能混包%s）"
+                % (key, sorted(str(v) for v in vals),
+                   "" if allow_mixed or key not in FAMILY_KEYS
+                   else "；跨族合并实验请显式 --allow-mixed-geometry"))
+        if vals and missing:
+            if allow_mixed and key == CAMERA_KEY:
+                print("preprocess: 警告：部分 episode 缺 %s（混包模式放行；缺字段的集相机口径未知）"
+                      % key, file=sys.stderr)
+                continue
+            die("部分 episode 缺 %s，不能与有该字段的数据混包%s"
+                % (key, "" if allow_mixed or key not in FAMILY_KEYS
+                   else "；跨族合并实验请显式 --allow-mixed-geometry"))
+
+
 def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
-         split_salt=None, allow_frozen=False, allow_diagnostic=False):
+         split_salt=None, allow_frozen=False, allow_diagnostic=False, allow_mixed=False):
     """加载全部 episode 索引，并检查 scene_id 的 split 唯一性。"""
     episodes, scene_split, gid_split, total, dropped = [], {}, {}, 0, 0
     skipped = 0
@@ -290,17 +331,7 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
         print("preprocess: 跳过整集 %d 个（--exclude-collision-episodes）" % skipped)
     if total == 0:
         die("没有可写样本")
-    # 同一数据集不能混 observation/dispatch、不同 hold 或不同任务版本，否则
-    # eval.json / 训练日志里的数字无法归因。缺字段的旧数据与有字段的数据也不能混。
-    for key in ("window_from", "hold_s", "task_version", "stop_radius", "geometry_version",
-                "appearance_version", "split_policy", "split_salt", "camera_profile",
-                "dynamics_profile", "success_criterion", "goal_radius"):
-        vals = {ep.get(key) for ep in episodes if ep.get(key) is not None}
-        if len(vals) > 1:
-            die("episode 的 %s 不一致: %s（不同口径不能混包）"
-                % (key, sorted(str(v) for v in vals)))
-        if vals and any(ep.get(key) is None for ep in episodes):
-            die("部分 episode 缺 %s，不能与有该字段的数据混包" % key)
+    _check_uniform_keys(episodes, allow_mixed)
     # L0：指令要么全有、要么全无。部分集有指令会让「文本是否可用」变成静默偏置。
     have = [bool(ep.get("instruction") and ep["instruction"].strip()) for ep in episodes]
     if any(have) and not all(have):
@@ -312,6 +343,12 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
 def _uniform(episodes, key):
     """所有 episode 同值才返回该值；调用方已在 scan 里拒绝不一致。"""
     vals = {ep.get(key) for ep in episodes if ep.get(key) is not None}
+    return next(iter(vals)) if len(vals) == 1 else None
+
+
+def _uniform_all(episodes, key):
+    """同 _uniform，但「部分缺」也算不一致：混包时族身份键只有一族有值不能写成全包的值。"""
+    vals = {ep.get(key) for ep in episodes}
     return next(iter(vals)) if len(vals) == 1 else None
 
 
@@ -328,14 +365,51 @@ def _require_uniform(episodes, key):
     return next(iter(vals)) if vals else None
 
 
-def split_facts(episodes, split_scheme=None):
+def family_facts(episodes):
+    """按 geometry_version 分族：每族的集数/样本数/salt/口径。单族包也记（一项），混包时逐族看。"""
+    # 键名不能与 C++ 读端按子串查找的顶层/逐集键重名（"episodes"/"split_salt"/"split"…）：
+    # dataset.cpp 用 meta.find("\"episodes\"") 定位数组，嵌套对象里出现同名键会让它读错位置。
+    fams = {}
+    for ep in episodes:
+        fam = fams.setdefault(str(ep.get("geometry_version")), {"n_episodes": 0, "n_samples": 0})
+        fam["n_episodes"] += 1
+        fam["n_samples"] += ep["num_samples"]
+    for ver, fam in fams.items():
+        eps = [ep for ep in episodes if str(ep.get("geometry_version")) == ver]
+        try:
+            _policy, scheme, salt = _split_facts_one_family(eps)
+        except ValueError:   # 诊断构建（--split-by-map）下未知版本无 salt 可复算：只记计数
+            scheme, salt = None, None
+        fam.update({"family_split_scheme": scheme, "family_split_salt": salt,
+                    **{key: _uniform(eps, key) for key in
+                       ("appearance_version", "task_version", "hold_s", "camera_profile")}})
+    return fams
+
+
+def split_facts(episodes, split_scheme=None, allow_mixed=False):
     """返回 (split_policy, split_scheme, split_salt)：记录实际用的划分。
 
     split_scheme 非空 = --split-by-map 诊断构建；否则按 manifest 记录的策略/版本
     推导。salt 取记录值，冻结数据不能回落当前 SPLIT_SALT（会改 split）。
+    allow_mixed：逐族推导，要求每族都是 geometry_gid 方案（C++ 读端只认一个 split_scheme，
+    且逐 gid 校验同几何同 split）；各族 salt 不同时 meta.split_salt 为空、逐族 salt 在 geometry_versions 里。
     """
     if split_scheme:
         return split_scheme, split_scheme, split_scheme.partition(":")[2] or None
+    if not allow_mixed:
+        return _split_facts_one_family(episodes)
+    versions = sorted({str(ep.get("geometry_version")) for ep in episodes})
+    facts = {ver: _split_facts_one_family([ep for ep in episodes
+                                           if str(ep.get("geometry_version")) == ver])
+             for ver in versions}
+    bad = {ver: scheme for ver, (_p, scheme, _s) in facts.items() if scheme != "geometry_gid"}
+    if bad:
+        die("跨族混包要求每族都按 geometry_gid 划分，实际：%s" % bad)
+    salts = {salt for _p, _s, salt in facts.values()}
+    return "geometry_gid", "geometry_gid", (next(iter(salts)) if len(salts) == 1 else None)
+
+
+def _split_facts_one_family(episodes):
     policy = _uniform(episodes, "split_policy")
     gver = _require_uniform(episodes, "geometry_version")
     recorded_salt = _uniform(episodes, "split_salt")
@@ -358,8 +432,16 @@ def split_facts(episodes, split_scheme=None):
 
 
 def build_meta(episodes, total, size, dropped=0, split_scheme=None,
-               collision_filter=None):
+               collision_filter=None, allow_mixed=False):
     src_w, src_h = episodes[0]["src_w"], episodes[0]["src_h"]
+    families = family_facts(episodes)
+    if allow_mixed and len(families) > 1:
+        # 不能回落 SPLIT_SALT，也不能写成 uavrgb.geom.*（train_student_with_video 等按前缀认柱阵）。
+        geometry_version = "mixed:" + "+".join(sorted(families))
+        pick = _uniform_all   # 族身份/任务口径键：只有一族有值时顶层不能冒充全包
+    else:
+        geometry_version = _require_uniform(episodes, "geometry_version") or sm.SPLIT_SALT
+        pick = _uniform
     out_w, out_h = size
     preserve = out_w * src_h == out_h * src_w  # 交叉相乘判断目标是否与原图同纵横比
     counts = {s: 0 for s in SPLITS}
@@ -379,7 +461,7 @@ def build_meta(episodes, total, size, dropped=0, split_scheme=None,
         if groups.setdefault(gid, ep["split"]) != ep["split"]:
             die("几何组 %s 跨 split（%s 与 %s）"
                 % (gid, groups[gid], ep["split"]))
-    split_policy, split_scheme, split_salt = split_facts(episodes, split_scheme)
+    split_policy, split_scheme, split_salt = split_facts(episodes, split_scheme, allow_mixed)
     meta = {
         "schema": "uavrgb.dataset.v1",
         "created_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -401,17 +483,21 @@ def build_meta(episodes, total, size, dropped=0, split_scheme=None,
         # 碰撞过滤会改变各 split 的样本集（尤其 test）：记录策略，跨 run 才可解释。
         "collision_filter": collision_filter,
         # 口径字段：eval/训练/audit 从数据集本身就能看出 observation/dispatch 与任务版本。
-        "geometry_version": _require_uniform(episodes, "geometry_version") or sm.SPLIT_SALT,
-        "appearance_version": _uniform(episodes, "appearance_version"),
-        "success_criterion": _uniform(episodes, "success_criterion"),
-        "goal_radius": _uniform(episodes, "goal_radius"),
+        # 混包（--allow-mixed-geometry）时 geometry_version 写 mixed:<族+族>，逐族计数/salt/口径见 geometry_versions；
+        # 族间不一致的口径字段（appearance/task_version/stop_radius…）在顶层为 null。
+        "geometry_version": geometry_version,
+        "mixed_geometry": bool(allow_mixed and len(families) > 1),
+        "geometry_versions": families,
+        "appearance_version": pick(episodes, "appearance_version"),
+        "success_criterion": pick(episodes, "success_criterion"),
+        "goal_radius": pick(episodes, "goal_radius"),
         "window_from": _uniform(episodes, "window_from"),
         "hold_s": _uniform(episodes, "hold_s"),
         # 3DGS 数据：记录渲染后端与每集 scene.json，自动评测据此走 eval_3dgs。
         "renderer_backend": _uniform(episodes, "renderer_backend"),
         "scene_json": _uniform(episodes, "scene_json"),
-        "task_version": _uniform(episodes, "task_version"),
-        "stop_radius": _uniform(episodes, "stop_radius"),
+        "task_version": pick(episodes, "task_version"),
+        "stop_radius": pick(episodes, "stop_radius"),
         # 逐样本碰撞标记（'1' = collision=true），供 C++ 读端 LoadOptions.drop_collision
         # 在不重新打包的情况下过滤；--drop-collision 打包时已丢弃的步不在这里。
         "collision_flags": "".join("1" if s["collision"] else "0"
@@ -482,14 +568,26 @@ def load_frame(path, src_w, src_h, size, crop=None, src_expected=None):
 
 
 def write_dataset(out_dir, episodes, total, size, dropped=0, crop=None,
-                  src_expected=None, split_scheme=None, collision_filter=None):
+                  src_expected=None, split_scheme=None, collision_filter=None,
+                  allow_mixed=False):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "dataset.uavr")
     out_w, out_h = size
 
     meta_bytes = json.dumps(build_meta(episodes, total, size, dropped, split_scheme,
-                                       collision_filter),
+                                       collision_filter, allow_mixed),
                             ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    # C++ 读端（dataset.cpp）按子串定位 "episodes" 数组与 split_* 标量，不是完整 JSON 解析：
+    # "episodes" 只能出现一次，split_*/collision_flags 的第一次出现必须是顶层（在 episodes 数组之前），
+    # 否则读端静默读错（2026-11-07 逐族计数表里的 "episodes" 键实测让读端报「episodes[] 为空」）。
+    ep_at = meta_bytes.find(b'"episodes":')
+    if meta_bytes.count(b'"episodes":') != 1:
+        die("meta 里 \"episodes\" 出现 %d 次（C++ 读端按子串查找，必须恰好 1 次）"
+            % meta_bytes.count(b'"episodes":'))
+    for key in ("split_policy", "split_scheme", "split_salt", "collision_flags"):
+        at = meta_bytes.find(('"%s":' % key).encode("utf-8"))
+        if at < 0 or at > ep_at:
+            die("meta 顶层 \"%s\" 必须出现在 episodes 数组之前（C++ 读端取第一次出现）" % key)
     images_off = HEADER_SIZE
     images_len = total * OBS_C * out_h * out_w
     labels_off = images_off + images_len
@@ -596,6 +694,10 @@ def main():
                         "混进常规实验会让跨族结论失效；必须配 --allow-diagnostic-split")
     p.add_argument("--allow-diagnostic-split", action="store_true",
                    help="显式允许 map-hash:*/diag* 诊断性划分（读端默认拒绝）")
+    p.add_argument("--allow-mixed-geometry", action="store_true",
+                   help="【跨族合并实验】允许不同几何族（柱阵/森林/3DGS）混包：只放开族身份字段"
+                        "（geometry/appearance/split_salt/task_version…），hold_s/window_from/"
+                        "dynamics_profile 仍必须一致；meta.geometry_versions 记每族计数与 salt")
     p.add_argument("episodes", nargs="+", help="一个或多个 collect.py episode 目录")
     args = p.parse_args()
     if args.split_by_map and not args.allow_diagnostic_split:
@@ -603,7 +705,8 @@ def main():
 
     episodes, total, dropped, skipped = scan(
         args.episodes, args.drop_collision, args.exclude_collision_episodes,
-        args.split_by_map, args.allow_frozen_geometry, args.allow_diagnostic_split)
+        args.split_by_map, args.allow_frozen_geometry, args.allow_diagnostic_split,
+        args.allow_mixed_geometry)
     split_scheme = "map-hash:%s" % args.split_by_map if args.split_by_map else None
     collision_filter = {
         "drop_collision_steps": bool(args.drop_collision),
@@ -621,7 +724,8 @@ def main():
         os.remove(stale)
     out_path, meta_bytes = write_dataset(args.out, episodes, total, args.size, dropped,
                                          split_scheme=split_scheme,
-                                         collision_filter=collision_filter)
+                                         collision_filter=collision_filter,
+                                         allow_mixed=args.allow_mixed_geometry)
     # 3DGS 数据集把 scene.json 放到 <out>/scene.json，自动评测/换机复现不必回找 episode。
     scene_paths = [os.path.join(ep["dir"], "scene.json") for ep in episodes
                    if ep.get("scene_json")]

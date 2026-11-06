@@ -58,7 +58,8 @@ import campus  # noqa: E402
 from instruction import parse_target_color  # noqa: E402
 from split_manifest import SPLIT_SALT, geometry_gid  # noqa: E402
 from teacher import (TEACHER_VERSION, plan_action, plan_action_global,
-                     astar_path, _point_blocked, set_vehicle)  # noqa: E402
+                     astar_path, _point_blocked, set_vehicle,
+                     teacher_version, task_of_scene)  # noqa: E402
 
 # scene.json 里落盘的全局几何常量；与当前 scene_gen 不一致说明改了几何但没
 # bump GEOMETRY_VERSION，gid 会全变、别的闸门查不出新旧混包（A2）。
@@ -900,14 +901,16 @@ def audit(facts, pre_excluded=(), quarantined=()):
         if not f["pillars"]:
             no_truth += len(f["steps"])
             continue
-        # 旧几何/旧教师版本数据没有版本字段；用当前算法复算会假 FAIL。
+        # 旧几何/旧教师版本数据没有版本字段；用当前算法复算会假 FAIL。版本按任务档位比：
+        # forest_e1 集要求 forest 档版本（v6），旧森林集（写 v5、按 0.40/0.30 方框算）自动跳过。
+        teacher_task = task_of_scene(f.get("scene_metadata"))
         if (f.get("geometry_version") not in RECOMPUTE_GEOMETRY_VERSIONS or
-                f.get("teacher_version") != TEACHER_VERSION):
+                f.get("teacher_version") != teacher_version(teacher_task)):
             old_version += len(f["steps"])
             continue
-        # 脱困段的机身方框按采集时的载具算：E1 数据用 X3 半宽复算会在 0.36 m 余量内判出不同标签
-        # （pilot 20 集实测 47/800 假不一致，按 e1_mini 复算为 0）
-        set_vehicle(f["vehicle"])
+        # 脱困段的机身方框与规划余量按采集时的 (载具, 任务) 算：E1 数据用 X3 半宽复算会在 0.36 m
+        # 余量内判出不同标签（pilot 20 集实测 47/800 假不一致，按 e1_mini 复算为 0）
+        set_vehicle(f["vehicle"], teacher_task)
         for s in f["steps"]:
             pb, yb = s["pose_before"], s["yaw_before"]
             if (not isinstance(pb, dict) or yb is None or
@@ -940,7 +943,7 @@ def audit(facts, pre_excluded=(), quarantined=()):
         # 「一步都没复算成」不等于「全错」。旧格式/缺真值走这里，别报成 100% 不一致。
         checks.append(check("label_recompute", "SKIP",
                             f"没有可复算的步：缺动作前位姿 {no_pose} 步、"
-                            f"缺柱子真值 {no_truth} 步、旧几何版本 {old_version} 步"
+                            f"缺柱子真值 {no_truth} 步、旧几何或教师版本 {old_version} 步"
                             f"（共 {len(given)} 集）",
                             skipped=skipped))
     else:
@@ -950,7 +953,7 @@ def audit(facts, pre_excluded=(), quarantined=()):
                             f"{mism}/{total} 步复算标签与原标签不一致（{share:.1%}，"
                             f"阈值 {MAX_LABEL_MISMATCH:.0%}；跳过 {skipped} 步"
                             f"（缺位姿 {no_pose}、缺真值 {no_truth}、"
-                            f"旧几何版本 {old_version}）；"
+                            f"旧几何或教师版本 {old_version}）；"
                             f"另有 {uncovered} 步来自非 plan_action 的集未参与）",
                             samples=samples, mismatch=round(share, 4),
                             covered_steps=total, skipped=skipped))
