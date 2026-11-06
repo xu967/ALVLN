@@ -1182,6 +1182,16 @@ class StudioGuiTests(unittest.TestCase):
         self.app = studio.StudioApp(self.root)
         self.addCleanup(self._destroy)
 
+    def _geometry(self, w, h):
+        """按显示器字体像素比例放大测试窗口（上限屏幕）。几何断言按 96 dpi（TkDefaultFont 行高约 20 px）写；
+        桌面 :20 的 Xft.dpi 会变（2026-11-07 为 156，行高 33 px，控件放大 1.65 倍后 1500x960 里顶视只剩 49 px）。
+        Xft 字体像素由 Xft.dpi 决定，`tk scaling` 管不到，所以只能放大窗口。"""
+        import tkinter.font as tkfont
+        f = max(1.0, tkfont.nametofont("TkDefaultFont").metrics("linespace") / 20.0)
+        w = min(int(w * f), self.root.winfo_screenwidth()) // 2 * 2   # 偶数宽：两列等权重才能逐像素相等
+        h = min(int(h * f), self.root.winfo_screenheight())
+        self.root.geometry(f"{w}x{h}")
+
     def _destroy(self):
         if not self.app._closing:
             self.app._closing = True
@@ -1196,7 +1206,7 @@ class StudioGuiTests(unittest.TestCase):
     def test_sim_panels_keep_weight_ratio(self):
         """REVIEW #10：顶视和地图不能被压扁；格子按权重 3:2、两列等宽。"""
         import base64
-        self.root.geometry("1500x960")
+        self._geometry(1500, 960)
         self.app.tabs.select(self.app.sim_tab)
         msgs = {k: {"width": w, "height": h, "step": w * 3, "pixelFormatType": "RGB_INT8",
                     "data": base64.b64encode(bytes(range(256)) * (w * h * 3 // 256)).decode()}
