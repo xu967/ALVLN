@@ -133,7 +133,6 @@ void BatchReader::read_images(const std::vector<std::uint32_t>& indices, float* 
       throw std::out_of_range("BatchReader: 样本下标越界");
     }
   }
-  const float inv = 1.0f / 255.0f;
   for (std::size_t i = 0; i < indices.size(); ++i) {
     const auto relative = checked_product(indices[i], plane);
     if (relative > std::numeric_limits<std::uint64_t>::max() - metadata_->images_off) {
@@ -141,7 +140,8 @@ void BatchReader::read_images(const std::vector<std::uint32_t>& indices, float* 
     }
     read_exact_at(fd_, metadata_->images_off + relative, scratch_.data(), plane);
     float* dst = destination + i * plane;
-    for (std::size_t j = 0; j < plane; ++j) dst[j] = static_cast<float>(scratch_[j]) * inv;
+    // 除法而非乘倒数：与 UavrDataset::load_images / 设备 kernel 同一舍入（见 dataset.cpp）。
+    for (std::size_t j = 0; j < plane; ++j) dst[j] = static_cast<float>(scratch_[j]) / 255.0f;
   }
   verify_unchanged();
 }

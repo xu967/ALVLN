@@ -506,13 +506,14 @@ void UavrDataset::load_images(const std::vector<std::uint32_t>& idx, Tensor& out
   if (out.dims() != want) out = Tensor(want);
   const std::size_t plane = static_cast<std::size_t>(c) * h * w;
   std::vector<unsigned char> buf(plane);
-  const float inv = 1.0f / 255.0f;
   for (std::int64_t i = 0; i < b; ++i) {
     if (idx[static_cast<std::size_t>(i)] >= static_cast<std::uint32_t>(n)) fail("样本下标越界");
     read_exact(file, images_off + static_cast<std::uint64_t>(idx[i]) * plane, buf.data(), plane,
                "图像区");
     float* dst = out.data() + static_cast<std::size_t>(i) * plane;  // 文件已是 NCHW
-    for (std::size_t j = 0; j < plane; ++j) dst[j] = static_cast<float>(buf[j]) * inv;
+    // 必须写成除法：x*(1/255.0f) 在 126/256 个取值上与设备 kernel（augment_dev.cu 的
+    // x/255.0f，训练与推理共用）差 1 ulp，CPU/CUDA 对拍就不再逐位一致。
+    for (std::size_t j = 0; j < plane; ++j) dst[j] = static_cast<float>(buf[j]) / 255.0f;
   }
 }
 

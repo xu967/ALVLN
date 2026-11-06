@@ -1,8 +1,10 @@
 // LoadOptions.drop_collision 自检（无外部测试框架）：
 //   meta.collision_flags 里的 '1' 步必须从 train/val/test 三个下标表里删掉；
 //   请求过滤但 meta 缺标记时必须报错（不得静默保留错误标签）。
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <stdexcept>
 #include <string>
@@ -61,6 +63,29 @@ int main() {
   const auto legacy = uavrgb_test::write_synthetic_uavr(root + "/legacy.uavr", 8, 64, 64, 8, 3);
   const UavrDataset legacy_ds = load_uavr(legacy.path);
   check(legacy_ds.train_idx.size() == 8, "无 collision_flags 的旧数据集默认可读");
+
+  // host 端 u8→float 必须与设备 kernel（augment_dev.cu：x/255.0f）逐位一致：
+  // 写成 x*(1/255.0f) 会在 126 个取值上差 1 ulp。像素均匀随机，256 个取值全覆盖。
+  {
+    Tensor xf;
+    legacy_ds.load_images(legacy_ds.train_idx, xf);
+    const std::size_t plane = 3u * 64u * 64u;
+    std::vector<unsigned char> raw(plane * 8);
+    std::ifstream f(legacy.path, std::ios::binary);
+    f.seekg(static_cast<std::streamoff>(legacy_ds.images_off));
+    f.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(raw.size()));
+    check(static_cast<std::size_t>(f.gcount()) == raw.size(), "读取原始像素字节");
+    std::vector<bool> seen(256, false);
+    std::size_t mismatch = 0;
+    for (std::size_t j = 0; j < raw.size(); ++j) {
+      seen[raw[j]] = true;
+      if (xf.data()[j] != static_cast<float>(raw[j]) / 255.0f) ++mismatch;
+    }
+    const std::size_t covered = static_cast<std::size_t>(std::count(seen.begin(), seen.end(), true));
+    std::cout << "u8->float: 取值覆盖=" << covered << "/256 与 x/255.0f 不一致=" << mismatch << "\n";
+    check(covered == 256, "测试数据覆盖全部 256 个像素取值");
+    check(mismatch == 0, "load_images 与 x/255.0f 逐位一致");
+  }
   bool threw = false;
   try {
     (void)load_uavr(legacy.path, LoadOptions{true});

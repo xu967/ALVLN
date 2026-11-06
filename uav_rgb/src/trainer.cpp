@@ -136,20 +136,35 @@ SoftFacts read_soft_facts(const std::string& soft_path) {
 }
 
 // 运行目录附近的 git 提交（可选事实）。优先环境变量，便于离线/打包环境显式注入。
+// worktree 的 .git 是一行 "gitdir: <main>/.git/worktrees/<name>" 的文件，HEAD 在那里，
+// 而分支 ref 在 <gitdir>/commondir 指向的主 .git 下；两处都查，否则 worktree 里训出的
+// config.json 会静默写成 source_git=""。packed-refs 不解析（返回空，与原行为一致）。
 std::string detect_git_sha() {
   if (const char* e = std::getenv("UAVRGB_SOURCE_GIT")) return e;
+  namespace fs = std::filesystem;
   std::error_code ec;
-  std::filesystem::path p = std::filesystem::current_path(ec);
+  fs::path p = fs::current_path(ec);
   for (int i = 0; i < 8 && !ec && !p.empty(); ++i, p = p.parent_path()) {
-    std::ifstream head(p / ".git" / "HEAD");
+    fs::path gitdir = p / ".git";
     std::string line;
-    if (!std::getline(head, line)) continue;
-    if (line.rfind("ref: ", 0) == 0) {
-      std::ifstream ref(p / ".git" / line.substr(5));
-      if (std::getline(ref, line) && !line.empty()) return line;
-      return {};
+    if (fs::is_regular_file(gitdir, ec)) {  // worktree
+      std::ifstream f(gitdir);
+      if (!std::getline(f, line) || line.rfind("gitdir: ", 0) != 0) return {};
+      gitdir = fs::path(line.substr(8));
+      if (gitdir.is_relative()) gitdir = p / gitdir;
     }
-    return line;
+    std::ifstream head(gitdir / "HEAD");
+    if (!std::getline(head, line)) continue;
+    if (line.rfind("ref: ", 0) != 0) return line;  // detached HEAD：直接是 sha
+    const std::string ref = line.substr(5);
+    fs::path common = gitdir;
+    std::ifstream cf(gitdir / "commondir");  // 仅 worktree 有；内容相对 gitdir
+    if (std::getline(cf, line) && !line.empty()) common = gitdir / line;
+    for (const fs::path& base : {gitdir, common}) {
+      std::ifstream rf(base / ref);
+      if (std::getline(rf, line) && !line.empty()) return line;
+    }
+    return {};
   }
   return {};
 }
@@ -482,10 +497,11 @@ void Trainer::run() {
       metrics.flush();  // 监控台按追加偏移增量读，每步必须落盘
       check_out(metrics, "metrics.jsonl");
 
-      // results.csv 的 train_ce 必须与 dev_ce 同口径（都是无权 CE），否则两列不可比。
-      const float plain = (class_weights_.empty() && soft_targets_.empty())
-                              ? loss
-                              : softmax_ce_loss_cuda(logits, y);
+      // results.csv 的 train_ce 必须与 dev_ce 同口径（都是无权、无平滑的 CE），否则两列不可比。
+      const float plain =
+          (class_weights_.empty() && soft_targets_.empty() && cfg_.label_smoothing <= 0.0f)
+              ? loss
+              : softmax_ce_loss_cuda(logits, y);
       ce_sum += static_cast<double>(plain) * static_cast<double>(part.size());
       seen += part.size();
     }

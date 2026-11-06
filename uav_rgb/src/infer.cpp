@@ -49,7 +49,8 @@ std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream
   std::vector<std::uint8_t> chw(frame);
   std::vector<double> probs(static_cast<std::size_t>(ncls));
   std::size_t frames = 0;
-  // 权重常驻显存，每帧只上传 h*w*c 字节；/255 在设备侧做，与旧 host 路径同一舍入。
+  // 权重常驻显存，每帧只上传 h*w*c 字节；/255 在设备侧做，与训练 DeviceCnn 同一个 kernel、
+  // 同一舍入（host load_images 也写成 x/255.0f；闭环与打包两条输入路对拍见 tools/check_input_parity.py）。
   DeviceCnn dev(model, /*max_batch=*/1);
 
   while (true) {

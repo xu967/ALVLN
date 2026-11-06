@@ -579,6 +579,48 @@ int main() {
     check(ok, "--vision-only 应允许在带侧车的数据集上训纯视觉模型");
   }
 
+  // results.csv 的 train_ce 必须是无权、无平滑的 CE（与 dev_ce 同口径）。开 label_smoothing
+  // 时 step loss 是平滑损失：模型一旦偏离均匀预测，平滑损失就明显高于无平滑 CE
+  // （ε=0.2、C=4 的平滑最优点 CE≈0.16 而平滑损失≈0.59）。曾经的判断漏掉 ε，
+  // train_ce 列记成了 step loss 的均值。两类亮度可分，几步就能学会。
+  {
+    const std::vector<int> tl(32, 0), vl(8, 0);
+    std::vector<int> train_labels = tl, val_labels = vl;
+    train_labels.insert(train_labels.end(), 32, 1);
+    val_labels.insert(val_labels.end(), 8, 1);
+    fs::create_directories(root + "/smooth");  // 单独目录：避开上面用例留下的 instructions.jsonl 侧车
+    const uavrgb_test::SynthDataset sd4 = uavrgb_test::write_class_conditional_uavr(
+        root + "/smooth/ds_smooth.uavr", 32, 32, train_labels, val_labels,
+        {0.15f, 0.85f, 0.0f, 0.0f}, 0.02f, 0.02f, 21);
+    TrainConfig c4;
+    c4.data_path = sd4.path;
+    c4.out_dir = root + "/run_smooth";
+    c4.epochs = 10;
+    c4.batch = 32;
+    c4.lr = 1e-3f;
+    c4.seed = 5;
+    c4.label_smoothing = 0.2f;
+    Trainer t4(c4);
+    t4.run();
+    const auto rows = read_lines(c4.out_dir + "/results.csv");
+    std::vector<double> step_losses;
+    for (const std::string& line : read_lines(c4.out_dir + "/metrics.jsonl")) {
+      if (line.find("\"event\":\"train_step\"") != std::string::npos) {
+        step_losses.push_back(field_num(line, "\"loss\":"));
+      }
+    }
+    check(rows.size() == 11 && step_losses.size() == 20, "平滑口径用例应有 10 行 CSV、20 个 step");
+    if (rows.size() == 11 && step_losses.size() == 20) {
+      const double train_ce = std::stod(split_csv(rows[10])[1]);
+      const double smoothed = mean(step_losses, 18, 2);  // 末轮 2 个 step 的平滑损失均值
+      std::cout << "label_smoothing=0.2 末轮: train_ce=" << train_ce
+                << " 平滑 step loss 均值=" << smoothed << "\n";
+      check(train_ce < 0.9 * smoothed,
+            "results.csv 的 train_ce 应是无平滑 CE，明显低于平滑 step loss（实际 " +
+                std::to_string(train_ce) + " vs " + std::to_string(smoothed) + "）");
+    }
+  }
+
   fs::remove_all(root);
   if (g_failures == 0) {
     std::cout << "RESULT: PASS\n";
