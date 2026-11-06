@@ -33,6 +33,7 @@ elseif(TARGET ${CF_SITL_TARGET})
   set(_cf_sitl_link ${CF_SITL_TARGET})
 else()
   if(NOT CF_SITL_LIB)
+    unset(CF_SITL_LIB CACHE)   # 上面声明的空 FILEPATH 缓存项会让 find_library 直接跳过搜索
     find_library(CF_SITL_LIB NAMES cf_sitl HINTS "${CF_SITL_LIB_DIR}" "${CF_SITL_LIB_DIR}/lib")
   endif()
   if(NOT CF_SITL_LIB)
