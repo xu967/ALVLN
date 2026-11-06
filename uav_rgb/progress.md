@@ -1,6 +1,21 @@
 # progress.md（新开会话先读这个）
 
-- 更新：2026-11-07 04:05
+- 更新：2026-11-07 05:30（Cursor 新会话接手，第三阶段：全库并行精读 + 修 bug + demo）
+
+## 第三阶段（2026-11-07 05:10 起）
+
+用户原话：仿真里的无人机不像真机、可视化可能有 bug、要真实仿真环境、读代码/注释/git、用马尾辫 skill、跑测试和 demo、读三处硬件网址、调研浙大高飞/中科大、能改的直接改、并行 agent 不超上限。
+
+- 05:15 接手时：E1 流水线 PID 424699 在 collect 步（156/300 集在 `.staging`）；forest agent 两个守护进程 DONE；3DGS 多路线守护进程 DONE rc=1（6 路线 × 2 集完成、11/12 到达；pilot 阶段 route_2 因 agent 边跑边改 `collect_3dgs.py` 报 `NameError: ANOMALY_BACK_M`，现文件已完整）。
+- 05:18 forest / 3dgs-routes 两位 agent 的未提交改动跑单测全绿后按归属提交：`1825c8b feat(sim/tools) forest_e1 接管线`、`4a3f4f6 feat(3dgs) 多路线 + A* 教师 + demo_3dgs_routes`。两份 worklog（untracked）占位符待填。
+- CF-Drone 本地 36 文件改动只是 CRLF（`git diff --ignore-all-space` 为空），固件与 e7f507f 一致。
+- 05:25 建 5 个 worktree（`$DATA_ROOT/uav_rgb/tmp/wt-{sitl,viz,data,3dgs,src}-20261107`，分支同名），公共简报 `tmp/phase3-20261107/BRIEF.md`，报告目录 `tmp/phase3-20261107/reports/`。理由：流水线逐集起新进程读主工作树的 `sim/tools/*.py`、`e1_mini.json`，并 mmap `tmp/build-cf-sitl/*.so`、用 `build/check/` 二进制；agent 直接改主目录会让数据集前后集不一致。
+- 05:28 派出 5 个并行 agent（上限 6）：SITL（固件在环保真度、倒飞/悬停漂移根因、`build-cf-sitl-s3`）、VIZ（看真实视频帧找可视化 bug）、DATA（教师/采集/评测/审计/preprocess，森林膨胀按 (vehicle,task)、preprocess 跨族打包、compare_datasets 骨架）、3DGS（pilot 重跑守护进程 + 真实场景评估 + 相机一致性）、SRC（C++/CUDA 读审 + B4 输入一致性对拍，`build-src-s3`）。都不 commit，不起 Gazebo，`--parallel 2`。
+- 待办：收 5 份报告 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
+
+---
+
+- 上一段更新：2026-11-07 04:05
 - 代码仓库：`/root/claude-code-backup-20261028/code/uav_rgb`（main）；GitHub 镜像 `git@github.com:xu967/ALVLN.git` 的 `uav_rgb/` 子目录，用 `bash tools/git_mirror_alvln.sh` 推
 - 数据盘：`$DATA_ROOT/uav_rgb`（`/root/rivermind-data/uav_rgb`）；构建产物、数据集、实验输出都在这里，不进仓库
 - 任务边界：`$DATA_ROOT/uav_rgb/grill-me/boundary-v4.txt` + `boundary-v5-addendum.txt`；任务板 `docs/TASKS.md`（SIM-E1）；实验计划 `docs/experiments/2026-11-07-e1-demo-plan.md`；长期规划 `docs/ROADMAP.md`、`docs/TEACHER_LINE_PLAN.md`
