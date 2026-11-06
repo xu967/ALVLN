@@ -83,6 +83,8 @@ MAX_DEPTH_GAP_NS = 100_000_000
 MAX_WINDOW_CV = 0.05
 FWD_MIN_V = 0.4 * SPEED_FWD
 MAX_FWD_FAIL_SHARE = 0.01
+# 没有固定前进速度的动力学档（dynamics_profile 前缀）：定速判据 4/4b 跳过，偏航起始步免验。
+NON_FIXED_SPEED_PREFIXES = ("cf_stab", "cf_sitl")
 # T2 标定（2026-10-30，52 集 / 2080 步 / 164 个偏航接前进）：中位数 44%，
 # 是速度控制器加速滞后，不是没动。旧阈值 50% 会把正常数据判死；20% 仍能抓
 # 「几乎不动」的过渡步（stuck 级）。改阈值必须同步 HANDOFF §九。
@@ -600,12 +602,13 @@ def audit(facts, pre_excluded=(), quarantined=()):
     #    两群混在一起会得出「13% 动作没生效」的误判。
     approx = "（位移由位姿差近似，窗口错位 ±60 ms）" if any(
         s["disp_approx"] for s in traj_steps) else ""
-    # 4/4b 按 x3 定速 SPEED_FWD 判定；cf_stab 是倾角加速+滑行，没有固定速度，不适用。
+    # 4/4b 按 x3 定速 SPEED_FWD 判定；cf_stab 是倾角加速+滑行、cf_sitl 是固件速度环
+    # （起步/刹停曲线由固件定），都没有固定速度，不适用。
     cf_stab = [f for f in norm_ok
-               if str(f.get("dynamics_profile") or "").startswith("cf_stab")]
+               if str(f.get("dynamics_profile") or "").startswith(NON_FIXED_SPEED_PREFIXES)]
     stab_ids = {id(f) for f in cf_stab}
     fixed_v = [s for f in norm_ok if id(f) not in stab_ids for s in f["steps"]]
-    STAB_SKIP = (f"cf_stab 动力学没有固定前进速度，定速判据不适用（{len(cf_stab)} 集）")
+    STAB_SKIP = (f"cf_stab/cf_sitl 动力学没有固定前进速度，定速判据不适用（{len(cf_stab)} 集）")
     steady = [s for s in fixed_v if s["action"] == 1 and s["prev_action"] == 1
               and s["disp"] is not None]
     if cf_stab and not fixed_v:

@@ -47,6 +47,11 @@ WAYPOINT_RADIUS = 1.0
 REACH_RADIUS = 1.5
 # 新指标合同版本（SIM-09）。旧 success 定义不变，新字段单独按此版本解释。
 METRIC_VERSION = "sim09.v1"
+# cf_sitl（固件在环）下 FORWARD 到期后机体还会滑行，碰撞步的 action 多半已是 SAFE/YAW；
+# false_forward 改成「碰撞前 1 s 仿真内下过 FORWARD」。metric_version 带后缀，数字不与旧档混报。
+COAST_WINDOW_S = {"cf_sitl": 1.0}
+# stable_termination：末步真值速度 < 0.05 m/s（只有 oracle 带 speed_mps 的档能算，其余 None）。
+STABLE_SPEED_MPS = 0.05
 # scene_gen/campus/asset_campus 目前都写死这个相机档；协议比对只用它做本次运行的实际值。
 CAMERA_PROFILE = "rgb320x240_fov60_v1"
 PROTOCOL_KEYS = ("window_from", "hold_s", "steps", "task",
@@ -209,9 +214,32 @@ def _src(a):
     return a.get("src") or ""
 
 
+def coast_false_forward(actions, window_s):
+    """碰撞（contact）步之前 window_s 仿真秒内是否下过 FORWARD（含碰撞步本身）。
+
+    按 action_start_ns 计时；缺时间戳的行退回「碰撞步动作 == FORWARD」。
+    """
+    starts = [a.get("action_start_ns") for a in actions]
+    for k, a in enumerate(actions):
+        if not (bool(a.get("collision")) and _src(a) != "stuck"):
+            continue
+        if starts[k] is None:
+            if int(a.get("action_executed", -1)) == 1:
+                return True
+            continue
+        for j in range(k, -1, -1):
+            if starts[j] is None:
+                continue
+            if (int(starts[k]) - int(starts[j])) > window_s * 1e9:
+                break
+            if int(actions[j].get("action_executed", -1)) == 1:
+                return True
+    return False
+
+
 def summarize_episode(actions, oracle, goal_x, waypoint=None,
                       waypoint_radius=WAYPOINT_RADIUS, stop_radius=None, goal_radius=None,
-                      timed_out=False):
+                      timed_out=False, coast_window_s=None):
     """单集指标；纯函数，便于单测。actions/oracle 是 jsonl 行。
 
     EVAL_STANDARD §5.1：stuck（FORWARD 位移 < 阈值）不是碰撞，碰撞率只看 contact。
@@ -235,9 +263,14 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
       stop_action_issued = 最近 waypoint 点前后各 2 步内出现过 SAFE_NEUTRAL；
         不只看最后一步。没有可靠速度数据，因此不用速度阈值。
       task_success = reach_ever + final_in_radius + stop_action_issued + 无 contact + 未超时；
-        stable_termination 固定为 None（不知道，不等于通过）。
+        stable_termination：oracle 末行带 speed_mps（cf_sitl）时 = 速度 < STABLE_SPEED_MPS，
+        否则 None（不知道，不等于通过）。
+    coast_window_s（cf_sitl）：false_forward 改为「碰撞前该窗口内下过 FORWARD」，
+    metric_version 加后缀 .coast<N>s。
     """
     goal_radius_stop = float(stop_radius) if stop_radius is not None else None
+    metric_version = (METRIC_VERSION if coast_window_s is None
+                      else f"{METRIC_VERSION}.coast{coast_window_s:g}s")
     if not actions:
         return {"steps": 0, "collision": False, "stuck": False, "false_forward": False,
                 "success": False, "stop_success": False, "max_x": None,
@@ -247,13 +280,19 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
                 "stop_action_issued": False, "collision_free": True,
                 "stuck_free": True, "task_success": False,
                 "stable_termination": None, "timed_out": bool(timed_out),
-                "metric_version": METRIC_VERSION,
+                "metric_version": metric_version,
                 "goal_radius_reach": REACH_RADIUS,
                 "goal_radius_stop": goal_radius_stop}
     collision = any(bool(a.get("collision")) and _src(a) != "stuck" for a in actions)
     stuck = any(bool(a.get("collision")) and "stuck" in _src(a) for a in actions)
-    false_forward = any(bool(a.get("collision")) and _src(a) != "stuck" and
-                        int(a.get("action_executed", -1)) == 1 for a in actions)
+    if coast_window_s is None:
+        false_forward = any(bool(a.get("collision")) and _src(a) != "stuck" and
+                            int(a.get("action_executed", -1)) == 1 for a in actions)
+    else:
+        false_forward = coast_false_forward(actions, coast_window_s)
+    final_speed = oracle[-1].get("speed_mps") if oracle and isinstance(oracle[-1], dict) else None
+    stable_termination = (bool(float(final_speed) < STABLE_SPEED_MPS)
+                          if final_speed is not None else None)
     xs = [float(o["pose_gt"]["x"]) for o in oracle
           if isinstance(o.get("pose_gt"), dict) and "x" in o["pose_gt"]]
     max_x = max(xs) if xs else None
@@ -311,9 +350,9 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
             "stop_action_issued": stop_action_issued,
             "collision_free": collision_free, "stuck_free": not stuck,
             "task_success": task_success,
-            # 没有可靠速度/姿态窗口数据，只能报未知；None 不等于通过。
-            "stable_termination": None, "timed_out": bool(timed_out),
-            "metric_version": METRIC_VERSION,
+            # 只有 oracle 带真值速度（cf_sitl）才能判；其余档 None，不等于通过。
+            "stable_termination": stable_termination, "timed_out": bool(timed_out),
+            "metric_version": metric_version,
             "goal_radius_reach": REACH_RADIUS,
             "goal_radius_stop": goal_radius_stop}
 
@@ -366,8 +405,11 @@ def aggregate(episodes, requested=None, attempted=None, failed_count=0, skipped_
         "task_success_rate": rate("task_success"),
         "collision_free_rate": rate("collision_free"),
         "stuck_free_rate": rate("stuck_free"),
-        # 无可靠速度/姿态数据：只能报未知，不能报通过率。
-        "stable_termination_rate": None,
+        # 只在有真值速度的集上算（cf_sitl）；一集都没有就是 None，不是 0。
+        "stable_termination_rate": (
+            (sum(1 for e in done if e.get("stable_termination")) /
+             sum(1 for e in done if e.get("stable_termination") is not None))
+            if any(e.get("stable_termination") is not None for e in done) else None),
         "collision_rate": rate("collision"),
         # stuck 是「被挡住没动」而非接触；EVAL_STANDARD 要求单列，不能混进碰撞率。
         "stuck_rate": rate("stuck"),
@@ -390,7 +432,7 @@ def run_episode(seed, args, workdir, seen_gids):
     meta_path = os.path.join(workdir, f"scene_{seed}.json")
     cmd = [sys.executable, SCENE_GEN, "--seed", str(seed), "--scene-id", str(seed),
            "--out", world, "--template", args.template, "--task", args.task,
-           "--appearance", args.appearance]
+           "--appearance", args.appearance] + cp.scene_gen_extra(args)
     if args.task == "l1":
         # v5 关系任务要求两根同色柱横跨出生点，默认 spawn 在 y=0 时
         # assign_landmarks 找不到柱对会直接抛错（采集也是 random）。
@@ -454,6 +496,8 @@ def run_episode(seed, args, workdir, seen_gids):
             cmd += ["--rl-checkpoint", args.rl_checkpoint]
         if args.policy == "teacher" and args.teacher_planner != "astar":
             cmd += ["--teacher-planner", args.teacher_planner]
+        if getattr(args, "vehicle", None) and args.vehicle != "x3":
+            cmd += ["--vehicle", args.vehicle]   # x3 不传：旧命令行逐字不变
         env = cp.gz_env(partition)
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -484,11 +528,13 @@ def run_episode(seed, args, workdir, seen_gids):
         manifest = {}
     summary = summarize_episode(actions, oracle, goal_x, meta.get("waypoint"),
                                 WAYPOINT_RADIUS, meta.get("stop_radius"), meta.get("goal_radius"),
-                                timed_out=(rc == "timeout"))
+                                timed_out=(rc == "timeout"),
+                                coast_window_s=COAST_WINDOW_S.get(args.dynamics))
     summary.update({
         "seed": seed, "geometry_gid": gid, "split": split, "policy": args.policy,
         "task": args.task, "window_from": args.window_from,
         "dynamics": args.dynamics,
+        "vehicle": getattr(args, "vehicle", None) or "x3",
         "text_mode": args.text_mode,
         "task_version": meta.get("task_version"),
         **{key: meta.get(key) for key in sm.PROVENANCE_KEYS},
@@ -516,6 +562,49 @@ def run_episode(seed, args, workdir, seen_gids):
     if frames_dir:
         _write_video(summary, frames_dir, ep_dir, world, args, seed, goal_x, meta)
     return summary, None
+
+
+def scan_episodes(seed_list, episodes, run_fn, log=print):
+    """固定请求集扫描（AUDIT #11）：成功与采集失败都占一个名额，不再为失败补扫新 seed。
+
+    之前按 len(results) 停：1 集失败就多扫 1 个 seed 补上，requested_SR 的分母名义上是
+    请求数、实际成功集却来自更大的集合（4 请求 1 失败 → SR 1.0 / execution 1.0 /
+    completion 0.75 自相矛盾）。现在按 len(attempted) 停：失败进分母、单列 failed。
+    跳过（split 不符 / 重复几何）不占名额。run_fn(seed, seen) -> (summary, skip_reason)。
+    返回 (results, failures, skips, scanned, attempted)。
+    """
+    results, seen, failures, skips, scanned, attempted = [], set(), [], [], [], []
+    for seed in seed_list:
+        if len(attempted) >= episodes:
+            break
+        scanned.append(seed)
+        try:
+            summary, skip = run_fn(seed, seen)
+        except Exception as e:  # noqa: BLE001 - 单集失败要记录，不能拖垮整轮
+            log(f"[seed {seed}] 失败: {type(e).__name__}: {e}", flush=True)
+            attempted.append(seed)
+            failures.append({"seed": seed, "error": f"{type(e).__name__}: {e}"})
+            continue
+        if skip:
+            log(f"[seed {seed}] 跳过: {skip}", flush=True)
+            skips.append({"seed": seed, "reason": skip})
+            continue
+        attempted.append(seed)
+        if summary["collect_rc"] != 0 or summary["steps"] == 0:
+            # 采集中途失败不是「学生飞得差」，不计进 SR 分子，但占请求名额。
+            failures.append({"seed": seed, "rc": summary["collect_rc"],
+                             "stderr_tail": summary.get("stderr_tail"),
+                             "performance": summary.get("performance"),
+                             "render_backend_requested": summary.get("render_backend_requested")})
+            log(f"[seed {seed}] 采集失败 rc={summary['collect_rc']}，占请求名额、不计入成功",
+                flush=True)
+            continue
+        seen.add(summary["dedup_key"])
+        results.append(summary)
+        log(f"[seed {seed}] steps={summary['steps']} "
+            f"collision={summary['collision']} success={summary['success']} "
+            f"max_x={summary['max_x']} rc={summary['collect_rc']}", flush=True)
+    return results, failures, skips, scanned, attempted
 
 
 def _write_video(summary, frames_dir, ep_dir, world, args, seed, goal_x, meta):
@@ -558,7 +647,8 @@ def main():
     p.add_argument("--teacher-ckpt", default=None,
                    help="PrivilegedTeacher checkpoint（--policy teacher-nn 必填）")
     p.add_argument("--episodes", type=int, default=None,
-                   help="成功评测的 episode 数（缺省：给了 --seeds 用其个数，否则 3）")
+                   help="请求评测的 episode 数 = SR 分母（失败集也占名额并计入分母，列在 failed；"
+                        "缺省：给了 --seeds 用其个数，否则 3）")
     p.add_argument("--steps", type=int, default=80, help="每集最大步数")
     p.add_argument("--hold", type=float, default=1.0, help="每动作仿真时间秒")
     # default=None 只为识别「用户显式给了 dispatch」；缺省解析成 observation。
@@ -570,7 +660,15 @@ def main():
                    help="透传给 collect.py：x3_velocity=旧行为（唯一历史基线）；"
                         "cf_stab=CF-Drone 摇杆模型（建议配 --hold 0.1~0.2）；"
                         "cf_blackbox=纯 Python 黑盒（3DGS collector 直接使用；Gazebo "
-                        "闭环会明确拒绝，不拿 x3 物理冒充）")
+                        "闭环会明确拒绝，不拿 x3 物理冒充）；"
+                        "cf_sitl=E1 MINI 固件在环（必须 --vehicle e1_mini；false_forward 按滑行窗口"
+                        f"{COAST_WINDOW_S['cf_sitl']:g}s 判，metric_version 带 .coast 后缀）")
+    p.add_argument("--vehicle", choices=("x3", "e1_mini"), default=None,
+                   help="世界载具：缺省 x3（旧行为）；e1_mini 选 E1 模板并透传给 collect.py")
+    p.add_argument("--camera-rate", type=float, default=None,
+                   help="透传给 scene_gen：学生 RGB/深度相机 update_rate（Hz）；缺省用模板值")
+    p.add_argument("--no-aux-cameras", action="store_true",
+                   help="透传给 scene_gen：不生成 chase/top 辅助相机（仅 E1 模板；--record-video 时不要加）")
     p.add_argument("--protocol", default=None,
                    help="可选协议快照 JSON；比对 window_from/hold_s/steps/task/"
                         "appearance_version/dynamics/camera_profile，不一致写 ood=true 并警告")
@@ -589,7 +687,8 @@ def main():
     p.add_argument("--seeds", default="",
                    help="固定 seed 列表（逗号分隔或 a:b）；T7 三个基线用同一批场景")
     p.add_argument("--out", required=True)
-    p.add_argument("--template", default=DEFAULT_TEMPLATE)
+    p.add_argument("--template", default=None,
+                   help="模板 SDF（缺省按 --vehicle 选；x3 为 sim/worlds/uav_rgb.sdf）")
     p.add_argument("--infer-bin", default=None)
     p.add_argument("--goal-margin", type=float, default=1.0,
                    help="成功 = 无碰撞且 max_x >= 最远柱 x + 该余量")
@@ -647,6 +746,9 @@ def main():
     if args.dynamics == "cf_blackbox":
         p.error("cf_blackbox 是纯 Python 模型档，Gazebo 闭环未接入；"
                 "请让 3DGS collector 直接调用 cf_blackbox，或改用 cf_stab/x3_velocity")
+    cp.resolve_vehicle(args, p.error)
+    if args.record_video and args.no_aux_cameras:
+        p.error("--record-video 需要 chase/top 相机，不能同时 --no-aux-cameras")
     for name in ("goal_margin", "sim_timeout", "episode_timeout"):
         value = getattr(args, name)
         if not (math.isfinite(value) and value > 0):
@@ -722,43 +824,13 @@ def main():
         raise SystemExit(143)
 
     signal.signal(signal.SIGTERM, _term)
-    results, seen_gids, failures, skips = [], set(), [], []
-    scanned_seeds, attempted_seeds = [], []
     if not seed_list:
         seed_list = list(range(args.base_seed, args.base_seed + args.max_seeds))
     started = time.monotonic()
     try:
-        for seed in seed_list:
-            if len(results) >= args.episodes:
-                break
-            scanned_seeds.append(seed)
-            try:
-                summary, skip = run_episode(seed, args, workdir, seen_gids)
-            except Exception as e:  # noqa: BLE001 - 单集失败要记录，不能拖垮整轮
-                print(f"[seed {seed}] 失败: {type(e).__name__}: {e}", flush=True)
-                attempted_seeds.append(seed)
-                failures.append({"seed": seed,
-                                 "error": f"{type(e).__name__}: {e}"})
-                continue
-            if skip:
-                print(f"[seed {seed}] 跳过: {skip}", flush=True)
-                skips.append({"seed": seed, "reason": skip})
-                continue
-            attempted_seeds.append(seed)
-            if summary["collect_rc"] != 0 or summary["steps"] == 0:
-                # 采集中途失败不是「学生飞得差」，不能计进 SR/碰撞率。
-                failures.append({"seed": seed, "rc": summary["collect_rc"],
-                                 "stderr_tail": summary["stderr_tail"],
-                                 "performance": summary.get("performance"),
-                                 "render_backend_requested": summary.get("render_backend_requested")})
-                print(f"[seed {seed}] 采集失败 rc={summary['collect_rc']}，不计入指标",
-                      flush=True)
-                continue
-            seen_gids.add(summary["dedup_key"])
-            results.append(summary)
-            print(f"[seed {seed}] steps={summary['steps']} "
-                  f"collision={summary['collision']} success={summary['success']} "
-                  f"max_x={summary['max_x']} rc={summary['collect_rc']}", flush=True)
+        results, failures, skips, scanned_seeds, attempted_seeds = scan_episodes(
+            seed_list, args.episodes,
+            lambda seed, seen: run_episode(seed, args, workdir, seen))
     finally:
         cp.cleanup_all()
 
@@ -772,9 +844,15 @@ def main():
               "rl_checkpoint": args.rl_checkpoint if args.policy == "teacher-rl" else None,
               "task": args.task, "window_from": args.window_from,
               "dynamics": args.dynamics,
+              "vehicle": args.vehicle or "x3",
+              "camera_rate_hz": args.camera_rate,   # None = 模板默认（X3 30 Hz / E1 10 Hz）
+              "aux_cameras": not args.no_aux_cameras,
               "text_mode": args.text_mode, "text_dim": text_dim,
               # 新指标合同（SIM-09）；旧 success/stop_success 定义不变。
-              "metric_version": METRIC_VERSION,
+              # cf_sitl 带 .coast 后缀：false_forward 按滑行窗口判，数字不与旧档混报。
+              "metric_version": (METRIC_VERSION if args.dynamics not in COAST_WINDOW_S else
+                                 f"{METRIC_VERSION}.coast{COAST_WINDOW_S[args.dynamics]:g}s"),
+              "coast_window_s": COAST_WINDOW_S.get(args.dynamics),
               # 成功语义跟着数据走：L1 是 goal_reach_ever「轨迹上曾进入 waypoint
               # 1.5 m 且无碰撞」，旧数据是 route_choice「越过终点」。不写死会让新旧
               # SR 被直接混报。历史口径：2026-11-01 前是 goal_stop（含 SAFE 判定），

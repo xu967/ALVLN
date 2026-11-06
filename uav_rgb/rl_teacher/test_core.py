@@ -2,7 +2,7 @@
 """Numerical and integration regressions without optional Gym/Gazebo."""
 import math
 from .core import (Phys,advance,DistanceField,signed_clearance,NavigationCore,
-                   RewardConfig,state_vector,FORWARD,NEUTRAL)
+                   RewardConfig,state_vector,FORWARD,NEUTRAL,delay_remaining_at)
 
 
 def main():
@@ -40,6 +40,17 @@ def main():
     assert abs(first+c2.cfg.gamma*second-(c2.cfg.gamma**2*phif-phi0))<1e-7
     # Success requires sustained low-speed presence, not merely passing a radius.
     assert not c2.step(FORWARD)[4]['success']
+    # N1: at decision time the env has counted the dispatch delay down to 0 (0.15 < 0.2),
+    # so obs[-1] is 0; the Gazebo collector must derive the same number from sim time.
+    c3=NavigationCore(seed=0)
+    obs=c3.obs()
+    assert obs[-1]==0.0
+    for _ in range(3):
+        obs,_,_,_,_=c3.step(FORWARD)
+        assert obs[-1]==0.0
+    assert delay_remaining_at(0.0,0.2,0.15)==0.0           # a full hold later: elapsed
+    assert math.isclose(delay_remaining_at(0.0,0.05,0.15),0.10)  # mid-delay observation
+    assert delay_remaining_at(None,5.0,0.15)==0.0          # nothing dispatched yet
     print('rl_teacher core PASS')
 
 if __name__=='__main__':main()

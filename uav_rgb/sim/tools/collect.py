@@ -69,6 +69,7 @@ import save_frame
 import split_manifest as sm
 import cf_sil
 import cf_blackbox
+import cf_sitl_exec
 
 TWIST_TOPIC = "/X3/gazebo/command/twist"
 CAMERA_TOPIC = "/uav/camera"
@@ -81,6 +82,29 @@ DEPTH_DIR = "depth"
 DEPTH_REF = DEPTH_DIR + "/depth_%05d.png"   # episode 内相对路径模板（downstream 按 %05d 展开）
 
 RGB_FRAME_ID = "x3::base_link::camera"   # /uav/camera_info 上 RGB 与 depth 两个 publisher
+# 载具只影响位姿话题与 camera_info 的 frame_id（相机话题/分辨率两种载具相同）。
+# x3 是默认，旧命令不传 --vehicle 时行为不变；e1_mini 配 --dynamics cf_sitl。
+# pose_buf：位姿订阅的 latest-wins 缓冲帧数。_pick_pose_after 在缓冲里找「晚于 RGB 的最早一帧」，
+# 缓冲跨度必须盖过 RGB 帧经 gz topic/JSON 到达的延迟（实测 70~175 ms 仿真时间），否则只能拿到
+# 缓冲里最旧的一帧，pose 与 RGB 的间隔就等于到达延迟。x3 位姿约 45 Hz，6 帧≈130 ms（历史值不动）；
+# e1_mini OdometryPublisher 200 Hz，64 帧≈320 ms（2026-11-07 真库采集实测 6 帧时 pose_gap 25~175 ms，8/10 步超 50 ms）。
+VEHICLES = {
+    "x3": {"pose_topic": POSE_TOPIC, "rgb_frame_id": RGB_FRAME_ID, "pose_buf": 6},
+    "e1_mini": {"pose_topic": "/model/e1_mini/pose",
+                "rgb_frame_id": "e1_mini::base_link::camera", "pose_buf": 64},
+}
+DEFAULT_VEHICLE = "x3"
+
+
+def vehicle_name(world_sdf):
+    """世界 SDF 文本里带学生相机（<sensor name="camera"）的模型名；找不到回退 x3。"""
+    import re
+    for m in re.finditer(r'<model name="([^"]+)">', world_sdf):
+        end = world_sdf.find("</model>", m.end())
+        body = world_sdf[m.end():end if end >= 0 else None]
+        if '<sensor name="camera"' in body and "<topic>" + CAMERA_TOPIC + "</topic>" in body:
+            return m.group(1)
+    return DEFAULT_VEHICLE
 
 GZ_TIMEOUT = 5.0      # 单次 gz 命令行调用上限（publisher 卡住时不永久挂起）
 STUCK_EPS = 0.03      # FORWARD_SLOW 下动作窗口位移 < 3cm 视为卡滞（被挡）
@@ -144,10 +168,13 @@ def altitude_vz(pose):
 # 倾角，水平加速度 g·tanθ，线性阻力 k；其余动作俯仰杆回中，靠阻力滑停（不刹车）。
 # 速度在世界系积分（转头时动量不随机头转），发指令前转回机体系；底层仍由
 # MulticopterVelocityControl 跟踪这条速度曲线。默认 x3_velocity 保持旧行为不变。
-DYNAMICS = ("x3_velocity", "cf_stab", "cf_blackbox", "cf_sil")
+DYNAMICS = ("x3_velocity", "cf_stab", "cf_blackbox", "cf_sil", "cf_sitl")
 # cf_sil 已退出 collect_parallel / eval 的默认矩阵，只在 collect.py 保留手动入口；
 # 写进 manifest 的 experimental 位，提醒下游不要把它当默认训练档。
 DYNAMICS_EXPERIMENTAL = ("cf_sil",)
+# cf_sitl：E1 MINI 固件在环（Gazebo 内 CfSitlSystem 插件 1 kHz 跑固件），collect 只发
+# 「动作 + 截止仿真秒」；必须配 --vehicle e1_mini 的世界，默认参数 sim/dynamics/e1_mini.json。
+DYNAMICS_VEHICLE = {"cf_sitl": "e1_mini"}
 CF_STAB_PROFILE = "cf_stab_v1"
 G = 9.81
 CF_MAX_TILT_DEG = 30.0  # CF-Drone/control.ino 的最大倾角
@@ -223,6 +250,24 @@ class CfStab:
         wz = {YAW_LEFT: SPEED_YAW, YAW_RIGHT: -SPEED_YAW}.get(self.active, 0.0)
         c, s = math.cos(yaw), math.sin(yaw)
         return c * self.vx + s * self.vy, -s * self.vx + c * self.vy, wz
+
+
+def rl_delay_remaining(dyn, now_ns):
+    """teacher-rl 观测的 delay_remaining：上一次派发的指令延迟在观测时刻还剩多少秒。
+
+    N1：训练环境在决策时刻早已把延迟倒计时到 0（0.15 < ACTION_DT 0.2），常量 latency_s
+    会让 Gazebo 侧 obs[-1]=0.3 而训练侧恒为 0。按仿真时间算：有尚未生效的派发才非零。
+    """
+    from pathlib import Path
+    repo_root = str(Path(__file__).resolve().parents[2])
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from rl_teacher.core import delay_remaining_at
+    if not dyn.pending:
+        return 0.0
+    t_eff, _ = dyn.pending[-1]
+    dispatch_s = (t_eff - int(dyn.latency_s * 1e9)) / 1e9
+    return delay_remaining_at(dispatch_s, now_ns / 1e9, dyn.latency_s)
 
 
 def dyn_twist(dyn, t_ns, yaw_deg, pose):
@@ -488,13 +533,14 @@ def _angle_diff(a, b):
 
 # ---------------------------------------------------------------- 常驻订阅
 
-def open_subs():
+def open_subs(vehicle=DEFAULT_VEHICLE):
     """给采集用到的 5 个话题各起一个常驻订阅；半路失败也要关掉已起的。"""
     subs = {}
     try:
         subs["rgb"] = gz_io.TopicSub(CAMERA_TOPIC, buf=4)
         subs["depth"] = gz_io.TopicSub(DEPTH_TOPIC, buf=4)
-        subs["pose"] = gz_io.TopicSub(POSE_TOPIC, buf=6, stamp_fn=_pose_stamp)
+        subs["pose"] = gz_io.TopicSub(VEHICLES[vehicle]["pose_topic"],
+                                      buf=VEHICLES[vehicle]["pose_buf"], stamp_fn=_pose_stamp)
         subs["contact"] = gz_io.TopicSub(CONTACT_TOPIC, buf=16,
                                           event_predicate=_contact_nonempty)
         subs["camera_info"] = gz_io.TopicSub(CAMERA_INFO_TOPIC, buf=4)
@@ -531,12 +577,12 @@ def wait_ready(subs, timeout=READY_TIMEOUT):
     return f"{timeout:.0f}s 内没有数据: {missing}"
 
 
-def read_camera_info(sub, timeout=3.0):
-    """从 /uav/camera_info 取 RGB 那条（frame_id=x3::base_link::camera）的内参。"""
+def read_camera_info(sub, timeout=3.0, frame_id=RGB_FRAME_ID):
+    """从 /uav/camera_info 取 RGB 那条（frame_id=<载具>::base_link::camera）的内参。"""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         for _, msg in sub.frames():
-            cam = camera_from_info(msg)
+            cam = camera_from_info(msg, frame_id)
             if cam:
                 return cam
         if not sub.healthy():
@@ -545,7 +591,7 @@ def read_camera_info(sub, timeout=3.0):
     return None
 
 
-def camera_from_info(msg):
+def camera_from_info(msg, rgb_frame_id=RGB_FRAME_ID):
     """gz.msgs.CameraInfo -> {width,height,fx,fy,cx,cy,frame_id}；非 RGB 相机返回 None。"""
     if not isinstance(msg, dict):
         return None
@@ -555,7 +601,7 @@ def camera_from_info(msg):
         if isinstance(item, dict) and item.get("key") == "frame_id":
             value = item.get("value")
             frame_id = value[0] if isinstance(value, list) and value else value
-    if frame_id != RGB_FRAME_ID:
+    if frame_id != rgb_frame_id:
         return None
     k = (msg.get("intrinsics") or {}).get("k") or []
     if len(k) < 9:
@@ -709,6 +755,46 @@ def take_off_cf_sil(pose_sub, sil, contact_sub=None, z_target=None, timeout=120.
     raise RuntimeError(f"起飞超时 {timeout:.0f}s：z={last_z}，目标 {z_target}")
 
 
+def take_off_cf_sitl(pose_sub, ex, contact_sub=None):
+    """cf_sitl 起飞：执行器自己发 reset/arm_takeoff 并等固件 READY；这里只管真值侧的检查。
+
+    与 take_off_cf_sil 同样的两道门：world 必须是新鲜的（z<=0.5），离地后出现 contact
+    就中止（spawn 太近或撞柱）。落地瞬间的接触不算：基线序号取 READY 时刻的值。
+    """
+    def pose_now():
+        msg = pose_sub.latest()
+        return _pose_parts(msg) if msg else (None, 0, None)
+
+    pos, _, _ = pose_now()
+    z0 = pos.get("z") if isinstance(pos, dict) else None
+    if z0 is not None and z0 > 0.5:
+        raise RuntimeError(
+            f"world 未复位：起飞前 z={z0:.2f} m > 0.5；请重启 gz sim 或换新 world")
+    if contact_sub is not None and not contact_sub.healthy():
+        raise RuntimeError("contact 订阅进程已退出")
+    air_seq0 = [None]
+
+    def abort_check():
+        if contact_sub is None:
+            return None
+        if not contact_sub.healthy():
+            return "contact 订阅进程已退出"
+        pos, _, _ = pose_now()
+        z = pos.get("z") if isinstance(pos, dict) else None
+        if z is not None and z > 0.5:
+            if air_seq0[0] is None:
+                air_seq0[0] = _contact_seq(contact_sub)
+            elif _contact_since(contact_sub, air_seq0[0]):
+                return "离地后检测到 contact（spawn 太近或撞柱）"
+        return None
+
+    ex.start(abort_check)
+    pos, _, _ = pose_now()
+    z = pos.get("z") if isinstance(pos, dict) else None
+    print(f"起飞完成: z={'?' if z is None else f'{z:.2f}'} m（固件 READY）", file=sys.stderr)
+    return _contact_seq(contact_sub) if contact_sub is not None else None
+
+
 # ---------------------------------------------------------------- 单步
 
 def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
@@ -797,7 +883,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             state = Phys(x=pose_before["x"], y=pose_before["y"],
                          yaw=math.radians(yaw_before), vx=dyn.vx, vy=dyn.vy,
                          action=dyn.active, last_action=dyn.active,
-                         delay_remaining=max(0., dyn.latency_s))
+                         delay_remaining=rl_delay_remaining(dyn, pose_before_ts))
             import numpy as np
             obs = np.asarray(state_vector(state, (waypoint["x"], waypoint["y"]),
                                           pillars), dtype=np.float32)
@@ -863,7 +949,10 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         try:
             if sil is not None:
                 # 动作交给后台电机线程；不建 twist publisher，也不发 twist。
-                sil.dispatch(action, exec_ts)
+                # cf_sitl 的截止时刻按动作窗口起点算（observation 语义 = 观测帧 + hold），
+                # 与下面 hold_end_ns 同一个起点；cf_sil 仍按派发时刻加延迟。
+                sil.dispatch(action, action_start_ns
+                             if getattr(sil, "until_from_window_start", False) else exec_ts)
                 action_handle = None
                 path0 = 0.0
             elif dyn is None:
@@ -901,7 +990,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 return None, "动作窗口内 contact 订阅进程已退出"
             if sil is not None and sil.error():
                 stop_executor(publisher, sil)
-                return None, f"cf_sil 执行器故障: {sil.error()}"
+                return None, f"{getattr(sil, 'name', 'cf_sil')} 执行器故障: {sil.error()}"
             msg = subs["pose"].latest()
             if msg is not None and _pose_stamp(msg) >= hold_end_ns:
                 break
@@ -987,9 +1076,11 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         # cf_sil：hold < 0.5 s 时从静止起步的位移本身就小于 STUCK_EPS，不启用卡滞
         # 兜底（碰撞以 contact 为主）。长窗口按本步 FORWARD 设定点折算期望位移。
         # shortcut: 忽略步前已有速度，期望位移偏保守；换 hold/速度设定点后要重测。
+        # cf_sitl（stuck_detection=False）：速度曲线由固件决定，不按 SPEED_FWD 折算，碰撞只认 contact。
         expected_m = SPEED_FWD * sim_dt if action == FORWARD_SLOW else 0.0
         stuck_eps = min(STUCK_EPS, 0.25 * expected_m)
-        armed = sim_dt >= 0.5 and expected_m >= 2 * STUCK_EPS
+        armed = (getattr(sil, "stuck_detection", True)
+                 and sim_dt >= 0.5 and expected_m >= 2 * STUCK_EPS)
     else:
         # cf_stab：X3 底层跟踪模型曲线滞后约 0.4 s（2026-11-04 实测加速初段实际/预测
         # 低至 0.3），按 0.5×预测会把起步误判成卡滞。只在模型预测已走满 STUCK_EPS 时判，
@@ -1024,6 +1115,10 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         "displacement_m": dist,
         "dyaw_deg": dyaw,
         "sim_dt": sim_dt,
+        # 窗口末速度（m/s）：只有 cf_sitl 的 state 话题给真值速度；其余档为 None。
+        # eval 的 stable_termination 用它，不用「位移/时间」的窗口均值冒充末速度。
+        "speed_after_mps": (sil.speed_mps() if sil is not None and hasattr(sil, "speed_mps")
+                            else None),
         "infer_ms": infer_ms,
         "action_wall_s": action_wall,
         "src": "+".join(s for s, on in (("contact", contact), ("stuck", stuck)) if on) or None,
@@ -1136,6 +1231,13 @@ def main():
     p.add_argument("--cf-sil-params", default=None,
                    help="cf_sil 参数 JSON（默认 sim/dynamics/cf_sil_v1.json）；"
                         "只能和 --dynamics cf_sil 一起用")
+    p.add_argument("--vehicle", choices=tuple(VEHICLES), default=None,
+                   help="世界里的载具模型：x3（默认）或 e1_mini；决定位姿话题 /model/<name>/pose "
+                        "与 camera_info 的 frame_id。缺省取 scene-meta 的 vehicle，再缺省 x3。"
+                        "--dynamics cf_sitl 必须是 e1_mini")
+    p.add_argument("--cf-sitl-params", default=None,
+                   help="cf_sitl 参数 JSON（默认 sim/dynamics/e1_mini.json，与世界模板同一单源）；"
+                        "只能和 --dynamics cf_sitl 一起用")
     p.add_argument("--flight-log", default=None,
                    help="cf_sil 参数辨识用 ULog(.ulg)；需要 pyulog，未安装时先导出 CSV")
     p.add_argument("--flight-log-csv", default=None,
@@ -1209,6 +1311,20 @@ def main():
                   file=sys.stderr)
     elif args.cf_sil_params:
         p.error("--cf-sil-params 只能和 --dynamics cf_sil 一起用")
+    cf_sitl_params = None
+    if args.dynamics == "cf_sitl":
+        try:
+            cf_sitl_params = cf_sitl_exec.CfSitlParams.from_json(
+                args.cf_sitl_params or cf_sitl_exec.DEFAULT_PARAMS)
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            p.error(f"无法加载 cf_sitl 参数: {e}")
+        if not cf_sitl_params.calibrated:
+            print("警告: cf_sitl 参数 calibrated=false（硬件草案/假设值，不是实测标定）",
+                  file=sys.stderr)
+        if args.no_takeoff:
+            p.error("--dynamics cf_sitl 不支持 --no-takeoff：固件必须经 arm_takeoff 进入 READY")
+    elif args.cf_sitl_params:
+        p.error("--cf-sitl-params 只能和 --dynamics cf_sitl 一起用")
     if args.flight_log and args.flight_log_csv:
         p.error("--flight-log 和 --flight-log-csv 只能二选一")
     log_path = args.flight_log or args.flight_log_csv
@@ -1257,6 +1373,20 @@ def main():
         want_split = sm.split_for_scene(scene_meta_obj)
         if args.split != want_split:
             p.error(f"--split {args.split} 与几何组 {scene_gid} 的固定 split={want_split} 不一致")
+    # 载具：显式 --vehicle > scene-meta.vehicle（scene_gen --vehicle 写入）> x3。
+    # cf_sitl 的固件只在 e1_mini 世界里有插件可收；e1_mini 世界也没有 X3 的速度控制器。
+    vehicle = args.vehicle or scene_meta_obj.get("vehicle") or DEFAULT_VEHICLE
+    if vehicle not in VEHICLES:
+        p.error(f"scene-meta 的 vehicle={vehicle!r} 不在 {sorted(VEHICLES)}；请显式 --vehicle")
+    need_vehicle = DYNAMICS_VEHICLE.get(args.dynamics)
+    if need_vehicle and vehicle != need_vehicle:
+        p.error(f"--dynamics {args.dynamics} 需要 --vehicle {need_vehicle}（当前 {vehicle}）")
+    if vehicle != DEFAULT_VEHICLE and not need_vehicle:
+        p.error(f"--vehicle {vehicle} 只能配 --dynamics "
+                f"{[d for d, v in DYNAMICS_VEHICLE.items() if v == vehicle]}（当前 {args.dynamics}）")
+    # 教师只换脱困段的机身碰撞盒半宽（x3 0.235 / e1_mini 0.102），规划几何不变。
+    import teacher as _teacher
+    _teacher.set_vehicle(vehicle)
     # 标签来自哪个教师必须进 manifest：两种策略产出的数据长得一模一样，
     # 事后只能靠这个字段区分（旧版没有任何记录）。
     if args.policy == "forward":
@@ -1306,16 +1436,21 @@ def main():
     dyn = CfStab() if args.dynamics == "cf_stab" else None
     sil = (cf_sil.CfSilMotorThread(cf_sil_params)
            if cf_sil_params is not None else None)
+    if cf_sitl_params is not None:
+        sil = cf_sitl_exec.CfSitlExecutor(
+            cf_sitl_params, hold_s=args.hold,
+            episode=args.episode_id if args.episode_id is not None else args.seed)
+    rgb_frame_id = VEHICLES[vehicle]["rgb_frame_id"]
     try:
-        subs = open_subs()
+        subs = open_subs(vehicle)
         not_ready = wait_ready(subs)
         if not_ready:
             raise RuntimeError(f"常驻订阅未就绪: {not_ready}")
-        cam_info = read_camera_info(subs["camera_info"])
+        cam_info = read_camera_info(subs["camera_info"], frame_id=rgb_frame_id)
         if cam_info:
             print(f"相机内参: fx={cam_info['fx']:.3f} fy={cam_info['fy']:.3f} "
                   f"cx={cam_info['cx']:.3f} cy={cam_info['cy']:.3f} "
-                  f"({cam_info['width']}x{cam_info['height']}, {RGB_FRAME_ID})",
+                  f"({cam_info['width']}x{cam_info['height']}, {rgb_frame_id})",
                   file=sys.stderr)
         else:
             print("警告: 没读到 /uav/camera_info 的 RGB 内参，manifest 里 fx/fy/cx/cy 保持 null",
@@ -1331,7 +1466,7 @@ def main():
                     f"常驻 twist publisher 不可用（{e}）；定量采集不做 gz topic -p CLI"
                     f" 回退（每条指令约 +1.0 s，动作窗口会失真）") from e
         else:
-            print(f"cf_sil 执行器: {sil.params.profile()}（calibrated="
+            print(f"{args.dynamics} 执行器: {sil.params.profile()}（calibrated="
                   f"{sil.params.calibrated}，altitude={sil.params.altitude_assumption}）",
                   file=sys.stderr)
 
@@ -1353,7 +1488,10 @@ def main():
             teacher_nn = TeacherPolicy(args.teacher_ckpt)
 
         contact_seq0 = _contact_seq(subs["contact"])
-        if sil is not None:
+        if cf_sitl_params is not None:
+            print("cf_sitl: reset + arm_takeoff，等固件 READY…", file=sys.stderr)
+            contact_seq0 = take_off_cf_sitl(subs["pose"], sil, subs["contact"])
+        elif sil is not None:
             print("cf_sil: 停用 MulticopterVelocityControl 并启动电机线程…",
                   file=sys.stderr)
             sil.start()
@@ -1409,7 +1547,9 @@ def main():
                                        "timestamp_ns": r["pose_ts"],
                                        "pose_gt": r["pose_gt"],
                                        "action_start_ns": r["action_start_ns"],
-                                       "action_end_ns": r["action_end_ns"]}) + "\n")
+                                       "action_end_ns": r["action_end_ns"],
+                                       # 特权通道：窗口末真值速度（只有 cf_sitl 有，其余 null）
+                                       "speed_mps": r["speed_after_mps"]}) + "\n")
             oracle_f.flush()
             rows_written += 1
             timings.append(r["timing"] | {"depth_gap_ns": gap_ns,
@@ -1519,6 +1659,13 @@ def main():
                 "dynamics_params": sil.params.manifest(),
                 "altitude_assumption": sil.params.altitude_assumption}
                if sil is not None else {}),
+            # 采集器选的动力学档与世界里的载具；x3_velocity/x3 是历史默认。
+            "dynamics": args.dynamics,
+            "vehicle": vehicle,
+            # cf_sitl：参数单源 sha 与标定位提到顶层，下游不用翻 dynamics_params。
+            **({"params_sha256": sil.params.sha256, "calibrated": sil.params.calibrated,
+                "takeoff_failsafe_retries": sil.takeoff_failsafes}
+               if cf_sitl_params is not None else {}),
             # 飞行日志只做接口校验/摘要，不参与本次控制参数；留路径供事后追溯。
             **({"flight_log": os.path.abspath(log_path)} if log_path else {}),
             # 标签由哪个教师产生：forward=盲策略对照，expert_action=深度反应式，

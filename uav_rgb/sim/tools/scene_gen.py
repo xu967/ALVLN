@@ -83,8 +83,22 @@ MAX_ATTEMPTS = 100
 SIM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPO_ROOT = os.path.dirname(SIM_DIR)
 DEFAULT_TEMPLATE = os.path.join(SIM_DIR, "worlds", "uav_rgb.sdf")
+# 载具 -> 默认模板。模板里的载具模型名必须与键一致（_apply_spawn 按它找 pose）。
+# x3 是默认载具，旧命令行为不变；e1_mini 是 SITL 固件在环的 E1 MINI（CfSitlSystem 插件）。
+VEHICLES = {
+    "x3": {"template": DEFAULT_TEMPLATE, "dynamics_profile": "x3_v1"},
+    "e1_mini": {"template": os.path.join(SIM_DIR, "worlds", "uav_rgb_e1.sdf"),
+                "dynamics_profile": "cf_sitl_v1"},
+}
+DEFAULT_VEHICLE = "x3"
 START_MARK = "    <!-- tall pillars"
 END_MARK = "    <!-- X3-equivalent quadrotor"
+# E1 模板里可选相机（chase/top）的包裹标记；--no-aux-cameras 整块删掉（采集提速，录 demo 时才开）。
+AUX_CAMERA_RE = re.compile(r"\n    <!-- aux-camera:.*?<!-- /aux-camera -->", re.S)
+# 学生相机与配对深度相机的 update_rate（只匹配 name="camera"/"depth" 的两个传感器）。
+CAMERA_RATE_RE = re.compile(
+    r'(<sensor name="(?:camera|depth)" type="(?:camera|depth_camera)">\s*<pose>[^<]*</pose>'
+    r'\s*<always_on>1</always_on>\s*<update_rate>)([0-9.]+)(</update_rate>)')
 # 外观版本：只改材质/光照/固定地标，不动 pillars 几何 → geometry_gid 与旧数据都保留。
 # legacy 显式复现改动前逐字节输出（含 3 个固定纯色方块）；v1 删掉它们并随机化光照/天空。
 # 2026-11-04 起新场景默认 v1：固定地标是每集重复的捷径，且不在教师真值里。
@@ -229,17 +243,51 @@ def make_spawn(pillars, seed, mode="default"):
             "yaw_deg": round(rng.uniform(-5.0, 5.0), 1), "mode": mode}
 
 
-X3_POSE_RE = re.compile(r'(<model name="x3">\s*<pose>)([^<]*)(</pose>)')
+VEHICLE_POSE_RE = re.compile(
+    r'(<model name="(' + "|".join(map(re.escape, VEHICLES)) + r')">\s*<pose>)([^<]*)(</pose>)')
+X3_POSE_RE = VEHICLE_POSE_RE   # 旧名字保留给外部引用
+
+
+def vehicle_of_template(template):
+    """模板里是哪种载具：按 VEHICLES 的模型名找；找不到或多个都报错。"""
+    found = [m.group(2) for m in VEHICLE_POSE_RE.finditer(template)]
+    if len(found) != 1:
+        raise ValueError(f"template 里载具模型匹配到 {found}，应恰好 1 个（{sorted(VEHICLES)}）")
+    return found[0]
 
 
 def _apply_spawn(world, spawn):
-    """只替换 x3 模型的第一条 pose；控制 spawn 不影响其它模板内容。"""
+    """只替换载具模型（x3 / e1_mini）的第一条 pose；控制 spawn 不影响其它模板内容。"""
     def repl(m):
         return (m.group(1) + f"{spawn['x']:g} {spawn['y']:g} {spawn['z']:g} "
-                f"0 0 {spawn['yaw_deg'] * 3.141592653589793 / 180.0:.6f}" + m.group(3))
-    world, n = X3_POSE_RE.subn(repl, world, count=1)
+                f"0 0 {spawn['yaw_deg'] * 3.141592653589793 / 180.0:.6f}" + m.group(4))
+    world, n = VEHICLE_POSE_RE.subn(repl, world, count=1)
     if n != 1:
-        raise ValueError(f"template x3 pose 匹配到 {n} 处，应为 1")
+        raise ValueError(f"template 载具 pose 匹配到 {n} 处，应为 1")
+    return world
+
+
+def set_camera_rate(world, hz):
+    """改学生 RGB 与配对深度相机的 update_rate（两者必须同频，配对误差才接近 0）。"""
+    if not (hz > 0 and math.isfinite(hz)):
+        raise ValueError(f"camera rate 无效: {hz}")
+    world, n = CAMERA_RATE_RE.subn(lambda m: f"{m.group(1)}{hz:g}{m.group(3)}", world)
+    if n != 2:
+        raise ValueError(f"template 里学生相机/深度相机 update_rate 匹配到 {n} 处，应为 2")
+    return world
+
+
+def camera_rate_of(world):
+    """生成结果里学生相机的 update_rate（Hz）；没匹配到返回 None。"""
+    m = CAMERA_RATE_RE.search(world)
+    return float(m.group(2)) if m else None
+
+
+def strip_aux_cameras(world):
+    """删掉 aux-camera 标记包裹的 chase/top 相机模型（只有 E1 模板有标记）。"""
+    world, n = AUX_CAMERA_RE.subn("", world)
+    if n < 1:
+        raise ValueError("template 没有 aux-camera 标记（X3 模板不支持 --no-aux-cameras）")
     return world
 
 
@@ -384,6 +432,7 @@ def build_scene(template, seed, scene_id, spawn_mode="default", task="base",
     head, appearance_used = _apply_appearance(template[:start], seed, appearance)
     world = head + "\n".join(lines) + "\n" + template[end:]
     world = _apply_spawn(world, spawn)
+    vehicle = vehicle_of_template(template)
     meta = {
         "schema": "navlab.scene.v1",
         "scene_id": scene_id,
@@ -398,7 +447,9 @@ def build_scene(template, seed, scene_id, spawn_mode="default", task="base",
         "requested_appearance": appearance,
         "effective_appearance": appearance,
         "camera_profile": "rgb320x240_fov60_v1",
-        "dynamics_profile": "x3_v1",
+        # 载具只换模型不换几何：gid/GEOMETRY_VERSION 不变，靠 vehicle/dynamics_profile 区分数据。
+        "vehicle": vehicle,
+        "dynamics_profile": VEHICLES[vehicle]["dynamics_profile"],
         "spawn": spawn,
         "template_sha256": sha256(template.encode("utf-8")),
         "world_sha256": sha256(world.encode("utf-8")),
@@ -544,8 +595,16 @@ def main():
     p.add_argument("--appearance", choices=(APPEARANCE_LEGACY, APPEARANCE_V1),
                    default=APPEARANCE_DEFAULT,
                    help="v1=删固定地标+随机光照/天空（默认）；legacy=模板原样，仅用于复现旧数据")
-    p.add_argument("--template", default=DEFAULT_TEMPLATE,
-                   help=f"模板 SDF（默认 {_rel(DEFAULT_TEMPLATE)}）")
+    p.add_argument("--vehicle", choices=tuple(VEHICLES), default=None,
+                   help="载具：x3=默认（旧行为）；e1_mini=SITL 固件在环的 E1 MINI。"
+                        "决定默认模板；几何/gid/split 不随载具变")
+    p.add_argument("--template", default=None,
+                   help=f"模板 SDF（默认按 --vehicle 选；x3 为 {_rel(DEFAULT_TEMPLATE)}）")
+    p.add_argument("--camera-rate", type=float, default=None,
+                   help="学生 RGB 与深度相机的 update_rate（Hz）；缺省用模板值"
+                        "（E1 模板 10 Hz：每个 hold 窗口只消费 1 帧，两路同频配对误差≈0）")
+    p.add_argument("--no-aux-cameras", action="store_true",
+                   help="不生成 chase/top 两路辅助相机（采集提速；录 demo 视频时不要加）。仅 E1 模板")
     p.add_argument("--no-velocity-control", action="store_true",
                    help="删除 MulticopterVelocityControl（cf_sil 用；保留电机模型/odometry）")
     p.add_argument("--self-check", action="store_true",
@@ -553,6 +612,10 @@ def main():
     p.add_argument("--check-seeds", type=int, default=100,
                    help="--self-check 检查的 seed 数（默认 100）")
     args = p.parse_args()
+    if args.template is None:
+        args.template = VEHICLES[args.vehicle or DEFAULT_VEHICLE]["template"]
+    if args.camera_rate is not None and not (math.isfinite(args.camera_rate) and args.camera_rate > 0):
+        p.error("--camera-rate 必须是有限正数")
 
     if args.self_check:
         if args.check_seeds < 1:
@@ -563,6 +626,9 @@ def main():
     scene_id = args.seed if args.scene_id is None else args.scene_id
 
     template = _read_template(args.template)
+    template_vehicle = vehicle_of_template(template)
+    if args.vehicle and args.vehicle != template_vehicle:
+        p.error(f"--vehicle {args.vehicle} 与模板里的载具 {template_vehicle} 不一致")
     world, meta = build_scene(template, args.seed, scene_id, args.spawn_mode, args.task,
                               args.appearance)
     if args.no_velocity_control:
@@ -570,6 +636,16 @@ def main():
         meta["velocity_control"] = "removed"
     else:
         meta["velocity_control"] = "template"
+    if args.camera_rate is not None:
+        world = set_camera_rate(world, args.camera_rate)
+    if args.no_aux_cameras:
+        world = strip_aux_cameras(world)
+    if args.camera_rate is not None or args.no_aux_cameras:
+        meta["world_sha256"] = sha256(world.encode("utf-8"))
+    # campus/asset_campus 自己写 meta，这里统一补载具与相机采样信息。
+    meta.setdefault("vehicle", template_vehicle)
+    meta["camera_rate_hz"] = camera_rate_of(world)
+    meta["aux_cameras"] = not args.no_aux_cameras
     meta["template"] = _rel(os.path.abspath(args.template))
     out = os.path.abspath(args.out)
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)

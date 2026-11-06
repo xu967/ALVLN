@@ -1,0 +1,309 @@
+<?xml version="1.0" ?>
+<!--
+  uav_rgb E1 MINI world template: firmware-in-the-loop (SITL) micro quadrotor + forward RGB camera.
+
+  Vehicle: model "e1_mini", single link "base_link" (no rotor links). Mass / inertia / collision
+  envelope / camera mount come from sim/dynamics/e1_mini.json (sim/tools/test_e1_template.py
+  asserts the numbers below equal that file, so edit the JSON first, then this template).
+  Forces come from the CfSitlSystem plugin (sim/cf_sitl/gz): every 1 ms physics step it runs one
+  firmware loop and applies the resulting body wrench; Gazebo integrates the rigid body and
+  resolves contacts. The firmware executor holds height 2.0 m and speed, so the world has no
+  motor-model or velocity-control plugins.
+
+  Topics (same names as the X3 world, so collect.py / Studio need no topic changes):
+    /uav/camera        student RGB, 320x240 R8G8B8, 60 deg HFOV, update_rate below (scene_gen --camera-rate)
+    /uav/depth         teacher-only depth, same pose/FOV/res/rate as RGB
+    /uav/contact       contact sensor on base_link_collision (sparse: publishes only while touching)
+    /uav/chase_camera  third-person view from the separate "chase_cam" model (position + yaw follow only;
+                       the plugin places it behind/above the vehicle; aux camera, scene_gen --no-aux-cameras drops it)
+    /uav/top_camera    static top-down view (aux camera)
+    /model/e1_mini/pose, /model/e1_mini/odometry   OdometryPublisher at 200 Hz
+    /e1_mini/action    gz.msgs.Double_V [action, until_s_sim]  (0 SAFE, 1 FORWARD, 2 YAW_LEFT, 3 YAW_RIGHT)
+    /e1_mini/cmd       gz.msgs.StringMsg "reset <episode>" | "arm_takeoff <height_m>"
+    /e1_mini/state     gz.msgs.Double_V 200 Hz, index table in sim/cf_sitl/gz/README.md ([32] = gz sim time s)
+
+  Coordinate convention: world ENU (z up), body FLU (x forward, y left, z up). Camera optical axis +X.
+  Physics step must stay 0.001 s: the plugin refuses to apply forces at any other step size.
+  scene_gen markers kept verbatim: "tall pillars" (START_MARK) and "X3-equivalent quadrotor" (END_MARK).
+-->
+<sdf version="1.6">
+  <world name="uav_rgb">
+    <physics name="1ms" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors">
+      <render_engine>ogre2</render_engine>
+    </plugin>
+    <!-- contact sensor system: publishes /uav/contact (gz.msgs.Contacts) only while
+         base_link_collision is touching something (sparse/triggered topic) -->
+    <plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact"/>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <attenuation>
+        <range>1000</range>
+        <constant>0.9</constant>
+        <linear>0.01</linear>
+        <quadratic>0.001</quadratic>
+      </attenuation>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>100 100</size></plane></geometry>
+          <material>
+            <ambient>0.8 0.8 0.8 1</ambient>
+            <diffuse>0.8 0.8 0.8 1</diffuse>
+            <specular>0.8 0.8 0.8 1</specular>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- aux-camera: top -->
+    <!-- Static overhead camera for the desktop Studio's rendered top-down view.
+         Visual-only sensor: no collision, mass or effect on UAV physics.
+         Height 6 m: with 80 deg HFOV the ground footprint is about 10 m, the pillar
+         field (x 1.3-5.2, y +-1.85) fills about 40% of the frame. -->
+    <model name="studio_top_camera">
+      <static>true</static>
+      <pose>2.5 0 6 0 1.57079632679 1.57079632679</pose>
+      <link name="camera_link">
+        <sensor name="top_camera" type="camera">
+          <pose>0 0 0 0 0 0</pose>
+          <always_on>1</always_on>
+          <update_rate>10</update_rate>
+          <topic>/uav/top_camera</topic>
+          <camera>
+            <horizontal_fov>1.3962634</horizontal_fov>
+            <image>
+              <width>480</width>
+              <height>360</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip>
+              <near>0.1</near>
+              <far>80</far>
+            </clip>
+          </camera>
+        </sensor>
+      </link>
+    </model>
+    <!-- /aux-camera -->
+
+    <!-- colored landmarks in front of the spawn (forward = +X) -->
+    <model name="landmark_red">
+      <static>true</static>
+      <pose>3 0 1 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>1 1 1</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>1 1 1</size></box></geometry>
+          <material><ambient>1 0 0 1</ambient><diffuse>1 0 0 1</diffuse><specular>1 0 0 1</specular></material>
+        </visual>
+      </link>
+    </model>
+    <model name="landmark_green">
+      <static>true</static>
+      <pose>3 1.5 1 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>1 1 1</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>1 1 1</size></box></geometry>
+          <material><ambient>0 1 0 1</ambient><diffuse>0 1 0 1</diffuse><specular>0 1 0 1</specular></material>
+        </visual>
+      </link>
+    </model>
+    <model name="landmark_blue">
+      <static>true</static>
+      <pose>3 -1.5 1 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>1 1 1</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>1 1 1</size></box></geometry>
+          <material><ambient>0 0 1 1</ambient><diffuse>0 0 1 1</diffuse><specular>0 0 1 1</specular></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- tall pillars: grounded obstacles that block the drone at flight altitude.
+         +Y is body-left, so the y=+1.4 pillar blocks the teacher's left strip;
+         body-right (y<0) is open -> teacher must YAW_RIGHT. -->
+    <model name="pillar_center">
+      <static>true</static>
+      <pose>3.0 0 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.4 0.4 3</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.4 0.4 3</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.6 0.6 0.6 1</diffuse><specular>0.6 0.6 0.6 1</specular></material>
+        </visual>
+      </link>
+    </model>
+    <model name="pillar_body_left">
+      <static>true</static>
+      <pose>3.0 1.4 1.5 0 0 0</pose>
+      <link name="link">
+        <collision name="collision"><geometry><box><size>0.4 0.4 3</size></box></geometry></collision>
+        <visual name="visual">
+          <geometry><box><size>0.4 0.4 3</size></box></geometry>
+          <material><ambient>0.6 0.6 0.6 1</ambient><diffuse>0.6 0.6 0.6 1</diffuse><specular>0.6 0.6 0.6 1</specular></material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- X3-equivalent quadrotor slot (scene_gen END_MARK, keep this comment prefix): here the vehicle is
+         the E1 MINI, driven by the CfSitlSystem plugin. Numbers below mirror sim/dynamics/e1_mini.json. -->
+    <model name="e1_mini">
+      <pose>0 0 0.15 0 0 0</pose>
+
+      <link name="base_link">
+        <pose>0 0 0 0 0 0</pose>
+        <inertial>
+          <mass>0.102</mass>
+          <inertia>
+            <ixx>7.5e-05</ixx><ixy>0</ixy><ixz>0</ixz>
+            <iyy>8.9e-05</iyy><iyz>0</iyz>
+            <izz>0.000149</izz>
+          </inertia>
+        </inertial>
+        <!-- collision_envelope: radius_from_center 0.102, z -0.020..+0.028 -> cylinder centered at z=0.004 -->
+        <collision name="base_link_collision">
+          <pose>0 0 0.004 0 0 0</pose>
+          <geometry><cylinder><radius>0.102</radius><length>0.048</length></cylinder></geometry>
+        </collision>
+        <visual name="base_link_visual">
+          <pose>0 0 0.004 0 0 0</pose>
+          <geometry><cylinder><radius>0.102</radius><length>0.048</length></cylinder></geometry>
+          <material><ambient>0.3 0.3 0.3 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material>
+        </visual>
+        <!-- heading marker for the chase/top views (no collision) -->
+        <visual name="nose_visual">
+          <pose>0.06 0 0.02 0 0 0</pose>
+          <geometry><box><size>0.04 0.02 0.01</size></box></geometry>
+          <material><ambient>0.9 0.2 0.1 1</ambient><diffuse>0.9 0.2 0.1 1</diffuse></material>
+        </visual>
+
+        <!-- camera_mount: xyz [0.045, 0, 0.015], pitch 0. Intrinsics unchanged from X3 (320x240, 60 deg).
+             update_rate: scene_gen --camera-rate rewrites this value (default 10 Hz: one frame per hold
+             window is consumed, RGB/depth stay paired because both sensors tick together). -->
+        <sensor name="camera" type="camera">
+          <pose>0.045 0 0.015 0 0 0</pose>
+          <always_on>1</always_on>
+          <update_rate>10</update_rate>
+          <topic>/uav/camera</topic>
+          <camera>
+            <horizontal_fov>1.0471975512</horizontal_fov>
+            <image>
+              <width>320</width>
+              <height>240</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip>
+              <near>0.05</near>
+              <far>50</far>
+            </clip>
+          </camera>
+          <plugin filename="gz-sim-camera-video-recorder-system" name="gz::sim::systems::CameraVideoRecorder">
+            <service>uav/camera/record_video</service>
+          </plugin>
+        </sensor>
+
+        <!-- depth camera: teacher-only privileged ground truth. Same pose/FOV/res/rate as RGB. -->
+        <sensor name="depth" type="depth_camera">
+          <pose>0.045 0 0.015 0 0 0</pose>
+          <always_on>1</always_on>
+          <update_rate>10</update_rate>
+          <topic>/uav/depth</topic>
+          <camera>
+            <horizontal_fov>1.0471975512</horizontal_fov>
+            <image>
+              <width>320</width>
+              <height>240</height>
+              <format>R_FLOAT32</format>
+            </image>
+            <clip>
+              <near>0.05</near>
+              <far>20</far>
+            </clip>
+          </camera>
+        </sensor>
+
+        <!-- collision ground truth: publishes on /uav/contact while base_link_collision touches
+             something (sparse). No rotor links on this vehicle, so one sensor covers the envelope. -->
+        <sensor name="contact" type="contact">
+          <always_on>1</always_on>
+          <update_rate>100</update_rate>
+          <contact>
+            <collision>base_link_collision</collision>
+            <topic>/uav/contact</topic>
+          </contact>
+        </sensor>
+      </link>
+
+      <!-- Firmware-in-the-loop: one firmware loop per 1 ms physics step, body wrench applied to base_link.
+           <params> is repo-relative; the plugin resolves it against $UAVRGB_REPO_ROOT (set by
+           collect_parallel.gz_env) or the current directory. -->
+      <plugin filename="CfSitlSystem" name="uavrgb::CfSitlSystem">
+        <link_name>base_link</link_name>
+        <params>sim/dynamics/e1_mini.json</params>
+        <seed>0</seed>
+        <action_topic>/e1_mini/action</action_topic>
+        <cmd_topic>/e1_mini/cmd</cmd_topic>
+        <state_topic>/e1_mini/state</state_topic>
+        <state_hz>200</state_hz>
+        <chase_model>chase_cam</chase_model>
+        <chase_offset>-1.0 0 0.5</chase_offset>
+        <chase_pitch>0.45</chase_pitch>
+      </plugin>
+
+      <plugin filename="gz-sim-odometry-publisher-system" name="gz::sim::systems::OdometryPublisher">
+        <dimensions>3</dimensions>
+        <odom_publish_frequency>200</odom_publish_frequency>
+      </plugin>
+    </model>
+
+    <!-- aux-camera: chase -->
+    <!-- Third-person chase view. Separate static model (not a child of base_link) so that it follows
+         only the vehicle position and yaw: CfSitlSystem moves it every 20 ms with SetWorldPoseCmd to
+         body + yaw-rotated <chase_offset>, pitched down <chase_pitch>. Not a student input. -->
+    <model name="chase_cam">
+      <static>true</static>
+      <pose>-1.5 0 0.65 0 0.45 0</pose>
+      <link name="link">
+        <sensor name="chase_camera" type="camera">
+          <pose>0 0 0 0 0 0</pose>
+          <always_on>1</always_on>
+          <update_rate>15</update_rate>
+          <topic>/uav/chase_camera</topic>
+          <camera>
+            <horizontal_fov>1.3962634</horizontal_fov>
+            <image>
+              <width>640</width>
+              <height>360</height>
+              <format>R8G8B8</format>
+            </image>
+            <clip>
+              <near>0.05</near>
+              <far>60</far>
+            </clip>
+          </camera>
+        </sensor>
+      </link>
+    </model>
+    <!-- /aux-camera -->
+  </world>
+</sdf>

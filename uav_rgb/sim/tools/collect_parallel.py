@@ -54,7 +54,19 @@ SIM_SETTLE_S = 3.0   # sim-ready 后再稳 3 s 才发首条起飞指令（发布
 # 默认训练/评测矩阵：cf_sil 已退出（模块/测试保留作参考，只能手动跑 collect.py）。
 # cf_blackbox 是纯 Python 档，3DGS collector 直接 import；Gazebo 编排只保留名字，
 # 选了会在参数校验阶段明确失败，避免把 x3 物理写成 cf_blackbox 数据。
-DYNAMICS_CHOICES = ("x3_velocity", "cf_stab", "cf_blackbox")
+DYNAMICS_CHOICES = ("x3_velocity", "cf_stab", "cf_blackbox", "cf_sitl")
+# cf_sitl（E1 MINI 固件在环）要求显式 --vehicle e1_mini（或载具为 e1_mini 的 --template）；
+# gz 进程还要能找到 CfSitlSystem 插件：$UAVRGB_CF_SITL_PLUGIN_DIR，否则按下面顺序找
+# 第一个含 libCfSitlSystem.so 的目录（SITL 库 agent 的构建目录优先，桩库目录兜底）。
+DYNAMICS_VEHICLE = {"cf_sitl": "e1_mini"}
+PLUGIN_SO = "libCfSitlSystem.so"
+_DATA_ROOT = os.environ.get("DATA_ROOT", "/root/rivermind-data")
+DEFAULT_PLUGIN_DIRS = (
+    os.path.join(_DATA_ROOT, "uav_rgb", "tmp", "build-cf-sitl", "gz"),
+    os.path.join(_DATA_ROOT, "uav_rgb", "tmp", "build-cf-sitl"),
+    os.path.join(_DATA_ROOT, "uav_rgb", "tmp", "agent-gz", "build-gz-stub"),
+)
+PLUGIN_DIR_ENV = "UAVRGB_CF_SITL_PLUGIN_DIR"
 # 不写死几何版本号：salt 是 split_manifest.SPLIT_SALT，写死过一次就再也对不上。
 SPLIT_POLICY = ("geometry group: sha256(<SPLIT_SALT>:<gid>) % 100 -> "
                 "<80 train; <90 val; else test")
@@ -88,18 +100,36 @@ def _utc_now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def find_plugin_dir():
+    """CfSitlSystem 插件目录：环境变量优先，否则第一个含 libCfSitlSystem.so 的候选目录。"""
+    explicit = os.environ.get(PLUGIN_DIR_ENV)
+    if explicit:
+        return explicit
+    for d in DEFAULT_PLUGIN_DIRS:
+        if os.path.isfile(os.path.join(d, PLUGIN_SO)):
+            return d
+    return None
+
+
 def gz_env(partition):
     env = dict(os.environ)
     backend = env.get("UAVRGB_RENDER_BACKEND", "gpu")
     if backend not in ("gpu", "software"):
         raise ValueError("UAVRGB_RENDER_BACKEND 必须是 gpu 或 software")
     env.update({"XDG_RUNTIME_DIR": XDG_RUNTIME_DIR, "GZ_PARTITION": partition,
-                "UAVRGB_RENDER_BACKEND": backend})
+                "UAVRGB_RENDER_BACKEND": backend,
+                # E1 模板里 <params>sim/dynamics/e1_mini.json</params> 是仓库相对路径，
+                # CfSitlSystem 按这个变量解析；对 X3 世界无影响。
+                "UAVRGB_REPO_ROOT": env.get("UAVRGB_REPO_ROOT") or REPO_ROOT})
     # Local, vendored assets: no network lookups or per-run downloads.
     assets_root = os.path.join(SIM_DIR, "assets")
     old = env.get("GZ_SIM_RESOURCE_PATH", "")
     env["GZ_SIM_RESOURCE_PATH"] = os.pathsep.join(
         p for p in (assets_root, old) if p)
+    plugin_dir = find_plugin_dir()
+    if plugin_dir:
+        env["GZ_SIM_SYSTEM_PLUGIN_PATH"] = os.pathsep.join(
+            p for p in (plugin_dir, env.get("GZ_SIM_SYSTEM_PLUGIN_PATH", "")) if p)
     if backend == "gpu":
         # CUDA 可用不代表 EGL 选到了 NVIDIA；GLVND 默认可能仍选 Mesa。
         env["__EGL_VENDOR_LIBRARY_FILENAMES"] = "/usr/share/glvnd/egl_vendor.d/10_nvidia.json"
@@ -115,6 +145,53 @@ def gz_env(partition):
         env.update({"DISPLAY": env.get("DISPLAY") or DISPLAY_VALUE,
                     "LP_NUM_THREADS": "1"})
     return env
+
+
+def resolve_vehicle(args, error):
+    """载具 / 模板 / 动力学三者对齐（collect_parallel 与 eval_closed_loop 共用）。
+
+    显式 --template 以模板里的载具为准；否则按 --vehicle（缺省 x3）选模板。
+    cf_sitl 必须是 e1_mini 且 gz 能找到 CfSitlSystem 插件。args 需有
+    template / vehicle / dynamics / camera_rate / no_aux_cameras。
+    """
+    import scene_gen  # noqa: PLC0415 - 只为 VEHICLES / vehicle_of_template
+    if args.template is None:
+        args.template = scene_gen.VEHICLES[args.vehicle or "x3"]["template"]
+    elif os.path.isfile(args.template):
+        try:
+            template_vehicle = scene_gen.vehicle_of_template(scene_gen._read_template(args.template))
+        except ValueError as e:
+            error(f"--template: {e}")
+        if args.vehicle and args.vehicle != template_vehicle:
+            error(f"--vehicle {args.vehicle} 与 --template 的载具 {template_vehicle} 不一致")
+        args.vehicle = template_vehicle
+    need_vehicle = DYNAMICS_VEHICLE.get(args.dynamics)
+    if need_vehicle and args.vehicle != need_vehicle:
+        error(f"--dynamics {args.dynamics} 需要显式 --vehicle {need_vehicle}"
+              f"（或载具为 {need_vehicle} 的 --template）")
+    if args.vehicle and args.vehicle != "x3" and not need_vehicle:
+        error(f"--vehicle {args.vehicle} 只能配 --dynamics "
+              f"{[d for d, v in DYNAMICS_VEHICLE.items() if v == args.vehicle]}")
+    if getattr(args, "no_aux_cameras", False) and (args.vehicle or "x3") == "x3":
+        error("--no-aux-cameras 只对 E1 模板有效（X3 模板没有 aux-camera 标记）")
+    rate = getattr(args, "camera_rate", None)
+    if rate is not None and not (math.isfinite(rate) and rate > 0):
+        error("--camera-rate 必须是有限正数")
+    if need_vehicle and not find_plugin_dir():
+        error(f"找不到 {PLUGIN_SO}：请设 {PLUGIN_DIR_ENV}=<插件目录>，或先构建到 "
+              f"{' / '.join(DEFAULT_PLUGIN_DIRS)} 之一")
+    return args.vehicle or "x3"
+
+
+def scene_gen_extra(args):
+    """透传给 scene_gen 的可选相机参数（没给就不传，旧命令行逐字不变）。"""
+    extra = []
+    rate = getattr(args, "camera_rate", None)
+    if rate is not None:
+        extra += ["--camera-rate", f"{rate:g}"]
+    if getattr(args, "no_aux_cameras", False):
+        extra.append("--no-aux-cameras")
+    return extra
 
 
 def _register(proc):
@@ -304,6 +381,8 @@ def _popen_collect(task, args, env, log_path):
         cmd += ["--rl-checkpoint", args.rl_checkpoint]
     if args.save_depth:
         cmd.append("--save-depth")
+    if getattr(args, "vehicle", None) and args.vehicle != "x3":
+        cmd += ["--vehicle", args.vehicle]   # x3 不传：旧命令行逐字不变
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, bufsize=1,
                             start_new_session=True)
@@ -462,7 +541,16 @@ def main():
                    help="透传给 collect.py：x3_velocity=旧行为（唯一历史基线）；"
                         "cf_stab=CF-Drone 摇杆模型（建议配 --hold 0.1~0.2）；"
                         "cf_blackbox=纯 Python 黑盒（3DGS collector 直接使用；Gazebo "
-                        "编排会明确拒绝，不拿 x3 物理冒充）；数字不可与旧档混报")
+                        "编排会明确拒绝，不拿 x3 物理冒充）；"
+                        "cf_sitl=E1 MINI 固件在环（必须 --vehicle e1_mini，gz 需能加载 "
+                        f"CfSitlSystem：${PLUGIN_DIR_ENV} 或默认构建目录）；数字不可与旧档混报")
+    p.add_argument("--vehicle", choices=("x3", "e1_mini"), default=None,
+                   help="世界载具：缺省 x3（旧行为，模板 sim/worlds/uav_rgb.sdf）；"
+                        "e1_mini 选 E1 模板并透传给 collect.py")
+    p.add_argument("--camera-rate", type=float, default=None,
+                   help="透传给 scene_gen：学生 RGB/深度相机 update_rate（Hz）；缺省用模板值")
+    p.add_argument("--no-aux-cameras", action="store_true",
+                   help="透传给 scene_gen：不生成 chase/top 辅助相机（仅 E1 模板；采集提速）")
     p.add_argument("--out", required=True, help="汇总输出目录（必须为空/不存在）")
     p.add_argument("--base-seed", type=int, default=0,
                    help="scene_id = seed = base_seed + 扫描序号；给 --split 时只取该 split 的 seed")
@@ -481,7 +569,8 @@ def main():
     p.add_argument("--rl-checkpoint", default="")
     p.add_argument("--save-depth", action="store_true",
                    help="透传给 collect.py：每步另存 depth/depth_%%05d.png（16 位 PNG，毫米）")
-    p.add_argument("--template", default=DEFAULT_TEMPLATE)
+    p.add_argument("--template", default=None,
+                   help=f"模板 SDF（缺省按 --vehicle 选；x3 为 {_rel(DEFAULT_TEMPLATE)}）")
     p.add_argument("--keep-worlds", action="store_true",
                    help="把生成的 SDF 保留到 <out>/worlds/ 便于复现")
     p.add_argument("--episode-timeout", type=float, default=600.0)
@@ -515,6 +604,7 @@ def main():
     if args.dynamics == "cf_blackbox":
         p.error("cf_blackbox 是纯 Python 模型档，Gazebo 并行采集未接入；"
                 "请让 3DGS collector 直接调用 cf_blackbox，或改用 cf_stab/x3_velocity")
+    resolve_vehicle(args, p.error)
     for path, name in ((SCENE_GEN, "scene_gen.py"), (COLLECT, "collect.py"),
                        (args.template, "template")):
         if not os.path.isfile(path):
@@ -583,12 +673,13 @@ def main():
     t_start = time.monotonic()
     try:
         # 1) 先全部生成世界；任何失败都不起 sim。
+        scene_extra = scene_gen_extra(args)
         for t in tasks:
             r = subprocess.run(
                 [sys.executable, SCENE_GEN, "--seed", str(t.seed),
                  "--scene-id", str(t.scene_id), "--out", t.world,
                  "--spawn-mode", t.spawn_mode, "--template", args.template,
-                 "--task", args.task, "--appearance", args.appearance],
+                 "--task", args.task, "--appearance", args.appearance] + scene_extra,
                 capture_output=True, text=True, timeout=120)
             if r.returncode != 0:
                 print(r.stdout, flush=True)
@@ -672,6 +763,10 @@ def main():
             "hold_s": args.hold,
             "window_from": args.window_from,
             "dynamics": args.dynamics,
+            "vehicle": args.vehicle or "x3",
+            "camera_rate_hz": args.camera_rate,       # None = 模板默认值（X3 30 Hz / E1 10 Hz）
+            "aux_cameras": not args.no_aux_cameras,
+            "cf_sitl_plugin_dir": find_plugin_dir() if args.dynamics == "cf_sitl" else None,
             "task": args.task,
             "geometry_version": (campus.VERSION if args.task == "campus" else
                                  asset_campus.VERSION if args.task == "campus_assets" else sm.SPLIT_SALT),

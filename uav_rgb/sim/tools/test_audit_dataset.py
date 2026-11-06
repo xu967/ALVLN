@@ -605,6 +605,22 @@ def main():
         assert d19c["status"] == "PASS" and "0/4 " in d19c["detail"], d19c
         assert "起始步 8 个未验" in d19c["detail"], d19c
         shutil.rmtree(root19c)
+        # 19d) cf_sitl（固件在环）同样没有固定前进速度：4/4b SKIP，文案点名 cf_sitl。
+        root19d = tempfile.mkdtemp(prefix="audit_test_")
+        write_ep(root19d, "train", 1, CLEAN,
+                 man_extra={"dynamics_profile": "cf_sitl_v1:deadbeef", "dynamics": "cf_sitl",
+                            "vehicle": "e1_mini"})
+        d19d = details(root19d)
+        for name in ("forward_motion", "transition_lag"):
+            assert d19d[name]["status"] == "SKIP", (name, d19d[name])
+            assert "cf_sitl" in d19d[name]["detail"], (name, d19d[name])
+        shutil.rmtree(root19d)
+        # 19e) cf_sil（电机级 PID，速度设定点固定）不在豁免名单：定速判据照常跑。
+        root19e = tempfile.mkdtemp(prefix="audit_test_")
+        write_ep(root19e, "train", 1, CLEAN, man_extra={"dynamics_profile": "cf_sil_v1:abc12345"})
+        d19e = details(root19e)
+        assert d19e["forward_motion"]["status"] != "SKIP" or "cf_stab" not in d19e["forward_motion"]["detail"], d19e["forward_motion"]
+        shutil.rmtree(root19e)
 
         # 20) provenance：teacher_version 有值必须统一；task_version 全缺视为同代。
         root20 = tempfile.mkdtemp(prefix="audit_test_")

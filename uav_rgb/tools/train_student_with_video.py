@@ -117,7 +117,7 @@ def infer_dynamics(meta):
         return "x3_velocity"
     if profile.startswith("x3_v1"):
         return "x3_velocity"
-    for name in ("cf_stab", "cf_sil", "cf_blackbox"):
+    for name in ("cf_stab", "cf_sitl", "cf_sil", "cf_blackbox"):
         if profile.startswith(name):
             return name
     return None

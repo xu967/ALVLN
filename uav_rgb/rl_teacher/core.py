@@ -137,6 +137,20 @@ def advance(state, command, dt=DT, latency=0.15, tilt_deg=2.0, drag_k=1.0,
     state.yaw=(state.yaw+wz*dt+math.pi)%(2*math.pi)-math.pi
 
 
+def delay_remaining_at(dispatch_t, now_t, latency):
+    """Pending command delay still to elapse at time now_t (seconds, same clock).
+
+    Shared by the training env (advance() counts it down per tick) and the Gazebo
+    teacher-rl collector, which must fill state.delay_remaining from sim time since
+    the last dispatch rather than with the constant latency: at decision time the
+    env has always counted the delay down (latency 0.15 < ACTION_DT 0.2), so the
+    constant would put obs[-1]=0.3 in Gazebo against 0 in training.
+    """
+    if dispatch_t is None:
+        return 0.0
+    return max(0.0, float(latency) - (float(now_t) - float(dispatch_t)))
+
+
 def state_vector(state, waypoint, obstacles, geodesic=None):
     """13 privileged numerical features. RL and Gazebo teacher must share schema.
 

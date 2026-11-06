@@ -475,6 +475,112 @@ def cf_sil_error_fails():
             and sil.zeroed > 0)
 
 
+class FakeSitl(FakeSil):
+    """cf_sitl 执行器替身：截止从窗口起点算、关卡滞、带末速度。"""
+    until_from_window_start = True
+    stuck_detection = False
+    name = "cf_sitl"
+
+    def speed_mps(self):
+        return 0.012
+
+
+def cf_sitl_window():
+    """collect_one + cf_sitl：observation 语义下派发时间戳 = 观测位姿戳；长窗口静止也不判卡滞。"""
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    pose = ClockPoseSub(pose_msg(10.02))
+    subs = {"rgb": FakeSub(after=rgb), "depth": FakeSub(frames=[(1, _fresh_depth(w, h))]),
+            "pose": pose, "contact": FakeSub()}
+    t = [10.02]
+
+    def advance(_secs):
+        t[0] = round(t[0] + 0.05, 3)
+        pose.current = pose_msg(t[0])
+
+    out = {}
+    for window_from in ("observation", "dispatch"):
+        sil = FakeSitl()
+        pose.current = pose_msg(10.02)
+        t[0] = 10.02
+        with tempfile.TemporaryDirectory() as d, \
+                patch.object(collect, "write_rgb_png", return_value=(True, None)), \
+                patch.object(collect.time, "sleep", side_effect=advance):
+            row, err = collect.collect_one(d, 0, 1.0, "forward", subs, FakePub(), sil=sil,
+                                           window_from=window_from)
+        if row is None:
+            out[f"ran_{window_from}"] = False
+            continue
+        out[f"ran_{window_from}"] = err is None
+        # 两种语义下 FakeSub 的观测位姿与派发位姿是同一帧（10.02 s），截止起点都应等于 action_start_ns
+        out[f"anchor_{window_from}"] = sil.actions == [(collect.FORWARD_SLOW, row["action_start_ns"])]
+        # 1 s 窗口、位姿不动：cf_sil 会判 stuck，cf_sitl 关掉卡滞只认 contact
+        out[f"no_stuck_{window_from}"] = row["src"] is None and row["collision"] is False
+        out[f"speed_{window_from}"] = row["speed_after_mps"] == 0.012
+    # 对照：同样的静止 1 s 窗口，cf_sil 应判 stuck（证明豁免只对 cf_sitl 生效）
+    sil = FakeSil()
+    pose.current = pose_msg(10.02)
+    t[0] = 10.02
+    with tempfile.TemporaryDirectory() as d, \
+            patch.object(collect, "write_rgb_png", return_value=(True, None)), \
+            patch.object(collect.time, "sleep", side_effect=advance):
+        row, err = collect.collect_one(d, 0, 1.0, "forward", subs, FakePub(), sil=sil)
+    out["cf_sil_control_stuck"] = row is not None and row["src"] == "stuck" and row["speed_after_mps"] is None
+    return out
+
+
+def cf_sitl_error_text():
+    """cf_sitl 执行器故障时错误文案点名 cf_sitl。"""
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    pose = ClockPoseSub(pose_msg(10.02))
+    subs = {"rgb": FakeSub(after=rgb), "depth": FakeSub(frames=[(1, _fresh_depth(w, h))]),
+            "pose": pose, "contact": FakeSub()}
+    sil = FakeSitl(error="FAILSAFE")
+    with tempfile.TemporaryDirectory() as d, \
+            patch.object(collect, "write_rgb_png", return_value=(True, None)):
+        row, err = collect.collect_one(d, 0, 0.2, "forward", subs, FakePub(), sil=sil)
+    return row is None and "cf_sitl 执行器故障" in (err or "") and sil.zeroed > 0
+
+
+def vehicle_checks():
+    x3 = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "worlds", "uav_rgb.sdf"), encoding="utf-8").read()
+    e1 = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "worlds", "uav_rgb_e1.sdf"), encoding="utf-8").read()
+    out = {
+        "x3_template": collect.vehicle_name(x3) == "x3",
+        "e1_template": collect.vehicle_name(e1) == "e1_mini",
+        "fallback": collect.vehicle_name("<sdf/>") == "x3",
+        "pose_topic": collect.VEHICLES["e1_mini"]["pose_topic"] == "/model/e1_mini/pose"
+                      and collect.VEHICLES["x3"]["pose_topic"] == collect.POSE_TOPIC,
+        # x3 位姿缓冲保持历史 6 帧；e1_mini 200 Hz 位姿缓冲要盖过 RGB 到达延迟（≥ 0.3 s）
+        "pose_buf": collect.VEHICLES["x3"]["pose_buf"] == 6
+                    and collect.VEHICLES["e1_mini"]["pose_buf"] / 200.0 >= 0.3,
+        "cf_sitl_in_dynamics": "cf_sitl" in collect.DYNAMICS
+                               and collect.DYNAMICS_VEHICLE["cf_sitl"] == "e1_mini",
+    }
+    info = {"header": {"data": [{"key": "frame_id", "value": ["e1_mini::base_link::camera"]}]},
+            "width": 320, "height": 240,
+            "intrinsics": {"k": [277.0, 0, 160, 0, 277.0, 120, 0, 0, 1]}}
+    out["camera_info_by_vehicle"] = (
+        collect.camera_from_info(info) is None
+        and collect.camera_from_info(info, collect.VEHICLES["e1_mini"]["rgb_frame_id"])["fx"] == 277.0)
+    return out
+
+
+def rl_delay_checks():
+    """N1：teacher-rl 的 delay_remaining 按仿真时间算，不再恒等于 latency_s。"""
+    dyn = collect.CfStab(latency_s=0.15)
+    out = {"idle_zero": collect.rl_delay_remaining(dyn, 5_000_000_000) == 0.0}
+    dyn.dispatch(collect.FORWARD_SLOW, 10_000_000_000)        # 生效于 10.15 s
+    out["mid_delay"] = abs(collect.rl_delay_remaining(dyn, 10_050_000_000) - 0.10) < 1e-9
+    out["after_hold"] = collect.rl_delay_remaining(dyn, 10_200_000_000) == 0.0   # 0.2 s 后：训练侧也是 0
+    dyn.step(10_200_000_000, 0.0)                               # 推进后 pending 清空
+    out["popped_zero"] = collect.rl_delay_remaining(dyn, 10_250_000_000) == 0.0 and not dyn.pending
+    return out
+
+
 def cf_stab_window(cruise=False):
     """collect_one + cf_stab：窗口内逐帧更新指令、窗口末不刹停、卡滞判定。
 
@@ -547,6 +653,15 @@ def main():
         check(f"cf_sil 采集窗口: {k}", v)
     check("cf_sil 窗口超时 -> 停桨", cf_sil_stale_pose_zeroes())
     check("cf_sil 执行器故障 -> 该步失败并停桨", cf_sil_error_fails())
+    for k, v in cf_sitl_window().items():
+        check(f"cf_sitl 采集窗口: {k}", v)
+    check("cf_sitl 执行器故障 -> 文案点名 cf_sitl", cf_sitl_error_text())
+    for k, v in vehicle_checks().items():
+        check(f"载具: {k}", v)
+    for k, v in rl_delay_checks().items():
+        check(f"N1 delay_remaining: {k}", v)
+    check("编排器矩阵含 cf_sitl", "cf_sitl" in cp.DYNAMICS_CHOICES
+          and cp.DYNAMICS_VEHICLE["cf_sitl"] == "e1_mini")
     contact("contact 有元素 -> True", b'{"contact":[{}]}', want=True)
     contact("contact 空列表 -> False", b'{"contact":[]}')
     contact("接触 JSON null -> False", b'null')

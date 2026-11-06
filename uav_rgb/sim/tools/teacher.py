@@ -112,14 +112,30 @@ def expert_action(depth, w, h, turn_dist=1.5, emergency=0.8, prev_action=None,
     return SAFE_NEUTRAL
 
 
-def _body_hits_box(px, py, yaw_deg, pillar, half):
-    """0.47 m 方形机身（含 1 cm 余量）与柱方框是否重叠（2D 分离轴）。
+# 机身半宽（m）：只用于脱困段的真实碰撞盒判定，不改 clearance/lookahead 等规划几何。
+# x3 0.235 是历史默认（标签逐字节不变）；e1_mini 取 sim/dynamics/e1_mini.json 的
+# collision_envelope.radius_from_center 0.102（按方框半宽用，角部比圆保守 0.042 m）。
+BODY_HALF_BY_VEHICLE = {"x3": 0.235, "e1_mini": 0.102}
+BODY_HALF_M = BODY_HALF_BY_VEHICLE["x3"]
 
-    机身随 yaw 旋转。按轴向包围盒会把 45° 机身的半宽当成 0.245 m，实际方角
-    伸到 0.332 m，角部漏判；膨胀到外接圆又会在斜向误报、把脱困路径挡死。
+
+def set_vehicle(name):
+    """按载具切换机身半宽；未知载具报错。collect.py 在解析 --vehicle 后调用一次。"""
+    global BODY_HALF_M
+    if name not in BODY_HALF_BY_VEHICLE:
+        raise ValueError(f"未知载具 {name!r}，可选 {sorted(BODY_HALF_BY_VEHICLE)}")
+    BODY_HALF_M = BODY_HALF_BY_VEHICLE[name]
+    return BODY_HALF_M
+
+
+def _body_hits_box(px, py, yaw_deg, pillar, half):
+    """方形机身（半宽 BODY_HALF_M，含 1 cm 余量）与柱方框是否重叠（2D 分离轴）。
+
+    X3 为 0.47 m 方。机身随 yaw 旋转。按轴向包围盒会把 45° 机身的半宽当成 0.245 m，
+    实际方角伸到 0.332 m，角部漏判；膨胀到外接圆又会在斜向误报、把脱困路径挡死。
     两条方框的分离轴只有 4 条：世界 x/y 与机身局部 x/y。
     """
-    a = 0.235 + 0.01
+    a = BODY_HALF_M + 0.01
     cy, sy = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
     dx, dy = px - pillar["x"], py - pillar["y"]
     hx, hy = (v / 2 for v in pillar.get("size", [half * 2, half * 2])[:2])
