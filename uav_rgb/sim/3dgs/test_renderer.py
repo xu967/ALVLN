@@ -61,6 +61,21 @@ class TestGeometry(unittest.TestCase):
         np.testing.assert_allclose(g["means"], means, atol=1e-5)
         np.testing.assert_allclose(g["colors"], colors, atol=2e-3)
         self.assertTrue(np.all(g["opacities"] > 0.5))
+        # write_gaussian_ply 补零的 f_rest 读回来是 sh_degree=3、高阶系数全 0、DC 与 colors 一致
+        self.assertEqual(g["sh_degree"], 3)
+        self.assertEqual(g["sh"].shape, (32, 16, 3))
+        self.assertTrue(np.all(g["sh"][:, 1:] == 0))
+        np.testing.assert_allclose(g["sh"][:, 0] * scene_mod.C0 + 0.5, colors, atol=2e-3)
+
+    def test_render_options_and_scale_mask(self):
+        self.assertEqual(scene_mod.render_options({}), scene_mod.RENDER_DEFAULTS)
+        opts = scene_mod.render_options({"render": {"sh_degree": 0, "bogus": 1}})
+        self.assertEqual(opts["sh_degree"], 0)
+        self.assertNotIn("bogus", opts)
+        self.assertEqual(opts["max_scale_m"], scene_mod.RENDER_DEFAULTS["max_scale_m"])
+        scales = np.array([[0.1, 0.1, 0.1], [0.1, 5.0, 0.1], [2.9, 0.2, 0.2]], np.float32)
+        np.testing.assert_array_equal(scene_mod.scale_keep_mask(scales, 3.0), [True, False, True])
+        np.testing.assert_array_equal(scene_mod.scale_keep_mask(scales, None), [True, True, True])
 
 
 @unittest.skipUnless(os.environ.get("RUN_3DGS_REAL") == "1",
@@ -79,6 +94,52 @@ class TestGsplatReal(unittest.TestCase):
                 self.assertGreater((depth > 0).mean(), 0.2)
                 print(f"{w}x{h}: {ms:.2f} ms")
             print(r.stats())
+
+    def test_sh_supersample_and_scale_filter(self):
+        """新默认（sh3/ss2/max_scale）与旧路径（sh0/ss1/不过滤）的关系可验证：
+        f_rest 全 0 时 sh3 与 sh0 同图；ss2 = 2 倍图 2x2 盒滤波；尺度过滤把巨型高斯去掉。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_mod.make_corridor(tmp, seed=0, length=12.0)
+            scene = scene_mod.load_scene(os.path.join(tmp, "scene.json"))
+            # 加一个 1σ=50 m 的巨型高斯盖住整个走廊（模拟 Callinstrasse 的"天空壳"）。
+            # 中心要在相机前方（gsplat 按中心深度排序/剔除，放在相机后面会被整个剔掉）。
+            g = scene_mod.read_gaussian_ply(scene["ply_path"])
+            means = np.vstack([g["means"], [[2.0, 0.0, 2.0]]]).astype(np.float32)
+            colors = np.vstack([g["colors"], [[1.0, 1.0, 1.0]]]).astype(np.float32)
+            scales = np.vstack([g["scales"], [[50.0, 50.0, 50.0]]]).astype(np.float32)
+            quats = np.vstack([g["quats"], [[1.0, 0.0, 0.0, 0.0]]]).astype(np.float32)
+            opac = np.concatenate([g["opacities"], [0.6]]).astype(np.float32)
+            scene_mod.write_gaussian_ply(scene["ply_path"], means, colors, scales, quats, opac)
+            pose = (1.0, 0.0, 2.0, 0.0)
+            old = renderer_mod.GsplatRenderer(scene, sh_degree=0, max_scale_m=0, supersample=1)
+            sh3 = renderer_mod.GsplatRenderer(scene, sh_degree=3, max_scale_m=0, supersample=1)
+            ss2 = renderer_mod.GsplatRenderer(scene, sh_degree=0, max_scale_m=0, supersample=2)
+            filt = renderer_mod.GsplatRenderer(scene, sh_degree=0, max_scale_m=3.0, supersample=1)
+            new = renderer_mod.GsplatRenderer(scene)
+            self.assertEqual((old.sh_degree, sh3.sh_degree, new.sh_degree), (0, 3, 3))
+            self.assertEqual((old.n_removed_by_scale, filt.n_removed_by_scale, new.n_removed_by_scale),
+                             (0, 1, 1))
+            self.assertEqual(new.supersample, scene_mod.RENDER_DEFAULTS["supersample"])
+            rgb_old, d_old, _ = old.render_pose(*pose)
+            rgb_sh3, _, _ = sh3.render_pose(*pose)
+            rgb_ss2, d_ss2, _ = ss2.render_pose(*pose)
+            rgb_filt, _, _ = filt.render_pose(*pose)
+            rgb_new, d_new, _ = new.render_pose(*pose)
+            big, _, _ = old.render_pose(*pose, width=640, height=480)
+            # f_rest 全 0：sh3 与 sh0 同图（允许量化 1 级）
+            self.assertLessEqual(np.abs(rgb_sh3.astype(int) - rgb_old.astype(int)).max(), 1)
+            # ss2 ≈ 2 倍渲染后 2x2 平均（gsplat 的像素覆盖在两种分辨率下有细微差异，看均值）
+            pooled = big.reshape(240, 2, 320, 2, 3).mean(axis=(1, 3))
+            self.assertLess(np.abs(rgb_ss2.astype(float) - pooled).mean(), 3.0)
+            self.assertEqual(rgb_ss2.shape, (240, 320, 3))
+            self.assertEqual(d_ss2.shape, (240, 320))
+            # 巨型高斯是半透明白壳：去掉后画面更暗、对比更高
+            self.assertLess(rgb_filt.mean(), rgb_old.mean() - 5)
+            self.assertGreater(rgb_filt.std(), rgb_old.std())
+            self.assertEqual(rgb_new.shape, (240, 320, 3))
+            self.assertTrue(np.isfinite(d_new).all())
+            self.assertGreater((d_new > 0).mean(), 0.2)
+            print("old", rgb_old.mean(), "filt", rgb_filt.mean(), "new", rgb_new.mean(), new.stats())
 
 
 if __name__ == "__main__":

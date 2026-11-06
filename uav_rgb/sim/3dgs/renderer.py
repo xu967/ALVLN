@@ -37,12 +37,19 @@ def _save_rgb(path, rgb):
 
 
 class GsplatRenderer:
-    """一次性把高斯放到 GPU；每帧只传 viewmat/K。"""
+    """一次性把高斯放到 GPU；每帧只传 viewmat/K。
+
+    渲染选项（scene.json "render" 段，默认 scene.RENDER_DEFAULTS）：
+      sh_degree    用几阶球谐（场景没有 f_rest 时自动退回 0）；
+      max_scale_m  去掉最大轴 1σ 超过该值的巨型高斯（None 不过滤），碰撞端用同一值；
+      supersample  整数 s：按 s 倍分辨率渲染再 s×s 盒滤波缩小（抗闪烁）。
+    """
 
     backend = "gsplat"
 
     def __init__(self, scene, width=None, height=None, fov_deg=None,
-                 device="cuda", sh_degree=0, background=(0.7, 0.75, 0.8)):
+                 device="cuda", sh_degree=None, max_scale_m=None, supersample=None,
+                 background=(0.7, 0.75, 0.8)):
         try:
             import torch
             from gsplat import rasterization
@@ -57,7 +64,18 @@ class GsplatRenderer:
         self.width = int(width or cam.get("width", 320))
         self.height = int(height or cam.get("height", 240))
         self.fov_deg = float(fov_deg or cam.get("fov_deg", 60.0))
-        self.sh_degree = int(sh_degree)
+        opts = scene_mod.render_options(scene)
+        if sh_degree is not None:
+            opts["sh_degree"] = sh_degree
+        if max_scale_m is not None:
+            opts["max_scale_m"] = max_scale_m
+        if supersample is not None:
+            opts["supersample"] = supersample
+        self.supersample = int(opts["supersample"])
+        if self.supersample < 1:
+            raise ValueError("supersample 必须 >= 1")
+        self.max_scale_m = (None if opts["max_scale_m"] in (None, 0)
+                            else float(opts["max_scale_m"]))
         self.nav_to_world = scene.get("_nav_to_world")
         # 不用 gsplat 的 backgrounds：1.5.3 在 packed=True 时要求 (channels,)，
         # 与高层 [C,3] 的约定冲突。改为拿 alpha 后自己合成背景。
@@ -65,14 +83,23 @@ class GsplatRenderer:
                                 device=self.device).view(1, 1, 3)
 
         g = scene_mod.read_gaussian_ply(scene["ply_path"])
-        self.n_gaussians = int(len(g["means"]))
+        self.n_loaded = int(len(g["means"]))
+        keep = scene_mod.scale_keep_mask(g["scales"], self.max_scale_m)
+        self.n_removed_by_scale = int((~keep).sum())
+        self.n_gaussians = int(keep.sum())
         t = torch.from_numpy
-        self.means = t(g["means"]).to(self.device).contiguous()
-        self.quats = t(g["quats"]).to(self.device).contiguous()
-        self.scales = t(g["scales"]).to(self.device).contiguous()
-        self.opacities = t(g["opacities"]).to(self.device).contiguous()
-        # sh_degree=None -> colors 直接是 RGB [N,3]，避免为 pilot 读 45 维 SH。
-        self.colors = t(g["colors"]).to(self.device).contiguous()
+        self.means = t(g["means"][keep]).to(self.device).contiguous()
+        self.quats = t(g["quats"][keep]).to(self.device).contiguous()
+        self.scales = t(g["scales"][keep]).to(self.device).contiguous()
+        self.opacities = t(g["opacities"][keep]).to(self.device).contiguous()
+        want = int(opts["sh_degree"])
+        self.sh_degree = min(want, int(g["sh_degree"])) if g["sh"] is not None else 0
+        if self.sh_degree > 0:
+            k = (self.sh_degree + 1) ** 2        # 只传需要的前 k 个系数
+            self.colors = t(np.ascontiguousarray(g["sh"][keep][:, :k])).to(self.device)
+        else:
+            # sh_degree=None -> colors 直接是 DC 换算的 RGB [N,3]。
+            self.colors = t(g["colors"][keep]).to(self.device).contiguous()
         self.scene = scene
         self.samples = 0
         self.total_ms = 0.0
@@ -83,7 +110,9 @@ class GsplatRenderer:
         height = int(height or self.height)
         view = scene_mod.viewmat_from_pose(x, y, z, yaw_deg, pitch_deg,
                                            self.nav_to_world)
-        k = scene_mod.intrinsics(width, height, self.fov_deg)
+        s = self.supersample
+        # 超采样：内参按 s 缩放（fx/fy/cx/cy 都线性），渲染 s 倍大图。
+        k = scene_mod.intrinsics(width * s, height * s, self.fov_deg)
         torch = self.torch
         vm = torch.from_numpy(view).float().to(self.device)[None]
         ks = torch.from_numpy(k).float().to(self.device)[None]
@@ -93,18 +122,28 @@ class GsplatRenderer:
         with torch.no_grad():
             colors, alphas, _meta = self.rasterization(
                 self.means, self.quats, self.scales, self.opacities, self.colors,
-                vm, ks, width, height,
-                sh_degree=None, render_mode="RGB+ED",
-                backgrounds=None, packed=True)
+                vm, ks, width * s, height * s,
+                sh_degree=self.sh_degree if self.sh_degree > 0 else None,
+                render_mode="RGB+ED", backgrounds=None, packed=True)
+            out = colors[0].detach()
+            alpha = alphas[0].detach().float()              # [H*s, W*s, 1]
+            # 手动背景合成：accumulated RGB 已是预乘 alpha。
+            rgb_t = out[..., :3] + self._bg * (1.0 - alpha)
+            depth_t = out[..., 3:4].float()
+            if s > 1:
+                pool = torch.nn.functional.avg_pool2d
+                nchw = lambda im: im.permute(2, 0, 1)[None]          # noqa: E731
+                hwc = lambda im: im[0].permute(1, 2, 0)              # noqa: E731
+                rgb_t = hwc(pool(nchw(rgb_t), s))
+                # 期望深度按 alpha 加权合并子像素，和 gsplat 单像素内 sum(w z)/sum(w) 同义。
+                wsum = pool(nchw(alpha), s)
+                depth_t = hwc(pool(nchw(depth_t * alpha), s) / wsum.clamp_min(1e-6))
+                alpha = hwc(wsum)
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         ms = (time.perf_counter() - t0) * 1e3
-        out = colors[0].detach()
-        alpha = alphas[0].detach().float()
-        # 手动背景合成：accumulated RGB 已是预乘 alpha。
-        rgb_t = out[..., :3] + self._bg * (1.0 - alpha)
         rgb = (rgb_t.clamp(0.0, 1.0).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
-        depth = out[..., 3].float().cpu().numpy()
+        depth = depth_t[..., 0].cpu().numpy()
         alpha_np = alpha.cpu().numpy()
         depth = np.where(alpha_np[..., 0] >= 0.05, depth, 0.0).astype(np.float32)
         self.samples += 1
@@ -113,6 +152,8 @@ class GsplatRenderer:
 
     def stats(self):
         return {"backend": self.backend, "n_gaussians": self.n_gaussians,
+                "n_loaded": self.n_loaded, "n_removed_by_scale": self.n_removed_by_scale,
+                "max_scale_m": self.max_scale_m, "supersample": self.supersample,
                 "width": self.width, "height": self.height, "fov_deg": self.fov_deg,
                 "sh_degree": self.sh_degree, "device": str(self.device),
                 "samples": self.samples,
@@ -158,11 +199,14 @@ class MockRenderer:
 
 
 def make_renderer(scene, mock=False, width=None, height=None, fov_deg=None,
-                  device="cuda"):
-    """显式选择后端；真实后端不可用时直接报错，不静默回退 mock。"""
+                  device="cuda", **render_opts):
+    """显式选择后端；真实后端不可用时直接报错，不静默回退 mock。
+
+    render_opts：sh_degree / max_scale_m / supersample，None 表示按 scene.render 段。
+    """
     if mock:
         return MockRenderer(scene, width, height, fov_deg)
-    return GsplatRenderer(scene, width, height, fov_deg, device=device)
+    return GsplatRenderer(scene, width, height, fov_deg, device=device, **render_opts)
 
 
 def parse_pose(text):
@@ -204,6 +248,12 @@ def main():
     p.add_argument("--bench", type=int, default=0, help="额外计时帧数")
     p.add_argument("--mock", action="store_true", help="显式 mock 后端（仅冒烟）")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--sh-degree", type=int, default=None,
+                   help="球谐阶数（默认 scene.render.sh_degree=3；0=只用 DC）")
+    p.add_argument("--max-scale", type=float, default=None,
+                   help="去掉最大轴 1σ 超过该米数的高斯（默认 3.0；<=0 不过滤）")
+    p.add_argument("--supersample", type=int, default=None,
+                   help="超采样倍数（默认 2；1=关闭）")
     args = p.parse_args()
     if args.scene:
         scene = scene_mod.load_scene(args.scene)
@@ -213,8 +263,10 @@ def main():
     else:
         p.error("--scene 或 --ply 必填")
     pose = parse_pose(args.pose)
+    max_scale = None if args.max_scale is None else (args.max_scale if args.max_scale > 0 else 0)
     renderer = make_renderer(scene, args.mock, args.width, args.height, args.fov,
-                             args.device)
+                             args.device, sh_degree=args.sh_degree,
+                             max_scale_m=max_scale, supersample=args.supersample)
     rgb, depth, ms = renderer.render_pose(*pose)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     _save_rgb(args.out, rgb)

@@ -13,6 +13,16 @@ import numpy as np
 
 C0 = 0.28209479177387814   # SH DC -> RGB 的系数
 
+# 渲染/碰撞共用的默认值（scene.json 的 "render" 段可覆盖）。数字来自
+# docs/worklog/2026-11-06-*-3dgs-geometry-render.md 的 Callinstrasse 扫描：
+#   max_scale_m=3：去掉最大轴 1σ > 3 m 的 6226 个（0.3%）"天空壳/雾"高斯后，机载帧
+#     暗通道 0.51→0.40、拉普拉斯方差 36→437，alpha 均值仍 0.96；再往下（2/1.5/1 m）
+#     背景洞 >17%。
+#   supersample=2：2 倍渲染再盒滤波缩小，细结构不闪且比 antialiased 模式清楚
+#     （lapvar 83 vs 38）。
+#   sh_degree=3：读 f_rest，视角相关颜色恢复（暗通道 0.51→0.49，lapvar 36→68）。
+RENDER_DEFAULTS = {"sh_degree": 3, "max_scale_m": 3.0, "supersample": 2}
+
 PLY_PROPS = ("x", "y", "z", "nx", "ny", "nz",
              "f_dc_0", "f_dc_1", "f_dc_2") + tuple(
     f"f_rest_{i}" for i in range(45)) + (
@@ -28,8 +38,9 @@ def _ply_dtype(props, endian="<"):
 def read_gaussian_ply(path):
     """读 INRIA 3DGS PLY（binary_little_endian/ascii），返回 numpy 字段字典。
 
-    只保证返回 means/quats/scales/opacities/colors（RGB 0..1）与 points；
-    缺 f_rest 也能读（sh_degree=0 渲染）。
+    返回 means/quats(w,x,y,z)/scales/opacities/colors（DC 项换算的 RGB 0..1），以及
+    sh：[N,(L+1)^2,3] 的完整球谐系数（DC + f_rest），sh_degree=L；缺 f_rest 或
+    数量不是 3*((L+1)^2-1) 时 sh=None、sh_degree=0（只能按 DC 渲染）。
     """
     with open(path, "rb") as f:
         if f.readline().strip() != b"ply":
@@ -84,8 +95,38 @@ def read_gaussian_ply(path):
         quats /= np.linalg.norm(quats, axis=1, keepdims=True) + 1e-9
     else:
         quats = np.tile(np.array([1, 0, 0, 0], dtype=np.float32), (count, 1))
+    # 高阶球谐：INRIA 布局 f_rest 按 [3 通道][(L+1)^2-1 系数] 排，gsplat 要 [N,K,3]。
+    n_rest = sum(1 for p in props if p.startswith("f_rest_"))
+    sh, sh_degree = None, 0
+    if n_rest and n_rest % 3 == 0:
+        k = n_rest // 3 + 1
+        deg = int(round(math.sqrt(k))) - 1
+        if (deg + 1) ** 2 == k and deg > 0:
+            rest = np.stack([table[f"f_rest_{i}"] for i in range(n_rest)],
+                            axis=1).astype(np.float32).reshape(count, 3, k - 1)
+            sh = np.concatenate([dc[:, None, :], rest.transpose(0, 2, 1)], axis=1)
+            sh_degree = deg
     return {"means": means, "colors": colors, "opacities": opac,
-            "scales": scales, "quats": quats}
+            "scales": scales, "quats": quats, "sh": sh, "sh_degree": sh_degree}
+
+
+def scale_keep_mask(scales, max_scale_m):
+    """尺度过滤：保留最大轴 1σ <= max_scale_m 的高斯；None 表示不过滤。
+
+    巨型高斯（Callinstrasse 里 1σ 可到 6500 m）是训练时拟合天空/远景的"壳"，
+    机载视角里它们盖在近景前面形成白雾；去掉后被它们遮住的洞会露出背景色。
+    """
+    scales = np.asarray(scales)
+    if max_scale_m is None:
+        return np.ones(len(scales), dtype=bool)
+    return scales.max(axis=1) <= float(max_scale_m)
+
+
+def render_options(scene):
+    """scene.json 的 render 段 + RENDER_DEFAULTS -> dict（渲染端与碰撞端同一来源）。"""
+    opts = dict(RENDER_DEFAULTS)
+    opts.update({k: v for k, v in (scene or {}).get("render", {}).items() if k in opts})
+    return opts
 
 
 def write_gaussian_ply(path, means, colors, scales=None, quats=None, opacities=None):
@@ -142,7 +183,8 @@ def make_corridor(out_dir, seed=0, length=32.0, width=8.0, height=4.0):
     """生成 3DGS 合成走廊（盒面高斯）+ scene.json；返回 scene 字典。
 
     这是**合成场景**，不是真实重建；用于在没有公共场景的情况下打通渲染/碰撞/闭环。
-    几何：地面 + 两侧墙 + 若干立柱/箱子，沿 +x。点密度约 0.15 m。
+    几何：地面 + 两侧墙 + 若干立柱/箱子，沿 +x。点间距约 0.1 m、σ=0.06 m，
+    相邻高斯在 1.5σ 处重叠，碰撞代理 v2（3D 椭球占据）才能把面补严。
     """
     rng = np.random.default_rng(seed)
     pts, cols = [], []
@@ -156,10 +198,10 @@ def make_corridor(out_dir, seed=0, length=32.0, width=8.0, height=4.0):
         pts.append(p)
         cols.append(c)
 
-    add((-2.0, -width / 2, -0.05), (length, width / 2, 0.0), (0.42, 0.38, 0.30), 0.18)
+    add((-2.0, -width / 2, -0.05), (length, width / 2, 0.0), (0.42, 0.38, 0.30), 0.12)
     for sign in (-1, 1):
         y = sign * width / 2
-        add((-2.0, y - 0.05, 0.0), (length, y + 0.05, height), (0.62, 0.60, 0.55), 0.16)
+        add((-2.0, y - 0.05, 0.0), (length, y + 0.05, height), (0.62, 0.60, 0.55), 0.10)
     # 立柱/箱子：给碰撞和偏航留出真实障碍。
     boxes = [(7.0, 1.2, 0.45, 2.4, (0.75, 0.30, 0.15)),
              (7.0, -1.2, 0.45, 2.4, (0.75, 0.30, 0.15)),
@@ -168,14 +210,14 @@ def make_corridor(out_dir, seed=0, length=32.0, width=8.0, height=4.0):
              (21.0, -1.6, 0.45, 2.2, (0.66, 0.62, 0.12)),
              (27.0, 0.0, 0.60, 2.3, (0.16, 0.55, 0.24))]
     for x, y, half, h, color in boxes:
-        add((x - half, y - half, 0.0), (x + half, y + half, h), color, 0.10)
+        add((x - half, y - half, 0.0), (x + half, y + half, h), color, 0.07)
 
     means = np.concatenate(pts).astype(np.float32)
     colors = np.concatenate(cols).astype(np.float32)
     os.makedirs(out_dir, exist_ok=True)
     ply = os.path.join(out_dir, "scene.ply")
     write_gaussian_ply(ply, means, colors,
-                       scales=np.full((len(means), 3), 0.035, np.float32))
+                       scales=np.full((len(means), 3), 0.06, np.float32))
     scene = {
         "schema": "uavrgb.3dgs_scene.v1",
         "name": f"synthetic_corridor_s{seed}",
@@ -189,13 +231,15 @@ def make_corridor(out_dir, seed=0, length=32.0, width=8.0, height=4.0):
         "waypoint": {"x": 30.0, "y": 0.0, "z": 2.0},
         "reach_radius_m": 1.5,
         "camera": {"width": 320, "height": 240, "fov_deg": 60.0, "pitch_deg": 0.0},
+        # 合成点是随机撒的，局部会有 0.2–0.3 m 的空隙；用 3σ + 0.1 m 余量把面补严
+        # （真实场景用 collision.py 的默认 1.5σ、无余量）。
         "collision": {"z_slice": [1.65, 2.35], "voxel_m": 0.1,
-                      "inflate_m": 0.35, "drone_radius_m": 0.3},
+                      "sigma_k": 3.0, "margin_m": 0.1, "envelope": "e1_mini"},
         "max_steps": 60,
         "step_s": 0.5,
         "notes": [
             "合成走廊，尺度/上轴已知（米，z 向上），非 COLMAP 重建。",
-            "碰撞代理：2 m 高度切片点云体素占据 + 地面平面，不是 3DGS 求交。",
+            "碰撞代理：导航系 3D 体素占据（高斯椭球）+ 地面平面，沿轨迹扫掠；不是 3DGS 求交。",
         ],
     }
     save_scene(scene, os.path.join(out_dir, "scene.json"))
