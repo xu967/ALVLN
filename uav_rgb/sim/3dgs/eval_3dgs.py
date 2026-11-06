@@ -31,7 +31,7 @@ from . import collect_3dgs
 from . import renderer as renderer_mod
 from . import scene as scene_mod
 from .collect_3dgs import StudentAdapter
-from .dynamics import CfBlackboxParams
+from .dynamics import CfBlackboxParams, CfSitlParams
 
 TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 if TOOLS not in sys.path:
@@ -141,6 +141,8 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--save-depth", action="store_true")
+    p.add_argument("--dynamics", choices=("cf_blackbox", "cf_sitl"), default="cf_blackbox",
+                   help="cf_sitl = E1 MINI 固件在环子进程（参数默认 sim/dynamics/e1_mini.json）")
     p.add_argument("--dynamics-params", default=None)
     p.add_argument("--spawn-jitter", type=float, default=0.0)
     p.add_argument("--record-video", action="store_true",
@@ -161,7 +163,8 @@ def main():
         p.error(str(e))
     if args.episodes < 1 or steps < 1 or not (math.isfinite(hold) and hold > 0):
         p.error("episodes/steps 必须 >=1，hold 必须有限正数")
-    params = CfBlackboxParams.from_json(args.dynamics_params)
+    params = (CfSitlParams.from_json(args.dynamics_params) if args.dynamics == "cf_sitl"
+              else CfBlackboxParams.from_json(args.dynamics_params))
     occ = collision_mod.from_scene(scene)
     renderer = renderer_mod.make_renderer(scene, args.mock_renderer, args.width,
                                           args.height, args.fov, args.device)
@@ -193,7 +196,8 @@ def main():
                     stop_on_collision=True,
                     dynamics_path=args.dynamics_params,
                     spawn_jitter=args.spawn_jitter,
-                    identity=identity, split_policy=split_policy)
+                    identity=identity, split_policy=split_policy,
+                    dynamics=args.dynamics)
             except Exception as e:  # noqa: BLE001 - 单集失败要进报告
                 failures.append({"episode": ep, "seed": args.seed + ep,
                                  "error": f"{type(e).__name__}: {e}"})
@@ -268,6 +272,7 @@ def main():
                   "spawn": scene.get("spawn"),
                   "source": scene.get("source"),
                   "license": scene.get("license")},
+        "dynamics": args.dynamics,
         "dynamics_profile": params.profile(),
         "dynamics_params": params.manifest(),
         "collision_proxy": occ.summary(),

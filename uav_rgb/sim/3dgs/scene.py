@@ -303,6 +303,44 @@ def viewmat_from_pose(x, y, z, yaw_deg, pitch_deg=0.0, nav_to_world=None):
     return view
 
 
+def _quat_rotmat(q):
+    """单个 (w,x,y,z) -> 3x3（机体->世界）。"""
+    w, x, y, z = (float(v) for v in q)
+    n = math.sqrt(w * w + x * x + y * y + z * z)
+    if n < 1e-12:
+        raise ValueError("四元数不能为零")
+    w, x, y, z = w / n, x / n, y / n, z / n
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                     [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                     [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+
+
+def viewmat_from_quat(pos, quat, mount=None, nav_to_world=None):
+    """机体位姿（nav 系位置 + FLU->nav 四元数 w,x,y,z）⊗ 相机安装 -> gsplat world->camera 4x4。
+
+    mount：e1_mini.json camera_mount.value，{"xyz": 机体系偏移 m, "pitch_deg": 抬头为正}；
+    None = 机体原点、不俯仰。相机轴：右=-y_body、下=-z_body、前=+x_body，再绕机体 y 轴抬头 pitch。
+    四元数只含 yaw、mount 为 None 时与 viewmat_from_pose(x, y, z, yaw) 相同；roll/pitch 直接进画面。
+    """
+    r_nb = _quat_rotmat(quat)                                   # body -> nav
+    xyz = np.zeros(3) if mount is None else np.asarray(mount.get("xyz", (0, 0, 0)), np.float64)
+    pitch = math.radians(0.0 if mount is None else float(mount.get("pitch_deg", 0.0)))
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    r_cb = np.array([[0.0, -1.0, 0.0],       # 相机右 = 机体 -y
+                     [sp, 0.0, -cp],         # 相机下 = 机体 -z 抬头 pitch 后
+                     [cp, 0.0, sp]])         # 相机前 = 机体 +x 抬头 pitch 后
+    r_cn = r_cb @ r_nb.T
+    c_nav = np.asarray(pos, dtype=np.float64) + r_nb @ xyz
+    m = np.asarray(np.eye(4) if nav_to_world is None else nav_to_world, dtype=np.float64)
+    r_m, t_m = m[:3, :3], m[:3, 3]
+    r_cw = r_cn @ r_m.T
+    c_world = r_m @ c_nav + t_m
+    view = np.eye(4)
+    view[:3, :3] = r_cw
+    view[:3, 3] = -r_cw @ c_world
+    return view
+
+
 def intrinsics(width, height, fov_deg):
     """水平 FOV -> K；方形像素（fy=fx），主点在中心。"""
     fx = 0.5 * width / math.tan(math.radians(fov_deg) / 2.0)

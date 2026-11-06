@@ -106,10 +106,15 @@ class GsplatRenderer:
 
     def render_pose(self, x, y, z, yaw_deg, pitch_deg=0.0, width=None, height=None):
         """nav 位姿 -> (rgb uint8 HxWx3, depth float32 HxW[米,0=无效], 耗时 ms)。"""
-        width = int(width or self.width)
-        height = int(height or self.height)
         view = scene_mod.viewmat_from_pose(x, y, z, yaw_deg, pitch_deg,
                                            self.nav_to_world)
+        return self.render_view(view, width, height)
+
+    def render_view(self, view, width=None, height=None):
+        """任意 world->camera 4x4（已含 nav_to_world，如 scene.viewmat_from_quat）-> 同 render_pose。"""
+        width = int(width or self.width)
+        height = int(height or self.height)
+        view = np.asarray(view, dtype=np.float64)
         s = self.supersample
         # 超采样：内参按 s 缩放（fx/fy/cx/cy 都线性），渲染 s 倍大图。
         k = scene_mod.intrinsics(width * s, height * s, self.fov_deg)
@@ -174,6 +179,15 @@ class MockRenderer:
         self.depth_m = float(depth_m)
         self.samples = 0
         self.total_ms = 0.0
+
+    def render_view(self, view, width=None, height=None):
+        """从 world->camera 4x4 反推相机中心与朝向，再走 render_pose 的渐变。"""
+        view = np.asarray(view, dtype=np.float64)
+        r, t = view[:3, :3], view[:3, 3]
+        c = -r.T @ t
+        fwd = r[2]                                  # 相机 +z（前）在世界系
+        return self.render_pose(c[0], c[1], c[2], np.degrees(np.arctan2(fwd[1], fwd[0])),
+                                np.degrees(np.arcsin(np.clip(fwd[2], -1.0, 1.0))), width, height)
 
     def render_pose(self, x, y, z, yaw_deg, pitch_deg=0.0, width=None, height=None):
         w = int(width or self.width)

@@ -27,7 +27,8 @@ import numpy as np
 from . import collision as collision_mod
 from . import scene as scene_mod
 from . import renderer as renderer_mod
-from .dynamics import (CfBlackboxParams, FORWARD_SLOW, make_blackbox)
+from .dynamics import (CfBlackboxParams, CfSitlDynamics, CfSitlParams, FORWARD_SLOW,
+                       make_blackbox)
 
 TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 if TOOLS not in sys.path:
@@ -161,12 +162,15 @@ def _spawn_for_episode(scene, occ, jitter_m, rng):
 def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
                 split="train", seed=0, episode_id=None,
                 save_depth=False, stop_on_collision=False, dynamics_path=None,
-                spawn_jitter=0.0, identity=None, split_policy=None):
+                spawn_jitter=0.0, identity=None, split_policy=None,
+                dynamics="cf_blackbox"):
     """跑一集，返回 (manifest, error)。产物写 out_dir；异常也尽量落 manifest。
 
     identity：scene_identity() 的结果（gid/scene_id/task_id）；None 时现算。
     split_policy：None -> "geometry_gid"（split 必须等于 identity["split"]）；
     调用方强行指定别的 split 时传 "diag-manual-split"，preprocess 要 --allow-diagnostic-split。
+    dynamics："cf_blackbox"（params 是 CfBlackboxParams，z 固定）或 "cf_sitl"（params 是
+    CfSitlParams，E1 MINI 固件在环子进程，相机位姿用完整四元数，另写 trace.jsonl）。
     """
     os.makedirs(out_dir, exist_ok=True)
     identity = identity or scene_identity(scene)
@@ -177,11 +181,23 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
                              f"按几何组应属的 split={identity['split']} 不一致")
     if save_depth:
         os.makedirs(os.path.join(out_dir, "depth"), exist_ok=True)
-    dyn = make_blackbox(scene, dynamics_path, params)
     rng = np.random.default_rng(seed)
     x, y, yaw = _spawn_for_episode(scene, occ, spawn_jitter, rng)
-    dyn.x, dyn.y = x, y
-    dyn.yaw = math.radians(yaw)
+    if dynamics == "cf_sitl":
+        dyn = CfSitlDynamics(scene, params, dynamics_path, seed=seed)
+        try:
+            # 噪声种子 = --seed ^ episode；seed 已按集递增，episode 固定 0（两者相等时异或为 0，所有集相同）。
+            s = dyn.reset(x, y, yaw, episode=0)    # 地面起飞到 READY，起飞时间不计入 episode
+        except BaseException:
+            dyn.close()
+            raise
+        x, y, yaw = s["x"], s["y"], s["yaw_deg"]   # 起飞段有漂移，episode 从实际位姿开始
+    elif dynamics == "cf_blackbox":
+        dyn = make_blackbox(scene, dynamics_path, params)
+        dyn.x, dyn.y = x, y
+        dyn.yaw = math.radians(yaw)
+    else:
+        raise ValueError(f"dynamics 必须是 cf_blackbox 或 cf_sitl，得到 {dynamics!r}")
     actions, oracle, render_ms = [], [], []
     rows_ok, all_rgb_ok = 0, True
     stopped = False
@@ -192,9 +208,12 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
 
     try:
         for i in range(steps):
-            rgb, depth, ms = renderer.render_pose(
-                x, y, dyn.z, yaw, pitch_deg=float(
-                    scene.get("camera", {}).get("pitch_deg", 0.0)))
+            if dynamics == "cf_sitl":   # 机体四元数 ⊗ camera_mount：roll/pitch 进画面
+                rgb, depth, ms = renderer.render_view(dyn.camera_viewmat(scene["_nav_to_world"]))
+            else:
+                rgb, depth, ms = renderer.render_pose(
+                    x, y, dyn.z, yaw, pitch_deg=float(
+                        scene.get("camera", {}).get("pitch_deg", 0.0)))
             render_ms.append(ms)
             t_rgb = dyn.t
             rgb_ok = True
@@ -234,7 +253,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
                 "frame": "rgb_%05d.png" % i,
                 "rgb_ts": ts0,
                 "pose_ts": ts0,
-                "pose_before": {"x": x0, "y": y0, "z": state["z"]},
+                "pose_before": {"x": x0, "y": y0, "z": z0},
                 "yaw_before": math.degrees(yaw0),
                 "displacement_m": dist,
                 "dyaw_deg": dyaw,
@@ -268,6 +287,10 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
     finally:
         _write_jsonl(os.path.join(out_dir, "actions.jsonl"), actions)
         _write_jsonl(os.path.join(out_dir, "oracle.jsonl"), oracle)
+        if getattr(dyn, "trace", None) is not None:   # cf_sitl：hold 窗口内 10 Hz 中间状态（视频用）
+            _write_jsonl(os.path.join(out_dir, "trace.jsonl"), dyn.trace)
+        if hasattr(dyn, "close"):
+            dyn.close()
         try:
             with open(scene["path"], encoding="utf-8") as f:
                 scene_copy = json.load(f)
@@ -302,8 +325,10 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
                       "ply_sha256": identity["ply_sha256"],
                       "scene_json_sha256": _sha256(scene["path"]),
                       "spawn": scene.get("spawn"), "waypoint": scene.get("waypoint")},
-            "dynamics_profile": dyn.params.profile(),
-            "dynamics_params": dyn.params.manifest(),
+            "dynamics_backend": dynamics,
+            "dynamics_profile": dyn.profile(),
+            "dynamics_params": dyn.manifest(),
+            "trace_ref": "trace.jsonl" if getattr(dyn, "trace", None) is not None else None,
             "teacher": policy.name,
             "teacher_version": TEACHER_VERSION if policy.name == "expert_action" else None,
             "hold_s": hold_s,
@@ -339,7 +364,9 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
             "stopped_on_collision": stopped,
             "error": error,
             "notes": [
-                "3DGS 在线渲染，无 Gazebo；位姿由 cf_blackbox 推进，z 固定。",
+                ("3DGS 在线渲染，无 Gazebo；位姿由 E1 MINI 固件在环（cf_sitl_proc）推进，"
+                 "高度由固件定高，相机位姿含 roll/pitch。" if dynamics == "cf_sitl" else
+                 "3DGS 在线渲染，无 Gazebo；位姿由 cf_blackbox 推进，z 固定。"),
                 "碰撞是导航系 3D 体素占据代理（不透明度筛过的高斯椭球，沿每步位移扫掠），"
                 "不是真实接触真值。",
             ],
@@ -369,6 +396,9 @@ def main():
                         "不同时记为诊断划分 diag-manual-split，打包要 --allow-diagnostic-split")
     p.add_argument("--save-depth", action="store_true")
     p.add_argument("--stop-on-collision", action="store_true")
+    p.add_argument("--dynamics", choices=("cf_blackbox", "cf_sitl"), default="cf_blackbox",
+                   help="cf_sitl = E1 MINI 固件在环子进程（参数默认 sim/dynamics/e1_mini.json，"
+                        "可执行文件取 $CF_SITL_PROC）")
     p.add_argument("--dynamics-params", default=None)
     p.add_argument("--spawn-jitter", type=float, default=0.0)
     args = p.parse_args()
@@ -381,7 +411,8 @@ def main():
         p.error("steps 必须 >=1，hold 必须有限正数")
     if args.spawn_jitter < 0 or not math.isfinite(args.spawn_jitter):
         p.error("--spawn-jitter 必须有限且 >= 0")
-    params = CfBlackboxParams.from_json(args.dynamics_params)
+    params = (CfSitlParams.from_json(args.dynamics_params) if args.dynamics == "cf_sitl"
+              else CfBlackboxParams.from_json(args.dynamics_params))
     identity = scene_identity(scene)
     split, split_policy = identity["split"], "geometry_gid"
     if args.split is not None and args.split != split:
@@ -406,7 +437,7 @@ def main():
                 stop_on_collision=args.stop_on_collision,
                 dynamics_path=args.dynamics_params,
                 spawn_jitter=args.spawn_jitter, identity=identity,
-                split_policy=split_policy)
+                split_policy=split_policy, dynamics=args.dynamics)
             episodes.append({"episode": ep, "dir": os.path.basename(ep_dir),
                              "steps": manifest["num_steps"],
                              "collision": any(a["collision"] for a in
@@ -421,6 +452,7 @@ def main():
                   "ply": scene["ply_path"], **identity},
         "split": split, "split_policy": split_policy,
         "policy": args.policy, "steps": steps, "hold_s": hold,
+        "dynamics": args.dynamics,
         "dynamics_profile": params.profile(),
         "dynamics_params": params.manifest(),
         "renderer": renderer.stats(),
