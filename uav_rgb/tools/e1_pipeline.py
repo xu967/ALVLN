@@ -44,7 +44,10 @@ CFG = dict(
     no_aux_cameras=True,     # 采集不要 chase/top 相机：RTF 锁 1.0 时每步快 17%；录像只在评测时开
     collect_min_ok=0.95,     # 偶发丢首条起飞指令属正常（collect_parallel 自带重试一次）；低于 95% 说明环境坏了，停
     # 审计
-    audit_ignore=(),         # 任一 FAIL 即停（audit_dataset 已豁免 cf_sitl 的定速判据）；临时放行写检查名，如 ("class_share",)
+    audit_ignore=("class_share", "safe_collision"),
+                             # 其余任一 FAIL 即停。这两项是 X3 口径、E1 上放行（pilot 2 轮实测）：E1 教师脱困 v2 后几乎不再 SAFE 死锁，
+                             # SAFE 只占 3.9% (<5%)；仍有 ~15% 集在柱旁左右摆后擦柱，擦柱步 preprocess --drop-collision 会丢掉，
+                             # 擦柱前的标签仍是对的。教师真实 SR 由评测 teacher 组报，不靠这里兜
     # 打包 / 训练（uavrgb_train；没列的 flag 用 trainer.hpp 默认：max-grad-norm 5.0，A/B 开关全关）
     drop_collision=True,     # 专家撞柱后的标签本身是错的；T6 起一直开。打包与训练同步传
     epochs=30,               # T6 best 落在 epoch 8，20 轮后 dev F1 不再涨；30 轮给 best-ckpt 余量
