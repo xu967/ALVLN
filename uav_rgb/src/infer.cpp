@@ -10,6 +10,7 @@
 #include <string>
 #include <vector>
 
+#include "uavrgb/model_dev.hpp"
 #include "uavrgb/tensor.hpp"
 
 namespace uavrgb {
@@ -44,9 +45,12 @@ std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream
     throw std::invalid_argument("infer: 模型尺寸非法");
   }
   const std::size_t frame = static_cast<std::size_t>(h) * w * c;
-  std::vector<unsigned char> rgb(frame);
+  std::vector<std::uint8_t> rgb(frame);
+  std::vector<std::uint8_t> chw(frame);
   std::vector<double> probs(static_cast<std::size_t>(ncls));
   std::size_t frames = 0;
+  // 权重常驻显存，每帧只上传 h*w*c 字节；/255 在设备侧做，与旧 host 路径同一舍入。
+  DeviceCnn dev(model, /*max_batch=*/1);
 
   while (true) {
     in.read(reinterpret_cast<char*>(rgb.data()), static_cast<std::streamsize>(frame));
@@ -55,18 +59,17 @@ std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream
       throw std::runtime_error("infer: 帧数据不足（截断）");
     }
 
-    Tensor x({1, c, h, w});
-    for (int ch = 0; ch < c; ++ch) {
+    for (int ch = 0; ch < c; ++ch) {  // HWC → CHW
       for (int y = 0; y < h; ++y) {
         for (int xx = 0; xx < w; ++xx) {
           const std::size_t src = (static_cast<std::size_t>(y) * w + xx) * c + ch;
-          x[(static_cast<std::size_t>(ch) * h + y) * w + xx] = rgb[src] / 255.0f;
+          chw[(static_cast<std::size_t>(ch) * h + y) * w + xx] = rgb[src];
         }
       }
     }
 
     const auto t0 = std::chrono::steady_clock::now();
-    const Tensor logits = forward(model, x, nullptr, text.empty() ? nullptr : &text);
+    const Tensor logits = dev.forward(chw.data(), 1, text.empty() ? nullptr : text.data());
     const auto t1 = std::chrono::steady_clock::now();
     if (logits.numel() != static_cast<std::size_t>(ncls)) {
       throw std::runtime_error("infer: logits 维度与 num_classes 不符");

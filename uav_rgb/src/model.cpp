@@ -275,7 +275,7 @@ CnnGrad backward(const CnnModel& m, const CnnCache& c, const Tensor& dlogits) {
   g.c2 = conv2d_backward_cuda(m.c2, c.p1.y, dc2);
   Tensor dr1 = maxpool2d_backward_cuda(kPool, c.r1, c.p1.argmax, g.c2.dx);
   Tensor dc1 = relu_backward_cuda(c.c1, dr1);
-  g.c1 = conv2d_backward_cuda(m.c1, c.x, dc1);
+  g.c1 = conv2d_backward_cuda(m.c1, c.x, dc1, /*need_dx=*/false);  // 输入图像不需要梯度
   return g;
 }
 

@@ -12,6 +12,7 @@
 #include <filesystem>
 #include <optional>
 #include <stdexcept>
+#include <sstream>
 #include <string>
 
 #include "uavrgb/run_owner.hpp"
@@ -25,7 +26,8 @@ void usage() {
                "--out <run_dir> [--resume <ckpt>] [--seed S] [--max-grad-norm G] "
                "[--class-weights auto|<w0,w1,w2,w3>] [--drop-collision] "
                "[--text-dim N | --vision-only] [--soft-targets <bin> [--distill-alpha A]] "
-               "[--allow-resume-mismatch] [--strict-distill]\n"
+               "[--allow-resume-mismatch] [--strict-distill] "
+               "[--augment all|photo,shift,flip] [--warmup N] [--cosine-lr] [--weight-decay W] [--label-smoothing E]\n"
                "  或: uavrgb_train --data <dataset.uavr> --eval-only <ckpt> --out "
                "<run_dir> [--batch B] [--split val|test|all] [--drop-collision]\n");
 }
@@ -88,6 +90,27 @@ int main(int argc, char** argv) {
         cfg.allow_resume_mismatch = true;
       } else if (a == "--strict-distill") {
         cfg.strict_distill = true;
+      } else if (a == "--augment") {
+        cfg.augment = next("--augment");
+        std::stringstream ss(cfg.augment);
+        for (std::string tok; std::getline(ss, tok, ',');) {
+          if (tok != "all" && tok != "photo" && tok != "shift" && tok != "flip") {
+            throw std::invalid_argument("--augment 只接受 all 或 photo/shift/flip 的逗号组合: " + tok);
+          }
+        }
+      } else if (a == "--warmup") {
+        cfg.warmup_steps = std::stoi(next("--warmup"));
+        if (cfg.warmup_steps < 0) throw std::invalid_argument("--warmup 不能为负");
+      } else if (a == "--cosine-lr") {
+        cfg.cosine_lr = true;
+      } else if (a == "--weight-decay") {
+        cfg.weight_decay = std::stof(next("--weight-decay"));
+        if (!(cfg.weight_decay >= 0.0f)) throw std::invalid_argument("--weight-decay 不能为负");
+      } else if (a == "--label-smoothing") {
+        cfg.label_smoothing = std::stof(next("--label-smoothing"));
+        if (!(cfg.label_smoothing >= 0.0f) || !(cfg.label_smoothing < 1.0f)) {
+          throw std::invalid_argument("--label-smoothing 必须在 [0,1)");
+        }
       } else if (a == "--eval-only") {
         eval_ckpt = next("--eval-only");
       } else if (a == "--split") {

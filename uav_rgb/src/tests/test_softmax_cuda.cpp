@@ -51,7 +51,8 @@ double max_abs_diff(const uavrgb::Tensor& a, const uavrgb::Tensor& b) {
 int main() {
   using namespace uavrgb;
 
-  const int n = 6;
+  // 600 行 = loss kernel 3 个 block，grad 3000 元素 = 12 个 block（旧尺寸 6×5 只有单 block）。
+  const int n = 600;
   const int c = 5;
 
   // 确定性 logits：行内混入大值（±8 量级）验证先减 max 的 stable softmax。
@@ -62,7 +63,8 @@ int main() {
                           (j == 2 ? 8.0f : 0.0f) - (j == 4 ? 8.0f : 0.0f);
     }
   }
-  const std::vector<int> labels = {2, 0, 3, 1, 4, 2};
+  std::vector<int> labels(static_cast<std::size_t>(n));
+  for (int i = 0; i < n; ++i) labels[static_cast<std::size_t>(i)] = (i * 7 + 2) % c;
 
   const float loss_cpu = softmax_ce_loss(logits, labels);
   const float loss_cuda = softmax_ce_loss_cuda(logits, labels);

@@ -2,13 +2,16 @@
 // NativeTrainer：UAVR 数据集 → CNN 前向/反向 → 梯度裁剪 → Adam → checkpoint + 指标落盘。
 // 每 epoch 追加一行 results.csv（列固定见 event.hpp 的 kResultsCsvHeader），
 // 每 step 追加一行 metrics.jsonl（字段见 event.hpp 的 MetricsEvent，监控台在读）。
-// 纯单线程；前向/反向走 CUDA 算子，host 侧只做 IO 与标量统计。
+// 纯单线程；前向/反向/Adam 在 DeviceCnn（设备常驻）上跑，host 侧只做 IO、loss 与标量统计。
 #include "uavrgb/checkpoint.hpp"
 #include "uavrgb/dataset.hpp"
 #include "uavrgb/event.hpp"
 #include "uavrgb/model.hpp"
+#include "uavrgb/model_dev.hpp"
 
 #include <cstdint>
+#include <memory>
+#include <random>
 #include <string>
 #include <utility>
 #include <vector>
@@ -49,6 +52,14 @@ struct TrainConfig {
   bool allow_resume_mismatch = false;
   // 教师选模 split 与 student val 重叠时默认只警告；strict 直接失败。
   bool strict_distill = false;
+  // 算法 A/B 开关，默认全关 = 原行为（实验记录见 docs/worklog 2026-11-06 src-algo）。
+  // 设备侧增强，逗号分隔的组合：photo（gamma/对比度/亮度抖动）、shift（±4px 平移）、
+  // flip（水平翻转，仅纯视觉模型，左右偏航标签互换）、all；空 = 关。
+  std::string augment;
+  int warmup_steps = 0;          // 线性 warmup 步数
+  bool cosine_lr = false;        // warmup 之后余弦退火到 0
+  float weight_decay = 0.0f;     // AdamW 解耦权重衰减（0 = 原 Adam）
+  float label_smoothing = 0.0f;  // 标签平滑 ε（与类别权重叠加；与蒸馏互斥，蒸馏优先）
   // 以下由 trainer 在 run() 里按实际数据/环境补齐，再落进 config.json。
   std::string dataset_sha256, split_scheme, window_from, hold_s;
   std::string soft_targets_sha256, teacher_ckpt_sha256, teacher_select_split, source_git;
@@ -122,10 +133,23 @@ class Trainer {
   void write_csv_header_if_needed() const;
   // 在 idx 上评估，结果写进 out。
   void evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& idx, EvalStats* out);
+  // 以下三个在 trainer_dev.cpp。
+  // 读 part 这批样本（uint8 + token）并在 dev_ 上前向，返回 host logits。train_labels 非空
+  // 表示训练批：cfg_.augment 非空时做增强，翻转样本的左右偏航标签就地互换。
+  Tensor forward_batch(const UavrDataset& ds, const std::vector<std::uint32_t>& part,
+                       std::vector<int>* train_labels = nullptr);
+  // 按 warmup/余弦日程算第 step 步（1 起）的 lr，写进 state_.adam[*].lr 并返回。
+  float step_lr(std::uint32_t step, std::uint32_t total_steps);
+  // 训练 loss 与 dlogits：蒸馏 > 标签平滑(+类别权重) > 类别权重/无权。
+  Tensor loss_and_grad(const Tensor& logits, const std::vector<int>& y,
+                       const std::vector<float>& q, float* loss);
 
   TrainConfig cfg_;
   CnnModel model_;
   TrainState state_;
+  std::unique_ptr<DeviceCnn> dev_;    // 权重/Adam/激活常驻显存；存 checkpoint 前 download
+  std::vector<std::uint8_t> u8_batch_;  // forward_batch 复用的像素缓冲
+  std::mt19937 aug_rng_{0x9e3779b9u};   // 增强专用，与打乱顺序的 rng 分开，A/B 时样本顺序不变
   std::vector<float> class_weights_;          // 最终生效权重（同时写进 state_/checkpoint）
   std::string class_weights_source_ = "none";  // "none"/"auto"/"explicit"/"checkpoint"
   std::vector<float> soft_targets_;  // [n*C]；空 = 不蒸馏

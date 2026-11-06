@@ -48,6 +48,14 @@ double max_abs_err(const uavrgb::Tensor& a, const uavrgb::Tensor& b) {
   return m;
 }
 
+// 有界伪随机填充（|值| ≤ scale，周期 101 内均值 0）：张量大到跨多个 block 时，累加项再多
+// 也不会把和撑到让 1e-4 绝对误差门槛失去意义。
+void fill(uavrgb::Tensor& t, float scale, int salt) {
+  for (std::size_t i = 0; i < t.numel(); ++i) {
+    t[i] = scale * (static_cast<float>((static_cast<int>(i) * 37 + salt) % 101) / 50.0f - 1.0f);
+  }
+}
+
 // 对一组确定性 (m, x, dy) 跑 CPU/CUDA 前反向，返回四个最大绝对误差中最大者，并打印各值。
 double run_parity(const uavrgb::Conv2d& m, const uavrgb::Tensor& x, const uavrgb::Tensor& dy,
                   const char* tag) {
@@ -86,43 +94,28 @@ int main() {
 
   double worst = 0.0;
 
-  // 配置 1：pad=1（输出同尺寸），非对称 H/W 防转置 bug。
+  // 配置 1：pad=1（输出同尺寸），非对称 H/W 防转置 bug。y 有 3·3·40·17=6120 个元素
+  // （24 个 block），N=3 且 H'=40 跨多个行分块：覆盖 dW/db 的多 block 归约与原子累加路径。
   {
     Conv2d m(2, 3, 3, 3, 1);
-    for (std::size_t i = 0; i < m.W.numel(); ++i) {
-      m.W[i] = 0.04f * (static_cast<float>(i) - 30.0f);
-    }
-    for (std::size_t i = 0; i < m.b.numel(); ++i) {
-      m.b[i] = 0.1f * (static_cast<float>(i) - 1.0f);
-    }
-    Tensor x = Tensor::zeros({2, 2, 6, 7});
-    for (std::size_t i = 0; i < x.numel(); ++i) {
-      x[i] = 0.02f * (static_cast<float>(i) - 80.0f);
-    }
-    Tensor dy = Tensor::zeros({2, 3, 6, 7});
-    for (std::size_t i = 0; i < dy.numel(); ++i) {
-      dy[i] = 0.03f * (static_cast<float>(i) - 100.0f);
-    }
+    fill(m.W, 0.5f, 3);
+    fill(m.b, 0.1f, 5);
+    Tensor x = Tensor::zeros({3, 2, 40, 17});
+    fill(x, 0.05f, 11);
+    Tensor dy = Tensor::zeros({3, 3, 40, 17});
+    fill(dy, 0.05f, 17);
     worst = std::max(worst, run_parity(m, x, dy, "pad=1"));
   }
 
-  // 配置 2：pad=0（默认值），输出缩小。
+  // 配置 2：pad=0（默认值），输出缩小；y 2·2·18·31=2232 个元素（9 个 block）。
   {
     Conv2d m(1, 2, 3, 3, 0);
-    for (std::size_t i = 0; i < m.W.numel(); ++i) {
-      m.W[i] = 0.05f * (static_cast<float>(i) - 9.0f);
-    }
-    for (std::size_t i = 0; i < m.b.numel(); ++i) {
-      m.b[i] = 0.1f * static_cast<float>(i);
-    }
-    Tensor x = Tensor::zeros({2, 1, 8, 9});
-    for (std::size_t i = 0; i < x.numel(); ++i) {
-      x[i] = 0.02f * (static_cast<float>(i) - 70.0f);
-    }
-    Tensor dy = Tensor::zeros({2, 2, 6, 7});
-    for (std::size_t i = 0; i < dy.numel(); ++i) {
-      dy[i] = 0.03f * (static_cast<float>(i) - 40.0f);
-    }
+    fill(m.W, 0.5f, 7);
+    fill(m.b, 0.1f, 1);
+    Tensor x = Tensor::zeros({2, 1, 20, 33});
+    fill(x, 0.05f, 13);
+    Tensor dy = Tensor::zeros({2, 2, 18, 31});
+    fill(dy, 0.05f, 19);
     worst = std::max(worst, run_parity(m, x, dy, "pad=0"));
   }
 

@@ -392,6 +392,7 @@ void Trainer::run() {
                       static_cast<int>(ds.num_classes), cfg_.text_dim, cfg_.lr, state_);
   }
   write_run_config(cfg_.out_dir, cfg_, class_weights_, class_weights_source_);
+  dev_ = std::make_unique<DeviceCnn>(model_, cfg_.batch, &state_);
 
   std::vector<std::uint32_t> dev = ds.val_idx;
   const bool dev_is_train = dev.empty();
@@ -436,7 +437,6 @@ void Trainer::run() {
   const Clock::time_point t0 = Clock::now();
   const int epoch_base = state_.epoch;  // 续训时 results.csv 接着编号
   const std::uint32_t start_step = step;  // eta 只按本次运行的步数算
-  Tensor x;
   samples_seen_ = 0;
 
   for (int ep = 1; ep <= cfg_.epochs; ++ep) {
@@ -446,10 +446,7 @@ void Trainer::run() {
     for (std::size_t s = 0; s < order.size(); s += bs) {
       const std::size_t e = std::min(order.size(), s + bs);
       const std::vector<std::uint32_t> part = detail::slice(order, s, e);
-      const std::vector<int> y = detail::take_labels(ds, order, s, e);
-      ds.load_images(part, x);
-      std::vector<std::uint8_t> text;
-      if (cfg_.text_dim > 0) ds.load_text(part, text);
+      std::vector<int> y = detail::take_labels(ds, order, s, e);  // 增强翻转时会就地互换左右
 
       // 蒸馏批次：按全局样本下标 gather 教师分布，与 order/part 严格对齐。
       std::vector<float> q;
@@ -461,10 +458,9 @@ void Trainer::run() {
         }
       }
 
-      CnnCache cache;
-      const Tensor logits = forward(model_, x, &cache, text.empty() ? nullptr : &text);
-      const float loss = q.empty() ? class_weighted_loss(logits, y, class_weights_)
-                                   : softmax_ce_loss_soft(logits, y, q, cfg_.distill_alpha);
+      const Tensor logits = forward_batch(ds, part, &y);
+      float loss = 0.0f;
+      const Tensor dlogits = loss_and_grad(logits, y, q, &loss);
       if (!std::isfinite(loss)) {
         metrics << metrics_json(make_error(Severity::kFatal, "TRAIN_NONFINITE_METRIC", step + 1,
                                            "训练 loss 非有限值，中止"))
@@ -474,21 +470,14 @@ void Trainer::run() {
       }
       const float acc = static_cast<float>(count_correct(logits, y)) /
                         static_cast<float>(part.size());
-      const Tensor dlogits = q.empty()
-                                 ? class_weighted_grad(logits, y, class_weights_)
-                                 : softmax_ce_grad_soft(logits, y, q, cfg_.distill_alpha);
-      CnnGrad g = backward(model_, cache, dlogits);
-
-      std::vector<Tensor*> gts = cnn_grad_tensors(g);
-      clip_grad_norm_cuda(gts, cfg_.max_grad_norm);
-      std::vector<Tensor*> ps = cnn_params(model_);
-      for (std::size_t i = 0; i < ps.size(); ++i) adam_step_cuda(state_.adam[i], *ps[i], *gts[i]);
+      const float lr_now = step_lr(step + 1, total_steps);
+      dev_->backward_step(dlogits, cfg_.max_grad_norm, state_, cfg_.weight_decay);
 
       ++step;
       const double elapsed = since(t0);
       const double done = static_cast<double>(step - start_step);
       const double eta = elapsed / done * static_cast<double>(total_steps - step);
-      metrics << metrics_json(make_train_step(step, total_steps, loss, acc, cfg_.lr, elapsed, eta))
+      metrics << metrics_json(make_train_step(step, total_steps, loss, acc, lr_now, elapsed, eta))
               << '\n';
       metrics.flush();  // 监控台按追加偏移增量读，每步必须落盘
       check_out(metrics, "metrics.jsonl");
@@ -541,6 +530,7 @@ void Trainer::run() {
     }
     metrics.flush();
     check_out(metrics, "metrics.jsonl");
+    dev_->download(model_, &state_);  // 本轮两份 checkpoint 都写这份权重
     // 交付模型不能是最后一轮：dev 宏 F1 峰值常早于末轮（见 docs/results.md）。
     // dev 回退到 train 时不选模型，否则等于用训练集挑权重。
     if (!dev_is_train && dev_stats.macro_f1 > static_cast<double>(state_.best_macro_f1)) {
@@ -564,6 +554,7 @@ void Trainer::run() {
   if (!ds.test_idx.empty() && !dev_is_train && std::filesystem::exists(best_ckpt_path)) {
     TrainState best_state = state_;  // 只借用模型的权重布局校验，不回写训练状态
     load_checkpoint(best_ckpt_path, model_, best_state);
+    dev_->upload(model_);
   }
   if (!ds.test_idx.empty()) {
     EvalStats test_stats;

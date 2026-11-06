@@ -26,6 +26,8 @@ add_library(uavrgb_core
   softmax_cuda.cu
   nn_cuda.cu
   model.cpp
+  model_dev.cu
+  augment_dev.cu
   dataset.cpp
   batch_reader.cpp
   run_owner.cpp
@@ -35,6 +37,7 @@ add_library(uavrgb_core
   metrics_json.cpp
   trainer.cpp
   trainer_eval.cpp
+  trainer_dev.cpp
   infer.cpp
 )
 target_include_directories(uavrgb_core PUBLIC include)
@@ -82,6 +85,16 @@ add_test(NAME test_cuda_alloc_errors COMMAND test_cuda_alloc_errors)
 add_executable(test_nn_cuda tests/test_nn_cuda.cpp)
 target_link_libraries(test_nn_cuda PRIVATE uavrgb_core)
 add_test(NAME test_nn_cuda COMMAND test_nn_cuda)
+
+# 设备常驻训练一步 vs host 算子逐层一步：同 batch/同初始权重，参数差 < 1e-5。
+add_executable(test_device_train_step tests/test_device_train_step.cpp)
+target_link_libraries(test_device_train_step PRIVATE uavrgb_core)
+add_test(NAME test_device_train_step COMMAND test_device_train_step)
+
+# 设备侧 uint8→float（+数据增强）的下标与数值语义。
+add_executable(test_augment_dev tests/test_augment_dev.cpp)
+target_link_libraries(test_augment_dev PRIVATE uavrgb_core CUDA::cudart)
+add_test(NAME test_augment_dev COMMAND test_augment_dev)
 
 # 训练器 CLI 与端到端自检（合成数据，不依赖真实采集）。
 add_executable(uavrgb_train train_main.cpp)

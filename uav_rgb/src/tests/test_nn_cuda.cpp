@@ -39,10 +39,10 @@ int main() {
   using namespace uavrgb;
   double worst = 0.0;
 
-  // ---- ReLU：前向 + 反向 parity（输入含正/负/精确 0） ----
+  // ---- ReLU：前向 + 反向 parity（输入含正/负/精确 0；6000 元素 = 24 个 block） ----
   {
-    Tensor x = Tensor::zeros({3, 4, 5});
-    Tensor dy = Tensor::zeros({3, 4, 5});
+    Tensor x = Tensor::zeros({3, 40, 50});
+    Tensor dy = Tensor::zeros({3, 40, 50});
     for (std::size_t i = 0; i < x.numel(); ++i) {
       x[i] = 0.1f * (static_cast<float>(i % 11) - 5.0f);  // i%11==5 处为精确 0
       dy[i] = 0.03f * (static_cast<float>(i % 7) - 3.0f);
@@ -84,15 +84,16 @@ int main() {
     check(std::isinf(max_abs_err(a, b)), "max_abs_err 遇到 NaN 必须返回非有限值");
   }
 
-  // ---- MaxPool2d（k=s=2）：前向 y/argmax + 反向 dx parity；H/W 为奇数验证向下取整 ----
+  // ---- MaxPool2d（k=s=2）：前向 y/argmax + 反向 dx parity；H/W 为奇数验证向下取整；
+  //      输出 3·2·16·23=2208 元素（9 个 block） ----
   {
     const MaxPool2d m(2, 2);
-    Tensor x = Tensor::zeros({2, 2, 5, 7});
+    Tensor x = Tensor::zeros({3, 2, 33, 47});
     for (std::size_t i = 0; i < x.numel(); ++i) {
-      // 窗口内下标差为 1/7/8，(37*Δ mod 101) 非零 → 同一 2×2 窗口内无并列。
+      // 窗口内下标差为 1/47/48，(37*Δ mod 101) 非零 → 同一 2×2 窗口内无并列。
       x[i] = 0.01f * static_cast<float>((static_cast<int>(i) * 37) % 101) - 0.5f;
     }
-    Tensor dy = Tensor::zeros({2, 2, 2, 3});
+    Tensor dy = Tensor::zeros({3, 2, 16, 23});
     for (std::size_t i = 0; i < dy.numel(); ++i) {
       dy[i] = 0.1f * (static_cast<float>(i % 5) - 2.0f);
     }
@@ -110,9 +111,9 @@ int main() {
     check(e_arg == 0.0, "MaxPool argmax CPU/CUDA 完全一致");
   }
 
-  // ---- Adam：同初值跑 5 步，逐步比较 param / 一阶矩 m / 二阶矩 v ----
+  // ---- Adam：同初值跑 5 步，逐步比较 param / 一阶矩 m / 二阶矩 v（12000 元素 = 47 个 block） ----
   {
-    Tensor p0 = Tensor::zeros({4, 5, 6});
+    Tensor p0 = Tensor::zeros({4, 50, 60});
     for (std::size_t i = 0; i < p0.numel(); ++i) {
       p0[i] = 0.1f * static_cast<float>(static_cast<int>(i) % 13 - 6);
     }
@@ -122,7 +123,7 @@ int main() {
     Adam st_cuda = adam_make(p0, 1e-2f);
     double worst_adam = 0.0;
     for (int step = 1; step <= 5; ++step) {
-      Tensor g = Tensor::zeros({4, 5, 6});
+      Tensor g = Tensor::zeros({4, 50, 60});
       for (std::size_t i = 0; i < g.numel(); ++i) {
         g[i] = 0.02f * static_cast<float>((static_cast<int>(i) * 7 + step * 13) % 19 - 9);
       }
@@ -176,9 +177,10 @@ int main() {
           "gradcheck_maxpool2d 遇到非有限差分必须返回非有限");
   }
 
-  // ---- 梯度裁剪：global L2 norm + 原地缩放 CPU/CUDA parity + 公式独立自检 ----
+  // ---- 梯度裁剪：global L2 norm + 原地缩放 CPU/CUDA parity + 公式独立自检
+  //      （a 600 元素跨 3 个 block；b 单 block） ----
   {
-    Tensor a = Tensor::zeros({2, 3});
+    Tensor a = Tensor::zeros({20, 30});
     Tensor b = Tensor::zeros({4});
     for (std::size_t i = 0; i < a.numel(); ++i) {
       a[i] = 0.1f * static_cast<float>(static_cast<int>(i) % 7 - 3);
@@ -196,7 +198,7 @@ int main() {
     for (std::size_t i = 0; i < a.numel(); ++i) sq += static_cast<double>(a[i]) * a[i];
     for (std::size_t i = 0; i < b.numel(); ++i) sq += static_cast<double>(b[i]) * b[i];
     const float n_ref = static_cast<float>(std::sqrt(sq));
-    const float max_norm = 0.5f;  // 实测 norm≈0.656 > 0.5，确保触发裁剪
+    const float max_norm = 0.5f;  // 实测 norm≈4.92 > 0.5，确保触发裁剪
     const float expected_coef = std::min(1.0f, max_norm / (n_ref + 1e-6f));
     const float c_cpu = clip_grad_norm({&a, &b}, max_norm);
     const float c_cuda = clip_grad_norm_cuda({&a_cuda, &b_cuda}, max_norm);

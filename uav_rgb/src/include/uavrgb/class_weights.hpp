@@ -29,6 +29,11 @@ float class_weighted_loss(const Tensor& logits, const std::vector<int>& labels,
 Tensor class_weighted_grad(const Tensor& logits, const std::vector<int>& labels,
                            const std::vector<float>& weights);
 
+// 标签平滑 + 类别加权 CE：t = (1-ε)·onehot + ε/C，分母同加权版（Σ w_{y_i}；weights 为空即全 1）。
+// ε = 0 时与 class_weighted_loss/grad 数值一致。grad 非空时写入 dlogits。实现在 trainer_dev.cpp。
+float smoothed_weighted_loss(const Tensor& logits, const std::vector<int>& labels,
+                             const std::vector<float>& weights, float eps, Tensor* grad);
+
 // 覆盖写 <out_dir>/config.json：记录本次训练参数与最终生效的类别权重。
 void write_run_config(const std::string& out_dir, const TrainConfig& cfg,
                       const std::vector<float>& weights, const std::string& source);

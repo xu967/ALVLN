@@ -59,32 +59,25 @@ int main() {
                                        {1}, {std::numeric_limits<float>::quiet_NaN()}))),
         "max_abs_err 必须把 NaN 判成非有限");
 
-  const int in = 8;
+  // y 1200 元素（5 个 block）、dW 400（2 个 block）、dx 30000（118 个 block）：
+  // 训练形状 fc 是 in=19200/out=4，单 block 的旧尺寸测不到 blockIdx≥1 的路径。
+  const int in = 100;
   const int out = 4;
-  const int n = 16;
+  const int n = 300;
 
-  // 确定性非平凡参数：W[k,j] = 0.05*(k*in+j-10)，b[k] = 0.1*(k-2)。
+  // 确定性非平凡参数/输入：周期 101 的有界伪随机值（均值 0），累加项多也不会撑大绝对误差。
+  auto fill = [](Tensor& t, float scale, int salt) {
+    for (std::size_t i = 0; i < t.numel(); ++i) {
+      t[i] = scale * (static_cast<float>((static_cast<int>(i) * 37 + salt) % 101) / 50.0f - 1.0f);
+    }
+  };
   Linear m(in, out);
-  for (int k = 0; k < out; ++k) {
-    for (int j = 0; j < in; ++j) {
-      m.W[k * in + j] = 0.05f * static_cast<float>(k * in + j - 10);
-    }
-    m.b[k] = 0.1f * static_cast<float>(k - 2);
-  }
-
-  // 确定性输入 x 与上游梯度 dlogits（本层只做 Linear，dlogits 为任意上游梯度）。
+  fill(m.W, 0.5f, 3);
+  fill(m.b, 0.2f, 5);
   Tensor x = Tensor::zeros({n, in});
-  for (int i = 0; i < n; ++i) {
-    for (int j = 0; j < in; ++j) {
-      x[i * in + j] = 0.02f * static_cast<float>(i * in + j - 20);
-    }
-  }
-  Tensor dlogits = Tensor::zeros({n, out});
-  for (int i = 0; i < n; ++i) {
-    for (int k = 0; k < out; ++k) {
-      dlogits[i * out + k] = 0.03f * static_cast<float>(i * out + k - 6);
-    }
-  }
+  fill(x, 0.1f, 11);
+  Tensor dlogits = Tensor::zeros({n, out});  // 本层只做 Linear，dlogits 为任意上游梯度
+  fill(dlogits, 0.1f, 17);
 
   // CPU 与 CUDA 前向。
   Tensor y_cpu = linear_forward(m, x);
@@ -113,7 +106,7 @@ int main() {
   // ---- 第 1 条负例：参数/形状校验 ----
   {
     Linear bad_w(in, out);
-    bad_w.W = Tensor::zeros({2});  // 应为 out*in = 32 元素
+    bad_w.W = Tensor::zeros({2});  // 应为 out*in = 400 元素
     check(throws_invalid([&] { (void)linear_forward_cuda(bad_w, x); }),
           "linear_forward_cuda: W 元素数不足抛 invalid_argument");
   }

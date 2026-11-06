@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "uavrgb/class_weights.hpp"
 #include "uavrgb/ops.hpp"
 #include "uavrgb/softmax_cuda.hpp"
 
@@ -155,6 +156,40 @@ int main() {
         "权重和超出 float 范围（梯度会全 0）抛 invalid_argument");
   check(throws_invalid([&] { (void)softmax_ce_grad_weighted_cuda(logits, labels, huge_w); }),
         "CUDA 权重和超出 float 范围抛 invalid_argument");
+
+  // ---- 5) 标签平滑版：ε=0 退化成加权 CE；ε>0 的 loss 等于 (1-ε)·加权CE + ε·均匀分布CE ----
+  Tensor sg0;
+  const float s0 = smoothed_weighted_loss(logits, labels, w, 0.0f, &sg0);
+  check(std::fabs(static_cast<double>(s0) - static_cast<double>(cpu_loss)) < 1e-5 &&
+            max_abs_diff(sg0, cpu_g) < 1e-5,
+        "标签平滑 ε=0 与加权 CE 的 loss/grad 一致");
+  Tensor sg;
+  const float eps = 0.05f;
+  const float s_eps = smoothed_weighted_loss(logits, labels, w, eps, &sg);
+  // 均匀目标的加权 CE = Σ_i w_i·(lse_i - mean_k logits_ik) / Σ w_i，直接按定义算。
+  double uni = 0.0, wsum = 0.0;
+  const std::size_t cc = static_cast<std::size_t>(c);
+  for (std::size_t i = 0; i < labels.size(); ++i) {
+    const float* row = logits.data() + i * cc;
+    double m = row[0], z = 0.0, mean = 0.0;
+    for (std::size_t k = 1; k < cc; ++k) m = std::max(m, static_cast<double>(row[k]));
+    for (std::size_t k = 0; k < cc; ++k) {
+      z += std::exp(row[k] - m);
+      mean += row[k] / static_cast<double>(cc);
+    }
+    uni += w[static_cast<std::size_t>(labels[i])] * (m + std::log(z) - mean);
+    wsum += w[static_cast<std::size_t>(labels[i])];
+  }
+  const double expect = (1.0 - eps) * cpu_loss + eps * uni / wsum;
+  std::cout << "smoothed(eps=0.05)=" << s_eps << " expect=" << expect << "\n";
+  check(std::fabs(static_cast<double>(s_eps) - expect) < 1e-5, "标签平滑 loss 符合定义");
+  double gsum = 0.0;  // 每行 dlogits 之和应为 0（softmax 与目标分布都归一）
+  for (std::size_t i = 0; i < labels.size(); ++i) {
+    for (std::size_t k = 0; k < cc; ++k) gsum += sg[i * cc + k];
+  }
+  check(std::fabs(gsum) < 1e-6, "标签平滑 grad 每行和为 0");
+  check(throws_invalid([&] { (void)smoothed_weighted_loss(logits, labels, w, 1.0f, nullptr); }),
+        "ε=1 抛 invalid_argument");
 
   if (g_failures == 0) {
     std::cout << "test_weighted_loss: PASS\n";

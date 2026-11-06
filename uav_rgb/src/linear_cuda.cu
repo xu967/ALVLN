@@ -1,7 +1,10 @@
 // 单层 Linear 的 CUDA 实现：前向 y = x@W^T + b，反向 dW/db/dx。
-// 只针对 sm_75（Turing）；不引入 cuBLAS/cuDNN，纯手写 kernel，供 CPU/CUDA 对拍。
+// 只针对 sm_75（Turing）；不引入 cuBLAS/cuDNN，纯手写 kernel。
+// kernel 经 ops_dev.hpp 的设备指针级函数暴露给常驻路径；host Tensor 包装只做分配/拷贝/同步，
+// 供 CPU/CUDA 对拍。
 #include "uavrgb/linear_cuda.hpp"
 #include "uavrgb/cuda_alloc.hpp"
+#include "uavrgb/ops_dev.hpp"
 
 #include <cuda_runtime.h>
 
@@ -25,13 +28,12 @@ namespace {
     }                                                                             \
   } while (0)
 
-// 每次 kernel launch 后必查：先 cudaGetLastError 抓异步错误，再同步等 kernel 结束。
-void check_after_kernel(const char* name) {
+// launch 后立刻查配置错误；执行期错误留给调用方的同步点。
+void launched(const char* name) {
   const cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
     throw std::runtime_error(std::string("CUDA kernel ") + name + ": " + cudaGetErrorString(err));
   }
-  CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 // 极简设备缓冲 RAII：析构自动释放，异常路径也不泄漏。
@@ -44,11 +46,13 @@ struct DeviceBuf {
   ~DeviceBuf() {
     if (p) cudaFree(p);
   }
+  DeviceBuf(DeviceBuf&& o) noexcept : p(o.p) { o.p = nullptr; }
   DeviceBuf(const DeviceBuf&) = delete;
   DeviceBuf& operator=(const DeviceBuf&) = delete;
 };
 
 constexpr int kThreads = 256;
+int blocks_for(std::int64_t total) { return static_cast<int>((total + kThreads - 1) / kThreads); }
 
 // 元素数一律先用 int64 计算并校验上限：超过 INT_MAX 直接抛异常，绝不静默回绕后少算输出。
 std::int64_t check_elems(std::int64_t total, const char* what) {
@@ -114,7 +118,42 @@ __global__ void linear_dx_kernel(const float* __restrict__ dlogits,
   dx[i * in + j] = acc;
 }
 
+DeviceBuf upload(const Tensor& t) {
+  DeviceBuf d(t.numel() * sizeof(float));
+  CUDA_CHECK(cudaMemcpy(d.p, t.data(), t.numel() * sizeof(float), cudaMemcpyHostToDevice));
+  return d;
+}
+
+void download(Tensor& dst, const float* src) {
+  CUDA_CHECK(cudaMemcpy(dst.data(), src, dst.numel() * sizeof(float), cudaMemcpyDeviceToHost));
+}
+
 }  // namespace
+
+namespace dev {
+
+void linear_forward(int n, int in, int out, const float* x, const float* w, const float* b,
+                    float* y) {
+  if (n == 0) return;  // 0 个 block 的 launch 会报 invalid configuration。
+  linear_forward_kernel<<<blocks_for(static_cast<std::int64_t>(n) * out), kThreads>>>(x, w, b, y,
+                                                                                    n, in, out);
+  launched("linear_forward_kernel");
+}
+
+void linear_backward(int n, int in, int out, const float* x, const float* w, const float* dl,
+                     float* dw, float* db, float* dx) {
+  if (n == 0) return;
+  linear_dw_kernel<<<blocks_for(static_cast<std::int64_t>(out) * in), kThreads>>>(dl, x, dw, n, in,
+                                                                                out);
+  launched("linear_dw_kernel");
+  linear_db_kernel<<<blocks_for(out), kThreads>>>(dl, db, n, out);
+  launched("linear_db_kernel");
+  linear_dx_kernel<<<blocks_for(static_cast<std::int64_t>(n) * in), kThreads>>>(dl, w, dx, n, in,
+                                                                              out);
+  launched("linear_dx_kernel");
+}
+
+}  // namespace dev
 
 Tensor linear_forward_cuda(const Linear& m, const Tensor& x) {
   detail::check_linear_params(m);
@@ -122,36 +161,18 @@ Tensor linear_forward_cuda(const Linear& m, const Tensor& x) {
     throw std::invalid_argument("linear_forward_cuda: x 形状必须为 [N, in]");
   }
   const std::int64_t n64 = x.dims()[0];
-  const int in = m.in;
-  const int out = m.out;
-  const std::int64_t n_in = check_elems(n64 * in, "x 元素数");
-  const std::int64_t n_out = check_elems(n64 * out, "y 元素数");
-  check_elems(static_cast<std::int64_t>(out) * in, "W 元素数");
-  if (n64 == 0) {
-    // 空 batch：0 个 block 的 launch 会报 invalid configuration，直接返回形状正确的空张量。
-    return Tensor::zeros({n64, out});
-  }
-
-  DeviceBuf d_x(static_cast<std::size_t>(n_in) * sizeof(float));
-  DeviceBuf d_w(static_cast<std::size_t>(out) * in * sizeof(float));
-  DeviceBuf d_b(static_cast<std::size_t>(out) * sizeof(float));
-  DeviceBuf d_y(static_cast<std::size_t>(n_out) * sizeof(float));
-
-  CUDA_CHECK(cudaMemcpy(d_x.p, x.data(), static_cast<std::size_t>(n_in) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_w.p, m.W.data(), static_cast<std::size_t>(out) * in * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_b.p, m.b.data(), static_cast<std::size_t>(out) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-
-  const int n = static_cast<int>(n64);
-  const int blocks = static_cast<int>((n_out + kThreads - 1) / kThreads);
-  linear_forward_kernel<<<blocks, kThreads>>>(d_x.p, d_w.p, d_b.p, d_y.p, n, in, out);
-  check_after_kernel("linear_forward_kernel");
-
-  Tensor y = Tensor::zeros({n, out});
-  CUDA_CHECK(cudaMemcpy(y.data(), d_y.p, static_cast<std::size_t>(n_out) * sizeof(float),
-                        cudaMemcpyDeviceToHost));
+  check_elems(n64 * m.in, "x 元素数");
+  check_elems(n64 * m.out, "y 元素数");
+  check_elems(static_cast<std::int64_t>(m.out) * m.in, "W 元素数");
+  Tensor y = Tensor::zeros({n64, m.out});
+  if (n64 == 0) return y;  // 空 batch：直接返回形状正确的空张量。
+  const DeviceBuf d_x = upload(x);
+  const DeviceBuf d_w = upload(m.W);
+  const DeviceBuf d_b = upload(m.b);
+  DeviceBuf d_y(y.numel() * sizeof(float));
+  dev::linear_forward(static_cast<int>(n64), m.in, m.out, d_x.p, d_w.p, d_b.p, d_y.p);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  download(y, d_y.p);
   return y;
 }
 
@@ -164,51 +185,26 @@ LinearGrad linear_backward_cuda(const Linear& m, const Tensor& x, const Tensor& 
     throw std::invalid_argument("linear_backward_cuda: dlogits 形状必须为 [N, out]");
   }
   const std::int64_t n64 = x.dims()[0];
-  const int in = m.in;
-  const int out = m.out;
-  const std::int64_t n_in = check_elems(n64 * in, "x/dx 元素数");
-  const std::int64_t n_out = check_elems(n64 * out, "dlogits 元素数");
-  const std::int64_t n_w = check_elems(static_cast<std::int64_t>(out) * in, "W/dW 元素数");
-
+  check_elems(n64 * m.in, "x/dx 元素数");
+  check_elems(n64 * m.out, "dlogits 元素数");
+  check_elems(static_cast<std::int64_t>(m.out) * m.in, "W/dW 元素数");
   LinearGrad g;
-  g.dW = Tensor::zeros({out, in});
-  g.db = Tensor::zeros({out});
-  g.dx = Tensor::zeros({n64, in});
+  g.dW = Tensor::zeros({m.out, m.in});
+  g.db = Tensor::zeros({m.out});
+  g.dx = Tensor::zeros({n64, m.in});
   if (n64 == 0) return g;  // 空 batch：全零梯度，不 launch kernel（0 block 非法）。
-
-  DeviceBuf d_x(static_cast<std::size_t>(n_in) * sizeof(float));
-  DeviceBuf d_w(static_cast<std::size_t>(n_w) * sizeof(float));
-  DeviceBuf d_dl(static_cast<std::size_t>(n_out) * sizeof(float));
-  DeviceBuf d_dw(static_cast<std::size_t>(n_w) * sizeof(float));
-  DeviceBuf d_db(static_cast<std::size_t>(out) * sizeof(float));
-  DeviceBuf d_dx(static_cast<std::size_t>(n_in) * sizeof(float));
-
-  CUDA_CHECK(cudaMemcpy(d_x.p, x.data(), static_cast<std::size_t>(n_in) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_w.p, m.W.data(), static_cast<std::size_t>(n_w) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_dl.p, dlogits.data(), static_cast<std::size_t>(n_out) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-
-  const int n = static_cast<int>(n64);
-  int blocks = static_cast<int>((n_w + kThreads - 1) / kThreads);
-  linear_dw_kernel<<<blocks, kThreads>>>(d_dl.p, d_x.p, d_dw.p, n, in, out);
-  check_after_kernel("linear_dw_kernel");
-
-  blocks = static_cast<int>((static_cast<std::int64_t>(out) + kThreads - 1) / kThreads);
-  linear_db_kernel<<<blocks, kThreads>>>(d_dl.p, d_db.p, n, out);
-  check_after_kernel("linear_db_kernel");
-
-  blocks = static_cast<int>((n_in + kThreads - 1) / kThreads);
-  linear_dx_kernel<<<blocks, kThreads>>>(d_dl.p, d_w.p, d_dx.p, n, in, out);
-  check_after_kernel("linear_dx_kernel");
-
-  CUDA_CHECK(cudaMemcpy(g.dW.data(), d_dw.p, static_cast<std::size_t>(n_w) * sizeof(float),
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(g.db.data(), d_db.p, static_cast<std::size_t>(out) * sizeof(float),
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(g.dx.data(), d_dx.p, static_cast<std::size_t>(n_in) * sizeof(float),
-                        cudaMemcpyDeviceToHost));
+  const DeviceBuf d_x = upload(x);
+  const DeviceBuf d_w = upload(m.W);
+  const DeviceBuf d_dl = upload(dlogits);
+  DeviceBuf d_dw(g.dW.numel() * sizeof(float));
+  DeviceBuf d_db(g.db.numel() * sizeof(float));
+  DeviceBuf d_dx(g.dx.numel() * sizeof(float));
+  dev::linear_backward(static_cast<int>(n64), m.in, m.out, d_x.p, d_w.p, d_dl.p, d_dw.p, d_db.p,
+                       d_dx.p);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  download(g.dW, d_dw.p);
+  download(g.db, d_db.p);
+  download(g.dx, d_dx.p);
   return g;
 }
 

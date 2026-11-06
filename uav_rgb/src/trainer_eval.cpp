@@ -27,17 +27,13 @@ void Trainer::evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& 
   Confusion conf;
   conf.reset(c);
   const std::size_t b = static_cast<std::size_t>(cfg_.batch);
-  Tensor x;
   double sum = 0.0;
   std::uint64_t seen = 0;
   for (std::size_t s = 0; s < idx.size(); s += b) {
     const std::size_t e = std::min(idx.size(), s + b);
     const std::vector<std::uint32_t> part = detail::slice(idx, s, e);
     const std::vector<int> y = detail::take_labels(ds, idx, s, e);
-    ds.load_images(part, x);
-    std::vector<std::uint8_t> text;
-    if (cfg_.text_dim > 0) ds.load_text(part, text);
-    const Tensor logits = forward(model_, x, nullptr, text.empty() ? nullptr : &text);
+    const Tensor logits = forward_batch(ds, part);
     // dev_ce 合同为无权 Teacher CE，不能随训练权重或 batch 划分改变。
     sum += static_cast<double>(softmax_ce_loss_cuda(logits, y)) *
            static_cast<double>(part.size());
@@ -78,6 +74,7 @@ void Trainer::eval_only(const std::string& ckpt_path, bool eval_val, bool eval_t
   model_ = make_cnn(ds.h, ds.w, cfg_.seed, static_cast<int>(ds.num_classes), cfg_.text_dim);
   state_ = make_train_state(model_, cfg_.lr);
   load_checkpoint(ckpt_path, model_, state_);
+  dev_ = std::make_unique<DeviceCnn>(model_, cfg_.batch);
 
   const std::string metrics_path = cfg_.out_dir + "/metrics.jsonl";
   std::ofstream metrics(metrics_path, std::ios::app);

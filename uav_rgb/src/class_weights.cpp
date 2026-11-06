@@ -227,7 +227,12 @@ void write_run_config(const std::string& out_dir, const TrainConfig& cfg,
      << ",\"teacher_ckpt_sha256\":" << quote(cfg.teacher_ckpt_sha256)
      << ",\"teacher_select_split\":" << quote(cfg.teacher_select_split)
      << ",\"beta1\":" << cfg.adam_beta1 << ",\"beta2\":" << cfg.adam_beta2
-     << ",\"eps\":" << cfg.adam_eps << ",\"source_git\":" << quote(cfg.source_git);
+     << ",\"eps\":" << cfg.adam_eps << ",\"source_git\":" << quote(cfg.source_git)
+     << ",\"augment\":" << quote(cfg.augment)
+     << ",\"warmup_steps\":" << cfg.warmup_steps
+     << ",\"cosine_lr\":" << (cfg.cosine_lr ? "true" : "false")
+     << ",\"weight_decay\":" << cfg.weight_decay
+     << ",\"label_smoothing\":" << cfg.label_smoothing;
   if (!cfg.resume.empty()) os << ",\"resume\":" << quote(cfg.resume);
   os << "}\n";
   auto write_to = [&](const std::string& path) {

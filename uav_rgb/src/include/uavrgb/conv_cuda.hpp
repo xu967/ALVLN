@@ -9,6 +9,8 @@ namespace uavrgb {
 Tensor conv2d_forward_cuda(const Conv2d& m, const Tensor& x);
 
 // 反向：给定上游梯度 dy[N,out,H',W']，返回 dW[out,in,kh,kw]、db[out]、dx[N,in,H,W]。
-ConvGrad conv2d_backward_cuda(const Conv2d& m, const Tensor& x, const Tensor& dy);
+// need_dx=false 时不算 dx（返回全零）：第一层的 dx 没有下游，省掉与前向同量级的 MAC。
+ConvGrad conv2d_backward_cuda(const Conv2d& m, const Tensor& x, const Tensor& dy,
+                              bool need_dx = true);
 
 }  // namespace uavrgb

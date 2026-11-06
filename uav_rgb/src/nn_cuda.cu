@@ -1,13 +1,13 @@
-// ReLU / MaxPool2d / Adam 的 CUDA 实现：纯手写 kernel，不引入 cuBLAS/cuDNN。
+// ReLU / MaxPool2d / Adam / 梯度裁剪的 CUDA 实现：纯手写 kernel，不引入 cuBLAS/cuDNN。
 // 只针对 sm_75（Turing）；接口与 nn.hpp 的 CPU 参考一一对称，供 CPU/CUDA 对拍（doc 04 §6 N3）。
+// kernel 经 ops_dev.hpp 的设备指针级函数暴露给常驻路径；host Tensor 包装只做分配/拷贝/同步。
 #include "uavrgb/nn.hpp"
 #include "uavrgb/cuda_alloc.hpp"
+#include "uavrgb/ops_dev.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cmath>
-#include <cstdio>
-#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -28,14 +28,12 @@ namespace {
     }                                                                           \
   } while (0)
 
-// 每次 kernel launch 后必查：先 cudaGetLastError 抓异步错误，再同步等 kernel 结束。
-void check_after_kernel(const char* name) {
-  cudaError_t err = cudaGetLastError();
+// launch 后立刻查配置错误；执行期错误留给调用方的同步点。
+void launched(const char* name) {
+  const cudaError_t err = cudaGetLastError();
   if (err != cudaSuccess) {
-    throw std::runtime_error(std::string("CUDA kernel ") + name + ": " +
-                             cudaGetErrorString(err));
+    throw std::runtime_error(std::string("CUDA kernel ") + name + ": " + cudaGetErrorString(err));
   }
-  CUDA_CHECK(cudaDeviceSynchronize());
 }
 
 // 极简设备缓冲 RAII：析构自动释放，异常路径也不泄漏。
@@ -49,11 +47,13 @@ struct DeviceBuf {
   ~DeviceBuf() {
     if (p) cudaFree(p);
   }
+  DeviceBuf(DeviceBuf&& o) noexcept : p(o.p) { o.p = nullptr; }
   DeviceBuf(const DeviceBuf&) = delete;
   DeviceBuf& operator=(const DeviceBuf&) = delete;
 };
 
 constexpr int kThreads = 256;
+int blocks_for(int total) { return (total + kThreads - 1) / kThreads; }
 
 // ReLU 前向：x==0 → 0；NaN 继续传播（压成 0 会把坏权重藏起来）。
 __global__ void relu_forward_kernel(const float* __restrict__ x, float* __restrict__ y,
@@ -106,15 +106,14 @@ __global__ void maxpool_backward_kernel(const float* __restrict__ arg,
   const int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx >= total) return;
   const int plane = idx / (ow * oh);  // n*C+c
-  const float a = arg[idx];
-  const int p = static_cast<int>(a);
+  const int p = static_cast<int>(arg[idx]);
   atomicAdd(dx + static_cast<long long>(plane) * h * wd + p, dy[idx]);
 }
 
-// Adam 单步：每线程一个参数元素，m/v/param 原地更新。
+// Adam 单步：每线程一个参数元素，m/v/param 原地更新；wd>0 即 AdamW 的解耦权重衰减。
 __global__ void adam_step_kernel(float* __restrict__ p, const float* __restrict__ g,
                                  float* __restrict__ m, float* __restrict__ v, float lr,
-                                 float b1, float b2, float bc1, float bc2, float eps,
+                                 float b1, float b2, float bc1, float bc2, float eps, float wd,
                                  int total) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
@@ -123,7 +122,7 @@ __global__ void adam_step_kernel(float* __restrict__ p, const float* __restrict_
   const float vi = b2 * v[i] + (1.0f - b2) * gi * gi;
   m[i] = mi;
   v[i] = vi;
-  p[i] -= lr * (mi / bc1) / (sqrtf(vi / bc2) + eps);
+  p[i] -= lr * ((mi / bc1) / (sqrtf(vi / bc2) + eps) + wd * p[i]);
 }
 
 // 梯度裁剪归约：double atomicAdd 累加平方和（与 CPU 的 double 累加对拍）。
@@ -142,97 +141,134 @@ __global__ void scale_kernel(float* __restrict__ x, float coef, int total) {
 }
 
 // ---- host 侧形状校验（与 nn_cpu.cpp 同一合同） ----
-struct PoolDims {
-  int n, c, h, wd, oh, ow;
-};
-
-PoolDims check_pool_dims(const MaxPool2d& m, const Tensor& x) {
+dev::PoolShape check_pool_dims(const MaxPool2d& m, const Tensor& x) {
   if (m.k <= 0 || m.s <= 0) throw std::invalid_argument("maxpool2d: k/s 必须为正");
   if (x.ndim() != 4) throw std::invalid_argument("maxpool2d: x 形状必须为 [N, C, H, W]");
-  PoolDims d;
+  dev::PoolShape d;
   d.n = static_cast<int>(x.dims()[0]);
   d.c = static_cast<int>(x.dims()[1]);
   d.h = static_cast<int>(x.dims()[2]);
-  d.wd = static_cast<int>(x.dims()[3]);
+  d.w = static_cast<int>(x.dims()[3]);
+  d.k = m.k;
+  d.s = m.s;
   // 必须在除法前拒绝不完整窗口，避免负数向零截断掩盖越界。
-  if (d.h < m.k || d.wd < m.k) throw std::invalid_argument("maxpool2d: k 大于 H/W");
+  if (d.h < m.k || d.w < m.k) throw std::invalid_argument("maxpool2d: k 大于 H/W");
   d.oh = (d.h - m.k) / m.s + 1;
-  d.ow = (d.wd - m.k) / m.s + 1;
+  d.ow = (d.w - m.k) / m.s + 1;
   if (d.oh <= 0 || d.ow <= 0) throw std::invalid_argument("maxpool2d: 输出尺寸非正（k 大于 H/W）");
   return d;
 }
 
+DeviceBuf<float> upload(const Tensor& t) {
+  DeviceBuf<float> d(t.numel() * sizeof(float));
+  CUDA_CHECK(cudaMemcpy(d.p, t.data(), t.numel() * sizeof(float), cudaMemcpyHostToDevice));
+  return d;
+}
+
+Tensor download(const std::vector<std::int64_t>& dims, const float* src) {
+  Tensor t = Tensor::zeros(dims);
+  CUDA_CHECK(cudaMemcpy(t.data(), src, t.numel() * sizeof(float), cudaMemcpyDeviceToHost));
+  return t;
+}
+
 }  // namespace
 
+namespace dev {
+
+void relu_forward(const float* x, float* y, int total) {
+  if (total == 0) return;  // 0 个元素时不能 launch：grid 为 0，cudaErrorInvalidConfiguration。
+  relu_forward_kernel<<<blocks_for(total), kThreads>>>(x, y, total);
+  launched("relu_forward_kernel");
+}
+
+void relu_backward(const float* x, const float* dy, float* dx, int total) {
+  if (total == 0) return;
+  relu_backward_kernel<<<blocks_for(total), kThreads>>>(x, dy, dx, total);
+  launched("relu_backward_kernel");
+}
+
+void maxpool_forward(const PoolShape& d, const float* x, float* y, float* argmax) {
+  const int total = d.n * d.c * d.oh * d.ow;
+  if (total == 0) return;
+  maxpool_forward_kernel<<<blocks_for(total), kThreads>>>(x, y, argmax, d.h, d.w, d.oh, d.ow, d.k,
+                                                         d.s, total);
+  launched("maxpool_forward_kernel");
+}
+
+void maxpool_backward(const PoolShape& d, const float* argmax, const float* dy, float* dx) {
+  const int total = d.n * d.c * d.oh * d.ow;
+  if (total == 0) return;
+  CUDA_CHECK(cudaMemsetAsync(dx, 0, static_cast<std::size_t>(d.n) * d.c * d.h * d.w * sizeof(float)));
+  maxpool_backward_kernel<<<blocks_for(total), kThreads>>>(argmax, dy, dx, d.h, d.w, d.oh, d.ow,
+                                                          total);
+  launched("maxpool_backward_kernel");
+}
+
+void adam_step(float* p, const float* g, float* m, float* v, float lr, float b1, float b2,
+               float bc1, float bc2, float eps, float weight_decay, int total) {
+  if (total == 0) return;
+  adam_step_kernel<<<blocks_for(total), kThreads>>>(p, g, m, v, lr, b1, b2, bc1, bc2, eps,
+                                                   weight_decay, total);
+  launched("adam_step_kernel");
+}
+
+void sumsq(const float* x, double* accum, int total) {
+  if (total == 0) return;
+  sumsq_kernel<<<blocks_for(total), kThreads>>>(x, accum, total);
+  launched("sumsq_kernel");
+}
+
+void scale(float* x, float coef, int total) {
+  if (total == 0) return;
+  scale_kernel<<<blocks_for(total), kThreads>>>(x, coef, total);
+  launched("scale_kernel");
+}
+
+}  // namespace dev
+
 Tensor relu_forward_cuda(const Tensor& x) {
-  const int total = static_cast<int>(x.numel());
-  // 0 个元素时不能 launch：grid 会算成 0，cudaErrorInvalidConfiguration。
-  if (total == 0) return Tensor::zeros(x.dims());
-  DeviceBuf<float> d_x(static_cast<std::size_t>(total) * sizeof(float));
-  DeviceBuf<float> d_y(static_cast<std::size_t>(total) * sizeof(float));
-  CUDA_CHECK(cudaMemcpy(d_x.p, x.data(), static_cast<std::size_t>(total) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  relu_forward_kernel<<<(total + kThreads - 1) / kThreads, kThreads>>>(d_x.p, d_y.p, total);
-  check_after_kernel("relu_forward_kernel");
-  Tensor y = Tensor::zeros(x.dims());
-  CUDA_CHECK(cudaMemcpy(y.data(), d_y.p, static_cast<std::size_t>(total) * sizeof(float),
-                        cudaMemcpyDeviceToHost));
-  return y;
+  if (x.numel() == 0) return Tensor::zeros(x.dims());
+  const DeviceBuf<float> d_x = upload(x);
+  DeviceBuf<float> d_y(x.numel() * sizeof(float));
+  dev::relu_forward(d_x.p, d_y.p, static_cast<int>(x.numel()));
+  CUDA_CHECK(cudaDeviceSynchronize());
+  return download(x.dims(), d_y.p);
 }
 
 Tensor relu_backward_cuda(const Tensor& x, const Tensor& dy) {
   if (x.dims() != dy.dims()) throw std::invalid_argument("relu_backward_cuda: x/dy 形状不一致");
-  const int total = static_cast<int>(x.numel());
-  if (total == 0) return Tensor::zeros(x.dims());
-  DeviceBuf<float> d_x(static_cast<std::size_t>(total) * sizeof(float));
-  DeviceBuf<float> d_dy(static_cast<std::size_t>(total) * sizeof(float));
-  DeviceBuf<float> d_dx(static_cast<std::size_t>(total) * sizeof(float));
-  CUDA_CHECK(cudaMemcpy(d_x.p, x.data(), static_cast<std::size_t>(total) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_dy.p, dy.data(), static_cast<std::size_t>(total) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  relu_backward_kernel<<<(total + kThreads - 1) / kThreads, kThreads>>>(d_x.p, d_dy.p, d_dx.p,
-                                                                       total);
-  check_after_kernel("relu_backward_kernel");
-  Tensor dx = Tensor::zeros(x.dims());
-  CUDA_CHECK(cudaMemcpy(dx.data(), d_dx.p, static_cast<std::size_t>(total) * sizeof(float),
-                        cudaMemcpyDeviceToHost));
-  return dx;
+  if (x.numel() == 0) return Tensor::zeros(x.dims());
+  const DeviceBuf<float> d_x = upload(x);
+  const DeviceBuf<float> d_dy = upload(dy);
+  DeviceBuf<float> d_dx(x.numel() * sizeof(float));
+  dev::relu_backward(d_x.p, d_dy.p, d_dx.p, static_cast<int>(x.numel()));
+  CUDA_CHECK(cudaDeviceSynchronize());
+  return download(x.dims(), d_dx.p);
 }
 
 MaxPoolResult maxpool2d_forward_cuda(const MaxPool2d& m, const Tensor& x) {
-  const PoolDims d = check_pool_dims(m, x);
-  const int total_in = d.n * d.c * d.h * d.wd;
-  const int total_out = d.n * d.c * d.oh * d.ow;
-  if (total_out == 0) {
-    MaxPoolResult empty;
-    empty.y = Tensor::zeros({d.n, d.c, d.oh, d.ow});
-    empty.argmax = Tensor::zeros({d.n, d.c, d.oh, d.ow});
-    return empty;
-  }
-  DeviceBuf<float> d_x(static_cast<std::size_t>(total_in) * sizeof(float));
-  DeviceBuf<float> d_y(static_cast<std::size_t>(total_out) * sizeof(float));
-  DeviceBuf<float> d_arg(static_cast<std::size_t>(total_out) * sizeof(float));
-  CUDA_CHECK(cudaMemcpy(d_x.p, x.data(), static_cast<std::size_t>(total_in) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  maxpool_forward_kernel<<<(total_out + kThreads - 1) / kThreads, kThreads>>>(
-      d_x.p, d_y.p, d_arg.p, d.h, d.wd, d.oh, d.ow, m.k, m.s, total_out);
-  check_after_kernel("maxpool_forward_kernel");
-
+  const dev::PoolShape d = check_pool_dims(m, x);
+  const std::vector<std::int64_t> out_dims{d.n, d.c, d.oh, d.ow};
   MaxPoolResult r;
-  r.y = Tensor::zeros({d.n, d.c, d.oh, d.ow});
-  r.argmax = Tensor::zeros({d.n, d.c, d.oh, d.ow});
-  CUDA_CHECK(cudaMemcpy(r.y.data(), d_y.p, static_cast<std::size_t>(total_out) * sizeof(float),
-                        cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(r.argmax.data(), d_arg.p,
-                        static_cast<std::size_t>(total_out) * sizeof(float),
-                        cudaMemcpyDeviceToHost));
+  if (d.n * d.c * d.oh * d.ow == 0) {
+    r.y = Tensor::zeros(out_dims);
+    r.argmax = Tensor::zeros(out_dims);
+    return r;
+  }
+  const DeviceBuf<float> d_x = upload(x);
+  const std::size_t out_bytes = static_cast<std::size_t>(d.n) * d.c * d.oh * d.ow * sizeof(float);
+  DeviceBuf<float> d_y(out_bytes);
+  DeviceBuf<float> d_arg(out_bytes);
+  dev::maxpool_forward(d, d_x.p, d_y.p, d_arg.p);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  r.y = download(out_dims, d_y.p);
+  r.argmax = download(out_dims, d_arg.p);
   return r;
 }
 
 Tensor maxpool2d_backward_cuda(const MaxPool2d& m, const Tensor& x, const Tensor& argmax,
                                const Tensor& dy) {
-  const PoolDims d = check_pool_dims(m, x);
+  const dev::PoolShape d = check_pool_dims(m, x);
   if (argmax.ndim() != 4 || argmax.dims()[0] != d.n || argmax.dims()[1] != d.c ||
       argmax.dims()[2] != d.oh || argmax.dims()[3] != d.ow) {
     throw std::invalid_argument("maxpool2d_backward_cuda: argmax 形状必须为 [N, C, H', W']");
@@ -241,7 +277,7 @@ Tensor maxpool2d_backward_cuda(const MaxPool2d& m, const Tensor& x, const Tensor
     throw std::invalid_argument("maxpool2d_backward_cuda: dy 形状必须与 argmax 一致");
   }
   // 信任边界：argmax 会直接作为 GPU 写偏移，先在 host 校验范围与整数性，防越界写。
-  const int plane_in = d.h * d.wd;
+  const int plane_in = d.h * d.w;
   for (std::size_t i = 0; i < argmax.numel(); ++i) {
     const float a = argmax[i];
     const int p = static_cast<int>(a);
@@ -249,24 +285,13 @@ Tensor maxpool2d_backward_cuda(const MaxPool2d& m, const Tensor& x, const Tensor
       throw std::invalid_argument("maxpool2d_backward_cuda: argmax 越界或非整数");
     }
   }
-  const int total_in = d.n * d.c * d.h * d.wd;
-  const int total_out = d.n * d.c * d.oh * d.ow;
-  if (total_out == 0) return Tensor::zeros(x.dims());
-  DeviceBuf<float> d_arg(static_cast<std::size_t>(total_out) * sizeof(float));
-  DeviceBuf<float> d_dy(static_cast<std::size_t>(total_out) * sizeof(float));
-  DeviceBuf<float> d_dx(static_cast<std::size_t>(total_in) * sizeof(float));
-  CUDA_CHECK(cudaMemcpy(d_arg.p, argmax.data(), static_cast<std::size_t>(total_out) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_dy.p, dy.data(), static_cast<std::size_t>(total_out) * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemset(d_dx.p, 0, static_cast<std::size_t>(total_in) * sizeof(float)));
-  maxpool_backward_kernel<<<(total_out + kThreads - 1) / kThreads, kThreads>>>(
-      d_arg.p, d_dy.p, d_dx.p, d.h, d.wd, d.oh, d.ow, total_out);
-  check_after_kernel("maxpool_backward_kernel");
-  Tensor dx = Tensor::zeros(x.dims());
-  CUDA_CHECK(cudaMemcpy(dx.data(), d_dx.p, static_cast<std::size_t>(total_in) * sizeof(float),
-                        cudaMemcpyDeviceToHost));
-  return dx;
+  if (argmax.numel() == 0) return Tensor::zeros(x.dims());
+  const DeviceBuf<float> d_arg = upload(argmax);
+  const DeviceBuf<float> d_dy = upload(dy);
+  DeviceBuf<float> d_dx(x.numel() * sizeof(float));
+  dev::maxpool_backward(d, d_arg.p, d_dy.p, d_dx.p);
+  CUDA_CHECK(cudaDeviceSynchronize());
+  return download(x.dims(), d_dx.p);
 }
 
 void adam_step_cuda(Adam& st, Tensor& param, const Tensor& grad) {
@@ -277,20 +302,17 @@ void adam_step_cuda(Adam& st, Tensor& param, const Tensor& grad) {
   // 与 CPU 参考一致：host double 算偏差校正，再以同一 float 传入 kernel。
   const float bc1 = static_cast<float>(1.0 - std::pow(static_cast<double>(st.beta1), st.t));
   const float bc2 = static_cast<float>(1.0 - std::pow(static_cast<double>(st.beta2), st.t));
-  const int total = static_cast<int>(param.numel());
-  if (total == 0) return;  // st.t 已自增，与 CPU 参考的步数一致
-  const std::size_t bytes = static_cast<std::size_t>(total) * sizeof(float);
-  DeviceBuf<float> d_p(bytes), d_g(bytes), d_m(bytes), d_v(bytes);
-  CUDA_CHECK(cudaMemcpy(d_p.p, param.data(), bytes, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_g.p, grad.data(), bytes, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_m.p, st.m.data(), bytes, cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_v.p, st.v.data(), bytes, cudaMemcpyHostToDevice));
-  adam_step_kernel<<<(total + kThreads - 1) / kThreads, kThreads>>>(
-      d_p.p, d_g.p, d_m.p, d_v.p, st.lr, st.beta1, st.beta2, bc1, bc2, st.eps, total);
-  check_after_kernel("adam_step_kernel");
-  CUDA_CHECK(cudaMemcpy(param.data(), d_p.p, bytes, cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(st.m.data(), d_m.p, bytes, cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(st.v.data(), d_v.p, bytes, cudaMemcpyDeviceToHost));
+  if (param.numel() == 0) return;  // st.t 已自增，与 CPU 参考的步数一致
+  DeviceBuf<float> d_p = upload(param);
+  const DeviceBuf<float> d_g = upload(grad);
+  DeviceBuf<float> d_m = upload(st.m);
+  DeviceBuf<float> d_v = upload(st.v);
+  dev::adam_step(d_p.p, d_g.p, d_m.p, d_v.p, st.lr, st.beta1, st.beta2, bc1, bc2, st.eps, 0.0f,
+                 static_cast<int>(param.numel()));
+  CUDA_CHECK(cudaDeviceSynchronize());
+  param = download(param.dims(), d_p.p);
+  st.m = download(param.dims(), d_m.p);
+  st.v = download(param.dims(), d_v.p);
 }
 
 float global_grad_norm_cuda(const std::vector<const Tensor*>& grads) {
@@ -298,13 +320,10 @@ float global_grad_norm_cuda(const std::vector<const Tensor*>& grads) {
   CUDA_CHECK(cudaMemset(d_sum.p, 0, sizeof(double)));
   for (const Tensor* t : grads) {
     if (!t) throw std::invalid_argument("global_grad_norm_cuda: 张量指针为空");
-    const int total = static_cast<int>(t->numel());
-    if (total == 0) continue;
-    DeviceBuf<float> d_x(static_cast<std::size_t>(total) * sizeof(float));
-    CUDA_CHECK(cudaMemcpy(d_x.p, t->data(), static_cast<std::size_t>(total) * sizeof(float),
-                          cudaMemcpyHostToDevice));
-    sumsq_kernel<<<(total + kThreads - 1) / kThreads, kThreads>>>(d_x.p, d_sum.p, total);
-    check_after_kernel("sumsq_kernel");
+    if (t->numel() == 0) continue;
+    const DeviceBuf<float> d_x = upload(*t);
+    dev::sumsq(d_x.p, d_sum.p, static_cast<int>(t->numel()));
+    CUDA_CHECK(cudaDeviceSynchronize());
   }
   double sum = 0.0;
   CUDA_CHECK(cudaMemcpy(&sum, d_sum.p, sizeof(double), cudaMemcpyDeviceToHost));
@@ -328,14 +347,11 @@ float clip_grad_norm_cuda(std::vector<Tensor*> grads, float max_norm) {
   const float coef = raw > 1.0f ? 1.0f : raw;  // 与 CPU 的 min(1, ...) 一致
   if (coef >= 1.0f) return coef;
   for (Tensor* t : grads) {
-    const int total = static_cast<int>(t->numel());
-    if (total == 0) continue;
-    const std::size_t bytes = static_cast<std::size_t>(total) * sizeof(float);
-    DeviceBuf<float> d_x(bytes);
-    CUDA_CHECK(cudaMemcpy(d_x.p, t->data(), bytes, cudaMemcpyHostToDevice));
-    scale_kernel<<<(total + kThreads - 1) / kThreads, kThreads>>>(d_x.p, coef, total);
-    check_after_kernel("scale_kernel");
-    CUDA_CHECK(cudaMemcpy(t->data(), d_x.p, bytes, cudaMemcpyDeviceToHost));
+    if (t->numel() == 0) continue;
+    DeviceBuf<float> d_x = upload(*t);
+    dev::scale(d_x.p, coef, static_cast<int>(t->numel()));
+    CUDA_CHECK(cudaDeviceSynchronize());
+    *t = download(t->dims(), d_x.p);
   }
   return coef;
 }
