@@ -26,7 +26,9 @@ if [[ -z "$last" ]]; then
   # 首次：以 ALVLN 里 uav_rgb/ 当前内容对应的 uav_rgb 提交为起点（由人确认后写入 MARK）
   echo "缺 $MARK；请先 echo <uav_rgb提交哈希> > $DST/$MARK 并提交" >&2; exit 1
 fi
-mapfile -t commits < <(git -C "$SRC" rev-list --reverse "${last}..HEAD")
+# --first-parent：合并进来的分支按一个 ALVLN 提交（合并提交的快照）镜像；逐个镜像分支内部提交会让
+# 每个快照在「分支基点」和「main 当前」之间来回跳，GitHub 上的 diff 没法看
+mapfile -t commits < <(git -C "$SRC" rev-list --reverse --first-parent "${last}..HEAD")
 [[ ${#commits[@]} -gt 0 ]] || { echo "没有新提交需要镜像（$last 已是 HEAD）"; exit 0; }
 
 for c in "${commits[@]}"; do
