@@ -1,4 +1,4 @@
-"""画 cf_sitl_selftest 的 CSV：frame / hover / actuator / steps / battery 各一张 PNG，写回同一目录。
+"""画 cf_sitl_selftest 的 CSV：frame / hover / actuator / steps / battery / longrun 各一张 PNG，写回同一目录。
 用法：$UAV_RGB_PYTHON sim/cf_sitl/selftest/plot.py <out_dir>
 图上用英文标签（matplotlib 默认字体没有中文字形）。缺哪个 CSV 就跳过哪张图。
 """
@@ -192,3 +192,65 @@ if d is not None:
     ax[2].set_ylabel("m")
     ax[2].set_xlabel("sim time [s]")
     finish(fig, "battery.png")
+
+# (6) 长航时：phase 1 SAFE 保持 30 s，phase 2 FORWARD/YAW 交替；看姿态估计误差（真值 − 估计）线性增长、
+#     速度环积分（杆×30°）跟着涨、机体 vx 是否保持为正、高度/油门/电压
+d = rd("longrun.csv")
+if d is not None:
+    fig, ax = plt.subplots(4, 2, figsize=(14, 12))   # 不共享 x：左下是 x-y 航迹
+    t = d["t"]
+    fwd = d["action"] == 1
+    for a in ax.flat:
+        if a is ax[3, 0]:
+            continue
+        m = d["phase"] == 1
+        if m.any():
+            a.axvspan(t[m].min(), t[m].max(), color="#e8f5e9", zorder=0)
+        for lo, hi in zip(np.flatnonzero(np.diff(fwd.astype(int)) == 1), np.flatnonzero(np.diff(fwd.astype(int)) == -1)):
+            a.axvspan(t[lo + 1], t[hi], color="#dde7f5", zorder=0)
+    ax[0, 0].plot(t, d["vx_b"], label="body vx true")
+    ax[0, 0].plot(t, d["vel_est_x"], "--", lw=0.7, label="executor vx est")
+    ax[0, 0].plot(t, d["vy_b"], lw=0.7, label="body vy true")
+    ax[0, 0].axhline(FWD_TARGET, color="k", lw=0.5)
+    ax[0, 0].axhline(0, color="r", lw=0.5)
+    ax[0, 0].set_ylabel("m/s")
+    ax[0, 0].set_title("(6) long run: SAFE hold (green) then FORWARD (blue) / YAW alternating")
+    ax[1, 0].plot(t, d["pitch_deg"], label="pitch true")
+    ax[1, 0].plot(t, d["est_pitch_deg"], "--", label="pitch fw est")
+    ax[1, 0].plot(t, d["roll_deg"], lw=0.7, label="roll true")
+    ax[1, 0].plot(t, d["est_roll_deg"], "--", lw=0.7, label="roll fw est")
+    ax[1, 0].set_ylabel("deg")
+    ax[1, 0].set_title("attitude: firmware integrates gyro only in flight -> estimate drifts")
+    ax[2, 0].plot(t, d["err_pitch_deg"], label="pitch est - true")
+    ax[2, 0].plot(t, d["err_roll_deg"], label="roll est - true")
+    ax[2, 0].plot(t, d["pitch_stick"] * 30, "--", label="pitch stick x 30 deg (~ velocity-loop integral)")
+    ax[2, 0].plot(t, -d["roll_stick"] * 30, "--", label="-roll stick x 30 deg")
+    ax[2, 0].set_ylabel("deg")
+    ax[2, 0].set_title("estimate error vs. executor integral (must stay under tilt_int_max)")
+    ax[3, 0].plot(d["x"], d["y"], lw=0.8)
+    ax[3, 0].plot(d["x"][0], d["y"][0], "go", label="start")
+    ax[3, 0].plot(d["x"][-1], d["y"][-1], "rs", label="end")
+    ax[3, 0].set_xlabel("x [m]  (ground track, not time)")
+    ax[3, 0].set_ylabel("y [m]")
+    ax[3, 0].set_title("ground track")
+    ax[0, 1].plot(t, d["z"], label="z true")
+    ax[0, 1].plot(t, d["height_est"], "--", label="executor height est")
+    ax[0, 1].axhline(TARGET_H, color="k", lw=0.5)
+    ax[0, 1].set_ylabel("m")
+    ax[0, 1].set_title("height")
+    ax[1, 1].plot(t, d["yaw_deg"], label="yaw true")
+    ax[1, 1].set_ylabel("deg")
+    ax[1, 1].set_title("yaw")
+    ax[2, 1].plot(t, d["throttle_stick"], label="throttle stick")
+    ax[2, 1].plot(t, d["hover_thrust"], "k--", label="hover stick (ff + integral)")
+    ax[2, 1].plot(t, d["yaw_stick"], lw=0.7, label="yaw stick")
+    ax[2, 1].set_ylabel("0..1")
+    ax[2, 1].set_title("sticks")
+    ax[3, 1].plot(t, d["battery_v"], label="V_bus")
+    ax[3, 1].axhline(BAT_L1, color="orange", lw=0.7, label="L1 3.5 V")
+    ax[3, 1].axhline(BAT_L3, color="r", lw=0.7, label="L3 3.0 V")
+    ax[3, 1].set_ylabel("V")
+    ax[3, 1].set_xlabel("sim time [s]")
+    ax[3, 1].set_title("battery")
+    ax[3, 0].set_aspect("equal")
+    finish(fig, "longrun.png")

@@ -99,6 +99,10 @@ struct Params {
 		e.height_kp = (float)numf(ex, "height_kp"); e.height_kd = (float)numf(ex, "height_kd"); e.height_ki = (float)numf(ex, "height_ki");
 		e.height_filter_alpha = (float)numf(ex, "height_filter_alpha"); e.height_filter_beta = (float)numf(ex, "height_filter_beta");
 		e.vel_kp = (float)numf(ex, "vel_kp"); e.vel_ki = (float)numf(ex, "vel_ki"); e.vel_filter_cutoff_hz = (float)numf(ex, "vel_filter_cutoff_hz");
+		e.tilt_int_max_deg = (float)numf(ex, "tilt_int_max_deg");
+		e.pos_kp = (float)numf(ex, "pos_kp"); e.pos_vmax_mps = (float)numf(ex, "pos_vmax_mps");
+		if (e.tilt_max_deg + e.tilt_int_max_deg > e.tilt_per_stick_deg + 1e-6)
+			throw std::runtime_error("executor.tilt_max_deg + tilt_int_max_deg 超过 tilt_per_stick_deg（杆量满程）");
 		e.takeoff_climb_rate_mps = (float)numf(ex, "takeoff_climb_rate_mps");
 		e.ready_height_tol_m = (float)numf(ex, "ready_height_tol_m"); e.ready_vz_tol_mps = (float)numf(ex, "ready_vz_tol_mps");
 		e.ready_hold_s = (float)numf(ex, "ready_hold_s"); e.tof_timeout_s = (float)numf(ex, "tof_timeout_s");

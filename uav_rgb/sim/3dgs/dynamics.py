@@ -205,8 +205,11 @@ class CfSitlDynamics:
             raise ValueError(f"cf_sitl dt 必须有限且 > 0，得到 {dt!r}")
         if self.takeoff_s is None:
             raise RuntimeError("先 reset() 起飞再 step()")
-        self._call({"cmd": "act", "action": action, "until_s": self.t_sitl + dt})
-        self.active = action          # 窗口内生效的动作；窗口末刻固件已过期回悬停（trace 里 action=-1）
+        # until_s 多给半个 SITL 步：执行器的判据是 t < until_s，窗口最后一步 t == t_sitl + dt 若不多给，
+        # 那一步动作已过期、执行器回 SAFE 一个 tick（速度参考归零、位置保持点重置），每个窗口末刻都来一下，
+        # trace 里也会记成 action=-1 / exec_state=READY。下一窗口的 act 在继续步进之前到达，所以不会多执行。
+        self._call({"cmd": "act", "action": action, "until_s": self.t_sitl + dt + 0.5 * SITL_DT_S})
+        self.active = action          # 窗口内（含末刻）生效的动作
         n_total = int(round(dt / SITL_DT_S))
         n_chunk = max(1, int(round(self.trace_dt / SITL_DT_S)))
         yaw_prev, done = self.yaw, 0
@@ -246,8 +249,8 @@ class CfSitlDynamics:
         return {**self.params.manifest(), "seed": self.seed,
                 "takeoff_height_m": self.takeoff_height, "takeoff_s": self.takeoff_s,
                 "trace_dt_s": self.trace_dt,
-                "action_window": "until_s = t_obs + hold_s（observation 语义；SITL 时钟只在 step 里走，"
-                                 "渲染、决策、下发同刻，等于 dispatch 语义）",
+                "action_window": "until_s = t_obs + hold_s + 0.5 ms（observation 语义；SITL 时钟只在 step 里走，"
+                                 "渲染、决策、下发同刻，等于 dispatch 语义；半步余量让窗口末刻仍在动作内）",
                 "episode_clock": "t=0 为 READY 时刻，起飞不计入"}
 
     def close(self):

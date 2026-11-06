@@ -68,6 +68,21 @@ constexpr int kDetEpisode = 3;             // 任意固定值，两进程相同
 constexpr double kDetHoverS = 4.0;         // 起飞 + 悬停 4 s，再 FORWARD/YAW/SAFE 各 2 s，覆盖全部动作分支
 constexpr double kDetActS = 2.0;
 
+// ---- (6) 长航时（SAFE 保持 + FORWARD/YAW 交替） ----
+constexpr int kLongrunEpisode = 6;         // 任意固定值；seed 500/episode 0（route 5 倒飞）的精确复现在 tests/test_forward_longrun
+constexpr double kLongrunSafeS = 30.0;     // 任务要求：SAFE 30 s
+constexpr double kLongrunSafeDriftM = 0.05; // 任务要求：漂移 < 5 cm。只有速度环时漂移 ≈ 零偏/vel_ki ≈ 1.1 cm/s（1σ）→ 30 s 0.3 m；
+                                           //   位置保持后：执行器相信的位移 < 5 cm（判据 1）；真值还剩光流陀螺补偿零偏 |b|·h ≈ 0.35 cm/s（1σ，2 m 高）
+constexpr double kLongrunFlowBiasMargin = 1.5; // 判据 2 的余量：真值漂移 < 5 cm + 1.5×|b|·h·T；0.5 的余量给陀螺随机游走（1e-4 rad/s/√s，30 s 后 ≈0.03 °/s）与位置环常值偏离
+constexpr double kLongrunAltS = 60.0;      // 任务要求 60–120 s；加起飞 7 s + SAFE 30 s 共 ~97 s。取 90 s 时总时长 127 s，电池从 50% SoC 放到 3.2 V、悬停杆 0.97，t>110 s 保不住高度（见报告），所以取下限
+constexpr double kLongrunFwdS = 3.0;       // 每段 FORWARD 3 s（与场景 3 一致）
+constexpr double kLongrunYawS = 1.5;       // 每段 YAW 1.5 s ≈ 52°，左右交替，航向在 ±52° 内摆动，整段仍大致向前
+constexpr double kLongrunSettleS = 1.0;    // FORWARD 起步 1 s 后才算稳态（场景 3 实测到 90% 用时 0.72 s）
+constexpr double kLongrunVxMinFrac = 0.5;  // 稳态机体 vx 下限 = 0.5 × 0.3 = 0.15 m/s；倒飞时 vx < 0，光流噪声下 vx 波动 ≈ ±0.05
+constexpr double kLongrunIntSatDeg = 20.0; // = executor.tilt_int_max_deg；杆×30° 是 P+I 的和，P 在稳态 ≈ 0，近似积分
+constexpr double kLongrunZTolM = 0.3;      // 末态高度容差：长航时 h_est = ToF·cos(估计倾角)，估计误差 10° 时真值高 1.5%
+constexpr int kLongrunCsvEveryMs = 20;     // 130 s × 50 Hz = 6500 行
+
 // ---- (5) 电池 ----
 constexpr double kBatSocInit = 1.0;        // 任务要求从 SoC 1.0 开始；参数文件 sim.battery_soc_init ≠ 1.0 时写一份改过的副本再 init
 constexpr double kBatMaxS = 600.0;         // 2 × 参数文件 endurance 5 min：这之前固件 L3 还没触发，说明功率模型与标称续航差一倍以上

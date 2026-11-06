@@ -1,9 +1,9 @@
-// cf_sitl_selftest：对 libcf_sitl（固件在环 E1 MINI）跑 5 个场景，逐项 PASS/FAIL + 数字，退出码 = 失败数。
+// cf_sitl_selftest：对 libcf_sitl（固件在环 E1 MINI）跑 6 个场景，逐项 PASS/FAIL + 数字，退出码 = 失败数。
 // 用法：cf_sitl_selftest --params sim/dynamics/e1_mini.json --out <dir> [--seed N]
 //       画图：$UAV_RGB_PYTHON selftest/plot.py <dir>
 // 超参数全部在 selftest_config.h（场景时长、注入量、阈值，行尾有依据）。
 // 场景：(1) 坐标系一致性 (2) 悬停 10 s (3) 执行器级四个数字 (3.5) 固件级打杆阶跃（cf_sitl_set_sticks_raw 旁路执行器）
-//       (4) 两进程确定性哈希 (5) 电池放电曲线。
+//       (4) 两进程确定性哈希 (5) 电池放电曲线 (6) 长航时：SAFE 保持 30 s + FORWARD/YAW 交替 90 s（姿态估计漂移/积分/倒飞监控）。
 #include "selftest_util.h"
 #include "selftest_config.h"
 
@@ -47,6 +47,7 @@ int main(int argc, char **argv) {
 	scenario_sticks(r, c);
 	scenario_determinism(r, c);
 	scenario_battery(r, c);
+	scenario_longrun(r, c);
 
 	r.line("== 结果: %d 项失败，%d 项通过，%d 项跳过", r.fails, r.passes, r.skips);
 	return r.fails;

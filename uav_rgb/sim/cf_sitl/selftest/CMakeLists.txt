@@ -1,4 +1,4 @@
-# cf_sitl_selftest：5 个场景的自检程序（用法见 selftest_main.cpp 文件头），由顶层 CMake add_subdirectory。
+# cf_sitl_selftest：6 个场景的自检程序（用法见 selftest_main.cpp 文件头），由顶层 CMake add_subdirectory。
 if(NOT TARGET cf_sitl_tools_json)
   add_library(cf_sitl_tools_json STATIC ${CMAKE_CURRENT_SOURCE_DIR}/../src/json_min.cpp)
   target_include_directories(cf_sitl_tools_json PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../src)
@@ -7,7 +7,7 @@ endif()
 
 add_executable(cf_sitl_selftest
   selftest_main.cpp scenario_frame.cpp scenario_hover.cpp scenario_actuator.cpp scenario_sticks.cpp
-  scenario_determinism.cpp scenario_battery.cpp)
+  scenario_determinism.cpp scenario_battery.cpp scenario_longrun.cpp)
 target_include_directories(cf_sitl_selftest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 target_link_libraries(cf_sitl_selftest PRIVATE cf_sitl cf_sitl_tools_json)
 target_compile_features(cf_sitl_selftest PRIVATE cxx_std_17)

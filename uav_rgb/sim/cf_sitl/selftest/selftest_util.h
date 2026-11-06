@@ -165,3 +165,4 @@ void scenario_sticks(Report &r, const Ctx &c);
 void scenario_determinism(Report &r, const Ctx &c);
 uint64_t determinism_hash_run(const Ctx &c);   // --hash-run 子进程用：跑固定脚本，返回哈希
 void scenario_battery(Report &r, const Ctx &c);
+void scenario_longrun(Report &r, const Ctx &c);

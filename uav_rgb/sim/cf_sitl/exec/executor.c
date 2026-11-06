@@ -31,6 +31,7 @@ void cf_exec_arm_takeoff(cf_exec *e, float target_height_m) {
 	e->target_height_m = target_height_m;
 	e->height_ref_m = e->height_valid ? e->height_est_m : 0.0f;
 	e->ready_since_s = -1.0f;
+	e->holding = 0;
 	e->state = CF_EXEC_TAKEOFF;
 }
 
@@ -43,12 +44,15 @@ void cf_exec_set_action(cf_exec *e, int action, float until_s) {
 // ---- 观测器 ----
 static void observe(cf_exec *e, const cf_exec_input *in) {
 	const cf_exec_params *p = &e->p;
-	// 高度 = ToF·cos(倾角)，cos(倾角) = 机体 z 轴的世界 z 分量 = 1 − 2(qx² + qy²)
+	// cos(估计倾角) = 机体 z 轴的世界 z 分量 = 1 − 2(qx² + qy²)，只用来判断「估计姿态朝上」。
+	// 高度直接取 ToF 斜距，不乘 cos(估计倾角)：固件飞行中只积分陀螺，估计倾角含随时间增长的零偏误差
+	// （seed 500 60 s 后 17°），乘上去会让真值高度跟着漂（2.00 → 2.10 m）；不补偿时误差 = 1 − cos(真倾角)，
+	// 机动倾角 ≤ tilt_max 10° 时 ≤ 1.5%（2 m 高 3 cm），不随时间增长。固件在飞行中能修正姿态后可改回补偿。
 	const float cos_tilt = 1.0f - 2.0f * (in->att_q[1] * in->att_q[1] + in->att_q[2] * in->att_q[2]);
 	// 两次 ToF 之间按速度外推；ToF 失效超过 tof_timeout_s 后停止外推（否则估计会无界漂移）
 	if (e->height_valid && in->t_s - e->last_tof_valid_s <= p->tof_timeout_s) e->height_est_m += e->vz_est_mps * p->dt_s;
 	if (in->tof_new && in->tof_m >= 0.0f && cos_tilt > 0.0f) {
-		const float h = in->tof_m * cos_tilt;
+		const float h = in->tof_m;
 		if (!e->height_valid) {
 			e->height_est_m = h; e->vz_est_mps = 0.0f; e->height_valid = 1;
 		} else {
@@ -85,19 +89,42 @@ static float height_loop(cf_exec *e, float ref, float vref) {
 	return uc;
 }
 
-// ---- 水平速度环：PI → 目标倾角（≤ tilt_max）→ 杆量。+x 加速 = 低头(pitch+)，+y(左) 加速 = 左滚(roll−)
+// ---- 水平速度环：PI → 目标倾角 → 杆量。+x 加速 = 低头(pitch+)，+y(左) 加速 = 左滚(roll−)
+//      P 项限 ±tilt_max（机动倾角）；I 项单独限 ±tilt_int_max，P 饱和时冻结（条件积分）。积分吸收的是固件飞行中
+//      不修正的姿态估计漂移（陀螺零偏 × 时间）和阻力配平，不是机动——两者共用一个限幅时，漂移吃满限幅后
+//      速度环开环，FORWARD 会反向加速（3DGS route 5 seed 500 t≈44 s 倒飞的根因）。总倾角 ≤ tilt_max + tilt_int_max，
+//      由参数文件保证不超过固件杆量满程 tilt_per_stick。
 static void horizontal_loop(cf_exec *e, float vx_ref, float vy_ref, cf_exec_sticks *s) {
 	const cf_exec_params *p = &e->p;
-	const float tilt_max = p->tilt_max_deg * CF_EXEC_D2R, per_stick = p->tilt_per_stick_deg * CF_EXEC_D2R;
+	const float tilt_max = p->tilt_max_deg * CF_EXEC_D2R, int_max = p->tilt_int_max_deg * CF_EXEC_D2R;
+	const float per_stick = p->tilt_per_stick_deg * CF_EXEC_D2R;
 	const float ref[2] = {vx_ref, vy_ref};
 	float tilt[2];
 	for (int i = 0; i < 2; i++) {
 		const float err = ref[i] - e->vel_est[i];
-		if (e->flow_ok) e->vel_int[i] = clampf(e->vel_int[i] + p->vel_ki * err * p->dt_s, -tilt_max, tilt_max);
-		tilt[i] = clampf(p->vel_kp * err + e->vel_int[i], -tilt_max, tilt_max);
+		const float pt = p->vel_kp * err;
+		const int p_sat = pt > tilt_max || pt < -tilt_max;
+		if (e->flow_ok && !p_sat) e->vel_int[i] = clampf(e->vel_int[i] + p->vel_ki * err * p->dt_s, -int_max, int_max);
+		tilt[i] = clampf(pt, -tilt_max, tilt_max) + e->vel_int[i];
 	}
 	s->pitch = tilt[0] / per_stick;
 	s->roll = -tilt[1] / per_stick;
+}
+
+// ---- SAFE 位置保持：保持点 = 进入保持时的位置。机体系偏离 p 按 ṗ = v_b − ω×p 积分光流速度（随偏航一起转），
+//      外环 P 给速度环参考（限 ±pos_vmax）。只有速度环时，姿态估计以零偏速率漂，SAFE 以 零偏/vel_ki 匀速漂走
+//      （0.1 °/s ÷ 0.15 rad/m ≈ 1.2 cm/s，smoke 8.4 s 漂 0.10–0.49 m）；加位置环后同一漂移变成常值偏离
+//      零偏/(pos_kp·vel_ki)，不随时间增长。光流无效时偏离不更新、参考置零（退回纯速度环）。
+static void position_hold(cf_exec *e, const cf_exec_input *in, float *vx_ref, float *vy_ref) {
+	const cf_exec_params *p = &e->p;
+	if (!e->holding) { e->pos_err[0] = e->pos_err[1] = 0.0f; e->holding = 1; }
+	*vx_ref = *vy_ref = 0.0f;
+	if (!e->flow_ok) return;
+	const float wz = in->gyro[2], px = e->pos_err[0], py = e->pos_err[1];
+	e->pos_err[0] = px + (e->vel_est[0] + wz * py) * p->dt_s;
+	e->pos_err[1] = py + (e->vel_est[1] - wz * px) * p->dt_s;
+	*vx_ref = clampf(-p->pos_kp * e->pos_err[0], -p->pos_vmax_mps, p->pos_vmax_mps);
+	*vy_ref = clampf(-p->pos_kp * e->pos_err[1], -p->pos_vmax_mps, p->pos_vmax_mps);
 }
 
 static float yaw_stick(const cf_exec_params *p, float rate_rps) {
@@ -129,7 +156,11 @@ void cf_exec_tick(cf_exec *e, const cf_exec_input *in) {
 			e->height_ref_m = fminf(e->target_height_m, e->height_ref_m + p->takeoff_climb_rate_mps * p->dt_s);
 			s.throttle = height_loop(e, e->height_ref_m, climbing ? p->takeoff_climb_rate_mps : 0.0f);
 		}
-		horizontal_loop(e, 0.0f, 0.0f, &s);
+		{
+			float vx = 0.0f, vy = 0.0f;   // 起飞段就保持起飞点（光流 ≥ flow_min_height 后生效）
+			position_hold(e, in, &vx, &vy);
+			horizontal_loop(e, vx, vy, &s);
+		}
 		if (e->height_valid && fabsf(e->height_est_m - e->target_height_m) < p->ready_height_tol_m &&
 		    fabsf(e->vz_est_mps) < p->ready_vz_tol_mps) {
 			if (e->ready_since_s < 0.0f) e->ready_since_s = in->t_s;
@@ -143,10 +174,12 @@ void cf_exec_tick(cf_exec *e, const cf_exec_input *in) {
 		const int active = e->action >= 0 && in->t_s < e->action_until_s;
 		const int act = active ? e->action : CF_EXEC_SAFE;
 		e->state = active ? CF_EXEC_ACTING : CF_EXEC_READY;
-		const float vx = act == CF_EXEC_FORWARD ? p->forward_speed_mps : 0.0f;
+		float vx = act == CF_EXEC_FORWARD ? p->forward_speed_mps : 0.0f, vy = 0.0f;
 		const float yaw = act == CF_EXEC_YAW_LEFT ? p->yaw_rate_rps : act == CF_EXEC_YAW_RIGHT ? -p->yaw_rate_rps : 0.0f;
 		s.throttle = height_loop(e, e->target_height_m, 0.0f);
-		horizontal_loop(e, vx, 0.0f, &s);
+		if (act == CF_EXEC_SAFE) position_hold(e, in, &vx, &vy);   // SAFE / 无动作 = 原地保持，不只是速度归零
+		else e->holding = 0;                                        // 机动中不保持；下次 SAFE 从停下的位置重新起算
+		horizontal_loop(e, vx, vy, &s);
 		s.yaw = yaw_stick(p, yaw);
 		break;
 	}

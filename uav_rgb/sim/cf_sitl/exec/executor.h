@@ -23,6 +23,9 @@ typedef struct {
 	float height_kp, height_kd, height_ki;        // 高度环：杆量/m、杆量/(m/s)、杆量/(m·s)
 	float height_filter_alpha, height_filter_beta; // ToF 高度 g-h 观测器增益（按 ToF 样本更新）
 	float vel_kp, vel_ki;                         // 速度环：倾角 rad/(m/s)、rad/m
+	float tilt_int_max_deg;                       // 速度环积分单独限幅：它吸收固件飞行中不修正的姿态估计漂移（陀螺零偏×时间），
+	                                              // 与 tilt_max 分开，否则漂移吃满 tilt_max 后 FORWARD 会反向（3DGS route 5 seed 500 倒飞）
+	float pos_kp, pos_vmax_mps;                   // SAFE 位置保持：光流速度积分的位置偏离 → 速度参考（1/s），参考上限 m/s
 	float vel_filter_cutoff_hz;                   // 光流速度一阶低通截止
 	float takeoff_climb_rate_mps;                 // 起飞时高度参考的爬升速率
 	float ready_height_tol_m, ready_vz_tol_mps, ready_hold_s; // 到达目标高度的判据
@@ -55,7 +58,9 @@ typedef struct {
 	float last_tof_valid_s;
 	float hover_stick;                // 悬停油门杆：前馈 + 积分
 	float flow_vel[2];                // 最近一帧光流换算速度（未滤波）
-	float vel_est[2], vel_int[2];     // 滤波速度；速度环积分（单位 rad 倾角）
+	float vel_est[2], vel_int[2];     // 滤波速度；速度环积分（单位 rad 倾角，限幅 tilt_int_max_deg）
+	float pos_err[2];                 // SAFE 期间 vel_est 的积分 = 机体系位置偏离保持点（m）；进入 SAFE 时清零
+	int holding;                      // 位置保持已激活（当前动作是 SAFE）
 	int flow_ok;                      // 最近一帧光流有效
 	float vel_alpha;                  // 由 vel_filter_cutoff_hz 与 dt 导出的低通系数
 	float ready_since_s;              // 满足 READY 判据的起始时刻，< 0 未满足

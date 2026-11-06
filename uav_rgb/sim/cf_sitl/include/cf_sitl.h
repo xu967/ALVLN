@@ -7,8 +7,8 @@
 // - 时间：SITL 时钟每次 cf_sitl_reset 归零（对应真机上电），固件 micros() 取这个时钟。
 //   Gazebo 插件在 reset 时记下 gz 时间基准，把 gz 时间换算成 SITL 时间再传入。
 // - 动作：0=SAFE_NEUTRAL 1=FORWARD_SLOW 2=YAW_LEFT 3=YAW_RIGHT。
-//   SAFE=悬停（水平速度 0、保持高度）；FORWARD=机体前向定速；YAW_LEFT/RIGHT=原地偏航，
-//   YAW_LEFT 为绕 z 正向（逆时针）。动作在 until_s（SITL 时间）前有效，过期回悬停。
+//   SAFE=原地保持（光流位置保持 + 保持高度，保持点 = 进入 SAFE 时的位置）；FORWARD=机体前向定速；
+//   YAW_LEFT/RIGHT=原地偏航，YAW_LEFT 为绕 z 正向（逆时针）。动作在 until_s（SITL 时间）前有效（t < until_s），过期回 SAFE。
 // - 单线程：所有函数在同一线程调用（插件在 PreUpdate 里调，topic 回调只入队）。
 // - 固件代码是全局变量写法，一个进程只能有一个实例。
 #ifndef CF_SITL_H
@@ -26,7 +26,8 @@ enum cf_sitl_exec_state {
   CF_SITL_TAKEOFF = 1,   // 已解锁，爬升到目标高度
   CF_SITL_READY = 2,     // 在目标高度稳定悬停，可以接收动作
   CF_SITL_ACTING = 3,    // 正在执行未过期的动作
-  CF_SITL_FAILSAFE = 4,  // 动作流超时，固件 descend() 接管
+  CF_SITL_FAILSAFE = 4,  // 飞行中 ToF 连续无效 > tof_timeout_s：执行器输出悬停杆、水平、不再闭环（固件 descend() 不会接管：
+                         // 杆量每 tick 都在刷新，固件判不出 RC 丢失）；只能 reset 退出，调用方应把它当终止条件
 };
 
 // Gazebo 插件每个物理步传入的刚体状态（来自 Gazebo，世界系）
