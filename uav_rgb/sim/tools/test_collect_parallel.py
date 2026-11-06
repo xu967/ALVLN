@@ -38,5 +38,33 @@ class PartitionTests(unittest.TestCase):
         self.assertFalse(item.ok)  # 缺 manifest 的失败不能被隔离测试伪装成成功
 
 
+class StopTests(unittest.TestCase):
+    """AUDIT Q1/Q2：停止位置位后 worker 不重试、不起下一集，否则 Ctrl-C/SIGTERM 之后还会起新 gz。"""
+
+    def tearDown(self):
+        parallel._STOP.clear()
+        parallel._PROC_GROUPS.clear()
+
+    def test_stop_skips_retry_and_remaining_episodes(self):
+        calls = []
+
+        def once(item, *_):
+            calls.append(item.scene_id)
+            item.ok = False
+            parallel._STOP.set()   # 第一集跑到一半收到 Ctrl-C / SIGTERM，被 cleanup_all 杀成 rc=-15
+
+        with patch.object(parallel, "_run_episode_once", side_effect=once):
+            results = parallel.run_instance(SimpleNamespace(steps=1), [task(), task()], "", "")
+        self.assertEqual(calls, [42])          # 不进 attempt 2，第二集不开始
+        self.assertEqual([r.status for r in results], ["failed"])
+
+    def test_register_after_stop_kills_late_group(self):
+        parallel._STOP.set()
+        proc = Mock(pid=4242)
+        with patch.object(parallel, "stop_group") as stop:
+            parallel._register(proc)   # cleanup_all 扫完之后才起来的进程组，登记时就地收掉
+        self.assertIs(stop.call_args.args[0], proc)
+
+
 if __name__ == "__main__":
     unittest.main()

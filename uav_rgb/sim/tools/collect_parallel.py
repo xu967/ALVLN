@@ -73,6 +73,7 @@ SPLIT_POLICY = ("geometry group: sha256(<SPLIT_SALT>:<gid>) % 100 -> "
 
 _REG_LOCK = threading.Lock()
 _PROC_GROUPS = {}   # pgid -> Popen，收尾时兜底 kill
+_STOP = threading.Event()   # Ctrl-C / SIGTERM 后置位：worker 不再重试、不再起下一集（AUDIT Q2）
 
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -197,6 +198,8 @@ def scene_gen_extra(args):
 def _register(proc):
     with _REG_LOCK:
         _PROC_GROUPS[proc.pid] = proc
+    if _STOP.is_set():   # 置位之后才起的进程 cleanup_all 已经扫过，这里补杀
+        stop_group(proc, "stop 后启动")
 
 
 def _unregister(proc):
@@ -258,6 +261,13 @@ def cleanup_all():
         procs = list(_PROC_GROUPS.values())
     for proc in procs:
         stop_group(proc, "cleanup")
+
+
+def request_stop(reason):
+    """Ctrl-C 与 SIGTERM 共用：先置停止位再杀进程组，worker 拿到 rc=-15 后不重试直接收工。"""
+    _STOP.set()
+    print(f"\n{reason}：清理所有 gz sim / collect 进程组…", flush=True)
+    cleanup_all()
 
 
 def _tail(path, n=20):
@@ -463,7 +473,7 @@ def run_episode(task, args, staging_root, logs_dir):
     for attempt in (1, 2):
         task.attempts = attempt
         _run_episode_once(task, args, staging_root, logs_dir)
-        if task.ok or attempt == 2:
+        if task.ok or attempt == 2 or _STOP.is_set():
             break
         print(f"[inst {task.instance}] scene {task.scene_id} 失败，重启 sim 重试 "
               f"({attempt}/1)", flush=True)
@@ -484,7 +494,12 @@ def run_episode(task, args, staging_root, logs_dir):
 
 
 def run_instance(args, tasks, staging_root, logs_dir):
-    return [run_episode(t, args, staging_root, logs_dir) for t in tasks]
+    results = []
+    for t in tasks:
+        if _STOP.is_set():
+            break
+        results.append(run_episode(t, args, staging_root, logs_dir))
+    return results
 
 
 def _write_json(path, obj):
@@ -524,6 +539,10 @@ def _sweep_world_ruby(worlds_dir):
 
 
 def main():
+    def _term(_sig, _frame):   # AUDIT Q1：SIGTERM 默认不跑 finally，kill -- -PGID 会留下整排孤儿 gz
+        request_stop("SIGTERM")
+        raise SystemExit(143)
+    signal.signal(signal.SIGTERM, _term)
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--instances", type=int, default=4, help="并行实例数（默认 4）")
@@ -708,8 +727,7 @@ def main():
             for fut in futures:
                 results.extend(fut.result())
         except KeyboardInterrupt:
-            print("\n中断：清理所有 gz sim / collect 进程组…", flush=True)
-            cleanup_all()
+            request_stop("中断")
             executor.shutdown(wait=True, cancel_futures=True)
             raise
         finally:
