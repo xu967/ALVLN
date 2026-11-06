@@ -96,10 +96,12 @@ def _panel(renderer, view=None, pose=None):
 class _TopMap:
     """固定顶视：占据代理（collision.Occupancy.raw 沿 z 投影）的 2D 地图，x 朝上、y 朝左（ENU 俯视）。"""
 
-    def __init__(self, scene, occ):
+    def __init__(self, scene, occ, extra_xy=()):
+        """extra_xy：也要落在图里的点（整条轨迹）；多路线的 A* 绕行会跑出 spawn–waypoint 包围盒。"""
         import cv2
         sp, wp = scene["spawn"], scene["waypoint"]
-        xs, ys = (sp["x"], wp["x"]), (sp["y"], wp["y"])
+        pts = [(sp["x"], sp["y"]), (wp["x"], wp["y"])] + [(float(x), float(y)) for x, y in extra_xy]
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
         span_x, span_y = max(xs) - min(xs) + 2 * TOP_MARGIN_M, max(ys) - min(ys) + 2 * TOP_MARGIN_M
         self.scale = max(span_x / PANEL_H, span_y / PANEL_W)           # m/px，x 映射到图高
         self.cx, self.cy = 0.5 * (min(xs) + max(xs)), 0.5 * (min(ys) + max(ys))
@@ -161,7 +163,7 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
     key_idx = sorted({int(round(k * (len(trace) - 1) / max(1, KEYFRAMES - 1))) for k in range(KEYFRAMES)})
     keyframes, cx, cy = [], PANEL_W // 2, PANEL_H // 2
     pitch_follow = -math.degrees(math.atan2(FOLLOW_UP_M, FOLLOW_BACK_M))
-    topmap, path_xy = _TopMap(scene, occ), []
+    topmap, path_xy = _TopMap(scene, occ, extra_xy=[row["pos"][:2] for row in trace]), []
     try:
         for i, row in enumerate(trace):
             x, y, z = (float(v) for v in row["pos"])
@@ -262,8 +264,11 @@ def main():
     occ = importlib.import_module("sim.3dgs.collision").from_scene(scene)   # 顶视地图 = 碰撞用的同一份占据
     for ep in args.ep:
         with open(os.path.join(ep, "episode_manifest.json"), encoding="utf-8") as f:
-            mount = json.load(f)["dynamics_params"].get("camera_mount")
-        r = compose_views_video(ep, scene, renderer, mount, occ)
+            man = json.load(f)
+        mount = man["dynamics_params"].get("camera_mount")
+        # 顶视的 spawn/waypoint 取本集 manifest 里的（--route 选的路线），不是 scene.json 顶层那条。
+        ep_scene = dict(scene, **{k: man["scene"][k] for k in ("spawn", "waypoint") if man.get("scene", {}).get(k)})
+        r = compose_views_video(ep, ep_scene, renderer, mount, occ)
         print(json.dumps(r, ensure_ascii=False))
 
 

@@ -147,6 +147,8 @@ def main():
     p.add_argument("--spawn-jitter", type=float, default=0.0)
     p.add_argument("--record-video", action="store_true",
                    help="每集把 rgb_*.png 合成 <out>/videos/seed_<seed>.webm（VP8，fps=1/hold）")
+    p.add_argument("--route", type=int, default=None,
+                   help="scene.routes[N]：覆盖 spawn/waypoint/max_steps（默认 0 = 顶层 spawn/waypoint）")
     args = p.parse_args()
     if args.policy == "student" and not args.ckpt:
         p.error("--policy student 需要 --ckpt")
@@ -155,6 +157,10 @@ def main():
     if os.path.isdir(args.out) and os.listdir(args.out):
         p.error(f"--out {args.out} 不是空目录")
     scene = scene_mod.load_scene(args.scene)
+    try:
+        scene_mod.apply_route(scene, args.route)
+    except ValueError as e:
+        p.error(str(e))
     steps = args.steps if args.steps is not None else int(scene.get("max_steps", 60))
     # AUDIT #12：hold 不再静默回退 scene.step_s；来源写进报告。
     try:
@@ -268,6 +274,7 @@ def main():
                   "scene_id": identity["scene_id"],
                   "task_id": identity["task_id"],
                   "split": "test", "split_policy": split_policy,
+                  "route": scene.get("route"),
                   "waypoint": scene.get("waypoint"),
                   "spawn": scene.get("spawn"),
                   "source": scene.get("source"),

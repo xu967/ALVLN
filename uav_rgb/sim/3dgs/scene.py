@@ -271,6 +271,31 @@ def load_scene(path):
     return scene
 
 
+def apply_route(scene, route=None):
+    """按 scene["routes"][route] 覆盖 spawn / waypoint / max_steps，并记 scene["route"]={index,name,note}。
+
+    没有 routes 列表的旧 scene.json：route None/0 原样返回，其余报错。约定 routes[0] 与顶层
+    spawn/waypoint 相同（向后兼容），所以 route=None 时也套用 routes[0] 的 max_steps。
+    """
+    routes = scene.get("routes") or []
+    idx = 0 if route is None else int(route)
+    if not routes:
+        if idx != 0:
+            raise ValueError(f"{scene.get('path')}: 没有 routes 列表，只能用 route 0")
+        return scene
+    if not (0 <= idx < len(routes)):
+        raise ValueError(f"route {idx} 超出范围（scene 共 {len(routes)} 条）")
+    r = routes[idx]
+    for key in ("spawn", "waypoint"):
+        if not isinstance(r.get(key), dict):
+            raise ValueError(f"routes[{idx}] 缺 {key}")
+        scene[key] = dict(r[key])
+    if "max_steps" in r:
+        scene["max_steps"] = int(r["max_steps"])
+    scene["route"] = {"index": idx, "name": r.get("name", f"route{idx}"), "note": r.get("note")}
+    return scene
+
+
 def viewmat_from_pose(x, y, z, yaw_deg, pitch_deg=0.0, nav_to_world=None):
     """nav 位姿 -> gsplat world->camera 4x4（float64）。
 

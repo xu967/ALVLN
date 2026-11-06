@@ -25,10 +25,11 @@ import time
 import numpy as np
 
 from . import collision as collision_mod
+from . import planner as planner_mod
 from . import scene as scene_mod
 from . import renderer as renderer_mod
 from .dynamics import (CfBlackboxParams, CfSitlDynamics, CfSitlParams, FORWARD_SLOW,
-                       make_blackbox)
+                       SAFE_NEUTRAL, make_blackbox)
 
 TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 if TOOLS not in sys.path:
@@ -37,6 +38,9 @@ from teacher import ACTIONS, TEACHER_VERSION, expert_action  # noqa: E402
 import split_manifest as sm  # noqa: E402
 
 GEOMETRY_VERSION = "3dgs.v1"
+# FORWARD 下沿航向后退超过这个距离判执行器失控（见 run_episode 注释）；cf_sitl 悬停漂移实测 1–2 cm/步，
+# FORWARD 首步也至少 +3 cm，5 cm 留出两倍余量。
+ANOMALY_BACK_M = 0.05
 
 
 def _sha256(path):
@@ -201,6 +205,13 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
     actions, oracle, render_ms = [], [], []
     rows_ok, all_rgb_ok = 0, True
     stopped = False
+    # goal-stop（与 sim/tools/collect.py 同口径）：教师带 stop_radius（planner.OccAstarTeacher）时，
+    # 连续 3 步 SAFE 且动作前位姿在 waypoint 半径内就提前结束，避免后 20+ 步全是悬停 SAFE 把类别
+    # 分布拉偏；cf_sitl 悬停还会漂 2–4 cm/s，窄巷里挂着不动 10 s 就漂进树篱（smoke_r3 实测）。
+    stop_radius = getattr(policy, "stop_radius", None)
+    wp = scene.get("waypoint") or {}
+    stop_streak, stopped_on_goal = 0, False
+    anomaly = None
     error = None
     if hasattr(policy, "prev"):        # 每集重置教师滞回
         policy.prev = None
@@ -238,6 +249,14 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
             # yaw 是 state["yaw_deg"]（度），yaw0 是 dyn.yaw（弧度）：先统一成度再求 [-180,180) 环绕差。
             # 以前直接相减再 degrees()，实测左转 9.65° 记成 553°。
             dyaw = (yaw - math.degrees(yaw0) + 180.0) % 360.0 - 180.0
+            # 固件在环失控保护：FORWARD 命令下机体沿航向后退 ≥ ANOMALY_BACK_M（悬停漂移只有 1–2 cm/步）。
+            # route 5 seed 500 实测：飞到 t≈44 s 光流速度环反向积分，FORWARD 下倒飞加速到 2.5 m/s，
+            # 18 m 外撞树才被碰撞代理停下，中间 45 步标签 FORWARD 与运动相反。这里标记并结束本集，
+            # validity.physics_verified=False 让 preprocess 拒收；不改 cf_sitl。
+            along = (x - x0) * math.cos(yaw0) + (y - y0) * math.sin(yaw0)
+            if action == FORWARD_SLOW and along < -ANOMALY_BACK_M:
+                anomaly = {"step": i, "kind": "backward_under_forward",
+                           "along_m": round(along, 3), "displacement_m": round(dist, 3)}
             ts0 = int(round(t_rgb * 1e9))
             ts1 = int(round(state["t"] * 1e9))
             actions.append({
@@ -277,10 +296,20 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
             print(f"step {i}: {ACTIONS[action]} pos=({x:.2f},{y:.2f},{state['z']:.2f}) "
                   f"yaw={yaw:.1f} d={dist:.2f} collide={collided} "
                   f"render={ms:.1f}ms infer={infer_ms}", file=sys.stderr)
+            if anomaly is not None:
+                print(f"step {i}: 动力学异常 {anomaly}，提前结束", file=sys.stderr)
+                break
             if stop_on_collision and collided:
                 stopped = True
                 print(f"step {i}: 碰撞，提前结束", file=sys.stderr)
                 break
+            if stop_radius is not None:
+                at_goal = math.hypot(x0 - float(wp["x"]), y0 - float(wp["y"])) <= stop_radius
+                stop_streak = stop_streak + 1 if (action == SAFE_NEUTRAL and at_goal) else 0
+                if stop_streak >= 3:
+                    stopped_on_goal = True
+                    print(f"step {i}: goal-stop 连续 3 步 SAFE，提前结束", file=sys.stderr)
+                    break
     except BaseException as e:  # noqa: BLE001 - 异常也要写 manifest
         error = f"{type(e).__name__}: {e}"
         raise
@@ -318,6 +347,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
             "task_version": scene.get("task_version") or "3dgs.pilot.v1",
             "geometry_version": identity["geometry_version"],
             "appearance_version": scene.get("appearance_version") or "3dgs.v1",
+            "route": scene.get("route"),      # scene.apply_route 选的路线（index/name）；旧 scene 为 None
             "waypoint": scene.get("waypoint"),
             "scene": {"name": scene.get("name"),
                       "source": scene.get("source"),
@@ -330,7 +360,9 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
             "dynamics_params": dyn.manifest(),
             "trace_ref": "trace.jsonl" if getattr(dyn, "trace", None) is not None else None,
             "teacher": policy.name,
-            "teacher_version": TEACHER_VERSION if policy.name == "expert_action" else None,
+            "planner": getattr(policy, "planner_name", None),
+            "teacher_version": (TEACHER_VERSION if policy.name == "expert_action"
+                                else getattr(policy, "version", None)),
             "hold_s": hold_s,
             "window_from": "render_observation",
             "actions_ref": "actions.jsonl",
@@ -349,9 +381,10 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
             "validity": {
                 # 碰撞提前结束时也认为本集执行过；只要求每步都有帧、无异常。
                 "camera_verified": bool(all_rgb_ok and rows_ok > 0),
-                "physics_verified": bool(rows_ok > 0 and error is None),
+                "physics_verified": bool(rows_ok > 0 and error is None and anomaly is None),
                 "episode_executed": bool(rows_ok > 0),
             },
+            "dynamics_anomaly": anomaly,
             "num_steps": rows_ok,
             "requested_steps": steps,
             "performance": {
@@ -362,6 +395,8 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
                 "wall_s": round(time.perf_counter() - t_wall, 3),
             },
             "stopped_on_collision": stopped,
+            "stop_radius": stop_radius,            # 教师 goal-stop 半径（深度教师/forward 为 None）
+            "stopped_on_goal": stopped_on_goal,
             "error": error,
             "notes": [
                 ("3DGS 在线渲染，无 Gazebo；位姿由 E1 MINI 固件在环（cf_sitl_proc）推进，"
@@ -382,7 +417,11 @@ def main():
     p.add_argument("--out", required=True, help="输出根目录（必须为空/新目录）")
     p.add_argument("--steps", type=int, default=None, help="每集步数（默认 scene.max_steps）")
     p.add_argument("--episodes", type=int, default=1)
-    p.add_argument("--policy", choices=("teacher", "forward"), default="teacher")
+    p.add_argument("--policy", choices=("teacher", "astar", "forward"), default="teacher",
+                   help="teacher = 深度反应式（不知道 waypoint，开阔路线全程 FORWARD）；"
+                        "astar = 占据栅格 A* + 纯追踪 + goal-stop（sim/3dgs/planner.py，多路线用）")
+    p.add_argument("--route", type=int, default=None,
+                   help="scene.routes[N]：覆盖 spawn/waypoint/max_steps（默认 0 = 顶层 spawn/waypoint）")
     p.add_argument("--hold", type=float, default=None, help="每步动作窗口秒（默认 scene.step_s）")
     p.add_argument("--width", type=int, default=None)
     p.add_argument("--height", type=int, default=None)
@@ -405,6 +444,10 @@ def main():
     if os.path.isdir(args.out) and os.listdir(args.out):
         p.error(f"--out {args.out} 不是空目录")
     scene = scene_mod.load_scene(args.scene)
+    try:
+        scene_mod.apply_route(scene, args.route)
+    except ValueError as e:
+        p.error(str(e))
     steps = args.steps if args.steps is not None else int(scene.get("max_steps", 60))
     hold = args.hold if args.hold is not None else float(scene.get("step_s", 0.5))
     if steps < 1 or not (math.isfinite(hold) and hold > 0):
@@ -422,7 +465,17 @@ def main():
     occ = collision_mod.from_scene(scene)
     renderer = renderer_mod.make_renderer(scene, args.mock_renderer, args.width,
                                           args.height, args.fov, args.device)
-    policy = DepthTeacher() if args.policy == "teacher" else ForwardPolicy()
+    if args.policy == "astar":
+        occ_planner = planner_mod.OccPlanner(occ)
+        policy = planner_mod.OccAstarTeacher(occ_planner, scene["waypoint"])
+        check = planner_mod.route_check(occ_planner, scene["spawn"], scene["waypoint"])
+        if not check["feasible"]:
+            p.error(f"route {scene.get('route')}: spawn/waypoint 不可达 {check}")
+        print(f"astar 教师: route={scene.get('route')} 航程 {check['path_m']} m 转向 {check['turn_deg']}° "
+              f"最小净空 {check['min_clearance_m']} m 步数预算 {check['steps_estimate']}（--steps {steps}）",
+              file=sys.stderr)
+    else:
+        policy = DepthTeacher() if args.policy == "teacher" else ForwardPolicy()
     os.makedirs(args.out, exist_ok=True)
     episodes, failures = [], []
     for ep in range(args.episodes):
@@ -450,6 +503,7 @@ def main():
         "schema": "uavrgb.3dgs_collect.v1",
         "scene": {"name": scene.get("name"), "path": scene["path"],
                   "ply": scene["ply_path"], **identity},
+        "route": scene.get("route"), "spawn": scene.get("spawn"), "waypoint": scene.get("waypoint"),
         "split": split, "split_policy": split_policy,
         "policy": args.policy, "steps": steps, "hold_s": hold,
         "dynamics": args.dynamics,

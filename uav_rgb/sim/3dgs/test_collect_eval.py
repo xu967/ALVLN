@@ -92,6 +92,45 @@ class TestCollect3dgs(unittest.TestCase):
             self.assertEqual(run["split"], m["split"])
             self.assertEqual(m["collision_proxy"]["proxy_version"], "3dgs.occ.v2")
 
+    def test_route_select_and_astar_teacher(self):
+        """--route N 覆盖 spawn/waypoint/max_steps；astar 教师朝 +y 出生、目标在 +x 时先右转；越界报错。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_dir = os.path.join(tmp, "scene")
+            scene = scene_mod.make_corridor(scene_dir, seed=2, length=12.0)
+            scene["routes"] = [
+                {"name": "r0", "spawn": scene["spawn"], "waypoint": scene["waypoint"]},
+                {"name": "r1", "spawn": {"x": 3.0, "y": 0.0, "z": 2.0, "yaw_deg": 90.0},
+                 "waypoint": {"x": 10.0, "y": 0.0, "z": 2.0}, "max_steps": 4}]
+            scene_json = os.path.join(scene_dir, "scene.json")
+            scene_mod.save_scene({k: v for k, v in scene.items() if not k.startswith("_") and k not in ("path", "dir", "ply_path")}, scene_json)
+            out = os.path.join(tmp, "r1")
+            r = _run(["sim.3dgs.collect_3dgs", "--scene", scene_json, "--out", out, "--mock-renderer",
+                      "--policy", "astar", "--route", "1"])
+            self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+            m = _load(os.path.join(out, "ep_00000", "episode_manifest.json"))
+            self.assertEqual((m["route"]["index"], m["route"]["name"]), (1, "r1"))
+            self.assertEqual(m["scene"]["spawn"]["yaw_deg"], 90.0)
+            self.assertEqual(m["waypoint"]["x"], 10.0)
+            self.assertEqual(m["requested_steps"], 4)            # 没给 --steps 时用 routes[1].max_steps
+            self.assertEqual((m["teacher"], m["planner"], m["stop_radius"]), ("plan_action", "astar_occ", 0.5))
+            self.assertEqual(m["teacher_version"], "uavrgb.teacher_occ.v1")
+            with open(os.path.join(out, "ep_00000", "actions.jsonl")) as f:
+                rows = [json.loads(x) for x in f]
+            self.assertEqual(rows[0]["action_executed"], 3)      # YAW_RIGHT：航向 +y，目标在 +x
+            # 默认 route（None）= 顶层 spawn/waypoint = routes[0]；task_id 与 route 1 不同
+            r0 = _run(["sim.3dgs.collect_3dgs", "--scene", scene_json, "--out", os.path.join(tmp, "r0"),
+                       "--mock-renderer", "--policy", "forward", "--steps", "2"])
+            self.assertEqual(r0.returncode, 0, r0.stderr[-2000:])
+            m0 = _load(os.path.join(tmp, "r0", "ep_00000", "episode_manifest.json"))
+            self.assertEqual(m0["route"]["index"], 0)
+            self.assertEqual(m0["scene"]["spawn"], scene["spawn"])
+            self.assertNotEqual(m0["task_id"], m["task_id"])
+            self.assertEqual(m0["geometry_gid"], m["geometry_gid"])
+            bad = _run(["sim.3dgs.collect_3dgs", "--scene", scene_json, "--out", os.path.join(tmp, "bad"),
+                        "--mock-renderer", "--route", "2", "--steps", "1"])
+            self.assertNotEqual(bad.returncode, 0)
+            self.assertIn("route 2", bad.stderr)
+
 
 class TestSceneIdentity(unittest.TestCase):
     """AUDIT #1：以前 scene_id=seed、split 由命令行随便给，同一 PLY 可同时进 train/val。"""
