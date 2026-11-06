@@ -41,8 +41,15 @@
 - 镜像脚本按 `--first-parent` 镜像：合并进来的分支在 GitHub 上是一个提交
 - 本仓库纯个人学习用途，文档不写商业授权声明
 
+## 用户 04:31 的新要求（两数据集对比）
+
+- 数据集 A = Gazebo「柱阵 → 森林三档」，数据集 B = 3DGS「Callinstrasse 转弯路线」；学生 S_A / S_B / S_AB 在两个域的测试集上交叉评测（教师、盲前进、旧 X3 学生作参照）。计划与矩阵：`docs/experiments/2026-11-07-dataset-compare-plan.md`。对比入口 `tools/compare_datasets.py` 等两个 agent 的 CLI 定下来再写。
+- 3DGS 画质结论（04:45）：Callinstrasse 是街面手持采集、2M 高斯铺一整条街，中景可用（Laplacian 方差 472，比 Gazebo 柱阵 140 还高），但靠近墙/绿篱的近景发糊重影、路线最长只有 8–15 m，是数据集本身的限制，不是渲染 bug。更好的选择：H3DGS Campus/SmallCity 预训练（Inria，2.3–9.8 GB，街面 1.5 km 级）、Mill-19/UrbanScene3D 无人机航拍自训 3DGS（gsplat 1–2 h/场景）、或自采校园（最贴合真机试飞场地）。
+- 定位结论：当前是「微型无人机单目 RGB 的语言条件反应式导航」，按 AerialVLN/CityNav/OpenFly 口径还不算 VLN；最短补齐路径见计划文档 §6。
+
 ## 未完成 / 待办
 
+0. 两数据集对比（上面）：等 forest agent 与 3DGS agent 交付 → B 放量 ≥300 集（建议 hold 统一 1.0）→ 写 `tools/compare_datasets.py` → 守护进程跑 → 填 §2 矩阵
 1. 等 E1 流水线跑完（预计 04:00 起 ≈ 2 h）：看 `summary.md`，把四组数字填进 `docs/experiments/2026-11-07-e1-demo-plan.md` §3 的表；teacher / 新学生组的三视角视频在 `eval-<组>/videos/`
 2. 若 pilot 的 audit FAIL（`class_share` 之类样本量问题 vs. 执行器问题）：先看 `pilot/audit.json`，确认是样本量再把检查名写进 `CFG["audit_ignore"]` 用 `--from collect` 续跑
 3. demo 素材：SITL 自检曲线 PNG（`$DATA_ROOT/uav_rgb/tmp/agent-sitl-tools/selftest-run5/out/*.png`）、3DGS Callinstrasse 视频、Gazebo 三视角视频，汇总成一页给老师看
