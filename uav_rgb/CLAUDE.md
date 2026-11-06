@@ -13,9 +13,11 @@ Design boundaries that must not be violated:
 
 ## Environment constraints (actual machine, not the spec's assumptions)
 
-The machine is a single **NVIDIA GeForce RTX 2080 Ti (sm_75, 22 GiB / 21.49 GiB usable, 68 SM)**, not the RTX 5090 described in the spec. (Earlier records said "Tesla T4"; the current device node is `/dev/nvidia0`.)
+**2026-11-06 实测**：显卡已换成 **NVIDIA GeForce RTX 4080 SUPER（sm_89，32 GB，驱动 595.99.02）**；仓库 CMake 仍写死 sm_75，产物靠 PTX JIT 在新卡上跑（CTest 25/25、`tools/check.sh` 全过、推理 p50 9.85 ms，实测），**CUDA 架构不改**。cgroup 实际 **12 核**（`nproc` 显示 88 不可信，构建 `--parallel 8`）。根分区只剩约 1.7 GB：构建目录、worktree、临时文件一律放 `/root/rivermind-data/uav_rgb/tmp/`。本容器 Gazebo 的 gpu 渲染后端会段错误（EGL 库是 0 字节占位），**只能 `UAVRGB_RENDER_BACKEND=software`**（约 3 s/步）。下文 2080 Ti 的描述是 2026-11-05 前的历史环境，保留作对照。
 
-- CUDA Toolkit **12.8** at `/usr/local/cuda-12.8`; driver 580.119.02. Do not install CUDA 13.x (driver caps at CUDA 13.0, and Turing/sm_75 gains nothing) and never compile for sm_120.
+The machine was a single **NVIDIA GeForce RTX 2080 Ti (sm_75, 22 GiB / 21.49 GiB usable, 68 SM)**, not the RTX 5090 described in the spec. (Earlier records said "Tesla T4"; the current device node is `/dev/nvidia0`.)
+
+- CUDA Toolkit **12.8** at `/usr/local/cuda-12.8`; driver 580.119.02（2026-11-06 起为 595.99.02）. Do not install CUDA 13.x (driver caps at CUDA 13.0, and Turing/sm_75 gains nothing) and never compile for sm_120.
 - Installed and usable: OpenCV 4.6 (C++), Eigen 3.4, Gazebo Harmonic 8.15 (`gz sim`), CMake 3.28 + Ninja, GCC 13.3, ncu/nsys/cuobjdump/nvdisasm.
 - Intentionally **not installed**: cuDNN, PyTorch, TensorRT, ROS 2. Do not install them.
 - `apt` installs are fine on this machine (the earlier `apt-gazebo` ownership note is obsolete — no such process exists, no dpkg lock held). Still do not run `apt upgrade` / driver / kernel changes.
