@@ -65,9 +65,10 @@ CFG = dict(
     class_weights="auto",    # 训练集逆频率。FORWARD 占 ~75%，不加权 SAFE/YAW 召回归零（EVAL_STANDARD §0）
     text_dim=0,              # base 任务无指令。l1 用 16
     # 评测（四组同一批 test 场景；E1 机体、observation 语义、hold 1.0）
-    eval_seeds="180,206,250,485,503,555,586,708,715,721,799,855,932,992,1113,1116,1123,1145,1246,1282",
-                             # 0–2999 中在 geom.v3 与 v5 两个 salt 下都是 test 的前 20 个（docs/experiments/2026-11-07-e1-demo-plan.md §1）；
-                             # HANDOFF 的 23..180 在 v5 下 17 个落 train，不能用
+    eval_seeds="1,58,113,122,127,153,172,176,180,190,230,250,256,259,312,327,361,395,422,536",
+                             # tools/pick_test_seeds.py 挑的 20 个：几何组两两不同、v5 下都是 test、与 collection/ 的 300 集零重叠。
+                             # 之前的 180,206,…,1282 虽然都是 test，但按 gid 去重只剩 11 个独立几何（eval 会「跳过: 已评测」），
+                             # 0417 那轮四组对照实际 n=11（docs/experiments/2026-11-07-e1-demo-plan.md §3 已注明）
     eval_steps=80,           # 给足全程余量（T7 起 80）；碰撞/到达会提前结束
     old_x3_ckpt=f"{DATA_ROOT}/uav_rgb/t6-full-1640/run/ckpt_best.bin",   # T6 best（epoch 8）：X3 / x3_velocity / hold 1.0 训的
     record_groups=("teacher", "student-e1-new"),   # 这两组录三视角视频（≈10 MB/仿真秒暂存，合成后删）
