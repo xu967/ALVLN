@@ -117,14 +117,32 @@ def expert_action(depth, w, h, turn_dist=1.5, emergency=0.8, prev_action=None,
 # collision_envelope.radius_from_center 0.102（按方框半宽用，角部比圆保守 0.042 m）。
 BODY_HALF_BY_VEHICLE = {"x3": 0.235, "e1_mini": 0.102}
 BODY_HALF_M = BODY_HALF_BY_VEHICLE["x3"]
+# 规划余量（m）：(A* 栅格膨胀, 局部射线/前向检查净空)。x3 0.5/0.36 是历史默认（标签逐字节不变）。
+# E1 沿用 X3 余量时 1.2 m 缝隙的可行走廊只剩 0.2 m：一步 0.25 m 带 20° 航向偏差就出走廊，
+# 进余量后 A* 起点四邻全堵、局部脱困也找不到 1.6 m 净空射线 → 永远 SAFE，悬停漂移 2.4 cm/s 撞柱
+# （E1 pilot 20 集 8 集这样失败）。E1 按「机身半宽差 0.133 m」缩，再各留 0.03/0.07 给漂移。
+CLEARANCE_BY_VEHICLE = {"x3": (0.5, 0.36), "e1_mini": (0.40, 0.30)}
+ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M = CLEARANCE_BY_VEHICLE["x3"]
+# 脱困阶段 (前这么多米只查机身方框, 射线长度 None=lookahead)：已漂进余量时按顺序试，第一阶段有解就停。
+# x3 只有历史那一档。E1 多一档短射线：柱阵里离柱 0.26 m 时 1.6 m 全净空的射线几乎不存在
+# （pilot 实测 142/173 个 SAFE 步在新余量下仍无解），0.6 m 够离开余量后让 A* 重新接手。
+ESCAPE_STAGES_BY_VEHICLE = {"x3": ((0.2, None),), "e1_mini": ((0.2, None), (0.2, 0.6))}
+ESCAPE_STAGES = ESCAPE_STAGES_BY_VEHICLE["x3"]
+# 脱困 v2（x3 False = 历史行为，v5 标签逐字节不变）：① 全局规划里「已在余量内」时交给局部脱困而不是
+# 按 err 原地左右换向；② 局部脱困选出射线后，前向 0.4 m 检查用同样的 skip，否则 t=0 永远被判堵、
+# 脱困射线永远走不出去（只会 YAW）。E1 pilot 两种卡法都实测到了。
+ESCAPE_V2 = False
 
 
 def set_vehicle(name):
-    """按载具切换机身半宽；未知载具报错。collect.py 在解析 --vehicle 后调用一次。"""
-    global BODY_HALF_M
+    """按载具切换机身半宽、规划余量与脱困策略；未知载具报错。collect.py 在解析 --vehicle 后调用一次。"""
+    global BODY_HALF_M, ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M, ESCAPE_STAGES, ESCAPE_V2
     if name not in BODY_HALF_BY_VEHICLE:
         raise ValueError(f"未知载具 {name!r}，可选 {sorted(BODY_HALF_BY_VEHICLE)}")
     BODY_HALF_M = BODY_HALF_BY_VEHICLE[name]
+    ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M = CLEARANCE_BY_VEHICLE[name]
+    ESCAPE_STAGES = ESCAPE_STAGES_BY_VEHICLE[name]
+    ESCAPE_V2 = name != "x3"
     return BODY_HALF_M
 
 
@@ -187,7 +205,7 @@ def ray_clear(x, y, th_deg, length, pillars, clearance, half=0.2, samples=33,
     return True
 
 
-def plan_action(x, y, yaw_deg, pillars, lookahead=1.6, clearance=0.36,
+def plan_action(x, y, yaw_deg, pillars, lookahead=1.6, clearance=None,
                 y_gain=Y_GAIN, y_max=30.0, tol=15.0, turn_weight=0.25, grid=5):
     """GT carrot planner：挑一条净空视线，代价 = 偏离目标角 + 0.25×当前转角。
 
@@ -199,14 +217,16 @@ def plan_action(x, y, yaw_deg, pillars, lookahead=1.6, clearance=0.36,
     「从 base 向外试、取第一条空视线」：净空锥很窄时它会从 +43° 一步跳到 -47°，
     机器跟着左右各转 100° 以上、净位移为零（实测 4/8 场景这样卡死）。所以对
     -85°..85° 每 5° 求一次代价取最小；turn_weight 只用来在同分时偏向小转角，
-    不影响「回中线」的方向偏好。全都堵就退回 base。
+    不    影响「回中线」的方向偏好。全都堵就退回 base。
     """
+    if clearance is None:
+        clearance = LOCAL_CLEARANCE_M   # 按载具（set_vehicle）；x3 0.36
     base = max(-y_max, min(y_max, -y_gain * y))
 
-    def best_ray(skip_m):
+    def best_ray(skip_m, length=lookahead):
         aim, best = base, None
         for th in range(-85, 86, grid):
-            if not ray_clear(x, y, th, lookahead, pillars, clearance,
+            if not ray_clear(x, y, th, length, pillars, clearance,
                              skip_clearance_m=skip_m, yaw_deg=yaw_deg):
                 continue
             cost = (abs(th - base)
@@ -216,18 +236,24 @@ def plan_action(x, y, yaw_deg, pillars, lookahead=1.6, clearance=0.36,
         return aim, best
 
     aim, best = best_ray(0.0)
-    if best is None:
-        # 脱困：无人机可能已经漂进 0.36 m 安全余量（T1 实测 8/8 场景因此卡死）。
-        # 允许前 0.2 m 只查真实碰撞盒，离开余量后再要求 full clearance。
-        aim, best = best_ray(0.2)
+    skip_used = 0.0
+    for skip_m, length in ESCAPE_STAGES:
+        if best is not None:
+            break
+        # 脱困：无人机可能已经漂进安全余量（T1 实测 8/8 场景因此卡死）。
+        # 允许前 skip_m 米只查真实碰撞盒，离开余量后再要求 full clearance。
+        aim, best = best_ray(skip_m, length or lookahead)
+        skip_used = skip_m
     # 所有方向都堵时不能默认 base 可走：base 自己可能正对着柱子。
     if best is None and not ray_clear(x, y, base, lookahead, pillars, clearance):
         return SAFE_NEUTRAL
     err = (yaw_deg - aim + 180.0) % 360.0 - 180.0
     if abs(err) > tol:
         return YAW_LEFT if err < 0 else YAW_RIGHT
-    # 局部回退同样不能盲目前进：0.4 m 内会进 0.36 m 余量就先转。
-    if not ray_clear(x, y, yaw_deg, 0.4, pillars, clearance):
+    # 局部回退同样不能盲目前进：0.4 m 内会进余量就先转。脱困 v2 下前 skip_used 米只查机身方框，
+    # 否则在余量内 t=0 必堵，脱困射线永远走不出去。
+    if not ray_clear(x, y, yaw_deg, 0.4, pillars, clearance,
+                     skip_clearance_m=skip_used if ESCAPE_V2 else 0.0, yaw_deg=yaw_deg):
         return YAW_LEFT if err >= 0 else YAW_RIGHT
     return FORWARD_SLOW
 
@@ -324,7 +350,7 @@ def _path_carrot(path, x, y, lookahead):
     return px, py
 
 
-def plan_action_global(x, y, yaw_deg, pillars, clearance=0.5, step=0.1,
+def plan_action_global(x, y, yaw_deg, pillars, clearance=None, step=0.1,
                        lookahead=0.7, tol=25.0, waypoint=None,
                        stop_at_waypoint=False, stop_radius=0.5):
     """A* 全局路径 + 纯追踪；失败时退回局部 plan_action。
@@ -337,6 +363,8 @@ def plan_action_global(x, y, yaw_deg, pillars, clearance=0.5, step=0.1,
     ≤ stop_radius 时输出 SAFE_NEUTRAL；不再去走廊终点。旧 route-choice 的
     “先到 waypoint 再飞终点”保留为默认，只用于复现旧数据。
     """
+    if clearance is None:
+        clearance = ASTAR_CLEARANCE_M   # 按载具（set_vehicle）；x3 0.5
     if not pillars:
         return plan_action(x, y, yaw_deg, [], tol=tol)
     if waypoint is not None:
@@ -365,9 +393,13 @@ def plan_action_global(x, y, yaw_deg, pillars, clearance=0.5, step=0.1,
         return YAW_LEFT
     if err < -tol:
         return YAW_RIGHT
-    # 航向已对准也不能盲目前进：机体有惯性，A* 路径的 0.5 m 余量会被一步
-    # 0.27 m 的漂移吃掉。前向 0.4 m 若进 0.36 m 机身余量，先转再走。
-    if not ray_clear(x, y, yaw_deg, 0.4, pillars, 0.36):
+    # 航向已对准也不能盲目前进：机体有惯性，A* 路径的余量（x3 0.5 m）会被一步
+    # 0.27 m 的漂移吃掉。前向 0.4 m 若进机身余量（x3 0.36 m），先转再走。
+    if not ray_clear(x, y, yaw_deg, 0.4, pillars, LOCAL_CLEARANCE_M):
+        # 已经在余量内时这条检查对任何航向都不过，按 err 换向会左右摆到漂进柱子
+        # （E1 pilot 实测 "LRLRLR…"）；交给局部规划的脱困阶段先离开余量。
+        if ESCAPE_V2 and _point_blocked(x, y, pillars, LOCAL_CLEARANCE_M):
+            return plan_action(x, y, yaw_deg, pillars, tol=tol)
         return YAW_LEFT if err >= 0 else YAW_RIGHT
     return FORWARD_SLOW
 

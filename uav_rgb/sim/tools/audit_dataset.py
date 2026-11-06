@@ -57,7 +57,7 @@ import campus  # noqa: E402
 from instruction import parse_target_color  # noqa: E402
 from split_manifest import SPLIT_SALT, geometry_gid  # noqa: E402
 from teacher import (TEACHER_VERSION, plan_action, plan_action_global,
-                     astar_path, _point_blocked)  # noqa: E402
+                     astar_path, _point_blocked, set_vehicle)  # noqa: E402
 
 # scene.json 里落盘的全局几何常量；与当前 scene_gen 不一致说明改了几何但没
 # bump GEOMETRY_VERSION，gid 会全变、别的闸门查不出新旧混包（A2）。
@@ -221,6 +221,7 @@ def episode_facts(ep_dir):
         # make_counterfactual.py 写进 manifest 的标记；非空说明标签是重算的。
         "counterfactual_of": man.get("counterfactual_of"),
         "dynamics_profile": man.get("dynamics_profile"),
+        "vehicle": man.get("vehicle") or "x3",   # 旧数据没写 vehicle，一律 X3
         # 动作窗口语义：collect.py 只写进 episode_manifest.json，actions.jsonl 行里没有。
         "window_from": man.get("window_from"),
         "gid": gid,
@@ -876,6 +877,9 @@ def audit(facts, pre_excluded=(), quarantined=()):
                 f.get("teacher_version") != TEACHER_VERSION):
             old_version += len(f["steps"])
             continue
+        # 脱困段的机身方框按采集时的载具算：E1 数据用 X3 半宽复算会在 0.36 m 余量内判出不同标签
+        # （pilot 20 集实测 47/800 假不一致，按 e1_mini 复算为 0）
+        set_vehicle(f["vehicle"])
         for s in f["steps"]:
             pb, yb = s["pose_before"], s["yaw_before"]
             if (not isinstance(pb, dict) or yb is None or
