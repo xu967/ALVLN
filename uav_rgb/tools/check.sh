@@ -63,6 +63,22 @@ if [[ "${1:-}" != "--python-only" ]]; then
   g++ -std=c++17 -O2 -Wall -Wextra "$uav_check_root/tools/read_dataset.cpp" \
     -o "$uav_check_fmt/read_dataset"
   "$uav_check_fmt/read_dataset" "$uav_check_fmt/ds/dataset.uavr" --selfcheck >/dev/null
+
+  # cf_sitl（固件在环 E1 MINI）：固件源码在仓库外（CF_DRONE_DIR，默认仓库旁的 ../CF-Drone），
+  # 没有就 SKIP 而不是红。构建目录跟 UAV_RGB_BUILD_DIR 走（根分区装不下，别用仓库内 build/）。
+  uav_check_cfd="${CF_DRONE_DIR:-$uav_check_root/../CF-Drone}"
+  if [[ -f "$uav_check_cfd/CF-Drone.ino" && -f "$uav_check_root/sim/cf_sitl/CMakeLists.txt" ]]; then
+    uav_check_sitl="${UAV_RGB_SITL_BUILD_DIR:-${uav_check_build}-cf-sitl}"
+    cmake -S "$uav_check_root/sim/cf_sitl" -B "$uav_check_sitl" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DCF_DRONE_DIR="$uav_check_cfd"
+    cmake --build "$uav_check_sitl" --parallel "${UAV_RGB_BUILD_JOBS:-8}"
+    ctest --test-dir "$uav_check_sitl" --output-on-failure --no-tests=error
+    # 自检退出码 = 失败场景数；输出（TXT/CSV）落在构建目录，画图另跑 sim/cf_sitl/selftest/plot.py
+    "$uav_check_sitl/cf_sitl_selftest" --params "$uav_check_root/sim/dynamics/e1_mini.json" \
+      --out "$uav_check_sitl/selftest-out"
+  else
+    echo "SKIP: cf_sitl 未检查（CF_DRONE_DIR=$uav_check_cfd 没有 CF-Drone.ino，或 sim/cf_sitl/CMakeLists.txt 缺失）"
+  fi
 else
   echo "SKIP: 用户指定 --python-only，未验证 C++/CUDA 构建和 GPU 测试。"
   "$UAV_RGB_PYTHON" "$uav_check_root/tools/test_join_soft_targets.py"
