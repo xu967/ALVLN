@@ -17,7 +17,11 @@
 - 3DGS P0：Callinstrasse 之前把相机平面当地面，nav z=2 实际离地 3.7 m，已修（nav_to_world t_z −1.6）。按用户决定 FOV 改回 60°（备份 scene.json.bak-20261107-0605-fov649），v3 路线+pilot 守护进程 PID/PGID 607752（`demo-e1-20261107/3dgs-callinstrasse-routes-v3-fov60/run.log`，pilot 输出 `datasets/e1-3dgs-callinstrasse-pilot-v3-fov60`，停：`kill -- -607752`）。
 - 06:10 规划 v2 算法定稿：P1 信念边际化 kino cost-to-go 软标签 + DAgger（主）、P2 双帧 + 深度分带辅助头、P3 探索；RL 教师改为 P1 后的 RL 微调；场景清单与评测协议进 `docs/PLAN_2026-11-07_demo_and_paper.md`。
 - 06:20 第四阶段派出 5 个开发 agent（+SITL 共 6）：TEACHER-P1（`plan_costs` + `teacher_belief.py` + 3DGS `--policy student` + `dagger_pipeline.py`，Callinstrasse 小规模硬/软标签对照）、STUDENT-P2（UAVR 升版双帧/prev-action/深度分带、`in_c=6`、辅助头、逐格 CE 算子、checkpoint v6、infer 协议）、SCENE-A（Wanderland 调研下载接入 + 碰撞代理 v3 网格真值对照）、SCENE-B（Mip-NeRF 360 garden/bicycle 接入 + `tools/scene_probe_quality.py`）、EVAL（SPL/CR/task_success 列、`tools/stats_report.py`、compare_datasets 补全、论文表模板、四组对照表）。worktree `tmp/wt-{teacher-p1,student-p2,scene-wanderland,scene-mipnerf,eval-matrix}`，简报 `tmp/phase3-20261107/BRIEF4.md`。
-- 待办：收 SITL 报告 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
+- 06:40 流水线 DONE rc=0：四组对照 n=11（20 seed 只有 11 个独立几何）：教师 10/11、新 E1 学生 6/11、旧 X3 学生 2/11、盲前进 0/11（`docs/experiments/2026-11-07-e1-demo-plan.md` §3.1）。
+- 07:00 SITL(50cd5ee)、VIZ(b918ee1)、SCENE-A(88357bc) 合并进 main；SITL 库 v2 重建到 `tmp/build-cf-sitl`（旧库 `build-cf-sitl-v1-20261106`），ctest/自检/smoke 全过；`check.sh` 全过（Studio GUI 测试按 DPI 缩放窗口 e325add）；真 Gazebo 1 集教师录像验证新链路（`tmp/gz-validate-20261107/teacher-seed58/videos/seed_58.mp4`）。
+- 07:11 第二轮四组重评守护进程：`e1-pipeline-20261107-0417-eval2`，PGID 694826，20 独立几何 × 4 组，lib v2，`--from eval`（run/ ds/ 软链到 0417）；停：`kill -- -694826`。
+- 主会话 worklog：`docs/worklog/2026-11-07-0515-phase3-main-session.md`。
+- 待办：收 TEACHER-P1 / STUDENT-P2 / SCENE-B / EVAL 报告并合并 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
 
 ---
 
@@ -30,7 +34,7 @@
 
 | 实验 | 启动 | 进程 | 看进度 | 停 |
 | --- | --- | --- | --- | --- |
-| E1 流水线 `tools/e1_pipeline.py`（300 集采集 → 审计 → 打包 → 训练 30 轮 → 20 seed 四组闭环含三视角视频 → 汇总；pilot 已过） | 2026-11-07 04:25（`--from collect`） | PID/PGID 424699，`$DATA_ROOT/uav_rgb/e1-pipeline-20261107-0417/run.pid` | `tail -f …/run.log`；每步状态 `…/status.json`；结束落 `…/DONE`（rc + 最后一步）；评测各组日志 `…/eval-<组>.log`，视频 `…/eval-teacher/videos/`、`…/eval-student-e1-new/videos/` | `kill -- -424699`（collect_parallel 已装 SIGTERM 处理器，会把 gz 一起收掉） |
+| （已完成 06:40）E1 流水线 `tools/e1_pipeline.py`（300 集采集 → 审计 → 打包 → 训练 30 轮 → 20 seed 四组闭环含三视角视频 → 汇总；pilot 已过） | 2026-11-07 04:25（`--from collect`） | PID/PGID 424699，`$DATA_ROOT/uav_rgb/e1-pipeline-20261107-0417/run.pid` | `tail -f …/run.log`；每步状态 `…/status.json`；结束落 `…/DONE`（rc + 最后一步）；评测各组日志 `…/eval-<组>.log`，视频 `…/eval-teacher/videos/`、`…/eval-student-e1-new/videos/` | `kill -- -424699`（collect_parallel 已装 SIGTERM 处理器，会把 gz 一起收掉） |
 | 子 agent「Gazebo forest_e1 场景接入」（随机圆柱森林三档密度接进 scene_gen/collect/eval/audit/e1_pipeline，真 Gazebo 测教师，录 1 段三视角） | 04:19 | 工作目录 `$DATA_ROOT/uav_rgb/tmp/agent-forest/`，断点 `PROGRESS.md` | 同左 | 它自己的 run.pid |
 | 子 agent「3DGS 多路线 demo 与数据」（Callinstrasse ≥4 条带转弯路线、三视角视频、20 集 3DGS E1 pilot 数据集） | 04:19 | 工作目录 `$DATA_ROOT/uav_rgb/tmp/agent-3dgs-routes/`，断点 `PROGRESS.md`；产物 `$DATA_ROOT/uav_rgb/demo-e1-20261107/3dgs-callinstrasse-routes/` | 同左 | 它自己的 run.pid |
 
