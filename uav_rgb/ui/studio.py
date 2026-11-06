@@ -8,10 +8,8 @@ shown unless the user explicitly selects the legacy demo trainer.
 from __future__ import annotations
 
 import argparse
-import base64
 import csv
 import hashlib
-import io
 import json
 import math
 import os
@@ -21,6 +19,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 import uuid
@@ -57,8 +56,30 @@ PYTHON_FOR_SIM = os.path.expanduser(os.environ.get("UAV_RGB_PYTHON", sys.executa
 CAMERA_TOPIC = "/uav/camera"
 CHASE_TOPIC = "/uav/chase_camera"
 TOP_TOPIC = "/uav/top_camera"
-POSE_TOPIC = "/model/x3/pose"
-SIM_STALE_S = 1.0  # 相机/位姿 header stamp 落后当前仿真时间超过此值即标 STALE
+# 载具模型名从世界 SDF 推断（含 <sensor name="camera"> 的 model：x3 或 e1_mini）；推断不到退回 x3。
+# 相机话题不随载具变，位姿话题是 /model/<载具>/pose。
+DEFAULT_VEHICLE = "x3"
+
+# ---- 用户会改的默认值集中在这里（改数值即可，调用链不用动）----
+# 刷新周期
+DASHBOARD_REFRESH_MS = 1000  # 仪表盘/训练事件轮询周期（--refresh-ms 可覆盖；下限 300，更快只会多读文件）
+SIM_TICK_MS = 80             # 仿真页取帧/位姿周期：机载相机 30 Hz 不漏帧够用，再快主线程画不过来
+HISTORY_POLL_MS = 50         # 等后台扫描线程结果的轮询间隔（只影响“历史”刷新出现的延迟）
+SIM_CONNECT_DELAY_MS = 3500  # 启动 Gazebo 后多久订阅话题：server 起来约 2–3 s，早了订阅不到
+SIM_VIEW_PERIOD_S = 0.1      # chase/顶视相机最多 10 Hz 刷新（15 Hz 的 chase 每帧都缩放会拖慢主线程）
+SIM_STALE_S = 1.0            # 相机/位姿 header stamp 落后当前仿真时间超过此值即标 STALE
+SIM_STOP_GRACE_S = 5.0       # 停止 Gazebo：SIGINT→SIGTERM→SIGKILL 每级宽限
+SIM_CLOSE_GRACE_S = 2.0      # 关窗/收到信号时的每级宽限（窗口已没了，不值得多等）
+# 评测 / 演示默认值
+EVAL_EPISODES_DEFAULT = "20"  # 手动闭环评测集数：20 集 Wilson 区间半宽约 ±0.2，再少没统计意义
+AUTO_EVAL_EPISODES = 1        # 训练后自动录像只跑 1 集：是演示录像不是成功率（仪表盘按“单集录像”显示）
+LIVE_STEPS_DEFAULT = "80"     # 实时演示步数，与 eval_closed_loop 的 --steps 默认一致
+LIVE_HOLD_DEFAULT = "1.0"     # 实时演示 Hold 秒；选中权重后会按其训练数据的 hold_s 覆盖
+# Gazebo 渲染后端（启动 Gazebo 前可在仿真页改；进程环境里已有 UAVRGB_RENDER_BACKEND 时以它为准）。
+# 本容器 gpu 后端（EGL）段错误，只能 software；换了机器想用 GPU 就把这里改成 "gpu"。
+DEFAULT_RENDER_BACKEND = "software"
+RENDER_BACKENDS = ("software", "gpu")
+# 录像帧率不在这里：由 sim/tools/record_views.py 的 FPS 决定（评测录像），3DGS 录像 fps = 1/hold。
 ACTION_NAMES = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 ACTIONS = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 
@@ -135,22 +156,65 @@ def read_jsonl(path: Path, max_lines=200000):
     return list(rows)
 
 
-def parse_pose_msg(msg):
+def pose_topic(vehicle):
+    return f"/model/{vehicle}/pose"
+
+
+def _vehicle_from_root(root):
+    """载具 = 第一个带 <sensor name="camera"> 的 model（机载相机只装在载具上）；没有返回 None。"""
+    for model in root.iter("model"):
+        if any(s.get("name") == "camera" for s in model.iter("sensor")):
+            return model.get("name") or None
+    return None
+
+
+def sdf_root(world_path):
+    """解析 SDF 返回根元素；读不了/不是 XML 返回 None。
+
+    uav_rgb_e1.sdf 的注释里有 "--camera-rate" 这样的 "--"：Gazebo（tinyxml2）照常加载，
+    Python expat 按 XML 规范报 not well-formed。严格解析失败就去掉注释再试一次，
+    不然 e1 世界会被当成 x3，地图也画不出障碍物。
+    """
+    try:
+        return ET.parse(str(world_path)).getroot()
+    except OSError:
+        return None
+    except ET.ParseError:
+        pass
+    try:
+        text = Path(world_path).read_text(encoding="utf-8", errors="replace")
+        return ET.fromstring(re.sub(r"<!--.*?-->", "", text, flags=re.S))
+    except (OSError, ET.ParseError):
+        return None
+
+
+def vehicle_from_sdf(world_path):
+    """从世界 SDF 推断载具模型名；文件读不了/没有机载相机时退回 x3。"""
+    if not world_path:
+        return DEFAULT_VEHICLE
+    root = sdf_root(world_path)
+    if root is None:
+        return DEFAULT_VEHICLE
+    return _vehicle_from_root(root) or DEFAULT_VEHICLE
+
+
+def parse_pose_msg(msg, vehicle=DEFAULT_VEHICLE):
     """Return (x,y,z,yaw_rad,sim_time_ns) from gz.msgs.Pose_V / Pose JSON."""
     item = msg
     arr = msg.get("pose") if isinstance(msg, dict) else None
     if isinstance(arr, list) and arr:
-        # Current X3 publisher normally emits one Pose. Prefer a named X3 entry.
-        item = next((p for p in arr if str(p.get("name", "")).lower() in
-                     ("x3", "model/x3", "x3::base_link")), arr[0])
+        # Pose_V 里优先取载具自己那条（模型名 / model/<名> / <名>::base_link），没有就取第一条。
+        names = tuple(n.lower() for n in (vehicle, f"model/{vehicle}", f"{vehicle}::base_link"))
+        item = next((p for p in arr if str(p.get("name", "")).lower() in names), arr[0])
     if not isinstance(item, dict):
         return None
     pos = item.get("position") or {}
     q = item.get("orientation") or {}
     try:
-        x, y, z = (float(pos[k]) for k in ("x", "y", "z"))
+        # protobuf 转 JSON 省略值为 0 的字段：出生点 y=0 时消息里就没有 "y"。
+        x, y, z = (float(pos.get(k, 0.0)) for k in ("x", "y", "z"))
         qx, qy, qz, qw = (float(q.get(k, 0.0)) for k in ("x", "y", "z", "w"))
-    except (KeyError, TypeError, ValueError):
+    except (AttributeError, TypeError, ValueError):
         return None
     yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
     header = item.get("header") or {}
@@ -186,17 +250,18 @@ def parse_sdf_obstacles(world_path):
     """Extract simple top-down collision footprints from an SDF world."""
     if not world_path:
         return []
-    try:
-        root = ET.parse(str(world_path)).getroot()
-    except (OSError, ET.ParseError):
+    root = sdf_root(world_path)
+    if root is None:
         return []
     world = root.find(".//world")
     if world is None:
         return []
+    # 载具自己不是障碍物：以前只排除名为 x3 的模型，换成 e1_mini 后机体会被画成障碍。
+    vehicle = _vehicle_from_root(world) or DEFAULT_VEHICLE
     result = []
     for model in world.findall("model"):
         name = model.get("name", "model")
-        if name in ("x3", "ground_plane") or name.startswith("goal_mark"):
+        if name in (vehicle, "ground_plane") or name.startswith("goal_mark"):
             continue
         model_pose = _pose_values(model.findtext("pose"))
         for link in model.findall("link"):
@@ -355,6 +420,53 @@ def summarize_run(run_dir: Path, run_meta: dict, return_code, state):
     return summary
 
 
+VIDEO_SUFFIXES = (".mp4", ".webm")  # mp4v 只是兼容旧调用；浏览器能放的是 VP8 .webm
+LIVE_STATES = ("running", "starting")
+
+
+def unobserved_state(run_dir: Path):
+    """Studio 没看到退出码的 run：metrics.jsonl 有 done: 就算跑完，否则算未完成。"""
+    events = read_jsonl(Path(run_dir) / "metrics.jsonl")
+    done = any(e.get("event") == "status" and
+               str(e.get("message", "")).lower().startswith("done:") for e in events)
+    return "finished_unobserved" if done else "incomplete_unobserved"
+
+
+def carry_attachments(old_path: Path, summary: dict):
+    """把旧摘要里的评测/演示带进新摘要（训练结束、恢复时重写摘要用）。"""
+    try:
+        old = json.loads(Path(old_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return summary
+    if not isinstance(old, dict):
+        return summary
+    for key in ("closed_loop_evaluations", "live_demos"):
+        if isinstance(old.get(key), list) and old[key]:
+            summary[key] = old[key] + summary.get(key, [])
+    return summary
+
+
+def summary_is_final(path: Path):
+    """摘要存在且状态不是 running/starting。训练中途挂评测写的摘要不算定稿。"""
+    try:
+        summary = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return False
+    return isinstance(summary, dict) and summary.get("status") not in LIVE_STATES
+
+
+def _pid_exists(pid):
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return False  # os.kill(0/-1) 是进程组语义，不能拿来判断单个进程
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass
+    return True
+
+
 RUN_MARKERS = ("metrics.jsonl", "results.csv", "eval.json", "studio_summary.json")
 SKIP_RUN_NAMES = {"simulation_logs"}
 
@@ -363,10 +475,14 @@ def _is_run_dir(path: Path):
     return path.is_dir() and any((path / name).is_file() for name in RUN_MARKERS)
 
 
-def _skip_scan_dir(path: Path):
-    name = path.name
+def _skip_name(name):
+    """扫描时不进入的目录名（run 发现与 eval.json 遍历共用，规则只写一份）。"""
     return (name in SKIP_RUN_NAMES or name.startswith(".") or name.startswith("ep_")
-            or name.endswith(".monitor"))
+            or name.endswith(".monitor") or name == "__pycache__")
+
+
+def _skip_scan_dir(path: Path):
+    return _skip_name(path.name)
 
 
 def discover_runs(roots):
@@ -396,21 +512,41 @@ def discover_runs(roots):
     return sorted(found.values(), key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def _skip_scan_path(path: Path):
-    return any(part.startswith(".") or part.endswith(".monitor") or part.startswith("ep_")
-               or part in SKIP_RUN_NAMES for part in path.parts)
+def _walk_eval_json(root: Path):
+    """找 root 下所有 eval.json；遍历时就剪枝，不进 venv / pip 缓存 / episode 目录。
+
+    以前 rglob 先把 3dgs-venv、teacher-venv 和 5000+ 个 episode 目录全走一遍再过滤，
+    主线程 1.3 s。episode 目录（含 episode_manifest.json）里从不放 eval.json。
+    """
+    found = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        if "eval.json" in filenames:
+            found.append(Path(dirpath) / "eval.json")
+        if "pyvenv.cfg" in filenames or "episode_manifest.json" in filenames:
+            dirnames[:] = []
+            continue
+        dirnames[:] = [d for d in dirnames if not _skip_name(d)]
+    return found
 
 
 def eval_ckpt_state(run_dir: Path, report: dict):
-    """eval 的 ckpt_sha256 与当前 run 的 ckpt_best.bin 是否一致。
+    """eval 的 ckpt_sha256 与它评测的那份权重当前内容是否一致。
 
     'current' / 'stale' / 'unlabeled'。旧 eval 没有 sha 时不能判定，保留为未标注，
-    不拿“路径相同”冒充同一份权重。
+    不拿“路径相同”冒充同一份权重。比对对象是报告里的 ckpt（评末轮 ckpt.bin 就比
+    ckpt.bin）；路径失效时找 run 里同名文件（数据盘搬家），报告没写 ckpt 才退回 ckpt_best.bin。
+    以前一律比 ckpt_best.bin，评 ckpt.bin 的报告永远被判成旧评测藏起来。
     """
     reported = report.get("ckpt_sha256")
     if not reported:
         return "unlabeled"
-    ckpt = Path(run_dir) / "ckpt_best.bin"
+    named = report.get("ckpt")
+    if named:
+        ckpt = Path(named)
+        if not ckpt.is_file():
+            ckpt = Path(run_dir) / ckpt.name
+    else:
+        ckpt = Path(run_dir) / "ckpt_best.bin"
     if not ckpt.is_file():
         return "stale"
     try:
@@ -448,6 +584,46 @@ def eval_rate_context(report: dict):
             f"{requested if requested is not None else '未标注'}")
 
 
+def is_single_episode(report: dict):
+    """1 集评测（训练后自动录像，或 CLI --episodes 1）只是录像，成功率 1.0/0.0 不是 SR。"""
+    if not isinstance(report, dict):
+        return False
+    requested = report.get("episodes_requested")
+    if isinstance(requested, int) and not isinstance(requested, bool):
+        return requested == 1
+    episodes = report.get("per_episode")
+    return isinstance(episodes, list) and len(episodes) == 1
+
+
+def split_formal_evals(paths):
+    """(正式评测 [(path, report|None)], 单集录像 [(path, report)])；读不出的仍算正式（数量不丢）。"""
+    formal, single = [], []
+    for path in paths:
+        try:
+            report = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            report = None
+        if isinstance(report, dict) and is_single_episode(report):
+            single.append((path, report))
+        else:
+            formal.append((path, report if isinstance(report, dict) else None))
+    return formal, single
+
+
+def sr_text(paths):
+    """实验表 Success rate 列：1 条正式评测给数值，多条只报数量，只有单集录像时写“单集录像”。"""
+    formal, single = split_formal_evals(paths)
+    if not formal:
+        return f"单集录像({len(single)})" if single else "—"
+    if len(formal) > 1:
+        return f"多评测({len(formal)})"
+    report = formal[0][1]
+    if report is None:
+        return "—"
+    sr = safe_float(report.get("success_rate"))
+    return f"{sr:.3f}" if sr is not None else "未标注"
+
+
 def eval_fields_for_latest(paths):
     """实验表用：取 mtime 最新的 eval.json 的 task/criterion/window/dynamics。"""
     if not paths:
@@ -472,12 +648,10 @@ def eval_index(roots):
         if not root.is_dir():
             continue
         try:
-            paths = list(root.rglob("eval.json"))
+            paths = _walk_eval_json(root)
         except OSError:
             continue
         for path in paths:
-            if _skip_scan_path(path):
-                continue
             try:
                 report = json.loads(path.read_text(encoding="utf-8"))
             except (OSError, ValueError, RecursionError):
@@ -557,6 +731,33 @@ def run_data_path(run_dir, fallback_config=None):
     if not data:
         data = (fallback_config or {}).get("data")
     return Path(data).expanduser() if data else None
+
+
+def run_eval_protocol(run_dir, fallback_config=None):
+    """run 训练数据的执行协议（dynamics / window_from / hold_s / task / split），(params, 原因)。
+
+    与训练后自动录像共用 auto_eval_params：手动评测和 live demo 以前不传这些参数，
+    cf_stab + hold 0.2 训练的权重会按 x3_velocity + hold 1.0 跑，eval.json 还写 ood=false。
+    steps / template 不在 .uavr meta 里，仍由调用方给。
+    fallback_config 缺省时读该 run 自己的 <run>.monitor/job.json（不用 Studio 内存里上一次训练的 run_meta）。
+    """
+    if fallback_config is None:
+        try:
+            job = json.loads((Path(str(run_dir) + ".monitor") / "job.json").read_text(encoding="utf-8"))
+            fallback_config = job.get("config") if isinstance(job, dict) else None
+        except (OSError, ValueError, RecursionError):
+            fallback_config = None
+    data = run_data_path(run_dir, fallback_config)
+    if data is None:
+        return None, "run 配置里没有训练数据路径"
+    try:
+        meta = video_cli.read_uavr_meta(data)
+    except (OSError, ValueError) as exc:
+        return None, f"读取 {data} 的 .uavr meta 失败（{exc}）"
+    params, reason = video_cli.auto_eval_params(meta)
+    if params is not None:
+        params["data"] = str(data)
+    return params, reason
 
 
 def write_experiment_report(run_dir: Path, summary: dict):
@@ -708,7 +909,7 @@ def _draw_chart(canvas, series, title, percent=False):
 
 
 class StudioApp:
-    def __init__(self, root, run_dir=None, refresh_ms=1000):
+    def __init__(self, root, run_dir=None, refresh_ms=DASHBOARD_REFRESH_MS):
         if tk is None:
             raise RuntimeError("UAV Navigation Studio 需要 tkinter")
         self.root = root
@@ -723,9 +924,11 @@ class StudioApp:
         self.eval_log = None
         self.eval_out: Path | None = None
         self._eval_auto = False
+        self._eval_owner: Path | None = None  # 启动评测时的 run；归档只写它，不写“结束时界面上的 run”
         self._train_started_mono = None
         self._metric_sig = None
         self._events = deque(maxlen=300)  # validation/status/error/class-weight events only
+        self._val_events = []  # val 事件不设上限：Best Val 卡片和验证曲线要全量
         self._latest_train_event = None
         self._event_tail = {}
         self._train_log_state = {}
@@ -742,7 +945,12 @@ class StudioApp:
         self._sim_path = deque(maxlen=3000)
         self._sim_obstacles = []
         self._sim_waypoint = None
+        self._map_static_key = None
+        self._map_world = None
+        self._map_world_sha = None
+        self._map_source = "SDF"
         self._sim_proc = None
+        self._sim_stop = None  # (pgid, stage, deadline)：停止 Gazebo 时的 SIGINT→SIGTERM→SIGKILL 升级
         self._sim_log_handle = None
         self._sim_world_path = None
         self._sim_world_sha256 = None
@@ -753,16 +961,23 @@ class StudioApp:
         self._sim_partition_active = None
         self._live_proc = None
         self._live_out = None
+        self._live_owner = None  # 启动演示时的 run；演示结束只挂到它
         self._live_log = None
         self._live_last_action = None
         self._live_config = None
         self._sim_last_pose_wall = None
         self._sim_frames_seen = {"fpv": 0, "chase": 0, "top": 0}
+        self._sim_last_shown = {}  # key -> 上次显示该路相机帧的墙钟（chase/top 限 10 Hz）
+        self._vehicle = DEFAULT_VEHICLE  # connect_sim 时按所选 world 重新推断
         self._sim_status_var = tk.StringVar(value="仿真未连接")
+        # 流状态每 80 ms 刷新，单独一个变量；事件消息（Gazebo 已退出等）留在 _sim_status_var 不被覆盖。
+        self._sim_stream_var = tk.StringVar(value="")
         self._training_status_var = tk.StringVar(value="空闲")
         self._eval_status_var = tk.StringVar(value="未运行闭环评测")
         self._scan_sig = None
         self._scan_cache = None
+        self._history_thread = None
+        self._history_again = False
         self._eval_index = {}
         self._standalone_evals = []
         self._eval_report = None
@@ -777,7 +992,7 @@ class StudioApp:
         self._build_header()
         self._build_tabs()
         self._build_statusbar()
-        # 先扫描一次，Dashboard 才能从 eval.json 读到闭环 SR；扫描只在启动/按钮时发生。
+        # 启动时扫描一次（后台线程），Dashboard 的闭环 SR 卡片在扫描结果回来后刷新。
         self.refresh_history(force=True)
         if self.run_dir:
             self.load_run(self.run_dir)
@@ -901,6 +1116,8 @@ class StudioApp:
         ttk.Label(bar, textvariable=self._training_status_var).pack(side="left")
         ttk.Label(bar, text="  ·  ", style="Muted.TLabel").pack(side="left")
         ttk.Label(bar, textvariable=self._sim_status_var).pack(side="left")
+        ttk.Label(bar, textvariable=self._sim_stream_var, style="Muted.TLabel").pack(
+            side="left", padx=(8, 0))
         ttk.Label(bar, text="  ·  ", style="Muted.TLabel").pack(side="left")
         ttk.Label(bar, textvariable=self._eval_status_var).pack(side="left")
 
@@ -1081,8 +1298,15 @@ class StudioApp:
         ttk.Button(controls, text="选择…", command=self.choose_scene_meta).grid(row=1, column=2)
         ttk.Label(controls, text="GZ_PARTITION（空=default；启动时自动隔离）").grid(row=2, column=0, sticky="w", pady=3)
         # 按钮实际启动 gz sim -s（headless server）；容器内无 NVIDIA EGL，GUI 必失败。
-        ttk.Entry(controls, textvariable=self.partition_var, width=28).grid(
-            row=2, column=1, sticky="w", padx=5)
+        part_row = ttk.Frame(controls)
+        part_row.grid(row=2, column=1, columnspan=2, sticky="w", padx=5)
+        ttk.Entry(part_row, textvariable=self.partition_var, width=28).pack(side="left")
+        # 渲染后端：进程环境里已有 UAVRGB_RENDER_BACKEND 就沿用，否则用文件顶部的默认值。
+        self.render_backend_var = tk.StringVar(
+            value=os.environ.get("UAVRGB_RENDER_BACKEND") or DEFAULT_RENDER_BACKEND)
+        ttk.Label(part_row, text="渲染后端").pack(side="left", padx=(10, 4))
+        ttk.Combobox(part_row, textvariable=self.render_backend_var, values=RENDER_BACKENDS,
+                     width=9, state="readonly").pack(side="left")
         self.scene_task_var = tk.StringVar(value="campus")
         self.scene_seed_var = tk.StringVar(value="42")
         ttk.Label(controls, text="快速生成场景").grid(row=3, column=0, sticky="w", pady=3)
@@ -1104,8 +1328,8 @@ class StudioApp:
         live.grid(row=1, column=0, sticky="ew", pady=(8, 8))
         live.columnconfigure(1, weight=1)
         self.ckpt_var = tk.StringVar(value="")
-        self.live_steps_var = tk.StringVar(value="80")
-        self.live_hold_var = tk.StringVar(value="1.0")
+        self.live_steps_var = tk.StringVar(value=LIVE_STEPS_DEFAULT)
+        self.live_hold_var = tk.StringVar(value=LIVE_HOLD_DEFAULT)
         ttk.Label(live, text="Checkpoint").grid(row=0, column=0, sticky="w")
         ttk.Entry(live, textvariable=self.ckpt_var).grid(row=0, column=1, sticky="ew", padx=5)
         ttk.Button(live, text="选择…", command=self.choose_checkpoint).grid(row=0, column=2)
@@ -1124,11 +1348,12 @@ class StudioApp:
 
         views = ttk.Frame(tab)
         views.grid(row=2, column=0, sticky="nsew")
-        views.columnconfigure(0, weight=1)
-        views.columnconfigure(1, weight=1)
+        # uniform：格子按权重分配，不按各自当前图像大小；否则小面板缩图后请求更小，越缩越小。
+        views.columnconfigure(0, weight=1, uniform="sim_col")
+        views.columnconfigure(1, weight=1, uniform="sim_col")
         # 上排 3:2 下排：Canvas 的 height=300 请求高度会把上排挤成标题条。
-        views.rowconfigure(0, weight=3)
-        views.rowconfigure(1, weight=2)
+        views.rowconfigure(0, weight=3, uniform="sim_row")
+        views.rowconfigure(1, weight=2, uniform="sim_row")
         self.chase_panel, self.chase_label = self._camera_panel(
             views, "第三人称跟随视角 · CHASE CAMERA", "chase")
         self.chase_panel.grid(row=0, column=0, sticky="nsew", padx=(0, 4), pady=(0, 4))
@@ -1201,7 +1426,7 @@ class StudioApp:
         eval_box.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self.eval_task_var = tk.StringVar(value="base")
         self.eval_split_var = tk.StringVar(value="test")
-        self.eval_episodes_var = tk.StringVar(value="20")
+        self.eval_episodes_var = tk.StringVar(value=EVAL_EPISODES_DEFAULT)
         self.eval_appearance_var = tk.StringVar(value="v1")
         ttk.Label(eval_box, text="Task（必须匹配训练数据）").pack(side="left")
         ttk.Combobox(eval_box, textvariable=self.eval_task_var,
@@ -1355,7 +1580,9 @@ class StudioApp:
         }
         self.run_meta = run_meta
         write_json_atomic(sidecar / "job.json", run_meta)
-        write_json_atomic(sidecar / "lifecycle.json", {"status": "starting", "started_at": run_meta["started_at"]})
+        # studio_pid：别的 Studio 窗口据此判断这个 starting 是否有人在管，不把它当失联回收。
+        write_json_atomic(sidecar / "lifecycle.json", {"status": "starting", "started_at": run_meta["started_at"],
+                                                       "studio_pid": os.getpid()})
         log_path = sidecar / "train.log"
         self.proc_log = log_path.open("ab", buffering=0)
         try:
@@ -1385,6 +1612,7 @@ class StudioApp:
         self._train_started_mono = time.monotonic()
         self._metric_sig = None
         self._events.clear()
+        self._val_events = []
         self._latest_train_event = None
         self._event_tail = {}
         self._train_log_state = {}
@@ -1432,6 +1660,8 @@ class StudioApp:
         state = "finished" if rc == 0 else ("stopped_or_interrupted" if rc in (-2, 130, 143) else "failed")
         if self.run_dir is not None:
             summary = summarize_run(self.run_dir, self.run_meta, rc, state)
+            # 训练中途完成的评测/演示已写进旧摘要；整份覆盖会把它们从报告里抹掉。
+            carry_attachments(self.run_dir / "studio_summary.json", summary)
             write_json_atomic(self.run_dir / "studio_summary.json", summary)
             write_experiment_report(self.run_dir, summary)
             if self.sidecar:
@@ -1460,47 +1690,39 @@ class StudioApp:
                 except Exception as exc:  # noqa: BLE001 - 自动录像不能影响训练结果
                     self._eval_auto = False
                     self._auto_eval_note(
-                        f"自动录像失败：{type(exc).__name__}: {exc}")
+                        f"自动录像失败：{type(exc).__name__}: {exc}", self.run_dir)
         self.start_train_btn.configure(state="normal")
         self.stop_train_btn.configure(state="disabled")
 
     def _start_auto_eval(self, ckpt, config):
         """训练成功后自动跑 1 集闭环录像；失败只写 note，不改训练状态。"""
-        data = run_data_path(self.run_dir, config)
-        if data is None:
-            self._auto_eval_note("自动录像跳过：run 配置里没有训练数据路径")
-            return
-        try:
-            meta = video_cli.read_uavr_meta(data)
-        except (OSError, ValueError) as exc:
-            self._auto_eval_note(f"自动录像跳过：读取 {data} 的 .uavr meta 失败（{exc}）")
-            return
-        params, reason = video_cli.auto_eval_params(meta)
+        run_dir = self.run_dir
+        params, reason = run_eval_protocol(run_dir, config)
         if params is None:
-            self._auto_eval_note(f"自动录像跳过：{reason}")
+            self._auto_eval_note(f"自动录像跳过：{reason}", run_dir)
             return
-        params["episodes"] = 1
-        params["data"] = str(data)
+        params["episodes"] = AUTO_EVAL_EPISODES
         if INFER_BIN.is_file():
             params["infer_bin"] = str(INFER_BIN)
         self._eval_auto = True
         if not self.start_closed_loop_eval(auto=params):
             self._eval_auto = False
-            self._auto_eval_note("自动录像未启动（已有评测在运行或参数无效）")
+            self._auto_eval_note("自动录像未启动（已有评测在运行或参数无效）", run_dir)
 
-    def _auto_eval_note(self, text):
-        """自动录像的失败只进 note 和训练日志，不把训练改成失败。"""
+    def _auto_eval_note(self, text, run_dir):
+        """自动录像的失败只进 note 和训练日志，不把训练改成失败；只写这次录像所属的 run。"""
         self._append_train_log(f"[studio] {text}")
-        if not self.run_dir:
+        if not run_dir:
             return
-        path = self.run_dir / "studio_summary.json"
+        run_dir = Path(run_dir)
+        path = run_dir / "studio_summary.json"
         try:
             summary = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             return
         summary.setdefault("notes", []).append(text)
         write_json_atomic(path, summary)
-        write_experiment_report(self.run_dir, summary)
+        write_experiment_report(run_dir, summary)
 
     def _refresh_train_log(self):
         if not self.sidecar:
@@ -1545,15 +1767,20 @@ class StudioApp:
         if not force and sig == self._metric_sig:
             return
         self._rows = read_training_rows(self.run_dir)
-        events, reset = monitor_io.tail_events(str(self.run_dir), self._event_tail)
+        # 全量读：只读末尾 1 MiB / 200 条时，长 run 的 val 事件几乎全被 train_step 挤掉。
+        events, reset = monitor_io.tail_events(str(self.run_dir), self._event_tail,
+                                               limit=None, window=None)
         if reset:
             self._events.clear()
+            self._val_events = []
             self._latest_train_event = None
         for event in events:
             if event.get("event") == "train_step":
                 self._latest_train_event = event
-            else:
-                self._events.append(event)
+                continue
+            self._events.append(event)
+            if event.get("event") == "validation" and event.get("split") == "val":
+                self._val_events.append(event)
         self._metric_sig = sig
         self._update_dashboard()
         self._update_event_text()
@@ -1591,43 +1818,45 @@ class StudioApp:
         return len(gids) if gids else None
 
     def _update_sr_card(self):
-        paths = self._run_eval_paths(self.run_dir)
+        formal, single = split_formal_evals(self._run_eval_paths(self.run_dir))
         var, sub = self.card_vars["closed_loop_sr"], self.hero_sub["closed_loop_sr"]
-        if not paths:
-            var.set("—")
-            sub.set("尚无闭环评测 · 训练分类指标 ≠ 闭环成功率")
+        extra = f" · 另有 {len(single)} 份单集录像未计入" if single else ""
+        if not formal:
+            if single:
+                var.set("单集录像")
+                sub.set(f"{len(single)} 份 1 集录像，不是成功率 · 需要多集正式闭环评测")
+            else:
+                var.set("—")
+                sub.set("尚无闭环评测 · 训练分类指标 ≠ 闭环成功率")
             return
-        if len(paths) > 1:
-            var.set(f"多评测({len(paths)})")
+        if len(formal) > 1:
+            var.set(f"多评测({len(formal)})")
             detail = "多评测未合并，口径可能不同；在 Experiments 页选择具体报告"
-            try:
-                latest = json.loads(Path(paths[0]).read_text(encoding="utf-8"))
+            latest = formal[0][1]
+            if latest is not None:
                 maps = self._report_maps(latest)
                 detail = (f"最新：{eval_rate_context(latest)} · "
                           f"{maps if maps is not None else '—'} 张图 · " + detail)
-            except (OSError, ValueError, RecursionError):
-                pass
-            sub.set(detail)
+            sub.set(detail + extra)
             return
-        try:
-            report = json.loads(Path(paths[0]).read_text(encoding="utf-8"))
-        except (OSError, ValueError, RecursionError):
+        report = formal[0][1]
+        if report is None:
             var.set("—")
-            sub.set("eval.json 无法读取")
+            sub.set("eval.json 无法读取" + extra)
             return
         sr = safe_float(report.get("success_rate"))
         maps = self._report_maps(report)
         var.set(f"{sr:.3f}" if sr is not None else "未标注")
         # 报告必须同时给出判据、请求集成功率、完成率和失败数：三者分母不同，
         # 只报 success_rate 会让“被跳过的集”看起来像成功。
-        sub.set(f"{eval_rate_context(report)} · {maps if maps is not None else '—'} 张图")
+        sub.set(f"{eval_rate_context(report)} · {maps if maps is not None else '—'} 张图" + extra)
 
     def _update_dashboard(self):
         rows = self._rows
         valid = [r for r in rows if r.get("epoch") is not None]
         last = valid[-1] if valid else {}
         evs = list(self._events)
-        vals = [e for e in evs if e.get("event") == "validation" and e.get("split") == "val"]
+        vals = self._val_events
         tests = [e for e in evs if e.get("event") == "validation" and e.get("split") == "test"]
         def metric_key(e):
             v = safe_float(e.get("macro_f1"))
@@ -1760,8 +1989,7 @@ class StudioApp:
             {"name": "train CE", "color": "#60A5FA", "points": list(zip(epochs, [r["train_ce"] for r in self._rows]))},
             {"name": "dev CE", "color": "#F59E0B", "points": list(zip(epochs, [r["dev_ce"] for r in self._rows]))},
         ], "LOSS CURVE · cross entropy")
-        evs = list(self._events)
-        vals = [e for e in evs if e.get("event") == "validation" and e.get("split") == "val"]
+        vals = self._val_events
         _draw_chart(self.acc_canvas, [
             {"name": "accuracy", "color": "#34D399", "points": [(i + 1, safe_float(e.get("action_accuracy"))) for i, e in enumerate(vals)]},
             {"name": "macro F1", "color": "#A78BFA", "points": [(i + 1, safe_float(e.get("macro_f1"))) for i, e in enumerate(vals)]},
@@ -1787,14 +2015,33 @@ class StudioApp:
         path = filedialog.askopenfilename(title="选择学生 checkpoint",
                                           filetypes=[("UAV RGB checkpoint", "*.bin"), ("All", "*.*")])
         if path:
-            self.ckpt_var.set(path)
+            self._set_live_ckpt(Path(path))
+
+    def _ckpt_protocol(self, ckpt):
+        """权重所在 run（ckpt 的父目录）的执行协议。"""
+        return run_eval_protocol(Path(ckpt).expanduser().resolve().parent)
+
+    def _set_live_ckpt(self, ckpt):
+        """选中权重时把 Hold 预填成训练数据的 hold_s：演示窗口与训练协议一致，用户仍可改。"""
+        self.ckpt_var.set(str(ckpt))
+        protocol, _reason = self._ckpt_protocol(ckpt)
+        if protocol is not None and protocol.get("hold_s") is not None:
+            self.live_hold_var.set(f"{float(protocol['hold_s']):g}")
 
     def _load_world_geometry(self):
-        self._sim_obstacles = parse_sdf_obstacles(self.world_var.get())
+        raw = self.world_var.get().strip()
+        world = Path(raw).expanduser().resolve() if raw else None
+        self._sim_obstacles = parse_sdf_obstacles(world) if world else []
+        self._map_world, self._map_source = world, "SDF"
+        try:
+            self._map_world_sha = sha256_file(world) if world and world.is_file() else None
+        except OSError:
+            self._map_world_sha = None
         meta = load_scene_meta(self.meta_var.get())
         wp = meta.get("waypoint") if isinstance(meta.get("waypoint"), dict) else None
         self._sim_waypoint = (safe_float(wp.get("x")), safe_float(wp.get("y"))) if wp else None
         if not self._sim_obstacles and isinstance(meta.get("pillars"), list):
+            self._map_source = "metadata"
             for p in meta["pillars"]:
                 try:
                     sx, sy = p.get("size", [0.4, 0.4, 1.0])[:2]
@@ -1803,6 +2050,7 @@ class StudioApp:
                                                 "sx": float(sx), "sy": float(sy), "yaw": 0.0})
                 except (KeyError, TypeError, ValueError):
                     continue
+        self._map_static_key = None  # 障碍物/目标变了，静态层必须重画
         self._draw_topdown()
 
     def _set_partition(self, partition):
@@ -1874,17 +2122,22 @@ class StudioApp:
         if self._sim_proc is not None and self._sim_proc.poll() is None:
             messagebox.showinfo("Gazebo 已运行", "当前 Studio 已经启动一个 Gazebo 实例。")
             return
+        if self._sim_stop is not None:
+            messagebox.showinfo("Gazebo 仍在停止", "上一个 Gazebo 进程组还没退出，请稍候再启动。")
+            return
         world = Path(self.world_var.get()).expanduser().resolve()
         if not world.is_file():
             messagebox.showerror("World 不存在", f"找不到 SDF：{world}")
             return
         partition = self.partition_var.get().strip() or ("uavrgb_studio_" + uuid.uuid4().hex[:10])
         self.partition_var.set(partition)
+        owns_partition = self._sim_partition_active is None
         self._set_partition(partition)
         worlds_resource = str(REPO_ROOT / "sim" / "worlds")
         existing_resources = os.environ.get("GZ_SIM_RESOURCE_PATH", "")
         resources = [worlds_resource] + [x for x in existing_resources.split(os.pathsep) if x]
         os.environ["GZ_SIM_RESOURCE_PATH"] = os.pathsep.join(dict.fromkeys(resources))
+        backend = self._apply_render_backend()
         try:
             # 复用采集脚本的 EGL/XDG 环境；容器里 GUI 渲染会失败，统一走 headless server。
             import collect_parallel
@@ -1897,6 +2150,8 @@ class StudioApp:
                 except OSError:
                     pass
         except (ImportError, ValueError, OSError) as exc:
+            if owns_partition:  # 失败要撤销本次 _set_partition，否则之后连接被锁在这个分区
+                self._restore_partition()
             self._sim_status_var.set(f"Gazebo 环境准备失败：{exc}")
             messagebox.showerror("Gazebo 环境准备失败", str(exc))
             return
@@ -1907,6 +2162,8 @@ class StudioApp:
             log_path = log_dir / (datetime.now().strftime("%Y%m%d-%H%M%S") + "-gazebo.log")
             self._sim_log_handle = log_path.open("ab", buffering=0)
         except OSError as exc:
+            if owns_partition:
+                self._restore_partition()
             self._sim_status_var.set(f"Gazebo 日志无法写入：{exc}")
             messagebox.showerror("数据目录不可用", f"无法写入仿真日志：\n{log_dir}\n\n{exc}")
             return
@@ -1929,21 +2186,39 @@ class StudioApp:
             self.disconnect_sim()
             self._sim_status_var.set(f"Gazebo 启动失败：{exc}")
             return
-        self._sim_status_var.set(f"Gazebo headless 启动中 · partition={partition}")
+        self._sim_status_var.set(f"Gazebo headless 启动中 · partition={partition} · 渲染={backend}")
         self._load_world_geometry()
-        self.root.after(3500, self.connect_sim)
+        self.root.after(SIM_CONNECT_DELAY_MS, lambda proc=self._sim_proc: self._connect_after_start(proc))
+
+    def _apply_render_backend(self):
+        """把界面选的渲染后端写进本进程环境并返回。
+
+        collect_parallel.gz_env 只认环境变量；评测/演示子进程继承本进程环境再各自起 Gazebo，
+        这样三处用同一个后端。空值退回 DEFAULT_RENDER_BACKEND；非法值留给 gz_env 报错。
+        """
+        backend = self.render_backend_var.get().strip() or DEFAULT_RENDER_BACKEND
+        os.environ["UAVRGB_RENDER_BACKEND"] = backend
+        return backend
+
+    def _connect_after_start(self, proc):
+        # 3.5 s 内 Gazebo 已退出（坏 SDF 等）就不再连接，否则“已连接·等待相机帧”会盖掉退出原因。
+        if self._sim_proc is proc and proc.poll() is None:
+            self.connect_sim()
 
     def connect_sim(self):
         if self._sim_subs:
             self.disconnect_sim()
         partition = self.partition_var.get().strip()
         self._set_partition(partition or None)
+        # 位姿话题跟着所选 world 里的载具走（x3 → /model/x3/pose，e1_mini → /model/e1_mini/pose）。
+        self._vehicle = vehicle_from_sdf(self.world_var.get().strip())
         new_subs = {}
         try:
             new_subs["fpv"] = gz_io.TopicSub(CAMERA_TOPIC, buf=3)
             new_subs["chase"] = gz_io.TopicSub(CHASE_TOPIC, buf=3)
             new_subs["top"] = gz_io.TopicSub(TOP_TOPIC, buf=3)
-            new_subs["pose"] = gz_io.TopicSub(POSE_TOPIC, buf=8, stamp_fn=pose_stamp_ns)
+            new_subs["pose"] = gz_io.TopicSub(pose_topic(self._vehicle), buf=8,
+                                              stamp_fn=pose_stamp_ns)
             self._sim_subs = new_subs
         except Exception as exc:
             for sub in new_subs.values():
@@ -1992,47 +2267,113 @@ class StudioApp:
                 status.set("视角已断开")
         if hasattr(self, "top_canvas"):
             self._draw_topdown()
+        self._restore_partition()
+        self._sim_stream_var.set("")
+        self._sim_status_var.set("视角已断开")
+
+    def _restore_partition(self):
         if self._sim_partition_active is not None:
             if self._sim_partition_old is None:
                 os.environ.pop("GZ_PARTITION", None)
             else:
                 os.environ["GZ_PARTITION"] = self._sim_partition_old
             self._sim_partition_active = None
-        self._sim_status_var.set("视角已断开")
 
-    def stop_gazebo(self):
+    def stop_gazebo(self, grace_s=None):
+        if self._sim_stop is not None:
+            return  # 已在升级流程里，重复点击不重置计时
         if self._sim_proc is None or self._sim_proc.poll() is not None:
             self._sim_status_var.set("没有由 Studio 启动的 Gazebo 进程")
             return
+        grace = SIM_STOP_GRACE_S if grace_s is None else grace_s
+        # start_new_session=True，pgid == pid；领头进程退出后仍按这个组号收尾。
+        pgid = self._sim_proc.pid
+        self._signal_sim_group(pgid, signal.SIGINT)
+        self._sim_stop = (pgid, 0, time.monotonic() + grace, grace)
+        self._sim_status_var.set("已请求停止 Studio 启动的 Gazebo（SIGINT）")
+
+    def _signal_sim_group(self, pgid, sig):
         try:
-            os.killpg(os.getpgid(self._sim_proc.pid), signal.SIGINT)
-        except (ProcessLookupError, PermissionError, OSError):
-            try:
-                self._sim_proc.terminate()
-            except OSError:
-                pass
-        self._sim_status_var.set("已请求停止 Studio 启动的 Gazebo")
+            os.killpg(pgid, sig)
+        except ProcessLookupError:
+            pass
+        except (PermissionError, OSError):
+            if self._sim_proc is not None:
+                try:
+                    self._sim_proc.send_signal(sig)
+                except OSError:
+                    pass
+
+    def _poll_sim_stop(self):
+        """停止升级：SIGINT 宽限后 SIGTERM，再宽限后 SIGKILL。返回进程组是否还活着。"""
+        if self._sim_stop is None:
+            return False
+        pgid, stage, deadline, grace = self._sim_stop
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            self._sim_stop = None
+            self._sim_status_var.set("Studio 启动的 Gazebo 已停止")
+            return False
+        except PermissionError:
+            pass
+        if time.monotonic() < deadline:
+            return True
+        if stage == 0:
+            self._signal_sim_group(pgid, signal.SIGTERM)
+            self._sim_stop = (pgid, 1, time.monotonic() + grace, grace)
+            self._sim_status_var.set("Gazebo 未响应 SIGINT，已发 SIGTERM")
+        elif stage == 1:
+            self._signal_sim_group(pgid, signal.SIGKILL)
+            self._sim_stop = (pgid, 2, time.monotonic() + grace, grace)
+            self._sim_status_var.set("Gazebo 未响应 SIGTERM，已发 SIGKILL")
+        else:
+            self._sim_stop = None
+            self._sim_status_var.set(f"Gazebo 进程组 {pgid} SIGKILL 后仍在，请手动检查")
+            return False
+        return True
+
+    def _stop_gazebo_blocking(self, grace_s=SIM_CLOSE_GRACE_S):
+        """关窗/信号退出用：同一升级流程，但就地等完，窗口销毁后没有 tick 来收尾。"""
+        if self._sim_stop is not None:  # 交互停止已在进行：沿用当前阶段，宽限缩短到关窗用的值
+            pgid, stage, deadline, _ = self._sim_stop
+            self._sim_stop = (pgid, stage, min(deadline, time.monotonic() + grace_s), grace_s)
+        self.stop_gazebo(grace_s)
+        while self._sim_stop is not None:
+            if self._sim_proc is not None and self._sim_proc.poll() is not None:
+                self._sim_proc = None
+            if not self._poll_sim_stop():
+                break
+            time.sleep(0.05)
 
     def _show_camera_frame(self, key, msg):
+        label = {"fpv": self.fpv_label, "chase": self.chase_label,
+                 "top": self.topcam_label}[key]
         try:
-            w, h, nch, png = save_frame.png_bytes(msg)
-            label = {"fpv": self.fpv_label, "chase": self.chase_label,
-                     "top": self.topcam_label}[key]
-            label.update_idletasks()
-            max_w = max(1, label.winfo_width() - 12)
-            max_h = max(1, label.winfo_height() - 12)
+            w, h, nch, rows = save_frame.decode(msg)
+            # 不调 update_idletasks()：上一轮布局后的尺寸就够用，每帧强制布局是卡顿来源之一。
+            # 未映射的 label 宽高是 1，此时不缩放，避免把首帧缩成 1 像素。
+            lw, lh = label.winfo_width(), label.winfo_height()
+            max_w = lw - 12 if lw > 12 else w
+            max_h = lh - 12 if lh > 12 else h
+            scale = min(1.0, max_w / w, max_h / h)
             if Image is not None and ImageTk is not None:
-                image = Image.open(io.BytesIO(png)).convert("RGB")
-                scale = min(1.0, max_w / max(1, w), max_h / max(1, h))
+                image = Image.frombytes("RGB", (w, h), rows, "raw",
+                                        "RGBX" if nch == 4 else "RGB")
                 if scale < 0.999:
-                    resampling = getattr(Image, "Resampling", Image)
                     image = image.resize((max(1, int(w * scale)), max(1, int(h * scale))),
-                                         getattr(resampling, "LANCZOS", 1))
+                                         getattr(Image, "Resampling", Image).BILINEAR)
                 photo = ImageTk.PhotoImage(image)
             else:
-                photo = tk.PhotoImage(data=base64.b64encode(png).decode("ascii"), format="png")
+                # 无 PIL（launch_studio.sh 默认的 /usr/bin/python3）：PPM 不压缩，Tk 直接拷贝像素。
+                if nch == 4:
+                    rgb = bytearray(w * h * 3)
+                    for c in range(3):
+                        rgb[c::3] = rows[c::4]
+                    rows = bytes(rgb)
+                photo = tk.PhotoImage(data=b"P6 %d %d 255\n" % (w, h) + rows, format="ppm")
                 factor = max(1, math.ceil(max(w / max_w, h / max_h)))
-                if factor > 1:  # 无 PIL 时至少整数降采样，避免超出面板被裁切
+                if factor > 1:  # 无 PIL 时只能整数降采样，避免超出面板被裁切
                     photo = photo.subsample(factor, factor)
             label.configure(image=photo, text="")
             self._sim_photos[key] = photo
@@ -2041,14 +2382,13 @@ class StudioApp:
             if stamp:
                 self._sim_frame_stamps[key] = stamp
         except Exception as exc:
-            label = {"fpv": self.fpv_label, "chase": self.chase_label,
-                     "top": self.topcam_label}[key]
             label.configure(text=f"图像解码失败\n{exc}", image="")
             self._sim_photos.pop(key, None)
 
     def _sim_tick(self):
         try:
             if self._sim_subs:
+                now = time.monotonic()
                 for key in ("fpv", "chase", "top"):
                     sub = self._sim_subs.get(key)
                     if not sub:
@@ -2056,24 +2396,17 @@ class StudioApp:
                     frames = sub.frames()
                     if frames:
                         seq, msg = frames[-1]
-                        if seq != self._sim_last_seq[key]:
+                        # chase/顶视只是观感画面，限 10 Hz；机载画面是模型输入，每帧都显示。
+                        throttled = (key != "fpv" and
+                                     now - self._sim_last_shown.get(key, -1.0) < SIM_VIEW_PERIOD_S)
+                        if seq != self._sim_last_seq[key] and not throttled:
                             self._sim_last_seq[key] = seq
+                            self._sim_last_shown[key] = now
                             self._show_camera_frame(key, msg)
                 pose_msg = self._sim_subs["pose"].latest()
-                pose = parse_pose_msg(pose_msg) if pose_msg else None
+                pose = parse_pose_msg(pose_msg, self._vehicle) if pose_msg else None
                 if pose:
-                    x, y, z, yaw, sim_ns = pose
-                    prev_ns = self._sim_pose[4] if self._sim_pose else None
-                    if sim_ns != prev_ns:
-                        self._sim_last_pose_wall = time.monotonic()
-                    self._sim_pose = pose
-                    if not self._sim_path or math.hypot(x - self._sim_path[-1][0], y - self._sim_path[-1][1]) > 0.005:
-                        self._sim_path.append((x, y))
-                    self.sim_info_var.set(
-                        f"Position  x={x:.2f} m  y={y:.2f} m  z={z:.2f} m    "
-                        f"Yaw={math.degrees(yaw):.1f}°    Sim time={sim_ns / 1e9:.2f} s    "
-                        f"Path points={len(self._sim_path)}")
-                    self._draw_topdown()
+                    self._ingest_pose(pose)
                 now_ns = self._sim_pose[4] if self._sim_pose else None
                 pose_stale = (self._sim_pose is not None and
                               self._sim_last_pose_wall is not None and
@@ -2096,7 +2429,7 @@ class StudioApp:
                     statuses.append("pose:STALE")
                 else:
                     statuses.append("pose:OK")
-                self._sim_status_var.set("Gazebo " + " · ".join(statuses))
+                self._sim_stream_var.set("Gazebo " + " · ".join(statuses))
             if self._live_proc is not None:
                 rc = self._live_proc.poll()
                 self._update_live_action()
@@ -2114,11 +2447,32 @@ class StudioApp:
                 if self._sim_log_handle:
                     self._sim_log_handle.close()
                     self._sim_log_handle = None
+            # 放在 poll() 之后：先回收领头进程，killpg(pgid, 0) 才不会把僵尸当成还活着。
+            self._poll_sim_stop()
         except Exception:
             traceback.print_exc()
         finally:
             if not self._closing:
-                self.root.after(80, self._sim_tick)
+                self.root.after(SIM_TICK_MS, self._sim_tick)
+
+    def _ingest_pose(self, pose):
+        x, y, z, yaw, sim_ns = pose
+        prev = self._sim_pose
+        if prev is not None and pose == prev:
+            return  # 同一条位姿消息：不追加轨迹，也不重画地图
+        if prev is not None and 0 < sim_ns < prev[4]:
+            # 仿真时间倒退 = 世界重置/重启：新一集的轨迹不能接到上一集末尾。
+            self._sim_path.clear()
+        if prev is None or sim_ns != prev[4]:
+            self._sim_last_pose_wall = time.monotonic()
+        self._sim_pose = pose
+        if not self._sim_path or math.hypot(x - self._sim_path[-1][0], y - self._sim_path[-1][1]) > 0.005:
+            self._sim_path.append((x, y))
+        self.sim_info_var.set(
+            f"Position  x={x:.2f} m  y={y:.2f} m  z={z:.2f} m    "
+            f"Yaw={math.degrees(yaw):.1f}°    Sim time={sim_ns / 1e9:.2f} s    "
+            f"Path points={len(self._sim_path)}")
+        self._draw_topdown()
 
     def _camera_age_text(self, key, now_ns):
         stamp = self._sim_frame_stamps.get(key)
@@ -2133,42 +2487,87 @@ class StudioApp:
             stale = True
         return f"last sim {stamp / 1e9:.2f} s · age {age:.2f} s" + (" · STALE" if stale else "")
 
-    def _draw_topdown(self):
-        if not hasattr(self, "top_canvas"):
-            return
-        c = self.top_canvas
-        c.delete("all")
-        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
-        margin = 34
+    def _map_bounds(self):
+        """地图范围取整到米：轨迹每帧延伸几毫米时范围不变，静态层就不用重画。"""
         xs = [o["x"] for o in self._sim_obstacles]
         ys = [o["y"] for o in self._sim_obstacles]
         if self._sim_path:
-            xs += [p[0] for p in self._sim_path]
-            ys += [p[1] for p in self._sim_path]
+            xs += (min(p[0] for p in self._sim_path), max(p[0] for p in self._sim_path))
+            ys += (min(p[1] for p in self._sim_path), max(p[1] for p in self._sim_path))
         if self._sim_waypoint:
             xs.append(self._sim_waypoint[0]); ys.append(self._sim_waypoint[1])
         if self._sim_pose:
             xs.append(self._sim_pose[0]); ys.append(self._sim_pose[1])
         if not xs:
             xs, ys = [-1, 8], [-4, 4]
-        xmin, xmax = min(xs) - 1.5, max(xs) + 1.5
-        ymin, ymax = min(ys) - 1.5, max(ys) + 1.5
-        sx = (w - 2 * margin) / max(1.0, xmax - xmin)
-        sy = (h - 2 * margin) / max(1.0, ymax - ymin)
-        scale = min(sx, sy)
+        return (math.floor(min(xs) - 1.5), math.ceil(max(xs) + 1.5),
+                math.floor(min(ys) - 1.5), math.ceil(max(ys) + 1.5))
+
+    def _map_world_note(self):
+        """(文字, 颜色)：底图来自哪个 SDF，是否已核对为正在运行的世界。"""
+        world = self._map_world
+        if world is None:
+            return "障碍物：未加载 SDF", "#FBBF24"
+        name = f"{self._map_source}: {world.name}"
+        running = (self._sim_proc is not None and self._sim_proc.poll() is None
+                   and self._sim_world_path is not None)
+        if running and world == self._sim_world_path and self._map_world_sha == self._sim_world_sha256:
+            return f"{name} · 已核对（Studio 启动的世界）", "#34D399"
+        return f"{name} · 未核对：不一定是正在运行的世界", "#FBBF24"
+
+    def _draw_topdown(self):
+        if not hasattr(self, "top_canvas"):
+            return
+        c = self.top_canvas
+        w, h = max(1, c.winfo_width()), max(1, c.winfo_height())
+        margin = 34
+        xmin, xmax, ymin, ymax = self._map_bounds()
+        scale = min((w - 2 * margin) / max(1.0, xmax - xmin),
+                    (h - 2 * margin) / max(1.0, ymax - ymin))
         cx = (w - (xmax - xmin) * scale) / 2
         cy = (h - (ymax - ymin) * scale) / 2
+
         def screen(x, y):
             return cx + (x - xmin) * scale, h - cy - (y - ymin) * scale
-        # meter grid
-        gx0, gx1 = math.floor(xmin), math.ceil(xmax)
-        gy0, gy1 = math.floor(ymin), math.ceil(ymax)
-        for gx in range(gx0, gx1 + 1):
+        key = (w, h, xmin, xmax, ymin, ymax)
+        if key != self._map_static_key:
+            self._draw_map_static(c, w, h, xmin, xmax, ymin, ymax, screen)
+            self._map_static_key = key
+        # 动态层只改坐标/状态，不删重建（以前每 80 ms delete("all") 再画 3000 点平滑线）。
+        if len(self._sim_path) > 1:
+            c.coords("map_path", *[v for p in self._sim_path for v in screen(*p)])
+            sx0, sy0 = screen(*self._sim_path[0])
+            c.coords("map_start", sx0 - 4, sy0 - 4, sx0 + 4, sy0 + 4)
+            c.itemconfigure("map_path", state="normal")
+            c.itemconfigure("map_start", state="normal")
+        else:
+            c.itemconfigure("map_path", state="hidden")
+            c.itemconfigure("map_start", state="hidden")
+        if self._sim_pose:
+            x, y, z, yaw, _ = self._sim_pose
+            px, py = screen(x, y)
+            length = max(18, min(35, scale * 0.55))
+            c.coords("map_uav", px - 8, py - 8, px + 8, py + 8)
+            c.coords("map_heading", px, py, px + math.cos(yaw) * length,
+                     py - math.sin(yaw) * length)
+            c.coords("map_uav_text", px + 12, py + 12)
+            c.itemconfigure("map_uav_text", text=f"UAV z={z:.1f}m")
+            for tag in ("map_uav", "map_heading", "map_uav_text"):
+                c.itemconfigure(tag, state="normal")
+        else:
+            for tag in ("map_uav", "map_heading", "map_uav_text"):
+                c.itemconfigure(tag, state="hidden")
+        note, color = self._map_world_note()
+        c.itemconfigure("map_world", text=note, fill=color)
+
+    def _draw_map_static(self, c, w, h, xmin, xmax, ymin, ymax, screen):
+        c.delete("all")
+        for gx in range(int(xmin), int(xmax) + 1):
             x0, y0 = screen(gx, ymin)
             x1, y1 = screen(gx, ymax)
             c.create_line(x0, y0, x1, y1, fill="#1E293B")
             c.create_text(x0, h - 12, text=str(gx), fill="#64748B", font=("TkDefaultFont", 8))
-        for gy in range(gy0, gy1 + 1):
+        for gy in range(int(ymin), int(ymax) + 1):
             x0, y0 = screen(xmin, gy)
             x1, y1 = screen(xmax, gy)
             c.create_line(x0, y0, x1, y1, fill="#1E293B")
@@ -2196,20 +2595,18 @@ class StudioApp:
             x, y = screen(*self._sim_waypoint)
             c.create_oval(x - 7, y - 7, x + 7, y + 7, outline="#FBBF24", width=2)
             c.create_text(x + 10, y - 10, text="WAYPOINT", fill="#FBBF24", anchor="w")
-        if len(self._sim_path) > 1:
-            pts = [v for p in self._sim_path for v in screen(*p)]
-            c.create_line(*pts, fill="#38BDF8", width=3, smooth=True)
-            sx0, sy0 = screen(*self._sim_path[0])
-            c.create_oval(sx0 - 4, sy0 - 4, sx0 + 4, sy0 + 4, fill="#34D399", outline="")
-        if self._sim_pose:
-            x, y, z, yaw, _ = self._sim_pose
-            px, py = screen(x, y)
-            length = max(18, min(35, scale * 0.55))
-            ex, ey = px + math.cos(yaw) * length, py - math.sin(yaw) * length
-            c.create_oval(px - 8, py - 8, px + 8, py + 8, fill="#2563EB", outline="#BFDBFE", width=2)
-            c.create_line(px, py, ex, ey, fill="#F8FAFC", width=3, arrow="last", arrowshape=(10, 12, 5))
-            c.create_text(px + 12, py + 12, text=f"UAV z={z:.1f}m", fill="#93C5FD", anchor="nw")
         c.create_text(w - 12, 12, text="TOP VIEW · metres", fill="#94A3B8", anchor="ne")
+        c.create_text(12, 12, text="", anchor="nw", tags="map_world",
+                      font=("TkDefaultFont", 9))
+        # 动态项先建好、隐藏，之后只用 coords() 移动；轨迹点间距只有毫米级，不用 smooth。
+        c.create_line(0, 0, 0, 0, fill="#38BDF8", width=3, tags="map_path", state="hidden")
+        c.create_oval(0, 0, 0, 0, fill="#34D399", outline="", tags="map_start", state="hidden")
+        c.create_oval(0, 0, 0, 0, fill="#2563EB", outline="#BFDBFE", width=2, tags="map_uav",
+                      state="hidden")
+        c.create_line(0, 0, 0, 0, fill="#F8FAFC", width=3, arrow="last", arrowshape=(10, 12, 5),
+                      tags="map_heading", state="hidden")
+        c.create_text(0, 0, text="", fill="#93C5FD", anchor="nw", tags="map_uav_text",
+                      state="hidden")
 
     # --------------------------------------------------------------- live student
     def start_live_student(self):
@@ -2271,6 +2668,12 @@ class StudioApp:
             cmd += ["--scene-id", str(meta["scene_id"])]
         if meta.get("seed") is not None:
             cmd += ["--seed", str(meta["seed"])]
+        # dynamics / window_from 按权重所在 run 的训练数据推断（N2）；推断不到就按 collect 默认值。
+        protocol, _reason = self._ckpt_protocol(ckpt)
+        if protocol is not None and protocol.get("renderer") != "3dgs":
+            cmd += ["--dynamics", protocol["dynamics"]]
+            if protocol.get("window_from"):
+                cmd += ["--window-from", str(protocol["window_from"])]
         env = os.environ.copy()
         if self._sim_partition_active and self._sim_partition_active != "default":
             env["GZ_PARTITION"] = self._sim_partition_active
@@ -2278,6 +2681,8 @@ class StudioApp:
         self._live_config = {"checkpoint": str(ckpt), "scene_meta": str(meta_path),
                              "world": str(Path(self.world_var.get()).expanduser().resolve()),
                              "steps": steps, "hold_s": hold, "split": split,
+                             "dynamics": protocol.get("dynamics") if protocol else None,
+                             "window_from": protocol.get("window_from") if protocol else None,
                              "partition": self._sim_partition_active}
         write_json_atomic(side / "job.json", self._live_config)
         self._live_action_offset = 0
@@ -2292,6 +2697,10 @@ class StudioApp:
             self._live_log = None
             messagebox.showerror("学生策略启动失败", str(exc))
             return
+        # 演示目录在 run_dir 下时，结束后只挂到这个 run（期间切换实验也不变）。
+        self._live_owner = self.run_dir
+        # 新一集从当前位置重新画轨迹，不接上一集（collect.py 不重置位姿，旧轨迹会连成一条）。
+        self._sim_path.clear()
         self.live_btn.configure(state="disabled")
         self.live_stop_btn.configure(state="normal")
         self._sim_status_var.set("学生策略正在驱动 Gazebo · 三视角实时更新")
@@ -2354,19 +2763,16 @@ class StudioApp:
                        "config": self._live_config or {}, "manifest": manifest,
                        "interpretation": "single-episode live demonstration; not a formal navigation success-rate evaluation"}
             write_json_atomic(self._live_out / "live_demo_summary.json", summary)
-            if self.run_dir and self._live_out.parent == self.run_dir:
-                summary_path = self.run_dir / "studio_summary.json"
-                try:
-                    run_summary = json.loads(summary_path.read_text(encoding="utf-8"))
-                except (OSError, ValueError):
-                    run_summary = summarize_run(self.run_dir, self.run_meta or {"run_id": self.run_dir.name},
-                                                0, "finished")
+            owner = self._live_owner
+            if owner and self._live_out.parent == owner:
+                summary_path = owner / "studio_summary.json"
+                run_summary = self._load_run_summary(owner)
                 run_summary.setdefault("live_demos", []).append({
                     "output_dir": str(self._live_out), "steps": len(actions),
                     "collision_steps": collisions, "action_counts": counts,
                     "return_code": rc, "finished_at": summary["finished_at"]})
                 write_json_atomic(summary_path, run_summary)
-                write_experiment_report(self.run_dir, run_summary)
+                write_experiment_report(owner, run_summary)
                 self.refresh_history(force=True)
             self.live_action_var.set(f"学生策略演示结束 rc={rc} · steps={len(actions)} · collision_steps={collisions} · 结果：{self._live_out}")
         self.live_btn.configure(state="normal")
@@ -2403,6 +2809,23 @@ class StudioApp:
                 return False
             task = self.eval_task_var.get()
             split = self.eval_split_var.get()
+            # 执行协议（dynamics / hold / window_from）从训练数据推断，与自动录像同一规则（N2）。
+            # 不用 self.run_meta 兜底：它只在本 Studio 启动训练时赋值，load_run 不更新，可能是上一个 run 的。
+            protocol, reason = run_eval_protocol(self.run_dir)
+            if protocol is not None and protocol.get("renderer") == "3dgs":
+                messagebox.showerror("数据来自 3DGS",
+                                     f"该 run 的训练数据是 3DGS（{protocol.get('dynamics')}），"
+                                     "Gazebo 闭环评测不适用；请用 sim/3dgs/eval_3dgs.py。")
+                return False
+            if protocol is None and not messagebox.askyesno(
+                    "无法推断执行协议",
+                    f"{reason}。\n\n将按 eval_closed_loop 默认值（x3_velocity、hold 1.0、"
+                    "observation）评测；训练数据若不是这套协议，结果不可比。仍要继续吗？"):
+                return False
+            if protocol is not None and protocol.get("task") != task and not messagebox.askyesno(
+                    "Task 与训练数据不一致",
+                    f"界面选的 Task={task}，训练数据推断为 {protocol.get('task')}。\n\n仍要继续吗？"):
+                return False
         out = self.run_dir / ("closed_loop_eval_" + datetime.now().strftime("%Y%m%d-%H%M%S"))
         out.mkdir(parents=True, exist_ok=False)
         side = Path(str(out) + ".monitor")
@@ -2414,15 +2837,24 @@ class StudioApp:
                    "--split", split, "--out", str(out), "--text-mode", "keep"]
             if task == "campus":
                 cmd += ["--appearance", self.eval_appearance_var.get()]
+            if protocol is not None:
+                cmd += ["--dynamics", protocol["dynamics"]]
+                if protocol.get("window_from"):
+                    cmd += ["--window-from", str(protocol["window_from"])]
+                if protocol.get("hold_s") is not None:
+                    cmd += ["--hold", repr(float(protocol["hold_s"]))]
         else:
             cmd = video_cli.build_eval_command(
                 PYTHON_FOR_SIM, SIM_TOOLS / "eval_closed_loop.py", ckpt, out, auto)
             if auto.get("renderer") != "3dgs":
                 cmd += ["--text-mode", "keep"]  # 自动录像不做文本消融
+        if auto is None or auto.get("renderer") != "3dgs":
+            self._apply_render_backend()  # 评测自己起的 Gazebo 与仿真页用同一渲染后端
         env = os.environ.copy()
         # The evaluator owns its own isolated GZ_PARTITIONs; do not inherit the GUI demo partition.
         env.pop("GZ_PARTITION", None)
         self.eval_out, self.eval_log = out, log
+        owner = self.run_dir
         try:
             self.eval_proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT), env=env,
                                               stdin=subprocess.DEVNULL, stdout=log,
@@ -2432,10 +2864,11 @@ class StudioApp:
             self.eval_log = None
             if auto is not None:
                 self._eval_auto = False
-                self._auto_eval_note(f"自动录像启动失败：{exc}")
+                self._auto_eval_note(f"自动录像启动失败：{exc}", owner)
             else:
                 messagebox.showerror("评测启动失败", str(exc))
             return False
+        self._eval_owner = owner
         self.eval_btn.configure(state="disabled")
         self.eval_stop_btn.configure(state="normal")
         self._eval_status_var.set(
@@ -2454,18 +2887,46 @@ class StudioApp:
                 pass
         self._eval_status_var.set("正在请求停止闭环评测…")
 
-    def _attach_eval_to_run(self, report, return_code=None):
-        if not self.run_dir or not report:
-            return
-        summary_path = self.run_dir / "studio_summary.json"
+    def _load_run_summary(self, run_dir):
+        """读 run 的 studio_summary.json；没有时按该 run 自己的 job/lifecycle 建一份。
+
+        以前缺摘要时一律写 finished / return_code=0：评测或演示在训练中途结束，
+        就把仍在训练的 run 标成已完成。现在只用该 run 自己记录的状态，不编造。
+        """
+        run_dir = Path(run_dir)
         try:
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            summary = summarize_run(self.run_dir, self.run_meta or {"run_id": self.run_dir.name},
-                                    0, "finished")
+            summary = json.loads((run_dir / "studio_summary.json").read_text(encoding="utf-8"))
+            if isinstance(summary, dict):
+                return summary
+        except (OSError, ValueError, RecursionError):
+            pass
+        sidecar = Path(str(run_dir) + ".monitor")
+        try:
+            job = json.loads((sidecar / "job.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            job = {}
+        try:
+            life = json.loads((sidecar / "lifecycle.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            life = {}
+        if not isinstance(job, dict):
+            job = {}
+        state = life.get("status") if isinstance(life, dict) else None
+        if not state:
+            state = unobserved_state(run_dir)
+        return summarize_run(run_dir, job or {"run_id": run_dir.name},
+                             life.get("return_code") if isinstance(life, dict) else None, state)
+
+    def _attach_eval_to_run(self, run_dir, out, report, return_code=None):
+        """评测结果只写进启动它的 run（run_dir），与结束时界面上加载的 run 无关。"""
+        if not run_dir or not report:
+            return
+        run_dir = Path(run_dir)
+        summary_path = run_dir / "studio_summary.json"
+        summary = self._load_run_summary(run_dir)
         entries = summary.setdefault("closed_loop_evaluations", [])
-        video_dir = self.eval_out / "videos" if self.eval_out else None
-        videos = (sorted(str(p) for p in video_dir.glob("*.mp4"))
+        video_dir = out / "videos" if out else None
+        videos = (sorted(str(p) for p in video_dir.iterdir() if p.suffix in VIDEO_SUFFIXES)
                   if video_dir is not None and video_dir.is_dir() else [])
         entry = {"task": report.get("task"), "split": report.get("split"),
                  "success_rate": report.get("success_rate"),
@@ -2482,15 +2943,51 @@ class StudioApp:
                  "window_from": report.get("window_from"),
                  "dynamics": report.get("dynamics"),
                  "ckpt_sha256": report.get("ckpt_sha256"),
-                 "eval_json": str(self.eval_out / "eval.json") if self.eval_out else None,
+                 "eval_json": str(out / "eval.json") if out else None,
                  "video_dir": str(video_dir) if video_dir is not None and video_dir.is_dir() else None,
                  "videos": videos,
                  "return_code": return_code, "finished_at": now_iso()}
         entries.append(entry)
         write_json_atomic(summary_path, summary)
-        write_experiment_report(self.run_dir, summary)
+        write_experiment_report(run_dir, summary)
         self.refresh_history(force=True)
         self.refresh_run(force=True)
+
+    def _finish_closed_loop_eval(self, rc):
+        auto, owner, out = self._eval_auto, self._eval_owner, self.eval_out
+        self._eval_auto = False
+        self._eval_owner = None
+        self.eval_proc = None
+        if self.eval_log:
+            self.eval_log.close()
+            self.eval_log = None
+        self.eval_btn.configure(state="normal")
+        self.eval_stop_btn.configure(state="disabled")
+        report = None
+        if out and (out / "eval.json").is_file():
+            try:
+                report = json.loads((out / "eval.json").read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                pass
+        run_name = owner.name if owner else "—"
+        if report:
+            self._attach_eval_to_run(owner, out, report, rc)
+            if auto and rc != 0:
+                self._auto_eval_note(
+                    f"自动录像评测 rc={rc}：部分或全部集失败，已附加可用结果", owner)
+            self._eval_status_var.set(
+                f"闭环评测结束（{run_name}）rc={rc} · success={report.get('success_rate')} · "
+                f"requested={report.get('requested_success_rate')} · "
+                f"collision={report.get('collision_rate')} · "
+                f"episodes={report.get('episodes_done')}/{report.get('episodes_requested')} · "
+                f"completion={report.get('completion_rate')} · "
+                f"failed={report.get('failed_count')} · "
+                f"unique_maps={report.get('unique_maps', report.get('unique_geometry'))}")
+        else:
+            if auto:
+                self._auto_eval_note(
+                    f"自动录像评测失败 rc={rc}：未生成 eval.json（见 {out}）", owner)
+            self._eval_status_var.set(f"闭环评测结束（{run_name}）rc={rc} · 请检查 {out}")
 
     def open_eval_dir(self):
         if self.eval_out and self.eval_out.exists():
@@ -2529,7 +3026,7 @@ class StudioApp:
             if not run_dir.is_dir() or run_dir.name == "simulation_logs":
                 continue
             summary_path = run_dir / "studio_summary.json"
-            if summary_path.exists():
+            if summary_is_final(summary_path):
                 continue
             sidecar = Path(str(run_dir) + ".monitor")
             life_path = sidecar / "lifecycle.json"
@@ -2539,16 +3036,20 @@ class StudioApp:
                 job = json.loads(job_path.read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 continue
-            if life.get("status") not in ("running", "starting"):
+            if life.get("status") not in LIVE_STATES:
                 continue
-            if self._run_pid_alive(life.get("pid") or job.get("pid"), run_dir):
+            if life.get("status") == "starting" and not life.get("pid"):
+                # 启动窗口里还没有 trainer PID。另一个 Studio 这时写摘要会让 run 目录非空，
+                # RunOwner 随即拒绝训练；只有确认启动它的 Studio 已不在才回收。
+                studio_pid = life.get("studio_pid")
+                if studio_pid is None or _pid_exists(studio_pid):
+                    continue  # 旧格式没有启动者身份，或启动者还活着：不动
+            elif self._run_pid_alive(life.get("pid") or job.get("pid"), run_dir):
                 continue
-            events = read_jsonl(run_dir / "metrics.jsonl")
-            done = any(e.get("event") == "status" and
-                       str(e.get("message", "")).lower().startswith("done:") for e in events)
-            state = "finished_unobserved" if done else "incomplete_unobserved"
+            state = unobserved_state(run_dir)
             summary = summarize_run(run_dir, job, None, state)
             summary["notes"].append("The desktop monitor was closed while the child process ran; process exit code was not observed by Studio.")
+            carry_attachments(summary_path, summary)
             write_json_atomic(summary_path, summary)
             write_experiment_report(run_dir, summary)
             write_json_atomic(life_path, {"status": state, "return_code": None,
@@ -2580,20 +3081,6 @@ class StudioApp:
         test = tests[-1] if tests else {}
         return (epochs or None, test.get("macro_f1"), test.get("balanced_accuracy"),
                 "—", None)
-
-    @staticmethod
-    def _sr_text(eval_paths):
-        n = len(eval_paths)
-        if n == 0:
-            return "—"
-        if n > 1:
-            return f"多评测({n})"
-        try:
-            report = json.loads(Path(eval_paths[0]).read_text(encoding="utf-8"))
-        except (OSError, ValueError, RecursionError):
-            return "—"
-        sr = safe_float(report.get("success_rate"))
-        return f"{sr:.3f}" if sr is not None else "未标注"
 
     def _scan_runs(self, force=False):
         """扫描 DATA_ROOT/uav_rgb（两层）并缓存；_tick 每秒刷新绝不触发这里。"""
@@ -2636,7 +3123,7 @@ class StudioApp:
                     started = "—"
             entries.append({"path": run_dir, "kind": kind, "evals": evals,
                             "status": status, "epochs": epochs, "macro": macro,
-                            "bal": bal, "sr": self._sr_text(evals), "started": started,
+                            "bal": bal, "sr": sr_text(evals), "started": started,
                             **eval_fields_for_latest(evals)})
         for ev in standalone:
             # 已在 run 行里出现过的目录不再重复列。
@@ -2648,25 +3135,23 @@ class StudioApp:
                 continue
             if not isinstance(report, dict):
                 continue
-            sr = safe_float(report.get("success_rate"))
             entries.append({"path": ev, "kind": "独立评测", "evals": [ev], "status": "—",
                             "epochs": None, "macro": None, "bal": None,
-                            "sr": f"{sr:.3f}" if sr is not None else "未标注",
+                            "sr": sr_text([ev]),
                             "started": datetime.fromtimestamp(ev.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
                             **eval_display_fields(report)})
         for ev in stale:
-            # ckpt_sha256 与当前 ckpt_best.bin 不一致：单独列出，不挂到新 run。
+            # ckpt_sha256 与它评测的那份权重当前内容不一致：单独列出，不挂到新 run。
             try:
                 report = json.loads(ev.read_text(encoding="utf-8"))
             except (OSError, ValueError, RecursionError):
                 continue
             if not isinstance(report, dict):
                 continue
-            sr = safe_float(report.get("success_rate"))
             entries.append({"path": ev, "kind": "旧评测", "evals": [ev],
                             "status": "旧 checkpoint/旧评测",
                             "epochs": None, "macro": None, "bal": None,
-                            "sr": f"{sr:.3f}" if sr is not None else "未标注",
+                            "sr": sr_text([ev]),
                             "started": datetime.fromtimestamp(ev.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
                             **eval_display_fields(report)})
         def _mtime(entry):
@@ -2682,6 +3167,10 @@ class StudioApp:
         return entries
 
     def refresh_history(self, force=False):
+        """扫描放后台线程（真实数据盘约 1 s）；Tk 控件只在主线程的 _apply_history 里改。
+
+        扫描进行中再次请求时只记一笔，结束后补扫一次，不并发开多个线程。
+        """
         if not hasattr(self, "history_tree"):
             return
         # DATA_ROOT 配错时不能让界面启动即崩。
@@ -2694,7 +3183,39 @@ class StudioApp:
                                      "请检查 DATA_ROOT 环境变量是否指向可写目录。")
             return
         self._recover_detached_runs()
-        entries = self._scan_runs(force)
+        if self._history_thread is not None:
+            self._history_again = True
+            return
+        box = {}
+
+        def work():
+            try:
+                box["entries"] = self._scan_runs(force)
+            except Exception:  # noqa: BLE001 - 线程里的异常要回到主线程打印
+                box["error"] = traceback.format_exc()
+        self._history_thread = threading.Thread(target=work, name="studio-history-scan",
+                                                daemon=True)
+        self._history_thread.start()
+        self.root.after(HISTORY_POLL_MS, lambda: self._poll_history(box))
+
+    def _poll_history(self, box):
+        thread = self._history_thread
+        if thread is not None and thread.is_alive():
+            if not self._closing:
+                self.root.after(HISTORY_POLL_MS, lambda: self._poll_history(box))
+            return
+        self._history_thread = None
+        if self._closing:
+            return
+        if "error" in box:
+            sys.stderr.write(box["error"])
+        else:
+            self._apply_history(box.get("entries") or [])
+        if self._history_again:
+            self._history_again = False
+            self.refresh_history(force=True)
+
+    def _apply_history(self, entries):
         self.history_tree.delete(*self.history_tree.get_children())
         for item in entries[:300]:
             path = item["path"]
@@ -2708,6 +3229,9 @@ class StudioApp:
                         f"{item['macro']:.4f}" if isinstance(item["macro"], (int, float)) else "—",
                         f"{item['bal']:.4f}" if isinstance(item["bal"], (int, float)) else "—",
                         item["sr"], item["started"] or "—"))
+        # SR 卡片读 _eval_index；扫描在后台完成后这里才有新索引（例如刚归档的评测）。
+        if hasattr(self, "card_vars") and self.run_dir:
+            self._update_sr_card()
 
     def _pick_eval(self, run_dir):
         """按任务约定：closed_loop_eval_* 最新 mtime > run_dir/eval.json > 反查索引。
@@ -2790,7 +3314,10 @@ class StudioApp:
             sr = sum(1 for ep in episodes if ep.get("success")) / total
         maps = self._report_maps(report)
         p95 = safe_float((report.get("inference_ms") or {}).get("p95"))
-        self.eval_chip_vars["sr"].set(f"{sr * 100:.0f}%" if sr is not None else "未标注")
+        if is_single_episode(report):
+            self.eval_chip_vars["sr"].set("单集录像（非 SR）")
+        else:
+            self.eval_chip_vars["sr"].set(f"{sr * 100:.0f}%" if sr is not None else "未标注")
         self.eval_chip_vars["collision"].set(rate("collision", "collision_rate"))
         self.eval_chip_vars["stuck"].set(rate("stuck", "stuck_rate"))
         self.eval_chip_vars["false_forward"].set(rate("false_forward", "false_forward_rate"))
@@ -2882,6 +3409,7 @@ class StudioApp:
         self._metric_sig = None
         self._event_tail = {}
         self._events.clear()
+        self._val_events = []
         self._latest_train_event = None
         self._train_log_state = {}
         self._train_log_lines = 0
@@ -2889,7 +3417,7 @@ class StudioApp:
         self.refresh_run(force=True)
         best = path / "ckpt_best.bin"
         if best.is_file():
-            self.ckpt_var.set(str(best))
+            self._set_live_ckpt(best)
         lifecycle = {}
         try:
             lifecycle = json.loads((self.sidecar / "lifecycle.json").read_text(encoding="utf-8"))
@@ -2948,9 +3476,9 @@ class StudioApp:
                 self.refresh_run()
                 self._refresh_train_log()
                 summary_path = self.run_dir / "studio_summary.json"
-                if not summary_path.exists():
+                if not summary_is_final(summary_path):
                     self._recover_detached_runs()
-                    if summary_path.exists():
+                    if summary_is_final(summary_path):
                         self.refresh_history(force=True)
                         self._detached_pid = None
                         self.start_train_btn.configure(state="normal")
@@ -2963,38 +3491,7 @@ class StudioApp:
             if self.eval_proc is not None:
                 rc = self.eval_proc.poll()
                 if rc is not None:
-                    auto = self._eval_auto
-                    self._eval_auto = False
-                    self.eval_proc = None
-                    if self.eval_log:
-                        self.eval_log.close()
-                        self.eval_log = None
-                    self.eval_btn.configure(state="normal")
-                    self.eval_stop_btn.configure(state="disabled")
-                    report = None
-                    if self.eval_out and (self.eval_out / "eval.json").is_file():
-                        try:
-                            report = json.loads((self.eval_out / "eval.json").read_text(encoding="utf-8"))
-                        except (OSError, ValueError):
-                            pass
-                    if report:
-                        self._attach_eval_to_run(report, rc)
-                        if auto and rc != 0:
-                            self._auto_eval_note(
-                                f"自动录像评测 rc={rc}：部分或全部集失败，已附加可用结果")
-                        self._eval_status_var.set(
-                            f"闭环评测结束 rc={rc} · success={report.get('success_rate')} · "
-                            f"requested={report.get('requested_success_rate')} · "
-                            f"collision={report.get('collision_rate')} · "
-                            f"episodes={report.get('episodes_done')}/{report.get('episodes_requested')} · "
-                            f"completion={report.get('completion_rate')} · "
-                            f"failed={report.get('failed_count')} · "
-                            f"unique_maps={report.get('unique_maps', report.get('unique_geometry'))}")
-                    else:
-                        if auto:
-                            self._auto_eval_note(
-                                f"自动录像评测失败 rc={rc}：未生成 eval.json（见 {self.eval_out}）")
-                        self._eval_status_var.set(f"闭环评测结束 rc={rc} · 请检查 {self.eval_out}")
+                    self._finish_closed_loop_eval(rc)
             if self._live_proc is not None:
                 self._update_live_action()
         except Exception:
@@ -3003,7 +3500,9 @@ class StudioApp:
             if not self._closing:
                 self.root.after(self.refresh_ms, self._tick)
 
-    def _on_close(self):
+    def _on_close(self, interactive=True):
+        """interactive=False 来自 SIGINT/SIGTERM：不弹框，后台任务照常继续（与选“否”相同），
+        只收掉 Studio 自己启动的 Gazebo，避免留下孤儿 gz sim 占 GPU。"""
         if self._closing:
             return
         active = []
@@ -3017,7 +3516,7 @@ class StudioApp:
             active.append("学生策略演示")
         if self._scene_proc is not None:
             active.append("场景生成")
-        if active:
+        if active and interactive:
             stop = messagebox.askyesno("仍有任务运行", "当前仍在运行：" + "、".join(active) +
                                        "。\n\n选择“是”会发送安全停止信号；选择“否”则关闭界面但让任务继续运行并保留日志。")
             if stop:
@@ -3034,12 +3533,25 @@ class StudioApp:
                         pass
         if self._sim_subs:
             self.disconnect_sim()
-        if self._sim_proc is not None and self._sim_proc.poll() is None:
-            stop_sim = messagebox.askyesno("Gazebo 仍在运行", "是否停止由 Studio 启动的 Gazebo？")
-            if stop_sim:
-                self.stop_gazebo()
+        if (self._sim_proc is not None and self._sim_proc.poll() is None) or self._sim_stop:
+            if not interactive or messagebox.askyesno("Gazebo 仍在运行", "是否停止由 Studio 启动的 Gazebo？"):
+                self._stop_gazebo_blocking()
         self._closing = True
         self.root.destroy()
+
+    def _request_quit(self, *_args):
+        """信号处理里不直接碰 Tk：排进事件循环，走与关窗相同的收尾。"""
+        if self._closing:
+            return
+        try:
+            self.root.after(0, lambda: self._on_close(interactive=False))
+        except tk.TclError:
+            pass
+
+
+def install_quit_signals(app):
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, app._request_quit)
 
 
 def main():
@@ -3052,7 +3564,9 @@ def main():
     if tk is None:
         raise SystemExit("UAV Navigation Studio 需要 tkinter；Ubuntu 可安装 python3-tk")
     root = tk.Tk()
-    StudioApp(root, args.run_dir or None, int(args.refresh * 1000))
+    app = StudioApp(root, args.run_dir or None, int(args.refresh * 1000))
+    # 终端 Ctrl+C / 注销 SIGTERM 以前直接抛 KeyboardInterrupt 退出，_on_close 不跑，Gazebo 成孤儿。
+    install_quit_signals(app)
     root.mainloop()
 
 

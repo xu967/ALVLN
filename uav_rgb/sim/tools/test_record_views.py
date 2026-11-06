@@ -41,8 +41,121 @@ class _FakeCv2:
     def drawMarker(self, _img, p, color, *_args):
         self.markers.append((p, color))
 
+    def rectangle(self, *_args):
+        pass
+
     def getTextSize(self, text, _font, _scale, _thickness):
         return (len(text) * 6, 10), 2
+
+
+def check_ascii_overlay(cam):
+    """Hershey 字体画不了「·」和中文，叠字一律 ASCII。"""
+    cv2 = _FakeCv2()
+    note, _ = rv._frame_note(10 * S, 2, 2, 10 * S + S // 2)
+    note2, _ = rv._frame_note(10 * S, 2, 1, 12 * S)
+    cv2.texts += [note, note2]
+    rv._draw_top(cv2, _FakeImage(), cam, [(10 * S, 1.0, 0.0, 2.0)], 10 * S, None, None, None,
+                 {"x": 2.0, "y": 1.0}, success_criterion=None, goal_radius=1.5)
+    actions = [{"step": 0, "action_executed": 1, "action_start_ns": 10 * S,
+                "collision": True, "src": "contact+stuck"}]
+    rv._panel(cv2, None, 640, 360, 10 * S + 1, 10 * S, 11 * S, actions,
+              [(10 * S, 1.0, 0.0, 2.0)], actions[0], actions[0], "student | x3 | seed 1",
+              "SUCCESS")
+    bad = [t for t in cv2.texts if any(ord(ch) > 127 for ch in t)]
+    assert not bad, ("叠字含非 ASCII，会被画成 ?", bad)
+    print("  ok  录像叠字全是 ASCII")
+
+
+class _FakeSub:
+    """record() 用的 TopicSub 替身：第一次给出全部帧，第二次模拟 SIGTERM 退出。"""
+    frames_by_topic = {}
+
+    def __init__(self, topic, buf=8):
+        self.msgs = self.frames_by_topic.get(topic, [])
+        self.calls = 0
+
+    def frames(self):
+        self.calls += 1
+        if self.calls > 1:
+            raise SystemExit(0)
+        return [(i + 1, m) for i, m in enumerate(self.msgs)]
+
+    def close(self):
+        pass
+
+
+def _msg(ts, v=7, w=8, h=6):
+    import base64
+    return {"width": w, "height": h, "step": w * 3, "pixelFormatType": "RGB_INT8",
+            "data": base64.b64encode(bytes([v]) * (w * h * 3)).decode(),
+            "header": {"stamp": {"sec": ts // S, "nsec": ts % S}}}
+
+
+def run_record(out, stamps):
+    """真跑 record()：TopicSub 换成替身，SIGTERM handler 跑完恢复。"""
+    import signal
+    _FakeSub.frames_by_topic = {rv.CAMS[k]: [_msg(t) for t in ts] for k, ts in stamps.items()}
+    real_sub, real_term = rv.gz_io.TopicSub, signal.getsignal(signal.SIGTERM)
+    rv.gz_io.TopicSub = _FakeSub
+    try:
+        rv.record(out)
+    except SystemExit:
+        pass
+    finally:
+        rv.gz_io.TopicSub = real_sub
+        signal.signal(signal.SIGTERM, real_term)
+
+
+def check_record_buckets_and_overwrite():
+    period = S // rv.FPS
+    chase = [10 * S + S // 30 + i * S // 15 for i in range(30)]   # 15 Hz，相位不对齐 100 ms
+    uav = [10 * S + i * S // 30 for i in range(60)]                # 30 Hz
+    with tempfile.TemporaryDirectory() as d:
+        # 残留目录：上一次录像的帧不能混进这一次（以前用 "ab"/"a" 追加）
+        with open(os.path.join(d, "chase.idx.jsonl"), "w") as f:
+            f.write(json.dumps({"ts": 1, "w": 8, "h": 6, "c": 3, "off": 0}) + "\n")
+        with open(os.path.join(d, "chase.rgb"), "wb") as f:
+            f.write(b"OLD!" * 36)
+        run_record(d, {"uav": uav, "chase": chase, "top": []})
+        rows = rv.load_frames(d, "chase")
+        assert rows[0][0] != 1 and rows[0][4] == 0, ("残留帧混进新录像", rows[:2])
+        assert os.path.getsize(os.path.join(d, "chase.rgb")) == len(rows) * 8 * 6 * 3
+        buckets = [r[0] // period for r in rows]
+        want = sorted({t // period for t in chase})
+        assert buckets == want, ("每个 100 ms 桶必须恰好一帧", buckets, want)
+        print(f"  ok  record 覆盖残留帧；15 Hz chase 每桶一帧（{len(rows)} 帧 / {len(want)} 桶）")
+        try:
+            import numpy as np
+        except ImportError:
+            print("  skip 无 numpy：跳过重复帧检查")
+            return
+        _, times = rv.sample_grid(uav[0], uav[-1])
+
+        def repeats(reader):
+            old, n = reader.i, 0
+            for t in times:
+                reader.at(t + period - 1)
+                n += reader.i == old
+                old = reader.i
+            return n
+        rd = rv._Reader(d, "chase", np)
+        got = repeats(rd)
+        rd.close()
+        assert got == 0, ("15 Hz chase 在 10 fps 网格上不该有重复帧", got)
+        # 对照：改前的取帧规则（距上一帧 >= period 才留）在同一组帧上会产生重复帧。
+        kept, last = [], -10**18
+        for t in chase:
+            if t >= last + period:
+                kept.append(t)
+                last = t
+        old_dir = os.path.join(d, "old")
+        os.makedirs(old_dir)
+        write_cam(old_dir, "chase", [(t, 1) for t in kept])
+        rd = rv._Reader(old_dir, "chase", np)
+        old_repeats = repeats(rd)
+        rd.close()
+        assert old_repeats > 0, old_repeats
+        print(f"  ok  10 fps 网格无重复帧（改前规则同一组帧重复 {old_repeats} 次）")
 
 
 def check_labels_and_notes():
@@ -87,11 +200,47 @@ def check_goal_criterion(cam):
         calls.clear(); cv2.circles.clear()
         rv._draw_top(cv2, img, cam, [], 0, None, None, None, {"x": 2.0, "y": 1.0},
                      success_criterion="goal_reach_ever", goal_radius=1.5)
-        assert calls == [(2.0, 1.0, 0.0)], ("waypoint 必须投到地面 z=0", calls)
+        assert calls == [(2.0, 1.0, 0.0)], ("没有轨迹时 waypoint 投到地面 z=0", calls)
         assert cv2.circles and cv2.circles[0][1] >= 70, cv2.circles
+        # 有轨迹时 waypoint/goal 线投到机体当前高度：透视相机下地面投影和 2.3 m 高的机体差 25–30 px
+        calls.clear(); cv2.circles.clear()
+        track = [(0, 0.5, 0.0, 2.3), (10 * S, 1.0, 0.0, 2.1)]
+        rv._draw_top(cv2, img, cam, track, 5 * S, None, None, 5.0, {"x": 2.0, "y": 1.0},
+                     success_criterion="route_choice", goal_radius=1.5)
+        assert (2.0, 1.0, 2.3) in calls and (5.0, 10, 2.3) in calls, ("按当前高度投影", calls)
+        assert (2.0, 1.0, 0.0) not in calls, calls
+        r_alt = cv2.circles[0][1]
+        assert r_alt > 70 * 1.3, ("半径圈也按机体高度算，比地面投影大", r_alt)
     finally:
         rv.project_top = real_project
-    print("  ok  goal 线仅 route_choice；waypoint 半径/地面投影")
+    print("  ok  goal 线仅 route_choice；waypoint 半径按机体高度投影")
+
+
+def check_overlay_layout(cam):
+    """图例不能压住左下角的时间角标；面板时间与角标同口径；机载标题写实际分辨率。"""
+    cv2, img = _FakeCv2(), _FakeImage()
+    texts = []
+    cv2.putText = lambda _img, text, org, *_a: texts.append((text, org))
+    track = [(10 * S, 1.0, 0.0, 2.2)]
+    rv._draw_top(cv2, img, cam, track, 10 * S, ((1.0, 0.0, 2.2), 10 * S), None, None,
+                 {"x": 2.0, "y": 1.0}, success_criterion="goal_reach_ever", goal_radius=1.5)
+    legend = [(t, o) for t, o in texts if t in ("trail", "contact") or t.startswith("waypoint")]
+    assert len(legend) == 3, texts
+    assert all(o[1] < img.shape[0] // 2 for _, o in legend), ("图例应在上半部", legend)
+    assert all(o[1] > 22 for _, o in legend), ("图例在 TOP 标签之下", legend)
+    texts.clear()
+    cv2.rectangle = lambda *_a: None
+    cv2.line = lambda *_a: None
+    actions = [{"step": 0, "action_executed": 1, "action_start_ns": 10 * S}]
+    rv._panel(cv2, None, 640, 360, 16 * S + S // 5, 10 * S, 20 * S, actions, track,
+              None, None, "t", "")
+    sim_line = next(t for t, _ in texts if t.startswith("sim t"))
+    note, _ = rv._frame_note(16 * S + S // 5, 0, -1, 16 * S + S // 5)
+    assert sim_line.startswith("sim t = 16.20 s") and note.startswith("sim 16.20s"), (sim_line, note)
+    assert "+6.2 s" in sim_line, sim_line
+    assert rv.onboard_label(_FakeImage()) == "ONBOARD 480x360 camera (model input is resized)"
+    assert rv.onboard_label(None) == "ONBOARD"
+    print("  ok  图例在上半部不压角标；面板与角标同为绝对仿真时间；机载标题写实际分辨率")
 
 
 def write_cam(d, cam, frames, w=8, h=6):
@@ -120,6 +269,9 @@ def main():
     print("  ok  顶视投影方向/姿态门禁")
     check_labels_and_notes()
     check_goal_criterion(cam)
+    check_overlay_layout(cam)
+    check_ascii_overlay(cam)
+    check_record_buckets_and_overwrite()
 
     with tempfile.TemporaryDirectory() as d:
         write_cam(d, "uav", [(10 * S, 10), (10 * S + S // 2, 20), (11 * S, 30)])
@@ -166,6 +318,21 @@ def main():
         assert ok and frame.shape == (720, 1280, 3)
         cap.release()
         print("  ok  合成 16 帧 1280x720（缺顶视帧不崩）")
+        # .webm 走 VP8（浏览器可播）；本机 cv2 没有 H.264，mp4 只能是 mp4v。
+        assert rv.fourcc_for("a/seed_1.webm") == "VP80" and rv.fourcc_for("a/b.mp4") == "mp4v"
+        web = os.path.join(d, "v.webm")
+        n = rv.compose(d, ep, WORLD, web, title="t", result="COLLISION", goal_x=5.0,
+                       hold_end_s=0.5)
+        with open(web, "rb") as f:
+            head = f.read(4096)
+        assert head[:4] == b"\x1a\x45\xdf\xa3" and b"webm" in head and b"V_VP8" in head, head[:40]
+        cap = cv2.VideoCapture(web)
+        back = 0
+        while cap.read()[0]:
+            back += 1
+        cap.release()
+        assert n == 16 and back == 16, (n, back)
+        print("  ok  .webm 合成为 VP8/WebM，回读 16 帧")
     print("test_record_views: PASS")
     return 0
 

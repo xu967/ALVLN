@@ -100,11 +100,13 @@ def _reset_tail(state, inode=None, head=None):
     state.update(inode=inode, offset=0, partial=b"", head=head)
 
 
-def tail_events(run_dir, state, limit=EVENT_LIMIT):
+def tail_events(run_dir, state, limit=EVENT_LIMIT, window=TAIL_WINDOW):
     """读 metrics.jsonl 自上次调用后新增的完整行；返回 (events, reset)。
 
     state 由调用方持有并跨刷新复用。文件被截断/替换时 reset=True，调用方
-    应清空旧日志。shortcut: 用首 64 字节指纹识别同 inode 的原地重写；若新文件
+    应清空旧日志。首次/重载只读末尾 window 字节、返回最后 limit 条；
+    window=None / limit=None 表示读全量、不截断（Studio 的 Best Val 需要全部 val 事件）。
+    shortcut: 用首 64 字节指纹识别同 inode 的原地重写；若新文件
     前 64 字节与旧文件相同，仍会按旧偏移读，需改成全文件 hash。
     """
     path = os.path.join(run_dir, "metrics.jsonl")
@@ -133,8 +135,8 @@ def tail_events(run_dir, state, limit=EVENT_LIMIT):
             else:
                 # 文件不足 64 字节时追加会让指纹变长；前缀相同就是追加。
                 state["head"] = head
-            if reset and st.st_size > TAIL_WINDOW:
-                f.seek(st.st_size - TAIL_WINDOW)
+            if reset and window is not None and st.st_size > window:
+                f.seek(st.st_size - window)
                 f.readline()  # 丢弃窗口首行的半截内容
             else:
                 f.seek(state.get("offset", 0))
@@ -157,6 +159,8 @@ def tail_events(run_dir, state, limit=EVENT_LIMIT):
             continue
         if isinstance(event, dict):
             events.append(event)
+    if limit is None:
+        return events, reset
     return (events[-limit:] if limit > 0 else []), reset
 
 
@@ -970,7 +974,9 @@ class MonitorApp:
     def _start_training(self):
         if self.proc is not None:
             return
-        rollback = False   # 目录确认是空的之后写下的文件都归本次启动，失败可安全删掉
+        # run 目录和 .monitor 都确认为空之后写下的文件才归本次启动，失败时只删这些。
+        # 以前只查 run 目录：复用旧 .monitor 时，命令解析失败也会删掉上次的配置/命令/日志。
+        rollback = False
         try:
             config = validate_train_config(
                 self.train_dir_var.get(),
@@ -980,16 +986,19 @@ class MonitorApp:
                 self.train_vars["lr"].get(),
                 self.train_vars["seed"].get())
             run_dir = config["run_dir"]
+            art_dir = monitor_dir(run_dir)
+            # 先解析命令：坏命令不碰磁盘。
+            argv = build_train_argv(self.train_cmd_var.get(),
+                                    os.path.join(art_dir, "train_config.json"))
             if os.path.isdir(run_dir) and os.listdir(run_dir):
                 raise ValueError(f"运行目录不是空目录: {run_dir}（请用新目录）")
+            if os.path.isdir(art_dir) and os.listdir(art_dir):
+                raise ValueError(f"监控目录已有旧文件: {art_dir}（保留旧日志；请用新运行目录）")
             os.makedirs(run_dir, exist_ok=True)
             if not os.path.isdir(run_dir):
                 raise ValueError(f"无法创建运行目录: {run_dir}")
-            rollback = True
-            art_dir = monitor_dir(run_dir)
             os.makedirs(art_dir, exist_ok=True)
-            argv = build_train_argv(self.train_cmd_var.get(),
-                                    os.path.join(art_dir, "train_config.json"))
+            rollback = True
             write_train_config(art_dir, config, argv)
             log_path = os.path.join(art_dir, "train.log")
             self._apply_train_state("starting")

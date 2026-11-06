@@ -51,16 +51,17 @@ def decode(msg):
     if step < w * nch:
         raise ValueError(f"step {step} < width*channels {w * nch}")
     raw = base64.b64decode(msg.get('data', ''))
-    need = (h - 1) * step + w * nch
+    row_bytes = w * nch
+    need = (h - 1) * step + row_bytes
     if len(raw) < need:
         raise ValueError(f"payload too short: {len(raw)} < {need}")
-    rows = bytearray(w * h * nch)
-    for y in range(h):
-        row = bytearray(raw[y*step:y*step + w*nch])
-        if swap:
-            for i in range(0, len(row), nch):
-                row[i], row[i+2] = row[i+2], row[i]
-        rows[y*w*nch:(y+1)*w*nch] = row
+    # 整行/整通道切片在 C 里做：Studio 每帧都调，逐像素 Python 循环 640x360 要几十 ms。
+    if step == row_bytes:
+        rows = bytearray(raw[:h * row_bytes])
+    else:
+        rows = bytearray(b''.join(raw[y*step:y*step + row_bytes] for y in range(h)))
+    if swap:
+        rows[0::nch], rows[2::nch] = rows[2::nch], rows[0::nch]
     return w, h, nch, bytes(rows)
 
 def png_bytes(msg):

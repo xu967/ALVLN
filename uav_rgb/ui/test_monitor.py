@@ -197,6 +197,16 @@ with tempfile.TemporaryDirectory() as d:
         f.write('{"event":"x"}\n{"event":"y"}\n')
     check("load_events limit=0 返回空", monitor.load_events(d, limit=0) == [])
 
+    # Studio 用 limit=None/window=None 读全量：大文件首次读取不能只剩末尾窗口（REVIEW #6）
+    with open(p, "w", encoding="utf-8") as f:
+        for i in range(3000):
+            f.write(json.dumps({"event": "train_step", "step": i, "pad": "x" * 400}) + "\n")
+    part, _ = monitor.tail_events(d, {})
+    full, _ = monitor.tail_events(d, {}, limit=None, window=None)
+    check("tail 默认仍只读末尾窗口", os.path.getsize(p) > monitor.TAIL_WINDOW
+          and len(part) == monitor.EVENT_LIMIT)
+    check("tail limit/window=None 读全量", len(full) == 3000 and full[0]["step"] == 0)
+
 # 6. 曲线：断点分段 + 单点圆点
 canvas = FakeCanvas()
 monitor._line_chart(canvas, [{"name": "x", "color": "#000",
@@ -626,6 +636,32 @@ if gui_ok:
             check("GUI 写盘失败回滚 .tmp",
                   os.listdir(os.path.join(td, "run5")) == []
                   and os.listdir(os.path.join(td, "run5.monitor")) == [])
+
+            # AUDIT #15：空 run + 已有 .monitor 日志。坏命令和好命令都不能删/截断旧文件。
+            side6 = os.path.join(td, "run6.monitor")
+            os.makedirs(side6)
+            for name, text in (("train.log", "old log\n"), ("train_config.json", "{}\n"),
+                               ("train_command.txt", "old cmd\n")):
+                with open(os.path.join(side6, name), "w", encoding="utf-8") as f:
+                    f.write(text)
+
+            def side6_files():
+                out = {}
+                for name in sorted(os.listdir(side6)):
+                    with open(os.path.join(side6, name), encoding="utf-8") as f:
+                        out[name] = f.read()
+                return out
+            before = side6_files()
+            app.train_dir_var.set(os.path.join(td, "run6"))
+            app.train_cmd_var.set("'unterminated")
+            app._start_training()
+            check("GUI 坏命令不删已有 .monitor 日志",
+                  app.proc is None and side6_files() == before)
+            app.train_cmd_var.set(f"{shlex.quote(sys.executable)} {shlex.quote(fake)}")
+            app._start_training()
+            check("GUI 已有 .monitor 时拒绝启动且旧日志不被截断",
+                  app.proc is None and side6_files() == before
+                  and "监控目录已有旧文件" in app.train_status.cget("text"))
 
         # 刷新异常也必须重排 after，否则自动刷新永久停掉。
         calls = []

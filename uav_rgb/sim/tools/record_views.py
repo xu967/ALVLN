@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""三视图任务视频：录 机载/追尾/顶视 三路相机，再按仿真时间合成一段 mp4。
+"""三视图任务视频：录 机载/追尾/顶视 三路相机，再按仿真时间合成一段视频。
 
-  record   在 sim 运行期间常驻订阅三路相机，按仿真时间降到 ≤FPS 帧/秒，原始 RGB 追加写盘。
+  record   在 sim 运行期间常驻订阅三路相机，按仿真时间 ts//(1/FPS) 分桶、每桶留一帧，原始 RGB 写盘。
            SIGTERM 结束（eval_closed_loop 用 stop_group 收）。纯 stdlib，任意解释器可跑。
-  compose  读帧 + actions/oracle.jsonl，按仿真时间轴合成 1280x720 mp4：
+  compose  读帧 + actions/oracle.jsonl，按同一分桶网格合成 1280x720 视频：
            追尾 | 顶视（叠加轨迹、碰撞点、终点线） / 机载 | 状态面板（动作、速度、碰撞）。
-           需要 cv2+numpy（本机 conda python3 有；/usr/bin/python3 没有）。
+           --out 以 .webm 结尾用 VP8（浏览器可直接播放）；其他扩展名用 mp4v（浏览器放不了，
+           只为兼容旧调用）。本机 cv2 没有 H.264 编码器。需要 cv2+numpy（.venv-tools / 3dgs-venv）。
 
 用法：
   python3 record_views.py record --out FRAMES_DIR            # 需在 sim 的 GZ_PARTITION 环境下
   python3 record_views.py compose --frames FRAMES_DIR --episode EP_DIR \\
-      --world scene_42.sdf --out seed_42.mp4 [--title "..."] [--result SUCCESS]
+      --world scene_42.sdf --out seed_42.webm [--title "..."] [--result SUCCESS]
 """
 import argparse
 import json
@@ -28,6 +29,7 @@ import save_frame
 CAMS = {"uav": "/uav/camera", "chase": "/uav/chase_camera", "top": "/uav/top_camera"}
 FPS = 10                      # 视频帧率 = 每仿真秒 10 帧
 STALE_AFTER_S = 1.0           # 帧龄超过此值标 STALE（相机 10–30 Hz，1 s 已是停更）
+LEGEND_TOP = 44               # 顶视图例首行 y：TOP 标签（y=22）之下、criterion 文字（右上）之外
 ACTIONS = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 ACTION_BGR = ((200, 200, 200), (80, 200, 80), (230, 160, 40), (40, 160, 230))
 
@@ -47,27 +49,37 @@ def stuck_step(actions):
 
 
 def _frame_note(ts, idx, old_idx, t):
-    """面板角标：该帧 sim time / 帧龄；重复帧 REPEAT，停更帧 STALE。"""
+    """面板角标：该帧 sim time / 帧龄；重复帧 REPEAT，停更帧 STALE。只用 ASCII（Hershey 字体画不了「·」和中文）。"""
     if ts is None:
         return "", None
     age = max(0.0, (t - ts) / 1e9)
     if age > STALE_AFTER_S:
-        tag, color = " · STALE", (0, 0, 255)
+        tag, color = " | STALE", (0, 0, 255)
     elif idx == old_idx:
-        tag, color = " · REPEAT", (0, 165, 255)
+        tag, color = " | REPEAT", (0, 165, 255)
     else:
         tag, color = "", (235, 235, 235)
-    return f"sim {ts / 1e9:.2f}s · age {age:.2f}s{tag}", color
+    return f"sim {ts / 1e9:.2f}s | age {age:.2f}s{tag}", color
+
+
+def fourcc_for(path):
+    """按扩展名选编码：.webm 用 VP8，浏览器直接能放；其他用 mp4v（只是兼容旧调用，浏览器放不了）。
+
+    实测 .venv-tools 与 3dgs-venv 的 cv2 5.0.0 都没有 H.264 编码器（avc1/H264 打不开），
+    VP80/VP90 可用；VP90 在 1280x720 下约 190 ms/帧，太慢，选 VP80（约 50 ms/帧）。
+    """
+    return "VP80" if str(path).lower().endswith(".webm") else "mp4v"
 
 
 def record(out_dir):
     os.makedirs(out_dir, exist_ok=True)
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     subs = {k: gz_io.TopicSub(t, buf=8) for k, t in CAMS.items()}
-    files = {k: (open(os.path.join(out_dir, k + ".rgb"), "ab"),
-                 open(os.path.join(out_dir, k + ".idx.jsonl"), "a")) for k in CAMS}
+    # "wb"/"w"：目录里残留上一次的帧时不能追加，否则两次录像的帧混在一起。
+    files = {k: (open(os.path.join(out_dir, k + ".rgb"), "wb"),
+                 open(os.path.join(out_dir, k + ".idx.jsonl"), "w")) for k in CAMS}
     last_seq = dict.fromkeys(CAMS, 0)
-    last_ts = dict.fromkeys(CAMS, -10**18)
+    last_bucket = dict.fromkeys(CAMS, None)
     period = int(1e9 / FPS)
     try:
         while True:
@@ -77,7 +89,10 @@ def record(out_dir):
                         continue
                     last_seq[k] = seq
                     ts = gz_io.header_stamp_ns(msg)
-                    if ts < last_ts[k] + period:
+                    # 按 ts // period 分桶、每桶留一帧，与 compose 的取帧网格对齐。以前用
+                    # “距上一帧 >= period”，15 Hz 的 chase 实际只留 7.5 Hz，合成时约每 4 帧重复 1 帧。
+                    bucket = ts // period
+                    if bucket == last_bucket[k]:
                         continue
                     try:
                         w, h, nch, rows = save_frame.decode(msg)
@@ -89,7 +104,7 @@ def record(out_dir):
                     data.write(rows)
                     data.flush()
                     idx.flush()
-                    last_ts[k] = ts
+                    last_bucket[k] = bucket
             time.sleep(0.01)
     finally:
         for data, idx in files.values():
@@ -189,6 +204,14 @@ def _track(actions, oracle):
     return [(t, *pts[t]) for t in sorted(pts)]
 
 
+def sample_grid(t_first, t_end):
+    """(period, 各帧区间起点)。第 k 帧代表 [t0+k*period, t0+(k+1)*period)，t0 对齐到
+    record 的 ts//period 分桶；每帧取区间里最新的那张，15 Hz 的 chase 每格都有新帧。"""
+    period = int(1e9 / FPS)
+    t0 = t_first // period * period
+    return period, list(range(t0, t_end + 1, period))
+
+
 def compose(frames_dir, ep_dir, world_path, out_path, title="", result="",
             goal_x=None, waypoint=None, hold_end_s=1.5,
             success_criterion=None, goal_radius=None):
@@ -208,25 +231,24 @@ def compose(frames_dir, ep_dir, world_path, out_path, title="", result="",
     readers = {k: _Reader(frames_dir, k, np) for k in CAMS}
     if not readers["uav"].idx:
         raise RuntimeError(f"{frames_dir} 没有机载相机帧")
-    t0 = readers["uav"].idx[0][0]
     t_end = max([readers["uav"].idx[-1][0]] + [o.get("timestamp_ns", 0) for o in oracle])
+    period, times = sample_grid(readers["uav"].idx[0][0], t_end)
+    t0 = times[0]
     hit = contact_step(actions)
     stuck = stuck_step(actions)
     hit_mark = _step_mark(hit, oracle, t_end)
     stuck_mark = _step_mark(stuck, oracle, t_end)
     W, H = 1280, 720
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (W, H))
+    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*fourcc_for(out_path)), FPS, (W, H))
     if not writer.isOpened():
-        raise RuntimeError(f"cv2.VideoWriter 打不开 {out_path}")
-    period = int(1e9 / FPS)
+        raise RuntimeError(f"cv2.VideoWriter 打不开 {out_path}（fourcc={fourcc_for(out_path)}）")
     n_end = int(hold_end_s * FPS)
-    times = list(range(t0, t_end + 1, period))
     frames = 0
     try:
         for k, t in enumerate(times + [t_end] * n_end):
             canvas = np.zeros((H, W, 3), np.uint8)
             old = {key: readers[key].i for key in CAMS}
-            images = {key: readers[key].at(t) for key in CAMS}
+            images = {key: readers[key].at(t + period - 1) for key in CAMS}
             notes = {key: _frame_note(readers[key].ts, readers[key].i, old[key], t)
                      for key in CAMS}
             _paste(cv2, canvas, images["chase"], 0, 0, 640, 360, "CHASE", *notes["chase"])
@@ -236,7 +258,7 @@ def compose(frames_dir, ep_dir, world_path, out_path, title="", result="",
                 _draw_top(cv2, top, top_cam, track, t, hit_mark, stuck_mark, goal_x,
                           waypoint, success_criterion, goal_radius)
             _paste(cv2, canvas, top, 640, 0, 640, 360, "TOP", *notes["top"])
-            _paste(cv2, canvas, images["uav"], 0, 360, 640, 360, "ONBOARD (model input)",
+            _paste(cv2, canvas, images["uav"], 0, 360, 640, 360, onboard_label(images["uav"]),
                    *notes["uav"])
             _panel(cv2, canvas, 640, 360, t, t0, t_end, actions, track, hit, stuck, title,
                    result if k >= len(times) else "")
@@ -258,6 +280,14 @@ def _step_mark(step, oracle, t_end):
         g = o["pose_gt"]
         return ((g["x"], g["y"], g.get("z", 0.0)), o.get("timestamp_ns") or t_end)
     return None
+
+
+def onboard_label(img):
+    """机载面板标题写相机实际分辨率。以前写 "(model input)"：画面是 320x240 的相机帧，
+    模型吃的是 student.py 再缩放后的输入（本仓库 160x120），录像里拿不到那个尺寸，不冒充。"""
+    if img is None:
+        return "ONBOARD"
+    return f"ONBOARD {img.shape[1]}x{img.shape[0]} camera (model input is resized)"
 
 
 def _paste(cv2, canvas, img, x, y, w, h, label, note="", note_color=(235, 235, 235)):
@@ -290,9 +320,11 @@ def _draw_top(cv2, img, cam, track, t, hit_mark, stuck_mark, goal_x, waypoint,
         cv2.putText(img, "top camera pose unsupported: no overlay", (8, img.shape[0] - 10),
                     font, 0.45, (0, 0, 255), 1)
         return
-    # 判据线和 waypoint 都投到地面 z=0，不能用无人机当前高度，否则同一位置
-    # 会随飞行高度在画面里漂移。
-    z = 0.0
+    # 判据线和 waypoint 投到无人机当前高度，不投地面：顶视相机只有 6 m 高，是透视投影，
+    # 同一 (x,y) 在地面和 2.3 m 机体高度差 25–30 px、半径圈小 38%（基线 demo 实测），
+    # 机体到了圈里画面上却在圈外。按机体高度投，高度变 0.2 m 圈心只移约 3 px。没有轨迹时按地面。
+    past = [p for p in track if p[0] <= t]
+    z = past[-1][3] if past else 0.0
     draw_goal = (goal_x is not None and
                  success_criterion in (None, "", "route_choice"))
     if draw_goal:
@@ -308,7 +340,7 @@ def _draw_top(cv2, img, cam, track, t, hit_mark, stuck_mark, goal_x, waypoint,
                 radius_px = max(3, int(round((w / 2) / math.tan(hfov / 2) *
                                              goal_radius / max(cz - z, 1e-6))))
             cv2.circle(img, p, radius_px, (255, 0, 255), 2)
-    pts = [project_top(cam, x, y, pz) for ts, x, y, pz in track if ts <= t]
+    pts = [project_top(cam, x, y, pz) for ts, x, y, pz in past]
     pts = [p for p in pts if p]
     for a, b in zip(pts, pts[1:]):
         cv2.line(img, a, b, (0, 255, 255), 2)
@@ -322,10 +354,10 @@ def _draw_top(cv2, img, cam, track, t, hit_mark, stuck_mark, goal_x, waypoint,
         p = project_top(cam, *stuck_mark[0])
         if p:
             cv2.drawMarker(img, p, (0, 165, 255), cv2.MARKER_TILTED_CROSS, 18, 3)
-    # 判据/半径和简单图例；放在底部，避开左上角的 TOP 标签。
-    text = f"criterion={success_criterion or '未标注'}"
+    # 判据/半径写右上角，避开左上角的 TOP 标签。只用 ASCII（Hershey 字体）。
+    text = f"criterion={success_criterion or 'unlabeled'}"
     if goal_radius is not None:
-        text += f" · r={goal_radius:g} m"
+        text += f" | r={goal_radius:g} m"
     (tw, _), _ = cv2.getTextSize(text, font, 0.45, 1)
     cv2.putText(img, text, (max(8, img.shape[1] - tw - 8), 20), font, 0.45,
                 (235, 235, 235), 1)
@@ -341,9 +373,9 @@ def _draw_top(cv2, img, cam, track, t, hit_mark, stuck_mark, goal_x, waypoint,
         legend.append(("contact", (0, 0, 255)))
     if stuck_mark is not None:
         legend.append(("stuck", (0, 165, 255)))
+    # 图例放左上、TOP 标签下方：左下角是 _paste 写的 sim 时间/帧龄，以前两者叠在一起。
     for i, (label, color) in enumerate(legend):
-        cv2.putText(img, label, (8, img.shape[0] - 10 - 15 * (len(legend) - 1 - i)),
-                    font, 0.4, color, 1)
+        cv2.putText(img, label, (8, LEGEND_TOP + 15 * i), font, 0.4, color, 1)
 
 
 def _active(actions, t):
@@ -360,7 +392,9 @@ def _active(actions, t):
 def _panel(cv2, canvas, x, y, t, t0, t_end, actions, track, hit, stuck, title, result):
     font = cv2.FONT_HERSHEY_SIMPLEX
     white = (235, 235, 235)
-    lines = [title, f"sim t = {(t - t0) / 1e9:6.1f} s"]
+    # 与各视角角标同一口径：绝对仿真时间；括号里才是从视频第一帧起算的时长。
+    # 以前面板只写相对时长，角标写绝对时间，同一画面两个数差 t0（基线 demo 差 5.6 s）。
+    lines = [title, f"sim t = {t / 1e9:.2f} s  (video +{(t - t0) / 1e9:.1f} s)"]
     cur = _active(actions, t)
     if cur is not None:
         lines.append(f"step {cur['step'] + 1}/{len(actions)}")
