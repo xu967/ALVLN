@@ -840,19 +840,22 @@ class VehicleTests(unittest.TestCase):
         self.assertEqual(studio.pose_topic("e1_mini"), "/model/e1_mini/pose")
 
     def test_parse_sdf_obstacles_excludes_inferred_vehicle(self):
-        # uav_rgb_e1.sdf 的注释含 "--"，expat 严格解析失败；去注释重试后仍要拿到障碍物
-        with self.assertRaises(ET.ParseError):
-            ET.parse(str(WORLD_E1))
+        # E1 模板现在是严格合法的 XML（注释里不再有 "--"，gz sdf -k 也通过）；
+        # 含 "--" 注释的旧世界（expat 严格解析失败）仍要靠去注释重试拿到障碍物。
+        ET.parse(str(WORLD_E1))
         names = {o["name"] for o in studio.parse_sdf_obstacles(WORLD_E1)}
         self.assertIn("pillar_center", names)
         self.assertNotIn("e1_mini", names, "e1_mini 机体不能被画成障碍物")
         sdf = '''<sdf version="1.6"><world name="w">
+          <!-- 旧模板风格的注释：--camera-rate 这种写法让 expat 报 ParseError -->
           <model name="e1_mini"><link name="base_link">
             <collision name="c"><geometry><box><size>0.2 0.2 0.1</size></box></geometry></collision>
             <sensor name="camera" type="camera"/></link></model>
           <model name="pillar_0"><link name="l">
             <collision name="c"><geometry><box><size>0.4 0.4 2</size></box></geometry></collision></link></model>
         </world></sdf>'''
+        with self.assertRaises(ET.ParseError):
+            ET.fromstring(sdf)
         with tempfile.NamedTemporaryFile("w", suffix=".sdf", delete=False) as f:
             f.write(sdf)
         self.addCleanup(os.unlink, f.name)
@@ -899,9 +902,60 @@ class ProtocolTests(unittest.TestCase):
         app = _headless_app(run)
         app.eval_episodes_var, app.eval_task_var = _Var("5"), _Var(task)
         app.eval_split_var, app.eval_appearance_var = _Var("val"), _Var("v1")
+        app.eval_density_var = _Var("medium")
         app._sim_proc, app._sim_subs = None, {}
         self.addCleanup(_restore_env, "UAVRGB_RENDER_BACKEND", os.environ.get("UAVRGB_RENDER_BACKEND"))
         return app, data
+
+    def test_manual_eval_cf_sitl_adds_vehicle(self):
+        """eval_closed_loop 的 cf_sitl 要显式 --vehicle e1_mini，否则 resolve_vehicle 直接报错。"""
+        with tempfile.TemporaryDirectory() as d:
+            app, _ = self._eval_app(d, meta=dict(CF_META, dynamics_profile="cf_sitl_v1:bd0dcd43"))
+            _patched_messagebox(self)
+            calls = _patched_popen(self)
+            self.assertTrue(app.start_closed_loop_eval())
+            cmd = calls[0][0]
+            self.assertEqual(cmd[cmd.index("--dynamics") + 1], "cf_sitl")
+            self.assertEqual(cmd[cmd.index("--vehicle") + 1], "e1_mini")
+            self.assertNotIn("--density", cmd)
+
+    def test_manual_eval_forest_e1_without_protocol_uses_e1_stack(self):
+        """forest_e1 数据没有 task_version，auto_eval_params 推断不出协议；选了 forest_e1 仍要按
+        E1 载具 + cf_sitl + 密度档跑，不能退回 x3_velocity（eval_closed_loop 也会拒绝）。"""
+        forest_meta = {"geometry_version": "uavrgb.forest_e1.v1", "splits": {"test": 3},
+                       "dynamics_profile": "cf_sitl_v1:bd0dcd43", "hold_s": 1.0}
+        with tempfile.TemporaryDirectory() as d:
+            app, _ = self._eval_app(d, meta=forest_meta, task="forest_e1")
+            box = _patched_messagebox(self, **{"无法推断执行协议": True})
+            calls = _patched_popen(self)
+            self.assertTrue(app.start_closed_loop_eval())
+            self.assertEqual(box[0][1], "无法推断执行协议")
+            cmd = calls[0][0]
+            self.assertEqual(cmd[cmd.index("--task") + 1], "forest_e1")
+            self.assertEqual(cmd[cmd.index("--density") + 1], "medium")
+            self.assertEqual(cmd[cmd.index("--dynamics") + 1], "cf_sitl")
+            self.assertEqual(cmd[cmd.index("--vehicle") + 1], "e1_mini")
+
+    def test_quick_scene_forest_e1_passes_density_and_vehicle(self):
+        """快速生成场景：forest_e1 必须带 --density 与 --vehicle e1_mini（否则 scene_gen 报错或生成 X3 世界）。"""
+        with tempfile.TemporaryDirectory() as d:
+            old_root = studio.DATA_ROOT
+            studio.DATA_ROOT = Path(d)
+            self.addCleanup(setattr, studio, "DATA_ROOT", old_root)
+            calls = _patched_popen(self)
+            _patched_messagebox(self)
+            for task, extra in (("forest_e1", ["--density", "dense", "--vehicle", "e1_mini"]),
+                                ("campus", [])):
+                app = _headless_app()
+                app._scene_proc, app._scene_log_handle, app._scene_out = None, None, None
+                app.scene_seed_var, app.scene_task_var = _Var("7"), _Var(task)
+                app.scene_density_var = _Var("dense")
+                app.generate_scene()
+                cmd = calls[-1][0]
+                self.assertEqual(cmd[cmd.index("--task") + 1], task)
+                self.assertEqual([a for a in cmd if a in ("--density", "dense", "--vehicle", "e1_mini")],
+                                 extra, cmd)
+                app._scene_log_handle.close()
 
     def test_run_eval_protocol_reads_the_runs_own_job_json(self):
         with tempfile.TemporaryDirectory() as d:
@@ -978,6 +1032,13 @@ class ProtocolTests(unittest.TestCase):
             self.assertEqual(cmd[cmd.index("--window-from") + 1], "observation")
             self.assertEqual(cmd[cmd.index("--hold") + 1], "0.2")
             self.assertEqual(app._live_config["dynamics"], "cf_stab")
+            self.assertNotIn("--vehicle", cmd, "x3 世界不传 --vehicle，旧命令行不变")
+            app._live_log.close()
+            # E1 世界：按 connect_sim 推断出的载具显式传给 collect.py（旧 metadata 没有 vehicle 字段）
+            app._vehicle, app._live_proc = "e1_mini", None
+            app.start_live_student()
+            cmd = calls[1][0]
+            self.assertEqual(cmd[cmd.index("--vehicle") + 1], "e1_mini")
             app._live_log.close()
 
 

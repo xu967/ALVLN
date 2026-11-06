@@ -82,6 +82,11 @@ RENDER_BACKENDS = ("software", "gpu")
 # 录像帧率不在这里：由 sim/tools/record_views.py 的 FPS 决定（评测录像），3DGS 录像 fps = 1/hold。
 ACTION_NAMES = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 ACTIONS = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
+# 任务列表与 scene_gen / eval_closed_loop 的 --task 一致；forest_e1 要配 --density（档位同 scene_gen）
+# 和 E1 载具（--vehicle e1_mini）。
+TASKS = ("base", "l1", "campus", "forest_e1")
+DENSITIES = ("sparse", "medium", "dense")
+DENSITY_DEFAULT = "sparse"   # 森林密度档：sparse 最窄缝 0.45 m，是 e1_pipeline 的默认档
 
 sys.path.insert(0, str(UI_DIR))
 sys.path.insert(0, str(SIM_TOOLS))
@@ -89,6 +94,7 @@ sys.path.insert(0, str(REPO_ROOT / "tools"))
 import monitor as monitor_io  # noqa: E402
 import gz_io  # noqa: E402
 import save_frame  # noqa: E402
+import collect_parallel  # noqa: E402  （只用 DYNAMICS_VEHICLE / gz_env，顶层只有标准库）
 # 复用 CLI 包装的 .uavr meta 推断，避免训练后自动评测与独立 CLI 两处规则漂移。
 import train_student_with_video as video_cli  # noqa: E402
 
@@ -1308,12 +1314,16 @@ class StudioApp:
         ttk.Combobox(part_row, textvariable=self.render_backend_var, values=RENDER_BACKENDS,
                      width=9, state="readonly").pack(side="left")
         self.scene_task_var = tk.StringVar(value="campus")
+        self.scene_density_var = tk.StringVar(value=DENSITY_DEFAULT)
         self.scene_seed_var = tk.StringVar(value="42")
         ttk.Label(controls, text="快速生成场景").grid(row=3, column=0, sticky="w", pady=3)
         gen_row = ttk.Frame(controls)
         gen_row.grid(row=3, column=1, columnspan=2, sticky="w", padx=5)
         ttk.Combobox(gen_row, textvariable=self.scene_task_var,
-                     values=("campus", "base", "l1"), width=10, state="readonly").pack(side="left")
+                     values=TASKS, width=10, state="readonly").pack(side="left")
+        ttk.Label(gen_row, text="Density(forest_e1)").pack(side="left", padx=(10, 4))
+        ttk.Combobox(gen_row, textvariable=self.scene_density_var,
+                     values=DENSITIES, width=8, state="readonly").pack(side="left")
         ttk.Label(gen_row, text="Seed").pack(side="left", padx=(10, 4))
         ttk.Entry(gen_row, textvariable=self.scene_seed_var, width=8).pack(side="left")
         ttk.Button(gen_row, text="生成 SDF + metadata", command=self.generate_scene).pack(side="left", padx=8)
@@ -1425,13 +1435,17 @@ class StudioApp:
         eval_box = ttk.LabelFrame(tab, text="独立 Gazebo 闭环评测（训练分类指标 ≠ 导航成功率）", padding=8)
         eval_box.grid(row=2, column=0, sticky="ew", pady=(8, 0))
         self.eval_task_var = tk.StringVar(value="base")
+        self.eval_density_var = tk.StringVar(value=DENSITY_DEFAULT)
         self.eval_split_var = tk.StringVar(value="test")
         self.eval_episodes_var = tk.StringVar(value=EVAL_EPISODES_DEFAULT)
         self.eval_appearance_var = tk.StringVar(value="v1")
         ttk.Label(eval_box, text="Task（必须匹配训练数据）").pack(side="left")
         ttk.Combobox(eval_box, textvariable=self.eval_task_var,
-                     values=("base", "l1", "campus"), width=10, state="readonly").pack(
+                     values=TASKS, width=10, state="readonly").pack(
             side="left", padx=5)
+        ttk.Label(eval_box, text="Density").pack(side="left")
+        ttk.Combobox(eval_box, textvariable=self.eval_density_var,
+                     values=DENSITIES, width=8, state="readonly").pack(side="left", padx=5)
         ttk.Label(eval_box, text="Split").pack(side="left")
         ttk.Combobox(eval_box, textvariable=self.eval_split_var,
                      values=("train", "val", "test"), width=8, state="readonly").pack(
@@ -2088,6 +2102,9 @@ class StudioApp:
         log = log_path.open("ab", buffering=0)
         cmd = [PYTHON_FOR_SIM, str(SIM_TOOLS / "scene_gen.py"), "--seed", str(seed),
                "--out", str(out), "--task", task]
+        if task == "forest_e1":
+            # forest_e1 是 E1 任务：scene_gen 要 --density；不传 --vehicle 会生成 X3 世界，cf_sitl 跑不了。
+            cmd += ["--density", self.scene_density_var.get(), "--vehicle", "e1_mini"]
         try:
             self._scene_proc = subprocess.Popen(cmd, cwd=str(REPO_ROOT),
                                                 stdin=subprocess.DEVNULL, stdout=log,
@@ -2674,6 +2691,10 @@ class StudioApp:
             cmd += ["--dynamics", protocol["dynamics"]]
             if protocol.get("window_from"):
                 cmd += ["--window-from", str(protocol["window_from"])]
+        # 载具按所选 world 推断（connect_sim 已算出 self._vehicle）；collect.py 缺省只看 scene-meta 的
+        # vehicle 字段，旧 metadata 没有它时 E1 世界会被当 x3，cf_sitl 直接报错。
+        if self._vehicle != DEFAULT_VEHICLE:
+            cmd += ["--vehicle", self._vehicle]
         env = os.environ.copy()
         if self._sim_partition_active and self._sim_partition_active != "default":
             env["GZ_PARTITION"] = self._sim_partition_active
@@ -2837,12 +2858,23 @@ class StudioApp:
                    "--split", split, "--out", str(out), "--text-mode", "keep"]
             if task == "campus":
                 cmd += ["--appearance", self.eval_appearance_var.get()]
+            dynamics = protocol["dynamics"] if protocol is not None else None
+            if task == "forest_e1":
+                # forest_e1 只有 E1 载具 + cf_sitl（eval_closed_loop 要 --density）；训练数据推断不到协议
+                # 时也按这套跑，不能退回 x3_velocity。
+                cmd += ["--density", self.eval_density_var.get()]
+                dynamics = dynamics or "cf_sitl"
+            if dynamics:
+                cmd += ["--dynamics", dynamics]
             if protocol is not None:
-                cmd += ["--dynamics", protocol["dynamics"]]
                 if protocol.get("window_from"):
                     cmd += ["--window-from", str(protocol["window_from"])]
                 if protocol.get("hold_s") is not None:
                     cmd += ["--hold", repr(float(protocol["hold_s"]))]
+            # cf_sitl 的 eval_closed_loop 要显式 --vehicle e1_mini（resolve_vehicle 不从 dynamics 反推）
+            vehicle = collect_parallel.DYNAMICS_VEHICLE.get(dynamics)
+            if vehicle:
+                cmd += ["--vehicle", vehicle]
         else:
             cmd = video_cli.build_eval_command(
                 PYTHON_FOR_SIM, SIM_TOOLS / "eval_closed_loop.py", ckpt, out, auto)

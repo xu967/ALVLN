@@ -31,6 +31,12 @@ PANEL_W, PANEL_H = 320, 240   # 与机载帧同尺寸；三格横拼 960×240
 STATUS_H = 36          # 底部状态栏高度：一行 0.5 号 Hershey 字体 + 边距
 KEYFRAMES = 4          # 关键帧 PNG：首、1/3、2/3、末，预览用
 ACTION_NAMES = ("SAFE", "FORWARD", "YAW_LEFT", "YAW_RIGHT")
+# 跟随格里的机体线框（3DGS 没有机体模型，以前只画一个固定 6 px 圆）：尺寸取 e1_mini.json
+# collision_envelope.xy_half_extent / motor_positions / prop_diameter，按真实位姿投影，roll/pitch 可见。
+BODY_GUARD_HALF_M = 0.084
+BODY_MOTOR_M = 0.042
+BODY_PROP_R_M = 0.0325
+BODY_ROTOR_Z_M = 0.015
 
 
 def compose_rgb_video(frames_dir, out_path, fps=10.0):
@@ -82,6 +88,38 @@ def _label(img, text, org, color=(255, 255, 255), scale=0.5):
     cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, scale, color, 1, cv2.LINE_AA)
 
 
+def _draw_body(img, pos, quat, cam_view, fov_deg, n2w=None):
+    """把 E1 机体线框投到跟随格：保护罩方框（黄）、4 个桨圆、机头线（红）。
+
+    pos/quat 是 nav 系机体位姿，cam_view 是跟随相机的 world->camera 4x4（含 nav_to_world），
+    与渲染用的同一矩阵，所以线框与 3DGS 画面严格同一投影。机体在相机后方/过近时不画。
+    """
+    import cv2
+    k = scene_mod.intrinsics(PANEL_W, PANEL_H, fov_deg)
+    r_nb = scene_mod._quat_rotmat(quat)
+    m = np.eye(4) if n2w is None else np.asarray(n2w, np.float64)
+
+    def proj(p_body):
+        p_nav = np.asarray(pos, np.float64) + r_nb @ np.asarray(p_body, np.float64)
+        p_cam = cam_view @ np.append(m[:3, :3] @ p_nav + m[:3, 3], 1.0)
+        if p_cam[2] <= 0.05:
+            return None, None
+        return (int(round(k[0, 0] * p_cam[0] / p_cam[2] + k[0, 2])),
+                int(round(k[1, 1] * p_cam[1] / p_cam[2] + k[1, 2]))), p_cam[2]
+
+    h = BODY_GUARD_HALF_M
+    corners = [proj((sx * h, sy * h, BODY_ROTOR_Z_M))[0] for sx, sy in ((1, 1), (-1, 1), (-1, -1), (1, -1))]
+    if all(c is not None for c in corners):
+        cv2.polylines(img, [np.array(corners, np.int32)], True, (0, 255, 255), 1, cv2.LINE_AA)
+    for sx, sy in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
+        c, depth = proj((sx * BODY_MOTOR_M, sy * BODY_MOTOR_M, BODY_ROTOR_Z_M))
+        if c is not None:
+            cv2.circle(img, c, max(1, int(round(k[0, 0] * BODY_PROP_R_M / depth))), (0, 255, 255), 1, cv2.LINE_AA)
+    center, nose = proj((0.0, 0.0, BODY_ROTOR_Z_M))[0], proj((h, 0.0, BODY_ROTOR_Z_M))[0]
+    if center is not None and nose is not None:
+        cv2.line(img, center, nose, (0, 0, 255), 2, cv2.LINE_AA)
+
+
 def _panel(renderer, view=None, pose=None):
     """渲染一格并转 BGR、缩放到 PANEL_W×PANEL_H。"""
     import cv2
@@ -117,6 +155,13 @@ class _TopMap:
         cv2.circle(self.base, self.px(wp["x"], wp["y"]), r, (0, 0, 220), 1)          # 到达半径
         cv2.circle(self.base, self.px(wp["x"], wp["y"]), 4, (0, 0, 220), -1)
         cv2.circle(self.base, self.px(sp["x"], sp["y"]), 4, (0, 160, 0), -1)         # spawn
+        # 比例尺 + 朝向：地图窗口随路线变（8–20 m），没有比例尺看不出 2 m 到达圈有多大。
+        bar = int(round(1.0 / self.scale))
+        x0, y0 = 8, PANEL_H - 10
+        cv2.line(self.base, (x0, y0), (x0 + bar, y0), (0, 0, 0), 2)
+        cv2.putText(self.base, "1 m", (x0 + bar + 4, y0 + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
+        cv2.arrowedLine(self.base, (PANEL_W - 14, PANEL_H - 8), (PANEL_W - 14, PANEL_H - 30), (0, 0, 0), 1, tipLength=0.3)
+        cv2.putText(self.base, "+x", (PANEL_W - 34, PANEL_H - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1, cv2.LINE_AA)
 
     def px(self, x, y):
         return (int(round(PANEL_W / 2 - (y - self.cy) / self.scale)),
@@ -161,7 +206,7 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
     if not writer.isOpened():
         raise RuntimeError(f"无法创建 {out_path}（fourcc=VP80）")
     key_idx = sorted({int(round(k * (len(trace) - 1) / max(1, KEYFRAMES - 1))) for k in range(KEYFRAMES)})
-    keyframes, cx, cy = [], PANEL_W // 2, PANEL_H // 2
+    keyframes = []
     pitch_follow = -math.degrees(math.atan2(FOLLOW_UP_M, FOLLOW_BACK_M))
     topmap, path_xy = _TopMap(scene, occ, extra_xy=[row["pos"][:2] for row in trace]), []
     try:
@@ -173,19 +218,24 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
             pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2 * (w_ * qy - qz * qx)))))
             path_xy.append((x, y))
             onboard = _panel(renderer, view=scene_mod.viewmat_from_quat((x, y, z), row["quat"], mount, n2w))
-            follow = _panel(renderer, pose=(x - FOLLOW_BACK_M * math.cos(yaw), y - FOLLOW_BACK_M * math.sin(yaw),
-                                            z + FOLLOW_UP_M, math.degrees(yaw), pitch_follow))
+            follow_pose = (x - FOLLOW_BACK_M * math.cos(yaw), y - FOLLOW_BACK_M * math.sin(yaw),
+                           z + FOLLOW_UP_M, math.degrees(yaw), pitch_follow)
+            follow = _panel(renderer, pose=follow_pose)
             top = topmap.draw(path_xy, yaw)
-            cv2.circle(follow, (cx, cy), 6, (0, 255, 255), 2)                       # 机体在跟随格中心
-            for img, name in ((onboard, "ONBOARD 320x240"), (follow, "FOLLOW  back %.1fm up %.1fm" % (
-                    FOLLOW_BACK_M, FOLLOW_UP_M)), (top, "TOP MAP  occupancy proxy + path")):
+            # 机体线框用跟随相机同一 view 矩阵投影（以前是固定画在格子中心的 6 px 圆，看不出尺寸和姿态）
+            _draw_body(follow, (x, y, z), row["quat"], scene_mod.viewmat_from_pose(*follow_pose, n2w),
+                       renderer.fov_deg, n2w)
+            for img, name in ((onboard, "ONBOARD %dx%d HFOV %gdeg" % (PANEL_W, PANEL_H, renderer.fov_deg)),
+                              (follow, "FOLLOW  back %.1fm up %.1fm  (E1 wireframe 0.17m)" % (
+                                  FOLLOW_BACK_M, FOLLOW_UP_M)),
+                              (top, "TOP MAP  occupancy proxy + path")):
                 _label(img, name, (6, 16), scale=0.45)
             frame = np.zeros((h, w, 3), np.uint8)
             frame[:PANEL_H] = np.concatenate([onboard, follow, top], axis=1)
             a = steps.get(int(row["step"]), {})
             act = a.get("action_executed", row.get("action", -1))
             speed = math.sqrt(sum(float(v) ** 2 for v in row["vel"]))
-            text = ("t=%5.1fs step %2d  act=%-9s  z=%.2fm  v=%.2fm/s  yaw=%6.1f  roll=%5.1f  pitch=%5.1f"
+            text = ("t=%5.1fs step %2d  act=%-9s  z=%.2fm  v=%.2fm/s  yaw=%6.1f roll=%5.1f pitch=%5.1f deg"
                     % (row["t"], row["step"], ACTION_NAMES[act] if 0 <= int(act) < 4 else "HOVER",
                        z, speed, math.degrees(yaw), roll, pitch))
             _label(frame, text, (6, PANEL_H + 24), scale=0.5)
@@ -246,8 +296,21 @@ def _selftest():
             back += 1
         cap.release()
         assert (r["frames"], back, len(r["keyframes"])) == (10, 10, 4), (r, back)
-        assert cv2.imread(r["keyframes"][0]).shape == (PANEL_H + STATUS_H, 3 * PANEL_W, 3)
-        print(json.dumps({"3dgs_video": "PASS", "frames": frames, "files": 4, "views_frames": back}))
+        key0 = cv2.imread(r["keyframes"][0])
+        assert key0.shape == (PANEL_H + STATUS_H, 3 * PANEL_W, 3)
+        # 跟随格机体线框：水平机体、相机正后方 2.5 m 时，保护罩方框 0.168 m -> 约 19 px，落在格子中心附近
+        follow = key0[:PANEL_H, PANEL_W:2 * PANEL_W]
+        ys, xs = np.nonzero((follow[:, :, 0] < 40) & (follow[:, :, 1] > 215) & (follow[:, :, 2] > 215))
+        assert len(xs) >= 20, ("跟随格没画出机体线框", len(xs))
+        assert (abs(xs - PANEL_W / 2).max() <= 24 and abs(ys - PANEL_H / 2).max() <= 24), (
+            "线框应在格子中心、尺寸约 19 px", xs.min(), xs.max(), ys.min(), ys.max())
+        # 机体在相机后方时不画（proj 返回 None 不崩）
+        blank = np.zeros((PANEL_H, PANEL_W, 3), np.uint8)
+        _draw_body(blank, (-5.0, 0.0, 2.0), [1, 0, 0, 0],
+                   scene_mod.viewmat_from_pose(0.0, 0.0, 2.0, 0.0, 0.0), 60.0)
+        assert not blank.any(), "相机后方的机体不该画"
+        print(json.dumps({"3dgs_video": "PASS", "frames": frames, "files": 4, "views_frames": back,
+                          "body_px": int(len(xs))}))
 
 
 def main():

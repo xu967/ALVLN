@@ -5,6 +5,7 @@ compose 需要 cv2+numpy（conda python3）；缺了只跳过合成那一项。
 用法：python3 sim/tools/test_record_views.py
 """
 import json
+import math
 import os
 import sys
 import tempfile
@@ -14,6 +15,7 @@ import record_views as rv
 
 WORLD = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                      "worlds", "uav_rgb.sdf")
+WORLD_E1 = os.path.join(os.path.dirname(WORLD), "uav_rgb_e1.sdf")
 S = 1_000_000_000
 
 
@@ -239,8 +241,41 @@ def check_overlay_layout(cam):
     assert sim_line.startswith("sim t = 16.20 s") and note.startswith("sim 16.20s"), (sim_line, note)
     assert "+6.2 s" in sim_line, sim_line
     assert rv.onboard_label(_FakeImage()) == "ONBOARD 480x360 camera (model input is resized)"
+    assert rv.onboard_label(_FakeImage(), 60.0) == \
+        "ONBOARD 480x360 HFOV 60deg camera (model input is resized)"
     assert rv.onboard_label(None) == "ONBOARD"
-    print("  ok  图例在上半部不压角标；面板与角标同为绝对仿真时间；机载标题写实际分辨率")
+    print("  ok  图例在上半部不压角标；面板与角标同为绝对仿真时间；机载标题写实际分辨率与 FOV")
+
+
+def check_out_of_view_marker(cam):
+    """机体投影落在顶视图外时要标注，不能让裁在图边的轨迹冒充机体位置。"""
+    cv2, img = _FakeCv2(), _FakeImage()
+    cx, cy, cz, hfov, w, h = cam
+    far_x = cx + (w / 2 + 50) * (cz - 2.0) / ((w / 2) / math.tan(hfov / 2))   # 图右边外 50 px
+    rv._draw_top(cv2, img, cam, [(10 * S, far_x, cy, 2.0)], 10 * S, None, None, None, None)
+    assert any("OUT OF TOP VIEW" in t for t in cv2.texts), cv2.texts
+    edge = [c for c in cv2.circles if c[2] == (0, 0, 255)]
+    assert edge and 0 <= edge[0][0][0] < w and 0 <= edge[0][0][1] < h, ("标记应夹在图内", edge)
+    cv2 = _FakeCv2()
+    rv._draw_top(cv2, img, cam, [(10 * S, cx, cy, 2.0)], 10 * S, None, None, None, None)
+    assert not any("OUT OF TOP VIEW" in t for t in cv2.texts), cv2.texts
+    print("  ok  机体出顶视视野时画边缘标记 + OUT OF TOP VIEW")
+
+
+def check_e1_top_coverage():
+    """E1 模板顶视相机在 2 m 飞行高度要盖住 forest_e1 整条走廊（spawn x=-0.5 到 goal x=7）和
+    柱阵任务区（x 1.3–5.2, y ±1.85）；旧位姿 (2.5,0,6) 480x360 只到 x≈5.9，机体飞到终点就出画。"""
+    with open(WORLD_E1, encoding="utf-8") as f:
+        text = f.read()
+    cam = rv.top_camera_pose(text)
+    assert cam is not None, "E1 模板的 studio_top_camera 没解析出来"
+    assert abs(rv.student_camera_fov(text) - 60.0) < 1e-6, rv.student_camera_fov(text)
+    corners = [(-0.5, 0.0), (7.0, 1.65), (7.0, -1.65), (1.3, 1.85), (5.2, -1.85)]
+    for x, y in corners:
+        assert rv.in_image(cam, rv.project_top(cam, x, y, 2.0)), ("顶视盖不住", (x, y), cam)
+    old = (2.5, 0.0, 6.0, cam[3], 480, 360)
+    assert not rv.in_image(old, rv.project_top(old, 7.0, 0.0, 2.0)), "旧位姿本应盖不住终点"
+    print(f"  ok  E1 顶视相机 {cam[:3]} {cam[4]}x{cam[5]} 盖住森林走廊与柱阵区")
 
 
 def write_cam(d, cam, frames, w=8, h=6):
@@ -270,6 +305,8 @@ def main():
     check_labels_and_notes()
     check_goal_criterion(cam)
     check_overlay_layout(cam)
+    check_out_of_view_marker(cam)
+    check_e1_top_coverage()
     check_ascii_overlay(cam)
     check_record_buckets_and_overwrite()
 

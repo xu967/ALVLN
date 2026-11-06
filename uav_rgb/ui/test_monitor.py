@@ -221,6 +221,16 @@ labels = [i[2].get("text") for i in canvas.items
           if i[0] == "text" and i[2].get("anchor") == "n"
           and i[2].get("font") == ("TkDefaultFont", 8)]
 check("单点只画一个 x 刻度", labels == ["1"])
+# 画布放不下坐标轴（HiDPI/缩小窗口，曲线格只剩 ~37 px）：退化成无轴迷你折线，不能整块空白
+canvas = FakeCanvas(385, 37)
+monitor._line_chart(canvas, [{"name": "x", "color": "#000",
+                              "points": [(1, 1.0), (2, 1.5), (3, 3.0)]}], "tiny")
+check("小画布仍画数据折线", [i for i in canvas.items if i[0] == "line" and i[2].get("fill") == "#000"])
+check("小画布不画坐标轴和刻度", not [i for i in canvas.items if i[0] == "text"]
+      and not [i for i in canvas.items if i[0] == "line" and i[2].get("fill") == "#555"])
+canvas = FakeCanvas(1, 1)
+monitor._line_chart(canvas, [{"name": "x", "color": "#000", "points": [(1, 1.0), (2, 2.0)]}], "unmapped")
+check("未 map 的 1x1 画布不画", canvas.items == [])
 
 # 8. 训练控制：纯函数（无需 GUI）
 argv = monitor.build_train_argv(f"{sys.executable} ui/trainer_demo.py",

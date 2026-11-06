@@ -11,11 +11,11 @@
   motor-model or velocity-control plugins.
 
   Topics (same names as the X3 world, so collect.py / Studio need no topic changes):
-    /uav/camera        student RGB, 320x240 R8G8B8, 60 deg HFOV, update_rate below (scene_gen --camera-rate)
+    /uav/camera        student RGB, 320x240 R8G8B8, 60 deg HFOV, update_rate below (scene_gen option camera-rate)
     /uav/depth         teacher-only depth, same pose/FOV/res/rate as RGB
     /uav/contact       contact sensor on base_link_collision (sparse: publishes only while touching)
     /uav/chase_camera  third-person view from the separate "chase_cam" model (position + yaw follow only;
-                       the plugin places it behind/above the vehicle; aux camera, scene_gen --no-aux-cameras drops it)
+                       the plugin places it behind/above the vehicle; aux camera, scene_gen option no-aux-cameras drops it)
     /uav/top_camera    static top-down view (aux camera)
     /model/e1_mini/pose, /model/e1_mini/odometry   OdometryPublisher at 200 Hz
     /e1_mini/action    gz.msgs.Double_V [action, until_s_sim]  (0 SAFE, 1 FORWARD, 2 YAW_LEFT, 3 YAW_RIGHT)
@@ -74,13 +74,18 @@
     </model>
 
     <!-- aux-camera: top -->
-    <!-- Static overhead camera for the desktop Studio's rendered top-down view.
-         Visual-only sensor: no collision, mass or effect on UAV physics.
-         Height 6 m: with 80 deg HFOV the ground footprint is about 10 m, the pillar
-         field (x 1.3-5.2, y +-1.85) fills about 40% of the frame. -->
+    <!-- Static overhead camera for the desktop Studio's rendered top-down view and the
+         evaluation video's TOP panel. Visual-only sensor: no collision, mass or effect on UAV physics.
+         Pose (3.25, 0, 7), 80 deg HFOV, 640x360 (16:9 fills the video's 640x360 TOP slot):
+         at the 2 m flight height it covers x -0.9..7.4 m, y +-2.4 m (ground: x -2.6..9.1, y +-3.3).
+         The old (2.5, 0, 6) 480x360 pose only covered x -0.9..5.9 m at flight height: in the
+         forest_e1 task (trunks x 1.5-5.5, goal x 6-7) the vehicle left the frame for the last
+         third of every episode (seed 4103 video: trail clipped at the right edge from t=45 s on).
+         Keep pitch/yaw at +90 deg: record_views.project_top only overlays for this straight-down
+         pose (image right = world +X, image up = world +Y). -->
     <model name="studio_top_camera">
       <static>true</static>
-      <pose>2.5 0 6 0 1.57079632679 1.57079632679</pose>
+      <pose>3.25 0 7 0 1.57079632679 1.57079632679</pose>
       <link name="camera_link">
         <sensor name="top_camera" type="camera">
           <pose>0 0 0 0 0 0</pose>
@@ -90,7 +95,7 @@
           <camera>
             <horizontal_fov>1.3962634</horizontal_fov>
             <image>
-              <width>480</width>
+              <width>640</width>
               <height>360</height>
               <format>R8G8B8</format>
             </image>
@@ -185,20 +190,119 @@
           <pose>0 0 0.004 0 0 0</pose>
           <geometry><cylinder><radius>0.102</radius><length>0.048</length></cylinder></geometry>
         </collision>
-        <visual name="base_link_visual">
-          <pose>0 0 0.004 0 0 0</pose>
-          <geometry><cylinder><radius>0.102</radius><length>0.048</length></cylinder></geometry>
-          <material><ambient>0.3 0.3 0.3 1</ambient><diffuse>0.3 0.3 0.3 1</diffuse></material>
+        <!-- Visuals only (no mass, no collision): an X-frame micro quad built from the numbers in
+             e1_mini.json so the chase/top views show something shaped like the E1 MINI instead of a
+             0.2 m puck (which was just the collision cylinder drawn solid). Motors at (+-0.042, +-0.042)
+             (motor_positions), 8520 motors r 0.00425, props d 0.065 (prop_diameter) as translucent
+             discs on the rotor plane z 0.015 (rotor_plane_z), square guard half-extent 0.084
+             (collision_envelope.xy_half_extent), PCB frame, 1S battery underneath, camera module at the
+             camera_mount. Everything stays inside the collision cylinder (max radial extent 0.092 m).
+             Nothing is placed more than 0.05 m (camera near clip) in front of the camera, so the student
+             image is unchanged. -->
+        <visual name="pcb_center_visual">
+          <pose>0 0 0 0 0 0</pose>
+          <geometry><box><size>0.036 0.036 0.0016</size></box></geometry>
+          <material><ambient>0.05 0.25 0.10 1</ambient><diffuse>0.05 0.25 0.10 1</diffuse></material>
         </visual>
-        <!-- heading marker for the chase/top views (no collision) -->
-        <visual name="nose_visual">
-          <pose>0.06 0 0.02 0 0 0</pose>
-          <geometry><box><size>0.04 0.02 0.01</size></box></geometry>
+        <visual name="arm_fl_visual">
+          <pose>0.021 0.021 0 0 0 0.7853981634</pose>
+          <geometry><box><size>0.068 0.012 0.0016</size></box></geometry>
+          <material><ambient>0.05 0.25 0.10 1</ambient><diffuse>0.05 0.25 0.10 1</diffuse></material>
+        </visual>
+        <visual name="arm_fr_visual">
+          <pose>0.021 -0.021 0 0 0 -0.7853981634</pose>
+          <geometry><box><size>0.068 0.012 0.0016</size></box></geometry>
+          <material><ambient>0.05 0.25 0.10 1</ambient><diffuse>0.05 0.25 0.10 1</diffuse></material>
+        </visual>
+        <visual name="arm_rl_visual">
+          <pose>-0.021 0.021 0 0 0 -0.7853981634</pose>
+          <geometry><box><size>0.068 0.012 0.0016</size></box></geometry>
+          <material><ambient>0.05 0.25 0.10 1</ambient><diffuse>0.05 0.25 0.10 1</diffuse></material>
+        </visual>
+        <visual name="arm_rr_visual">
+          <pose>-0.021 -0.021 0 0 0 0.7853981634</pose>
+          <geometry><box><size>0.068 0.012 0.0016</size></box></geometry>
+          <material><ambient>0.05 0.25 0.10 1</ambient><diffuse>0.05 0.25 0.10 1</diffuse></material>
+        </visual>
+        <visual name="motor_fl_visual">
+          <pose>0.042 0.042 0.0078 0 0 0</pose>
+          <geometry><cylinder><radius>0.00425</radius><length>0.014</length></cylinder></geometry>
+          <material><ambient>0.25 0.25 0.25 1</ambient><diffuse>0.25 0.25 0.25 1</diffuse></material>
+        </visual>
+        <visual name="motor_fr_visual">
+          <pose>0.042 -0.042 0.0078 0 0 0</pose>
+          <geometry><cylinder><radius>0.00425</radius><length>0.014</length></cylinder></geometry>
+          <material><ambient>0.25 0.25 0.25 1</ambient><diffuse>0.25 0.25 0.25 1</diffuse></material>
+        </visual>
+        <visual name="motor_rl_visual">
+          <pose>-0.042 0.042 0.0078 0 0 0</pose>
+          <geometry><cylinder><radius>0.00425</radius><length>0.014</length></cylinder></geometry>
+          <material><ambient>0.25 0.25 0.25 1</ambient><diffuse>0.25 0.25 0.25 1</diffuse></material>
+        </visual>
+        <visual name="motor_rr_visual">
+          <pose>-0.042 -0.042 0.0078 0 0 0</pose>
+          <geometry><cylinder><radius>0.00425</radius><length>0.014</length></cylinder></geometry>
+          <material><ambient>0.25 0.25 0.25 1</ambient><diffuse>0.25 0.25 0.25 1</diffuse></material>
+        </visual>
+        <visual name="prop_fl_visual">
+          <pose>0.042 0.042 0.015 0 0 0</pose>
+          <geometry><cylinder><radius>0.0325</radius><length>0.0015</length></cylinder></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient><diffuse>0.75 0.75 0.75 1</diffuse></material>
+          <transparency>0.5</transparency>
+        </visual>
+        <visual name="prop_fr_visual">
+          <pose>0.042 -0.042 0.015 0 0 0</pose>
+          <geometry><cylinder><radius>0.0325</radius><length>0.0015</length></cylinder></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient><diffuse>0.75 0.75 0.75 1</diffuse></material>
+          <transparency>0.5</transparency>
+        </visual>
+        <visual name="prop_rl_visual">
+          <pose>-0.042 0.042 0.015 0 0 0</pose>
+          <geometry><cylinder><radius>0.0325</radius><length>0.0015</length></cylinder></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient><diffuse>0.75 0.75 0.75 1</diffuse></material>
+          <transparency>0.5</transparency>
+        </visual>
+        <visual name="prop_rr_visual">
+          <pose>-0.042 -0.042 0.015 0 0 0</pose>
+          <geometry><cylinder><radius>0.0325</radius><length>0.0015</length></cylinder></geometry>
+          <material><ambient>0.75 0.75 0.75 1</ambient><diffuse>0.75 0.75 0.75 1</diffuse></material>
+          <transparency>0.5</transparency>
+        </visual>
+        <visual name="guard_front_visual">
+          <pose>0.084 0 0.015 0 0 0</pose>
+          <geometry><box><size>0.004 0.168 0.004</size></box></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
+        </visual>
+        <visual name="guard_rear_visual">
+          <pose>-0.084 0 0.015 0 0 0</pose>
+          <geometry><box><size>0.004 0.168 0.004</size></box></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
+        </visual>
+        <visual name="guard_left_visual">
+          <pose>0 0.084 0.015 0 0 0</pose>
+          <geometry><box><size>0.168 0.004 0.004</size></box></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
+        </visual>
+        <visual name="guard_right_visual">
+          <pose>0 -0.084 0.015 0 0 0</pose>
+          <geometry><box><size>0.168 0.004 0.004</size></box></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
+        </visual>
+        <visual name="battery_visual">
+          <pose>-0.012 0 -0.0045 0 0 0</pose>
+          <geometry><box><size>0.032 0.017 0.007</size></box></geometry>
+          <material><ambient>0.10 0.15 0.45 1</ambient><diffuse>0.10 0.15 0.45 1</diffuse></material>
+        </visual>
+        <!-- camera module at camera_mount (front edge, lens looks +X); red so the heading reads in
+             the chase/top views. Inside the camera near clip, so not in the student image. -->
+        <visual name="camera_visual">
+          <pose>0.045 0 0.015 0 0 0</pose>
+          <geometry><box><size>0.009 0.009 0.009</size></box></geometry>
           <material><ambient>0.9 0.2 0.1 1</ambient><diffuse>0.9 0.2 0.1 1</diffuse></material>
         </visual>
 
         <!-- camera_mount: xyz [0.045, 0, 0.015], pitch 0. Intrinsics unchanged from X3 (320x240, 60 deg).
-             update_rate: scene_gen --camera-rate rewrites this value (default 10 Hz: one frame per hold
+             update_rate: scene_gen option camera-rate rewrites this value (default 10 Hz: one frame per hold
              window is consumed, RGB/depth stay paired because both sensors tick together). -->
         <sensor name="camera" type="camera">
           <pose>0.045 0 0.015 0 0 0</pose>

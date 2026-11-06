@@ -144,6 +144,13 @@ def top_camera_pose(world_text):
     return x, y, z, float(m.group(2)), int(m.group(3)), int(m.group(4))
 
 
+def student_camera_fov(world_text):
+    """机载学生相机 <sensor name="camera"> 的水平 FOV（度）；模板里没有返回 None。"""
+    m = re.search(r'<sensor name="camera" type="camera">.*?<horizontal_fov>([^<]+)</horizontal_fov>',
+                  world_text, re.S)
+    return math.degrees(float(m.group(1))) if m else None
+
+
 def project_top(cam, px, py, pz):
     """世界点 -> 顶视图像素。下视且 yaw=90°：图像右 = 世界 +X，图像上 = 世界 +Y。"""
     cx, cy, cz, hfov, w, h = cam
@@ -152,6 +159,11 @@ def project_top(cam, px, py, pz):
         return None
     f = (w / 2) / math.tan(hfov / 2)
     return int(round(w / 2 + f * (px - cx) / d)), int(round(h / 2 - f * (py - cy) / d))
+
+
+def in_image(cam, p):
+    """投影点是否落在顶视图像内。"""
+    return p is not None and 0 <= p[0] < cam[4] and 0 <= p[1] < cam[5]
 
 
 def _jsonl(path):
@@ -227,7 +239,8 @@ def compose(frames_dir, ep_dir, world_path, out_path, title="", result="",
     oracle = _jsonl(os.path.join(ep_dir, "oracle.jsonl"))
     track = _track(actions, oracle)
     with open(world_path, encoding="utf-8") as f:
-        top_cam = top_camera_pose(f.read())
+        world_text = f.read()
+    top_cam, hfov_deg = top_camera_pose(world_text), student_camera_fov(world_text)
     readers = {k: _Reader(frames_dir, k, np) for k in CAMS}
     if not readers["uav"].idx:
         raise RuntimeError(f"{frames_dir} 没有机载相机帧")
@@ -258,8 +271,8 @@ def compose(frames_dir, ep_dir, world_path, out_path, title="", result="",
                 _draw_top(cv2, top, top_cam, track, t, hit_mark, stuck_mark, goal_x,
                           waypoint, success_criterion, goal_radius)
             _paste(cv2, canvas, top, 640, 0, 640, 360, "TOP", *notes["top"])
-            _paste(cv2, canvas, images["uav"], 0, 360, 640, 360, onboard_label(images["uav"]),
-                   *notes["uav"])
+            _paste(cv2, canvas, images["uav"], 0, 360, 640, 360,
+                   onboard_label(images["uav"], hfov_deg), *notes["uav"])
             _panel(cv2, canvas, 640, 360, t, t0, t_end, actions, track, hit, stuck, title,
                    result if k >= len(times) else "")
             writer.write(canvas)
@@ -282,12 +295,15 @@ def _step_mark(step, oracle, t_end):
     return None
 
 
-def onboard_label(img):
-    """机载面板标题写相机实际分辨率。以前写 "(model input)"：画面是 320x240 的相机帧，
-    模型吃的是 student.py 再缩放后的输入（本仓库 160x120），录像里拿不到那个尺寸，不冒充。"""
+def onboard_label(img, hfov_deg=None):
+    """机载面板标题写相机实际分辨率和水平 FOV（取自本集 world SDF，不是硬件文档值：
+    e1_mini.json camera_fov 是 64.9°，模板仍是 X3 的 60°，写出来才看得见这个差异）。
+    以前写 "(model input)"：画面是 320x240 的相机帧，模型吃的是 student.py 再缩放后的
+    输入（本仓库 160x120），录像里拿不到那个尺寸，不冒充。"""
     if img is None:
         return "ONBOARD"
-    return f"ONBOARD {img.shape[1]}x{img.shape[0]} camera (model input is resized)"
+    fov = f" HFOV {hfov_deg:.0f}deg" if hfov_deg else ""
+    return f"ONBOARD {img.shape[1]}x{img.shape[0]}{fov} camera (model input is resized)"
 
 
 def _paste(cv2, canvas, img, x, y, w, h, label, note="", note_color=(235, 235, 235)):
@@ -346,6 +362,15 @@ def _draw_top(cv2, img, cam, track, t, hit_mark, stuck_mark, goal_x, waypoint,
         cv2.line(img, a, b, (0, 255, 255), 2)
     if pts:
         cv2.circle(img, pts[-1], 5, (0, 255, 255), -1)
+    if pts and not in_image(cam, pts[-1]):
+        # 机体飞出顶视相机视野（旧模板 6 m 高 80° 只盖到 x≈5.9 m，森林任务终点在 6–7 m）：
+        # 轨迹被裁在图边、机体点画不出来，不说明的话像是停在边上。把点夹到图边并标注。
+        _h, _w = img.shape[:2]
+        edge = (min(max(pts[-1][0], 4), _w - 5), min(max(pts[-1][1], 4), _h - 5))
+        cv2.circle(img, edge, 7, (0, 0, 255), 2)
+        warn = "UAV OUT OF TOP VIEW"
+        (tw, _), _ = cv2.getTextSize(warn, font, 0.5, 1)
+        cv2.putText(img, warn, (max(8, _w - tw - 8), _h - 28), font, 0.5, (0, 0, 255), 1)
     if hit_mark is not None and t >= hit_mark[1]:
         p = project_top(cam, *hit_mark[0])
         if p:

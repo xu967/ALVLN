@@ -205,14 +205,17 @@ def _line_chart(canvas, series, title):
     canvas.delete("all")
     w = canvas.winfo_width()
     h = canvas.winfo_height()
-    if w < 60 or h < 40:
-        return
-    pad_l, pad_r, pad_t, pad_b = 46, 10, 24, 20
+    if w < 20 or h < 10:
+        return   # 尚未 map（1x1），等 <Configure> 补画
     xs = [x for s in series for x, _ in s["points"] if x is not None]
     ys = [y for s in series for _, y in s["points"] if y is not None]
     if not xs or not ys:
         canvas.create_text(w / 2, h / 2, text="(无数据)", fill="#888")
         return
+    # 画布放不下坐标轴（窗口被缩小、或 Xft.dpi 156 这种 HiDPI 下固定高度的表格/日志把高度吃光，
+    # 两块曲线各只剩 ~37 px）时退化成无轴迷你折线，而不是整块空白。
+    pad_l, pad_r, pad_t, pad_b = (46, 10, 24, 20) if (w >= 60 and h >= 40) else (2, 2, 2, 2)
+    full_axes = pad_l > 2
     xmin, xmax = min(xs), max(xs)
     x_single = xmin == xmax
     if x_single:
@@ -227,23 +230,24 @@ def _line_chart(canvas, series, title):
     def Y(y):
         return h - pad_b - (y - ymin) / (ymax - ymin) * (h - pad_t - pad_b)
 
-    canvas.create_line(pad_l, h - pad_b, w - pad_r, h - pad_b, fill="#555")
-    canvas.create_line(pad_l, pad_t, pad_l, h - pad_b, fill="#555")
-    for i in range(5):
-        yv = ymin + (ymax - ymin) * i / 4
-        canvas.create_text(pad_l - 5, Y(yv), text=f"{yv:.2f}", anchor="e",
-                           font=("TkDefaultFont", 8))
-    # x 轴刻度：最多 ~6 个 epoch 标签；单点时只在真实值处画一个
-    if x_single:
-        canvas.create_text(X(xs[0]), h - pad_b + 8, text=str(int(round(xs[0]))),
-                           anchor="n", font=("TkDefaultFont", 8))
-    else:
-        n_ticks = max(2, min(6, int(xmax - xmin) + 1))
-        for i in range(n_ticks):
-            xv = xmin + (xmax - xmin) * i / (n_ticks - 1)
-            canvas.create_text(X(xv), h - pad_b + 8, text=str(int(round(xv))),
+    if full_axes:
+        canvas.create_line(pad_l, h - pad_b, w - pad_r, h - pad_b, fill="#555")
+        canvas.create_line(pad_l, pad_t, pad_l, h - pad_b, fill="#555")
+        for i in range(5):
+            yv = ymin + (ymax - ymin) * i / 4
+            canvas.create_text(pad_l - 5, Y(yv), text=f"{yv:.2f}", anchor="e",
+                               font=("TkDefaultFont", 8))
+        # x 轴刻度：最多 ~6 个 epoch 标签；单点时只在真实值处画一个
+        if x_single:
+            canvas.create_text(X(xs[0]), h - pad_b + 8, text=str(int(round(xs[0]))),
                                anchor="n", font=("TkDefaultFont", 8))
-    canvas.create_text(w / 2, 4, text=title, anchor="n", font=("TkDefaultFont", 9, "bold"))
+        else:
+            n_ticks = max(2, min(6, int(xmax - xmin) + 1))
+            for i in range(n_ticks):
+                xv = xmin + (xmax - xmin) * i / (n_ticks - 1)
+                canvas.create_text(X(xv), h - pad_b + 8, text=str(int(round(xv))),
+                                   anchor="n", font=("TkDefaultFont", 8))
+        canvas.create_text(w / 2, 4, text=title, anchor="n", font=("TkDefaultFont", 9, "bold"))
     for s in series:
         segment = []
         for x, y in s["points"]:
