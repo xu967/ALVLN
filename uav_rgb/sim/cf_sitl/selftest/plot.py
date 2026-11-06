@@ -1,4 +1,4 @@
-"""画 cf_sitl_selftest 的 CSV：frame / hover / actuator / battery 各一张 PNG，写回同一目录。
+"""画 cf_sitl_selftest 的 CSV：frame / hover / actuator / steps / battery 各一张 PNG，写回同一目录。
 用法：$UAV_RGB_PYTHON sim/cf_sitl/selftest/plot.py <out_dir>
 图上用英文标签（matplotlib 默认字体没有中文字形）。缺哪个 CSV 就跳过哪张图。
 """
@@ -17,6 +17,9 @@ TARGET_H = 2.0        # BRIEF §4 目标高度，画参考线
 FWD_TARGET = 0.3      # FORWARD 目标速度
 YAW_TARGET = 0.6      # YAW_LEFT 目标角速度（绕 z 正向）
 BAT_L1, BAT_L3 = 3.5, 3.0   # safety.ino 阈值，画参考线
+STEP_PITCH_DEG = 15.0       # 杆量 0.5 × tiltMax 30°
+STEP_YAW_DPS = -150.0       # 杆量 0.5 × maxRate.z 300°/s，正杆 = 顺时针 = 绕 z 负向
+STEP_TOL = 0.05             # ±5% 判据带
 
 out = sys.argv[1] if len(sys.argv) > 1 else "out"
 
@@ -132,6 +135,42 @@ if d is not None:
     for a in (ax[0, 0], ax[1, 0], ax[2, 0], ax[0, 1], ax[1, 1]):
         shade(a)
     finish(fig, "actuator.png")
+
+# (3.5) 固件级打杆阶跃：phase 1 俯仰 +0.5、2 松杆、3 执行器接管、4 偏航 +0.5、5 松杆、6 接管
+d = rd("steps.csv")
+if d is not None:
+    fig, ax = plt.subplots(4, 1, figsize=(12, 11), sharex=True)
+    t = d["t"]
+    raw = d["raw"] > 0.5
+    ax[0].plot(t, d["pitch_deg"], label="pitch true")
+    ax[0].plot(t, d["est_pitch_deg"], "--", label="pitch fw est (controlled)")
+    ax[0].plot(t, d["roll_deg"], lw=0.7, label="roll true")
+    for s in (1, -1):
+        ax[0].axhspan(STEP_PITCH_DEG * (1 - s * STEP_TOL), STEP_PITCH_DEG * (1 + s * STEP_TOL), color="g", alpha=0.08)
+    ax[0].axhline(STEP_PITCH_DEG, color="k", lw=0.5)
+    ax[0].set_ylabel("deg")
+    ax[0].set_title("(3.5) raw stick steps: pitch +0.5 (span 1), release (2), executor (3), yaw +0.5 (4), release (5), executor (6)")
+    ax[1].plot(t, d["yaw_rate_dps"], label="yaw rate true (0.1 s diff)")
+    ax[1].axhspan(STEP_YAW_DPS * (1 + STEP_TOL), STEP_YAW_DPS * (1 - STEP_TOL), color="g", alpha=0.08)
+    ax[1].axhline(STEP_YAW_DPS, color="k", lw=0.5)
+    ax[1].set_ylabel("deg/s")
+    ax[2].plot(t, d["z"], label="z true")
+    ax[2].plot(t, d["vx_b"], lw=0.8, label="body vx")
+    ax[2].axhline(TARGET_H, color="k", lw=0.5)
+    ax[2].set_ylabel("m, m/s")
+    ax[3].plot(t, np.where(raw, d["stick_pitch"], np.nan), label="raw pitch stick")
+    ax[3].plot(t, np.where(raw, d["stick_yaw"], np.nan), label="raw yaw stick")
+    ax[3].plot(t, d["throttle"], lw=0.8, label="throttle (raw: executor hover stick)")
+    ax[3].plot(t, d["hover_thrust"], "k--", lw=0.8, label="executor hover stick")
+    ax[3].plot(t, d["exec_state"] / 4.0, ":", label="exec_state/4 (READY=0.5, FAILSAFE=1)")
+    ax[3].set_ylabel("0..1")
+    ax[3].set_xlabel("sim time [s]")
+    for a in ax:
+        for ph, c in ((1, "#dde7f5"), (2, "#eef2f8"), (4, "#f5e6dd"), (5, "#f8efe8")):
+            m = d["phase"] == ph
+            if m.any():
+                a.axvspan(t[m].min(), t[m].max(), color=c, zorder=0)
+    finish(fig, "steps.png")
 
 # (5) 电池：母线电压、悬停油门杆、高度、固件模式
 d = rd("battery.csv")

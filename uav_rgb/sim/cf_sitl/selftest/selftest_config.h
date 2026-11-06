@@ -59,7 +59,7 @@ constexpr double kRecoverMaxS = 10.0;       // 俯仰阶跃后取消旁路，等
 constexpr double kSettleZM = 0.05;          // 「稳住」= |z−2| < 0.05 m 且 |vz| < 0.05 m/s 持续 0.5 s；比执行器 READY 判据（0.1/0.1/1 s）严一半，
 constexpr double kSettleVzMps = 0.05;       //   否则偏航阶跃会从带着爬升速度/积分未回落的状态开始（run3：以 0.26 m/s 爬到 2.9 m，ToF 超量程 → FAILSAFE）
 constexpr double kSettleHoldS = 0.5;
-constexpr double kYawReleaseS = 1.0;        // 松偏航杆后看 |r| < 5°/s 用时
+constexpr double kYawReleaseS = 2.0;        // 松偏航杆后看 |r| < 5°/s 用时；run4 里松杆后反向回摆到 +68°/s、1 s 内没停，给 2 s
 constexpr double kYawStopDps = 5.0;
 constexpr int kStepsCsvEveryMs = 5;         // 偏航上升约 0.1 s，10 ms 抽样太粗
 

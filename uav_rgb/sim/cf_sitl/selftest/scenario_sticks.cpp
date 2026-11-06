@@ -112,9 +112,11 @@ void scenario_sticks(Report &r, const Ctx &c) {
 	}
 	const double settle = last_off - t_rel;
 	rot_inv(run.s.quat, run.s.vel, vb);
-	r.line("  松杆 %.0f s：固件估计 %.3f s 后 |roll|,|pitch| 一直 < %.0f°（回摆范围 [%.2f°, %.2f°]）；真值 %s s 后 < %.0f°，末态真值 roll %+.2f° pitch %+.2f°；速度 %.2f m/s，z=%.3f",
-	       cfg::kStickReleaseS, settle, cfg::kLevelDeg, emin, emax, last_off_true - t_rel >= cfg::kStickReleaseS - 1e-6 ? "未" : fmt_or(last_off_true - t_rel).c_str(),
-	       cfg::kLevelDeg, roll_rad(run.s.quat) * R2D, true_pitch_of(run), vb[0], run.s.pos[2]);
+	const bool true_level = last_off_true - t_rel < cfg::kStickReleaseS - 1e-6;
+	r.line("  松杆 %.0f s：固件估计 %.3f s 后 |roll|,|pitch| 一直 < %.0f°（回摆范围 [%.2f°, %.2f°]）；真值%s（末态真值 roll %+.2f° pitch %+.2f°，差 = 估计误差）；速度 %.2f m/s，z=%.3f",
+	       cfg::kStickReleaseS, settle, cfg::kLevelDeg, emin, emax,
+	       true_level ? (" " + fmt_or(last_off_true - t_rel) + " s 后 < 1°").c_str() : "没有回到 < 1°",
+	       roll_rad(run.s.quat) * R2D, true_pitch_of(run), vb[0], run.s.pos[2]);
 	std::snprintf(what, sizeof what, "松杆 %.3f s 内回平（固件估计，< %.0f s）", settle, cfg::kStickReleaseS);
 	r.check(settle < cfg::kStickReleaseS - 1e-9, what);
 
@@ -142,12 +144,16 @@ void scenario_sticks(Report &r, const Ctx &c) {
 	// 松偏航杆：|r| 最后一次 > 5°/s；再取消旁路看执行器接住
 	run.phase = 5; run.set_raw(0, 0, 0);
 	const double t_yrel = run.s.t_s, yaw_b = run.yaw_unw;
-	double last_turn = t_yrel;
+	double last_turn = t_yrel, reverse_peak = 0;   // reverse_peak：松杆后反向（与阶跃相反符号）的最大角速度
 	for (int i = 0, n = (int)std::lround(cfg::kYawReleaseS / cfg::kDt); i < n; i++) {
 		if (!run.tick()) return bail();
-		if (std::fabs(run.yaw_rate_dps()) > cfg::kYawStopDps) last_turn = run.s.t_s;
+		const double rr = run.yaw_rate_dps();
+		if (std::fabs(rr) > cfg::kYawStopDps) last_turn = run.s.t_s;
+		if (rr * cfg::kStickYawTargetDps < 0) reverse_peak = std::fmax(reverse_peak, std::fabs(rr));
 	}
-	r.line("  松偏航杆 %.0f s：%.3f s 后 |r| 一直 < %.0f°/s，多转 %.1f°", cfg::kYawReleaseS, last_turn - t_yrel, cfg::kYawStopDps, (run.yaw_unw - yaw_b) * R2D);
+	const bool yaw_stopped = last_turn - t_yrel < cfg::kYawReleaseS - 1e-6;
+	r.line("  松偏航杆 %.0f s：%s|r| 一直 < %.0f°/s，反向回摆峰值 %.1f°/s，净多转 %.1f°（信息：速率环积分卸载）", cfg::kYawReleaseS,
+	       yaw_stopped ? (fmt_or(last_turn - t_yrel) + " s 后 ").c_str() : "到结束都没有 ", cfg::kYawStopDps, reverse_peak, (run.yaw_unw - yaw_b) * R2D);
 	run.phase = 6; run.clear_raw();
 	if (!run.run(1.0)) return bail();
 	std::snprintf(what, sizeof what, "全程取消旁路后执行器都接住（末态 exec_state=%d，armed=%d，z=%.3f）", run.s.exec_state, run.s.armed, run.s.pos[2]);
