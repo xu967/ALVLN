@@ -13,7 +13,10 @@
 - 05:28 派出 5 个并行 agent（上限 6）：SITL（固件在环保真度、倒飞/悬停漂移根因、`build-cf-sitl-s3`）、VIZ（看真实视频帧找可视化 bug）、DATA（教师/采集/评测/审计/preprocess，森林膨胀按 (vehicle,task)、preprocess 跨族打包、compare_datasets 骨架）、3DGS（pilot 重跑守护进程 + 真实场景评估 + 相机一致性）、SRC（C++/CUDA 读审 + B4 输入一致性对拍，`build-src-s3`）。都不 commit，不起 Gazebo，`--parallel 2`。
 - 05:50 用户拍板：相机参数按老实验（60°/320×240，Gazebo 与 3DGS 统一；Callinstrasse scene.json 的 64.9° 待 3DGS pilot 结束后改回并重跑 pilot）；排期同意；论文机器人/视觉并齐；用户团队将实地自采 3DGS（规范 `docs/DATASET_3DGS_SELF_CAPTURE.md`）；视频优先。
 - 05:55 v0 demo 短片：`$DATA_ROOT/uav_rgb/demo-e1-20261107/reel/demo_reel_v0.mp4`（296 s，`tools/make_demo_reel.py`，3DGS 6 路线 + 森林）。SRC 分支已审并合并（752fd9f）；GitHub 到 45336a4。
-- 待办：收 5 份报告 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
+- 06:00 ALGO / 3DGS / DATA 三份报告收齐（`tmp/phase3-20261107/reports/`）。SRC(752fd9f)、DATA(9edf915)、3DGS(6842cab) 已合并进 main 并推送；VIZ 已在分支 fabecb3 落提交，等流水线 DONE 再合并（它改 E1 模板，会影响正在跑的评测）。
+- 3DGS P0：Callinstrasse 之前把相机平面当地面，nav z=2 实际离地 3.7 m，已修（nav_to_world t_z −1.6）。按用户决定 FOV 改回 60°（备份 scene.json.bak-20261107-0605-fov649），v3 路线+pilot 守护进程 PID/PGID 607752（`demo-e1-20261107/3dgs-callinstrasse-routes-v3-fov60/run.log`，pilot 输出 `datasets/e1-3dgs-callinstrasse-pilot-v3-fov60`，停：`kill -- -607752`）。
+- 06:10 规划 v2 算法定稿：P1 信念边际化 kino cost-to-go 软标签 + DAgger（主）、P2 双帧 + 深度分带辅助头、P3 探索；RL 教师改为 P1 后的 RL 微调；场景清单与评测协议进 `docs/PLAN_2026-11-07_demo_and_paper.md`。
+- 待办：收 SITL 报告 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
 
 ---
 

@@ -1,6 +1,6 @@
-# TinyAerialVLN 总规划 v1.1：可展示的 demo + 有算法意义的模型（2026-11-07 立，05:55 按用户决策更新）
+# TinyAerialVLN 总规划 v2：可展示的 demo + 有算法意义的模型（2026-11-07 立，06:10 算法定稿）
 
-- 状态：v1.1。算法选型（§3 W2/W3）等 `tmp/phase3-20261107/reports/ALGO_survey_20261107.md` 调研报告出来后定稿为 v2；其余部分现在就按此执行。
+- 状态：v2。算法选型（§3 W2/W3）按 `tmp/phase3-20261107/reports/ALGO_survey_20261107.md`（30 篇全文 + 本仓代码对照）定稿；场景清单吸收 3DGS 复核报告（`3DGS_20261107.md`）的发现。
 - 用户 2026-11-07 05:50 拍板：
   1. **相机参数按老实验走**：Gazebo 与 3DGS 都用 60° HFOV、320×240（旧 X3 学生可比）。Callinstrasse `scene.json` 当前 64.9° 要改回 60°（等 3DGS pilot 本轮结束后改，再重跑 pilot）。§8 第 1 条关闭。
   2. 里程碑排期同意（M0 11-07 → M2 11-12 → M3 11-20 → M4 12-05）。
@@ -59,36 +59,49 @@
 
 ### W1 场景（demo 与论文共用；最先动）
 
-1. 选场景：从调研清单里挑 ≥3 个「有现成 3DGS PLY、许可允许研究使用、2 m 高度可飞 8–30 m」的真实场景（室内一个、室外一个以上）。现有 bicycle / kitchen / room / playroom 先评估能不能直接用。
+0. 已知短板（3DGS 复核报告）：碰撞代理只覆盖渲染可见表面的 24%，机体能穿过画面里的树篱而不判碰撞；深度是 alpha 加权期望。所以场景选择优先带**真实几何**（LiDAR 网格 / 激光扫描）的数据集，碰撞代理 v3 用网格或 Splat-Nav 式椭球测试做真值对照。
+1. 选场景（按调研清单排序）：① Callinstrasse（已有，MIT，米制；地面高度 P0 已修）；② **Wanderland**（Apache-2.0，自带 3DGS + LiDAR 网格 + 导航 episode，人行道/校园，首选新增）；③ Mip-NeRF 360 garden/bicycle/stump（CC-BY 4.0 待在原页复核，Inria 30k 预训练 PLY，本地 7k mini 版先评估）；④ DL3DV-GS-960P 室外子集（6,939 场景带预训练 3DGS，需申请，**用户申请账号**）；⑤ ScanNet++ v2（米制重力对齐室内，需申请 + gsplat 自训 20–40 min/场景）；⑥ Zip-NeRF Alameda/Berlin/London/NYC（CC-BY 4.0，多房间室内，自训 30–60 min/场景）。主表用 ①②④ 作训练集，③ 与 ⑤/⑥ 各一个作保留集；室内室外各有保留场景；自采场景单列。
+   M1（11-09）目标 ≥2 个新场景可飞：Wanderland 1 个 + Mip-NeRF 360 garden 或 bicycle。
 2. 每个场景的接入流水线（已有工具，逐场景跑）：`tools/splat_to_ply.py` 转换 → 尺度与重力对齐写进 `scene.json`（`nav_to_world`、`ground_z`）→ 碰撞代理 v2 → 占据地图可视化 → 用 `probe_visual` 沿候选路线量机载帧清晰度（Laplacian 方差）→ 写 ≥4 条路线（`routes[]`，planner 离线校验）→ 教师 2 集 × 路线冒烟 → 三视角视频 → 20 集 pilot → 放量。
 3. 相机统一：3DGS 渲染与 Gazebo E1 模板都用 **60° HFOV、320×240**（用户 11-07 拍板，沿用老实验）；`e1_mini.json camera_fov` 只作真机记录，sim-to-real 阶段再处理视场差。
 4. 质量门禁：每帧 `frame_quality`（Laplacian 方差）落盘，低于阈值的帧比例进 manifest；路线级「雾区比例」超限不进训练集。
 5. **W1b 自采 3DGS 数据集**（用户团队实地采集，我们出规范与处理流水线）：采集规范、处理步骤、验收标准见 `DATASET_3DGS_SELF_CAPTURE.md`；目录 `$DATA_ROOT/uav_rgb/3dgs-scenes/<site>/`；进论文时作为「自采场景组」与公开场景组分开报。
 
-### W2 教师算法（候选，调研后定稿）
+### W2 教师算法（已定稿：P1 主贡献）
 
-原则：教师可用特权信息和 PyTorch；产物是标签（硬标签或四动作价值分布），不进学生输入。候选三条，最终从中定 1 主 + 1–2 对照：
+为什么现在的学生会崩（SR 0.90 → 0.06）有两个可引用的形式化解释：离线行为克隆在部分可观测下会「锁住」历史动作，只有 on-policy 聚合能恢复（Swamy et al. 2022）；特权专家不知道学生看不见什么，给出的标签在部分信息下不可模仿甚至不安全（Warrington et al. 2021, A2D）。A* 硬标签 BC 同时踩中两条。
 
-- T1 **动力学感知的运动原语规划教师**（`teacher_kino.py` 转正）：状态含速度，四个原语按 SITL 实测闭环响应积分，必撞状态 fail-closed；输出每个动作的 cost-to-go（到目标的规划代价 + 碰撞/净空惩罚），softmax(−cost/τ) 作为价值软标签。文献根基：Fast-Planner 的 kinodynamic A*、AlphaGo 式策略–价值目标、policy distillation。
-- T2 **RL 特权教师**：在从 SITL 辨识出的快速 Python 代理动力学上，用非对称 actor-critic PPO 训练看特权状态（机体系最近 K 个障碍、速度、目标向量）的策略；奖励形式引用具体论文，不自造。学到提前转、少刹车的时序行为是规划教师给不了的。文献根基：Learning by Cheating、Agile Autonomy、RMA、D-NAV。
-- T3 **on-policy 聚合（DAgger 族）**：学生闭环飞，教师在学生到达的状态上重贴标签，迭代 2–3 轮；直接对付「换载具 SR 0.90 → 0.06」这种状态分布漂移。`eval_closed_loop.py --relabel`、`preprocess.py` 放行 `executed_by=student` 的 provenance。
+**P1 信念边际化的运动原语 cost-to-go 软标签 + DAgger**（教师侧，约 8 人日）
 
-不做：可见性加权、门控、自适应权重这类小改。
+- 命题：标签不是「专家在真世界里的最优动作」，而是「在学生可能看到的所有世界里，每个动作的期望 cost-to-go」，按软最优转成分布，再 on-policy 聚合。
+- 依据：非对称模仿最优解 π*(a|o)=Σ_s p(s|o)π_E(a|s)（Warrington 2021）；QMDP（Littman 1995）；cost-to-go 监督（AggreVaTe, Ross & Bagnell 2014）；搜索→软策略目标（Expert Iteration, Anthony 2017）；温度 = 代价尺度（Levine 2018）；必须 on-policy（DAgger, Ross 2011；Swamy 2022）。
+- 我们能显式构造 p(s|o)：学生视锥内未遮挡的几何固定，不可见部分按场景先验（森林柱密度 / 3DGS 占据统计）重采样，同时采样执行延迟与漂移。
+- 实现：`teacher_kino.py` 暴露 `plan_costs()`（四个首原语的 cost-to-go，不可行 = inf）→ 新 `sim/tools/teacher_belief.py`（可见集合、K=8–16 个假设、QMDP 平均、softmax(−Q̄/α)，α 取一步前进代价）→ 输出 UAVSOFT1（`tools/join_soft_targets.py` 已有格式）→ `collect_3dgs.py` 加 `--policy student`（Gazebo 侧 `collect.py` 已支持）→ DAgger 2–3 轮。学生侧零改动（`--soft-targets --distill-alpha`）。
+- 对照与消融：A* 硬标签 BC / 真世界 kino 硬标签 / 真世界 kino 软标签（无信念）/ P1 无 DAgger / P1 全量；K∈{1,4,16}；QMDP vs CVaR 聚合；α×{0.5,1,2}。
+- 它合并了旧计划的 A1+A2，**替代** A3（不是给样本降权，而是改变标签的定义）。
+- RL 特权教师（旧 A4）不单独做：按 Xing et al. 2024 的顺序，先 P1 的模仿，再用非对称 critic（`rl_teacher/core.py` 的 13 维特权状态）做 RL 微调，放第三阶段，只在 P1 平台期后做。
 
-### W3 学生算法（候选，调研后定稿）
+### W3 学生算法（已定稿：P2；P3 探索）
 
-模型要上 SG2002 NPU，参数量不大动；改的是**输入的几何信息**和**监督的形式**：
+**P2 双帧 + 低分辨率深度分带/TTC 辅助头**（学生侧，约 9 人日）
 
-- S1 **双帧输入作为运动视差**：连续两帧给网络，几何上等价于给了光流/视差（单目测距的基本信号）；不叫「堆帧」，要在论文里按运动视差论证，并做单帧 vs 双帧对照。
-- S2 **价值蒸馏头**：输出四个动作的价值（或分布），损失是对 T1/T2 软标签的 KL；闭环时取 argmax。与硬标签交叉熵对照。
-- S3 **辅助几何头（仅训练期）**：粗深度（20×15）由仿真深度监督，部署时丢掉；多任务监督是成熟做法，要做有/无对照。
-- 三者都要在 `src/` 加算子/格式（checkpoint v6、UAVR 多帧），SRC 线负责；`student.py` / `infer_main` 带一帧缓存。
+- 命题：学生输入 (I_t, I_{t−1}, 上一步动作)，第三层 64×20×15 特征上接 1×1 卷积预测每格 8 个深度分带（或「n 步内接触」二值 TTC），仿真深度监督，部署丢头只用 RGB。
+- 依据：depth-as-loss 优于 depth-as-input，低分辨率分类即可（Mirowski 2017）；二值 TTC 分类稳健（Badki 2021）；12×16 几何足以避障并迁移真机（DiffPhysDrone 2024；Seeing Through Pixel Motion 2024）；训练期辅助头部署丢弃（NanoFlowNet 2023）；双帧的几何量：1 m 处障碍 0.5 s 内视差约 8.6°≈23 px，可分辨；偏航步的旋转光流由上一步动作输入补偿。
+- 警告（Swamy 2022）：双帧学生离线 BC 会更差，**必须配 P1 的 DAgger**。
+- 实现：`preprocess.py` UAVR 升版（6 通道、prev-action、20×15 分带目标，分带边界 0.3/0.5/0.8/1.2/1.8/2.5/4 m/∞ 与 ToF 量程对齐）；`src/model.cpp` `in_c=6` + `aux Conv2d(64,8,1)` + prev-action 经 FiLM 口；新算子逐格 softmax CE；L = CE_action + λ·CE_depth，λ=0.5 起；NPU 首层 MAC 翻倍后总量仍 <60M。
+- 消融：单帧无头 / 单帧有头 / 双帧无头 / 双帧有头 / +prev-action；分带 vs TTC；λ∈{0.1,0.5,1}；关键检验是换动力学（τ ±30%）后 SR 跌幅是否小于基线。
+
+**P3 以 3DGS 渲染器为一步世界模型的 Bellman 一致性正则**（联合，探索，约 9 人日，M4 后视 P1/P2 结果决定）：学生 logit 解释为 −Q，对渲染出的反事实下一帧加 TD 残差（DQfD 形式）。小 CNN 上 TD 稳定性无先例，排最后。
+
+不做：可见性加权、门控、自适应权重、注意力小改。
 
 ### W4 评测与论文材料
 
-- 口径沿用 `EVAL_STANDARD.md`：离线四件套 + 闭环 SR/碰撞/false_forward；新增 SPL（以教师路径长为参考）和「到达且停住」的 task_success。
-- 两数据集对比矩阵（`experiments/2026-11-07-dataset-compare-plan.md`）扩成多场景矩阵：训练集 ∈ {Gazebo, 3DGS 场景集合, 混合}，测试域 ∈ {Gazebo 20 seed, 每个 3DGS 场景留出路线}。
-- 入口 `tools/compare_datasets.py`（DATA agent 出骨架）→ 守护进程跑 → `summary.md` 直接可贴论文。
+- 主表：行 = {A* 硬标签 BC, kino 硬标签, kino 软标签, P1, P1+P2, (P1+P2+P3), 各消融}；列 = 场景 × {SR, 碰撞率 CR（超时不算碰撞）, SPL（l_i 取 A* 最短路长）, 平均速度, false_forward}。场景组：forest_e1 三档缝宽（Gazebo，按 AvoidBench 可穿越性分桶）、3DGS 训练场景 2–4 个、3DGS 保留场景 2 个（OpenFly 的 seen/unseen 口径）、自采场景。
+- 样本量：每格同一起终点集合 ≥200 集（Wilson 95% 半宽 p=0.8 时约 ±5.5 pp）；两方法 McNemar（已有），多方法 Cochran's Q + 两两 McNemar + Holm；训练种子 3 个，报 IQM 与分层 bootstrap CI（Agarwal 2021），用 Colas 2018 的工具做功效复核。
+- 跨场景：训练集 A → 保留集 B 的 SR 差作「泛化缺口」列。sim-to-real：真机 ≥100 次（SOUS VIDE 105 / Splat-Nav 124 口径），同可穿越性下报仿真/真机 SR 比。
+- 口径沿用 `EVAL_STANDARD.md`，新增 SPL、CR、task_success（到达且停住）三列；val 太小的问题（18 集、SAFE 28 样本）在 §8 待拍板。
+- 入口 `tools/compare_datasets.py`（骨架已进 main，`--dry-run` 可跑）→ 守护进程跑 → `summary.md` 直接可贴论文。
 
 ### W5 工程纪律（每个工作流都守）
 
@@ -113,8 +126,8 @@
 | 批次 | agent | 分支 | 产物 |
 | --- | --- | --- | --- |
 | 第三阶段（进行中） | SITL / VIZ / DATA / 3DGS / SRC / ALGO | `*-20261107` | 审计报告 + 修复；算法调研 |
-| 第四阶段（M0 合并后） | SCENE-A、SCENE-B（各接 1–2 个新 3DGS 场景）；TEACHER（T1 价值标签 + T3 聚合）；STUDENT（S1/S2 的 C++/CUDA 与格式）；EVAL（compare_datasets 跑通 + 论文表模板）；E1-VISUAL（Gazebo 机体外观，小任务） | `scene-*`、`teacher-value`、`student-v2`、`eval-matrix` | 可飞场景、算法 v1、矩阵 v1 |
-| 第五阶段 | TEACHER-RL（T2）；视调研结论决定 | `teacher-rl` | RL 教师与对照 |
+| 第四阶段（M0 合并后，11-07 起） | SCENE-A（Wanderland 接入 + 碰撞代理 v3 网格真值对照）、SCENE-B（Mip-NeRF 360 garden/bicycle 以 Inria PLY 重做 + 路线）；TEACHER-P1（`plan_costs` + `teacher_belief.py` + 3DGS `--policy student` + DAgger 脚本）；STUDENT-P2（UAVR 升版、`in_c=6`、辅助头、逐格 CE 算子、导出）；EVAL（compare_datasets 跑通、SPL/CR/task_success 列、IQM/bootstrap 脚本、论文表模板）；SITL 收尾（倒飞/漂移根因修复后真 Gazebo 验证） | `scene-wanderland`、`scene-mipnerf`、`teacher-p1`、`student-p2`、`eval-matrix`、`sitl-20261107` | 可飞场景、P1/P2 代码与单测、矩阵 v1 |
+| 第五阶段（M3 后） | P3 探索；RL 微调（Xing 2024 第三阶段，非对称 critic）；自采场景接入（用户采集完成后） | `student-p3`、`teacher-rlft`、`scene-<site>` | 视 P1/P2 结果决定 |
 
 每个 agent：自己的 worktree、自己的构建目录、不起 Gazebo（主会话统一跑真 Gazebo 验证）、不 commit（主会话合并）。
 
@@ -137,8 +150,11 @@
 
 已定（2026-11-07 05:50）：相机参数沿用老实验 60°/320×240；排期同意；论文机器人与视觉并齐；视频优先。
 
+已定（06:10，按调研报告）：RL 教师不单独做，改为 P1 之后的 RL 微调（第五阶段）。
+
 待定：
 
-1. **T2 RL 教师**要不要进 M3（增加 1–2 周）：等调研报告的收益评估再定。
-2. **评测口径**：val 只有 18 集、SAFE 约 28 个样本（SRC 报告），宏 F1 噪声大；是否把 val 比例从 10% 提到 15–20%（改 split 规则要 bump 几何版本），或 best-ckpt 改按 val 平衡准确率选。
-3. **自采场景的采集设备与场地**：手机还是运动相机；室内走廊/实验室还是校园室外；决定后 `DATASET_3DGS_SELF_CAPTURE.md` 的参数表细化。
+1. **评测口径**：val 只有 18 集、SAFE 约 28 个样本（SRC 报告），宏 F1 噪声大；是否把 val 比例从 10% 提到 15–20%（改 split 规则要 bump 几何版本），或 best-ckpt 改按 val 平衡准确率选。
+2. **自采场景的采集设备与场地**：手机还是运动相机；室内走廊/实验室还是校园室外；决定后 `DATASET_3DGS_SELF_CAPTURE.md` 的参数表细化。
+3. **需要用户申请的数据集账号**：DL3DV（Terms of Use，研究可用）、ScanNet++（账号申请）。不申请就只用 Callinstrasse + Wanderland + Mip-NeRF 360 + Zip-NeRF。
+4. **SAFE 的语义**（DATA/SITL 报告都指出）：E1 的 SAFE 不是「停住」而是滑行 0.07–0.21 m 再漂移；教师在柱旁输出 SAFE 对 E1 不安全。两条路：执行器加位置保持（SITL 侧，优先）或教师近柱不输出 SAFE（改标签语义，要 bump 版本）。等 SITL 报告出来一起定。
