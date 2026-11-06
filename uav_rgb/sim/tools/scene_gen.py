@@ -393,23 +393,33 @@ def strip_velocity_control(world):
 
 
 def build_scene(template, seed, scene_id, spawn_mode="default", task="base",
-                appearance=APPEARANCE_LEGACY):
+                appearance=APPEARANCE_LEGACY, density=None):
     """返回 (world_text, meta)。template 只读，任何标记异常都直接报错。
 
     task="l1" 时额外给两根柱染同一色并写 relation/instruction/waypoint；
     task="base" 保持原几何与人任务无关的 meta 不变。
+    task="forest_e1" 转给 scene_forest（E1 随机圆柱森林，density 必填，只有 default 出生）。
     appearance="v1" 只改头部（删固定地标、随机光照/天空），pillars 几何与 gid 不变。
     Python API 默认仍是 legacy 以复现旧调用；命令行 --appearance 默认已改为 v1，
     新代码请显式传 APPEARANCE_DEFAULT。
     """
     if appearance not in (APPEARANCE_LEGACY, APPEARANCE_V1):
         raise ValueError(f"unknown appearance {appearance!r}")
+    if density is not None and task != "forest_e1":
+        raise ValueError(f"density 只对 task forest_e1 有效（task={task!r}）")
     if task == "campus":
         import campus
         return campus.build(template, seed, scene_id, appearance)
     if task == "campus_assets":
         import asset_campus
         return asset_campus.build(template, seed, scene_id, appearance)
+    if task == "forest_e1":
+        import scene_forest
+        if density is None:
+            raise ValueError("task forest_e1 需要 density（sparse/medium/dense）")
+        if spawn_mode != "default":
+            raise ValueError("forest_e1 只支持 default 出生（走廊保证按固定出生点算）")
+        return scene_forest.build_scene(template, seed, scene_id, density, appearance)
     if task not in ("base", "l1"):
         raise ValueError(f"unknown task {task!r}")
     for mark in (START_MARK, END_MARK):
@@ -590,8 +600,11 @@ def main():
                    help="EpisodeMeta.scene_id（默认=seed）")
     p.add_argument("--spawn-mode", choices=("default", "random"), default="default",
                    help="出生位姿：default=模板原点；random=y/yaw 随机")
-    p.add_argument("--task", choices=("base", "l1", "campus", "campus_assets"), default="base",
-                   help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
+    p.add_argument("--task", choices=("base", "l1", "campus", "campus_assets", "forest_e1"), default="base",
+                   help="base=原柱阵；l1=彩色 landmark + instruction/waypoint；"
+                        "forest_e1=E1 随机圆柱森林（scene_forest.py，需 --density，建议 --vehicle e1_mini）")
+    p.add_argument("--density", choices=("sparse", "medium", "dense"), default=None,
+                   help="forest_e1 的密度档（最窄缝 0.45/0.35/0.28 m），forest_e1 必填；其它任务不接受")
     p.add_argument("--appearance", choices=(APPEARANCE_LEGACY, APPEARANCE_V1),
                    default=APPEARANCE_DEFAULT,
                    help="v1=删固定地标+随机光照/天空（默认）；legacy=模板原样，仅用于复现旧数据")
@@ -616,6 +629,10 @@ def main():
         args.template = VEHICLES[args.vehicle or DEFAULT_VEHICLE]["template"]
     if args.camera_rate is not None and not (math.isfinite(args.camera_rate) and args.camera_rate > 0):
         p.error("--camera-rate 必须是有限正数")
+    if (args.task == "forest_e1") != (args.density is not None):
+        p.error("--density 与 --task forest_e1 必须同时给")
+    if args.task == "forest_e1" and args.spawn_mode != "default":
+        p.error("--task forest_e1 只支持 --spawn-mode default")
 
     if args.self_check:
         if args.check_seeds < 1:
@@ -630,7 +647,7 @@ def main():
     if args.vehicle and args.vehicle != template_vehicle:
         p.error(f"--vehicle {args.vehicle} 与模板里的载具 {template_vehicle} 不一致")
     world, meta = build_scene(template, args.seed, scene_id, args.spawn_mode, args.task,
-                              args.appearance)
+                              args.appearance, density=args.density)
     if args.no_velocity_control:
         world = strip_velocity_control(world)
         meta["velocity_control"] = "removed"

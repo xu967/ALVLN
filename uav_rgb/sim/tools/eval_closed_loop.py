@@ -676,8 +676,11 @@ def main():
                    help="协议与本次参数不一致时直接失败（默认只警告，保证旧 run 可复现）")
     p.add_argument("--text-mode", choices=TEXT_MODES, default="keep",
                    help="L2 消融：keep=原指令；blank=空文本；shuffle=把 left/right 反过来")
-    p.add_argument("--task", choices=("base", "l1", "campus", "campus_assets"), default="base",
-                   help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
+    p.add_argument("--task", choices=("base", "l1", "campus", "campus_assets", "forest_e1"), default="base",
+                   help="base=原柱阵；l1=彩色 landmark + instruction/waypoint；"
+                        "forest_e1=E1 随机圆柱森林（需 --density 与 --vehicle e1_mini）")
+    p.add_argument("--density", choices=("sparse", "medium", "dense"), default=None,
+                   help="透传给 scene_gen：forest_e1 密度档（最窄缝 0.45/0.35/0.28 m）；forest_e1 必填")
     p.add_argument("--appearance", choices=("legacy", "v1"), default="v1",
                    help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）；旧数据复现请显式 legacy")
     p.add_argument("--split", choices=("train", "val", "test"), default="test")
@@ -747,6 +750,10 @@ def main():
         p.error("cf_blackbox 是纯 Python 模型档，Gazebo 闭环未接入；"
                 "请让 3DGS collector 直接调用 cf_blackbox，或改用 cf_stab/x3_velocity")
     cp.resolve_vehicle(args, p.error)
+    if (args.task == "forest_e1") != (args.density is not None):
+        p.error("--density 与 --task forest_e1 必须同时给")
+    if args.task == "forest_e1" and args.vehicle != "e1_mini":
+        p.error("--task forest_e1 需要 --vehicle e1_mini（--dynamics cf_sitl）")
     if args.record_video and args.no_aux_cameras:
         p.error("--record-video 需要 chase/top 相机，不能同时 --no-aux-cameras")
     for name in ("goal_margin", "sim_timeout", "episode_timeout"):
@@ -880,8 +887,8 @@ def main():
               "goal_margin": args.goal_margin,
               "waypoint_radius": WAYPOINT_RADIUS,
               "stop_radius": stop_radius_used,
-              "geometry_version": (campus.VERSION if args.task == "campus" else
-                                   asset_campus.VERSION if args.task == "campus_assets" else sm.SPLIT_SALT),
+              "geometry_version": cp.task_geometry_version(args.task),
+              "density": args.density,   # forest_e1 的密度档；其它任务 None
               "ckpt": os.path.abspath(args.ckpt) if args.ckpt else None,
               "ckpt_sha256": sha256_file(args.ckpt) if args.ckpt else None,
               "infer_bin": infer_bin,

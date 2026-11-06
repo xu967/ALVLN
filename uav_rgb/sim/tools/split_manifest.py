@@ -112,7 +112,9 @@ def split_salt_for(meta):
     gver = meta.get("geometry_version")
     if not gver:
         return SPLIT_SALT
-    if gver.startswith("uavrgb.geom."):
+    # forest_e1 同旧柱阵约定「版本串 = salt」（scene_forest.GEOMETRY_VERSION_FOREST）；
+    # scene.json 显式带 split_salt，episode manifest 不带，靠这里复算。
+    if gver.startswith("uavrgb.geom.") or gver.startswith("uavrgb.forest_e1."):
         return gver
     raise ValueError("无法复算 split_salt：未知 geometry_version %r" % (gver,))
 
@@ -158,13 +160,17 @@ def split_for_scene(meta):
     return split_for_gid(gid, split_salt_for(meta))
 
 
-def split_for_seed(seed, task="base"):
+def split_for_seed(seed, task="base", density=None):
     if task == "campus":
         import campus
         return campus.split(seed)
     if task == "campus_assets":
         import asset_campus
         return asset_campus.split_key(asset_campus.map_key(seed))
+    if task == "forest_e1":
+        import scene_forest   # 几何随 density 变，salt 是森林族自己的版本串
+        trunks = scene_forest.sample_trunks(seed, density)[0]
+        return split_for_gid(geometry_gid(trunks), scene_forest.GEOMETRY_VERSION_FOREST)
     if task not in ("base", "l1"):
         raise ValueError(f"unknown task {task!r}")
     return split_for_gid(geometry_gid(sg.sample_pillars(seed)[0]))

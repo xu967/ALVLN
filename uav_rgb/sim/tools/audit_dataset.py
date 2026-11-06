@@ -53,6 +53,7 @@ from collections import Counter
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import landmarks as lm  # noqa: E402
 import scene_gen as sg  # noqa: E402
+import scene_forest as sf  # noqa: E402
 import campus  # noqa: E402
 from instruction import parse_target_color  # noqa: E402
 from split_manifest import SPLIT_SALT, geometry_gid  # noqa: E402
@@ -74,6 +75,23 @@ GEOM_CONST = {
     "pillar_height_m": sg.PILLAR_HEIGHT,
     "cruise_height_m": sg.CRUISE_HEIGHT,
 }
+
+
+def forest_geom_const(density):
+    """forest_e1 scene.json clearance 里落盘的几何常量（按档位）；与 GEOM_CONST 同一用途。"""
+    return {
+        "min_gap_required_m": sf.DENSITY_GAP_M[density],
+        "trunk_count_range": list(sf.DENSITY_COUNT[density]),
+        "forest_x": list(sf.FOREST_X),
+        "corridor_y": list(sf.FOREST_Y),
+        "trunk_radius_m": list(sf.TRUNK_RADIUS_M),
+        "trunk_height_m": sf.TRUNK_HEIGHT_M,
+        "spawn_clear_before_x_m": sf.FOREST_X[0],
+    }
+
+
+# label_recompute 可复算的几何版本：生成器仍是当前版本，pillars 真值与采集时同源。
+RECOMPUTE_GEOMETRY_VERSIONS = (SPLIT_SALT, campus.VERSION, sf.GEOMETRY_VERSION_FOREST)
 
 NAMES = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 SPEED_FWD = 0.3              # 与 collect.py 一致
@@ -753,26 +771,36 @@ def audit(facts, pre_excluded=(), quarantined=()):
         mismatch = next(c for c in checks if c["name"] == "campus_identity")
         checks.append(check("geometry_version", mismatch["status"],
                             "campus.v1 使用确定性地图布局合同；详见 campus_identity"))
-    elif present != {SPLIT_SALT}:
+    elif present not in ({SPLIT_SALT}, {sf.GEOMETRY_VERSION_FOREST}):
         checks.append(check("geometry_version", "FAIL",
-                            f"数据版本 {sorted(present)} != 当前 {SPLIT_SALT}"))
+                            f"数据版本 {sorted(present)} != 当前 {SPLIT_SALT} / {sf.GEOMETRY_VERSION_FOREST}"))
     else:
         # 版本字符串对还不够：改了 LANE_SEP/GATE_Y_ABS_MAX 等常量但忘 bump
         # GEOMETRY_VERSION 时，gid 全变、交集仍为 0，只有落盘常量能抓出来。
+        # forest_e1 同理，常量按 scene.json 的 density 档取（缺 density 记一处不一致）。
+        version = next(iter(present))
         clear = [f for f in gate if isinstance(f.get("clearance"), dict)]
         mism = []
         for f in clear:
             c = f["clearance"]
-            for key, want in GEOM_CONST.items():
+            if version == sf.GEOMETRY_VERSION_FOREST:
+                density = f.get("scene_metadata", {}).get("density")
+                if density not in sf.DENSITY_GAP_M:
+                    mism.append(f"{os.path.basename(f['dir'])}:density={density!r}")
+                    continue
+                const = forest_geom_const(density)
+            else:
+                const = GEOM_CONST
+            for key, want in const.items():
                 got = c.get(key)
                 if got != want:
                     mism.append(f"{os.path.basename(f['dir'])}:{key}={got!r}!={want!r}")
         if mism:
             checks.append(check("geometry_version", "FAIL",
-                                f"{len(mism)} 处几何常量与当前 scene_gen 不一致："
+                                f"{len(mism)} 处几何常量与当前生成器不一致："
                                 f"{mism[:3]}"))
         else:
-            detail = f"{SPLIT_SALT}；常量核对 {len(clear)}/{len(gate)} 集"
+            detail = f"{version}；常量核对 {len(clear)}/{len(gate)} 集"
             if len(clear) < len(gate):
                 detail += "（旧 scene.json 无 clearance）"
             checks.append(check("geometry_version", "PASS", detail))
@@ -873,7 +901,7 @@ def audit(facts, pre_excluded=(), quarantined=()):
             no_truth += len(f["steps"])
             continue
         # 旧几何/旧教师版本数据没有版本字段；用当前算法复算会假 FAIL。
-        if (f.get("geometry_version") not in (SPLIT_SALT, campus.VERSION) or
+        if (f.get("geometry_version") not in RECOMPUTE_GEOMETRY_VERSIONS or
                 f.get("teacher_version") != TEACHER_VERSION):
             old_version += len(f["steps"])
             continue

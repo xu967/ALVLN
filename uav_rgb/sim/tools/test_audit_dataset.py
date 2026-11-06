@@ -639,6 +639,40 @@ def main():
         assert c20b["status"] == "FAIL", c20b
         assert "teacher_version 混用" in c20b["detail"], c20b
         shutil.rmtree(root20)
+
+        # 21) forest_e1：版本白名单放行、常量按 density 档核对、E1 载具下标签可复算；
+        #     与旧柱阵混包仍 FAIL，常量被改仍 FAIL。
+        import scene_forest as sf
+        with open(sf.DEFAULT_TEMPLATE, encoding="utf-8") as fp:
+            _w, forest = sf.build_scene(fp.read(), 0, 0, "sparse")
+        root21 = tempfile.mkdtemp(prefix="audit_test_")
+        forest_man = {"geometry_version": sf.GEOMETRY_VERSION_FOREST, "vehicle": "e1_mini",
+                      "dynamics": "cf_sitl", "dynamics_profile": "cf_sitl_v1:deadbeef"}
+        ad.set_vehicle("e1_mini")   # 标签按采集载具算，audit 复算时也按 manifest.vehicle 切
+        try:
+            write_plan_ep(root21, "train", 1, pillars=forest["pillars"], scene_extra=forest,
+                          man_extra=forest_man)
+        finally:
+            ad.set_vehicle("x3")
+        d21 = details(root21)
+        assert d21["geometry_version"]["status"] == "PASS", d21["geometry_version"]
+        assert sf.GEOMETRY_VERSION_FOREST in d21["geometry_version"]["detail"], d21["geometry_version"]
+        assert d21["label_recompute"]["status"] == "PASS", d21["label_recompute"]
+        assert d21["label_recompute"]["covered_steps"] == 12, d21["label_recompute"]
+        ad.set_vehicle("x3")   # audit 按 manifest.vehicle 切过载具，旧柱阵集的标签按 x3 算
+        write_plan_ep(root21, "test", 2)   # 旧柱阵集混进来
+        c21 = details(root21)["geometry_version"]
+        assert c21["status"] == "FAIL" and "混用" in c21["detail"], c21
+        shutil.rmtree(os.path.join(root21, "test"))
+        p21 = os.path.join(root21, "train", "1", "scene.json")
+        with open(p21, encoding="utf-8") as f:
+            scene21 = json.load(f)
+        scene21["clearance"]["min_gap_required_m"] = 0.99
+        with open(p21, "w", encoding="utf-8") as f:
+            json.dump(scene21, f)
+        c21b = details(root21)["geometry_version"]
+        assert c21b["status"] == "FAIL" and "min_gap_required_m" in c21b["detail"], c21b
+        shutil.rmtree(root21)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

@@ -185,14 +185,28 @@ def resolve_vehicle(args, error):
 
 
 def scene_gen_extra(args):
-    """透传给 scene_gen 的可选相机参数（没给就不传，旧命令行逐字不变）。"""
+    """透传给 scene_gen 的可选参数：相机、forest_e1 密度（没给就不传，旧命令行逐字不变）。"""
     extra = []
     rate = getattr(args, "camera_rate", None)
     if rate is not None:
         extra += ["--camera-rate", f"{rate:g}"]
     if getattr(args, "no_aux_cameras", False):
         extra.append("--no-aux-cameras")
+    if getattr(args, "density", None):
+        extra += ["--density", args.density]
     return extra
+
+
+def task_geometry_version(task):
+    """collection_manifest / eval.json 记录的几何版本（salt）；与各生成器的版本串同源。"""
+    if task == "campus":
+        return campus.VERSION
+    if task == "campus_assets":
+        return asset_campus.VERSION
+    if task == "forest_e1":
+        import scene_forest
+        return scene_forest.GEOMETRY_VERSION_FOREST
+    return sm.SPLIT_SALT
 
 
 def _register(proc):
@@ -579,8 +593,11 @@ def main():
                    help="只采命中该 split 的几何组；seed 从 base-seed 起向后扫描")
     p.add_argument("--spawn-mode", choices=("default", "random"), default="default",
                    help="每个 episode 的出生位姿（random = y/yaw 随机化）")
-    p.add_argument("--task", choices=("base", "l1", "campus", "campus_assets"), default="base",
-                   help="base=原柱阵；l1=彩色 landmark + instruction/waypoint")
+    p.add_argument("--task", choices=("base", "l1", "campus", "campus_assets", "forest_e1"), default="base",
+                   help="base=原柱阵；l1=彩色 landmark + instruction/waypoint；"
+                        "forest_e1=E1 随机圆柱森林（需 --density 与 --vehicle e1_mini）")
+    p.add_argument("--density", choices=("sparse", "medium", "dense"), default=None,
+                   help="透传给 scene_gen：forest_e1 密度档（最窄缝 0.45/0.35/0.28 m）；forest_e1 必填")
     p.add_argument("--appearance", choices=("legacy", "v1"), default="v1",
                    help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）；旧数据复现请显式 legacy")
     p.add_argument("--policy", choices=("teacher", "forward", "teacher-rl"), default="teacher")
@@ -624,6 +641,11 @@ def main():
         p.error("cf_blackbox 是纯 Python 模型档，Gazebo 并行采集未接入；"
                 "请让 3DGS collector 直接调用 cf_blackbox，或改用 cf_stab/x3_velocity")
     resolve_vehicle(args, p.error)
+    # forest_e1 的缝 0.28–0.45 m 按 E1 外径 0.204 m 定，X3（0.711 m）过不去；density 只属于它。
+    if (args.task == "forest_e1") != (args.density is not None):
+        p.error("--density 与 --task forest_e1 必须同时给")
+    if args.task == "forest_e1" and args.vehicle != "e1_mini":
+        p.error("--task forest_e1 需要 --vehicle e1_mini（--dynamics cf_sitl）")
     for path, name in ((SCENE_GEN, "scene_gen.py"), (COLLECT, "collect.py"),
                        (args.template, "template")):
         if not os.path.isfile(path):
@@ -658,7 +680,7 @@ def main():
             scene_ids.extend(range(int(a), int(b) if b else int(a) + 1))
         if args.split:
             scene_ids = [s for s in scene_ids
-                         if sm.split_for_seed(s, args.task) == args.split]
+                         if sm.split_for_seed(s, args.task, args.density) == args.split]
     elif args.split:
         # 只取目标 split：test 只占几何组的 ~10%，顺序取 base-seed 起的前 N 个
         # 会全是 train。这里按几何 gid 的固定 split 过滤，扫描上限防止写错 split
@@ -668,7 +690,7 @@ def main():
             if seed > args.base_seed + 100_000:
                 p.error(f"从 base-seed={args.base_seed} 扫了 100000 个 seed 仍凑不齐 "
                         f"{target} 个 split={args.split} 的场景")
-            if sm.split_for_seed(seed, args.task) == args.split:
+            if sm.split_for_seed(seed, args.task, args.density) == args.split:
                 scene_ids.append(seed)
             seed += 1
     else:
@@ -786,8 +808,8 @@ def main():
             "aux_cameras": not args.no_aux_cameras,
             "cf_sitl_plugin_dir": find_plugin_dir() if args.dynamics == "cf_sitl" else None,
             "task": args.task,
-            "geometry_version": (campus.VERSION if args.task == "campus" else
-                                 asset_campus.VERSION if args.task == "campus_assets" else sm.SPLIT_SALT),
+            "density": args.density,                  # forest_e1 的密度档；其它任务 None
+            "geometry_version": task_geometry_version(args.task),
             "appearance_version": ("campus.v1" if args.task == "campus" else
                                     asset_campus.VERSION if args.task == "campus_assets" else args.appearance),
             "policy": args.policy,

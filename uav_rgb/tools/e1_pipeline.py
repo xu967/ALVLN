@@ -37,8 +37,13 @@ CFG = dict(
     # 采集（pilot 先过 audit 再放量；seed 段都避开下面 eval_seeds，它们最大 1282）
     pilot_episodes=20,       # 4 实例 × 5 集；只做闸门，不进训练集
     pilot_seed=3000,
-    episodes=300,            # 正式集数，取 instances 整数倍。T6 学生用了 599 集 / 23960 步；300 集 ≈ 12000 步
-    base_seed=3100,          # 与 pilot 段不重叠
+    # 采集场景集合 (task[:density], 集数, base_seed)：逐集合采（collect/、collection-<集合>/）、各自 audit、preprocess 合并打包。
+    # 集数取 instances 整数倍；T6 学生用了 599 集 / 23960 步，300 集 ≈ 12000 步。seed 段互不重叠、都避开 pilot 3000–3019。
+    collect_sets=(
+        ("base", 300, 3100),             # 旧柱阵 + E1 机体：当前唯一默认集
+        # ("forest_e1:sparse", 150, 4100),   # E1 随机圆柱森林稀疏档（缝 0.45 m）。启用前要先解决：教师 E1 膨胀 0.40 会绕林不穿林、
+        #                                    # preprocess.py 拒绝 base/forest 两个 geometry_version 混包（见 worklog 2026-11-07 forest-e1-pipeline）
+    ),
     steps=40,                # 每集步数：A* 每步约 0.27 m，29–38 步过柱区；80 步会让一半帧在柱区外原地转
     instances=4,             # gz agent 实测：4 实例 6.8 核 0.55 s/步；6 实例 8.6 核吞吐只多 10%（cgroup 12 核）
     no_aux_cameras=True,     # 采集不要 chase/top 相机：RTF 锁 1.0 时每步快 17%；录像只在评测时开
@@ -137,15 +142,23 @@ def vehicle_flags():
             "--hold", str(CFG["hold"]), "--window-from", CFG["window_from"]]
 
 
-def collect_into(col, episodes, base_seed):
+def set_dir(out, spec):
+    """集合的采集目录。base 仍叫 collection/：正在跑的 e1-pipeline-* 目录与 --from 续跑不用改名。"""
+    return os.path.join(out, "collection" if spec == "base" else "collection-" + spec.replace(":", "-"))
+
+
+def collect_into(col, episodes, base_seed, spec="base"):
     """collect_parallel 一集失败就 rc=1，300 集里丢 1 集是常态；按 manifest 的成功率判，不拿 rc 当成败。"""
     if os.path.isdir(col) and os.listdir(col):
         raise RuntimeError(f"{col} 非空：collect_parallel 拒绝复用目录。删掉它或换 --out；想跳过用 --from")
     per = math.ceil(episodes / CFG["instances"])
+    task, _, density = spec.partition(":")   # "forest_e1:sparse" -> --task forest_e1 --density sparse
     cmd = [PY, f"{REPO}/sim/tools/collect_parallel.py",
            "--instances", str(CFG["instances"]), "--episodes-per-instance", str(per),
            "--steps", str(CFG["steps"]), "--base-seed", str(base_seed),
-           "--task", "base", "--keep-worlds", "--out", col, *vehicle_flags()]
+           "--task", task, "--keep-worlds", "--out", col, *vehicle_flags()]
+    if density:
+        cmd += ["--density", density]
     if CFG["no_aux_cameras"]:
         cmd.append("--no-aux-cameras")
     run(cmd, env_extra=GZ_ENV)
@@ -186,24 +199,27 @@ def pilot(out):
 
 
 def collect(out):
-    collect_into(os.path.join(out, "collection"), CFG["episodes"], CFG["base_seed"])
+    for spec, episodes, base_seed in CFG["collect_sets"]:
+        collect_into(set_dir(out, spec), episodes, base_seed, spec)
 
 
 def audit(out):
-    col = os.path.join(out, "collection")
-    need(os.path.join(col, "collection_manifest.json"), "先跑 collect")
-    audit_dir(col)
+    for spec, _n, _seed in CFG["collect_sets"]:
+        col = set_dir(out, spec)
+        need(os.path.join(col, "collection_manifest.json"), f"先跑 collect（集合 {spec}）")
+        audit_dir(col)
 
 
 def preprocess(out):
-    col, ds = os.path.join(out, "collection"), os.path.join(out, "ds")
-    eps = sorted(d for s in ("train", "val", "test") for d in glob.glob(f"{col}/{s}/*/"))
+    """各集合的集目录合并进一个 dataset.uavr（preprocess 自己按 manifest 复算 split、拒绝混口径）。"""
+    cols, ds = [set_dir(out, spec) for spec, _n, _s in CFG["collect_sets"]], os.path.join(out, "ds")
+    eps = sorted(d for col in cols for s in ("train", "val", "test") for d in glob.glob(f"{col}/{s}/*/"))
     if not DRY and not eps:
-        raise RuntimeError(f"{col} 下没有 train/val/test 集目录")
+        raise RuntimeError(f"{cols} 下没有 train/val/test 集目录")
     cmd = [PY, f"{REPO}/tools/preprocess.py", "--out", ds]
     if CFG["drop_collision"]:
         cmd.append("--drop-collision")
-    sh(cmd + (eps or [f"{col}/{{train,val,test}}/*/"]))   # 集目录在 Python 里枚举，不依赖 shell 展开
+    sh(cmd + (eps or [f"{col}/{{train,val,test}}/*/" for col in cols]))   # 集目录在 Python 里枚举，不依赖 shell 展开
 
 
 def train(out):

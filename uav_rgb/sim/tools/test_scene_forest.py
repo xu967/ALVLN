@@ -98,8 +98,31 @@ def main():
     ratios = {k: v / (2 * sf.E1_RADIUS_M) for k, v in sf.DENSITY_GAP_M.items()}
     assert ratios["sparse"] > ratios["medium"] > ratios["dense"] >= 1.3, ratios
     assert abs(sf.E1_RADIUS_M - 0.102) < 1e-9, sf.E1_RADIUS_M
+
+    # 管线接入：scene_gen --task forest_e1 与 scene_forest 字节一致；split 按 seed/density 复算；
+    # episode manifest 只有 geometry_version（没有 split_salt）也能复算同一 split；collect_parallel 透传。
+    from types import SimpleNamespace
+    import collect_parallel as cp
+    for density in sf.DENSITY_GAP_M:
+        wg, mg = sg.build_scene(template, 1, 1, task="forest_e1", density=density, appearance=sg.APPEARANCE_DEFAULT)
+        wf, mf = sf.build_scene(template, 1, 1, density)
+        assert wg == wf and mg == mf, density
+        assert sm.split_for_seed(1, "forest_e1", density) == mg["split"], density
+        ep_manifest = {"geometry_version": mg["geometry_version"], "geometry_gid": mg["geometry_gid"]}
+        assert sm.split_for_scene(ep_manifest) == mg["split"], density
+    for bad in (dict(task="forest_e1"), dict(task="base", density="dense"),
+                dict(task="forest_e1", density="dense", spawn_mode="random")):
+        try:
+            sg.build_scene(template, 1, 1, **bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad} 应抛 ValueError")
+    assert cp.task_geometry_version("forest_e1") == sf.GEOMETRY_VERSION_FOREST != cp.task_geometry_version("base")
+    assert cp.scene_gen_extra(SimpleNamespace(density="dense")) == ["--density", "dense"]
+    assert cp.scene_gen_extra(SimpleNamespace(density=None)) == []
     print(f"test_scene_forest: PASS（{len(SEEDS)} seeds × {len(sf.DENSITY_GAP_M)} 档；模板 {os.path.basename(template_path)}；"
-          f"走廊 clearance {sf.CORRIDOR_CLEARANCE_M:.3f} m；横墙负例判无路）")
+          f"走廊 clearance {sf.CORRIDOR_CLEARANCE_M:.3f} m；横墙负例判无路；scene_gen/split/collect_parallel 接入）")
     return 0
 
 
