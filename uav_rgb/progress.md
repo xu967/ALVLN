@@ -41,8 +41,9 @@
 - 14:30 R2-SRC 报告（撞速率限制前已写完）：无 Must fix，7 条 Should fix 多为重列；落了其中「tools/test_*.py 进 check.sh 门禁」（5e2e0c1）。
 - 15:00 VIZ-LAYOUT 第一轮合并（cdac554）：`sim/tools/view_layout.py` 两域共用 1280×720 版式；48 集 3DGS 重合成 `views_1280.webm`；**demo 短片 v1** `demo-e1-20261107/reel/demo_reel_v1.mp4`（239 s，22 段，代表帧 `reel/stills_v1/`）；Gazebo 版式逐像素不变。GitHub 推到 e8ed497。VIZ-LAYOUT 第二轮已派（BRIEF_VIZ_LAYOUT §6：E1 部件表两域统一机体、FOLLOW 机位改近、TOP 四旋翼图标、chase_cam 录像补丁、VIDEO_QUALITY 三档 + ffmpeg、重录旧片/重采 3 集异常集、短片 v2 + 60 s 精简版）。R2-3DGS 已派（基于 cdac554）。
 - 根分区 `/` 只剩 4.8 GB（/tmp 1.1 GB 是 IDE AppImage 解包、/opt 13 GB，都不是我们的）；所有进程只写数据盘。
+- 15:10 R2-SITL 报告：approve、无 Must fix，固件假设逐条核实为真。两条 Should fix 待办（**eval3 结束后做**，因为 `sim/dynamics/e1_mini.json` 被跑着的 gz 每集读取，中途改会让 eval3 口径不一）：① `vel_ki` 0.15→0.30（FORWARD 稳态侧偏 b/ki 减半，7 m 航程偏 0.8→0.4 m；selftest 仍 33/33；dynamics_profile sha 会变，记为 lib v3.1）；② selftest 阈值按 40 种子扫描修（场景 1 加计链阈值 1.0° 实为 2σ、6a 缺光流随机游走项、6b 97 s 真饱和超 README 69 s 包络），脚本在 `tmp/agent7-r2-sitl/seeds/`。Nice：E1 模板护罩四角 0.120 m 伸出碰撞半径 0.102（交 VIZ-LAYOUT 二轮部件表时一并对齐）；`templates/uav_rgb_e1.118fa38c.sdf` 无代码引用但它是 0417 训练集的模板存档，**保留**（provenance）。
 - 主会话 worklog：`docs/worklog/2026-11-07-0515-phase3-main-session.md`（08:00 追加第五阶段小节）。
-- 待办：收 R2-SITL / R2-SIMTOOLS / R2-3DGS / DEV-DATA / VIZ-LAYOUT-2 报告 → 合并 → 推 GitHub → 派 R2-3DGS / R2-UIDOCS / R2-REPRO；收 R2-SRC / R2-SITL / R2-SIMTOOLS；DEV-DATA（DISTILL ①②③ 的 opt-in 实现）→ 评审 → Gazebo 对照实验 → 按 Must fix 修/合并 review-* 分支的改动 → 收 TEACHER-P1 / SCENE-B 报告并合并 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
+- 待办：eval3 后做 SITL v3.1（ki 0.30 + selftest 阈值）并重建库；收 R2-SIMTOOLS / R2-3DGS / DEV-DATA / VIZ-LAYOUT-2 报告 → 合并 → 推 GitHub → 派 R2-3DGS / R2-UIDOCS / R2-REPRO；收 R2-SRC / R2-SITL / R2-SIMTOOLS；DEV-DATA（DISTILL ①②③ 的 opt-in 实现）→ 评审 → Gazebo 对照实验 → 按 Must fix 修/合并 review-* 分支的改动 → 收 TEACHER-P1 / SCENE-B 报告并合并 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
 
 ---
 
