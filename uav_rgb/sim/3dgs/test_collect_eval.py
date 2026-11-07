@@ -243,6 +243,20 @@ class TestSceneIdentity(unittest.TestCase):
 
 
 class TestEval3dgs(unittest.TestCase):
+    def test_student_adapter_resets_policy_at_episode_start(self):
+        # eval_3dgs 跨集复用一个 StudentPolicy 进程、每集新建一个 adapter：双帧 / prev-action 模型的
+        # 帧缓存必须在集边界清掉，否则第 k≥1 集首帧拿的是上一集末帧（REVIEW-P2 Must fix #1）。
+        class FakeStudent:
+            resets = 0
+
+            def reset(self):
+                self.resets += 1
+
+        s = FakeStudent()
+        collect.StudentAdapter(s)
+        collect.StudentAdapter(s)
+        self.assertEqual(s.resets, 2)
+
     def test_forward_mock_eval(self):
         with tempfile.TemporaryDirectory() as tmp:
             scene_dir = os.path.join(tmp, "scene")

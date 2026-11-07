@@ -153,6 +153,10 @@ class StudentAdapter:
 
     def __init__(self, student):
         self.student = student
+        # 一个 adapter 对应一集；eval_3dgs 跨集复用同一个 StudentPolicy 进程。双帧 / prev-action 模型
+        # 缓存上一帧与上一步动作，不清掉的话第 k≥1 集首帧拿的是上一集末帧（REVIEW-P2 实测 max|Δp|=0.225，
+        # 第一步就可能错方向）；训练口径是首帧「上一帧=自身、prev=SAFE」。单帧模型 reset 是空操作。
+        student.reset()
 
     def __call__(self, rgb, depth, state):
         import base64
