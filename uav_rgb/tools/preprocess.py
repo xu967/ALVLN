@@ -196,6 +196,18 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
     if teacher not in ("plan_action", "expert_action", "synthetic"):
         die("%s: teacher=%r 不是教师标签（forward/student 产物不能当训练数据打包）"
             % (man_path, teacher))
+    # DAgger 自采集（collect_3dgs --policy student / collect_parallel --policy student）：动作由学生执行，
+    # 但 action_expert 仍是教师标签，允许进入；executed_by/dagger_round/beta 写进 episodes 表供溯源。
+    # 老 manifest 没有这几项 = 教师自采（round 0、β=1）。
+    executed_by = man.get("executed_by", "teacher")
+    if executed_by not in ("teacher", "student"):
+        die("%s: executed_by=%r 既不是 teacher 也不是 student" % (man_path, executed_by))
+    dagger_round = man.get("dagger_round", 0)
+    beta = man.get("beta", 1.0)
+    if not isinstance(dagger_round, int) or dagger_round < 0:
+        die("%s: dagger_round 必须是非负整数（实际 %r）" % (man_path, dagger_round))
+    if not isinstance(beta, (int, float)) or not (0.0 <= float(beta) <= 1.0):
+        die("%s: beta 必须在 [0,1]（实际 %r）" % (man_path, beta))
     instruction = man.get("instruction")
     if instruction is not None and not isinstance(instruction, str):
         die("%s: instruction 必须是字符串（实际 %r）" % (man_path, instruction))
@@ -290,6 +302,9 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
         "split_salt": man.get("split_salt"),
         "teacher": man.get("teacher"),
         "planner": man.get("planner"),
+        "executed_by": executed_by,
+        "dagger_round": dagger_round,
+        "beta": float(beta),
         "renderer_backend": (man.get("renderer") or {}).get("backend"),
         "scene_json": ("scene.json"
                        if os.path.isfile(os.path.join(ep_dir, "scene.json")) else None),
@@ -566,6 +581,10 @@ def build_meta(episodes, total, size, dropped=0, split_scheme=None,
             "geometry_version": ep.get("geometry_version"),
             **{key: ep.get(key) for key in sm.PROVENANCE_KEYS},
             "teacher": ep.get("teacher"),
+            # DAgger 溯源（airsim_to_uavr 等直接构造的 episode dict 没有：按教师自采补默认）
+            "executed_by": ep.get("executed_by", "teacher"),
+            "dagger_round": ep.get("dagger_round", 0),
+            "beta": ep.get("beta", 1.0),
             "task_version": ep.get("task_version"),
             "instruction": ep.get("instruction"),
             "target_color": ep.get("target_color"),

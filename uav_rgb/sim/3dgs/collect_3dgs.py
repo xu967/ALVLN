@@ -13,6 +13,9 @@ oracle.jsonl / rgb_%05d.png），但**不启动 Gazebo**：位姿由 sim/tools/c
   python -m sim.3dgs.collect_3dgs --scene $SCENES/synthetic/scene.json \
       --out $DATA_ROOT/uav_rgb/3dgs-pilot-... --steps 8 --policy teacher
   python -m sim.3dgs.collect_3dgs --scene ... --out ... --mock-renderer --steps 3
+  DAgger（学生执行、astar 教师打标签；tools/dagger_pipeline.py 调用）：
+  python -m sim.3dgs.collect_3dgs --scene ... --route 1 --out ... --policy student --ckpt run/ckpt_best.bin \
+      --beta 0.5 --dagger-round 1 --dynamics cf_sitl --hold 0.5
 """
 import argparse
 import hashlib
@@ -168,6 +171,41 @@ class StudentAdapter:
         return action, infer_ms
 
 
+class DaggerPolicy:
+    """DAgger 采集（Ross 2011）：学生看图出动作并执行，占据栅格 A* 教师按特权状态给标签。
+
+    每步以概率 beta 改执行教师动作（β 混合；第 1 轮 0.5，之后 0）。标签口径与 --policy astar
+    完全一样（teacher=plan_action, planner=astar_occ），只是 executed_by=student；
+    信念软标签由 sim/tools/teacher_belief.py 离线按位姿重标，不在这里算。
+    """
+
+    name = "plan_action"
+
+    def __init__(self, student, expert, beta, rng):
+        self.student, self.expert, self.beta, self.rng = StudentAdapter(student), expert, float(beta), rng
+        self.planner_name = expert.planner_name
+        self.version = getattr(expert, "version", None)
+        self.stop_radius = expert.stop_radius
+        self.last_expert = None
+        self.n_expert_exec = 0
+
+    @property
+    def n_plan_fail(self):
+        return self.expert.n_plan_fail
+
+    @n_plan_fail.setter
+    def n_plan_fail(self, v):
+        self.expert.n_plan_fail = v
+
+    def __call__(self, rgb, depth, state):
+        self.last_expert, _ = self.expert(rgb, depth, state)
+        action, infer_ms = self.student(rgb, depth, state)
+        if self.beta > 0.0 and self.rng.random() < self.beta:
+            action = self.last_expert
+            self.n_expert_exec += 1
+        return action, infer_ms
+
+
 def _spawn_for_episode(scene, occ, jitter_m, rng):
     s = scene["spawn"]
     x, y, yaw = float(s["x"]), float(s["y"]), float(s.get("yaw_deg", 0.0))
@@ -181,7 +219,7 @@ def _spawn_for_episode(scene, occ, jitter_m, rng):
     raise RuntimeError(f"spawn 抖动 {jitter_m} m 内找不到自由点")
 
 
-def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
+def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, dagger=None,
                 split="train", seed=0, episode_id=None,
                 save_depth=False, stop_on_collision=False, dynamics_path=None,
                 spawn_jitter=0.0, identity=None, split_policy=None,
@@ -236,6 +274,8 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
         policy.prev = None
     if hasattr(policy, "n_plan_fail"):   # A* 教师的规划失败计数是实例级的，按集归零才能落进本集 manifest
         policy.n_plan_fail = 0
+    if hasattr(policy, "n_expert_exec"):
+        policy.n_expert_exec = 0
     t_wall = time.perf_counter()
 
     try:
@@ -262,6 +302,8 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
                 raise RuntimeError(f"写 RGB 失败: {e}") from e
 
             action, infer_ms = policy(rgb, depth, dyn)
+            # DAgger：执行的是学生（或 β 抽中的教师）动作，标签始终是教师的；其它策略两者相同。
+            expert = policy.last_expert if isinstance(policy, DaggerPolicy) else action
             x0, y0, yaw0 = dyn.x, dyn.y, dyn.yaw
             z0 = dyn.z
             state = dyn.step(action, hold_s)
@@ -285,7 +327,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
             actions.append({
                 "step": i,
                 "timestamp_ns": ts0,
-                "action_expert": action,
+                "action_expert": expert,
                 "action_executed": action,
                 "collision": bool(collided),
                 # 与 collect.py 对齐：src 区分碰撞来源；这里只有代理栅格。
@@ -385,6 +427,14 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s,
             "trace_ref": "trace.jsonl" if getattr(dyn, "trace", None) is not None else None,
             "teacher": policy.name,
             "planner": getattr(policy, "planner_name", None),
+            # 谁执行了动作：teacher = 教师自采（默认），student = DAgger 学生自采（标签仍是教师）。
+            # preprocess 只认 teacher 标签，executed_by/dagger_round/beta 进 episodes 表供训练数据溯源。
+            "executed_by": (dagger or {}).get("executed_by", "forward" if policy.name == "forward" else "teacher"),
+            "dagger_round": (dagger or {}).get("dagger_round", 0),
+            "beta": (dagger or {}).get("beta", 1.0),
+            "student_ckpt": (dagger or {}).get("student_ckpt"),
+            "student_ckpt_sha256": (dagger or {}).get("student_ckpt_sha256"),
+            "n_expert_executed": getattr(policy, "n_expert_exec", None),
             "teacher_version": (TEACHER_VERSION if policy.name == "expert_action"
                                 else getattr(policy, "version", None)),
             "hold_s": hold_s,
@@ -453,9 +503,14 @@ def main():
     p.add_argument("--out", required=True, help="输出根目录（必须为空/新目录）")
     p.add_argument("--steps", type=int, default=None, help="每集步数（默认 scene.max_steps）")
     p.add_argument("--episodes", type=int, default=1)
-    p.add_argument("--policy", choices=("teacher", "astar", "forward"), default="teacher",
+    p.add_argument("--policy", choices=("teacher", "astar", "forward", "student"), default="teacher",
                    help="teacher = 深度反应式（不知道 waypoint，开阔路线全程 FORWARD）；"
-                        "astar = 占据栅格 A* + 纯追踪 + goal-stop（sim/3dgs/planner.py，多路线用）")
+                        "astar = 占据栅格 A* + 纯追踪 + goal-stop（sim/3dgs/planner.py，多路线用）；"
+                        "student = DAgger：学生执行（--ckpt），astar 教师打标签，--beta 概率改执行教师")
+    p.add_argument("--ckpt", default=None, help="--policy student 的学生 checkpoint")
+    p.add_argument("--infer-bin", default=None, help="uavrgb_infer 路径（默认 $UAV_RGB_BUILD_DIR/uavrgb_infer）")
+    p.add_argument("--beta", type=float, default=0.0, help="DAgger β：每步改执行教师动作的概率（第 1 轮 0.5，之后 0）")
+    p.add_argument("--dagger-round", type=int, default=0, help="DAgger 轮次，写进 manifest（0 = 教师数据）")
     p.add_argument("--route", type=int, default=None,
                    help="scene.routes[N]：覆盖 spawn/waypoint/max_steps（默认 0 = 顶层 spawn/waypoint）")
     p.add_argument("--hold", type=float, default=None, help="每步动作窗口秒（默认 scene.step_s）")
@@ -490,6 +545,10 @@ def main():
         p.error("steps 必须 >=1，hold 必须有限正数")
     if args.spawn_jitter < 0 or not math.isfinite(args.spawn_jitter):
         p.error("--spawn-jitter 必须有限且 >= 0")
+    if args.policy == "student" and not (args.ckpt and os.path.isfile(args.ckpt)):
+        p.error("--policy student 需要存在的 --ckpt")
+    if not (0.0 <= args.beta <= 1.0):
+        p.error("--beta 必须在 [0,1]")
     params = (CfSitlParams.from_json(args.dynamics_params) if args.dynamics == "cf_sitl"
               else CfBlackboxParams.from_json(args.dynamics_params))
     identity = scene_identity(scene)
@@ -501,7 +560,8 @@ def main():
     occ = collision_mod.from_scene(scene)
     renderer = renderer_mod.make_renderer(scene, args.mock_renderer, args.width,
                                           args.height, args.fov, args.device)
-    if args.policy == "astar":
+    student, dagger = None, None
+    if args.policy in ("astar", "student"):
         occ_planner = planner_mod.OccPlanner(occ)
         policy = planner_mod.OccAstarTeacher(occ_planner, scene["waypoint"])
         check = planner_mod.route_check(occ_planner, scene["spawn"], scene["waypoint"])
@@ -510,6 +570,13 @@ def main():
         print(f"astar 教师: route={scene.get('route')} 航程 {check['path_m']} m 转向 {check['turn_deg']}° "
               f"最小净空 {check['min_clearance_m']} m 步数预算 {check['steps_estimate']}（--steps {steps}）",
               file=sys.stderr)
+        if args.policy == "student":
+            from student import StudentPolicy   # sim/tools（TOOLS 已在 sys.path）；常驻 uavrgb_infer 子进程
+            import random
+            student = StudentPolicy(args.ckpt, args.infer_bin)
+            policy = DaggerPolicy(student, policy, args.beta, random.Random(args.seed))
+            dagger = {"executed_by": "student", "dagger_round": args.dagger_round, "beta": args.beta,
+                      "student_ckpt": os.path.abspath(args.ckpt), "student_ckpt_sha256": _sha256(args.ckpt)}
     else:
         policy = DepthTeacher() if args.policy == "teacher" else ForwardPolicy()
     os.makedirs(args.out, exist_ok=True)
@@ -520,7 +587,7 @@ def main():
             p.error(f"{ep_dir} 已存在")
         try:
             manifest, err = run_episode(
-                scene, ep_dir, renderer, occ, params, policy, steps, hold,
+                scene, ep_dir, renderer, occ, params, policy, steps, hold, dagger=dagger,
                 split=split, seed=args.seed + ep,
                 episode_id=args.seed + ep, save_depth=args.save_depth,
                 stop_on_collision=args.stop_on_collision,
@@ -535,6 +602,8 @@ def main():
         except Exception as e:  # noqa: BLE001 - 单集失败不拖垮整轮
             failures.append({"episode": ep, "error": f"{type(e).__name__}: {e}"})
             print(f"episode {ep} 失败: {e}", file=sys.stderr)
+    if student is not None:
+        student.close()
     _write_json_atomic(os.path.join(args.out, "run.json"), {
         "schema": "uavrgb.3dgs_collect.v1",
         "scene": {"name": scene.get("name"), "path": scene["path"],
@@ -542,6 +611,7 @@ def main():
         "route": scene.get("route"), "spawn": scene.get("spawn"), "waypoint": scene.get("waypoint"),
         "split": split, "split_policy": split_policy,
         "policy": args.policy, "steps": steps, "hold_s": hold,
+        "dagger": dagger,
         "dynamics": args.dynamics,
         "dynamics_profile": params.profile(),
         "dynamics_params": params.manifest(),
