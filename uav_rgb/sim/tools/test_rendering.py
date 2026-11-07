@@ -76,7 +76,7 @@ class RenderingTests(unittest.TestCase):
                     pose.current = fixtures.pose_msg(clock[0])
 
                 class Student:
-                    def act(self, msg):
+                    def act(self, msg, prev_action=None):   # 与 student.StudentPolicy.act 同签名（collect_one 传 prev_action）
                         advance(delay)
                         return 1, delay * 1000, [0., 1., 0., 0.]
 

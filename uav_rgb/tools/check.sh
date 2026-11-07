@@ -4,6 +4,7 @@ set -euo pipefail
 uav_check_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$uav_check_root/env.sh"
 uav_check_build="${UAV_RGB_BUILD_DIR:-$uav_check_root/build/check}"
+uav_check_skipped=()   # 被 SKIP 的段；末行 PASS 要把它们列出来，免得「没检查」被读成「检查过了」（R2-REPRO 2026-11-07）
 
 if [[ $# -gt 1 || ($# -eq 1 && "$1" != "--python-only") ]]; then
   echo "用法: tools/check.sh [--python-only]" >&2
@@ -77,10 +78,13 @@ if [[ "${1:-}" != "--python-only" ]]; then
     "$uav_check_sitl/cf_sitl_selftest" --params "$uav_check_root/sim/dynamics/e1_mini.json" \
       --out "$uav_check_sitl/selftest-out"
   else
-    echo "SKIP: cf_sitl 未检查（CF_DRONE_DIR=$uav_check_cfd 没有 CF-Drone.ino，或 sim/cf_sitl/CMakeLists.txt 缺失）"
+    echo "SKIP: cf_sitl 未检查（CF_DRONE_DIR=$uav_check_cfd 没有 CF-Drone.ino，或 sim/cf_sitl/CMakeLists.txt 缺失；" \
+         "固件来源见 README「环境与一键检查」）" >&2
+    uav_check_skipped+=("cf_sitl（固件在环库、CTest、selftest）")
   fi
 else
-  echo "SKIP: 用户指定 --python-only，未验证 C++/CUDA 构建和 GPU 测试。"
+  echo "SKIP: 用户指定 --python-only，未验证 C++/CUDA 构建和 GPU 测试。" >&2
+  uav_check_skipped+=("C++/CUDA 构建、CTest、GPU 测试、cf_sitl")
   "$UAV_RGB_PYTHON" "$uav_check_root/tools/test_join_soft_targets.py"
 fi
 
@@ -162,8 +166,8 @@ done
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_trainer_demo.py"
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_studio.py"
 "$UAV_RGB_PYTHON" "$uav_check_root/tools/test_train_student_with_video.py"
-if [[ "${1:-}" == "--python-only" ]]; then
-  echo "PASS（python-only）：C++/CUDA 构建、CTest、GPU 未验证；模拟采集、真实训练和学生闭环须独立验收。"
+if [[ ${#uav_check_skipped[@]} -gt 0 ]]; then
+  echo "PASS（有 SKIP）：所选检查完成，但未检查：$(IFS=';'; echo "${uav_check_skipped[*]}")；模拟采集、真实训练和学生闭环须独立验收。"
 else
   echo "PASS: 所选检查完成；模拟采集、真实训练和学生闭环须独立验收。"
 fi

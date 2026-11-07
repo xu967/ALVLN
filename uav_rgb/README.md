@@ -13,10 +13,8 @@
 
 ```bash
 source env.sh
-bash tools/setup_env.sh              # 新建 .venv-tools（numpy + Pillow），并跑一次 doctor
-# check.sh 里的 tools/test_scene_probe_quality.py 还要 cv2，requirements.txt 暂未列，先手装：
-.venv-tools/bin/python -m pip install opencv-python-headless
-# cf_sitl 段需要固件源码；不设 CF_DRONE_DIR 时 check.sh 只打印 SKIP（见下）
+bash tools/setup_env.sh              # 新建 .venv-tools（numpy + Pillow + opencv-python-headless，tools/requirements.txt），并跑一次 doctor
+# cf_sitl 段需要固件源码；不设 CF_DRONE_DIR 时 check.sh 把 SKIP 写到 stderr，末行 PASS 会列出未检查的段（见下）
 export CF_DRONE_DIR=<CF-Drone 目录>
 "$UAV_RGB_PYTHON" tools/doctor.py --require-gpu --require-sim
 bash tools/check.sh                  # 构建 + CTest + Python 自检 + cf_sitl（CTest/自检）

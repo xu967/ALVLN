@@ -17,9 +17,12 @@ __uav_rgb_prepend() {
   local var_name="$1" dir="$2"
   # 必须用 ${!var_name-}：set -u 下引用未定义变量会直接退出 shell，
   # 而 LD_LIBRARY_PATH 在干净容器/CI 里通常就是未定义的。
+  # ${!var:+:...}：变量已设且非空才接「:旧值」；:+ 这一族展开在 set -u 下对未定义变量也不报错。
+  # 旧写法 ${!var-:+:…} 被解析成 ${!var-WORD}：已设时直接把旧值贴在 $dir 后面不带冒号（PATH 第一项被吞），
+  # 未设时插入字面量 ":+:"（R2-REPRO 2026-11-07 在干净 shell 实测 which nvcc 为空）。
   case ":${!var_name-}:" in
     *":$dir:"*) ;;
-    *) export "${var_name}=$dir${!var_name-:+:${!var_name-}}" ;;
+    *) export "${var_name}=$dir${!var_name:+:${!var_name}}" ;;
   esac
 }
 __uav_rgb_prepend PATH "$CUDA_HOME/bin"

@@ -1,3 +1,6 @@
 # 数据工具的最小依赖；Python 不承担模型训练。已验证版本见环境审查日志。
 numpy>=1.24,<3
 Pillow>=9.1,<14
+# check.sh 跑的 tools/test_scene_probe_quality.py、sim/tools/record_views.py、tools/make_demo_reel.py 都 import cv2；
+# 缺它时 check.sh 4 min 后在一个 3DGS 工具测试上红（R2-REPRO 2026-11-07 从零克隆实测）。本机 .venv-tools 装的是 5.0.0.93。
+opencv-python-headless>=4.8,<6
