@@ -14,9 +14,14 @@
 - `tools/collect_parallel.py` —— 多实例 `GZ_PARTITION` 隔离 + 并发 `collect.py` 的采集编排。
 - `evidence/*.png` —— 实测抓帧证据。
 
-## 0. 当前渲染路径（2026-11-03 更新）
+## 0. 当前渲染路径（2026-11-03 更新；2026-11-07 补：本容器只能软件 GL）
 
-- 本机 NVIDIA EGL 已可用。采集、校园 smoke 和闭环评测默认使用
+- **2026-11-07 实测（RTX 4080 SUPER 容器）**：默认 `gpu` 后端起不来，`gz sim` 在
+  `Ogre2RenderEngine::CreateRenderSystem` 段错误（`Unable to load Ogre Plugin
+  RenderSystem_GL3Plus`，rc=-11，`collect_parallel` 重试 1 次后 0/1 集）。本机所有采集/评测
+  命令都要带 `UAVRGB_RENDER_BACKEND=software DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg`
+  （同 `CLAUDE.md` 环境节）；下面 §0 其余条目与 §1 的 EGL 命令是 2080 Ti 时期的记录。
+- 旧机 NVIDIA EGL 曾可用。采集、校园 smoke 和闭环评测默认使用
   `UAVRGB_RENDER_BACKEND=gpu`：指定 NVIDIA EGL vendor，移除 `DISPLAY` 和软件驱动覆盖，
   启动 `gz sim -s -r --headless-rendering`。本轮真实相机日志确认 RTX 2080 Ti。
 - GPU 模式启动失败会报错，不自动降级。缺显卡/驱动时须显式使用
@@ -41,8 +46,9 @@
 ## 1. 启动世界
 
 ```bash
-cd /root/claude-code-backup-20261028/code/uav_rgb
+cd "$UAV_RGB_ROOT"                        # 仓库根（source env.sh 后可用）
 mkdir -p /tmp/xdg && chmod 700 /tmp/xdg   # 消除 XDG_RUNTIME_DIR 报错
+# 下面是 EGL 路径（历史机器）；本容器改用：DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg gz sim -s -r sim/worlds/uav_rgb.sdf
 env -u DISPLAY -u LIBGL_ALWAYS_SOFTWARE \
   __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json \
   XDG_RUNTIME_DIR=/tmp/xdg gz sim -s -r --headless-rendering sim/worlds/uav_rgb.sdf
@@ -286,6 +292,25 @@ python3 sim/tools/collect_parallel.py --instances 4 --episodes-per-instance 1 \
   T1 实测（20 个 test 场景、20 个唯一几何、40 步/集）**20/20 无碰撞穿过
   x=6.0，100%**；旧局部规划在 v3 上 24 集 15 集擦柱。collision 真值会如实
   记录，训练前按需过滤。
+
+### 4.6.3 E1 MINI 固件在环采集（当前主线，`tools/e1_pipeline.py` 用的就是这组参数）
+
+上面 4.6.2 是 X3 + `MulticopterVelocityControl` 的旧机体。现在的主线载具是 E1 MINI
+（`--vehicle e1_mini`，模板 `worlds/uav_rgb_e1.sdf`）+ CF-Drone 固件在环（`--dynamics cf_sitl`），
+需要先按 [`cf_sitl/README.md`](cf_sitl/README.md) 构建 `libcf_sitl.so`，再按
+[`cf_sitl/gz/README.md`](cf_sitl/gz/README.md) 构建插件 `libCfSitlSystem.so`，并把插件目录给 gz：
+
+```bash
+export UAVRGB_CF_SITL_PLUGIN_DIR=<插件构建目录，含 libCfSitlSystem.so>   # 不设则按 $DATA_ROOT/uav_rgb/tmp/build-cf-sitl/gz 等顺序找
+UAVRGB_RENDER_BACKEND=software DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg \
+python3 sim/tools/collect_parallel.py --dynamics cf_sitl --vehicle e1_mini \
+  --instances 1 --episodes-per-instance 1 --steps 40 --hold 1.0 --window-from observation \
+  --camera-rate 10 --no-aux-cameras --base-seed 3000 --keep-worlds --out /tmp/e1-demo
+```
+
+2026-11-07 从零克隆实测（1 实例 1 集）：固件 READY 6.8 s（SITL 时间），40/40 步，端到端 57.7 s，
+动作窗口 RTF 0.92，FORWARD 14 / YAW_LEFT 13 / YAW_RIGHT 13，0 碰撞；`collection_manifest.json`
+记录 `cf_sitl_plugin_dir`。放量参数（4 实例、300 集）见 `tools/e1_pipeline.py` 顶部 CFG。
 
 ## 5. 对齐冻结的 ObservationSpec / EpisodeSchema
 

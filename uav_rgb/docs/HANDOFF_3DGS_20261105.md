@@ -44,7 +44,22 @@ source env.sh
 
 - 3DGS venv（**只在数据盘**）：
   `$DATA_ROOT/uav_rgb/3dgs-venv`，torch 2.7.1+cu128、gsplat 1.5.3、
-  numpy/scipy/pillow/opencv-python-headless。
+  numpy/scipy/pillow/opencv-python-headless。仓库里没有它的 requirements，从零搭建按
+  `docs/experiments/2026-11-05-3dgs-pilot.md` 的安装段：
+
+```bash
+# 2026-11-05 实际用过的命令（本轮未重装验证；pip 缓存/JIT 产物按 pilot 文档放数据盘）
+/usr/bin/python3 -m venv $DATA_ROOT/uav_rgb/3dgs-venv
+$DATA_ROOT/uav_rgb/3dgs-venv/bin/pip install \
+  'https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.7.1%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl'
+$DATA_ROOT/uav_rgb/3dgs-venv/bin/pip install gsplat==1.5.3 numpy scipy pillow opencv-python-headless ninja jaxtyping rich packaging
+unset TORCH_CUDA_ARCH_LIST   # pilot 文档里的 TORCH_CUDA_ARCH_LIST=7.5 是 2080 Ti 时期的；现在按本机 sm_89 JIT，带着会编错架构
+```
+
+- 场景数据也只在数据盘。没有 Callinstrasse（下载地址见 pilot 文档 §场景表，MIT）时可先用仓库自带的
+  合成走廊走通链路：`python -m sim.3dgs.scene make-synthetic --out <dir> --seed 0` 生成 `scene.json`，
+  再把下面 §五 命令里的 `--scene` 换成它（2026-11-07 从零克隆实测：生成 + 单帧渲染 5 s，
+  `collect_3dgs --episodes 1 --steps 10 --policy teacher` 7 s，首次 gsplat JIT 另计）。
 - 学生 C++ 推理：`src/build/uavrgb_infer`（`build/check` 也可，用 `UAV_RGB_BUILD_DIR`）。
 - 数据工具 venv：`.venv-tools`（已装 opencv-python-headless）。
 - 首次 gsplat 会 JIT 编译 CUDA 扩展，本机 sm_75 约 **228–235 s**；
@@ -140,8 +155,9 @@ python3 tools/test_train_student_with_video.py
 .venv-tools/bin/python tools/test_splat_to_ply.py
 ```
 
-本轮结果：`tools/check.sh` PASS；CTest 25/25；`sim/3dgs` 20 项（1 个真实
+本轮（2026-11-05）结果：`tools/check.sh` PASS；CTest 25/25；`sim/3dgs` 20 项（1 个真实
 gsplat 用例默认 skip，`RUN_3DGS_REAL=1` 开启）；其余单测全过。
+2026-11-07 从零克隆复跑：CTest 30/30；`sim/3dgs` 65 项 OK（2 skip，23 s）。
 
 ## 七、已知坑
 

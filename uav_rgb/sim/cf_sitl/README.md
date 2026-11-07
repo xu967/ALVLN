@@ -23,18 +23,22 @@ C 接口见 `include/cf_sitl.h`（签名冻结）。
 ## 构建
 
 依赖：CMake ≥ 3.22、Ninja、g++（C++17/C11）、Eigen 3.4（`/usr/include/eigen3`），以及只读的固件源码目录 `CF_DRONE_DIR`
-（默认 `${CMAKE_CURRENT_SOURCE_DIR}/../../../CF-Drone`，即 `/root/claude-code-backup-20261028/code/CF-Drone/`；不存在时 configure 报错）。
+（默认 `${CMAKE_CURRENT_SOURCE_DIR}/../../../CF-Drone`，即仓库旁的 `../CF-Drone`；不存在时 configure 报错，`tools/check.sh` 则整段 SKIP）。
+
+固件源码不在本仓库，从零克隆时要自己放好：ALVLN 仓库 `references/snapshots/CF-Drone.zip` 解包即是
+CF-Drone **e7f507f**（与 GitHub `https://github.com/songge8/CF-Drone` 同提交，只差 CRLF），解到任意目录后
+`export CF_DRONE_DIR=<该目录>`（含 `CF-Drone.ino`）。`check.sh` 用同一个变量，`UAV_RGB_SITL_BUILD_DIR` 指定它的构建目录。
 
 ```bash
-SRC=/root/claude-code-backup-20261028/code/uav_rgb/sim/cf_sitl
-BUILD=/root/rivermind-data/uav_rgb/tmp/build-cf-sitl
-cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release            # 可加 -DCF_DRONE_DIR=... -DCF_SITL_BUILD_GZ=ON
-cmake --build "$BUILD" --parallel 8                                          # 产物：$BUILD/libcf_sitl.so、$BUILD/cf_sitl_smoke
+SRC="$UAV_RGB_ROOT/sim/cf_sitl"                                              # source env.sh 后可用
+BUILD="$DATA_ROOT/uav_rgb/tmp/build-cf-sitl"                                 # 放数据盘，根分区装不下
+cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCF_DRONE_DIR="$CF_DRONE_DIR"   # 可加 -DCF_SITL_BUILD_GZ=ON
+cmake --build "$BUILD" --parallel 8                                          # 产物：$BUILD/libcf_sitl.so、$BUILD/cf_sitl_smoke；-j4 实测约 1 min
 "$BUILD"/cf_sitl_smoke [e1_mini.json 路径] [seed]                            # 到 READY 退出码 0，否则 1
 ```
 
 编译选项：Release（`-O3 -DNDEBUG`）加 `-ffp-contract=off -fno-fast-math`（两种模式、两次 reset 逐位一致），`-fvisibility=hidden -fvisibility-inlines-hidden
--fno-gnu-unique -Wl,-Bsymbolic -Wl,--no-undefined`，只导出 7 个 `cf_sitl_*` 符号（`nm -D libcf_sitl.so` 可查）。
+-fno-gnu-unique -Wl,-Bsymbolic -Wl,--no-undefined`，只导出 8 个 `cf_sitl_*` 符号（7 个接口 + 自检用的 `cf_sitl_set_sticks_raw`；`nm -D libcf_sitl.so` 可查）。
 固件源码通过 `fw/fw_sitl.cpp` 的 `#include` 进入同一翻译单元，库内只有一个固件实例，一个进程只能有一个 SITL 实例。
 
 `CF_SITL_BUILD_GZ=ON` 时 `add_subdirectory(gz)`；`proc/`、`selftest/`、`tests/` 的 `CMakeLists.txt` 存在时自动加入，`ctest` 在构建目录运行。

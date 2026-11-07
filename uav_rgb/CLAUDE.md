@@ -56,23 +56,28 @@ Build and test the core library (`src/`, C++ + CUDA kernels):
 
 ```bash
 source "$UAV_RGB_ROOT/env.sh"
-cmake -S "$UAV_RGB_ROOT/src" -B "$UAV_RGB_ROOT/src/build" -G Ninja -DCMAKE_BUILD_TYPE=Release
-cmake --build "$UAV_RGB_ROOT/src/build"
-ctest --test-dir "$UAV_RGB_ROOT/src/build" --output-on-failure   # 当前 20 项，以 ctest -N 为准
+# 默认构建目录是 build/check（tools/check.sh 建的那个；UAV_RGB_BUILD_DIR 可改）。src/build 是历史路径，
+# 从零克隆后并不存在——别照旧文档去找 src/build/uavrgb_train。
+cmake -S "$UAV_RGB_ROOT/src" -B "$UAV_RGB_ROOT/build/check" -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build "$UAV_RGB_ROOT/build/check" --parallel 4      # 2026-11-07 从零构建实测约 2 min
+ctest --test-dir "$UAV_RGB_ROOT/build/check" --output-on-failure   # 2026-11-07 为 30 项，以 ctest -N 为准
 ```
 
 Train a model end-to-end (collect → preprocess → train):
 
 ```bash
-# 并行采集（自动生成随机场景、按 GZ_PARTITION 隔离实例；纯 headless 相机会 segfault，必须 DISPLAY=:20）
-DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg python3 "$UAV_RGB_ROOT/sim/tools/collect_parallel.py" \
+# 并行采集（自动生成随机场景、按 GZ_PARTITION 隔离实例）。本容器默认 gpu 后端会在 Ogre2 段错误，
+# 必须三件套：UAVRGB_RENDER_BACKEND=software DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg（2026-11-07 实测）
+UAVRGB_RENDER_BACKEND=software DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg python3 "$UAV_RGB_ROOT/sim/tools/collect_parallel.py" \
   --instances 4 --episodes-per-instance 1 --steps 40 --hold 1.0 --base-seed 0 --out /tmp/dataset
+# E1 MINI 固件在环主线加 --dynamics cf_sitl --vehicle e1_mini，见 sim/README.md §4.6.3
 
-# 打包成 UAVR 数据集（默认 160×120，按 scene_id 划分 split）
+# 打包成 UAVR 数据集（默认 160×120，按几何组划分 split）
 python3 "$UAV_RGB_ROOT/tools/preprocess.py" --out /tmp/ds /tmp/dataset/train/*/
 
 # 训练（CNN → 4 logits；写 results.csv + metrics.jsonl，监控台可直接读）
-"$UAV_RGB_ROOT/src/build/uavrgb_train" --data /tmp/ds/dataset.uavr --epochs 30 --batch 128 --lr 1e-3 --out /tmp/run1
+# 数据集带 instructions.jsonl（l1 任务 / 合成夹具）时必须显式 --vision-only 或 --text-dim N，否则训练器拒绝启动
+"$UAV_RGB_ROOT/build/check/uavrgb_train" --data /tmp/ds/dataset.uavr --epochs 30 --batch 128 --lr 1e-3 --out /tmp/run1
 
 python3 "$UAV_RGB_ROOT/sim/tools/teacher.py"          # 专家策略 22 项自测
 python3 "$UAV_RGB_ROOT/sim/tools/scene_gen.py" --seed 42 --out /tmp/w.sdf   # 按 seed 生成场景

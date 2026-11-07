@@ -59,8 +59,9 @@ enum class Action : std::uint8_t {
 **每个 shell 的第一件事**（必须从仓库根目录）：
 
 ```bash
-cd /root/claude-code-backup-20261028/code/uav_rgb
+cd <仓库根>                                      # 本机 /root/claude-code-backup-20261028/code/uav_rgb；从零克隆是 ALVLN/uav_rgb
 source env.sh                                   # env.sh 自定位 UAV_RGB_ROOT
+bash tools/setup_env.sh                         # 首次：建 .venv-tools（numpy/Pillow）；check.sh 还要手装 opencv-python-headless，见 README
 source .venv-tools/bin/activate                 # 仅在跑 Python 数据工具时
 nvidia-smi -L                                   # 先判定 GPU 模式，别凭印象
 ```
@@ -72,7 +73,7 @@ nvidia-smi -L                                   # 先判定 GPU 模式，别凭�
 
 | 路径 | 作用 |
 | --- | --- |
-| `src/` | C++/CUDA 训练推理栈：`train_main.cpp`（CLI）、`trainer.cpp` / `trainer_eval.cpp`、`infer_main.cpp`（常驻推理进程）、`dataset.cpp`、`checkpoint.cpp`（v4，best-checkpoint + text_dim）、`src/tests/`（**21 个 CTest**） |
+| `src/` | C++/CUDA 训练推理栈：`train_main.cpp`（CLI）、`trainer.cpp` / `trainer_eval.cpp`、`infer_main.cpp`（常驻推理进程）、`dataset.cpp`、`checkpoint.cpp`（v4，best-checkpoint + text_dim）、`src/tests/`（**30 个 CTest**，2026-11-07 `ctest -N`；旧文「21 项」已过时） |
 | `sim/tools/` | `scene_gen.py`（柱阵世界生成）、`collect.py` / `collect_parallel.py`（采集）、`teacher.py`（`plan_action` GT planner / `expert_action` 深度专家）、`audit_dataset.py`（**18 条数据验收闸门**）、`eval_closed_loop.py`（闭环评测）、`split_manifest.py`（几何 gid + split）、13 个 `test_*.py` |
 | `tools/` | `preprocess.py`（采集目录 → `.uavr`）、`airsim_to_uavr.py`（公开数据接入）、`check.sh`（**L2 全量验证**）、`doctor.py` |
 | `ui/` | 原生 Tkinter 桌面 Studio（训练、实验归档、Gazebo 三视角、闭环评测）；旧 `monitor.py` 保留兼容 |
@@ -896,9 +897,10 @@ cd /root/claude-code-backup-20261028/code/uav_rgb && source env.sh
 bash tools/check.sh
 # 无卡时：bash tools/check.sh --python-only（会打印跳过 C++/CUDA 的说明）
 
-# 单独构建 + 全量 CTest（21 项）
-cmake -S src -B src/build -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build src/build
-ctest --test-dir src/build --output-on-failure
+# 单独构建 + 全量 CTest（30 项，2026-11-07）。默认目录 build/check（README/check.sh 同口径）；
+# src/build 是历史路径，从零克隆后不存在
+cmake -S src -B build/check -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build/check --parallel 4
+ctest --test-dir build/check --output-on-failure
 
 # Python 自测（不用 pytest，逐个直接跑；用 UAV_RGB_PYTHON 而不是裸 python3）
 for t in sim/tools/test_*.py; do "$UAV_RGB_PYTHON" "$t" || echo "FAIL $t"; done
@@ -907,13 +909,14 @@ for t in sim/tools/test_*.py; do "$UAV_RGB_PYTHON" "$t" || echo "FAIL $t"; done
 python3 sim/tools/teacher.py
 python3 sim/tools/scene_gen.py --self-check
 
-# 并行采集（必须 DISPLAY=:20）
-DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg python3 sim/tools/collect_parallel.py \
+# 并行采集（本容器必须 UAVRGB_RENDER_BACKEND=software + DISPLAY=:20；默认 gpu 后端 Ogre2 段错误，2026-11-07 实测）
+UAVRGB_RENDER_BACKEND=software DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg python3 sim/tools/collect_parallel.py \
   --instances 4 --episodes-per-instance 1 --steps 40 --hold 1.0 --base-seed 0 --out /tmp/dataset
+# E1 主线加 --dynamics cf_sitl --vehicle e1_mini（sim/README.md §4.6.3）
 
-# 打包 + 训练
+# 打包 + 训练（数据集带 instructions.jsonl 时要显式 --vision-only 或 --text-dim N）
 python3 tools/preprocess.py --out /tmp/ds /tmp/dataset/train/*/
-src/build/uavrgb_train --data /tmp/ds/dataset.uavr --epochs 10 --batch 128 --lr 1e-3 \
+build/check/uavrgb_train --data /tmp/ds/dataset.uavr --epochs 10 --batch 128 --lr 1e-3 \
   --class-weights auto --out /tmp/run1
 
 # 数据验收闸门（FAIL 即非零退出）

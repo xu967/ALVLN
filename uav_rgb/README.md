@@ -13,18 +13,28 @@
 
 ```bash
 source env.sh
-bash tools/setup_env.sh              # 修复备份迁移的 venv 路径，安装最小数据依赖
+bash tools/setup_env.sh              # 新建 .venv-tools（numpy + Pillow），并跑一次 doctor
+# check.sh 里的 tools/test_scene_probe_quality.py 还要 cv2，requirements.txt 暂未列，先手装：
+.venv-tools/bin/python -m pip install opencv-python-headless
+# cf_sitl 段需要固件源码；不设 CF_DRONE_DIR 时 check.sh 只打印 SKIP（见下）
+export CF_DRONE_DIR=<CF-Drone 目录>
 "$UAV_RGB_PYTHON" tools/doctor.py --require-gpu --require-sim
-bash tools/check.sh                  # 构建 + CTest + Python 自检
+bash tools/check.sh                  # 构建 + CTest + Python 自检 + cf_sitl（CTest/自检）
 ```
 
-本次实际设备：Ubuntu 24.04、RTX 2080 Ti / sm_75、CUDA 12.8、Gazebo 8.15.0。
+固件源码 CF-Drone（e7f507f）不在本目录：ALVLN 仓库里 `references/snapshots/CF-Drone.zip`
+解包即是（与 e7f507f 只差 CRLF），或 `git clone https://github.com/songge8/CF-Drone`
+后 `git checkout e7f507f`。
+
+本次实际设备：Ubuntu 24.04、RTX 4080 SUPER（sm_89，见 `CLAUDE.md`；CMake 仍编 sm_75，靠 PTX JIT 运行）、
+CUDA 12.8、Gazebo 8.15.0。早期记录的 RTX 2080 Ti / sm_75 是 2026-11-05 前的历史环境。
 保留已有驱动、CUDA 与 Gazebo；不使用 PyTorch、TensorRT、cuDNN、cuBLAS、ROS 2。
 `doctor` 检查命令与导入，`check` 才执行数值/训练测试；两者都不代替闭环验收。
 无卡时可显式执行 `bash tools/check.sh --python-only`，它会打印跳过 C++/CUDA 的说明。
 
 默认新构建目录为 `build/check`；可用 `UAV_RGB_BUILD_DIR` 覆盖。
-最近一次全量验证（2026-11-03）**25/25 CTest 通过**，编译产物仅 sm_75。
+最近一次从零克隆复现（2026-11-07，GitHub 镜像 6d7c258）：`check.sh` 全程 4 min
+（构建 `-j4` 约 2 min），**CTest 30/30**、cf_sitl CTest 7/7、`cf_sitl_selftest` 33/33。
 （接手开发先读 [`docs/HANDOFF.md`](docs/HANDOFF.md)；任务与验收见 [`docs/TASKS.md`](docs/TASKS.md)。）
 默认构建与推理统一使用 `build/check`；`UAV_RGB_BUILD_DIR` 可同时覆盖两者。旧 `src/build` 不再是默认推理入口，保留用于历史复现。
 `UAV_RGB_BUILD_JOBS` 默认 8。Python 工具用 `UAV_RGB_PYTHON`，Gazebo helper 用
@@ -37,13 +47,17 @@ bash tools/check.sh                  # 构建 + CTest + Python 自检
 
 ```bash
 source env.sh
-# 默认 NVIDIA EGL 无界面渲染；软件对照显式设置 UAVRGB_RENDER_BACKEND=software。
+# 渲染后端默认 gpu（NVIDIA EGL）。本容器的 EGL 库是占位文件，默认后端会在
+# Ogre2RenderEngine::CreateRenderSystem 段错误（2026-11-07 实测 rc=-11、0/1 集），
+# 必须显式走软件 GL：UAVRGB_RENDER_BACKEND=software DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg
 # 每次必须用新的输出目录：collect_parallel 和 uavrgb_train 都会拒绝复用非空目录
 # （uavrgb_train 的 RunOwner 只认 --resume），所以这里按时间戳建一个。
+mkdir -p /tmp/xdg && chmod 700 /tmp/xdg
+export UAVRGB_RENDER_BACKEND=software DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg
 RUN="$DATA_ROOT/uav_rgb/smoke/$(date +%Y%m%d-%H%M%S)"
 "$UAV_RGB_PYTHON" sim/tools/collect_parallel.py \
   --instances 1 --episodes-per-instance 1 --steps 5 --hold 0.5 \
-  --base-seed 42 --out "$RUN/collection"
+  --base-seed 42 --out "$RUN/collection"       # 实测 1 集 5 步 27 s
 "$UAV_RGB_PYTHON" tools/preprocess.py --drop-collision \
   --out "$RUN/preprocessed" "$RUN/collection/train/42"
 ./build/check/uavrgb_train \
@@ -53,12 +67,27 @@ RUN="$DATA_ROOT/uav_rgb/smoke/$(date +%Y%m%d-%H%M%S)"
 DISPLAY=:20 /usr/bin/python3 ui/monitor.py --run-dir "$RUN/train"
 ```
 
+数据集带 `instructions.jsonl`（`--task l1` 或下面的合成夹具）时，`uavrgb_train` 会拒绝缺省
+`--text-dim 0`：纯视觉基线显式加 `--vision-only`，文本分支给 `--text-dim 16`。
+不开 Gazebo 的最小链（check.sh 用的同一套夹具，3 集 15 步，全程几秒；2026-11-07 从零克隆实测 2–7 s）：
+
+```bash
+"$UAV_RGB_PYTHON" tools/make_synthetic_episode.py --out "$RUN/synth"
+"$UAV_RGB_PYTHON" tools/preprocess.py --out "$RUN/ds" "$RUN"/synth/ep{1,2,3}
+./build/check/uavrgb_train --data "$RUN/ds/dataset.uavr" --epochs 1 --batch 5 --lr 0.001 \
+  --class-weights auto --vision-only --out "$RUN/train-synth"
+./build/check/uavrgb_infer --ckpt "$RUN/train-synth/ckpt_best.bin" < /dev/null
+# 先打印一行结构头 {"in_h":120,"in_w":160,"in_c":3,"num_classes":4,...}，之后每收一帧
+# 160×120×3 HWC uint8 就回一行 {"action":..,"probs":[..],"infer_ms":..}（协议见 src/include/uavrgb/infer.hpp）
+```
+
 只有 train 时会明确输出 `DEV_SPLIT_EMPTY`，JSONL 的评测 `split=train`。
 `results.csv` 仍保留既有 `dev_*` 列名，因此必须结合事件判断评测数据来源。
 正式实验应提供按实际场景隔离的 train/val/test，并覆盖全部四类动作。
 旧 `ui/monitor.py` 保留用于兼容历史 DEMO/目录监控；新实验请使用 `ui/launch_studio.sh`，它会启动真实 C++/CUDA trainer，不会默认调用 DEMO。
 
-仿真采集与闭环已接入 RTX 2080 Ti 的 EGL 渲染；CUDA 可用与渲染可用分别验证。
+仿真采集与闭环曾在 RTX 2080 Ti 上接入 EGL 渲染（2026-11-03，历史）；本容器只能走软件 GL（见上）。
+CUDA 可用与渲染可用分别验证。
 启动方式见 [仿真说明](sim/README.md)，实测与优化顺序见
 [GPU 仿真实验](docs/experiments/2026-11-03-gpu-rendering.md)。
 
