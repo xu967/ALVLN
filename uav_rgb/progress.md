@@ -20,8 +20,14 @@
 - 06:40 流水线 DONE rc=0：四组对照 n=11（20 seed 只有 11 个独立几何）：教师 10/11、新 E1 学生 6/11、旧 X3 学生 2/11、盲前进 0/11（`docs/experiments/2026-11-07-e1-demo-plan.md` §3.1）。
 - 07:00 SITL(50cd5ee)、VIZ(b918ee1)、SCENE-A(88357bc) 合并进 main；SITL 库 v2 重建到 `tmp/build-cf-sitl`（旧库 `build-cf-sitl-v1-20261106`），ctest/自检/smoke 全过；`check.sh` 全过（Studio GUI 测试按 DPI 缩放窗口 e325add）；真 Gazebo 1 集教师录像验证新链路（`tmp/gz-validate-20261107/teacher-seed58/videos/seed_58.mp4`）。
 - 07:11 第二轮四组重评守护进程：`e1-pipeline-20261107-0417-eval2`，PGID 694826，20 独立几何 × 4 组，lib v2，`--from eval`（run/ ds/ 软链到 0417）；停：`kill -- -694826`。
-- 主会话 worklog：`docs/worklog/2026-11-07-0515-phase3-main-session.md`。
-- 待办：收 TEACHER-P1 / STUDENT-P2 / SCENE-B / EVAL 报告并合并 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
+- 07:20–07:30 STUDENT-P2 落提交 `ed25f52`（分支 student-p2，未合并，等 eval2 结束再合并并重建 build/check）；EVAL 合并 e33e816。
+- 07:38 用户新授权：可加派 agent 并行审核；数据盘已扩（余 78 GB），需要的内容直接下载；可并行跑验证。
+- 07:50 第五阶段派出 4 个独立审核 agent（+TEACHER-P1、SCENE-B 共 6，满上限）：REVIEW-P2（student-p2 分支 42 文件，worktree `tmp/wt-review-p2` 基于 ed25f52）、REVIEW-SITL（2b479cc 执行器修复，`tmp/wt-review-sitl`）、REVIEW-EVAL（8375325 SPL/stats_report/compare_datasets + pick_test_seeds，`tmp/wt-review-eval`）、REVIEW-3DGS（c4be9fb 碰撞代理 v3/Wanderland + e4184c3 规划/采集/demo，`tmp/wt-review-3dgs`）。简报 `tmp/phase3-20261107/BRIEF_REVIEW.md`；报告 `tmp/phase3-20261107/reports/REVIEW_{P2,SITL,EVAL,3DGS}_20261107.md`；各自构建目录 `tmp/build-review-<name>`。规则：ponytail-review 格式；Must fix ≤30 行直接在自己 worktree 修（先写会红的测试），不 commit；每人最多 1 个 gz 实例。
+- TEACHER-P1 中间结果（07:28，Callinstrasse pilot 20 集、6 路线 × 3 集评测）：hard SR 12/18、soft(K=8, α=1 步) SR 4/18、hard_plain 13/18 —— 软标签第 0 轮明显更差，agent 在试 α=0.25 与软硬混合，并跑 DAgger 第 1 轮（PGID 713232）。合并 P1 前要看清原因，不能只看 argmax 一致率 91%。
+- 07:55 独立核对 P1 统计（`tmp/main-session/P1_soft_label_diagnosis_0805.md`）与 TEACHER-P1 报告 §3–§4 一致：决定性消融「只把 8.7% 标签换成 kino argmax 硬标签」SR 13/18→5/18，问题在 `teacher_kino` 代价模型（走廊小角度修正判为不值得 + 剪枝键无速度让 SAFE 代价被低估），不是软标签本身。P1 下一步方向：示范与标注统一到同一代价模型（给 `astar_occ` 实现逐动作 cost-to-go），再做软 vs 硬。
+- 机器约束：cgroup CPU 配额 12 核（不是 88），负载 32、20% 周期限流。排队的验证：森林跨场景评测（teacher / e1-new / forward × forest_e1 sparse 20 独立几何 `7,8,19,22,23,39,53,64,71,86,90,102,110,134,135,136,142,145,155,161`），等 eval2 结束释放 gz 再起。
+- 主会话 worklog：`docs/worklog/2026-11-07-0515-phase3-main-session.md`（08:00 追加第五阶段小节）。
+- 待办：收 4 份审核报告 → 按 Must fix 修/合并 review-* 分支的改动 → 收 TEACHER-P1 / SCENE-B 报告并合并 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
 
 ---
 

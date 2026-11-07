@@ -53,3 +53,19 @@
 - lib v1 → v2 改变了 SAFE 行为（位置保持），新采数据与旧数据的动力学不同，混包时要分 `dynamics_profile`。
 - `build/check` 二进制已按合并后 main 重建；`tmp/build-cf-sitl` 为 v2，所有后续采集/评测默认用它。
 - 第四阶段 5 个 agent 的分支待审合并；worktree 清理在收尾做。
+
+## 更新 2026-11-07 08:00（第五阶段：独立审核 + 并行验证）
+
+用户 07:38 授权：加派 agent 并行审核；数据盘已扩（余 78 GB）可直接下载；可并行跑验证。
+
+- 派出 4 个独立审核 agent（与 TEACHER-P1、SCENE-B 共 6）：REVIEW-P2（student-p2 分支 ed25f52，未合并）、REVIEW-SITL（2b479cc）、REVIEW-EVAL（8375325 + pick_test_seeds）、REVIEW-3DGS（c4be9fb + e4184c3）。简报 `tmp/phase3-20261107/BRIEF_REVIEW.md`：ponytail-review 格式，每条发现要有具体案例；Must fix ≤30 行在自己 worktree（`tmp/wt-review-*`，分支 `review-*`）先写会红的测试再修，不 commit；允许每人 1 个 gz 实例与小规模 3DGS 渲染做真实验证；构建目录 `tmp/build-review-*`。
+- main `check.sh --python-only` 复跑：PASS（52 GUI 测试、inference/commands/dry-run/test_train_student_with_video 全过，91 s）。
+- 独立核对 TEACHER-P1 软标签统计（`tmp/main-session/P1_soft_label_diagnosis_0805.md`）：硬 FORWARD 帧上 Q_SAFE−Q_min≈0.516 s，α=1 步 → p(SAFE)≈0.26；硬 YAW 帧上软 Q 的 argmin 78–85% 是 FORWARD。与 agent 报告 §3.2/§3.3/§4.3 一致：决定性消融「只把 8.7% 标签改成 kino argmax 的硬标签」SR 13/18 → 5/18，失败在 `teacher_kino` 代价模型对走廊小角度航向修正的判断，与软硬无关。方向：示范与标注统一到同一代价模型（给 `astar_occ` 实现 `plan_costs`，软标签 = 同一 A* 的逐动作 cost-to-go），再做软 vs 硬对照。
+- cgroup CPU 配额实测 12 核（`cpu.max 1200000/100000`，20% 周期被限流，负载 32）：森林跨场景评测（已用 `pick_test_seeds.py --task forest_e1 --density sparse` 挑出 20 个独立几何 `7,8,19,22,23,39,53,64,71,86,90,102,110,134,135,136,142,145,155,161`）推迟到 eval2 结束释放 gz 后再起，避免拖慢正在跑的四组重评与审核构建。
+- eval2 进度（07:55）：forward 20/20（SR 2/20）、x3-old 20/20（SR 2/20）、e1-new 8/20（4 成功）、teacher 6/20（6 成功）；带录像两组约 09:10 结束。
+
+### 没做什么（本段）
+
+- 没起森林跨场景评测：CPU 配额 12 核已满载，等 eval2 释放。
+- 没下载新场景：第二个 Wanderland 场景需要人工看轨迹图选 ID 并设计路线，留给 SCENE-A agent 续做（slot 满）。
+- 没合并 student-p2 / teacher-p1 / scene-mipnerf：等审核报告与 eval2 结束（build/check 正在被评测使用）。
