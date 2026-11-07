@@ -28,6 +28,7 @@ void usage() {
                "[--text-dim N | --vision-only] [--soft-targets <bin> [--distill-alpha A]] "
                "[--allow-resume-mismatch] [--strict-distill] "
                "[--augment all|photo,shift,flip] [--warmup N] [--cosine-lr] [--weight-decay W] [--label-smoothing E]\n"
+               "       [--two-frame] [--prev-action] [--depth-aux [--aux-lambda L]]  （需要 dataset.aux 侧车）\n"
                "  或: uavrgb_train --data <dataset.uavr> --eval-only <ckpt> --out "
                "<run_dir> [--batch B] [--split val|test|all] [--drop-collision]\n");
 }
@@ -111,6 +112,19 @@ int main(int argc, char** argv) {
         if (!(cfg.label_smoothing >= 0.0f) || !(cfg.label_smoothing < 1.0f)) {
           throw std::invalid_argument("--label-smoothing 必须在 [0,1)");
         }
+      } else if (a == "--two-frame") {
+        cfg.two_frame = true;
+        cfg.two_frame_set = true;
+      } else if (a == "--prev-action") {
+        cfg.prev_action = true;
+        cfg.prev_action_set = true;
+      } else if (a == "--depth-aux") {
+        cfg.depth_aux = true;
+        cfg.depth_aux_set = true;
+      } else if (a == "--aux-lambda") {
+        cfg.aux_lambda = std::stof(next("--aux-lambda"));
+        if (!(cfg.aux_lambda >= 0.0f)) throw std::invalid_argument("--aux-lambda 不能为负");
+        cfg.aux_lambda_set = true;
       } else if (a == "--eval-only") {
         eval_ckpt = next("--eval-only");
       } else if (a == "--split") {

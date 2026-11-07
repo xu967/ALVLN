@@ -92,6 +92,51 @@ int main() {
   }
   check(threw, "截断帧未抛 runtime_error");
 
+  // ---- STUDENT-P2 协议：6 通道双帧 + prev-action 字节 ----
+  {
+    const CnnModel p2 = make_cnn(8, 8, 7, kNumActions, 0, /*in_c=*/6, /*aux_classes=*/8, /*prev_dim=*/4);
+    std::string prev_frame(frame_bytes, '\0');
+    for (std::size_t i = 0; i < prev_frame.size(); ++i) prev_frame[i] = static_cast<char>((i * 11 + 5) % 256);
+    auto run_p2 = [&](const std::string& input) {
+      std::istringstream in(input);
+      std::ostringstream out;
+      const std::size_t n = run_infer_loop(p2, in, out);
+      return std::pair<std::size_t, std::string>(n, out.str());
+    };
+    const std::string step = frame + prev_frame + std::string(1, '\x02');
+    const auto a = run_p2(step);
+    const auto b = run_p2(step);
+    check(a.first == 1 && b.first == 1, "双帧+prev 一步应处理 1 帧");
+    const std::size_t ca = a.second.find(key), cb = b.second.find(key);
+    check(ca != std::string::npos && a.second.substr(0, ca) == b.second.substr(0, cb), "双帧同输入两次输出一致");
+    // 上一帧或 prev-action 变化必须影响输出（否则第二帧/条件根本没接进网络）。
+    const auto other_prev = run_p2(frame + frame + std::string(1, '\x02'));
+    const auto other_act = run_p2(frame + prev_frame + std::string(1, '\x00'));
+    check(other_prev.second.substr(0, other_prev.second.find(key)) != a.second.substr(0, ca),
+          "换上一帧应改变输出");
+    check(other_act.second.substr(0, other_act.second.find(key)) != a.second.substr(0, ca),
+          "换 prev-action 应改变输出");
+    check(run_p2(step + step).first == 2, "两步连续输入应处理 2 帧");
+    bool t1 = false, t2 = false;
+    try {
+      (void)run_p2(frame + prev_frame);  // 缺 prev-action 字节
+    } catch (const std::runtime_error&) {
+      t1 = true;
+    }
+    try {
+      (void)run_p2(frame + prev_frame + std::string(1, '\x04'));  // prev >= prev_dim
+    } catch (const std::runtime_error&) {
+      t2 = true;
+    }
+    check(t1, "缺 prev-action 字节未抛 runtime_error");
+    check(t2, "prev-action 越界未抛 runtime_error");
+    // 只有双帧、不接 prev-action：payload 恰为两帧。
+    const CnnModel two = make_cnn(8, 8, 7, kNumActions, 0, 6);
+    std::istringstream in(frame + prev_frame);
+    std::ostringstream out;
+    check(run_infer_loop(two, in, out) == 1, "纯双帧模型一步 = 两帧、无 prev 字节");
+  }
+
   if (g_failures == 0) {
     std::cout << "test_infer_io: PASS\n";
     return 0;

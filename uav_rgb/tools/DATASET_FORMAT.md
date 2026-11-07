@@ -1,4 +1,4 @@
-# UAVR 二进制数据集格式（v1，冻结）
+# UAVR 二进制数据集格式（v1，冻结；§6 为可选侧车 UAVRAUX1）
 
 `tools/preprocess.py` 产出 `<out>/dataset.uavr`。文件为小端、无填充、可直接 `mmap`
 或按偏移 `read()`；H/W/C 一律以文件头为准，**读端不得假定 128×128**。
@@ -95,6 +95,9 @@
   切出 train/val/test，并独立校验 scene_id 不跨 split、区间不重叠且覆盖全部样本。
   scene_id 遵守 `EpisodeMeta` 的 int64 整数合同，不要按帧随机拆分。
 - `source_dir` 仅用于追溯，可能含机器相关绝对路径。
+- `aux_sidecar`（新版 preprocess 追加）：`{"file":"dataset.aux","format":"UAVRAUX1",
+  "depth":true|false,"depth_grid":[15,20]|null,"band_edges_m":[...],"envelope_radius_m":0.102}`，
+  记录同目录侧车的存在与口径（见 §6）。旧数据集没有该字段也没有侧车，读端照常。
 
 ## 2. 读取顺序（C++）
 
@@ -148,3 +151,58 @@ episode 相机尺寸必须一致。
 - `version` 变更仅在布局/字段语义不兼容时发生；新增 meta 字段不升版本。
 - 读端遇到未知 `version` 必须拒绝，不得猜测。
 - 单文件不存 per-sample split 字节；split 只能从 meta 的 episode 区间推导。
+- 逐样本的新字段放**侧车**而不是改 `dataset.uavr`（§6）：`tools/join_soft_targets.py`、
+  `tools/baseline_priors.py`、`tools/train_student_with_video.py` 都写死 `version==1`
+  并按整文件 SHA256 绑定软标签；升版本会让它们全部失效。
+
+## 6. UAVRAUX1 侧车 `dataset.aux`（STUDENT-P2：上一帧链 / prev-action / 深度分带目标）
+
+与 `dataset.uavr` 同目录、同名换后缀（`<name>.aux`），新版 `tools/preprocess.py` 总是写；
+`dataset.uavr` 的字节与 v1 完全一致。读端（`src/aux_sidecar.cpp`、`tools/read_dataset.cpp`）
+文件不存在 → 当旧数据集；存在但不自洽 → 直接报错，不半读。
+
+### 6.1 头（128 字节，little-endian）
+
+| 偏移 | 类型 | 字段 | 说明 |
+|---:|---|---|---|
+| 0 | `char[8]` | magic | `"UAVRAUX1"` |
+| 8 | `u64` | N | 样本数，必须等于 `dataset.uavr` 的 N |
+| 16 | `u32` | flags | bit0 = 有深度分带段；其余位必须为 0 |
+| 20 | `u16` | depth_h | 深度目标网格高 = H/8（无深度时 0） |
+| 22 | `u16` | depth_w | 深度目标网格宽 = W/8（无深度时 0） |
+| 24 | `u8` | depth_classes | 分带数 K = 8 |
+| 25 | `u8` | unknown_code | 255 |
+| 26 | `u16` | reserved | 0 |
+| 28 | `u8[32]` | uavr_sha256 | 同目录 `dataset.uavr` 整文件 SHA256（绑定，防「新数据集 + 旧侧车」） |
+| 60 | `u8[32]` | payload_sha256 | 偏移 128 起全部 payload 的 SHA256 |
+| 92 | `f32[7]` | band_edges_m | 分带上界 0.3/0.5/0.8/1.2/1.8/2.5/4.0 m；带 0 = <0.3 m，带 k = [edge(k−1), edge(k))，带 7 = ≥4 m（含无穷远/天空） |
+| 120 | `f32` | envelope_radius_m | 打包时用的机体包络半径（E1：0.102 m） |
+| 124 | `u32` | reserved | 0 |
+
+### 6.2 payload（紧接文件头）
+
+| 段 | 类型 | 说明 |
+|---|---|---|
+| prev_index | `u32[N]` | 全局样本下标：同 episode 内 step−1 的样本；首帧、或上一步被 `--drop-collision` 丢掉时 = 自身下标（训练器据此标记 first_frame） |
+| prev_action | `u8[N]` | 上一步**执行**的动作（`actions.jsonl` 的 `action_executed`，旧数据退回 `action_expert`）；首帧 = 0（SAFE_NEUTRAL）。注意：上一步被丢掉时它仍取该步真实执行的动作 |
+| depth（flags bit0） | `u8[N·depth_h·depth_w]` | 行优先 `[n][r][c]`，0..K−1 为分带（K−1 含「没打到东西」），255 = 未知（损失屏蔽） |
+
+深度目标的生成（`preprocess.aux_payload`）：源分辨率深度图 → 每格（源图按 H/8×W/8 均分）
+取最小已知深度 → 按机体包络膨胀（深度 z 的格把 z 扩散到像素半径 `f·r_env/z` 内的邻格，
+f 取 manifest `camera.fx`，没有则按 60° HFOV 推算）→ `searchsorted(band_edges)`。
+
+**深度 0 的语义按来源区分**，判据是 manifest 的 `depth_format`（它同时决定解码方式；不按文件扩展名猜）：
+
+| `depth_format` | 写端 | 0 的含义 | 目标 |
+|---|---|---|---|
+| `png16_mm` | `collect.py --save-depth`（uint16 毫米；写端把 `inf`——20 m 远裁剪内没打到——和负值编成 0，>65.535 m 截到 65535，见 `sim/tools/test_save_depth.py`） | 没打到东西 = 天空/超远 | **第 8 带（≥4 m）**，是有效监督 |
+| `npy_float32_m` | `collect_3dgs.py --save-depth`（float32 米） | alpha 空洞（渲染没覆盖）；负值/NaN/inf 同样 | **255 未知**，损失屏蔽 |
+
+格内聚合：未知像素不参与 min；「没东西」像素参与（整格只有它 → 第 8 带）；整格全未知 → 255。
+包络膨胀只由近处有限深度的格向外扩散（未知/没东西的格半径为 0），但两者都会被邻近近处格覆盖。
+一个包要么全部样本有深度，要么全无。
+
+### 6.3 训练器约定
+
+`--two-frame` / `--prev-action` 需要侧车存在，`--depth-aux` 需要 flags bit0；缺了直接报错，
+不静默降级。旧数据集（无侧车）不带这些开关时训练行为与之前逐字节一致。

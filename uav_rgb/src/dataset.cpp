@@ -497,6 +497,7 @@ UavrDataset load_uavr(const std::string& path, const LoadOptions& opts) {
     warn_collision_kept(ds, meta);
   }
   load_text_sidecar(ds, path, eps);  // 无侧车时 text_ids 保持空
+  ds.aux = load_aux_sidecar(path, ds.n, ds.h, ds.w, ds.num_classes);  // 无侧车时 present=false
   return ds;
 }
 

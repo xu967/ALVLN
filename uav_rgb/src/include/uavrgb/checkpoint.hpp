@@ -3,12 +3,12 @@
 //
 // 文件布局（偏移 B）：
 //   0    char[8]  magic "UAVRCK01"
-//   8    u32      version = 5（v2 起带类别权重；v3 追加 best_macro_f1；
-//                v4 追加 text_dim；v5 追加训练契约。读端接受 v2..v5；
-//                v1 无类别权重段，直接拒绝）
-//   12   u32      param_count（无文本分支 8；有文本分支 11：
-//                8 个 CNN/fc 参数 + text_emb, film.W, film.b）
-//   16   i32 in_h, i32 in_w, i32 in_c, i32 num_classes   ← 模型结构元信息
+//   8    u32      version = 6（v2 起带类别权重；v3 追加 best_macro_f1；
+//                v4 追加 text_dim；v5 追加训练契约；v6 追加 aux_classes/prev_dim。
+//                读端接受 v2..v6；v1 无类别权重段，直接拒绝）
+//   12   u32      param_count（顺序同 cnn_params：8 个 CNN/fc 参数 + 可选 text_emb
+//                + 可选 film.W, film.b + 可选 aux.W, aux.b）
+//   16   i32 in_h, i32 in_w, i32 in_c(3 单帧 / 6 双帧), i32 num_classes   ← 模型结构元信息
 //   32   u32      adam_t（已完成 step 数；8 个 Adam 共享同一 t）
 //   36   u32      epoch（已完成 epoch 数，续训时 results.csv 接着编号）
 //   40   u32      weight_count（0 或 num_classes），随后 f32 class_weights[weight_count]
@@ -18,6 +18,7 @@
 //             32B soft targets SHA256（全 0 = 未蒸馏）、f32 distill_alpha、f32 lr、
 //             u32 seed、i32 batch、32B split_scheme 字符串的 SHA256（全 0 = 未记录）。
 //             旧 v2..v4 没有该段：续训按旧行为放行，由 trainer 打警告。
+//        (v6) i32 aux_classes、i32 prev_dim（旧版本读回 0/0）——追加在契约之后
 //        逐参数（顺序同 cnn_params）：u32 ndim、i64 dims[ndim]、f32 data[numel]
 //        再逐参数：f32 m[numel]
 //        再逐参数：f32 v[numel]
@@ -69,6 +70,8 @@ struct CheckpointMeta {
   int in_c = 0;
   int num_classes = 0;
   int text_dim = 0;  // 0 = 无文本分支（推理端据此决定要不要读 --text）
+  int aux_classes = 0;  // v6：深度分带辅助头类别数（0 = 无；推理端不算它）
+  int prev_dim = 0;     // v6：prev-action one-hot 维度（0 = 无；>0 时每帧多读 1 字节）
 };
 CheckpointMeta read_checkpoint_meta(const std::string& path);
 

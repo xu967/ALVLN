@@ -61,6 +61,21 @@ CAMERA_KEY = "camera_profile"
 # 必须与 src/include/uavrgb/text.hpp 的 kTextLen 一致：不足补 <pad>，超长由两端报错。
 TEXT_LEN = 9
 
+# UAVRAUX1 侧车（dataset.aux，DATASET_FORMAT.md §6）：双帧的上一帧下标、prev-action、
+# 深度分带目标。dataset.uavr 本身字节不变，旧读端不受影响。
+AUX_MAGIC = b"UAVRAUX1"
+AUX_HEADER = struct.Struct("<8sQIHHBBH")  # magic N flags depth_h depth_w K unknown reserved = 28 B
+AUX_HEADER_SIZE = 128
+AUX_UNKNOWN = 255
+# 分带上界（m）：0.3/0.5/0.8/1.2/1.8/2.5/4，第 8 带 = ≥4 m（ALGO 报告 §2 P2）。
+DEPTH_BAND_EDGES_M = (0.3, 0.5, 0.8, 1.2, 1.8, 2.5, 4.0)
+DEPTH_CLASSES = len(DEPTH_BAND_EDGES_M) + 1
+# 机体包络半径：sim/dynamics/e1_mini.json collision_envelope.radius_from_center（E1 实机）。
+DEFAULT_ENVELOPE_RADIUS_M = 0.102
+DEFAULT_HFOV_DEG = 60.0  # manifest 没写 fx 时按 Gazebo 相机 60° 水平视场推焦距
+# 网格 = 模型第三层特征图（H/8 × W/8），与 1x1 辅助头逐格对齐。
+DEPTH_GRID_DOWN = 8
+
 try:
     import numpy as np
     from PIL import Image
@@ -207,6 +222,15 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
 
     samples, seen = [], set()
     dropped = 0
+    # prev-action 取上一步**执行**的动作（DAgger 数据里学生执行的 ≠ 教师标签；它要补偿的是
+    # 相机真实的自运动）；旧数据没有 action_executed 时退回 action_expert。
+    by_step = {}
+    for row in rows:
+        try:
+            by_step[int(row["step"])] = row
+        except (KeyError, TypeError, ValueError):
+            die("%s: action 行缺 step：%r" % (actions_path, row))
+    depth_format = man.get("depth_format")
     for row in sorted(rows, key=lambda r: int(r["step"])):
         try:
             step = int(row["step"])
@@ -218,6 +242,23 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
         if step in seen:
             die("%s: step %d 重复" % (actions_path, step))
         seen.add(step)
+        prev_row = by_step.get(step - 1)
+        prev_action = 0  # 首帧：没有上一步，按 SAFE_NEUTRAL
+        if prev_row is not None:
+            try:
+                prev_action = int(prev_row.get("action_executed", prev_row["action_expert"]))
+            except (KeyError, TypeError, ValueError):
+                die("%s step %d: 上一步缺 action_executed/action_expert" % (actions_path, step))
+            if prev_action not in range(len(ACTION_NAMES)):
+                die("%s step %d: 上一步动作 %d 超出 0..3" % (actions_path, step, prev_action))
+        depth = row.get("depth_file")
+        if depth is not None:
+            if depth_format not in DEPTH_LOADERS:
+                die("%s: 有 depth_file 但 manifest.depth_format=%r 不认识（支持 %s）"
+                    % (man_path, depth_format, "/".join(DEPTH_LOADERS)))
+            depth = os.path.join(ep_dir, depth)
+            if not os.path.isfile(depth):
+                die("缺深度帧：%s（actions.jsonl 的 depth_file 指向不存在的文件）" % depth)
         # 碰撞步的 action_expert 是专家在撞墙后的错误标签，过滤是标签清洗而不是丢样本。
         # 必须是真正的 bool：bool("false") 是 True，字符串会让过滤彻底失效。
         collision = row.get("collision", False)
@@ -231,10 +272,12 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
         if not os.path.isfile(png):
             die("缺帧：%s（actions.jsonl 与 rgb_*.png 不同步）" % png)
         samples.append({"png": png, "label": action, "step": step,
-                        "collision": collision})
+                        "collision": collision, "prev_action": prev_action,
+                        "depth": depth, "depth_format": depth_format})
 
     return {
         "dir": os.path.abspath(ep_dir),
+        "camera_fx": camera.get("fx"),
         "episode_id": man.get("episode_id"),
         "scene_id": scene_id,
         "seed": man.get("seed", 0),
@@ -432,7 +475,7 @@ def _split_facts_one_family(episodes):
 
 
 def build_meta(episodes, total, size, dropped=0, split_scheme=None,
-               collision_filter=None, allow_mixed=False):
+               collision_filter=None, allow_mixed=False, aux_info=None):
     src_w, src_h = episodes[0]["src_w"], episodes[0]["src_h"]
     families = family_facts(episodes)
     if allow_mixed and len(families) > 1:
@@ -503,6 +546,9 @@ def build_meta(episodes, total, size, dropped=0, split_scheme=None,
         "collision_flags": "".join("1" if s["collision"] else "0"
                                    for ep in episodes for s in ep["samples"]),
         "collision_dropped": dropped,
+        # UAVRAUX1 侧车摘要（新增 meta 字段不升版本，DATASET_FORMAT.md §5）；权威信息在侧车头里。
+        # 键名不能含 "episodes"/split_* 子串（C++ 读端按子串定位）。
+        "aux_sidecar": aux_info,
         "splits": counts,
         # 每 split 的每类样本数：T3 的「四类 recall >0」需要先确认 val/test 有 support。
         "class_counts": class_counts,
@@ -569,13 +615,13 @@ def load_frame(path, src_w, src_h, size, crop=None, src_expected=None):
 
 def write_dataset(out_dir, episodes, total, size, dropped=0, crop=None,
                   src_expected=None, split_scheme=None, collision_filter=None,
-                  allow_mixed=False):
+                  allow_mixed=False, aux_info=None):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "dataset.uavr")
     out_w, out_h = size
 
     meta_bytes = json.dumps(build_meta(episodes, total, size, dropped, split_scheme,
-                                       collision_filter, allow_mixed),
+                                       collision_filter, allow_mixed, aux_info),
                             ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     # C++ 读端（dataset.cpp）按子串定位 "episodes" 数组与 split_* 标量，不是完整 JSON 解析：
     # "episodes" 只能出现一次，split_*/collision_flags 的第一次出现必须是顶层（在 episodes 数组之前），
@@ -662,6 +708,175 @@ def write_instructions(out_dir, rows):
     return path
 
 
+# ---- UAVRAUX1 侧车：上一帧链 / prev-action / 深度分带目标 ----
+# 加载器统一输出 float32 米：+inf = 「前方没东西」（有效，落最远带），nan = 未知（255，损失屏蔽）。
+# 0 的语义按 manifest.depth_format 区分（它同时决定解码方式，不另按扩展名猜）。
+
+def _load_depth_png16_mm(path):
+    """collect.py --save-depth：16 位灰度 PNG，毫米。写端把 inf（20 m 远裁剪内没打到）和负值编成 0、
+    >65.535 m 截到 65535（sim/tools/test_save_depth.py）——所以 0 = 天空/超远 → +inf，是最远带的监督。"""
+    with Image.open(path) as im:
+        arr = np.asarray(im)
+    if arr.dtype != np.uint16:
+        die("%s: 深度 PNG 不是 16 位（dtype=%s）" % (path, arr.dtype))
+    depth = arr.astype(np.float32) / 1000.0
+    depth[arr == 0] = np.inf
+    return depth
+
+
+def _load_depth_npy_m(path):
+    """collect_3dgs.py --save-depth：float32 米；0（alpha 空洞，渲染没覆盖）/负/非有限 → 未知 nan。"""
+    arr = np.load(path)
+    if arr.ndim != 2:
+        die("%s: 深度 npy 应为二维（实际 shape=%r）" % (path, arr.shape))
+    depth = arr.astype(np.float32)
+    depth[~np.isfinite(depth) | (depth <= 0)] = np.nan
+    return depth
+
+
+DEPTH_LOADERS = {"png16_mm": _load_depth_png16_mm, "npy_float32_m": _load_depth_npy_m}
+
+
+def cell_min_depth(depth, grid):
+    """(src_h, src_w) 深度 → (dh, dw) 每格最小已知深度。
+
+    nan（未知）不参与 min；+inf（没东西）参与：整格只有 inf → inf（最远带），整格全 nan → nan（255）。
+    """
+    dh, dw = grid
+    src_h, src_w = depth.shape
+    known = ~np.isnan(depth)
+    filled = np.where(known, depth, np.inf).astype(np.float32)
+    if src_h % dh == 0 and src_w % dw == 0:
+        blocks = (dh, src_h // dh, dw, src_w // dw)
+        out = filled.reshape(blocks).min(axis=(1, 3))
+        any_known = known.reshape(blocks).any(axis=(1, 3))
+    else:
+        out = np.empty((dh, dw), dtype=np.float32)
+        any_known = np.empty((dh, dw), dtype=bool)
+        ys = (np.arange(dh + 1) * src_h) // dh
+        xs = (np.arange(dw + 1) * src_w) // dw
+        for r in range(dh):
+            for c in range(dw):
+                out[r, c] = filled[ys[r]:ys[r + 1], xs[c]:xs[c + 1]].min()
+                any_known[r, c] = known[ys[r]:ys[r + 1], xs[c]:xs[c + 1]].any()
+    out[~any_known] = np.nan
+    return out
+
+
+def dilate_by_envelope(cells, focal_px, cell_px, radius_m):
+    """按机体包络膨胀：深度 z 的格把 z 扩散到像素半径 f·r/z（换算成格）内的邻格，取 min。
+
+    这就是「E1 包络膨胀」：近处障碍在图上要按机身半径加宽，模型学的是「这格飞过去会碰」，
+    而不是「这格有像素」。cells 为 (N, dh, dw)：nan = 未知、+inf = 没东西，两者都不向外膨胀
+    （半径 0 / 无定义），但都会被邻近的近处格覆盖。
+    """
+    if radius_m <= 0 or focal_px <= 0:
+        return cells
+    out = cells.copy()
+    with np.errstate(all="ignore"):
+        rad = focal_px * radius_m / cells / cell_px  # 每格的膨胀半径（格）
+    finite = np.isfinite(rad)
+    if not finite.any():
+        return out
+    n, dh, dw = cells.shape
+    # 偏移上界按网格截断：|dy|≥dh 或 |dx|≥dw 的偏移落不到任何格，结果不变；不截断时一个
+    # 极近的格（3DGS 深度 1e-6 m）会让循环走 (2·1.8e6+1)² 次，preprocess 卡死不报错。
+    rmax = min(int(np.ceil(np.nanmax(rad[finite]))), max(dh, dw) - 1)
+    for dy in range(-rmax, rmax + 1):
+        for dx in range(-rmax, rmax + 1):
+            if dy == 0 and dx == 0:
+                continue
+            dist = (dy * dy + dx * dx) ** 0.5
+            src = np.where(finite & (rad >= dist), cells, np.nan)
+            # src[:, y, x] 影响 out[:, y+dy, x+dx]
+            ys, ye = max(0, -dy), min(dh, dh - dy)
+            xs, xe = max(0, -dx), min(dw, dw - dx)
+            if ys >= ye or xs >= xe:
+                continue
+            tgt = out[:, ys + dy:ye + dy, xs + dx:xe + dx]
+            out[:, ys + dy:ye + dy, xs + dx:xe + dx] = np.fmin(tgt, src[:, ys:ye, xs:xe])
+    return out
+
+
+def depth_bands(cells):
+    """每格深度 → 分带 0..K-1（≥最后一个上界含 +inf = K-1）；nan → AUX_UNKNOWN。"""
+    bands = np.searchsorted(np.asarray(DEPTH_BAND_EDGES_M, dtype=np.float32),
+                            np.nan_to_num(cells, nan=np.inf), side="right").astype(np.uint8)
+    bands[np.isnan(cells)] = AUX_UNKNOWN
+    return bands
+
+
+def aux_payload(episodes, size, envelope_radius_m):
+    """算 prev_index / prev_action / 深度分带；返回 (prev_index, prev_action, depth 或 None, grid)。"""
+    out_w, out_h = size
+    grid = (out_h // DEPTH_GRID_DOWN, out_w // DEPTH_GRID_DOWN)
+    flat = [(ep, s) for ep in episodes for s in ep["samples"]]
+    n = len(flat)
+    prev_index = np.arange(n, dtype=np.uint32)
+    prev_action = np.zeros(n, dtype=np.uint8)
+    for ep in episodes:
+        by_step = {s["step"]: ep["sample_start"] + i for i, s in enumerate(ep["samples"])}
+        for i, s in enumerate(ep["samples"]):
+            g = ep["sample_start"] + i
+            # 上一步被 --drop-collision 丢掉时 step-1 不在 by_step：同首帧处理（指向自身）。
+            prev_index[g] = by_step.get(s["step"] - 1, g)
+            prev_action[g] = s["prev_action"]
+    have = [s["depth"] is not None for _, s in flat]
+    if not any(have):
+        return prev_index, prev_action, None, grid
+    if not all(have):
+        die("深度文件部分缺失（%d/%d 个样本有 depth_file）：一个包要么全有深度要么全无"
+            % (sum(have), n))
+    depth = np.empty((n, grid[0], grid[1]), dtype=np.uint8)
+    chunk = 1024  # 分块做包络膨胀，内存按块算
+    for start in range(0, n, chunk):
+        part = flat[start:start + chunk]
+        cells = np.empty((len(part), grid[0], grid[1]), dtype=np.float32)
+        for k, (ep, s) in enumerate(part):
+            d = DEPTH_LOADERS[s["depth_format"]](s["depth"])
+            if d.shape != (ep["src_h"], ep["src_w"]):
+                die("%s: 深度尺寸 %r 与相机 %dx%d 不一致"
+                    % (s["depth"], d.shape, ep["src_w"], ep["src_h"]))
+            cells[k] = cell_min_depth(d, grid)
+        ep0 = part[0][0]
+        fx = ep0.get("camera_fx")
+        focal = float(fx) if fx else (ep0["src_w"] / 2.0) / np.tan(np.radians(DEFAULT_HFOV_DEG / 2))
+        cells = dilate_by_envelope(cells, focal, ep0["src_w"] / grid[1], envelope_radius_m)
+        depth[start:start + len(part)] = depth_bands(cells)
+    return prev_index, prev_action, depth, grid
+
+
+def write_aux_sidecar(out_dir, uavr_path, prev_index, prev_action, depth, grid,
+                      envelope_radius_m):
+    """写 <out>/dataset.aux（UAVRAUX1，tmp + rename）；头里绑定 dataset.uavr 的 SHA256。"""
+    n = len(prev_index)
+    with open(uavr_path, "rb") as f:
+        uavr_sha = hashlib.sha256(f.read()).digest()
+    has_depth = depth is not None
+    payload = prev_index.astype("<u4").tobytes() + prev_action.tobytes()
+    if has_depth:
+        payload += depth.tobytes(order="C")
+    header = AUX_HEADER.pack(AUX_MAGIC, n, 1 if has_depth else 0,
+                             grid[0] if has_depth else 0, grid[1] if has_depth else 0,
+                             DEPTH_CLASSES, AUX_UNKNOWN, 0)
+    header += uavr_sha + hashlib.sha256(payload).digest()
+    header += struct.pack("<7f", *DEPTH_BAND_EDGES_M)
+    header += struct.pack("<fI", envelope_radius_m, 0)
+    assert len(header) == AUX_HEADER_SIZE
+    path = os.path.join(out_dir, "dataset.aux")
+    fd, tmp = tempfile.mkstemp(prefix=".dataset.aux.", suffix=".tmp", dir=out_dir)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(header)
+            f.write(payload)
+        os.replace(tmp, path)
+    except OSError as exc:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        die("写 %s 失败：%s" % (path, exc))
+    return path
+
+
 def parse_size(text):
     try:
         w, h = (int(v) for v in text.lower().split("x"))
@@ -698,10 +913,14 @@ def main():
                    help="【跨族合并实验】允许不同几何族（柱阵/森林/3DGS）混包：只放开族身份字段"
                         "（geometry/appearance/split_salt/task_version…），hold_s/window_from/"
                         "dynamics_profile 仍必须一致；meta.geometry_versions 记每族计数与 salt")
+    p.add_argument("--envelope-radius", type=float, default=DEFAULT_ENVELOPE_RADIUS_M,
+                   metavar="M", help="深度分带目标的包络膨胀半径（m），E1 机体 0.102；0 = 不膨胀")
     p.add_argument("episodes", nargs="+", help="一个或多个 collect.py episode 目录")
     args = p.parse_args()
     if args.split_by_map and not args.allow_diagnostic_split:
         p.error("--split-by-map 生成 map-hash:* 诊断划分，需显式 --allow-diagnostic-split")
+    if not (0 <= args.envelope_radius < 10):
+        p.error("--envelope-radius 须在 [0,10) m")
 
     episodes, total, dropped, skipped = scan(
         args.episodes, args.drop_collision, args.exclude_collision_episodes,
@@ -722,10 +941,28 @@ def main():
     stale = os.path.join(args.out, "instructions.jsonl")
     if rows and os.path.exists(stale):
         os.remove(stale)
+    # 侧车先算后写：深度文件坏了要在替换 dataset.uavr 之前报错。旧 dataset.aux 先删——
+    # 它绑定的是旧 uavr 的 SHA，留着只会让读端报「SHA 不匹配」。
+    prev_index, prev_action, depth, grid = aux_payload(episodes, args.size, args.envelope_radius)
+    stale_aux = os.path.join(args.out, "dataset.aux")
+    if os.path.exists(stale_aux):
+        os.remove(stale_aux)
+    aux_info = {"file": "dataset.aux", "format": AUX_MAGIC.decode(), "depth": depth is not None,
+                "depth_grid": list(grid) if depth is not None else None,
+                "band_edges_m": list(DEPTH_BAND_EDGES_M),
+                "envelope_radius_m": args.envelope_radius}
     out_path, meta_bytes = write_dataset(args.out, episodes, total, args.size, dropped,
                                          split_scheme=split_scheme,
                                          collision_filter=collision_filter,
-                                         allow_mixed=args.allow_mixed_geometry)
+                                         allow_mixed=args.allow_mixed_geometry,
+                                         aux_info=aux_info)
+    apath = write_aux_sidecar(args.out, out_path, prev_index, prev_action, depth, grid,
+                              args.envelope_radius)
+    first = int((prev_index == np.arange(len(prev_index), dtype=np.uint32)).sum())
+    print("wrote %s (prev chain: %d first/self frames; depth bands: %s)"
+          % (apath, first, ("%dx%d grid, unknown %.1f%%" % (
+              grid[0], grid[1], 100.0 * float((depth == AUX_UNKNOWN).mean())))
+              if depth is not None else "none"))
     # 3DGS 数据集把 scene.json 放到 <out>/scene.json，自动评测/换机复现不必回找 episode。
     scene_paths = [os.path.join(ep["dir"], "scene.json") for ep in episodes
                    if ep.get("scene_json")]

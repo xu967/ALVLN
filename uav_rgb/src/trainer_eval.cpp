@@ -27,8 +27,9 @@ void Trainer::evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& 
   Confusion conf;
   conf.reset(c);
   const std::size_t b = static_cast<std::size_t>(cfg_.batch);
-  double sum = 0.0;
-  std::uint64_t seen = 0;
+  double sum = 0.0, depth_sum = 0.0;
+  std::uint64_t seen = 0, depth_valid = 0, depth_correct = 0;
+  const bool want_depth = model_.aux_classes > 0 && ds.aux.has_depth;
   for (std::size_t s = 0; s < idx.size(); s += b) {
     const std::size_t e = std::min(idx.size(), s + b);
     const std::vector<std::uint32_t> part = detail::slice(idx, s, e);
@@ -37,6 +38,12 @@ void Trainer::evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& 
     // dev_ce 合同为无权 Teacher CE，不能随训练权重或 batch 划分改变。
     sum += static_cast<double>(softmax_ce_loss_cuda(logits, y)) *
            static_cast<double>(part.size());
+    if (want_depth) {
+      const DeviceCnn::AuxStats a = aux_batch(ds, /*lambda=*/0.0f);  // 只评估，不反向
+      depth_sum += static_cast<double>(a.loss) * static_cast<double>(a.valid);
+      depth_valid += a.valid;
+      depth_correct += a.correct;
+    }
     for (std::size_t i = 0; i < y.size(); ++i) {
       const float* row = logits.data() + i * static_cast<std::size_t>(c);
       int best = 0;
@@ -55,6 +62,10 @@ void Trainer::evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& 
   out->balanced_acc = balanced_accuracy(conf);
   out->recall = per_class_recall(conf);
   out->confusion.assign(conf.cells.begin(), conf.cells.end());
+  if (want_depth && depth_valid > 0) {
+    out->depth_ce = depth_sum / static_cast<double>(depth_valid);
+    out->depth_acc = static_cast<double>(depth_correct) / static_cast<double>(depth_valid);
+  }
 }
 
 void Trainer::eval_only(const std::string& ckpt_path, bool eval_val, bool eval_test) {
@@ -66,12 +77,23 @@ void Trainer::eval_only(const std::string& ckpt_path, bool eval_val, bool eval_t
   // 的指标对不上（碰撞步在两边的去留不同）。
   UavrDataset ds = load_uavr(cfg_.data_path, LoadOptions{cfg_.drop_collision});
   std::filesystem::create_directories(cfg_.out_dir);
-  // 模型结构以 checkpoint 为准；--text-dim 只影响训练，不覆盖 checkpoint 记录的结构。
-  cfg_.text_dim = read_checkpoint_meta(ckpt_path).text_dim;
+  // 模型结构以 checkpoint 为准；--text-dim / --two-frame 等只影响训练，不覆盖 checkpoint 记录。
+  const CheckpointMeta meta = read_checkpoint_meta(ckpt_path);
+  cfg_.text_dim = meta.text_dim;
+  cfg_.two_frame = meta.in_c == 2 * ds.c;
+  cfg_.prev_action = meta.prev_dim > 0;
+  cfg_.depth_aux = meta.aux_classes > 0;
   if (cfg_.text_dim > 0 && ds.text_ids.empty()) {
     throw std::runtime_error("eval_only: checkpoint 有文本分支，但数据集没有 instructions 侧车");
   }
-  model_ = make_cnn(ds.h, ds.w, cfg_.seed, static_cast<int>(ds.num_classes), cfg_.text_dim);
+  if ((cfg_.two_frame || cfg_.prev_action) && !ds.aux.present) {
+    throw std::runtime_error("eval_only: checkpoint 是双帧/prev-action 模型，但数据集没有 dataset.aux 侧车");
+  }
+  if (cfg_.depth_aux && !ds.aux.has_depth) {
+    std::fprintf(stderr, "eval_only: 数据集没有深度目标，只评估动作头（depth_ce/depth_acc 记 -1）\n");
+  }
+  model_ = make_cnn(ds.h, ds.w, cfg_.seed, static_cast<int>(ds.num_classes), cfg_.text_dim,
+                    meta.in_c, meta.aux_classes, meta.prev_dim);
   state_ = make_train_state(model_, cfg_.lr);
   load_checkpoint(ckpt_path, model_, state_);
   dev_ = std::make_unique<DeviceCnn>(model_, cfg_.batch);
@@ -124,7 +146,9 @@ void Trainer::eval_only(const std::string& ckpt_path, bool eval_val, bool eval_t
     for (std::size_t k = 0; k < s.recall.size(); ++k) {
       std::printf("%s%.3f", k ? " " : "", s.recall[k]);
     }
-    std::printf("] n=%zu\n", idx.size());
+    std::printf("] n=%zu", idx.size());
+    if (s.depth_ce >= 0.0) std::printf(" depth_ce=%.4f depth_acc=%.3f", s.depth_ce, s.depth_acc);
+    std::printf("\n");
   };
   if (eval_val) emit(ds.val_idx, Split::kVal, "val");
   if (eval_test) emit(ds.test_idx, Split::kTest, "test");

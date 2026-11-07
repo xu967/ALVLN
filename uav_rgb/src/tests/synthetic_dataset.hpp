@@ -3,12 +3,17 @@
 // 样本 = 纯均匀随机噪声图 + 随机标签。图像与标签之间没有真实规律，模型只能靠记忆拟合，
 // 因此“训练集 loss/准确率上去”只能来自梯度链路真的通了（记忆型过拟合测试）。
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <fstream>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include "uavrgb/sha256.hpp"
 
 namespace uavrgb_test {
 
@@ -18,6 +23,7 @@ struct SynthDataset {
   int c = 3;
   int h = 0;
   int w = 0;
+  std::vector<std::uint8_t> labels;  // 写入的标签（侧车夹具据此推 prev_action）
 };
 
 inline void put_u16(std::ostream& f, std::uint16_t v) {
@@ -96,7 +102,7 @@ inline SynthDataset write_synthetic_uavr(const std::string& path, int n, int h, 
           static_cast<std::streamsize>(labels.size()));
   f.write(meta.data(), static_cast<std::streamsize>(meta.size()));
   if (!f) throw std::runtime_error("write_synthetic_uavr: 写入失败 " + path);
-  return SynthDataset{path, n, 3, h, w};
+  return SynthDataset{path, n, 3, h, w, labels};
 }
 
 // 类别条件合成集（不平衡实验/碰撞过滤测试用）：
@@ -187,7 +193,69 @@ inline SynthDataset write_class_conditional_uavr(
           static_cast<std::streamsize>(lab.size()));
   f.write(meta.data(), static_cast<std::streamsize>(meta.size()));
   if (!f) throw std::runtime_error("write_class_conditional_uavr: 写入失败 " + path);
-  return SynthDataset{path, total, 3, h, w};
+  return SynthDataset{path, total, 3, h, w, lab};
+}
+
+// UAVRAUX1 侧车（tools/DATASET_FORMAT.md §6；与 preprocess.write_aux_sidecar 同一布局），
+// 写到 uavr 同名 .aux。prev 链按 episodes（start,count）推：每集首帧指向自身、prev=SAFE，
+// 其余指向 i-1、prev = labels[i-1]（合成集把标签当作执行的动作）。
+// with_depth 时每格目标 = 该样本的标签（类别条件数据集上可由局部亮度学出，过拟合测试据此验证
+// 辅助头真的在学），(i + r*3 + c) % 7 == 0 的格写 255（未知，覆盖损失屏蔽路径）。
+// 两个 SHA256 用库里的 uavrgb::sha256（所有测试都链接 uavrgb_core）。
+inline std::string write_synthetic_aux(const std::string& uavr_path, int n, int h, int w,
+                                       const std::vector<std::pair<int, int>>& episodes,
+                                       const std::vector<std::uint8_t>& labels, bool with_depth) {
+  if (static_cast<int>(labels.size()) != n) throw std::invalid_argument("write_synthetic_aux: labels");
+  const uavrgb::Sha256 uavr_sha = uavrgb::sha256_file(uavr_path);
+  const int dh = h / 8, dw = w / 8;
+  std::vector<std::uint8_t> payload;
+  std::vector<std::uint32_t> prev_index(static_cast<std::size_t>(n));
+  std::vector<std::uint8_t> prev_action(static_cast<std::size_t>(n), 0);
+  for (std::size_t i = 0; i < prev_index.size(); ++i) prev_index[i] = static_cast<std::uint32_t>(i);
+  for (const auto& [start, count] : episodes) {
+    for (int i = start + 1; i < start + count; ++i) {
+      prev_index[static_cast<std::size_t>(i)] = static_cast<std::uint32_t>(i - 1);
+      prev_action[static_cast<std::size_t>(i)] = labels[static_cast<std::size_t>(i - 1)];
+    }
+  }
+  for (std::uint32_t v : prev_index) {
+    for (int b = 0; b < 4; ++b) payload.push_back(static_cast<std::uint8_t>((v >> (8 * b)) & 0xff));
+  }
+  payload.insert(payload.end(), prev_action.begin(), prev_action.end());
+  if (with_depth) {
+    for (int i = 0; i < n; ++i) {
+      for (int r = 0; r < dh; ++r) {
+        for (int c = 0; c < dw; ++c) {
+          const bool unknown = (i + r * 3 + c) % 7 == 0;
+          payload.push_back(unknown ? std::uint8_t{255} : labels[static_cast<std::size_t>(i)]);
+        }
+      }
+    }
+  }
+  std::string payload_str(payload.begin(), payload.end());
+  std::istringstream payload_in(payload_str);
+  const uavrgb::Sha256 psha = uavrgb::sha256(payload_in);
+  std::string path = uavr_path.substr(0, uavr_path.rfind('.')) + ".aux";
+  std::ofstream f(path, std::ios::binary | std::ios::trunc);
+  if (!f) throw std::runtime_error("write_synthetic_aux: 无法写 " + path);
+  f.write("UAVRAUX1", 8);
+  put_u64(f, static_cast<std::uint64_t>(n));
+  put_u32(f, with_depth ? 1u : 0u);
+  put_u16(f, static_cast<std::uint16_t>(with_depth ? dh : 0));
+  put_u16(f, static_cast<std::uint16_t>(with_depth ? dw : 0));
+  f.put(8);
+  f.put(static_cast<char>(255));
+  put_u16(f, 0);
+  f.write(reinterpret_cast<const char*>(uavr_sha.data()), 32);
+  f.write(reinterpret_cast<const char*>(psha.data()), 32);
+  const float edges[7] = {0.3f, 0.5f, 0.8f, 1.2f, 1.8f, 2.5f, 4.0f};
+  f.write(reinterpret_cast<const char*>(edges), sizeof edges);
+  const float r_env = 0.102f;
+  f.write(reinterpret_cast<const char*>(&r_env), 4);
+  put_u32(f, 0);
+  f.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
+  if (!f) throw std::runtime_error("write_synthetic_aux: 写入失败 " + path);
+  return path;
 }
 
 }  // namespace uavrgb_test

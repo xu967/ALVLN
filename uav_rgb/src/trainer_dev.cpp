@@ -17,22 +17,49 @@
 namespace uavrgb {
 namespace {
 
-// 读一批 NCHW uint8 样本；偏移公式与 UavrDataset::load_images 相同，只是不转 float。
+// 读一个样本的 CHW uint8 平面到 dst；偏移公式与 UavrDataset::load_images 相同，只是不转 float。
 // 长度不足即报错：截断文件不允许静默当成零填充。
-void read_u8_batch(const UavrDataset& ds, const std::vector<std::uint32_t>& idx,
+void read_u8_plane(const UavrDataset& ds, std::uint32_t idx, std::uint8_t* dst) {
+  const std::size_t plane = static_cast<std::size_t>(ds.c) * ds.h * ds.w;
+  if (idx >= static_cast<std::uint32_t>(ds.n)) throw std::runtime_error("UAVR: 样本下标越界");
+  ds.file.clear();
+  ds.file.seekg(static_cast<std::streamoff>(ds.images_off + static_cast<std::uint64_t>(idx) * plane));
+  if (!ds.file) throw std::runtime_error("UAVR: seek 失败: 图像区");
+  ds.file.read(reinterpret_cast<char*>(dst), static_cast<std::streamsize>(plane));
+  if (static_cast<std::size_t>(ds.file.gcount()) != plane) {
+    throw std::runtime_error("UAVR: 读取不足: 图像区");
+  }
+}
+
+// 一批样本：单帧 [N,3,H,W]；双帧 [N,6,H,W]，通道 3..5 是侧车 prev_index 指向的上一帧
+// （首帧指向自身 = 「复制并标记」）。文件里图像仍是 3 通道，上一帧现读，不占两倍磁盘。
+void read_u8_batch(const UavrDataset& ds, const std::vector<std::uint32_t>& idx, bool two_frame,
                    std::vector<std::uint8_t>& out) {
   const std::size_t plane = static_cast<std::size_t>(ds.c) * ds.h * ds.w;
-  out.resize(idx.size() * plane);
+  const std::size_t stride = two_frame ? 2 * plane : plane;
+  out.resize(idx.size() * stride);
   for (std::size_t i = 0; i < idx.size(); ++i) {
-    if (idx[i] >= static_cast<std::uint32_t>(ds.n)) throw std::runtime_error("UAVR: 样本下标越界");
-    ds.file.clear();
-    ds.file.seekg(static_cast<std::streamoff>(ds.images_off +
-                                              static_cast<std::uint64_t>(idx[i]) * plane));
-    if (!ds.file) throw std::runtime_error("UAVR: seek 失败: 图像区");
-    ds.file.read(reinterpret_cast<char*>(out.data() + i * plane),
-                 static_cast<std::streamsize>(plane));
-    if (static_cast<std::size_t>(ds.file.gcount()) != plane) {
-      throw std::runtime_error("UAVR: 读取不足: 图像区");
+    read_u8_plane(ds, idx[i], out.data() + i * stride);
+    if (two_frame) read_u8_plane(ds, ds.aux.prev_index.at(idx[i]), out.data() + i * stride + plane);
+  }
+}
+
+// 翻转样本：prev-action 的左右互换（与标签同一条规则）、深度目标按列镜像。
+void flip_side_inputs(const std::vector<dev::AugParams>& aug, std::vector<std::uint8_t>* prev,
+                      std::vector<std::uint8_t>* depth, int dh, int dw) {
+  for (std::size_t i = 0; i < aug.size(); ++i) {
+    if (!aug[i].flip) continue;
+    if (prev) {
+      std::uint8_t& a = (*prev)[i];
+      if (a == static_cast<std::uint8_t>(Action::YAW_LEFT)) {
+        a = static_cast<std::uint8_t>(Action::YAW_RIGHT);
+      } else if (a == static_cast<std::uint8_t>(Action::YAW_RIGHT)) {
+        a = static_cast<std::uint8_t>(Action::YAW_LEFT);
+      }
+    }
+    for (int r = 0; depth && r < dh; ++r) {
+      std::uint8_t* row = depth->data() + (i * dh + r) * dw;
+      std::reverse(row, row + dw);
     }
   }
 }
@@ -75,19 +102,53 @@ std::vector<dev::AugParams> make_aug(std::mt19937& rng, const std::string& spec,
 Tensor Trainer::forward_batch(const UavrDataset& ds, const std::vector<std::uint32_t>& part,
                               std::vector<int>* train_labels) {
   if (!dev_) throw std::logic_error("trainer: DeviceCnn 未初始化");
-  read_u8_batch(ds, part, u8_batch_);
+  const bool two_frame = model_.c1.in == 2 * ds.c;
+  if ((two_frame || model_.prev_dim > 0) && !ds.aux.present) {
+    throw std::runtime_error("trainer: 双帧/prev-action 模型需要 dataset.aux 侧车");
+  }
+  read_u8_batch(ds, part, two_frame, u8_batch_);
   std::vector<std::uint8_t> text;
   if (model_.text_dim > 0) ds.load_text(part, text);
+  std::vector<std::uint8_t> prev;
+  if (model_.prev_dim > 0) {
+    for (std::uint32_t i : part) prev.push_back(ds.aux.prev_action.at(i));
+  }
+  const bool want_depth = model_.aux_classes > 0 && ds.aux.has_depth;
+  const std::size_t cells = static_cast<std::size_t>(ds.aux.depth_h) * ds.aux.depth_w;
+  depth_batch_.clear();
+  if (want_depth) {
+    depth_batch_.resize(part.size() * cells);
+    for (std::size_t i = 0; i < part.size(); ++i) {
+      std::copy_n(ds.aux.depth.begin() + static_cast<std::ptrdiff_t>(part[i] * cells), cells,
+                  depth_batch_.begin() + static_cast<std::ptrdiff_t>(i * cells));
+    }
+  }
   std::vector<dev::AugParams> aug;
   if (train_labels && !cfg_.augment.empty()) {
     if (train_labels->size() != part.size()) throw std::logic_error("trainer: 标签数与批大小不符");
     // 翻转后教师分布的左右也该互换，软标签按样本下标 gather 做不到，故不允许同开。
     if (!cfg_.soft_targets.empty()) throw std::invalid_argument("trainer: --augment 与 --soft-targets 不能同时开");
     aug = make_aug(aug_rng_, cfg_.augment, /*allow_flip=*/model_.text_dim == 0, *train_labels);
+    // shortcut: shift（±4 px ≈ 半个 16 px 格）不平移深度目标，亚格错位先接受；
+    // 升级点是按 dx/dy 平移目标并把移入的边缘格置 255。
+    flip_side_inputs(aug, prev.empty() ? nullptr : &prev, want_depth ? &depth_batch_ : nullptr,
+                     ds.aux.depth_h, ds.aux.depth_w);
   }
   return dev_->forward(u8_batch_.data(), static_cast<int>(part.size()),
                        model_.text_dim > 0 ? text.data() : nullptr,
-                       aug.empty() ? nullptr : aug.data());
+                       aug.empty() ? nullptr : aug.data(), prev.empty() ? nullptr : prev.data());
+}
+
+DeviceCnn::AuxStats Trainer::aux_batch(const UavrDataset& ds, float lambda) {
+  if (model_.aux_classes == 0 || !ds.aux.has_depth) return {};
+  if (depth_batch_.empty()) throw std::logic_error("trainer: aux_batch 必须紧跟 forward_batch");
+  return dev_->aux_loss(depth_batch_.data(), lambda);
+}
+
+CnnModel Trainer::build_model(const UavrDataset& ds) const {
+  const int classes = static_cast<int>(ds.num_classes);
+  return make_cnn(ds.h, ds.w, cfg_.seed, classes, cfg_.text_dim, cfg_.two_frame ? 2 * ds.c : ds.c,
+                  cfg_.depth_aux ? ds.aux.depth_classes : 0, cfg_.prev_action ? classes : 0);
 }
 
 float Trainer::step_lr(std::uint32_t step, std::uint32_t total_steps) {

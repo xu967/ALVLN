@@ -60,6 +60,13 @@ struct TrainConfig {
   bool cosine_lr = false;        // warmup 之后余弦退火到 0
   float weight_decay = 0.0f;     // AdamW 解耦权重衰减（0 = 原 Adam）
   float label_smoothing = 0.0f;  // 标签平滑 ε（与类别权重叠加；与蒸馏互斥，蒸馏优先）
+  // STUDENT-P2（都需要 dataset.aux 侧车；旧数据集没有侧车时这些开关直接报错，不静默降级）：
+  bool two_frame = false;    // 输入 6 通道 [I_t ; I_{t-1}]（上一帧按侧车 prev_index 读）
+  bool prev_action = false;  // 上一步执行的动作 one-hot 经 FiLM 进第三层
+  bool depth_aux = false;    // 1x1 深度分带辅助头，总损失 L = L_action + aux_lambda·L_depth
+  float aux_lambda = 0.5f;
+  bool two_frame_set = false, prev_action_set = false, depth_aux_set = false,
+       aux_lambda_set = false;
   // 以下由 trainer 在 run() 里按实际数据/环境补齐，再落进 config.json。
   std::string dataset_sha256, split_scheme, window_from, hold_s;
   std::string soft_targets_sha256, teacher_ckpt_sha256, teacher_select_split, source_git;
@@ -80,6 +87,10 @@ struct RunConfigSnapshot {
   int text_dim = 0;
   bool vision_only = false;
   std::string dataset_sha256;
+  bool has_two_frame = false, has_prev_action = false, has_depth_aux = false,
+       has_aux_lambda = false;
+  bool two_frame = false, prev_action = false, depth_aux = false;
+  float aux_lambda = 0.0f;
 };
 bool read_run_config(const std::string& run_dir, RunConfigSnapshot* out);
 
@@ -105,6 +116,10 @@ struct EvalStats {
   double balanced_acc = 0.0;
   std::vector<double> recall;
   std::vector<std::uint32_t> confusion;  // C×C 行优先，行 = 真值，列 = 预测
+  // 深度分带辅助头（模型有辅助头且数据集带深度目标时才有）：有效格平均 CE 与 argmax 命中率；
+  // 没有时都是 -1。
+  double depth_ce = -1.0;
+  double depth_acc = -1.0;
 };
 
 class Trainer {
@@ -133,11 +148,17 @@ class Trainer {
   void write_csv_header_if_needed() const;
   // 在 idx 上评估，结果写进 out。
   void evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& idx, EvalStats* out);
-  // 以下三个在 trainer_dev.cpp。
-  // 读 part 这批样本（uint8 + token）并在 dev_ 上前向，返回 host logits。train_labels 非空
-  // 表示训练批：cfg_.augment 非空时做增强，翻转样本的左右偏航标签就地互换。
+  // 以下在 trainer_dev.cpp。
+  // 读 part 这批样本（uint8 + token + 双帧的上一帧 + prev-action）并在 dev_ 上前向，返回 host
+  // logits。train_labels 非空表示训练批：cfg_.augment 非空时做增强，翻转样本的左右偏航标签
+  // （和 prev-action）就地互换、深度目标按列镜像。本批深度目标留在 depth_batch_ 给 aux_loss。
   Tensor forward_batch(const UavrDataset& ds, const std::vector<std::uint32_t>& part,
                        std::vector<int>* train_labels = nullptr);
+  // 模型有辅助头且数据集带深度目标时，对最近一次 forward_batch 的批算辅助损失（lambda 为
+  // 反向时的权重；评估传 0）；否则返回 valid=0。
+  DeviceCnn::AuxStats aux_batch(const UavrDataset& ds, float lambda);
+  // 按 cfg_/数据集结构建模型（in_c / prev_dim / aux_classes 都在这里决定）。
+  CnnModel build_model(const UavrDataset& ds) const;
   // 按 warmup/余弦日程算第 step 步（1 起）的 lr，写进 state_.adam[*].lr 并返回。
   float step_lr(std::uint32_t step, std::uint32_t total_steps);
   // 训练 loss 与 dlogits：蒸馏 > 标签平滑(+类别权重) > 类别权重/无权。
@@ -149,6 +170,7 @@ class Trainer {
   TrainState state_;
   std::unique_ptr<DeviceCnn> dev_;    // 权重/Adam/激活常驻显存；存 checkpoint 前 download
   std::vector<std::uint8_t> u8_batch_;  // forward_batch 复用的像素缓冲
+  std::vector<std::uint8_t> depth_batch_;  // 最近一批的深度分带目标（已按翻转镜像）
   std::mt19937 aug_rng_{0x9e3779b9u};   // 增强专用，与打乱顺序的 rng 分开，A/B 时样本顺序不变
   std::vector<float> class_weights_;          // 最终生效权重（同时写进 state_/checkpoint）
   std::string class_weights_source_ = "none";  // "none"/"auto"/"explicit"/"checkpoint"

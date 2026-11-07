@@ -2,6 +2,7 @@
 // UAVR 二进制数据集读取（格式见 tools/DATASET_FORMAT.md v1，只读，不引入第三方库）。
 // H/W/C 一律从 48 B 文件头读，不假定 160x120；train/val/test 划分取 meta JSON 的
 // episodes[].sample_start/sample_count/split（按 scene_id 隔离，不按帧随机拆）。
+#include "uavrgb/aux_sidecar.hpp"
 #include "uavrgb/tensor.hpp"
 #include "uavrgb/text.hpp"  // kTextLen
 
@@ -38,6 +39,8 @@ struct UavrDataset {
   // 语言侧车 instructions.jsonl 里的 token id，展开后 [n * kTextLen]，缺位补 <pad>(0)。
   // 没有侧车时为空——此时只能训练无文本模型。
   std::vector<std::uint8_t> text_ids;
+  // UAVRAUX1 侧车（dataset.aux）：上一帧下标 / prev-action / 深度分带目标；没有时 present=false。
+  AuxSidecar aux;
   std::vector<std::uint32_t> train_idx;     // 全局样本下标
   std::vector<std::uint32_t> val_idx;
   std::vector<std::uint32_t> test_idx;

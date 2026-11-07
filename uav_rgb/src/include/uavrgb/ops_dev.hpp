@@ -49,4 +49,12 @@ void adam_step(float* p, const float* g, float* m, float* v, float lr, float b1,
 void sumsq(const float* x, double* accum, int total);  // accum 由调用方清零
 void scale(float* x, float coef, int total);
 
+// 逐格 softmax-CE（spatial_ce_cuda.cu；口径见 ops.hpp 的 spatial_ce_*）：
+// logits[n,k,hw]、targets[n*hw]（255 = 屏蔽）。grad 非空时写 scale·(p − onehot)（屏蔽格 0）；
+// loss 非空时把 Σ_valid CE 原子累加进去（调用方清零、自行除以有效格数）；
+// correct 非空时累加 argmax 命中格数。三个输出指针都可为空。
+void spatial_ce(const float* logits, const std::uint8_t* targets, int n, int k, int hw, float scale,
+                float* grad, double* loss, unsigned long long* correct);
+void add_inplace(float* y, const float* x, int total);  // y += x
+
 }  // namespace uavrgb::dev

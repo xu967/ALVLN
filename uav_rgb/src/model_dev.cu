@@ -1,5 +1,6 @@
-// 设备常驻 CNN（见 model_dev.hpp）。只有 uint8→float、文本 embedding 查表/散射、FiLM 调制
-// 这几个 kernel 在本文件；卷积/池化/线性/Adam/范数全部走 ops_dev.hpp，与 host 路径同一份代码。
+// 设备常驻 CNN（见 model_dev.hpp）。本文件只有分配/上传下载/前向/反向主干；FiLM 条件分支在
+// model_dev_film.cu，深度分带辅助头在 model_dev_aux.cu；卷积/池化/线性/Adam/范数全部走
+// ops_dev.hpp，与 host 路径同一份代码。
 // 全部在默认流上；forward 末尾的 logits D2H 和 backward_step 里的范数 D2H 是仅有的两个同步点。
 #include "uavrgb/model_dev.hpp"
 
@@ -17,86 +18,13 @@
 namespace uavrgb {
 namespace {
 
-constexpr int kThreads = 256;
 constexpr int kPoolK = 2;  // 与 model.cpp 的 kPool(2, 2) 一致
-int blocks_for(std::size_t total) { return static_cast<int>((total + kThreads - 1) / kThreads); }
 
 dev::ConvShape conv_shape(const DeviceCnn::LayerDims& L, int n) {
   return dev::ConvShape{n, L.c_in, L.h, L.w, L.c_out, L.kh, L.kw, L.pad, L.oh, L.ow};
 }
 dev::PoolShape pool_shape(const DeviceCnn::LayerDims& L, int n) {
   return dev::PoolShape{n, L.c_out, L.oh, L.ow, kPoolK, kPoolK, L.ph, L.pw};
-}
-
-// text_feat[n, kTextLen*text_dim]：<pad>(0) 与越界 id 的槽位置 0（与 model.cpp 一致）。
-__global__ void text_gather_kernel(const std::uint8_t* __restrict__ ids,
-                                   const float* __restrict__ emb, float* __restrict__ feat,
-                                   int text_dim, int total) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= total) return;
-  const int id = ids[i / text_dim];
-  feat[i] = (id == 0 || id >= kTextVocab) ? 0.0f : emb[id * text_dim + i % text_dim];
-}
-
-// demb[id, d] = Σ_{t: ids[t]==id} dfeat[t, d]：每线程一个 (id, d)，按 token 顺序扫一遍
-// （原子加版本求和顺序随机，同 seed 训练不可逐位复现）。<pad>=0 的行恒为 0。
-__global__ void text_demb_kernel(const std::uint8_t* __restrict__ ids,
-                                 const float* __restrict__ dfeat, float* __restrict__ demb,
-                                 int tokens, int text_dim) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= kTextVocab * text_dim) return;
-  const int id = i / text_dim, d = i % text_dim;
-  float acc = 0.0f;
-  for (int t = 0; id != 0 && t < tokens; ++t) {
-    if (ids[t] == id) acc += dfeat[t * text_dim + d];
-  }
-  demb[i] = acc;
-}
-
-// y' = (1+γ)·y + β。用 __fmul_rn/__fadd_rn 禁止 nvcc 合并成 FMA，保持与 CPU 路径逐位一致。
-__global__ void film_forward_kernel(const float* __restrict__ y, const float* __restrict__ film,
-                                    float* __restrict__ out, int channels, int hw, int total) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= total) return;
-  const int nc = i / hw;
-  const int s = nc / channels, c = nc % channels;
-  const float gamma = film[s * 2 * channels + c];
-  const float beta = film[s * 2 * channels + channels + c];
-  out[i] = __fadd_rn(__fmul_rn(1.0f + gamma, y[i]), beta);
-}
-
-// 每 block 一个 (sample, c)：dγ = Σ dy'·y、dβ = Σ dy'（double 累加，同 CPU 路径），
-// 然后把 dy' 原地改写成 dy = dy'·(1+γ)。
-__global__ void film_backward_kernel(float* __restrict__ d, const float* __restrict__ y,
-                                     const float* __restrict__ film, float* __restrict__ dfilm,
-                                     int channels, int hw) {
-  __shared__ double sg[kThreads];
-  __shared__ double sb[kThreads];
-  const int nc = blockIdx.x;
-  const int s = nc / channels, c = nc % channels;
-  const float gamma = film[s * 2 * channels + c];
-  float* dp = d + static_cast<std::size_t>(nc) * hw;
-  const float* yp = y + static_cast<std::size_t>(nc) * hw;
-  double g = 0.0, b = 0.0;
-  for (int k = threadIdx.x; k < hw; k += blockDim.x) {
-    g += static_cast<double>(dp[k]) * yp[k];
-    b += dp[k];
-  }
-  sg[threadIdx.x] = g;
-  sb[threadIdx.x] = b;
-  __syncthreads();
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (threadIdx.x < stride) {
-      sg[threadIdx.x] += sg[threadIdx.x + stride];
-      sb[threadIdx.x] += sb[threadIdx.x + stride];
-    }
-    __syncthreads();
-  }
-  if (threadIdx.x == 0) {
-    dfilm[s * 2 * channels + c] = static_cast<float>(sg[0]);
-    dfilm[s * 2 * channels + channels + c] = static_cast<float>(sb[0]);
-  }
-  for (int k = threadIdx.x; k < hw; k += blockDim.x) dp[k] = dp[k] * (1.0f + gamma);
 }
 
 }  // namespace
@@ -109,6 +37,11 @@ T* DeviceCnn::alloc(std::size_t count) {
   owned_.push_back(p);
   return static_cast<T*>(p);
 }
+// model_dev_aux.cu 也用这几个实例化（模板定义只在本文件）。
+template float* DeviceCnn::alloc<float>(std::size_t);
+template double* DeviceCnn::alloc<double>(std::size_t);
+template std::uint8_t* DeviceCnn::alloc<std::uint8_t>(std::size_t);
+template unsigned long long* DeviceCnn::alloc<unsigned long long>(std::size_t);
 
 DeviceCnn::DeviceCnn(const CnnModel& model, int max_batch, const TrainState* state)
     : max_batch_(max_batch),
@@ -116,7 +49,11 @@ DeviceCnn::DeviceCnn(const CnnModel& model, int max_batch, const TrainState* sta
       h_(model.in_h),
       w_(model.in_w),
       text_dim_(model.text_dim),
-      num_classes_(model.fc.out) {
+      num_classes_(model.fc.out),
+      prev_dim_(model.prev_dim),
+      cond_dim_(cond_dim(model)),
+      aux_classes_(model.aux_classes),
+      has_film_(has_film(model)) {
   if (max_batch <= 0) throw std::invalid_argument("DeviceCnn: max_batch 必须为正");
   // 形状推导与 host 路径（conv stride 1 / pool 2,2）一致，最后用 fc.in 反查一次。
   int h = h_, w = w_, cin = in_c_;
@@ -135,12 +72,24 @@ DeviceCnn::DeviceCnn(const CnnModel& model, int max_batch, const TrainState* sta
   if (model.fc.in != cin * h * w) {
     throw std::invalid_argument("DeviceCnn: fc 输入维度与卷积输出不符");
   }
-  if (text_dim_ > 0 && (model.film.in != kTextLen * text_dim_ || model.film.out != 2 * cin)) {
-    throw std::invalid_argument("DeviceCnn: film 层维度与 text_dim/c3.out 不符");
+  if (has_film_ && (model.film.in != cond_dim_ || model.film.out != 2 * cin)) {
+    throw std::invalid_argument("DeviceCnn: film 层维度与 text_dim/prev_dim/c3.out 不符");
+  }
+  if (aux_classes_ > 0 && (model.aux.in != cin || model.aux.out != aux_classes_ ||
+                           model.aux.kh != 1 || model.aux.kw != 1 || model.aux.pad != 0)) {
+    throw std::invalid_argument("DeviceCnn: 辅助头须为 c3.out -> aux_classes 的 1x1 卷积");
   }
   for (const Tensor* t : cnn_params(model)) {
     seg_.push_back(Seg{total_params_, t->numel()});
     total_params_ += t->numel();
+  }
+  // 可选段的下标按 cnn_params 的追加顺序推：8 个固定参数之后依次是 emb、film(W,b)、aux(W,b)。
+  int next = 8;
+  if (text_dim_ > 0) seg_emb_ = next++;
+  if (has_film_) seg_film_ = next, next += 2;
+  if (aux_classes_ > 0) seg_aux_ = next, next += 2;
+  if (static_cast<std::size_t>(next) != seg_.size()) {
+    throw std::logic_error("DeviceCnn: 参数段数与 cnn_params 不一致");
   }
   if (total_params_ > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     throw std::invalid_argument("DeviceCnn: 参数量超出 int 范围");
@@ -170,16 +119,17 @@ DeviceCnn::DeviceCnn(const CnnModel& model, int max_batch, const TrainState* sta
     *d_pool[l] = alloc<float>(pool_n);
     ws_[l] = alloc<float>(dev::conv2d_backward_workspace(conv_shape(L, max_batch_)));
   }
-  const std::size_t tfeat = static_cast<std::size_t>(kTextLen) * text_dim_;
   text_u8_ = alloc<std::uint8_t>(nb * kTextLen);
-  text_feat_ = alloc<float>(nb * tfeat);
-  dtext_feat_ = alloc<float>(nb * tfeat);
+  prev_u8_ = alloc<std::uint8_t>(nb);
+  cond_ = alloc<float>(nb * cond_dim_);
+  dcond_ = alloc<float>(nb * cond_dim_);
   film_out_ = alloc<float>(nb * 2 * cin);
   dfilm_ = alloc<float>(nb * 2 * cin);
-  p3mod_ = alloc<float>(text_dim_ > 0 ? nb * model.fc.in : 0);
+  p3mod_ = alloc<float>(has_film_ ? nb * model.fc.in : 0);
   logits_ = alloc<float>(nb * num_classes_);
   dlogits_ = alloc<float>(nb * num_classes_);
   d_sumsq_ = alloc<double>(1);
+  if (aux_classes_ > 0) alloc_aux(model);
   upload(model, state);
 }
 
@@ -228,46 +178,25 @@ void DeviceCnn::download(CnnModel& model, TrainState* state) const {
   }
 }
 
-void DeviceCnn::film_forward(int n) {
-  const LayerDims& L = layer_[2];
-  const int tfeat = kTextLen * text_dim_;
-  const int total = n * tfeat;
-  text_gather_kernel<<<blocks_for(total), kThreads>>>(text_u8_, params_ + seg_[8].off, text_feat_,
-                                                      text_dim_, total);
-  launched("text_gather_kernel");
-  dev::linear_forward(n, tfeat, 2 * L.c_out, text_feat_, params_ + seg_[9].off,
-                      params_ + seg_[10].off, film_out_);
-  const int hw = L.ph * L.pw;
-  const int tot = n * L.c_out * hw;
-  film_forward_kernel<<<blocks_for(tot), kThreads>>>(p3_, film_out_, p3mod_, L.c_out, hw, tot);
-  launched("film_forward_kernel");
-}
-
-void DeviceCnn::film_backward(int n) {
-  const LayerDims& L = layer_[2];
-  film_backward_kernel<<<n * L.c_out, kThreads>>>(dflat_, p3_, film_out_, dfilm_, L.c_out,
-                                                  L.ph * L.pw);
-  launched("film_backward_kernel");
-  const int tfeat = kTextLen * text_dim_;
-  dev::linear_backward(n, tfeat, 2 * L.c_out, text_feat_, params_ + seg_[9].off, dfilm_,
-                       grads_ + seg_[9].off, grads_ + seg_[10].off, dtext_feat_);
-  text_demb_kernel<<<blocks_for(seg_[8].len), kThreads>>>(text_u8_, dtext_feat_,
-                                                          grads_ + seg_[8].off, n * kTextLen,
-                                                          text_dim_);
-  launched("text_demb_kernel");
-}
-
 Tensor DeviceCnn::forward(const std::uint8_t* images, int n, const std::uint8_t* text,
-                          const dev::AugParams* aug) {
+                          const dev::AugParams* aug, const std::uint8_t* prev) {
   if (n <= 0 || n > max_batch_) {
     throw std::invalid_argument("DeviceCnn::forward: batch 必须在 1..max_batch 内");
   }
   if ((text_dim_ > 0) != (text != nullptr)) {
     throw std::invalid_argument("DeviceCnn::forward: 有文本分支必须传 text，无文本分支不能传");
   }
+  if ((prev_dim_ > 0) != (prev != nullptr)) {
+    throw std::invalid_argument("DeviceCnn::forward: 接 prev-action 的模型必须传 prev，否则不能传");
+  }
+  for (int i = 0; prev && i < n; ++i) {
+    if (prev[i] >= prev_dim_) throw std::invalid_argument("DeviceCnn::forward: prev-action id 越界");
+  }
   n_ = 0;
+  aux_pending_ = false;
   const std::size_t img = static_cast<std::size_t>(n) * in_c_ * h_ * w_;
   CUDA_CHECK(cudaMemcpy(x_u8_, images, img, cudaMemcpyHostToDevice));
+  if (prev) CUDA_CHECK(cudaMemcpy(prev_u8_, prev, static_cast<std::size_t>(n), cudaMemcpyHostToDevice));
   if (aug) CUDA_CHECK(cudaMemcpy(aug_, aug, n * sizeof(dev::AugParams), cudaMemcpyHostToDevice));
   dev::u8_to_float(x_u8_, x_, aug ? aug_ : nullptr, n, in_c_, h_, w_);
   const float* in = x_;
@@ -285,6 +214,8 @@ Tensor DeviceCnn::forward(const std::uint8_t* images, int n, const std::uint8_t*
   if (text_dim_ > 0) {
     CUDA_CHECK(cudaMemcpy(text_u8_, text, static_cast<std::size_t>(n) * kTextLen,
                           cudaMemcpyHostToDevice));
+  }
+  if (has_film_) {
     film_forward(n);
     in = p3mod_;
   }
@@ -311,10 +242,11 @@ float DeviceCnn::backward_step(const Tensor& dlogits, float max_grad_norm, Train
   CUDA_CHECK(cudaMemcpy(dlogits_, dlogits.data(), dlogits.numel() * sizeof(float),
                         cudaMemcpyHostToDevice));
   const LayerDims& L3 = layer_[2];
-  dev::linear_backward(n, L3.c_out * L3.ph * L3.pw, num_classes_, text_dim_ > 0 ? p3mod_ : p3_,
+  dev::linear_backward(n, L3.c_out * L3.ph * L3.pw, num_classes_, fc_input(),
                        params_ + seg_[6].off, dlogits_, grads_ + seg_[6].off,
                        grads_ + seg_[7].off, dflat_);
-  if (text_dim_ > 0) film_backward(n);  // dflat_ 原地变成对 p3 的梯度
+  if (aux_classes_ > 0) aux_backward(n);  // 辅助头对同一份特征的梯度叠进 dflat_
+  if (has_film_) film_backward(n);        // dflat_ 原地变成对 p3 的梯度
   float* d_in = dflat_;
   float* conv_out[3] = {c1_, c2_, c3_};
   float* pool_arg[3] = {arg1_, arg2_, arg3_};

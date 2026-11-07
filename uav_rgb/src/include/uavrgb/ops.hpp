@@ -4,6 +4,7 @@
 #include "uavrgb/tensor.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -78,6 +79,18 @@ float softmax_ce_loss_soft(const Tensor& logits, const std::vector<int>& labels,
                            const std::vector<float>& q, float alpha);
 Tensor softmax_ce_grad_soft(const Tensor& logits, const std::vector<int>& labels,
                             const std::vector<float>& q, float alpha);
+
+// 逐格 softmax 交叉熵（深度分带辅助头，ops_spatial.cpp）：logits[N,K,H,W]（通道在 H*W 之前，
+// 与卷积输出同布局），targets[N*H*W] 取 0..K-1，kSpatialIgnore 表示该格未知、不参与损失：
+//   L = Σ_{有效格} -log p[target] / n_valid；dlogits = (p - 1[k==target]) / n_valid，屏蔽格全 0。
+// 全部屏蔽（n_valid=0）时 loss=0、grad=0，不产生 NaN；valid_out 非空时写回 n_valid。
+inline constexpr std::uint8_t kSpatialIgnore = 255;
+float spatial_ce_loss(const Tensor& logits, const std::vector<std::uint8_t>& targets,
+                      std::size_t* valid_out = nullptr);
+Tensor spatial_ce_grad(const Tensor& logits, const std::vector<std::uint8_t>& targets);
+// FP64 中心差分：逐个 logit 扰动比对解析梯度，返回 max abs 误差（屏蔽格的解析梯度须为 0）。
+double gradcheck_spatial_ce(const Tensor& logits, const std::vector<std::uint8_t>& targets,
+                            double eps = 1e-5);
 
 // FP64 有限差分 gradcheck：对 Linear 的每个权重/偏置扰动，返回 max abs 误差。
 double gradcheck_linear(const Linear& m, const Tensor& x, const std::vector<int>& labels,

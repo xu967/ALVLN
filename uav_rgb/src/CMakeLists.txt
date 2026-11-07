@@ -16,6 +16,7 @@ add_library(uavrgb_core
   ops_cpu.cpp
   ops_weighted.cpp
   ops_soft.cpp
+  ops_spatial.cpp
   sha256.cpp
   soft_targets.cpp
   conv_cpu.cpp
@@ -24,11 +25,15 @@ add_library(uavrgb_core
   linear_cuda.cu
   conv_cuda.cu
   softmax_cuda.cu
+  spatial_ce_cuda.cu
   nn_cuda.cu
   model.cpp
   model_dev.cu
+  model_dev_film.cu
+  model_dev_aux.cu
   augment_dev.cu
   dataset.cpp
+  aux_sidecar.cpp
   batch_reader.cpp
   run_owner.cpp
   checkpoint.cpp
@@ -177,6 +182,19 @@ add_executable(test_batch_reader tests/test_batch_reader.cpp)
 target_link_libraries(test_batch_reader PRIVATE uavrgb_core)
 target_link_options(test_batch_reader PRIVATE "-Wl,--wrap=pread")
 add_test(NAME test_batch_reader COMMAND test_batch_reader)
+
+# STUDENT-P2：逐格 CE 算子、UAVRAUX1 侧车读写、checkpoint v4/v5/v6 交叉读。
+add_executable(test_spatial_ce tests/test_spatial_ce.cpp)
+target_link_libraries(test_spatial_ce PRIVATE uavrgb_core)
+add_test(NAME test_spatial_ce COMMAND test_spatial_ce)
+
+add_executable(test_aux_sidecar tests/test_aux_sidecar.cpp)
+target_link_libraries(test_aux_sidecar PRIVATE uavrgb_core)
+add_test(NAME test_aux_sidecar COMMAND test_aux_sidecar)
+
+add_executable(test_checkpoint_versions tests/test_checkpoint_versions.cpp)
+target_link_libraries(test_checkpoint_versions PRIVATE uavrgb_core)
+add_test(NAME test_checkpoint_versions COMMAND test_checkpoint_versions)
 
 add_executable(test_run_owner tests/test_run_owner.cpp)
 target_link_libraries(test_run_owner PRIVATE uavrgb_core)

@@ -148,6 +148,14 @@ bool read_run_config(const std::string& run_dir, RunConfigSnapshot* out) {
   out->has_vision_only = !str("vision_only").empty();
   out->vision_only = str("vision_only") == "true";
   out->dataset_sha256 = str("dataset_sha256");
+  out->has_two_frame = !str("two_frame").empty();
+  out->two_frame = str("two_frame") == "true";
+  out->has_prev_action = !str("prev_action").empty();
+  out->prev_action = str("prev_action") == "true";
+  out->has_depth_aux = !str("depth_aux").empty();
+  out->depth_aux = str("depth_aux") == "true";
+  out->has_aux_lambda = !str("aux_lambda").empty();
+  if (out->has_aux_lambda) out->aux_lambda = std::stof(str("aux_lambda"));
   return true;
 }
 
@@ -232,7 +240,11 @@ void write_run_config(const std::string& out_dir, const TrainConfig& cfg,
      << ",\"warmup_steps\":" << cfg.warmup_steps
      << ",\"cosine_lr\":" << (cfg.cosine_lr ? "true" : "false")
      << ",\"weight_decay\":" << cfg.weight_decay
-     << ",\"label_smoothing\":" << cfg.label_smoothing;
+     << ",\"label_smoothing\":" << cfg.label_smoothing
+     << ",\"two_frame\":" << (cfg.two_frame ? "true" : "false")
+     << ",\"prev_action\":" << (cfg.prev_action ? "true" : "false")
+     << ",\"depth_aux\":" << (cfg.depth_aux ? "true" : "false")
+     << ",\"aux_lambda\":" << cfg.aux_lambda;
   if (!cfg.resume.empty()) os << ",\"resume\":" << quote(cfg.resume);
   os << "}\n";
   auto write_to = [&](const std::string& path) {

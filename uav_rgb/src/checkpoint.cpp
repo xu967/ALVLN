@@ -13,8 +13,9 @@ namespace uavrgb {
 namespace {
 
 constexpr char kMagic[8] = {'U', 'A', 'V', 'R', 'C', 'K', '0', '1'};
-constexpr std::uint32_t kVersion = 5;     // v5 追加固定长度训练契约
+constexpr std::uint32_t kVersion = 6;     // v6 追加 aux_classes / prev_dim（STUDENT-P2）
 constexpr std::uint32_t kMinVersion = 2;  // v2 没有 best_macro_f1，读回 -1
+constexpr std::streamoff kContractBytes = 113;  // v5 训练契约定长段
 
 [[noreturn]] void bad(const std::string& msg) {
   throw std::invalid_argument("checkpoint: " + msg);
@@ -99,7 +100,24 @@ Header read_header(std::ifstream& f) {
   if (h.in_h <= 0 || h.in_w <= 0 || h.in_c <= 0 || h.num_classes <= 0) {
     bad("结构元信息非正数");
   }
+  if (h.in_c > kMaxInC) bad("in_c 非法（只支持 3/6）");
   return h;
+}
+
+// v6 把 aux_classes/prev_dim 放在 v5 契约之后；更早的版本都没有这两个分支。
+struct V6Fields {
+  std::int32_t aux_classes = 0, prev_dim = 0;
+};
+V6Fields read_v6(std::ifstream& f, std::uint32_t version) {
+  V6Fields v;
+  if (version < 6) return v;
+  get<std::int32_t>(f, v.aux_classes, "aux_classes");
+  get<std::int32_t>(f, v.prev_dim, "prev_dim");
+  if (v.aux_classes < 0 || v.aux_classes > kMaxAuxClasses || v.prev_dim < 0 ||
+      v.prev_dim > kMaxPrevDim) {
+    bad("aux_classes/prev_dim 非法");
+  }
+  return v;
 }
 
 // v4 把 text_dim 放在 best_macro_f1 之后（新版本只追加，旧偏移不变）。
@@ -153,6 +171,8 @@ void save_checkpoint(const std::string& path, const CnnModel& model, const Train
   put<std::uint32_t>(f, static_cast<std::uint32_t>(st.contract.seed));
   put<std::int32_t>(f, st.contract.batch);
   f.write(reinterpret_cast<const char*>(st.contract.split_scheme_sha256.data()), 32);
+  put<std::int32_t>(f, model.aux_classes);  // v6 追加，放在契约之后：v5 读端的偏移不变
+  put<std::int32_t>(f, model.prev_dim);
 
   for (std::size_t i = 0; i < ps.size(); ++i) {
     check_finite("param[" + std::to_string(i) + "]", *ps[i]);
@@ -194,7 +214,10 @@ CheckpointMeta read_checkpoint_meta(const std::string& path) {
     float best = -1.0f;
     get<float>(f, best, "best_macro_f1");
   }
-  return {h.in_h, h.in_w, h.in_c, h.num_classes, read_text_dim(f, h.version)};
+  const std::int32_t text_dim = read_text_dim(f, h.version);
+  if (h.version >= 5) f.seekg(kContractBytes, std::ios::cur);  // 契约对结构没有信息
+  const V6Fields v6 = read_v6(f, h.version);
+  return {h.in_h, h.in_w, h.in_c, h.num_classes, text_dim, v6.aux_classes, v6.prev_dim};
 }
 
 void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
@@ -253,6 +276,12 @@ void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
     get_sha(f, c.split_scheme_sha256, "split_scheme_sha256");
     if (!std::isfinite(c.distill_alpha) || !std::isfinite(c.lr)) bad("训练契约含非有限值");
     st.contract_present = true;
+  }
+  const V6Fields v6 = read_v6(f, version);
+  if (v6.aux_classes != model.aux_classes || v6.prev_dim != model.prev_dim) {
+    bad("aux_classes/prev_dim 与模型不符（ckpt " + std::to_string(v6.aux_classes) + "/" +
+        std::to_string(v6.prev_dim) + " vs 模型 " + std::to_string(model.aux_classes) + "/" +
+        std::to_string(model.prev_dim) + "）");
   }
 
   std::vector<std::int64_t> dims;

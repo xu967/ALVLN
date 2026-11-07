@@ -10,6 +10,9 @@
 // --selfcheck 约定：ep1(scene 42,train,6步) ep2(scene 42,train,4步) ep3(scene 43,val,5步)，
 // 标签 = episode 内 step%4；偶数全局样本为常量色帧，奇数为 R→x/G→y/B=77 梯度帧。
 // 任意 --size 预处理结果都可跑 --selfcheck（尺寸取自文件头）。
+// 同目录若有 dataset.aux（UAVRAUX1 侧车，DATASET_FORMAT.md §6）一并校验：头/长度/两个 SHA256/
+// 取值范围；--selfcheck 再核对合成集的上一帧链与 prev-action（首帧指向自身、prev=SAFE）。
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -18,6 +21,52 @@
 #include <vector>
 
 namespace {
+
+// 最小 SHA-256（FIPS 180-4），只为校验侧车绑定；本工具不链接 uavrgb 库。
+std::array<std::uint8_t, 32> sha256(const std::uint8_t* data, std::uint64_t len) {
+  static const std::uint32_t k[64] = {
+      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+      0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+      0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+      0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+      0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+      0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+  std::uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+  std::vector<std::uint8_t> msg(data, data + len);
+  msg.push_back(0x80);
+  while (msg.size() % 64 != 56) msg.push_back(0);
+  const std::uint64_t bits = len * 8;
+  for (int i = 7; i >= 0; --i) msg.push_back(static_cast<std::uint8_t>(bits >> (8 * i)));
+  auto rotr = [](std::uint32_t x, int n) { return (x >> n) | (x << (32 - n)); };
+  for (std::size_t off = 0; off < msg.size(); off += 64) {
+    std::uint32_t w[64];
+    for (int i = 0; i < 16; ++i) {
+      w[i] = (static_cast<std::uint32_t>(msg[off + 4 * i]) << 24) |
+             (static_cast<std::uint32_t>(msg[off + 4 * i + 1]) << 16) |
+             (static_cast<std::uint32_t>(msg[off + 4 * i + 2]) << 8) | msg[off + 4 * i + 3];
+    }
+    for (int i = 16; i < 64; ++i) {
+      const std::uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+      const std::uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    std::uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (int i = 0; i < 64; ++i) {
+      const std::uint32_t t1 = hh + (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) + ((e & f) ^ (~e & g)) + k[i] + w[i];
+      const std::uint32_t t2 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c));
+      hh = g, g = f, f = e, e = d + t1, d = c, c = b, b = a, a = t1 + t2;
+    }
+    h[0] += a, h[1] += b, h[2] += c, h[3] += d, h[4] += e, h[5] += f, h[6] += g, h[7] += hh;
+  }
+  std::array<std::uint8_t, 32> out{};
+  for (int i = 0; i < 8; ++i) {
+    for (int j = 0; j < 4; ++j) out[4 * i + j] = static_cast<std::uint8_t>(h[i] >> (24 - 8 * j));
+  }
+  return out;
+}
 
 struct Header {
   std::uint16_t version = 0;
@@ -189,6 +238,77 @@ int selfcheck(std::ifstream& f, const Header& hd, const std::string& meta,
   return 0;
 }
 
+// 侧车：uavr 路径换后缀 .aux；不存在返回 0（旧数据集没有侧车）。
+int check_aux(const std::string& uavr_path, const Header& hd, bool do_selfcheck) {
+  std::string aux_path = uavr_path;
+  const std::size_t dot = aux_path.rfind('.');
+  const std::size_t slash = aux_path.rfind('/');
+  if (dot != std::string::npos && (slash == std::string::npos || dot > slash)) aux_path.erase(dot);
+  aux_path += ".aux";
+  std::ifstream af(aux_path, std::ios::binary);
+  if (!af) {
+    std::printf("aux: 无 %s（旧数据集；双帧/prev-action/深度分带不可用）\n", aux_path.c_str());
+    return 0;
+  }
+  std::vector<std::uint8_t> bytes((std::istreambuf_iterator<char>(af)), std::istreambuf_iterator<char>());
+  if (bytes.size() < 128 || std::memcmp(bytes.data(), "UAVRAUX1", 8) != 0) return fail("aux: 头不足 128 B 或 magic 不是 UAVRAUX1");
+  const std::uint64_t n = le64(bytes.data() + 8);
+  const std::uint32_t flags = le32(bytes.data() + 16);
+  const std::uint16_t dh = le16(bytes.data() + 20), dw = le16(bytes.data() + 22);
+  const std::uint8_t classes = bytes[24], unknown = bytes[25];
+  if (n != hd.n) return fail("aux: N=" + std::to_string(n) + " != uavr n=" + std::to_string(hd.n));
+  if (flags > 1) return fail("aux: 未知 flags");
+  if (unknown != 255) return fail("aux: unknown_code != 255");
+  const bool has_depth = (flags & 1u) != 0;
+  if (has_depth && (dh != hd.h / 8 || dw != hd.w / 8 || classes != 8)) return fail("aux: 深度网格/分带数与 H/8×W/8、8 带不符");
+  if (!has_depth && (dh != 0 || dw != 0)) return fail("aux: 无深度时 depth_h/depth_w 须为 0");
+  const std::uint64_t depth_bytes = has_depth ? n * dh * dw : 0;
+  if (bytes.size() != 128 + 5 * n + depth_bytes) return fail("aux: 文件长度与 N/网格不符");
+  // 绑定：头里的 dataset.uavr SHA256 与 payload SHA256 都要对得上，防止「新数据集 + 旧侧车」。
+  std::ifstream uf(uavr_path, std::ios::binary);
+  std::vector<std::uint8_t> ubytes((std::istreambuf_iterator<char>(uf)), std::istreambuf_iterator<char>());
+  if (sha256(ubytes.data(), ubytes.size()) != *reinterpret_cast<const std::array<std::uint8_t, 32>*>(bytes.data() + 28)) {
+    return fail("aux: UAVR SHA256 不匹配（侧车不是这份 dataset.uavr 的）");
+  }
+  if (sha256(bytes.data() + 128, bytes.size() - 128) != *reinterpret_cast<const std::array<std::uint8_t, 32>*>(bytes.data() + 60)) {
+    return fail("aux: payload SHA256 不匹配");
+  }
+  const std::uint8_t* prev_idx = bytes.data() + 128;
+  const std::uint8_t* prev_act = prev_idx + 4 * n;
+  const std::uint8_t* depth = prev_act + n;
+  std::uint64_t self_count = 0;
+  for (std::uint64_t i = 0; i < n; ++i) {
+    const std::uint32_t p = le32(prev_idx + 4 * i);
+    if (p >= n) return fail("aux: prev_index 越界");
+    if (prev_act[i] >= 4) return fail("aux: prev_action 越界");
+    if (p == i) ++self_count;
+  }
+  std::uint64_t unknown_cells = 0;
+  for (std::uint64_t i = 0; i < depth_bytes; ++i) {
+    if (depth[i] == 255) ++unknown_cells;
+    else if (depth[i] >= classes) return fail("aux: 深度分带目标越界");
+  }
+  std::printf("aux: %s N=%llu first/self=%llu depth=%s\n", aux_path.c_str(),
+              static_cast<unsigned long long>(n), static_cast<unsigned long long>(self_count),
+              has_depth ? ("grid " + std::to_string(dh) + "x" + std::to_string(dw) + " unknown " +
+                           std::to_string(unknown_cells) + "/" + std::to_string(depth_bytes)).c_str()
+                        : "none");
+  if (!do_selfcheck) return 0;
+  // 合成集：首帧 0/6/10 指向自身且 prev=SAFE(0)；其余指向 i-1，prev = 上一步标签（action_executed=label）。
+  for (std::uint32_t i = 0; i < n; ++i) {
+    const bool first = i == 0 || i == 6 || i == 10;
+    const std::uint32_t want_idx = first ? i : i - 1;
+    const std::uint32_t local_prev = first ? 0 : (i - 1) - (i - 1 >= 10 ? 10 : (i - 1 >= 6 ? 6 : 0));
+    const std::uint8_t want_act = first ? 0 : static_cast<std::uint8_t>(local_prev % 4u);
+    if (le32(prev_idx + 4 * i) != want_idx || prev_act[i] != want_act) {
+      return fail("aux selfcheck: sample " + std::to_string(i) + " prev_index/prev_action 不符");
+    }
+  }
+  if (has_depth) return fail("aux selfcheck: 合成集没有深度，侧车却带 depth 段");
+  std::printf("selfcheck: aux prev chain %u/%u OK (首帧 0/6/10 指向自身, prev=SAFE)\n", hd.n, hd.n);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -261,6 +381,7 @@ int main(int argc, char** argv) {
   std::printf("labels: 0=%u 1=%u 2=%u 3=%u\n", hist[0], hist[1], hist[2], hist[3]);
   std::printf("meta: %s\n", meta.c_str());
   std::printf("OK: header/labels/meta structure valid\n");
+  if (const int rc = check_aux(argv[1], hd, do_selfcheck); rc != 0) return rc;
 
   if (do_selfcheck) {
     const int rc = selfcheck(f, hd, meta, file_size);

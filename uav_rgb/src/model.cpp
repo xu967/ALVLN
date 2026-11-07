@@ -36,7 +36,8 @@ std::int64_t flat_dim(const CnnModel& m) {
 
 }  // namespace
 
-CnnModel make_cnn(int in_h, int in_w, std::uint32_t seed, int num_classes, int text_dim) {
+CnnModel make_cnn(int in_h, int in_w, std::uint32_t seed, int num_classes, int text_dim,
+                  int in_c, int aux_classes, int prev_dim) {
   if (in_h <= 0 || in_w <= 0) {
     throw std::invalid_argument("make_cnn: in_h/in_w 必须为正");
   }
@@ -47,13 +48,19 @@ CnnModel make_cnn(int in_h, int in_w, std::uint32_t seed, int num_classes, int t
     throw std::invalid_argument("make_cnn: text_dim 必须在 0.." +
                                 std::to_string(kMaxTextDim));
   }
+  if (in_c != 3 && in_c != kMaxInC) {
+    throw std::invalid_argument("make_cnn: in_c 只能是 3（单帧）或 6（双帧）");
+  }
+  if (aux_classes < 0 || aux_classes > kMaxAuxClasses || prev_dim < 0 || prev_dim > kMaxPrevDim) {
+    throw std::invalid_argument("make_cnn: aux_classes 须在 0..254、prev_dim 须在 0..64");
+  }
   if (in_h % 8 != 0 || in_w % 8 != 0) {
     throw std::invalid_argument("make_cnn: 输入 H/W 必须是 8 的倍数（三次 2x2 pool）");
   }
   CnnModel m;
   m.in_h = in_h;
   m.in_w = in_w;
-  m.c1 = Conv2d(3, 16, 3, 3, 1);
+  m.c1 = Conv2d(in_c, 16, 3, 3, 1);
   m.c2 = Conv2d(16, 32, 3, 3, 1);
   m.c3 = Conv2d(32, 64, 3, 3, 1);
   const std::int64_t flat = flat_dim(m);
@@ -61,15 +68,16 @@ CnnModel make_cnn(int in_h, int in_w, std::uint32_t seed, int num_classes, int t
     throw std::invalid_argument("make_cnn: fc 输入维超出 int 范围");
   }
   m.text_dim = text_dim;
+  m.prev_dim = prev_dim;
+  m.aux_classes = aux_classes;
   m.fc = Linear(static_cast<int>(flat), num_classes);
-  if (text_dim > 0) {
-    const std::int64_t tfeat = static_cast<std::int64_t>(kTextLen) * text_dim;
-    if (tfeat > static_cast<std::int64_t>(std::numeric_limits<int>::max())) {
-      throw std::invalid_argument("make_cnn: 文本特征维超出 int 范围");
-    }
-    m.text_emb = Tensor({kTextVocab, text_dim});
-    m.film = Linear(static_cast<int>(tfeat), 2 * m.c3.out);
+  const std::int64_t cdim = static_cast<std::int64_t>(kTextLen) * text_dim + prev_dim;
+  if (cdim > static_cast<std::int64_t>(std::numeric_limits<int>::max())) {
+    throw std::invalid_argument("make_cnn: FiLM 条件维超出 int 范围");
   }
+  if (text_dim > 0) m.text_emb = Tensor({kTextVocab, text_dim});
+  if (cdim > 0) m.film = Linear(static_cast<int>(cdim), 2 * m.c3.out);
+  if (aux_classes > 0) m.aux = Conv2d(m.c3.out, aux_classes, 1, 1, 0);
 
   std::mt19937 rng(seed);
   auto xavier = [&rng](Tensor& w, int fan_in, int fan_out) {
@@ -81,15 +89,15 @@ CnnModel make_cnn(int in_h, int in_w, std::uint32_t seed, int num_classes, int t
   xavier(m.c2.W, m.c2.in * 9, m.c2.out * 9);
   xavier(m.c3.W, m.c3.in * 9, m.c3.out * 9);
   xavier(m.fc.W, m.fc.in, m.fc.out);
-  if (text_dim > 0) {
-    xavier(m.text_emb, kTextVocab, text_dim);
-    xavier(m.film.W, m.film.in, m.film.out);
-  }
+  if (text_dim > 0) xavier(m.text_emb, kTextVocab, text_dim);
+  if (cdim > 0) xavier(m.film.W, m.film.in, m.film.out);
+  if (aux_classes > 0) xavier(m.aux.W, m.aux.in, m.aux.out);
   // b 由 Conv2d/Linear 构造时清零，这里不再重复写。
   detail::check_conv_params(m.c1);
   detail::check_conv_params(m.c2);
   detail::check_conv_params(m.c3);
   detail::check_linear_params(m.fc);
+  if (aux_classes > 0) detail::check_conv_params(m.aux);
   return m;
 }
 
@@ -99,42 +107,48 @@ std::size_t num_params(const CnnModel& m) {
   return n;
 }
 
-std::vector<Tensor*> cnn_params(CnnModel& m) {
-  std::vector<Tensor*> p = {&m.c1.W, &m.c1.b, &m.c2.W, &m.c2.b,
-                            &m.c3.W, &m.c3.b, &m.fc.W, &m.fc.b};
-  if (m.text_dim > 0) {
-    p.push_back(&m.text_emb);
+namespace {
+
+// 参数/梯度列表共用的追加规则（顺序见 model.hpp）；Tm 为 Tensor 或 const Tensor。
+template <typename Tm, typename M>
+std::vector<Tm*> param_list(M& m) {
+  std::vector<Tm*> p = {&m.c1.W, &m.c1.b, &m.c2.W, &m.c2.b, &m.c3.W, &m.c3.b, &m.fc.W, &m.fc.b};
+  if (m.text_dim > 0) p.push_back(&m.text_emb);
+  if (has_film(m)) {
     p.push_back(&m.film.W);
     p.push_back(&m.film.b);
+  }
+  if (m.aux_classes > 0) {
+    p.push_back(&m.aux.W);
+    p.push_back(&m.aux.b);
   }
   return p;
 }
 
-std::vector<const Tensor*> cnn_params(const CnnModel& m) {
-  std::vector<const Tensor*> p = {&m.c1.W, &m.c1.b, &m.c2.W, &m.c2.b,
-                                  &m.c3.W, &m.c3.b, &m.fc.W, &m.fc.b};
-  if (m.text_dim > 0) {
-    p.push_back(&m.text_emb);
-    p.push_back(&m.film.W);
-    p.push_back(&m.film.b);
-  }
-  return p;
-}
+}  // namespace
+
+std::vector<Tensor*> cnn_params(CnnModel& m) { return param_list<Tensor>(m); }
+
+std::vector<const Tensor*> cnn_params(const CnnModel& m) { return param_list<const Tensor>(m); }
 
 std::vector<Tensor*> cnn_grad_tensors(CnnGrad& g) {
   std::vector<Tensor*> p = {&g.c1.dW, &g.c1.db, &g.c2.dW, &g.c2.db,
                             &g.c3.dW, &g.c3.db, &g.fc.dW, &g.fc.db};
-  // 默认构造的 Tensor 是 1 元素标量（ndim 0），用它表示"没有文本分支"。
-  if (g.text_demb.ndim() != 0) {
-    p.push_back(&g.text_demb);
+  // 默认构造的 Tensor 是 1 元素标量（ndim 0），用它表示"该分支不存在"。
+  if (g.text_demb.ndim() != 0) p.push_back(&g.text_demb);
+  if (g.film.dW.ndim() != 0) {
     p.push_back(&g.film.dW);
     p.push_back(&g.film.db);
+  }
+  if (g.aux.dW.ndim() != 0) {
+    p.push_back(&g.aux.dW);
+    p.push_back(&g.aux.db);
   }
   return p;
 }
 
 Tensor forward(const CnnModel& m, const Tensor& x, CnnCache* cache,
-               const std::vector<std::uint8_t>* text) {
+               const std::vector<std::uint8_t>* text, const std::vector<std::uint8_t>* prev) {
   if (x.ndim() != 4 || x.dims()[1] != m.c1.in || x.dims()[2] != m.in_h ||
       x.dims()[3] != m.in_w) {
     throw std::invalid_argument("forward: x 必须是 [N," + std::to_string(m.c1.in) + "," +
@@ -149,6 +163,16 @@ Tensor forward(const CnnModel& m, const Tensor& x, CnnCache* cache,
   } else if (text) {
     throw std::invalid_argument("forward: 模型没有文本分支，不接受 text ids");
   }
+  if (m.prev_dim > 0) {
+    if (!prev || prev->size() != n) {
+      throw std::invalid_argument("forward: 模型接 prev-action，必须传 N 个 prev id");
+    }
+    for (std::uint8_t id : *prev) {
+      if (id >= m.prev_dim) throw std::invalid_argument("forward: prev-action id 越界");
+    }
+  } else if (prev) {
+    throw std::invalid_argument("forward: 模型不接 prev-action，不接受 prev id");
+  }
   if (cache) cache->x = x;
 
   Tensor c1 = conv2d_forward_cuda(m.c1, x);
@@ -161,27 +185,29 @@ Tensor forward(const CnnModel& m, const Tensor& x, CnnCache* cache,
   Tensor r3 = relu_forward_cuda(c3);
   MaxPoolResult p3 = maxpool2d_forward_cuda(kPool, r3);
 
-  // 文本分支：token id → embedding 查表 → 按位置拼接 [kTextLen × text_dim]；
-  // <pad> 的槽位保持 0。再经 film 得到逐通道 γ/β，调制 conv 最后一层特征。
-  Tensor text_feat;
+  // FiLM 条件向量 [文本特征 | prev one-hot]：token id → embedding 查表 → 按位置拼接
+  // [kTextLen × text_dim]，<pad> 的槽位保持 0；prev-action 置 1 个槽位。
+  // 再经 film 得到逐通道 γ/β，调制 conv 最后一层特征。
+  Tensor cond;
   Tensor film_out;
-  Tensor p3mod;               // 有文本时的调制结果
-  const Tensor* p3y = &p3.y;  // 无文本时直接复用池化特征，避免整块深拷贝
-  const std::int64_t tfeat =
-      static_cast<std::int64_t>(kTextLen) * (m.text_dim > 0 ? m.text_dim : 0);
-  if (m.text_dim > 0) {
-    text_feat = Tensor({x.dims()[0], tfeat});
+  Tensor p3mod;               // 有 FiLM 时的调制结果
+  const Tensor* p3y = &p3.y;  // 无 FiLM 时直接复用池化特征，避免整块深拷贝
+  const std::size_t cdim = static_cast<std::size_t>(cond_dim(m));
+  const std::size_t tfeat = static_cast<std::size_t>(kTextLen) * m.text_dim;
+  if (has_film(m)) {
+    cond = Tensor({x.dims()[0], static_cast<std::int64_t>(cdim)});
     for (std::size_t i = 0; i < n; ++i) {
-      for (int l = 0; l < kTextLen; ++l) {
+      for (int l = 0; l < kTextLen && m.text_dim > 0; ++l) {
         const std::uint8_t id = (*text)[i * kTextLen + l];
         if (id == 0 || id >= kTextVocab) continue;  // 0 = <pad>，未知值按 pad 处理
-        const std::size_t dst = i * tfeat + static_cast<std::size_t>(l) * m.text_dim;
+        const std::size_t dst = i * cdim + static_cast<std::size_t>(l) * m.text_dim;
         for (int d = 0; d < m.text_dim; ++d) {
-          text_feat[dst + d] = m.text_emb[id * m.text_dim + d];
+          cond[dst + d] = m.text_emb[id * m.text_dim + d];
         }
       }
+      if (m.prev_dim > 0) cond[i * cdim + tfeat + (*prev)[i]] = 1.0f;
     }
-    film_out = linear_forward_cuda(m.film, text_feat);
+    film_out = linear_forward_cuda(m.film, cond);
     const int channels = m.c3.out;
     const std::int64_t hh = p3.y.dims()[2];
     const std::int64_t ww = p3.y.dims()[3];
@@ -210,27 +236,46 @@ Tensor forward(const CnnModel& m, const Tensor& x, CnnCache* cache,
     cache->r3 = std::move(r3);
     cache->p3 = std::move(p3);
     cache->flat = flat;  // 还要给 fc 反向用，保留副本
-    cache->text_feat = text_feat;
+    cache->cond = cond;
     cache->film_out = film_out;
     if (text) cache->text_ids = *text;
   }
   return linear_forward_cuda(m.fc, flat);
 }
 
-CnnGrad backward(const CnnModel& m, const CnnCache& c, const Tensor& dlogits) {
+Tensor aux_forward(const CnnModel& m, const CnnCache& c) {
+  if (m.aux_classes == 0) throw std::invalid_argument("aux_forward: 模型没有辅助头");
+  if (c.flat.numel() == 0) throw std::invalid_argument("aux_forward: cache 为空");
+  // flat 就是 fc 的输入（FiLM 之后的特征），还原成 4 维给 1x1 卷积。
+  return conv2d_forward_cuda(m.aux, reshape_copy(c.flat, c.p3.y.dims()));
+}
+
+CnnGrad backward(const CnnModel& m, const CnnCache& c, const Tensor& dlogits,
+                 const Tensor* daux) {
   if (c.flat.numel() == 0) {
     throw std::invalid_argument("backward: cache 为空，需用带 cache 的 forward 填充");
   }
+  if (daux && m.aux_classes == 0) throw std::invalid_argument("backward: 模型没有辅助头");
   CnnGrad g;
   g.fc = linear_backward_cuda(m.fc, c.flat, dlogits);
-  // fc 的 dx 是 [N, flat]，还原成 [N,64,h',w']；有文本时先反传 FiLM。
+  // fc 的 dx 是 [N, flat]，还原成 [N,64,h',w']；有 FiLM 时先反传 FiLM。
   Tensor dp3 = reshape_copy(g.fc.dx, c.p3.y.dims());
-  if (m.text_dim > 0) {
+  if (m.aux_classes > 0) {
+    if (daux) {
+      g.aux = conv2d_backward_cuda(m.aux, reshape_copy(c.flat, c.p3.y.dims()), *daux);
+      for (std::size_t i = 0; i < dp3.numel(); ++i) dp3[i] += g.aux.dx[i];
+    } else {
+      // 本步没有深度目标：辅助头梯度为 0，但形状要在，Adam/checkpoint 的参数表才对得上。
+      g.aux.dW = Tensor::zeros(m.aux.W.dims());
+      g.aux.db = Tensor::zeros(m.aux.b.dims());
+    }
+  }
+  if (has_film(m)) {
     const std::size_t n = static_cast<std::size_t>(c.p3.y.dims()[0]);
-    if (c.text_ids.size() != n * static_cast<std::size_t>(kTextLen)) {
+    if (m.text_dim > 0 && c.text_ids.size() != n * static_cast<std::size_t>(kTextLen)) {
       throw std::invalid_argument("backward: cache.text_ids 长度与 batch 不符");
     }
-    const std::int64_t tfeat = static_cast<std::int64_t>(kTextLen) * m.text_dim;
+    const std::size_t cdim = static_cast<std::size_t>(cond_dim(m));
     const int channels = m.c3.out;
     const std::int64_t hh = c.p3.y.dims()[2];
     const std::int64_t ww = c.p3.y.dims()[3];
@@ -252,19 +297,19 @@ CnnGrad backward(const CnnModel& m, const CnnCache& c, const Tensor& dlogits) {
         d_film[i * 2 * channels + channels + c0] = static_cast<float>(db);
       }
     }
-    g.film = linear_backward_cuda(m.film, c.text_feat, d_film);
-    g.text_demb = Tensor({kTextVocab, m.text_dim});
-    for (std::size_t i = 0; i < n; ++i) {
+    g.film = linear_backward_cuda(m.film, c.cond, d_film);
+    if (m.text_dim > 0) g.text_demb = Tensor({kTextVocab, m.text_dim});
+    for (std::size_t i = 0; i < n && m.text_dim > 0; ++i) {
       for (int l = 0; l < kTextLen; ++l) {
         const std::uint8_t id = c.text_ids[i * kTextLen + l];
         if (id == 0 || id >= kTextVocab) continue;
         for (int d = 0; d < m.text_dim; ++d) {
           g.text_demb[id * m.text_dim + d] +=
-              g.film.dx[i * tfeat + static_cast<std::size_t>(l) * m.text_dim + d];
+              g.film.dx[i * cdim + static_cast<std::size_t>(l) * m.text_dim + d];
         }
       }
     }
-    dp3 = std::move(dym);
+    dp3 = std::move(dym);  // prev one-hot 没有参数，film.dx 的 prev 段不再往下传
   }
   // FC 的 dx（或 FiLM 调制后的梯度）还原成 [N,64,h',w'] 再散回 pool3 的 argmax。
   Tensor dr3 = maxpool2d_backward_cuda(kPool, c.r3, c.p3.argmax, dp3);

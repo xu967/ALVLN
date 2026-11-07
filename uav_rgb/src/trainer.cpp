@@ -234,6 +234,11 @@ void merge_resume_config(TrainConfig* cfg) {
   if (!cfg->distill_alpha_set && snap.has_distill_alpha) cfg->distill_alpha = snap.distill_alpha;
   if (!cfg->text_dim_set && snap.has_text_dim) cfg->text_dim = snap.text_dim;
   if (!cfg->text_dim_set && snap.has_vision_only && snap.vision_only) cfg->vision_only = true;
+  // 结构开关不继承就建不出同形模型，load_checkpoint 会按参数个数/形状拒绝；这里先接过来。
+  if (!cfg->two_frame_set && snap.has_two_frame) cfg->two_frame = snap.two_frame;
+  if (!cfg->prev_action_set && snap.has_prev_action) cfg->prev_action = snap.prev_action;
+  if (!cfg->depth_aux_set && snap.has_depth_aux) cfg->depth_aux = snap.depth_aux;
+  if (!cfg->aux_lambda_set && snap.has_aux_lambda) cfg->aux_lambda = snap.aux_lambda;
   if (!(std::isfinite(cfg->lr) && cfg->lr > 0.0f && cfg->lr <= 1.0f)) {
     throw std::invalid_argument("resume: 源 config 的 lr 非法（" + num(cfg->lr) + "）");
   }
@@ -243,8 +248,8 @@ void merge_resume_config(TrainConfig* cfg) {
 // resume 的历史 best 必须能在新目录独立交付：同目录核对文件存在且状态一致；
 // 跨目录先核对再复制，绝不能让新 run 继承一个分数却没有对应权重文件。
 void carry_resume_best(const std::string& resume_path, const std::string& out_dir,
-                       int h, int w, std::uint32_t seed, int num_classes, int text_dim,
-                       float lr, const TrainState& state) {
+                       const CnnModel& like, std::uint32_t seed, float lr,
+                       const TrainState& state) {
   namespace fs = std::filesystem;
   if (!(state.best_macro_f1 >= 0.0f)) return;  // 旧格式/从未评估过，无 best 可带
   const fs::path rp(resume_path);
@@ -257,7 +262,8 @@ void carry_resume_best(const std::string& resume_path, const std::string& out_di
                              " 不存在；无法交付历史 best");
   }
   // 核对源 best 确实属于这次 resume：分数、类别权重都要与 checkpoint 记录一致。
-  CnnModel m = make_cnn(h, w, seed, num_classes, text_dim);
+  CnnModel m = make_cnn(like.in_h, like.in_w, seed, like.fc.out, like.text_dim, like.c1.in,
+                        like.aux_classes, like.prev_dim);
   TrainState s = make_train_state(m, lr);
   load_checkpoint(src_best.string(), m, s);
   if (s.best_macro_f1 != state.best_macro_f1 || s.class_weights != state.class_weights) {
@@ -387,7 +393,19 @@ void Trainer::run() {
         "trainer: 数据集有 instructions.jsonl 但 --text-dim 缺省为 0，会静默训成纯视觉模型；"
         "要文本分支请传 --text-dim N，要纯视觉基线请显式传 --vision-only");
   }
-  model_ = make_cnn(ds.h, ds.w, cfg_.seed, static_cast<int>(ds.num_classes), cfg_.text_dim);
+  if ((cfg_.two_frame || cfg_.prev_action) && !ds.aux.present) {
+    throw std::runtime_error(
+        "trainer: --two-frame/--prev-action 需要 dataset.aux 侧车（用新版 preprocess.py 重打包）");
+  }
+  if (cfg_.depth_aux && !(ds.aux.present && ds.aux.has_depth)) {
+    throw std::runtime_error(
+        "trainer: --depth-aux 需要带深度分带目标的 dataset.aux（采集时 --save-depth 并重打包）；"
+        "不要静默关掉辅助损失，去掉该参数即可只训动作头");
+  }
+  if (!(cfg_.aux_lambda >= 0.0f) || !std::isfinite(cfg_.aux_lambda)) {
+    throw std::invalid_argument("trainer: --aux-lambda 必须为非负有限数");
+  }
+  model_ = build_model(ds);
   state_ = make_train_state(model_, cfg_.lr);
   if (!cfg_.resume.empty()) {
     load_checkpoint(cfg_.resume, model_, state_);
@@ -403,8 +421,7 @@ void Trainer::run() {
   cfg_.adam_beta2 = state_.adam[0].beta2;
   cfg_.adam_eps = state_.adam[0].eps;
   if (!cfg_.resume.empty()) {
-    carry_resume_best(cfg_.resume, cfg_.out_dir, ds.h, ds.w, cfg_.seed,
-                      static_cast<int>(ds.num_classes), cfg_.text_dim, cfg_.lr, state_);
+    carry_resume_best(cfg_.resume, cfg_.out_dir, model_, cfg_.seed, cfg_.lr, state_);
   }
   write_run_config(cfg_.out_dir, cfg_, class_weights_, class_weights_source_);
   dev_ = std::make_unique<DeviceCnn>(model_, cfg_.batch, &state_);
@@ -456,8 +473,8 @@ void Trainer::run() {
 
   for (int ep = 1; ep <= cfg_.epochs; ++ep) {
     std::shuffle(order.begin(), order.end(), rng);
-    double ce_sum = 0.0;
-    std::uint64_t seen = 0;
+    double ce_sum = 0.0, aux_ce_sum = 0.0;
+    std::uint64_t seen = 0, aux_valid = 0, aux_correct = 0;
     for (std::size_t s = 0; s < order.size(); s += bs) {
       const std::size_t e = std::min(order.size(), s + bs);
       const std::vector<std::uint32_t> part = detail::slice(order, s, e);
@@ -486,6 +503,15 @@ void Trainer::run() {
       const float acc = static_cast<float>(count_correct(logits, y)) /
                         static_cast<float>(part.size());
       const float lr_now = step_lr(step + 1, total_steps);
+      if (cfg_.depth_aux) {
+        // 辅助损失的梯度留在显存，backward_step 把它叠到第三层特征上；loss 列仍只记动作 CE，
+        // results.csv/metrics 的口径不变，深度项另记。
+        const DeviceCnn::AuxStats a = aux_batch(ds, cfg_.aux_lambda);
+        if (!std::isfinite(a.loss)) throw std::runtime_error("trainer: 深度辅助 loss 非有限值");
+        aux_ce_sum += static_cast<double>(a.loss) * static_cast<double>(a.valid);
+        aux_valid += a.valid;
+        aux_correct += a.correct;
+      }
       dev_->backward_step(dlogits, cfg_.max_grad_norm, state_, cfg_.weight_decay);
 
       ++step;
@@ -538,7 +564,21 @@ void Trainer::run() {
     for (std::size_t k = 0; k < dev_stats.recall.size(); ++k) {
       std::printf("%s%.3f", k ? " " : "", dev_stats.recall[k]);
     }
-    std::printf("]\n");
+    std::printf("]");
+    if (cfg_.depth_aux) {
+      const double train_depth_ce = aux_valid ? aux_ce_sum / static_cast<double>(aux_valid) : 0.0;
+      const double train_depth_acc =
+          aux_valid ? static_cast<double>(aux_correct) / static_cast<double>(aux_valid) : 0.0;
+      std::printf(" depth_ce=%.4f/%.4f depth_acc=%.3f/%.3f(train/dev)", train_depth_ce,
+                  dev_stats.depth_ce, train_depth_acc, dev_stats.depth_acc);
+      metrics << metrics_json(make_status(
+                     "depth_aux epoch " + std::to_string(epoch_base + ep) + ": train_ce=" +
+                     num(train_depth_ce) + " train_acc=" + num(train_depth_acc) +
+                     " dev_ce=" + num(dev_stats.depth_ce) + " dev_acc=" + num(dev_stats.depth_acc) +
+                     " lambda=" + num(cfg_.aux_lambda)))
+              << '\n';
+    }
+    std::printf("\n");
     if (!class_weights_.empty()) {
       metrics << metrics_json(make_class_weights(static_cast<std::uint32_t>(state_.epoch), step,
                                                  class_weights_, class_weights_source_))

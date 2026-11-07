@@ -3,6 +3,7 @@
 
 用 make_synthetic_episode 生成 3 条小 episode，再改写 manifest；不读真实数据。
 """
+import hashlib
 import json
 import struct
 import subprocess
@@ -203,6 +204,173 @@ class PreprocessSplitTests(unittest.TestCase):
         self.assertEqual(meta["splits"]["test"], 4)
         self.assertTrue(meta["collision_filter"]["drop_collision_steps"])
         self.assertEqual(meta["collision_dropped"], 1)
+
+    # ---- UAVRAUX1 侧车（STUDENT-P2） ----
+    def read_aux(self, ds_dir):
+        b = (ds_dir / "dataset.aux").read_bytes()
+        magic, n, flags, dh, dw, k, unk, _ = struct.unpack_from("<8sQIHHBBH", b, 0)
+        self.assertEqual((magic, k, unk), (b"UAVRAUX1", 8, 255))
+        self.assertEqual(hashlib.sha256((ds_dir / "dataset.uavr").read_bytes()).digest(), b[28:60])
+        self.assertEqual(hashlib.sha256(b[128:]).digest(), b[60:92])
+        prev_index = struct.unpack_from("<%dI" % n, b, 128)
+        prev_action = b[128 + 4 * n:128 + 5 * n]
+        depth = b[128 + 5 * n:] if flags & 1 else None
+        self.assertEqual(len(b), 128 + 5 * n + (n * dh * dw if depth is not None else 0))
+        return prev_index, prev_action, depth, (dh, dw)
+
+    def test_aux_sidecar_prev_chain_without_depth(self):
+        # 合成集没有深度：侧车只有 prev 链；首帧 0/6/10 指向自身且 prev=SAFE，其余 prev=上一步标签。
+        r = self.run_pre(self.tmp / "ds", self.eps)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        meta = read_meta(self.tmp / "ds" / "dataset.uavr")
+        self.assertEqual(meta["aux_sidecar"]["depth"], False)
+        prev_index, prev_action, depth, grid = self.read_aux(self.tmp / "ds")
+        self.assertIsNone(depth)
+        self.assertEqual(grid, (0, 0))
+        starts = {0: 0, 6: 6, 10: 10}
+        for i in range(15):
+            first = i in starts
+            self.assertEqual(prev_index[i], i if first else i - 1)
+            local_prev = 0 if first else (i - 1) - max(s for s in starts if s <= i - 1)
+            self.assertEqual(prev_action[i], 0 if first else local_prev % 4, i)
+
+    def test_aux_sidecar_drop_collision_breaks_chain(self):
+        # ep1 的 step 2 是碰撞步并被 --drop-collision 丢掉：step 3 的上一帧指向自身（当首帧），
+        # 但 prev-action 仍取 actions.jsonl 里 step 2 真正执行的动作（它确实发生过）。
+        ep = self.eps[0]
+        actions = ep / "actions.jsonl"
+        rows = [json.loads(line) for line in actions.read_text().splitlines() if line]
+        for row in rows:
+            row["collision"] = row["step"] == 2
+            row["action_executed"] = (row["action_expert"] + 1) % 4  # 与标签不同，验证取的是 executed
+        actions.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        r = self.run_pre(self.tmp / "ds", self.eps, "--drop-collision")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        prev_index, prev_action, _, _ = self.read_aux(self.tmp / "ds")
+        # ep1 剩 5 样本：step 0,1,3,4,5 → 全局 0..4。
+        self.assertEqual(prev_index[:5], (0, 0, 2, 2, 3))
+        self.assertEqual(list(prev_action[:5]), [0, (0 + 1) % 4, (2 + 1) % 4, (3 + 1) % 4, (4 + 1) % 4])
+
+    def write_depth(self, fmt, make_frame):
+        """给三条 episode 写深度帧：fmt = png16_mm（uint16 毫米 PNG）或 npy_float32_m（float32 米 npy）；
+        make_frame(step) 返回 (240, 320) 数组。manifest.depth_format 与 actions 的 depth_file 一起写。"""
+        import numpy as np
+        from PIL import Image
+        ext = {"png16_mm": "png", "npy_float32_m": "npy"}[fmt]
+        for ep in self.eps:
+            man = self.man(ep)
+            man["depth_format"] = fmt
+            self.save(ep, man)
+            (ep / "depth").mkdir(exist_ok=True)
+            actions = ep / "actions.jsonl"
+            rows = [json.loads(line) for line in actions.read_text().splitlines() if line]
+            for row in rows:
+                name = "depth/depth_%05d.%s" % (row["step"], ext)
+                frame = make_frame(row["step"])
+                if fmt == "png16_mm":
+                    Image.fromarray(np.asarray(frame, dtype=np.uint16)).save(ep / name)
+                else:
+                    np.save(ep / name, np.asarray(frame, dtype=np.float32))
+                row["depth_file"] = name
+            actions.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+    def bands_of(self, ds_dir):
+        import numpy as np
+        _, _, depth, grid = self.read_aux(ds_dir)
+        self.assertEqual(grid, (15, 20))
+        return np.frombuffer(depth, dtype=np.uint8).reshape(-1, 15, 20)
+
+    def test_aux_sidecar_depth_zero_semantics_by_source(self):
+        # 深度 0 按来源区分（manifest.depth_format）：Gazebo png16 的 0 = 没打到东西（天空/超远）→ 最远带 7；
+        # 3DGS npy 的 0 = alpha 空洞 → 未知 255。两种都整帧全 0，膨胀开着也不该改变结果（没有近处格可扩散）。
+        import numpy as np
+        self.write_depth("png16_mm", lambda step: np.zeros((240, 320)))
+        r = self.run_pre(self.tmp / "ds_gz", self.eps)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.bands_of(self.tmp / "ds_gz") == 7).all(), "Gazebo 全 0 → 全部第 8 带")
+        self.write_depth("npy_float32_m", lambda step: np.zeros((240, 320)))
+        r = self.run_pre(self.tmp / "ds_3dgs", self.eps)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue((self.bands_of(self.tmp / "ds_3dgs") == 255).all(), "3DGS 全 0 → 全部未知")
+        # 3DGS 里 nan / 负值同样是未知；有效像素照常分带，且格内 nan 不拉低/抬高 min。
+        def mixed(step):
+            d = np.full((240, 320), 3.0, dtype=np.float32)
+            d[:16, :] = np.nan
+            d[16:32, :] = -1.0
+            d[32:48, ::2] = np.nan  # 半格 nan：另一半 3 m 仍给出带 6
+            return d
+        self.write_depth("npy_float32_m", mixed)
+        r = self.run_pre(self.tmp / "ds_mixed", self.eps, "--envelope-radius", "0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        b = self.bands_of(self.tmp / "ds_mixed")
+        self.assertTrue((b[:, 0, :] == 255).all() and (b[:, 1, :] == 255).all(), "nan / 负值 → 未知")
+        self.assertTrue((b[:, 2:, :] == 6).all(), "3 m（含半格 nan）→ 带 6")
+
+    def test_aux_sidecar_depth_bands_and_all_or_nothing(self):
+        # 三条 episode 写 16 位毫米深度：左半 0.4 m（带 1）、右半 3 m（带 6）、顶部一行 0 = Gazebo 没打到 → 带 7。
+        # 包络膨胀关掉（--envelope-radius 0）以便逐格核对。
+        import numpy as np
+
+        def frame(step):
+            d = np.full((240, 320), 3000, dtype=np.uint16)
+            d[:, :160] = 400
+            d[:16, :] = 0
+            return d
+        self.write_depth("png16_mm", frame)
+        r = self.run_pre(self.tmp / "ds", self.eps, "--envelope-radius", "0")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        meta = read_meta(self.tmp / "ds" / "dataset.uavr")
+        self.assertEqual(meta["aux_sidecar"]["depth"], True)
+        self.assertEqual(meta["aux_sidecar"]["depth_grid"], [15, 20])
+        bands = self.bands_of(self.tmp / "ds")
+        self.assertTrue((bands[:, 0, :] == 7).all(), "Gazebo 顶行 0 = 天空 → 最远带 7")
+        self.assertTrue((bands[:, 1:, :10] == 1).all(), "0.4 m → 带 1 (0.3..0.5)")
+        self.assertTrue((bands[:, 1:, 10:] == 6).all(), "3 m → 带 6 (2.5..4)")
+        # 膨胀：0.4 m 处 r=0.102 m 对应 f·r/z ≈ 277*0.102/0.4 ≈ 71 px ≈ 4.4 格，右侧 3 m 区会被近处带 1 侵蚀。
+        r = self.run_pre(self.tmp / "ds_dil", self.eps)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        bands_d = self.bands_of(self.tmp / "ds_dil")
+        self.assertTrue((bands_d[:, 1:, 10:14] == 1).all(), "包络膨胀把带 1 推进右侧 ≥4 格")
+        self.assertTrue((bands_d[:, 1:, 16:] == 6).all(), "远处格仍是带 6")
+        self.assertTrue((bands_d[:, 0, :10] == 1).all() and (bands_d[:, 0, 16:] == 7).all(),
+                        "顶行天空格被近处带 1 覆盖，远离近处的仍是带 7（inf 本身不向外膨胀）")
+        # 部分 episode 缺深度 → 拒绝（一个包要么全有要么全无）。
+        ep = self.eps[1]
+        actions = ep / "actions.jsonl"
+        rows = [json.loads(line) for line in actions.read_text().splitlines() if line]
+        for row in rows:
+            row.pop("depth_file", None)
+        actions.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        r = self.run_pre(self.tmp / "ds_partial", self.eps)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("部分缺失", r.stderr)
+
+    def test_dilate_by_envelope_bounded_by_grid(self):
+        # 一个极近的格（3DGS 深度 1e-6 m：相机贴着/钻进 splat）会让膨胀半径算到 1.8e6 格；
+        # 偏移循环若按该半径走是 (2r+1)^2 ≈ 1e13 次，preprocess 卡死不报错。
+        # 超出网格的偏移本就不落任何格，循环上界只能是网格尺寸；结果与原算法逐格相同。
+        import signal
+        import numpy as np
+        sys.path.insert(0, str(REPO / "tools"))
+        import preprocess as pre
+        cells = np.full((2, 15, 20), 5.0, dtype=np.float32)
+        cells[0, 7, 10] = 1e-6
+        cells[1, 0, 0] = 0.4  # 普通近处格：半径 ≈ 4.4 格，只影响附近
+
+        def on_alarm(*_):
+            raise TimeoutError("dilate_by_envelope 没在 10 s 内结束（偏移循环没按网格截断）")
+        old = signal.signal(signal.SIGALRM, on_alarm)
+        signal.alarm(10)
+        try:
+            out = pre.dilate_by_envelope(cells, 277.128, 16.0, 0.102)
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old)
+        self.assertTrue((out[0] == np.float32(1e-6)).all(), "极近格覆盖整张网格")
+        self.assertEqual(out[1, 0, 0], np.float32(0.4))
+        self.assertEqual(out[1, 0, 4], np.float32(0.4), "4 格内被近处格覆盖")
+        self.assertEqual(out[1, 0, 5], np.float32(5.0), "5 格外不受影响")
+        self.assertEqual(out[1, 14, 19], np.float32(5.0))
 
     def test_forest_version_accepted_without_frozen_flag(self):
         # forest_e1 与柱阵同约定「版本串 = salt」；episode manifest 不带 split_salt，按 geometry_version 复算。

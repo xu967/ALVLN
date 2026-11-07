@@ -3,6 +3,11 @@
 
 与 collect.py 的 teacher 分支同构：动作来自当前帧，推理在发指令之前完成。
 输入缩放口径与 tools/preprocess.py 一致（PIL bilinear，320x240 -> 模型 HxW）。
+
+双帧 / prev-action 模型（STUDENT-P2，hello 里 in_c=6 / prev_action_dim=4）：上一帧与上一步动作
+由本类缓存——推理进程按步无状态（一步 = 当前帧 + 上一帧 + 1 字节 prev-action），集边界只有
+采集脚本知道，所以缓存放 Python 侧，换集时调 reset()。首帧与训练时的打包口径一致：
+上一帧 = 当前帧、prev-action = 0（SAFE）。
 """
 import json
 import os
@@ -27,6 +32,12 @@ RESAMPLE = (Image.Resampling.BILINEAR if hasattr(Image, "Resampling")
 
 class StudentPolicy:
     """推理进程只启动一次；每帧写 RGB 字节、读一行 JSON。"""
+
+    # 类级默认：tools/check_input_parity.py 用 __new__ 绕过 __init__ 构造单帧实例，
+    # 这些字段必须有值才能让 act() 仍只发 h*w*3 字节。
+    prev_dim = 0
+    _prev_rgb = None
+    _last_action = 0
 
     def __init__(self, ckpt, infer_bin=None, text_ids=None, timeout_s=30.0):
         if not math.isfinite(timeout_s) or timeout_s <= 0:
@@ -59,8 +70,13 @@ class StudentPolicy:
         self.h = int(hello["in_h"])
         self.w = int(hello["in_w"])
         self.in_c = int(hello["in_c"])
-        if self.in_c != 3:
-            self._abort_start(f"模型输入通道 {self.in_c} != 3，相机是 RGB")
+        if self.in_c not in (3, 6):
+            self._abort_start(f"模型输入通道 {self.in_c} 不是 3（单帧）或 6（双帧），相机是 RGB")
+        # prev-action 维度：0 = 不接；4 = 四动作 one-hot。其它值说明模型与 collect 的动作集不符。
+        self.prev_dim = int(hello.get("prev_action_dim", 0))
+        if self.prev_dim not in (0, 4):
+            self._abort_start(f"模型 prev_action_dim {self.prev_dim} 不是 0 或 4")
+        self.aux_classes = int(hello.get("aux_classes", 0))  # 仅记录；部署时辅助头不算
         # 非四动作模型会让越界动作在 collect 里静默变成悬停，闭环数字看似正常但无意义。
         # 用 get：旧 infer 没有该字段时应走 _abort_start 杀掉子进程，而不是 KeyError 泄漏。
         classes = hello.get("num_classes")
@@ -77,23 +93,45 @@ class StudentPolicy:
 
         否则每集第一帧的推理要多花约 0.4 s，动作基于更旧的画面。
         """
-        if not self._exchange(bytes(self.h * self.w * self.in_c), "warmup"):
+        # 一步 payload = in_c/3 张 HWC 帧 + prev-action 1 字节（见 src/infer.cpp）。
+        zeros = bytes(self.h * self.w * self.in_c) + (bytes(1) if self.prev_dim else b"")
+        if not self._exchange(zeros, "warmup"):
             self._abort_start(f"推理进程 warmup 失败：{self._stderr()}")
 
-    def act(self, msg):
-        """gz.msgs.Image dict -> (action, infer_ms, probs)。解码/推理失败抛异常。"""
+    def reset(self):
+        """集边界：清掉上一帧/上一步动作缓存，下一帧按首帧口径发（上一帧=自身、prev=SAFE）。"""
+        self._prev_rgb = None
+        self._last_action = 0
+
+    def act(self, msg, prev_action=None):
+        """gz.msgs.Image dict -> (action, infer_ms, probs)。解码/推理失败抛异常。
+
+        prev_action：上一步真正执行的动作（采集脚本有安全接管时与模型输出不同）；
+        None 时用模型自己上一步的输出。单帧且不接 prev-action 的模型忽略缓存。
+        """
         w, h, nch, rows = save_frame.decode(msg)
         if nch not in (3, 4):
             raise ValueError(f"RGB 通道数 {nch} 不支持")
         mode = "RGB" if nch == 3 else "RGBA"
         im = Image.frombytes(mode, (w, h), rows).convert("RGB")
-        im = im.resize((self.w, self.h), RESAMPLE)
-        line = self._exchange(im.tobytes(), "act")
+        cur = im.resize((self.w, self.h), RESAMPLE).tobytes()
+        payload = cur
+        if self.in_c == 6:
+            payload += self._prev_rgb if self._prev_rgb is not None else cur
+        if self.prev_dim:
+            prev = self._last_action if prev_action is None else int(prev_action)
+            if not 0 <= prev < self.prev_dim:
+                raise ValueError(f"prev_action {prev} 越界（0..{self.prev_dim - 1}）")
+            payload += bytes([prev])
+        line = self._exchange(payload, "act")
         if not line:
             raise RuntimeError(f"推理进程无输出：{self._stderr()}")
         obj = json.loads(line)
         self.frames += 1
-        return int(obj["action"]), float(obj["infer_ms"]), obj["probs"]
+        action = int(obj["action"])
+        self._prev_rgb = cur
+        self._last_action = action
+        return action, float(obj["infer_ms"]), obj["probs"]
 
     def _exchange(self, payload, stage):
         # 同时约束写入和读完整行：仅给 readline 加超时挡不住不消费 stdin 的进程。

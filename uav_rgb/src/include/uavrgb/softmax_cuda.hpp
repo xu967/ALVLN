@@ -3,6 +3,7 @@
 // 接口与 ops.hpp 的 CPU 参考 softmax_ce_loss / softmax_ce_grad 对称，便于对拍（doc 04 §6 N3）。
 #include "uavrgb/tensor.hpp"
 
+#include <cstdint>
 #include <vector>
 
 namespace uavrgb {
@@ -19,5 +20,9 @@ float softmax_ce_loss_weighted_cuda(const Tensor& logits, const std::vector<int>
                                     const std::vector<float>& weights);
 Tensor softmax_ce_grad_weighted_cuda(const Tensor& logits, const std::vector<int>& labels,
                                      const std::vector<float>& weights);
+
+// 逐格版（spatial_ce_cuda.cu）：口径同 ops.hpp 的 spatial_ce_loss / spatial_ce_grad。
+float spatial_ce_loss_cuda(const Tensor& logits, const std::vector<std::uint8_t>& targets);
+Tensor spatial_ce_grad_cuda(const Tensor& logits, const std::vector<std::uint8_t>& targets);
 
 }  // namespace uavrgb

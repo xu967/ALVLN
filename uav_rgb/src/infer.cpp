@@ -41,36 +41,50 @@ std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream
   const int w = model.in_w;
   const int c = model.c1.in;
   const int ncls = model.fc.out;
-  if (h <= 0 || w <= 0 || c <= 0 || ncls <= 0) {
+  if (h <= 0 || w <= 0 || c <= 0 || c % kRgbChannels != 0 || ncls <= 0) {
     throw std::invalid_argument("infer: 模型尺寸非法");
   }
-  const std::size_t frame = static_cast<std::size_t>(h) * w * c;
-  std::vector<std::uint8_t> rgb(frame);
-  std::vector<std::uint8_t> chw(frame);
+  // 一步的输入 = images 张 HWC RGB（双帧模型：当前帧、上一帧，各 h*w*3 字节，顺序固定）
+  // + prev-action 1 字节（模型接 prev-action 时）。CHW 里通道 0..2 是当前帧、3..5 是上一帧。
+  const int images = c / kRgbChannels;
+  const std::size_t one = static_cast<std::size_t>(h) * w * kRgbChannels;
+  const std::size_t payload = one * images + (model.prev_dim > 0 ? 1 : 0);
+  std::vector<std::uint8_t> rgb(payload);
+  std::vector<std::uint8_t> chw(one * images);
   std::vector<double> probs(static_cast<std::size_t>(ncls));
   std::size_t frames = 0;
   // 权重常驻显存，每帧只上传 h*w*c 字节；/255 在设备侧做，与训练 DeviceCnn 同一个 kernel、
   // 同一舍入（host load_images 也写成 x/255.0f；闭环与打包两条输入路对拍见 tools/check_input_parity.py）。
+  // 辅助头不在这里算：DeviceCnn 只有 aux_loss 才跑它，部署路径的 MAC 与单头模型相同。
   DeviceCnn dev(model, /*max_batch=*/1);
 
   while (true) {
-    in.read(reinterpret_cast<char*>(rgb.data()), static_cast<std::streamsize>(frame));
+    in.read(reinterpret_cast<char*>(rgb.data()), static_cast<std::streamsize>(payload));
     if (in.gcount() == 0) break;  // 干净 EOF
-    if (in.gcount() != static_cast<std::streamsize>(frame)) {
+    if (in.gcount() != static_cast<std::streamsize>(payload)) {
       throw std::runtime_error("infer: 帧数据不足（截断）");
     }
 
-    for (int ch = 0; ch < c; ++ch) {  // HWC → CHW
-      for (int y = 0; y < h; ++y) {
-        for (int xx = 0; xx < w; ++xx) {
-          const std::size_t src = (static_cast<std::size_t>(y) * w + xx) * c + ch;
-          chw[(static_cast<std::size_t>(ch) * h + y) * w + xx] = rgb[src];
+    for (int f = 0; f < images; ++f) {  // 每张 HWC → CHW，按帧序堆叠
+      const std::uint8_t* src_img = rgb.data() + one * f;
+      std::uint8_t* dst_img = chw.data() + one * f;
+      for (int ch = 0; ch < kRgbChannels; ++ch) {
+        for (int y = 0; y < h; ++y) {
+          for (int xx = 0; xx < w; ++xx) {
+            const std::size_t src = (static_cast<std::size_t>(y) * w + xx) * kRgbChannels + ch;
+            dst_img[(static_cast<std::size_t>(ch) * h + y) * w + xx] = src_img[src];
+          }
         }
       }
     }
+    const std::uint8_t prev = model.prev_dim > 0 ? rgb[payload - 1] : 0;
+    if (model.prev_dim > 0 && prev >= model.prev_dim) {
+      throw std::runtime_error("infer: prev-action 字节越界: " + std::to_string(prev));
+    }
 
     const auto t0 = std::chrono::steady_clock::now();
-    const Tensor logits = dev.forward(chw.data(), 1, text.empty() ? nullptr : text.data());
+    const Tensor logits = dev.forward(chw.data(), 1, text.empty() ? nullptr : text.data(), nullptr,
+                                      model.prev_dim > 0 ? &prev : nullptr);
     const auto t1 = std::chrono::steady_clock::now();
     if (logits.numel() != static_cast<std::size_t>(ncls)) {
       throw std::runtime_error("infer: logits 维度与 num_classes 不符");
