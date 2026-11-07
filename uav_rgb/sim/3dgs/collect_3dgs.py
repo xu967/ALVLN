@@ -189,6 +189,11 @@ class DaggerPolicy:
         self.last_expert = None
         self.n_expert_exec = 0
 
+    def reset(self):
+        """集边界：清学生的帧/动作缓存（StudentAdapter 只在构造时 reset，而本对象整轮复用）。"""
+        self.student.student.reset()
+        self.last_expert = None
+
     @property
     def n_plan_fail(self):
         return self.expert.n_plan_fail
@@ -276,6 +281,8 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
         policy.n_plan_fail = 0
     if hasattr(policy, "n_expert_exec"):
         policy.n_expert_exec = 0
+    if hasattr(policy, "reset"):         # DAgger 学生跨集复用同一个推理进程：双帧 / prev-action 缓存按集清（同 StudentAdapter）
+        policy.reset()
     t_wall = time.perf_counter()
 
     try:

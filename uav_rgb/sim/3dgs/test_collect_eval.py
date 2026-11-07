@@ -256,6 +256,15 @@ class TestEval3dgs(unittest.TestCase):
         collect.StudentAdapter(s)
         collect.StudentAdapter(s)
         self.assertEqual(s.resets, 2)
+        # DAgger 采集整轮复用一个 DaggerPolicy：run_episode 开头调 policy.reset() 也要落到学生
+        class FakeExpert:
+            planner_name, stop_radius, n_plan_fail = "astar_occ", 0.5, 0
+
+        import random
+        dp = collect.DaggerPolicy(s, FakeExpert(), 0.5, random.Random(0))
+        dp.last_expert = 1
+        dp.reset()
+        self.assertEqual((s.resets, dp.last_expert), (4, None))
 
     def test_forward_mock_eval(self):
         with tempfile.TemporaryDirectory() as tmp:
