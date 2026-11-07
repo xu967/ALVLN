@@ -158,3 +158,36 @@
 2. **自采场景的采集设备与场地**：手机还是运动相机；室内走廊/实验室还是校园室外；决定后 `DATASET_3DGS_SELF_CAPTURE.md` 的参数表细化。
 3. **需要用户申请的数据集账号**：DL3DV（Terms of Use，研究可用）、ScanNet++（账号申请）。不申请就只用 Callinstrasse + Wanderland + Mip-NeRF 360 + Zip-NeRF。
 4. **SAFE 的语义**（DATA/SITL 报告都指出）：E1 的 SAFE 不是「停住」而是滑行 0.07–0.21 m 再漂移；教师在柱旁输出 SAFE 对 E1 不安全。两条路：执行器加位置保持（SITL 侧，优先）或教师近柱不输出 SAFE（改标签语义，要 bump 版本）。等 SITL 报告出来一起定。
+
+## 更新 2026-11-07 13:40（第四阶段收口、第五阶段审核中；按用户「更新布局」要求）
+
+### 事实变化
+
+- M0 过线：`check.sh` 全过；SITL 倒飞/漂移有根因并修复（2b479cc，lib v2）；四组对照 n=20 已出（`docs/experiments/2026-11-07-e1-demo-plan.md` §3.2）：教师 19/20、新 E1 学生 7/20、旧 X3 学生 2/20、盲前进 2/20；碰撞 0.05 / 0.40 / 0.45 / 0.90。
+- M1 场景提前达成：Callinstrasse（6 路线，60°，v3 pilot 20/20）、Wanderland 1MlUucug（6 路线，LiDAR 真值碰撞，冒烟 11/12）、Mip-NeRF 360 garden / bicycle（各 6 路线，冒烟 23/24）。4 个真实外观场景可飞；stump 只对齐未配路线；DL3DV / ScanNet++ 仍待用户申请。
+- **P1 第 0 轮是负结果**（`reports/TEACHER_P1_20261107.md` §3–§4）：Callinstrasse pilot 上 soft 4–6/18 vs hard 12–13/18，DAgger 一轮后 soft 5/18 无改善。决定性消融：只把 8.7% 标签换成 `teacher_kino` argmin 的硬标签，SR 13→5。根因在 `teacher_kino` 代价模型（走廊里小角度航向修正被判为不值得 + 剪枝键不含速度使 SAFE 代价低估），示范专家（`astar_occ`）与标注专家（`teacher_kino`）不一致。链路本身（`plan_costs`、`teacher_belief`、`--policy student`、`dagger_pipeline`）跑通有测试，已落分支 `teacher-p1` a4b932e，未合并。
+- P2 已落分支 `student-p2` ed25f52，REVIEW-P2 审核中；DISTILL agent 正在独立评估 prev-action 输入的「复读机」风险，P2 合并前要它的结论。
+- 机器：cgroup 实测 12 核（非 88），20% 周期限流；gz 只能 `UAVRGB_RENDER_BACKEND=software`（EGL 后端段错误）；08:03 IDE 会话中断杀掉全部非守护进程，守护进程存活。W5 的「长任务一律守护进程」从建议升为硬规则（已在 personal-skill §6.9）。
+
+### W2 教师算法改向（替换 §W2 的 P1 实施路径，叙事不变）
+
+P1 的叙事「cost-to-go 软标签 + 信念边际化 + DAgger」保留，实施改为：
+
+1. **统一代价模型**：给示范教师 `astar_occ`（3DGS）与 `teacher.py` A*（Gazebo）实现逐动作 cost-to-go：四个原语各执行一步后的位姿 → 同一测地场的剩余代价 + 一步；argmin 按构造等于硬标签。软标签只来自这一个代价模型。`teacher_kino` 保留为 Gazebo 教师线的 kinodynamic 变体，不再做 3DGS 标注。
+2. **先 Gazebo 后 3DGS**：柱阵真值简单、20 独立几何评测现成，hard vs soft（同一教师）先在 Gazebo 做对照，n≥20，Wilson 区间不重叠才上 3DGS。
+3. **信念边际化**建在同一测地场上：未知格按假设采样后重算测地场，QMDP 平均，温度 α 由代价尺度推出（≤0.25 步）并写出依据；不再与 `teacher_kino` 搜索耦合。
+4. DAgger 用同一教师做在环纠正；每轮集数与轮数按 Wilson 区间宽度定（DISTILL 报告给方案）。
+
+### 里程碑调整
+
+| 里程碑 | 原日期 | 现状 / 新日期 |
+| --- | --- | --- |
+| M0 审计与基线 | 11-07 | 达成（第五阶段 4 份独立审核报告 13:xx 收齐后关闭） |
+| M1 场景 | 11-09 | 达成（4 场景）；11-09 前补：第二个 Wanderland 场景、stump 路线、第一轮 20 集/场景 pilot |
+| M2 Demo | 11-12 | 不变；短片 v1 由 VIZ-LAYOUT 今日出（统一 1280×720 版式） |
+| M3 算法 v1 | 11-20 | 不变，内容改为上面的 W2 改向 + P2（视 DISTILL/REVIEW-P2 结论）；森林跨场景矩阵一格今日出 |
+| M4 论文材料 | 12-05 | 不变 |
+
+### 第五阶段 agent（11-07 13:00 起，并发 6）
+
+REVIEW-P2 / REVIEW-SITL / REVIEW-EVAL / REVIEW-3DGS（独立审核，`BRIEF_REVIEW.md`）、DISTILL（蒸馏环节判断，`BRIEF_DISTILL.md`）、VIZ-LAYOUT（版式统一 + 短片 v1，`BRIEF_VIZ_LAYOUT.md`）。排队：TEACHER-P1b（W2 改向实现）、SCENE-A 续（第二个 Wanderland 场景）、SCENE-B 续（stump 路线 / treehill / flowers）。
