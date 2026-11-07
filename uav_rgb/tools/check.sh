@@ -152,6 +152,12 @@ echo "PASS: preprocess 教师标签/几何隔离/重复目录/split 门禁 负�
 for uav_check_test in "$uav_check_root"/sim/tools/test_*.py; do
   "$UAV_RGB_PYTHON" "$uav_check_test"
 done
+# tools/ 下的纯 Python 测试（打包侧车/深度分带、seed 独立性、统计公式、3DGS 工具的 mock 路径）之前没进门禁
+# （REVIEW-P2 #4 / R2-SRC Should fix #2）：P2 的全部打包侧测试只靠人手跑。test_train_student_with_video 在下面单列。
+for uav_check_test in "$uav_check_root"/tools/test_*.py; do
+  [[ "$uav_check_test" == */test_join_soft_targets.py || "$uav_check_test" == */test_train_student_with_video.py ]] && continue
+  "$UAV_RGB_PYTHON" "$uav_check_test"
+done
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_monitor.py"
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_trainer_demo.py"
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_studio.py"
