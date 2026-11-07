@@ -1,7 +1,7 @@
 # progress.md（新开会话先读这个）
 
-- 更新：2026-11-07 16:50（第六阶段审核收口 + eval3 出数 + 方案盘点；最新一段见「第三阶段」列表末尾 15:30–16:50 条目）
-- **现在在跑（16:50）**：守护进程 ① 森林跨场景 lib v3 `xeval-forest-sparse-20261107-1600`（PGID 1195540）② 成功线截断 + L/R 可见化重采流水线 `e1-pipeline-20261107-1620-sgvis`（PGID 1216165，pilot→collect 300→训→20 seed 评，约 19:00 出）。子 agent 5 个：VIZ-LAYOUT 二轮、R2-UIDOCS、R2-REPRO、FIX-SITL（批次 C）、FIX-3DGS（批次 D）。**两个守护进程 DONE 之前不许改写 `tmp/build-cf-sitl`**（v3.1 就地重建等它们）。
+- 更新：2026-11-07 17:15（第七阶段算法优化 agent 派出；最新条目见「第三阶段」列表末尾 15:30–17:10）
+- **现在在跑（16:50）**：守护进程 ① 森林跨场景 lib v3 `xeval-forest-sparse-20261107-1600`（PGID 1195540）② 成功线截断 + L/R 可见化重采流水线 `e1-pipeline-20261107-1620-sgvis`（PGID 1216165，pilot→collect 300→训→20 seed 评，约 19:00 出）。子 agent 6 个：VIZ-LAYOUT 二轮、R2-UIDOCS、FIX-SITL（批次 C）、FIX-3DGS（批次 D）、TEACHER-COST、DAGGER-GZ（算法，简报 `tmp/phase3-20261107/BRIEF_ALGO.md`）；排队 STUDENT-SELECT、FIX-A。**两个守护进程 DONE 之前不许改写 `tmp/build-cf-sitl`**（v3.1 就地重建等它们）。
 - 方案效果盘点：`docs/experiments/2026-11-07-approach-scoreboard.md`；方向计划最新一节：`docs/PLAN_2026-11-07_demo_and_paper.md` 「更新 16:40」；修复清单：`tmp/phase3-20261107/FIXLIST_R2.md`。
 
 ## 第三阶段（2026-11-07 05:10 起）
@@ -54,6 +54,7 @@
 - 16:40 PLAN 追加更新（W2 实施顺序：标签定义层 → DAgger 层 → 统一代价模型层；M0 关闭；M3 过线判据相对 eval3 基准 n≥60）。
 - 16:45 R2-REPRO 报告（从 ALVLN 镜像 6d7c258 克隆按文档从零跑）：代码每步都能跑通，但只带 GitHub + 文档的人会卡在 README 第 4 行 `check.sh`（venv 缺 cv2）和 README 第一条 Gazebo 命令（默认 gpu 后端段错误）；固件来源无文档。4 Must fix / 7 Should fix 全部处理：文档修补 6 文件合并（ae0b031）；代码侧主会话修 `env.sh` PATH 拼接 bug（`${!var:+:${!var}}`，干净 shell 实测 nvcc 可见、二次 source 幂等）、`tools/requirements.txt` 加 `opencv-python-headless>=4.8,<6`、`check.sh` SKIP 进 stderr + 末行 PASS 列出未检查段。
 - 16:55 **check.sh --python-only 抓到 DEV-DATA 合并的回归**：`collect_one` 现在给 `student.act(msg, prev_action=…)`，`sim/tools/test_rendering.py` 的 mock Student 没有该参数 → 3 failures。修：mock 签名对齐 `StudentPolicy.act(msg, prev_action=None)`；test_rendering 6/6 OK，重跑 python-only 全量见 `tmp/main-session/check-python-only-1658.log`。教训：子 agent 只跑自己域的套件，合并前主会话要跑一遍 `check.sh --python-only`（4–5 min）。
+- 17:10 **第七阶段：按大方向优化算法**（用户 17:01 要求）。简报 `tmp/phase3-20261107/BRIEF_ALGO.md`（§0 算法 agent 公共规则：什么算优化 / 禁止项 / 冻结口径表 / gz 闸门；§1–§4 四个 agent）。先派两个（并发 6）：**TEACHER-COST**（`wt-teacher-cost`：teacher.py `geodesic_field` + `plan_costs` + `plan_action_costmap`，接 `--teacher-planner costmap`，离线重标分析，闭环 ① costmap 教师 20 seed 预注册 SR≥19/20 碰撞 0，闭环 ② trunc 重标学生对照 eval3 截断臂 13/20，软标签 α∈{0.25,0.5,1} 离线）、**DAGGER-GZ**（`wt-dagger-gz`：`tools/dagger_gz_pipeline.py` 3 轮 β 0.5/0/0 × 100 集 + more_demos 对照臂 + 基线复用条件 + 60 seed 清单 + 专家不一致率；测试；森林 DONE 后 2 gz smoke；正式跑由主会话在 sgvis DONE 后起）。排队：**STUDENT-SELECT**（逐轮 ckpt + `select_ckpt.py` 空画面 YAW 率判据 + 训练噪声 3 seed + 双帧反事实探针）、**FIX-A**（批次 A：评测器成功线停 + metric_version 等）。gz 闸门：森林 DONE 前任何 agent 不起 gz；sgvis DONE 前每 agent ≤2。
 - **异常**：`tmp/wt-fix-b`（分支 fix-b）+ `tmp/agent8-fix-b` 于 15:54:46 从 main 6c4a0b5 建出，空、无进程、无提交，不是本会话或其子 agent 建的（记录里都没有）。未删；派 FIX-B 前先确认来源与内容。
 - 主会话 worklog：`docs/worklog/2026-11-07-0515-phase3-main-session.md`（08:00 第五阶段、14:00 恢复与清理、16:50 审核收口与 eval3 小节）。
 - 待办（16:50 起）：收 VIZ-LAYOUT 二轮 → 合并 → D7（video.py 标题/结果字）与 D8（scene.json notes）→ 重录四组视频 → 短片 v2；收 R2-UIDOCS / R2-REPRO → 合并文档修补 → 按清单删废弃文件；收 FIX-SITL → 等两个守护进程 DONE → `mv tmp/build-cf-sitl tmp/build-cf-sitl-v3-20261107` 就地重建 v3.1 → 森林/后续评测都用 v3.1；收 FIX-3DGS → 合并；派 FIX-A（含评测器成功线停 + metric_version 升版，改完 eval3 五组同 seed 重算）/ FIX-B；sgvis 出数 → 对照截断臂 13/20 与碰撞 → 起 DAgger 第 0 轮（3 轮 × 100 集，β 0.5→0，带再采 300 集对照臂）；TEACHER-P1b 统一代价模型。

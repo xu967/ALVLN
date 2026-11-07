@@ -234,3 +234,7 @@ P2 代码在 main 但不进流水线（DISTILL 反事实探针：prev-action 在
 ### 第六阶段 agent（16:40 状态，并发 6）
 
 跑中：VIZ-LAYOUT 二轮、R2-UIDOCS、R2-REPRO、FIX-SITL（批次 C）、FIX-3DGS（批次 D）。排队：FIX-A（sim/tools 流水线，含评测器成功线停）、FIX-B（src）；TEACHER-P1b（统一代价模型）在 sgvis 出数后派。守护进程：森林跨场景 lib v3（PGID 1195540）、sgvis 流水线（PGID 1216165）。
+
+### 第七阶段 agent（17:10 起；简报 `tmp/phase3-20261107/BRIEF_ALGO.md`）
+
+按 W2 的 1→2→3 顺序，把第 2、3 层的实现同时开工（第 1 层 sgvis 在跑）：TEACHER-COST（统一代价模型教师：`plan_costs` / `plan_action_costmap`，costmap 教师先过 20 seed 闭环 ≥19/20 才算示范者；trunc 重标学生对照 13/20 作为代价模型的「消融式验证」；软标签只从这一个 Q 来，α 三档离线，闭环一档）、DAGGER-GZ（Gazebo DAgger 流水线 + more_demos 对照臂 + 60 seed 清单 + 专家不一致率；正式跑在 sgvis DONE 后）。排队：STUDENT-SELECT（模型选择判据 + 训练噪声 + 双帧反事实探针）、FIX-A（评测器成功线停 + metric_version）。规则：每个改动先预注册预测与证伪条件；闭环是裁判；禁止权重网格 / smoothing / 增强 / 门控 / 滞回。
