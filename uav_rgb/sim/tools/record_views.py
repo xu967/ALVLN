@@ -5,6 +5,7 @@
            SIGTERM 结束（eval_closed_loop 用 stop_group 收）。纯 stdlib，任意解释器可跑。
   compose  读帧 + actions/oracle.jsonl，按同一分桶网格合成 1280x720 视频：
            追尾 | 顶视（叠加轨迹、碰撞点、终点线） / 机载 | 状态面板（动作、速度、碰撞）。
+           网格、贴图、面板的版式在 view_layout.py，与 3DGS 的 sim/3dgs/video.py 共用同一份。
            --out 以 .webm 结尾用 VP8（浏览器可直接播放）；其他扩展名用 mp4v（浏览器放不了，
            只为兼容旧调用）。本机 cv2 没有 H.264 编码器。需要 cv2+numpy（.venv-tools / 3dgs-venv）。
 
@@ -25,13 +26,13 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gz_io
 import save_frame
+import view_layout as vl
+from view_layout import onboard_label  # noqa: F401 - 机载标题文案归版式模块，这里保留名字给 compose 与测试用
 
 CAMS = {"uav": "/uav/camera", "chase": "/uav/chase_camera", "top": "/uav/top_camera"}
 FPS = 10                      # 视频帧率 = 每仿真秒 10 帧
 STALE_AFTER_S = 1.0           # 帧龄超过此值标 STALE（相机 10–30 Hz，1 s 已是停更）
 LEGEND_TOP = 44               # 顶视图例首行 y：TOP 标签（y=22）之下、criterion 文字（右上）之外
-ACTIONS = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
-ACTION_BGR = ((200, 200, 200), (80, 200, 80), (230, 160, 40), (40, 160, 230))
 
 
 def _src(step):
@@ -251,29 +252,30 @@ def compose(frames_dir, ep_dir, world_path, out_path, title="", result="",
     stuck = stuck_step(actions)
     hit_mark = _step_mark(hit, oracle, t_end)
     stuck_mark = _step_mark(stuck, oracle, t_end)
-    W, H = 1280, 720
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*fourcc_for(out_path)), FPS, (W, H))
+    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*fourcc_for(out_path)), FPS,
+                             (vl.W, vl.H))
     if not writer.isOpened():
         raise RuntimeError(f"cv2.VideoWriter 打不开 {out_path}（fourcc={fourcc_for(out_path)}）")
     n_end = int(hold_end_s * FPS)
     frames = 0
     try:
         for k, t in enumerate(times + [t_end] * n_end):
-            canvas = np.zeros((H, W, 3), np.uint8)
+            canvas = np.zeros((vl.H, vl.W, 3), np.uint8)
             old = {key: readers[key].i for key in CAMS}
             images = {key: readers[key].at(t + period - 1) for key in CAMS}
             notes = {key: _frame_note(readers[key].ts, readers[key].i, old[key], t)
                      for key in CAMS}
-            _paste(cv2, canvas, images["chase"], 0, 0, 640, 360, "CHASE", *notes["chase"])
+            vl.paste(cv2, canvas, images["chase"], *vl.CELL_TL, vl.CW, vl.CH, "CHASE",
+                     *notes["chase"])
             top = images["top"]
             if top is not None:
                 top = top.copy()
                 _draw_top(cv2, top, top_cam, track, t, hit_mark, stuck_mark, goal_x,
                           waypoint, success_criterion, goal_radius)
-            _paste(cv2, canvas, top, 640, 0, 640, 360, "TOP", *notes["top"])
-            _paste(cv2, canvas, images["uav"], 0, 360, 640, 360,
-                   onboard_label(images["uav"], hfov_deg), *notes["uav"])
-            _panel(cv2, canvas, 640, 360, t, t0, t_end, actions, track, hit, stuck, title,
+            vl.paste(cv2, canvas, top, *vl.CELL_TR, vl.CW, vl.CH, "TOP", *notes["top"])
+            vl.paste(cv2, canvas, images["uav"], *vl.CELL_BL, vl.CW, vl.CH,
+                     onboard_label(images["uav"], hfov_deg), *notes["uav"])
+            _panel(cv2, canvas, *vl.CELL_BR, t, t0, t_end, actions, track, hit, stuck, title,
                    result if k >= len(times) else "")
             writer.write(canvas)
             frames += 1
@@ -293,35 +295,6 @@ def _step_mark(step, oracle, t_end):
         g = o["pose_gt"]
         return ((g["x"], g["y"], g.get("z", 0.0)), o.get("timestamp_ns") or t_end)
     return None
-
-
-def onboard_label(img, hfov_deg=None):
-    """机载面板标题写相机实际分辨率和水平 FOV（取自本集 world SDF，不是硬件文档值：
-    e1_mini.json camera_fov 是 64.9°，模板仍是 X3 的 60°，写出来才看得见这个差异）。
-    以前写 "(model input)"：画面是 320x240 的相机帧，模型吃的是 student.py 再缩放后的
-    输入（本仓库 160x120），录像里拿不到那个尺寸，不冒充。"""
-    if img is None:
-        return "ONBOARD"
-    fov = f" HFOV {hfov_deg:.0f}deg" if hfov_deg else ""
-    return f"ONBOARD {img.shape[1]}x{img.shape[0]}{fov} camera (model input is resized)"
-
-
-def _paste(cv2, canvas, img, x, y, w, h, label, note="", note_color=(235, 235, 235)):
-    """按比例缩放居中贴到 (x,y,w,h)；没有帧时写 NO FRAME，并在右下角标帧龄。"""
-    if img is None:
-        cv2.putText(canvas, label + ": NO FRAME", (x + 20, y + h // 2),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-        return
-    ih, iw = img.shape[:2]
-    s = min(w / iw, h / ih)
-    nw, nh = int(iw * s), int(ih * s)
-    ox, oy = x + (w - nw) // 2, y + (h - nh) // 2
-    canvas[oy:oy + nh, ox:ox + nw] = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
-    cv2.putText(canvas, label, (x + 8, y + 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
-                (255, 255, 255), 2)
-    if note:
-        cv2.putText(canvas, note, (x + 8, y + h - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-                    note_color or (235, 235, 235), 1)
 
 
 def _draw_top(cv2, img, cam, track, t, hit_mark, stuck_mark, goal_x, waypoint,
@@ -415,8 +388,7 @@ def _active(actions, t):
 
 
 def _panel(cv2, canvas, x, y, t, t0, t_end, actions, track, hit, stuck, title, result):
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    white = (235, 235, 235)
+    """把本集数据整理成公共面板的几行字 / 动作段；版式本身在 view_layout.panel。"""
     # 与各视角角标同一口径：绝对仿真时间；括号里才是从视频第一帧起算的时长。
     # 以前面板只写相对时长，角标写绝对时间，同一画面两个数差 t0（基线 demo 差 5.6 s）。
     lines = [title, f"sim t = {t / 1e9:.2f} s  (video +{(t - t0) / 1e9:.1f} s)"]
@@ -431,34 +403,19 @@ def _panel(cv2, canvas, x, y, t, t0, t_end, actions, track, hit, stuck, title, r
         if prev:
             d = math.dist(past[-1][1:3], prev[-1][1:3])
             lines.append(f"speed {d / max((past[-1][0] - prev[-1][0]) / 1e9, 1e-3):4.2f} m/s")
-    for i, s in enumerate(lines):
-        cv2.putText(canvas, s, (x + 16, y + 34 + 30 * i), font, 0.65, white, 2)
-    ay = y + 34 + 30 * len(lines) + 10
-    if cur is not None:
-        a = cur.get("action_executed", 0)
-        cv2.rectangle(canvas, (x + 16, ay - 24), (x + 330, ay + 10), ACTION_BGR[a], -1)
-        cv2.putText(canvas, ACTIONS[a], (x + 24, ay), font, 0.8, (0, 0, 0), 2)
+    flags = []
     if hit is not None and (hit.get("action_start_ns") or 0) <= t:
-        cv2.putText(canvas, f"COLLISION contact @ step {hit['step'] + 1}",
-                    (x + 16, ay + 50), font, 0.7, (0, 0, 255), 2)
+        flags.append((f"COLLISION contact @ step {hit['step'] + 1}", (0, 0, 255)))
     if stuck is not None and (stuck.get("action_start_ns") or 0) <= t:
-        cv2.putText(canvas, f"STUCK @ step {stuck['step'] + 1}",
-                    (x + 16, ay + 84), font, 0.7, (0, 165, 255), 2)
-    # 底部动作时间条：每步一段颜色，竖线是当前时刻。
-    bx0, bx1, by = x + 16, x + 624, y + 330
-    span = max(t_end - t0, 1)
+        flags.append((f"STUCK @ step {stuck['step'] + 1}", (0, 165, 255)))
+    # 动作时间条：每步一段，起止 = 本步/下步的 action_start_ns，最后一步到 t_end。
+    segments = []
     for r, nxt in zip(actions, actions[1:] + [None]):
         s = (r.get("action_start_ns") or t0) - t0
         e = ((nxt.get("action_start_ns") if nxt else t_end) or t_end) - t0
-        u0, u1 = bx0 + int((bx1 - bx0) * s / span), bx0 + int((bx1 - bx0) * e / span)
-        cv2.rectangle(canvas, (u0, by - 14), (max(u1, u0 + 1), by),
-                      ACTION_BGR[r.get("action_executed", 0)], -1)
-    u = bx0 + int((bx1 - bx0) * (t - t0) / span)
-    cv2.line(canvas, (u, by - 20), (u, by + 4), (255, 255, 255), 2)
-    if result:
-        ok = result.upper().startswith("SUCCESS")
-        cv2.putText(canvas, result, (x + 16, y + 290), font, 1.1,
-                    (80, 220, 80) if ok else (0, 0, 255), 3)
+        segments.append((s, e, r.get("action_executed", 0)))
+    vl.panel(cv2, canvas, x, y, lines, None if cur is None else cur.get("action_executed", 0),
+             flags, segments, t - t0, max(t_end - t0, 1), result)
 
 
 def main():
