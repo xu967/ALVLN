@@ -38,6 +38,41 @@ class PartitionTests(unittest.TestCase):
         self.assertFalse(item.ok)  # 缺 manifest 的失败不能被隔离测试伪装成成功
 
 
+def args_ns(**over):
+    base = dict(steps=40, hold=1.0, policy="teacher", teacher_planner="astar", rl_checkpoint="",
+                window_from="observation", dynamics="cf_sitl", save_depth=False, vehicle="e1_mini",
+                student_ckpt=None, infer_bin=None, beta=0.0, dagger_round=0,
+                stop_at_goal=False, tiebreak="legacy")
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+class CommandTests(unittest.TestCase):
+    """2026-11-07 DEV-DATA 开关的透传：默认命令行逐字不变，开了才追加对应 collect.py 参数。"""
+
+    def test_default_command_has_no_switch_flags(self):
+        cmd = parallel.collect_command(task(), args_ns())
+        self.assertEqual(cmd[2:], ["--steps", "40", "--hold", "1.0", "--out", task().staging,
+                                   "--scene-id", "42", "--seed", "42", "--episode-id", "42",
+                                   "--split", "train", "--scene-meta", "scene.json",
+                                   "--window-from", "observation", "--dynamics", "cf_sitl",
+                                   "--vehicle", "e1_mini"])
+        for flag in ("--stop-at-goal", "--tiebreak", "--beta", "--dagger-round", "--student-ckpt", "--policy"):
+            self.assertNotIn(flag, cmd)
+
+    def test_switches_pass_through(self):
+        cmd = parallel.collect_command(task(), args_ns(stop_at_goal=True, tiebreak="visible"))
+        self.assertIn("--stop-at-goal", cmd)
+        self.assertEqual(cmd[cmd.index("--tiebreak") + 1], "visible")
+        cmd = parallel.collect_command(task(), args_ns(policy="student", student_ckpt="/c.bin",
+                                                       infer_bin="/b/uavrgb_infer", beta=0.5, dagger_round=2))
+        for flag, val in (("--policy", "student"), ("--student-ckpt", "/c.bin"),
+                          ("--infer-bin", "/b/uavrgb_infer"), ("--beta", "0.5"), ("--dagger-round", "2")):
+            self.assertEqual(cmd[cmd.index(flag) + 1], val)
+        self.assertNotIn("--stop-at-goal", cmd)
+        self.assertNotIn("--tiebreak", cmd)
+
+
 class StopTests(unittest.TestCase):
     """AUDIT Q1/Q2：停止位置位后 worker 不重试、不起下一集，否则 Ctrl-C/SIGTERM 之后还会起新 gz。"""
 

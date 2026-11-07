@@ -763,6 +763,16 @@ R3 最小转向评分，约 +110–130 行。**故意排在数据采集之后**�
 11. **碰撞步的专家标签不可信**——专家撞墙时给的动作本身就是错的。用 `--drop-collision`
     过滤或降权。
 12. **场景族只有 1 个**（`family_holdout=false`）。几何去重 ≠ 泛化。
+13. **采集的三个可选开关（2026-11-07 DEV-DATA，默认全关、关着时产物逐位同旧版）**：
+    `collect.py --stop-at-goal`（真值 x 过成功线 `最远柱 x + 1.0` 即止，manifest `stopped_on_goal` +
+    `goal_line_x`，只用于 base/forest_e1；audit `episode_length` 按 manifest 放行并核对截断位置）、
+    `--tiebreak visible`（A* 教师 |Q_L−Q_R|<0.5 步的近平局改向学生视锥内最近柱的反侧；manifest
+    `teacher_tiebreak`，行内 `tie_margin_steps`；audit `label_recompute` 与 preprocess 都按该字段走，
+    混用 legacy/visible 的数据集 episodes 表能区分但 preprocess 不拦）、`--policy student` 的 DAgger
+    影子教师（`action_expert` = A* 标签、`action_executed` = 学生/教师实际执行，manifest
+    `executed_by=student` + `beta`（执行教师动作的概率，默认 0）+ `dagger_round`，与
+    `sim/3dgs/collect_3dgs.py` 同名）。`collect_parallel.py` 同名透传，`tools/e1_pipeline.py` CFG
+    `stop_at_goal` / `tiebreak`。依据与 Gazebo 验证：`docs/worklog/2026-11-07-*-dev-data.md`。
 
 ### 模型/数据格式
 

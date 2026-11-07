@@ -46,6 +46,11 @@ CFG = dict(
         #                                    # 启用前仍要：Gazebo 实测森林教师 SR（旧 0.20/0.15 方框试跑 19/20 擦柱）、评测加 forest 域（evaluate 现只跑 base）
     ),
     steps=40,                # 每集步数：A* 每步约 0.27 m（X3）/ E1 实测前飞 0.25 m，29–38 步过柱区；80 步会让一半帧在柱区外原地转
+    stop_at_goal=False,      # DISTILL §3.1：真值 x 过成功线（最远柱 x + 1.0 m，与 eval 同口径）即结束本集。0417 的 12000 帧里
+                             # 过线后 2155 帧（18%）93% 视锥内无柱、38% 标签是 YAW（看不见的目标点的函数）；离线截断重训无柱帧误转率
+                             # 22%→5%。开了后集长约 27–38 步，audit episode_length 按 manifest 放行。默认关：与 0417 基线逐位可比
+    tiebreak="legacy",       # DISTILL §3.3：A* 教师左右近平局（|Q_L−Q_R|<0.5 步，转弯帧 ~10%）的口径。"visible" 改向学生视锥内
+                             # 最近柱的反侧（0417 的 12000 帧里会改 85 帧）；"legacy" 与旧标签逐位相同。默认 legacy
     instances=4,             # gz agent 实测：4 实例 6.8 核 0.55 s/步；6 实例 8.6 核吞吐只多 10%（cgroup 12 核）
     no_aux_cameras=True,     # 采集不要 chase/top 相机：RTF 锁 1.0 时每步快 17%；录像只在评测时开
     collect_min_ok=0.95,     # 偶发丢首条起飞指令属正常（collect_parallel 自带重试一次）；低于 95% 说明环境坏了，停
@@ -182,6 +187,10 @@ def collect_into(col, episodes, base_seed, spec="base"):
         cmd += ["--density", density]
     if CFG["no_aux_cameras"]:
         cmd.append("--no-aux-cameras")
+    if CFG["stop_at_goal"]:
+        cmd.append("--stop-at-goal")
+    if CFG["tiebreak"] != "legacy":
+        cmd += ["--tiebreak", CFG["tiebreak"]]
     run(cmd, env_extra=GZ_ENV)
     if DRY:
         return

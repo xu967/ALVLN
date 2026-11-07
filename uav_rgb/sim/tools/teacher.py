@@ -413,6 +413,35 @@ def _path_carrot(path, x, y, lookahead):
     return px, py
 
 
+def _pursuit_err_deg(path, x, y, yaw_deg, lookahead):
+    """纯追踪的航向误差（度，(-180,180]）：lookahead 米处胡萝卜的方位角减当前航向；正 = 目标在左。"""
+    tx, ty = _path_carrot(path, x, y, lookahead)
+    return (math.degrees(math.atan2(ty - y, tx - x)) - yaw_deg + 180.0) % 360.0 - 180.0
+
+
+def _global_path(x, y, pillars, clearance, step, waypoint=None, stop_at_waypoint=False):
+    """plan_action_global 跟踪的那条 A* 路径；None = 无路或 waypoint 字段坏（调用方退回局部 plan_action）。
+
+    base 任务目标 (最远柱 x + 2.0, 0)：比验收线（最远柱 x + 1.0）再远 1 m，目标正好落在验收线上时
+    飞控会在终点前转头/减速，max_x 常停在 5.97 而判失败。waypoint 任务：stop_at_waypoint 时 waypoint 就是
+    终点；旧 route-choice 口径是「先到 waypoint 再到走廊终点」两段拼接。tie-break 的滚出位姿也走这里，
+    保证 Q_L/Q_R 与教师看的是同一张图、同一个目标。
+    """
+    goal = (max(float(p["x"]) for p in pillars) + 2.0, 0.0)
+    if waypoint is None:
+        return astar_path(pillars, (x, y), goal, clearance=clearance, step=step)
+    try:
+        wp = (float(waypoint["x"]), float(waypoint["y"]))
+    except (KeyError, TypeError, ValueError):
+        return None
+    if stop_at_waypoint:
+        return astar_path(pillars, (x, y), wp, clearance=clearance, step=step)
+    first = astar_path(pillars, (x, y), wp, clearance=clearance, step=step)
+    rest = (astar_path(pillars, wp, goal, clearance=clearance, step=step)
+            if first is not None else None)
+    return (first + rest[1:]) if first is not None and rest is not None else None
+
+
 def plan_action_global(x, y, yaw_deg, pillars, clearance=None, step=0.1,
                        lookahead=0.7, tol=25.0, waypoint=None,
                        stop_at_waypoint=False, stop_radius=0.5):
@@ -430,28 +459,17 @@ def plan_action_global(x, y, yaw_deg, pillars, clearance=None, step=0.1,
         clearance = ASTAR_CLEARANCE_M   # 按载具（set_vehicle）；x3 0.5
     if not pillars:
         return plan_action(x, y, yaw_deg, [], tol=tol)
-    if waypoint is not None:
+    if waypoint is not None and stop_at_waypoint:
         try:
             wp = (float(waypoint["x"]), float(waypoint["y"]))
         except (KeyError, TypeError, ValueError):
             return plan_action(x, y, yaw_deg, pillars, tol=tol)
-        if stop_at_waypoint:
-            if math.hypot(x - wp[0], y - wp[1]) <= stop_radius:
-                return SAFE_NEUTRAL
-            path = astar_path(pillars, (x, y), wp, clearance=clearance, step=step)
-        else:
-            goal = (max(float(p["x"]) for p in pillars) + 2.0, 0.0)
-            first = astar_path(pillars, (x, y), wp, clearance=clearance, step=step)
-            rest = (astar_path(pillars, wp, goal, clearance=clearance, step=step)
-                    if first is not None else None)
-            path = (first + rest[1:]) if first is not None and rest is not None else None
-    else:
-        goal = (max(float(p["x"]) for p in pillars) + 2.0, 0.0)
-        path = astar_path(pillars, (x, y), goal, clearance=clearance, step=step)
+        if math.hypot(x - wp[0], y - wp[1]) <= stop_radius:
+            return SAFE_NEUTRAL
+    path = _global_path(x, y, pillars, clearance, step, waypoint, stop_at_waypoint)
     if path is None:
         return plan_action(x, y, yaw_deg, pillars, tol=tol)
-    tx, ty = _path_carrot(path, x, y, lookahead)
-    err = (math.degrees(math.atan2(ty - y, tx - x)) - yaw_deg + 180.0) % 360.0 - 180.0
+    err = _pursuit_err_deg(path, x, y, yaw_deg, lookahead)
     if err > tol:
         return YAW_LEFT
     if err < -tol:
@@ -466,6 +484,100 @@ def plan_action_global(x, y, yaw_deg, pillars, clearance=None, step=0.1,
             return plan_action(x, y, yaw_deg, pillars, tol=tol)
         return YAW_LEFT if err >= 0 else YAW_RIGHT
     return FORWARD_SLOW
+
+
+# ---------------------------------------------------------------- L/R 近平局按可见几何决定（DISTILL §2.1 / §3.3）
+# plan_action_global 的左右决定有两处与图像无关：A* 对等长路径按 heap 顺序取一条；前向 0.4 m 被堵且 |err|≤tol 时
+# 按 `err >= 0` 的符号换向。DISTILL 2026-11-07 在 300 集上量到：转弯帧 11.6%（approach 区 24.6%）两侧代价差
+# < 0.5 步，学生拿到的 L/R 监督互相矛盾，val 上 L/R 召回逐轮翻转 0.19，ckpt_best 把 test 19.5% 的 YAW 帧预测成反向。
+# 近平局的度量照搬 agent6-distill/q1_cost_to_go.py：对 YAW_LEFT / YAW_RIGHT 各滚出一步，
+#   Q(a) = 1 + D(x′,y′)/v + max(0, |err′| − tol)/ω，D = 滚出点到目标的 A* 路长（同栅格、同膨胀、同目标）。
+TIE_V_STEP_M = 0.25          # v：E1 cf_sitl hold 1.0 s 前飞稳态位移/步（DATA 报告实测中位）。X3 约 0.27，未按载具分：
+TIE_YAW_STEP_DEG = 27.0      # ω：E1 偏航转角/步（同上）。X3 约 34°。平局阈值 0.5 步很粗，10% 的尺度差不改判定
+TIE_YAW_DRIFT_M = 0.11       # 偏航一步沿新航向的平移（E1 实测；SAFE 后仍滑行 0.07–0.21 m）
+TIE_COLLISION_STEPS = 40.0   # 滚出一步就撞机身方框或 A* 无路：记一集长度（40 步）
+TIE_MARGIN_STEPS = 0.5       # |Q_L − Q_R| 小于它算近平局（DISTILL §2.1 用的阈值）
+STUDENT_HFOV_DEG = 60.0      # 学生相机水平视场：sim/worlds 模板 <horizontal_fov>1.047</horizontal_fov>
+TIEBREAKS = ("legacy", "visible")
+
+
+def _q_after_yaw(x, y, yaw_deg, action, pillars, clearance, step, lookahead, tol,
+                 waypoint=None, stop_at_waypoint=False):
+    """DISTILL §2.1 的 Q(a)（单位：步）：滚出一步 YAW 后的 A* 路长 + 航向罚；撞柱 / 无路 = TIE_COLLISION_STEPS。"""
+    nyaw = yaw_deg + (TIE_YAW_STEP_DEG if action == YAW_LEFT else -TIE_YAW_STEP_DEG)
+    nx = x + TIE_YAW_DRIFT_M * math.cos(math.radians(nyaw))
+    ny = y + TIE_YAW_DRIFT_M * math.sin(math.radians(nyaw))
+    if any(_body_hits_box(nx, ny, nyaw, p, 0.2) for p in pillars):
+        return TIE_COLLISION_STEPS
+    path = _global_path(nx, ny, pillars, clearance, step, waypoint, stop_at_waypoint)
+    if path is None:
+        return TIE_COLLISION_STEPS
+    length = sum(math.hypot(bx - ax, by - ay) for (ax, ay), (bx, by) in zip(path, path[1:]))
+    err = abs(_pursuit_err_deg(path, nx, ny, nyaw, lookahead))
+    return 1.0 + length / TIE_V_STEP_M + max(0.0, err - tol) / TIE_YAW_STEP_DEG
+
+
+def lr_tie_margin_steps(x, y, yaw_deg, pillars, clearance=None, step=0.1, lookahead=0.7, tol=25.0,
+                        waypoint=None, stop_at_waypoint=False):
+    """|Q_L − Q_R|（步）：左转一步与右转一步之后到目标的代价差。小于 TIE_MARGIN_STEPS 即近平局。
+
+    两边都撞/无路时为 0（两边一样坏，也算平局）。多跑两次 A*（E1 柱阵实测每次约 21 ms）。
+    """
+    if clearance is None:
+        clearance = ASTAR_CLEARANCE_M
+    q = [_q_after_yaw(x, y, yaw_deg, a, pillars, clearance, step, lookahead, tol,
+                      waypoint, stop_at_waypoint) for a in (YAW_LEFT, YAW_RIGHT)]
+    return abs(q[0] - q[1])
+
+
+def visible_pillar_side(x, y, yaw_deg, pillars, hfov_deg=STUDENT_HFOV_DEG):
+    """学生视锥内最近的柱在机头哪一侧：+1 左（方位角 > 0）、-1 右、0 正前方；视锥内一根都没有 → None。
+
+    可见 = 柱外接圆有一部分落在 ±hfov/2 内（|方位角| − 角半径 ≤ hfov/2）。不做遮挡：最近的柱不会被更远的挡住。
+    只看水平：柱高 3 m，巡航高度 2.1 m 处始终在竖直视场内（DISTILL §5 同一简化）。
+    """
+    best = None
+    for p in pillars:
+        dx, dy = float(p["x"]) - x, float(p["y"]) - y
+        dist = math.hypot(dx, dy)
+        r = p.get("radius")
+        outer = float(r) if r is not None else math.hypot(*(v / 2 for v in p.get("size", [0.4, 0.4])[:2]))
+        half_ang = 90.0 if dist <= outer else math.degrees(math.asin(outer / dist))
+        bearing = (math.degrees(math.atan2(dy, dx)) - yaw_deg + 180.0) % 360.0 - 180.0
+        if abs(bearing) - half_ang > hfov_deg / 2:
+            continue
+        if best is None or dist < best[0]:
+            best = (dist, bearing)
+    if best is None:
+        return None
+    return (best[1] > 0) - (best[1] < 0)
+
+
+def plan_action_global_tiebreak(x, y, yaw_deg, pillars, tiebreak="legacy", clearance=None, step=0.1,
+                                lookahead=0.7, tol=25.0, waypoint=None, stop_at_waypoint=False,
+                                stop_radius=0.5):
+    """plan_action_global + 近平局时按可见几何定左右。返回 (动作, tie_margin_steps)。
+
+    legacy：原样返回 plan_action_global，margin None，不多跑一次 A*（默认采集路径逐位不变）。
+    visible：每步算 |Q_L − Q_R|；只有 legacy 动作是 YAW 且 margin < TIE_MARGIN_STEPS 时才改向，改成
+    「视锥内最近柱所在侧的反向」（柱在左就右转）：学生看得见这根柱，标签就成了图像的函数。视锥内无柱、
+    或最近柱正对机头（方位角 0）时沿用 legacy。FORWARD / SAFE 不改（平局只关乎左右）。
+    """
+    if tiebreak not in TIEBREAKS:
+        raise ValueError(f"tiebreak 必须是 {TIEBREAKS}，得到 {tiebreak!r}")
+    action = plan_action_global(x, y, yaw_deg, pillars, clearance=clearance, step=step,
+                                lookahead=lookahead, tol=tol, waypoint=waypoint,
+                                stop_at_waypoint=stop_at_waypoint, stop_radius=stop_radius)
+    if tiebreak == "legacy" or not pillars:
+        return action, None
+    margin = lr_tie_margin_steps(x, y, yaw_deg, pillars, clearance=clearance, step=step,
+                                 lookahead=lookahead, tol=tol, waypoint=waypoint,
+                                 stop_at_waypoint=stop_at_waypoint)
+    if action in (YAW_LEFT, YAW_RIGHT) and margin < TIE_MARGIN_STEPS:
+        side = visible_pillar_side(x, y, yaw_deg, pillars)
+        if side:
+            action = YAW_RIGHT if side > 0 else YAW_LEFT
+    return action, margin
 
 
 def _make(w, h, left_d, center_d, right_d):
@@ -711,6 +823,31 @@ if __name__ == "__main__":
         ok_f = ok_f and path is not None and max(abs(py) for _px, py in path) > 0.6
         ok = ok and ok_f
         print(f"  {'ok' if ok_f else 'FAIL'}  forest_e1 档穿 0.6 m 缝（{ACTIONS[got]}），base 档 0.40 膨胀只能绕行")
+
+        # L/R 近平局按可见几何（DISTILL §2.1）。两根柱 (1.5,0.35)、(2.4,-0.3)，机头 -10°：legacy A* 取左转，
+        # |Q_L − Q_R| = 0.22 步 < 0.5；视锥内最近柱 (1.5,0.35) 在左 → visible 改右转。legacy 必须与
+        # plan_action_global 相同且 margin None（不多跑 A*）。单柱 (1.0,0.3) 右绕明显更短（margin 1.4 步）→ 不改。
+        tie = [{"x": 1.5, "y": 0.35, "z": 1.5, "size": [0.4, 0.4, 3.0]},
+               {"x": 2.4, "y": -0.3, "z": 1.5, "size": [0.4, 0.4, 3.0]}]
+        leg, m_leg = plan_action_global_tiebreak(0.0, 0.0, -10.0, tie, "legacy")
+        vis, m_vis = plan_action_global_tiebreak(0.0, 0.0, -10.0, tie, "visible")
+        ok_t = leg == plan_action_global(0.0, 0.0, -10.0, tie) == YAW_LEFT and m_leg is None
+        ok_t = ok_t and vis == YAW_RIGHT and m_vis < TIE_MARGIN_STEPS
+        ok_t = ok_t and visible_pillar_side(0.0, 0.0, -10.0, tie) == 1
+        ok_t = ok_t and visible_pillar_side(0.0, 0.0, 180.0, tie) is None          # 都在身后：视锥内无柱
+        ok_t = ok_t and visible_pillar_side(0.0, 0.0, 0.0, [{"x": 1.0, "y": 0.0, "size": [0.4, 0.4, 3.0]}]) == 0
+        one = [{"x": 1.0, "y": 0.3, "z": 1.5, "size": [0.4, 0.4, 3.0]}]
+        got_one, m_one = plan_action_global_tiebreak(0.0, 0.0, 0.0, one, "visible")
+        ok_t = ok_t and got_one == plan_action_global(0.0, 0.0, 0.0, one) == YAW_RIGHT and m_one > TIE_MARGIN_STEPS
+        ok_t = ok_t and plan_action_global_tiebreak(0.0, 0.0, 0.0, [], "visible") == (FORWARD_SLOW, None)
+        try:
+            plan_action_global_tiebreak(0.0, 0.0, 0.0, tie, "nope")
+        except ValueError:
+            pass
+        else:
+            ok_t = False
+        ok = ok and ok_t
+        print(f"  {'ok' if ok_t else 'FAIL'}  tiebreak=visible 近平局（{m_vis:.2f} 步）改向可见柱反侧，legacy 不变、非平局不改")
     finally:
         set_vehicle("x3")
 

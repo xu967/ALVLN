@@ -80,6 +80,31 @@ class PreprocessSplitTests(unittest.TestCase):
         groups = {g["geometry_gid"]: g["split"] for g in meta["split_groups"]}
         self.assertEqual(groups, expect)
 
+    def test_goal_stopped_short_episode_packs_and_tiebreak_passthrough(self):
+        """collect.py --stop-at-goal 的短集（num_steps < requested_steps）无需改 preprocess 即可打包；
+        manifest.teacher_tiebreak 透传进 episodes 表，旧 manifest 没有该字段时为 null。"""
+        ep1 = self.eps[0]
+        rows = (ep1 / "actions.jsonl").read_text(encoding="utf-8").splitlines()[:3]
+        (ep1 / "actions.jsonl").write_text("\n".join(rows) + "\n", encoding="utf-8")
+        man = self.man(ep1)
+        man.update({"num_steps": 3, "requested_steps": 6, "stopped_on_goal": True,
+                    "goal_line_x": 5.97, "teacher_tiebreak": "visible"})
+        self.save(ep1, man)
+        for ep in self.eps:
+            m = self.man(ep)
+            m["geometry_gid"] = gid_for(m["split"], ep.name)
+            self.save(ep, m)
+        r = self.run_pre(self.tmp / "ds", self.eps)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        meta = read_meta(self.tmp / "ds" / "dataset.uavr")
+        by_dir = {Path(e["source_dir"]).name: e for e in meta["episodes"]}
+        # ep1 前 3 行没有碰撞行，3 步全进包；train = ep1 + ep2（默认丢碰撞行后的样本数）。
+        self.assertEqual(by_dir["ep1"]["num_steps"], 3)
+        self.assertEqual(meta["splits"]["train"], 3 + by_dir["ep2"]["num_steps"])
+        self.assertEqual(by_dir["ep1"]["teacher_tiebreak"], "visible")
+        self.assertIsNone(by_dir["ep2"]["teacher_tiebreak"])
+        self.assertEqual(by_dir["ep2"]["executed_by"], "teacher")   # 老 manifest 的 DAgger 默认值不变
+
     def test_same_scene_cross_split_rejected(self):
         ep1, ep2 = self.eps[0], self.eps[1]  # 两条都是 scene_id=42
         for ep, split in ((ep1, "train"), (ep2, "val")):

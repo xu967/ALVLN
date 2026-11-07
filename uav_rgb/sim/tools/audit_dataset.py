@@ -57,7 +57,7 @@ import scene_forest as sf  # noqa: E402
 import campus  # noqa: E402
 from instruction import parse_target_color  # noqa: E402
 from split_manifest import SPLIT_SALT, geometry_gid  # noqa: E402
-from teacher import (TEACHER_VERSION, plan_action, plan_action_global,
+from teacher import (TEACHER_VERSION, plan_action, plan_action_global_tiebreak,
                      astar_path, _point_blocked, set_vehicle,
                      teacher_version, task_of_scene)  # noqa: E402
 
@@ -227,6 +227,9 @@ def episode_facts(ep_dir):
                            (pg["y"] - waypoint["y"]) ** 2) ** 0.5)
         wp_min = min(ds) if ds else None
         final_wp = ds[-1] if ds else None
+    # 逐步的动作后真值 x（缺位姿记 None）：episode_length 用它核对 --stop-at-goal 的截断位置。
+    oracle_x = [(o.get("pose_gt") or {}).get("x") if isinstance(o.get("pose_gt"), dict) else None
+                for o in oracle]
 
     return {
         "dir": ep_dir,
@@ -254,6 +257,12 @@ def episode_facts(ep_dir):
         "task_version": task_version,
         "stop_radius": stop_radius,
         "stopped_on_goal": man.get("stopped_on_goal"),
+        "stopped_on_collision": man.get("stopped_on_collision"),
+        # collect.py --stop-at-goal 写的成功线 x（None = 没开）；--tiebreak 的口径；DAgger 执行者。
+        "goal_line_x": man.get("goal_line_x"),
+        "teacher_tiebreak": man.get("teacher_tiebreak"),
+        "executed_by": man.get("executed_by"),
+        "oracle_x": oracle_x,
         "waypoint_min_dist": wp_min,
         "final_waypoint_dist": final_wp,
         "last_action": steps[-1]["action"] if steps else None,
@@ -919,9 +928,12 @@ def audit(facts, pre_excluded=(), quarantined=()):
                 continue
             total += 1
             # 普通集用 A*，safe 出生集用局部规划；manifest.planner 是唯一开关。
+            # 近平局口径按 manifest.teacher_tiebreak（旧数据没有 = legacy，与旧 plan_action_global 逐位相同）：
+            # visible 集的标签多了「按可见柱定左右」，用 legacy 复算会把 DISTILL 量到的 ~0.7% 帧报成不一致。
             if f.get("planner") == "astar":
-                want = plan_action_global(
+                want, _margin = plan_action_global_tiebreak(
                     pb["x"], pb["y"], yb, f["pillars"],
+                    tiebreak=f.get("teacher_tiebreak") or "legacy",
                     waypoint=f.get("waypoint"),
                     stop_at_waypoint=bool(f.get("stop_radius")),
                     stop_radius=f.get("stop_radius") or 0.5)
@@ -957,6 +969,44 @@ def audit(facts, pre_excluded=(), quarantined=()):
                             f"另有 {uncovered} 步来自非 plan_action 的集未参与）",
                             samples=samples, mismatch=round(share, 4),
                             covered_steps=total, skipped=skipped))
+
+    # 9) 集长度：短于 requested_steps 的集必须有 manifest 解释，不能悄悄混进训练集。
+    #    --stop-at-goal（DISTILL §3.1）记 stopped_on_goal + goal_line_x，且末步动作后真值 x 必须是**第一次**
+    #    到成功线（早一步已过线却没停、或没过线就停，都说明采集端判定坏了）；开了开关却过线不停同样 FAIL。
+    #    waypoint 任务的 goal-stop 记 stopped_on_goal + stop_radius（停稳与否由 teacher_stop 查）；
+    #    --stop-on-collision 记 stopped_on_collision。旧 manifest 没有 requested_steps 的集不参与。
+    short = [f for f in gate if type(f.get("requested_steps")) is int
+             and f["num_steps"] < f["requested_steps"]]
+    goal_line = [f for f in gate if f.get("goal_line_x") is not None]
+    n_line = n_wp = n_coll = 0
+    unexplained, bad_line = [], []
+    for f in short:
+        if f.get("stopped_on_goal") and f.get("goal_line_x") is not None:
+            n_line += 1
+        elif f.get("stopped_on_goal") and f.get("stop_radius") is not None:
+            n_wp += 1
+        elif f.get("stopped_on_collision"):
+            n_coll += 1
+        else:
+            unexplained.append(f["dir"])
+    for f in goal_line:
+        gx = float(f["goal_line_x"])
+        crossed = [x is not None and x >= gx for x in f["oracle_x"]]
+        if f.get("stopped_on_goal"):
+            if not crossed or not crossed[-1] or any(crossed[:-1]):
+                bad_line.append(f["dir"])
+        elif any(crossed):
+            bad_line.append(f["dir"])
+    if not short and not goal_line:
+        checks.append(check("episode_length", "PASS",
+                            f"{len(gate)} 集都跑满 requested_steps（或旧 manifest 无该字段），无 --stop-at-goal 集"))
+    else:
+        checks.append(check(
+            "episode_length", "FAIL" if (unexplained or bad_line) else "PASS",
+            f"{len(short)}/{len(gate)} 集短于 requested_steps：过成功线提前结束 {n_line}、"
+            f"waypoint goal-stop {n_wp}、碰撞终止 {n_coll}、无解释 {len(unexplained)}；"
+            f"--stop-at-goal 集 {len(goal_line)} 中截断位置与成功线不符 {len(bad_line)}",
+            samples=(unexplained + bad_line)[:5], short=len(short), goal_line=len(goal_line)))
 
     return checks
 

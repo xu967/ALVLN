@@ -54,6 +54,7 @@ import hashlib
 import json
 import math
 import os
+import random
 import struct
 import subprocess
 import sys
@@ -61,7 +62,7 @@ import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from teacher import (expert_action, plan_action, plan_action_global,
+from teacher import (expert_action, plan_action, plan_action_global_tiebreak, TIEBREAKS,
                      SAFE_NEUTRAL, FORWARD_SLOW, YAW_LEFT, YAW_RIGHT, ACTIONS,
                      teacher_version, task_of_scene)
 import gz_io
@@ -802,16 +803,23 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 global_plan=True, window_from="dispatch", waypoint=None,
                 stop_at_waypoint=False, stop_radius=0.5, save_depth=False,
                 teacher_nn=None, text_ids=None, contact_seq0=None, dyn=None,
-                predictive_teacher=None, rl_teacher=None, sil=None):
+                predictive_teacher=None, rl_teacher=None, sil=None,
+                tiebreak="legacy", beta=0.0, rng=None, prev_executed=None):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。
 
     dyn=None 为 x3_velocity 旧行为（定速 + 窗口末刹停）；给 CfStab 时按摇杆模型
     在窗口内逐帧更新速度，窗口末不刹停，最后一条指令一直保持到下一步派发。
     给 sil（CfSilMotorThread）时不发 twist：后台线程按动作直接驱动 4 个电机，
     窗口末也不刹停，最后一条动作保持到下一步派发。
+    tiebreak：A* 教师左右近平局的决定方式（teacher.TIEBREAKS；legacy 逐位等于旧 plan_action_global）。
+    beta / rng / prev_executed 只在 policy == "student" 且有柱子真值时起作用（DAgger 影子教师）：
+    每步以概率 beta 改执行教师动作，prev_executed 是上一步真正执行的动作（喂给 prev-action 模型）。
     """
     if window_from not in ("dispatch", "observation"):
         raise ValueError(f"window_from 无效: {window_from!r}")
+    tie_margin = None          # 只有 tiebreak=visible 的 A* 教师会填；legacy 不多算也不落盘
+    executed_by = None         # 只有 DAgger 影子教师模式会填 "student"/"expert"
+    label = None               # 标签（action_expert）；None = 与执行的动作相同（除影子教师外都如此）
     t_step = time.perf_counter()
     if contact_seq0 is None:
         contact_seq0 = _contact_seq(subs["contact"])
@@ -862,10 +870,10 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 action = predictive_teacher.act(pose_before["x"], pose_before["y"],
                     yaw_before, dyn.vx, dyn.vy, active=dyn.active, latency=dyn.latency_s)
             elif global_plan:
-                action = plan_action_global(pose_before["x"], pose_before["y"],
-                                            yaw_before, pillars, waypoint=waypoint,
-                                            stop_at_waypoint=stop_at_waypoint,
-                                            stop_radius=stop_radius)
+                action, tie_margin = plan_action_global_tiebreak(
+                    pose_before["x"], pose_before["y"], yaw_before, pillars, tiebreak,
+                    waypoint=waypoint, stop_at_waypoint=stop_at_waypoint,
+                    stop_radius=stop_radius)
             else:
                 action = plan_action(pose_before["x"], pose_before["y"], yaw_before,
                                      pillars)
@@ -895,9 +903,25 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         if student is None:
             return None, "student 策略未初始化"
         try:
-            action, infer_ms, _probs = student.act(rgb_msg)
+            # prev_executed：β>0 时上一步可能执行的是教师动作，prev-action 模型要看真正执行的那个；
+            # β=0 时它就是学生自己上一步的输出，与不传完全等价（student.act 的缓存语义）。
+            action, infer_ms, _probs = student.act(rgb_msg, prev_action=prev_executed)
         except Exception as e:  # noqa: BLE001 - 推理进程任何失败都算本步失败
             return None, f"学生推理失败: {type(e).__name__}: {e}"
+        if pillars:
+            # 影子教师（DAgger，DISTILL §3.2）：学生在自己的状态分布上飞，标签仍是该状态下的真值 A* 动作。
+            # 训练集全是教师轨迹时学生偏离一步就进了没见过的状态（0417 流水线 test 成功率 27% 的主因之一）。
+            # 位姿缺失时宁可本步失败，不能让学生动作冒充教师标签（manifest 已记成 plan_action）。
+            if not pose_before:
+                return None, "影子教师需要位姿真值，但该步 pose 缺 position"
+            label, tie_margin = plan_action_global_tiebreak(
+                pose_before["x"], pose_before["y"], yaw_before, pillars, tiebreak,
+                waypoint=waypoint, stop_at_waypoint=stop_at_waypoint, stop_radius=stop_radius)
+            # β 混合与 sim/3dgs/collect_3dgs.py DaggerPolicy 同义：以概率 β 改执行教师动作。
+            if beta > 0.0 and rng is not None and rng.random() < beta:
+                action, executed_by = label, "expert"
+            else:
+                executed_by = "student"
     elif policy == "teacher-nn":
         if teacher_nn is None:
             return None, "teacher-nn 策略未初始化"
@@ -919,6 +943,8 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             return None, f"teacher-nn 推理失败: {type(e).__name__}: {e}"
     else:  # policy == "forward": 盲策略（恒定前进），用于撞柱/基线对照
         action = FORWARD_SLOW
+    if label is None:
+        label = action
     t_io = time.perf_counter()
 
     # 动作窗口的起点是**派发时刻**的最新位姿，不是观测帧位姿：策略推理/解码
@@ -1097,9 +1123,12 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         "step": step_idx,
         "timestamp_ns": rgb_ts,        # 动作前 RGB 帧 sim-time（EpisodeStep）
         "rgb_ts": rgb_ts,
-        "action_expert": action,
-        "action_executed": action,     # 发布通道已确认成功，否则不会走到这里
+        "action_expert": label,
+        "action_executed": action,     # 发布通道已确认成功，否则不会走到这里；影子教师模式下可与标签不同
         "collision": contact or stuck,
+        # 下面两项为 None 时 action_row 不落盘（默认采集的字段集与旧版完全一致）。
+        "tie_margin_steps": tie_margin,
+        "executed_by": executed_by,
         "pose_gt": pose_after,
         "pose_ts": pose_ts,
         # 动作前位姿：audit 用它 + scene 柱子真值复算标签，验证「标签=该帧该做的动作」。
@@ -1179,6 +1208,11 @@ def action_row(r, save_depth=False):
     })
     if save_depth:
         row["depth_file"] = r["depth_file"]
+    # 可选字段只在开了对应开关时出现：tie_margin_steps 来自 --tiebreak visible（|Q_L−Q_R|，步），
+    # executed_by 来自 --policy student 的影子教师（本步执行者 student/expert）。
+    for k in ("tie_margin_steps", "executed_by"):
+        if r.get(k) is not None:
+            row[k] = r[k]
     return row
 
 
@@ -1207,6 +1241,24 @@ def stopped_at_waypoint(row, waypoint, stop_radius):
         return False
     return math.hypot(pb["x"] - waypoint["x"],
                       pb["y"] - waypoint["y"]) <= (stop_radius or 0.5)
+
+
+# 成功线 = 最远柱 x + 1.0 m：与 EVAL_STANDARD 的 route_choice / eval_closed_loop --goal-margin /
+# traverse_rate 同一口径（max_x 取 oracle pose_gt.x）。DISTILL §1.2/§3.1：0417 流水线 12000 帧里过线后的
+# 2155 帧（18%）92.9% 视锥内无柱，标签 37.8% 是 YAW——是看不见的目标点的函数，学生学成「空画面就转」；
+# --stop-at-goal 在采集时就不再产出它们（离线按同一条线截断重训：无柱帧误转率 22% → 5%）。
+GOAL_MARGIN_M = 1.0
+
+
+def goal_line_x(pillars, margin=GOAL_MARGIN_M):
+    """成功线的 x 坐标。"""
+    return max(float(pl["x"]) for pl in pillars) + margin
+
+
+def crossed_goal_line(row, goal_x):
+    """本步动作后的真值位姿是否已到/过成功线（与 eval 的 max_x ≥ goal_x 判定同口径）。"""
+    pg = row.get("pose_gt")
+    return isinstance(pg, dict) and pg.get("x") is not None and float(pg["x"]) >= goal_x
 
 
 def main():
@@ -1257,6 +1309,20 @@ def main():
                    help="uavrgb_infer 路径（默认 UAV_RGB_BUILD_DIR 或 build/check）")
     p.add_argument("--stop-on-collision", action="store_true",
                    help="碰撞后立即结束本 episode（闭环评测用）")
+    p.add_argument("--stop-at-goal", action="store_true",
+                   help="真值 x 首次到/过成功线（最远柱 x + 1.0 m，与 eval 同口径）即结束本集并记"
+                        " stopped_on_goal/goal_line_x；需要 --scene-meta，且不能是 waypoint 任务。"
+                        "DISTILL §3.1：过线后的帧占 18%%，93%% 视锥内无柱却有 38%% 是 YAW 标签")
+    p.add_argument("--tiebreak", choices=TIEBREAKS, default="legacy",
+                   help="A* 教师左右近平局（|Q_L−Q_R|<0.5 步）怎么定：legacy=沿用 heap 顺序/err 符号"
+                        "（逐位不变）；visible=改向学生视锥内最近柱的反侧（DISTILL §3.3）。"
+                        "只对柱子真值 A* 教师（--policy teacher 的 astar 规划器，或 --policy student 的"
+                        "影子教师）有意义")
+    p.add_argument("--beta", type=float, default=0.0,
+                   help="--policy student（DAgger）每步执行教师动作的概率，与 sim/3dgs/collect_3dgs.py"
+                        " 同义；0=全由学生执行（现状）。标签始终是教师动作")
+    p.add_argument("--dagger-round", type=int, default=0,
+                   help="--policy student 写进 manifest 的 DAgger 轮次（溯源用，0=首轮）")
     p.add_argument("--scene-id", type=int, default=0, help="EpisodeMeta.scene_id（场景隔离关键字段）")
     p.add_argument("--seed", type=int, default=0, help="EpisodeMeta.seed")
     p.add_argument("--episode-id", type=int, default=None, help="EpisodeMeta.episode_id（默认=seed）")
@@ -1284,6 +1350,18 @@ def main():
         p.error("新 Teacher 必须 --dynamics cf_stab 且提供 --scene-meta")
     if args.policy == "teacher-rl" and abs(args.hold - 0.2) > 1e-6:
         p.error("teacher-rl 的训练策略要求 --hold 0.2（5Hz）；其他时长需重新训练")
+    if args.policy != "student" and (args.beta != 0.0 or args.dagger_round != 0):
+        p.error("--beta/--dagger-round 只能和 --policy student 一起用")
+    if not (math.isfinite(args.beta) and 0.0 <= args.beta <= 1.0):
+        p.error("--beta 必须在 [0, 1]")
+    if args.dagger_round < 0:
+        p.error("--dagger-round 必须是非负整数")
+    if args.stop_at_goal and not args.scene_meta:
+        p.error("--stop-at-goal 需要 --scene-meta（成功线由柱子真值定）")
+    if args.tiebreak != "legacy" and not (args.scene_meta and (
+            (args.policy == "teacher" and args.teacher_planner == "astar") or args.policy == "student")):
+        p.error("--tiebreak visible 只对柱子真值 A* 教师有意义：需要 --scene-meta，"
+                "且 --policy teacher（astar）或 --policy student")
     if args.dynamics == "cf_blackbox":
         # 纯模型档只在这里做参数校验：Gazebo collect 没有它的状态闭环，
         # 继续跑会拿 x3 物理冒充 cf_blackbox 数据。3DGS collector 直接 import 模型。
@@ -1373,6 +1451,14 @@ def main():
         want_split = sm.split_for_scene(scene_meta_obj)
         if args.split != want_split:
             p.error(f"--split {args.split} 与几何组 {scene_gid} 的固定 split={want_split} 不一致")
+    goal_x = None
+    if args.stop_at_goal:
+        # waypoint 任务的成功是停在半径内（goal-stop），不是过线；两套终止条件混在一集里说不清。
+        if stop_radius or waypoint is not None:
+            p.error("--stop-at-goal 只用于走廊穿越任务；waypoint 任务按 stop_radius 的 goal-stop 结束")
+        if not pillars:
+            p.error("--stop-at-goal 需要 scene-meta 里至少一根柱（成功线 = 最远柱 x + 1.0 m）")
+        goal_x = goal_line_x(pillars)
     # 载具：显式 --vehicle > scene-meta.vehicle（scene_gen --vehicle 写入）> x3。
     # cf_sitl 的固件只在 e1_mini 世界里有插件可收；e1_mini 世界也没有 X3 的速度控制器。
     vehicle = args.vehicle or scene_meta_obj.get("vehicle") or DEFAULT_VEHICLE
@@ -1395,7 +1481,9 @@ def main():
     if args.policy == "forward":
         teacher_kind, planner_kind = "forward", None
     elif args.policy == "student":
-        teacher_kind, planner_kind = "student", None
+        # 有柱子真值时是 DAgger 影子教师：标签口径与 --policy teacher 完全一样（plan_action/astar），
+        # 只是 executed_by=student（与 sim/3dgs/collect_3dgs.py 同义）。没真值时标签只能是学生自己的输出。
+        teacher_kind, planner_kind = ("plan_action", "astar") if pillars else ("student", None)
     elif args.policy == "teacher-rl":
         teacher_kind, planner_kind = "teacher_rl", "ppo_discrete4"
     elif args.policy == "teacher-nn":
@@ -1434,8 +1522,18 @@ def main():
     stopped_on_collision = False
     stopped_on_goal = False
     prev_action = None
+    prev_executed = None
     prev_rgb_ts = 0
     timings = []
+    # DAgger（--policy student）：β 混合的随机源按 seed 固定，同 seed 可复现哪些步换成了教师执行。
+    dagger = None
+    if args.policy == "student" and pillars:
+        with open(args.student_ckpt, "rb") as f:
+            ckpt_sha = hashlib.sha256(f.read()).hexdigest()
+        dagger = {"executed_by": "student", "dagger_round": args.dagger_round, "beta": args.beta,
+                  "student_ckpt": os.path.abspath(args.student_ckpt), "student_ckpt_sha256": ckpt_sha,
+                  "n_expert_executed": 0}
+    rng = random.Random(args.seed) if dagger is not None else None
     dyn = CfStab() if args.dynamics == "cf_stab" else None
     sil = (cf_sil.CfSilMotorThread(cf_sil_params)
            if cf_sil_params is not None else None)
@@ -1529,12 +1627,17 @@ def main():
                                     teacher_nn=teacher_nn, text_ids=text_ids,
                                     contact_seq0=contact_seq0, dyn=dyn,
                                     predictive_teacher=predictive_teacher,
-                                    rl_teacher=rl_teacher, sil=sil)
+                                    rl_teacher=rl_teacher, sil=sil,
+                                    tiebreak=args.tiebreak, beta=args.beta, rng=rng,
+                                    prev_executed=prev_executed)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
                 break
             prev_action = r["action_expert"]   # 下一步的滞回基准
+            prev_executed = r["action_executed"]
+            if dagger is not None and r.get("executed_by") == "expert":
+                dagger["n_expert_executed"] += 1
             # 只推进到本步已检查的序号，步间漂移产生的事件归下一步。
             contact_seq0 = r["contact_seq_end"]
             prev_rgb_ts = r["rgb_ts"]
@@ -1562,7 +1665,9 @@ def main():
             all_pose_ok = all_pose_ok and r["pose_gt"] is not None
             dx = "?" if r["displacement_m"] is None else f"{r['displacement_m']:.3f}m"
             dyaw = "?" if r["dyaw_deg"] is None else f"{r['dyaw_deg']:.1f}deg"
-            print(f"step {i}: {ACTIONS[r['action_expert']]} pos={r['pose_gt']} "
+            executed = ("" if r.get("executed_by") is None
+                        else f" exec={ACTIONS[r['action_executed']]}({r['executed_by']})")
+            print(f"step {i}: {ACTIONS[r['action_expert']]}{executed} pos={r['pose_gt']} "
                   f"dx={dx} dyaw={dyaw} action_wall={r['action_wall_s']:.2f}s "
                   f"sim_dt={r['sim_dt']:.2f}s "
                   f"collision={r['collision']}({r['src'] or '-'}) rgb={r['rgb_ok']} "
@@ -1582,6 +1687,12 @@ def main():
             if goal_stop and stop_streak >= 3:
                 stopped_on_goal = True
                 print(f"step {i}: goal-stop 连续 3 步 SAFE，提前结束", file=sys.stderr)
+                break
+            # --stop-at-goal：本步动作后真值 x 已到成功线，本步保留（它是过线的那一步），不再采下一步。
+            if goal_x is not None and crossed_goal_line(r, goal_x):
+                stopped_on_goal = True
+                print(f"step {i}: 真值 x={r['pose_gt']['x']:.2f} ≥ 成功线 {goal_x:.2f}，"
+                      f"按 --stop-at-goal 结束", file=sys.stderr)
                 break
             if args.stop_on_collision and r["collision"]:
                 stopped_on_collision = True
@@ -1683,6 +1794,12 @@ def main():
             # plan_action 的具体实现：astar=全局路径（普通集），plan_action=局部
             # （safe 出生集，保留真 SAFE 标签）。audit 复算必须按这个字段选。
             "planner": planner_kind,
+            # A* 教师近平局的决定方式（--tiebreak）：legacy 与旧标签逐位相同；visible 的标签多了
+            # 「按可见柱定左右」这一步，audit 复算与训练数据溯源都要按它选。
+            "teacher_tiebreak": args.tiebreak,
+            # DAgger 影子教师（--policy student + scene-meta）：谁执行了动作、β、轮次、学生 ckpt。
+            # 字段名与 sim/3dgs/collect_3dgs.py 一致；教师自采不写这些键，preprocess 按 teacher/0/1.0 补。
+            **(dagger or {}),
             "rl_checkpoint": (os.path.abspath(args.rl_checkpoint) if args.policy == "teacher-rl" else None),
             "experimental_policy": args.policy == "teacher-rl" or planner_kind == "predictive",
             # hold 是**仿真时间**秒（D1 起）：窗口按位姿戳走满这个数才发零速，
@@ -1715,6 +1832,8 @@ def main():
             # 下游据此区分「采集完整」与「评测终止」，不要混淆。
             "stopped_on_collision": stopped_on_collision,
             "stopped_on_goal": stopped_on_goal,
+            # --stop-at-goal 的成功线 x（None = 没开）：audit 据此放行短集并核对最后一步确实过了线。
+            "goal_line_x": goal_x,
             "error": error,
         }
         if args.save_depth:

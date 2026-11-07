@@ -388,11 +388,11 @@ class Task:
     ok: bool = False
 
 
-def _popen_collect(task, args, env, log_path):
-    staging = task.staging
+def collect_command(task, args):
+    """单集 collect.py 命令行。开关类参数只在非默认时追加：默认命令行与旧版逐字相同。"""
     cmd = [sys.executable, COLLECT,
            "--steps", str(args.steps), "--hold", str(args.hold),
-           "--out", staging,
+           "--out", task.staging,
            "--scene-id", str(task.scene_id), "--seed", str(task.seed),
            "--episode-id", str(task.scene_id), "--split", task.split,
            "--scene-meta", task.scene_meta_path,
@@ -403,10 +403,28 @@ def _popen_collect(task, args, env, log_path):
         cmd += ["--teacher-planner", args.teacher_planner]
     if args.policy == "teacher-rl":
         cmd += ["--rl-checkpoint", args.rl_checkpoint]
+    if args.policy == "student":
+        # DAgger 自采（DISTILL §3.2）：学生 ckpt 必传；β/轮次 0 是 collect.py 默认值，不传
+        cmd += ["--student-ckpt", args.student_ckpt]
+        if getattr(args, "infer_bin", None):
+            cmd += ["--infer-bin", args.infer_bin]
+        if getattr(args, "beta", 0.0):
+            cmd += ["--beta", str(args.beta)]
+        if getattr(args, "dagger_round", 0):
+            cmd += ["--dagger-round", str(args.dagger_round)]
+    if getattr(args, "stop_at_goal", False):
+        cmd.append("--stop-at-goal")             # DISTILL §3.1：过线即止
+    if getattr(args, "tiebreak", "legacy") != "legacy":
+        cmd += ["--tiebreak", args.tiebreak]     # DISTILL §3.3：近平局按可见柱定左右
     if args.save_depth:
         cmd.append("--save-depth")
     if getattr(args, "vehicle", None) and args.vehicle != "x3":
         cmd += ["--vehicle", args.vehicle]   # x3 不传：旧命令行逐字不变
+    return cmd
+
+
+def _popen_collect(task, args, env, log_path):
+    cmd = collect_command(task, args)
     proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                             stderr=subprocess.STDOUT, text=True, bufsize=1,
                             start_new_session=True)
@@ -600,9 +618,24 @@ def main():
                    help="透传给 scene_gen：forest_e1 密度档（最窄缝 0.45/0.35/0.28 m）；forest_e1 必填")
     p.add_argument("--appearance", choices=("legacy", "v1"), default="v1",
                    help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）；旧数据复现请显式 legacy")
-    p.add_argument("--policy", choices=("teacher", "forward", "teacher-rl"), default="teacher")
+    p.add_argument("--policy", choices=("teacher", "forward", "teacher-rl", "student"), default="teacher",
+                   help="student=DAgger 自采：学生闭环飞、A* 影子教师给标签（需 --student-ckpt）")
     p.add_argument("--teacher-planner", choices=("astar", "predictive"), default="astar")
     p.add_argument("--rl-checkpoint", default="")
+    p.add_argument("--student-ckpt", default=None, help="透传给 collect.py：--policy student 的 checkpoint")
+    p.add_argument("--infer-bin", default=None,
+                   help="透传给 collect.py：uavrgb_infer 路径（默认 UAV_RGB_BUILD_DIR 或 build/check）")
+    p.add_argument("--beta", type=float, default=0.0,
+                   help="透传给 collect.py：--policy student 每步执行教师动作的概率（0=全学生执行）")
+    p.add_argument("--dagger-round", type=int, default=0,
+                   help="透传给 collect.py：--policy student 的 DAgger 轮次（溯源）")
+    p.add_argument("--stop-at-goal", action="store_true",
+                   help="透传给 collect.py：真值 x 过成功线（最远柱 x + 1.0 m）即结束本集；"
+                        "只用于验收线任务（base/forest_e1）。DISTILL §3.1：过线后的帧占 18%%，"
+                        "93%% 视锥内无柱却有 38%% 是 YAW 标签")
+    p.add_argument("--tiebreak", choices=("legacy", "visible"), default="legacy",
+                   help="透传给 collect.py：A* 教师左右近平局的决定方式（visible=按学生视锥内最近柱定；"
+                        "DISTILL §3.3）；legacy 逐位不变")
     p.add_argument("--save-depth", action="store_true",
                    help="透传给 collect.py：每步另存 depth/depth_%%05d.png（16 位 PNG，毫米）")
     p.add_argument("--template", default=None,
@@ -637,6 +670,19 @@ def main():
         p.error("新 Teacher 当前与 --hold 0.2s 配套")
     if args.policy == "teacher-rl" and not args.rl_checkpoint:
         p.error("teacher-rl 需要 --rl-checkpoint")
+    if args.policy == "student" and not (args.student_ckpt and os.path.isfile(args.student_ckpt)):
+        p.error("--policy student 需要存在的 --student-ckpt")
+    if args.policy != "student" and (args.beta != 0.0 or args.dagger_round != 0 or args.student_ckpt
+                                     or args.infer_bin):
+        p.error("--student-ckpt/--infer-bin/--beta/--dagger-round 只能和 --policy student 一起用")
+    if not (math.isfinite(args.beta) and 0.0 <= args.beta <= 1.0) or args.dagger_round < 0:
+        p.error("--beta 必须在 [0, 1]，--dagger-round 必须是非负整数")
+    # waypoint 任务（l1/campus）的成功是停在半径内，不是过线；collect.py 对这类 scene 也会拒绝。
+    if args.stop_at_goal and args.task not in ("base", "forest_e1"):
+        p.error("--stop-at-goal 只用于验收线任务（--task base/forest_e1）")
+    if args.tiebreak != "legacy" and not (args.policy == "student"
+                                          or (args.policy == "teacher" and args.teacher_planner == "astar")):
+        p.error("--tiebreak visible 只对 A* 教师有意义（--policy teacher/astar 或 student）")
     if args.dynamics == "cf_blackbox":
         p.error("cf_blackbox 是纯 Python 模型档，Gazebo 并行采集未接入；"
                 "请让 3DGS collector 直接调用 cf_blackbox，或改用 cf_stab/x3_velocity")
@@ -815,6 +861,11 @@ def main():
             "policy": args.policy,
             "teacher_planner": args.teacher_planner,
             "rl_checkpoint": args.rl_checkpoint if args.policy == "teacher-rl" else None,
+            # 可开关的采集特性（2026-11-07 DEV-DATA）；关着时就是旧值，便于按批次区分数据。
+            "stop_at_goal": bool(args.stop_at_goal),
+            "teacher_tiebreak": args.tiebreak,
+            **({"student_ckpt": os.path.abspath(args.student_ckpt), "beta": args.beta,
+                "dagger_round": args.dagger_round} if args.policy == "student" else {}),
             "split": args.split,
             "seeds": args.seeds,
             "spawn_mode": args.spawn_mode,

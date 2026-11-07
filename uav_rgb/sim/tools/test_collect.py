@@ -6,7 +6,9 @@
 """
 import base64
 import contextlib
+import hashlib
 import io
+import json
 import math
 import os
 import struct
@@ -18,6 +20,7 @@ from unittest.mock import patch
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS)
 import collect
+import split_manifest as sm
 
 passed = 0
 
@@ -276,7 +279,7 @@ def delayed_inference_window(window_from="dispatch", contact_phase=None):
             "pose": pose, "contact": FakeSub()}
 
     class Student:
-        def act(self, msg):
+        def act(self, msg, prev_action=None):   # 与 StudentPolicy.act 同签名
             pose.current = pose_msg(11.2)   # 推理期间仿真走到 11.2
             if contact_phase == "inference":
                 subs["contact"]._frames.append((1, {"contact": [{}]}))
@@ -630,6 +633,196 @@ def cf_stab_window(cruise=False):
             "no_false_stuck_from_rest": row["src"] is None}
 
 
+# ---------------------------------------------------------------- 可开关采集功能（2026-11-07 DEV-DATA；默认行为不变）
+# action_row 在 save_depth=False 时的旧字段集：新开关关着时必须一字不差（下游/审计按它读）。
+ROW_KEYS_LEGACY = {"step", "timestamp_ns", "action_expert", "action_executed", "collision", "rgb_ok",
+                   "frame", "src", "rgb_ts", "depth_ts", "depth_rgb_gap_ns", "pose_ts", "pose_rgb_gap_ns",
+                   "dyaw_deg", "displacement_m", "infer_ms", "action_start_ns", "pose_before", "yaw_before"}
+# 成功线 = 最远柱 4.97 + 1.0 = 5.97
+SCENE = {"pillars": [{"x": 1.0, "y": 0.3, "z": 1.5, "size": [0.4, 0.4, 3.0]},
+                     {"x": 4.97, "y": -0.5, "z": 1.5, "size": [0.4, 0.4, 3.0]}]}
+
+
+def fake_row(step, x, **over):
+    """collect_one 成功返回的 row（主循环与 action_row 用到的全部键）。"""
+    s = 10 + step
+    r = {"contact_seq_end": 0, "step": step, "timestamp_ns": s * 10**9, "rgb_ts": s * 10**9,
+         "action_expert": 1, "action_executed": 1, "collision": False,
+         "pose_gt": {"x": x, "y": 0.0, "z": 2.1}, "pose_ts": s * 10**9 + 10**9,
+         "pose_before": {"x": x - 0.25, "y": 0.0, "z": 2.1}, "yaw_before": 0.0, "rgb_ok": True,
+         "frame": "rgb_%05d.png" % step, "depth_file": None, "depth_ts": s * 10**9,
+         "pose_before_ts": s * 10**9 + 10**7, "action_start_ns": s * 10**9 + 10**7,
+         "action_end_ns": s * 10**9 + 10**9, "displacement_m": 0.25, "dyaw_deg": 0.0, "sim_dt": 1.0,
+         "speed_after_mps": None, "infer_ms": None, "action_wall_s": 1.0, "src": None,
+         "tie_margin_steps": None, "executed_by": None,
+         "timing": {"io": 0.01, "window": 1.0, "block": 1.0, "tail": 0.01, "total": 1.02,
+                    "dispatch_sim_dt": 1.0}}
+    r.update(over)
+    return r
+
+
+class FixedRng:
+    def __init__(self, v):
+        self.v = v
+
+    def random(self):
+        return self.v
+
+
+def shadow_teacher_step(beta, rng_value=0.0, tiebreak="legacy", prev_executed=None):
+    """真 collect_one + 假学生（恒 FORWARD）+ 正前方一根柱：标签来自 A* 影子教师，执行按 β。"""
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    pose = ClockPoseSub(pose_msg(10.2))
+    subs = {"rgb": FakeSub(after=rgb), "depth": FakeSub(frames=[(1, _fresh_depth(w, h))]),
+            "pose": pose, "contact": FakeSub()}
+    seen = []
+
+    class Student:
+        def act(self, msg, prev_action=None):
+            seen.append(prev_action)
+            return 1, 5.0, [0.0, 1.0, 0.0, 0.0]
+
+    def advance(_secs):
+        pose.current = pose_msg(11.2)
+
+    pillars = [{"x": 0.8, "y": 0.0, "z": 1.5, "size": [0.4, 0.4, 3.0]}]
+    with tempfile.TemporaryDirectory() as d, \
+            patch.object(collect, "write_rgb_png", return_value=(True, None)), \
+            patch.object(collect.time, "sleep", side_effect=advance):
+        row, err = collect.collect_one(d, 0, 1.0, "student", subs, FakePub(), student=Student(),
+                                       pillars=pillars, tiebreak=tiebreak, beta=beta,
+                                       rng=FixedRng(rng_value), prev_executed=prev_executed)
+    return row, err, seen
+
+
+class MainPub(FakePub):
+    mode = "fake"
+
+
+def run_main(extra_argv, rows, scene=SCENE, student_cls=None, steps=None):
+    """跑 collect.main() 的主循环与 manifest 收尾，Gazebo 全部替身，collect_one 按 rows 依次返回。
+
+    返回 (manifest, actions.jsonl 行, SystemExit code, ckpt sha256)；参数校验失败时 manifest 为 None。
+    """
+    with tempfile.TemporaryDirectory() as d:
+        out = os.path.join(d, "ep")
+        meta = os.path.join(d, "scene.json")
+        with open(meta, "w") as f:
+            json.dump(scene, f)
+        ckpt = os.path.join(d, "ckpt.bin")
+        with open(ckpt, "wb") as f:
+            f.write(b"not-a-real-checkpoint")
+        ckpt_sha = hashlib.sha256(b"not-a-real-checkpoint").hexdigest()
+        argv = ["collect.py", "--out", out, "--scene-meta", meta, "--split", sm.split_for_scene(scene),
+                "--steps", str(steps if steps is not None else len(rows))]
+        argv += [a.replace("CKPT", ckpt) for a in extra_argv]
+        subs = {k: FakeSub(latest=pose_msg(1.0)) for k in ("rgb", "depth", "pose", "contact", "camera_info")}
+        it = iter(rows)
+        code = None
+        with contextlib.ExitStack() as st, contextlib.redirect_stderr(io.StringIO()):
+            st.enter_context(patch.object(sys, "argv", argv))
+            st.enter_context(patch.object(collect, "open_subs", return_value=subs))
+            st.enter_context(patch.object(collect, "wait_ready", return_value=None))
+            st.enter_context(patch.object(collect, "read_camera_info", return_value=None))
+            st.enter_context(patch.object(collect.gz_io, "open_twist_publisher", return_value=MainPub()))
+            st.enter_context(patch.object(collect, "take_off", return_value=0))
+            st.enter_context(patch.object(collect, "stop_executor"))
+            st.enter_context(patch.object(collect, "close_subs"))
+            st.enter_context(patch.object(collect, "collect_one",
+                                          side_effect=lambda *a, **kw: (next(it), None)))
+            if student_cls is not None:
+                st.enter_context(patch("student.StudentPolicy", student_cls))
+            try:
+                collect.main()
+            except SystemExit as e:
+                code = e.code
+        man_path = os.path.join(out, "episode_manifest.json")
+        if not os.path.isfile(man_path):
+            return None, [], code, ckpt_sha
+        with open(man_path) as f:
+            manifest = json.load(f)
+        with open(os.path.join(out, "actions.jsonl")) as f:
+            actions = [json.loads(line) for line in f if line.strip()]
+        return manifest, actions, code, ckpt_sha
+
+
+class FakeStudentPolicy:
+    def __init__(self, ckpt, infer_bin, text_ids=None):
+        pass
+
+    def close(self):
+        pass
+
+
+def switch_checks():
+    """--stop-at-goal / --policy student 影子教师 / --tiebreak 三个开关，以及关着时与旧版一致。"""
+    out = {}
+    # 1) 成功线判定（与 eval 同口径：最远柱 x + 1.0，看 oracle pose_gt.x）
+    gx = collect.goal_line_x(SCENE["pillars"])
+    out["goal_line_x = 最远柱+1.0"] = abs(gx - 5.97) < 1e-9
+    out["过线判定看 pose_gt.x ≥ 线"] = (collect.crossed_goal_line({"pose_gt": {"x": 5.97}}, gx)
+                                       and not collect.crossed_goal_line({"pose_gt": {"x": 5.96}}, gx)
+                                       and not collect.crossed_goal_line({"pose_gt": None}, gx))
+    # 2) 主循环：真值 x 5.5 → 5.9 → 6.0（过线）→ 6.3；开了开关第 3 步后结束且算完整集，关着跑满 4 步
+    rows = [fake_row(i, x) for i, x in enumerate((5.5, 5.9, 6.0, 6.3))]
+    man, acts, code, _ = run_main(["--stop-at-goal"], rows)
+    out["--stop-at-goal 过线即止"] = (code is None and man is not None and man["num_steps"] == 3
+                                    and len(acts) == 3 and man["stopped_on_goal"] is True
+                                    and abs(man["goal_line_x"] - 5.97) < 1e-9
+                                    and man["validity"]["episode_executed"] is True)
+    man, acts, code, _ = run_main([], rows)
+    out["默认不截断，manifest goal_line_x=None"] = (code is None and man["num_steps"] == 4
+                                                  and man["stopped_on_goal"] is False
+                                                  and man["goal_line_x"] is None
+                                                  and man["teacher_tiebreak"] == "legacy"
+                                                  and man["teacher"] == "plan_action" and man["planner"] == "astar"
+                                                  and "executed_by" not in man and "beta" not in man
+                                                  and all(set(a) == ROW_KEYS_LEGACY for a in acts))
+    with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()), \
+            patch.object(sys, "argv", ["collect.py", "--out", os.path.join(d, "x"), "--stop-at-goal"]):
+        try:
+            collect.main()
+            out["--stop-at-goal 没有 scene-meta 拒绝"] = False
+        except SystemExit as e:
+            out["--stop-at-goal 没有 scene-meta 拒绝"] = e.code == 2
+    wp_scene = SCENE | {"waypoint": {"x": 3.0, "y": 0.5}, "stop_radius": 0.5}
+    out["--stop-at-goal 与 waypoint 任务互斥"] = run_main(["--stop-at-goal"], rows, scene=wp_scene)[2] == 2
+    # 3) 影子教师：学生恒 FORWARD，正前方 0.8 m 有柱 → 教师标签是转向；β=0 学生执行，β=1 教师执行
+    row, err, seen = shadow_teacher_step(beta=0.0)
+    out["影子教师：标签=A*，执行=学生"] = (err is None and row["action_expert"] in (collect.YAW_LEFT, collect.YAW_RIGHT)
+                                        and row["action_executed"] == collect.FORWARD_SLOW
+                                        and row["executed_by"] == "student" and row["tie_margin_steps"] is None
+                                        and seen == [None])
+    row_b, err_b, seen_b = shadow_teacher_step(beta=1.0, rng_value=0.3, prev_executed=3)
+    out["影子教师：β=1 执行教师动作，prev_executed 喂给学生"] = (
+        err_b is None and row_b["action_executed"] == row_b["action_expert"] == row["action_expert"]
+        and row_b["executed_by"] == "expert" and seen_b == [3])
+    row_v, err_v, _ = shadow_teacher_step(beta=0.0, tiebreak="visible")
+    out["--tiebreak visible 每步记 tie_margin_steps"] = (err_v is None
+                                                        and isinstance(row_v["tie_margin_steps"], float))
+    ar = collect.action_row(row | {"depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0})
+    out["action_row 只在开关开着时多字段"] = (set(ar) == ROW_KEYS_LEGACY | {"executed_by"}
+                                           and set(collect.action_row(fake_row(0, 1.0) | {
+                                               "depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0})) == ROW_KEYS_LEGACY)
+    # 4) student 模式 manifest：字段名与 sim/3dgs/collect_3dgs.py 一致
+    rows_s = [fake_row(i, 1.0 + 0.25 * i, action_expert=2, action_executed=1 if i != 1 else 2,
+                       executed_by="expert" if i == 1 else "student") for i in range(3)]
+    man, acts, code, sha = run_main(["--policy", "student", "--student-ckpt", "CKPT", "--beta", "0.5",
+                                     "--dagger-round", "2", "--tiebreak", "visible"],
+                                    rows_s, student_cls=FakeStudentPolicy)
+    out["student manifest：plan_action/astar + DAgger 字段"] = (
+        code is None and man["teacher"] == "plan_action" and man["planner"] == "astar"
+        and man["executed_by"] == "student" and man["beta"] == 0.5 and man["dagger_round"] == 2
+        and man["student_ckpt_sha256"] == sha and man["student_ckpt"].endswith("ckpt.bin")
+        and man["n_expert_executed"] == 1 and man["teacher_tiebreak"] == "visible"
+        and man["teacher_version"] is not None
+        and [a["executed_by"] for a in acts] == ["student", "expert", "student"])
+    out["--beta 只配 student"] = run_main(["--beta", "0.5"], rows)[2] == 2
+    out["--tiebreak visible 只配 A* 教师"] = run_main(["--tiebreak", "visible", "--policy", "forward"], rows)[2] == 2
+    return out
+
+
 def main():
     m = cf_stab_model()
     for k, v in m.items():
@@ -728,6 +921,8 @@ def main():
           not collect.stopped_at_waypoint({"pose_before": None}, wp, 0.5))
     check("没有 waypoint 时不算停稳",
           not collect.stopped_at_waypoint({"pose_before": {"x": 4.0, "y": 1.5}}, None, 0.5))
+    for k, v in switch_checks().items():
+        check(f"开关: {k}", v)
 
     print(f"test_collect: {passed} 项通过")
     return 0

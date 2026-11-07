@@ -516,8 +516,8 @@ def main():
         write_ep(root17, "train", 2, CLEAN, instruction="pass the red pillar",
                  window_from="observation")
         all17 = details(root17)
-        # 带 instruction 的常规数据：18 条 + 新增 waypoint_side = 19 条。
-        assert len(all17) == 19, all17
+        # 带 instruction 的常规数据：18 条 + waypoint_side + episode_length（2026-11-07）= 20 条。
+        assert len(all17) == 20, all17
         c17 = all17["window_semantics"]
         assert c17["status"] == "PASS" and "observation" in c17["detail"], c17
         write_ep(root17, "train", 3, CLEAN, window_from="dispatch")
@@ -690,6 +690,63 @@ def main():
         c21b = details(root21)["geometry_version"]
         assert c21b["status"] == "FAIL" and "min_gap_required_m" in c21b["detail"], c21b
         shutil.rmtree(root21)
+
+        # 22) 短集（collect.py --stop-at-goal，DISTILL §3.1）：manifest 记 stopped_on_goal + goal_line_x，
+        #     末步 oracle x 第一次到线 → episode_length PASS；没有解释的短集 / 过线早一步没停 → FAIL。
+        root22 = tempfile.mkdtemp(prefix="audit_test_")
+        write_plan_ep(root22, "train", 1, n=12)        # 跑满的集：requested 12
+        with open(os.path.join(root22, "train", "1", "episode_manifest.json"), encoding="utf-8") as f:
+            m22 = json.load(f)
+        m22["requested_steps"] = 12
+        with open(os.path.join(root22, "train", "1", "episode_manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(m22, f)
+        # PILLARS 最远柱 x=1.5 → 成功线 2.5；write_ep 的 oracle x = 0.25·i，第 11 步（i=10）x=2.5 第一次到线
+        write_ep(root22, "train", 2, [1] * 11,
+                 man_extra={"requested_steps": 40, "stopped_on_goal": True, "goal_line_x": 2.5})
+        d22 = details(root22)["episode_length"]
+        assert d22["status"] == "PASS" and "过成功线提前结束 1" in d22["detail"], d22
+        write_ep(root22, "train", 3, [1] * 11, man_extra={"requested_steps": 40})   # 短但没解释
+        d22b = details(root22)["episode_length"]
+        assert d22b["status"] == "FAIL" and "无解释 1" in d22b["detail"], d22b
+        shutil.rmtree(os.path.join(root22, "train", "3"))
+        write_ep(root22, "train", 4, [1] * 12,       # 第 11 步已到线却多采了一步
+                 man_extra={"requested_steps": 40, "stopped_on_goal": True, "goal_line_x": 2.5})
+        d22c = details(root22)["episode_length"]
+        assert d22c["status"] == "FAIL" and "截断位置与成功线不符 1" in d22c["detail"], d22c
+        shutil.rmtree(os.path.join(root22, "train", "4"))
+        write_ep(root22, "train", 5, [1] * 9,        # 没到线就停了
+                 man_extra={"requested_steps": 40, "stopped_on_goal": True, "goal_line_x": 2.5})
+        assert details(root22)["episode_length"]["status"] == "FAIL"
+        shutil.rmtree(root22)
+
+        # 23) label_recompute 按 manifest.teacher_tiebreak 复算：visible 集用 visible 口径才对得上。
+        #     teacher.py 自检的近平局场景：(0,0,-10°) legacy=YAW_LEFT，visible=YAW_RIGHT（E1 base 档）。
+        tie = [{"name": "p0", "x": 1.5, "y": 0.35, "z": 1.5, "size": [0.4, 0.4, 3.0]},
+               {"name": "p1", "x": 2.4, "y": -0.3, "z": 1.5, "size": [0.4, 0.4, 3.0]}]
+        ad.set_vehicle("e1_mini", "base")
+        try:
+            leg, _ = ad.plan_action_global_tiebreak(0.0, 0.0, -10.0, tie, "legacy")
+            vis, _ = ad.plan_action_global_tiebreak(0.0, 0.0, -10.0, tie, "visible")
+        finally:
+            ad.set_vehicle("x3")
+        assert (leg, vis) == (2, 3), (leg, vis)
+        e1_man = {"vehicle": "e1_mini", "dynamics": "cf_sitl", "planner": "astar"}
+        for label, tiebreak, want in ((vis, "visible", "PASS"), (leg, "visible", "FAIL"),
+                                      (leg, None, "PASS"), (vis, "legacy", "FAIL")):
+            root23 = tempfile.mkdtemp(prefix="audit_test_")
+            man23 = dict(e1_man, **({"teacher_tiebreak": tiebreak} if tiebreak else {}))
+            write_ep(root23, "train", 1, [label] * 4, pillars=tie, man_extra=man23)
+            with open(os.path.join(root23, "train", "1", "actions.jsonl"), encoding="utf-8") as f:
+                rows23 = [json.loads(line) for line in f]
+            for r in rows23:
+                r.update({"action_expert": label, "pose_before": {"x": 0.0, "y": 0.0, "z": 2.0},
+                          "yaw_before": -10.0})
+            with open(os.path.join(root23, "train", "1", "actions.jsonl"), "w", encoding="utf-8") as f:
+                f.writelines(json.dumps(r) + "\n" for r in rows23)
+            c23 = details(root23)["label_recompute"]
+            assert c23["status"] == want, (label, tiebreak, c23)
+            shutil.rmtree(root23)
+        ad.set_vehicle("x3")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

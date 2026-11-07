@@ -284,6 +284,12 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
   `max(p_i, l_i)` 截成 1，这一列就没有区分度。实测：E1 base 教师采集集 12 集，成功 10 集的 SPL
   0.88–0.99（p_i 6.0–7.0 m，l_i 5.9–6.1 m）；3DGS Callinstrasse route_3 的 astar 教师 3 集 SPL
   0.994–1.000（p_i 9.3–9.9 m，l_i 9.2–9.8 m）。
+- **采集端的成功线截断（`collect.py --stop-at-goal`，2026-11-07，默认关）**：与这里同一条线
+  （`goal_line_x = 最远柱 x + 1.0`，看 oracle `pose_gt.x`），过线的那一步保留、之后不再采；manifest 记
+  `stopped_on_goal=true` + `goal_line_x`，`validity` 按完整集填。它只改**训练数据**的集长（0417 的 12000 帧里
+  过线后的 2155 帧 93% 视锥内无柱、38% 标签是 YAW，DISTILL §1.2），不改评测：评测仍跑 `eval_steps`、SPL 仍按上面的截断口径。
+  用这类数据训出的学生与旧数据学生对照时，要在报告里写明训练集是否开了该开关（`collection_manifest.json`
+  的 `stop_at_goal`），别把集长差异当成模型差异。
 - **为什么 l_i 是教师参考路径**：膨胀余量 0.40 m 比机身半宽 0.10 m 大得多，学生贴柱抄近路时
   p_i < l_i 会出现，公式里的 `max(p_i, l_i)` 把它截成 S_i；因此 SPL=1 的含义是「不比教师绕」，
   不是「几何最优」。栅格 A* 只有 0°/45° 两种走向，不抽捷径时阶梯路径最多长 8%，几乎所有成功集
