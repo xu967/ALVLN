@@ -295,6 +295,7 @@ def evaluate(out):
     for name, proc in procs.items():
         rc = proc.wait()
         log(f"eval-{name} rc={rc}" + ("（有失败/跳过集，见 eval.json 的 failed）" if rc else ""))
+    for name in procs:   # 等齐了再查：中途抛出会让 main 写 DONE 退出，其余组的 gz 留成孤儿（tools/test_e1_pipeline.py）
         need(os.path.join(out, f"eval-{name}", "eval.json"), f"{name} 没写出 eval.json，看 {out}/eval-{name}.log")
 
 
