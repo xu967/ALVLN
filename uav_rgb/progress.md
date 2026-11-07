@@ -38,8 +38,11 @@
 - 森林跨场景评测（lib v2）在教师组 20/20（13 成功 / 7 碰撞）后由我停掉，目录改名 `xeval-forest-sparse-20261107-1310-libv2-partial`，等 eval3 结束后按 lib v3 重跑三组。
 - 14:15 **eval3** 守护进程：`e1-pipeline-20261107-0417-eval3`（PGID 1032381，`run.pid`），lib v3 + 新 20 seed（两份训练集零重叠）+ SPL 列 + 第 5 臂 `student-e1-trunc`（DISTILL 建议 1：成功线截断重训 ckpt，`ckpt_trunc_distill.bin`，e1_pipeline 新增 `extra_students`），teacher / e1-new 录像；预计 ~16:00。停：`kill -- -1032381`。
 - DISTILL 结论（`reports/DISTILL_20261107.md`）：建议 ① 采集在成功线处终止（18% 帧是越线后朝看不见的目标回正航向，占 YAW 标签 37.8%，学生学成「空画面→转」；截断重训离线误转 22%→5%，eval3 第 5 臂验证闭环）；② DAgger 且专家唯一（collect.py 学生模式加影子教师打 action_expert；3 轮×100 集 β 0.5→0 + 「再采 300 集」对照臂）；③ 教师 L/R 平局按可见几何决定（approach 区 24.6% 转弯帧左右代价差 <0.5 步，18% 靠视锥外的柱）。不建议：P1 现软标签/温度、类权重调参、label smoothing/增强、无深度数据上开 depth-aux、纯 BC 下开 prev-action（反事实探针：prev L↔R 翻转使 YAW_L 帧预测 34:5→18:19，复读机成立）。P2 已合并但 `--prev-action` / `--depth-aux` 不进流水线。
+- 14:30 R2-SRC 报告（撞速率限制前已写完）：无 Must fix，7 条 Should fix 多为重列；落了其中「tools/test_*.py 进 check.sh 门禁」（5e2e0c1）。
+- 15:00 VIZ-LAYOUT 第一轮合并（cdac554）：`sim/tools/view_layout.py` 两域共用 1280×720 版式；48 集 3DGS 重合成 `views_1280.webm`；**demo 短片 v1** `demo-e1-20261107/reel/demo_reel_v1.mp4`（239 s，22 段，代表帧 `reel/stills_v1/`）；Gazebo 版式逐像素不变。GitHub 推到 e8ed497。VIZ-LAYOUT 第二轮已派（BRIEF_VIZ_LAYOUT §6：E1 部件表两域统一机体、FOLLOW 机位改近、TOP 四旋翼图标、chase_cam 录像补丁、VIDEO_QUALITY 三档 + ffmpeg、重录旧片/重采 3 集异常集、短片 v2 + 60 s 精简版）。R2-3DGS 已派（基于 cdac554）。
+- 根分区 `/` 只剩 4.8 GB（/tmp 1.1 GB 是 IDE AppImage 解包、/opt 13 GB，都不是我们的）；所有进程只写数据盘。
 - 主会话 worklog：`docs/worklog/2026-11-07-0515-phase3-main-session.md`（08:00 追加第五阶段小节）。
-- 待办：收 VIZ-LAYOUT 报告 → 合并 → 推 GitHub → 派 R2-3DGS / R2-UIDOCS / R2-REPRO；收 R2-SRC / R2-SITL / R2-SIMTOOLS；DEV-DATA（DISTILL ①②③ 的 opt-in 实现）→ 评审 → Gazebo 对照实验 → 按 Must fix 修/合并 review-* 分支的改动 → 收 TEACHER-P1 / SCENE-B 报告并合并 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
+- 待办：收 R2-SITL / R2-SIMTOOLS / R2-3DGS / DEV-DATA / VIZ-LAYOUT-2 报告 → 合并 → 推 GitHub → 派 R2-3DGS / R2-UIDOCS / R2-REPRO；收 R2-SRC / R2-SITL / R2-SIMTOOLS；DEV-DATA（DISTILL ①②③ 的 opt-in 实现）→ 评审 → Gazebo 对照实验 → 按 Must fix 修/合并 review-* 分支的改动 → 收 TEACHER-P1 / SCENE-B 报告并合并 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
 
 ---
 
