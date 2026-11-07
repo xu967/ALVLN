@@ -74,6 +74,8 @@ CFG = dict(
     eval_steps=80,           # 给足全程余量（T7 起 80）；碰撞/到达会提前结束
     old_x3_ckpt=f"{DATA_ROOT}/uav_rgb/t6-full-1640/run/ckpt_best.bin",   # T6 best（epoch 8）：X3 / x3_velocity / hold 1.0 训的
     record_groups=("teacher", "student-e1-new"),   # 这两组录三视角视频（≈10 MB/仿真秒暂存，合成后删）
+    extra_students=os.environ.get("E1_EXTRA_STUDENTS", ""),   # 探索臂："名=ckpt路径;名=路径"，每臂多起 1 个 gz；默认空。
+                             # 例：DISTILL 2026-11-07 建议 1 的「成功线截断重训」ckpt 与四组同 seed 同动力学对照
     episode_timeout=600.0,   # 80 步 × ~1.1 s + 起飞 15 s，留 5 倍余量
     sim_timeout=120.0,       # 等相机/深度首帧
 )
@@ -83,6 +85,19 @@ EVAL_GROUPS = (   # (目录名, --policy, ckpt 的键)。四组并行各起 1 �
     ("student-e1-new", "student", "new_ckpt"),      # 本轮产物
     ("forward", "forward", None),              # 盲前进下限
 )
+
+
+def eval_groups():
+    """四个固定组 + CFG["extra_students"] 的探索臂（(目录名, "student", ckpt 路径)）。"""
+    extra = []
+    for item in filter(None, (x.strip() for x in CFG["extra_students"].split(";"))):
+        name, _, path = item.partition("=")
+        if not name or not path or name in {g[0] for g in EVAL_GROUPS}:
+            raise RuntimeError(f"extra_students 项格式应为 名=ckpt路径 且名字不与固定组重复：{item!r}")
+        extra.append((name.strip(), "student", path.strip()))
+    return EVAL_GROUPS + tuple(extra)
+
+
 GZ_ENV = {"UAVRGB_RENDER_BACKEND": "software", "DISPLAY": ":20",
           "XDG_RUNTIME_DIR": "/tmp/xdg",      # 本容器 gpu 后端（EGL）段错误；换机器删掉这三项即回到默认 EGL
           "UAVRGB_CF_SITL_PLUGIN_DIR": CFG["plugin_dir"]}
@@ -251,10 +266,13 @@ def train(out):
 def evaluate(out):
     """四组并行，各自 1 个 gz；eval_closed_loop 有失败集时 rc=1 但 eval.json 已写，四组全跑完再一起看。"""
     ckpts = dict(old_x3_ckpt=CFG["old_x3_ckpt"], new_ckpt=os.path.join(out, "run", "ckpt_best.bin"))
+    for name, _policy, ckpt_key in eval_groups():
+        if ckpt_key and ckpt_key not in ckpts:
+            ckpts[ckpt_key] = ckpt_key      # 探索臂：键就是 ckpt 路径
     for key, path in ckpts.items():
         need(path, f"{key} 不存在")
     procs = {}
-    for name, policy, ckpt_key in EVAL_GROUPS:
+    for name, policy, ckpt_key in eval_groups():
         edir = os.path.join(out, f"eval-{name}")
         if os.path.isfile(os.path.join(edir, "eval.json")):
             log(f"跳过 {name}：已有 eval.json")
@@ -282,7 +300,7 @@ def evaluate(out):
 
 def summary(out):
     rows = {}
-    for name, _policy, _k in EVAL_GROUPS:
+    for name, _policy, _k in eval_groups():
         path = os.path.join(out, f"eval-{name}", "eval.json")
         if DRY and not os.path.isfile(path):
             continue
@@ -325,8 +343,8 @@ def preflight():
         need(os.path.join(CFG["plugin_dir"], "libCfSitlSystem.so"),
              "按 sim/cf_sitl/gz/README.md 构建真库插件；不要指向 build-gz-stub 桩库")
     for name in CFG["record_groups"]:
-        if name not in {g[0] for g in EVAL_GROUPS}:
-            raise RuntimeError(f"record_groups 里的 {name} 不在 EVAL_GROUPS")
+        if name not in {g[0] for g in eval_groups()}:
+            raise RuntimeError(f"record_groups 里的 {name} 不在 EVAL_GROUPS / extra_students")
 
 
 def main():
@@ -341,7 +359,7 @@ def main():
     os.makedirs(out, exist_ok=True)
     if not DRY:
         write_json(os.path.join(out, "config.json"),   # 这次实验到底用了哪套参数，事后不用翻 manifest
-                   {"cfg": CFG, "groups": EVAL_GROUPS, "gz_env": GZ_ENV, "argv": sys.argv,
+                   {"cfg": CFG, "groups": eval_groups(), "gz_env": GZ_ENV, "argv": sys.argv,
                     "repo": REPO, "build": BUILD, "python": PY,
                     "git": subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"],
                                           capture_output=True, text=True).stdout.strip()})
