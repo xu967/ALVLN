@@ -65,9 +65,11 @@ CFG = dict(
     class_weights="auto",    # 训练集逆频率。FORWARD 占 ~75%，不加权 SAFE/YAW 召回归零（EVAL_STANDARD §0）
     text_dim=0,              # base 任务无指令。l1 用 16
     # 评测（四组同一批 test 场景；E1 机体、observation 语义、hold 1.0）
-    eval_seeds="1,58,113,122,127,153,172,176,180,190,230,250,256,259,312,327,361,395,422,536",
-                             # tools/pick_test_seeds.py 挑的 20 个：几何组两两不同、v5 下都是 test、与 collection/ 的 300 集零重叠。
-                             # 之前的 180,206,…,1282 虽然都是 test，但按 gid 去重只剩 11 个独立几何（eval 会「跳过: 已评测」），
+    eval_seeds="1,113,122,153,172,176,180,230,250,536,555,628,683,798,929,990,992,997,1113,1654",
+                             # tools/pick_test_seeds.py 挑的 20 个：几何组两两不同、v5 下都是 test、与新 E1 学生的 collection/（300 集）
+                             # 和旧 X3 学生的 t5-full-1155（600 集）的几何都零重叠（tools/test_pick_test_seeds.py 锁定）。
+                             # 0417-eval2 用的 1,58,113,…,536 只排除了 E1 集合，10/20 的几何在 X3 学生的 train 里，x3-old 那行不是留出集。
+                             # 更早的 180,206,…,1282 虽然都是 test，但按 gid 去重只剩 11 个独立几何（eval 会「跳过: 已评测」），
                              # 0417 那轮四组对照实际 n=11（docs/experiments/2026-11-07-e1-demo-plan.md §3 已注明）
     eval_steps=80,           # 给足全程余量（T7 起 80）；碰撞/到达会提前结束
     old_x3_ckpt=f"{DATA_ROOT}/uav_rgb/t6-full-1640/run/ckpt_best.bin",   # T6 best（epoch 8）：X3 / x3_velocity / hold 1.0 训的

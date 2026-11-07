@@ -26,7 +26,9 @@ SEED_MAX = 50_000     # 扫描上限，防写错 split 时死循环
 TASK = "base"         # 柱阵 base 任务；forest_e1 要配 --density
 SPLIT = "test"
 EXCLUDE_COLLECTIONS = (   # 训练集合的 collection_manifest.json：其中出现过的几何组一律排除（哪怕它落 test）
-    "/root/rivermind-data/uav_rgb/e1-pipeline-20261107-0417/collection/collection_manifest.json",
+    "/root/rivermind-data/uav_rgb/e1-pipeline-20261107-0417/collection/collection_manifest.json",   # 新 E1 学生
+    "/root/rivermind-data/uav_rgb/t5-full-1155/collection_manifest.json",   # 旧 X3 学生（T6 ckpt）的训练数据，v3 盐分的 split；
+    #   四组对照里它也是被评测的学生，不排除时 2026-11-07 第二轮的 20 个 seed 有 10 个几何在它的 train 里（tools/test_pick_test_seeds.py）
 )
 # ──────────────────────────────────────────────────────────────────────────
 
