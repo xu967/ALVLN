@@ -26,6 +26,10 @@
 - TEACHER-P1 中间结果（07:28，Callinstrasse pilot 20 集、6 路线 × 3 集评测）：hard SR 12/18、soft(K=8, α=1 步) SR 4/18、hard_plain 13/18 —— 软标签第 0 轮明显更差，agent 在试 α=0.25 与软硬混合，并跑 DAgger 第 1 轮（PGID 713232）。合并 P1 前要看清原因，不能只看 argmax 一致率 91%。
 - 07:55 独立核对 P1 统计（`tmp/main-session/P1_soft_label_diagnosis_0805.md`）与 TEACHER-P1 报告 §3–§4 一致：决定性消融「只把 8.7% 标签换成 kino argmax 硬标签」SR 13/18→5/18，问题在 `teacher_kino` 代价模型（走廊小角度修正判为不值得 + 剪枝键无速度让 SAFE 代价被低估），不是软标签本身。P1 下一步方向：示范与标注统一到同一代价模型（给 `astar_occ` 实现逐动作 cost-to-go），再做软 vs 硬。
 - 机器约束：cgroup CPU 配额 12 核（不是 88），负载 32、20% 周期限流。排队的验证：森林跨场景评测（teacher / e1-new / forward × forest_e1 sparse 20 独立几何 `7,8,19,22,23,39,53,64,71,86,90,102,110,134,135,136,142,145,155,161`），等 eval2 结束释放 gz 再起。
+- **08:03 会话中断**（IDE 会话重启，到 12:55 才恢复）：6 个子 agent 与它们起的 gz/渲染/构建进程全部被杀；只有 setsid 守护进程活下来。eval2 08:46 DONE rc=0：教师 19/20、新 E1 学生 7/20、旧 X3 学生 2/20、盲前进 2/20（碰撞 0.05/0.40/0.45/0.90；已填 `docs/experiments/2026-11-07-e1-demo-plan.md` §3.2；SPL 列空，因 eval2 启动早于 e33e816）。用户 YOLO 训练进程（82761）在此期间自行结束（不是我们动的；`YOLOVOmodal_3871538535/logs/full_e4_resume.log` 最后写于 12:05），GPU 空闲。
+- 12:58 按用户要求恢复中断的 agent：TEACHER-P1、SCENE-B 的报告/worklog/PROGRESS 在中断前已定稿（待办全勾），不再恢复，直接收报告；4 个审核员用 `resume` 续做（各自 PROGRESS.md 断点：P2 在 F/G、SITL 等 Gazebo 1 集 + 报告、EVAL 在 D、3DGS 等 Wanderland 渲染 + 报告）。
+- 13:00 新派 2 个 agent（共 6）：DISTILL（`tmp/phase3-20261107/BRIEF_DISTILL.md`：蒸馏环节 7 个问题，交判断不交改动，报告 `reports/DISTILL_20261107.md`）、VIZ-LAYOUT（`BRIEF_VIZ_LAYOUT.md`：3DGS 三视角从 960×276 统一到 Gazebo 的 1280×720 版式、一份版式实现、重合成已有 3DGS 集、demo 短片 v1；worktree `tmp/wt-viz-layout`）。用户 07:55 的「布局优化」问题（可视化版式 vs 规划排布）没等到回答：按可视化版式理解派了 VIZ-LAYOUT，规划文档更新由主会话自己做。
+- 13:11 森林跨场景评测守护进程：`$DATA_ROOT/uav_rgb/xeval-forest-sparse-20261107-1310/run_xeval.sh`，PGID 941204，teacher → student-e1-new → forward 顺序各 20 独立几何（forest_e1 sparse，test），一次 1 个 gz，infer 二进制快照在 `…/bin/`；看 `run.log` / `eval-<组>.log`，结束落 `DONE` + `summary.md`；停 `kill -- -941204`。教训：gz 必须 `UAVRGB_RENDER_BACKEND=software DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg`（同 `e1_pipeline.GZ_ENV`），默认 gpu(EGL) 后端在本容器段错误（nvidia EGL 库是 0 字节桩）；bash 里不能用 `GROUPS` 作变量名（只读数组）。
 - 主会话 worklog：`docs/worklog/2026-11-07-0515-phase3-main-session.md`（08:00 追加第五阶段小节）。
 - 待办：收 4 份审核报告 → 按 Must fix 修/合并 review-* 分支的改动 → 收 TEACHER-P1 / SCENE-B 报告并合并 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
 
@@ -40,6 +44,8 @@
 
 | 实验 | 启动 | 进程 | 看进度 | 停 |
 | --- | --- | --- | --- | --- |
+| 森林跨场景评测 `xeval-forest-sparse-20261107-1310/run_xeval.sh`（teacher → e1-new 学生 → forward，forest_e1 sparse 20 独立几何，一次 1 个 gz） | 2026-11-07 13:11 | PGID 941204，`$DATA_ROOT/uav_rgb/xeval-forest-sparse-20261107-1310/run.pid` | `tail -f …/run.log`、`…/eval-<组>.log`；结束落 `…/DONE` + `summary.md` | `kill -- -941204` |
+| （已完成 08:46）第二轮四组重评 `e1-pipeline-20261107-0417-eval2`（20 独立几何，lib v2） | 2026-11-07 07:11 | PGID 694826 | `…-eval2/run.log` 末尾 summary；视频 `eval-teacher/videos/`、`eval-student-e1-new/videos/` | — |
 | （已完成 06:40）E1 流水线 `tools/e1_pipeline.py`（300 集采集 → 审计 → 打包 → 训练 30 轮 → 20 seed 四组闭环含三视角视频 → 汇总；pilot 已过） | 2026-11-07 04:25（`--from collect`） | PID/PGID 424699，`$DATA_ROOT/uav_rgb/e1-pipeline-20261107-0417/run.pid` | `tail -f …/run.log`；每步状态 `…/status.json`；结束落 `…/DONE`（rc + 最后一步）；评测各组日志 `…/eval-<组>.log`，视频 `…/eval-teacher/videos/`、`…/eval-student-e1-new/videos/` | `kill -- -424699`（collect_parallel 已装 SIGTERM 处理器，会把 gz 一起收掉） |
 | 子 agent「Gazebo forest_e1 场景接入」（随机圆柱森林三档密度接进 scene_gen/collect/eval/audit/e1_pipeline，真 Gazebo 测教师，录 1 段三视角） | 04:19 | 工作目录 `$DATA_ROOT/uav_rgb/tmp/agent-forest/`，断点 `PROGRESS.md` | 同左 | 它自己的 run.pid |
 | 子 agent「3DGS 多路线 demo 与数据」（Callinstrasse ≥4 条带转弯路线、三视角视频、20 集 3DGS E1 pilot 数据集） | 04:19 | 工作目录 `$DATA_ROOT/uav_rgb/tmp/agent-3dgs-routes/`，断点 `PROGRESS.md`；产物 `$DATA_ROOT/uav_rgb/demo-e1-20261107/3dgs-callinstrasse-routes/` | 同左 | 它自己的 run.pid |
