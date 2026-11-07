@@ -69,3 +69,23 @@
 - 没起森林跨场景评测：CPU 配额 12 核已满载，等 eval2 释放。
 - 没下载新场景：第二个 Wanderland 场景需要人工看轨迹图选 ID 并设计路线，留给 SCENE-A agent 续做（slot 满）。
 - 没合并 student-p2 / teacher-p1 / scene-mipnerf：等审核报告与 eval2 结束（build/check 正在被评测使用）。
+
+## 更新 2026-11-07 14:00（恢复中断、合并审核修复、清理）
+
+- 08:03–12:55 会话中断：6 个 agent 及其子进程被杀，eval2 守护进程完成（n=20：教师 19、新 E1 学生 7、旧 X3 学生 2、盲前进 2）。12:58 用 resume 恢复 4 个审核员；TEACHER-P1、SCENE-B 已定稿直接收报告。
+- 合并：scene-mipnerf（c435b49）、review-3dgs（2c49fac，demo 续跑核对配置）、review-p2（7587e18，含 student-p2 全部 + dilate_by_envelope 截断）；主会话补 `StudentAdapter` 每集 `reset()` + 测试（6749eb2）。teacher-p1 落分支 a4b932e 不合并（W2 改向）。`check.sh` 全量通过（CTest 30/30、cf_sitl 6/6、selftest、Python 全过），`build/check` 重建，GitHub 推到 ebd007e。
+- Callinstrasse 高度口径收口（REVIEW-3DGS Must fix #2）：`docs/experiments/3dgs-site-callinstrasse.md`。
+- 新派：DISTILL（蒸馏判断）、VIZ-LAYOUT（版式统一 + 短片 v1；13:58 追加 §6：机体外观两域统一、画质 knob、ffmpeg）、R2-SRC（第六阶段先行）。森林跨场景评测守护进程 PGID 941204。
+- 用户 13:46「视频里无人机是小圆饼」：核帧确认两处来源（Gazebo 07:00 前模板的圆柱占位；3DGS 320×240 上 19 px 的线框糊成圆圈），修法写进 BRIEF_VIZ_LAYOUT §6.1。「画质超参数写进入口脚本」：§6.2（`VIDEO_QUALITY` 三档表 → 画布/显示渲染缩放/SSAA/CRF；PNG 帧 + ffmpeg libx264；需装 imageio-ffmpeg 或 apt ffmpeg）。
+
+### 清理（用户 13:46「废弃的实验结果、代码、测试脚本请及时删除」）
+
+删除（数据盘，共约 3 GB）：
+- `demo-e1-20261107/3dgs-callinstrasse-routes`（v1，离地 3.7 m）、`…-routes-v2`（64.9°）、`…-teacher`、`…-teacher-48steps`（修复前直线教师片）
+- `datasets/e1-3dgs-callinstrasse-pilot`（v1）、`…-pilot-v2`（数字已在报告里；v3-fov60 保留）
+- `3dgs-smoke-20261107-attempt1-oldbinary`、`tmp/agent4-teacher-p1/dagger-pilot-r0-aborted-{buildsnap,evallog}`
+- 旧构建目录 `tmp/build-cf-sitl-v1-20261106`、`build-src-s3`、`build-cf-sitl-s3`、`build-cf-sitl-tools`、`build-review-p2*`
+- `3dgs-scenes/{hf,kitchen,room}`（7k mini 室内，未用；可用 `agent4-scene-mipnerf/remote_zip.py` 重取 30k）、`bicycle-mini.splat`、`bicycle-cameras.json`、`bicycle/` 里 7k 变体（flip/flip2/real/v2 PLY + json + bak）
+仓库：移除 13 个已合并 worktree（`tmp/wt-{3dgs,data,sitl,src,viz}-20261107`、`wt-eval-matrix`、`wt-scene-wanderland`、`wt-scene-mipnerf`、`wt-review-3dgs`、`wt-review-p2`、`wt-src-algo-20261106`、`wt-baseline-20261106`、`wt-fastlab-20261106`）与分支（fastlab 内容已在 main，版本更新；`git diff` 只差 test_scene_forest 24 行主干新增）。
+保留：`tmp/agent*-*/` 工作目录（报告证据）、`wt-teacher-p1`（未合并）、`wt-student-p2`（DISTILL 只读中，合并后删）、在跑 agent 的 worktree。
+仓库内代码/测试的废弃项交 R2 审核（R2-UIDOCS 仓库卫生）列清单后删。
