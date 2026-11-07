@@ -128,15 +128,32 @@ def collect(out_dir, route, episodes, seed, jitter=0.0, steps=None, split=None):
     return [os.path.join(out_dir, "ep_%05d" % i) for i in range(episodes)]
 
 
-def complete_episodes(out_dir, episodes):
+def expected_run(scene, gid, route):
+    """当前配置下 route 的 run.json 关键字段；complete_episodes 拿它拒绝复用别的配置采的集
+    （默认 PILOT_OUT 里躺着 t_z 修复前的 pilot v1：gid 893fc2a757638edf、离地 3.7 m，run.json/集数都「完整」）。"""
+    r = scene["routes"][route]
+    return {"geometry_gid": gid, "fov_deg": float(scene["camera"]["fov_deg"]), "hold_s": HOLD_S, "policy": POLICY,
+            "dynamics": DYNAMICS, "spawn": r["spawn"], "waypoint": r["waypoint"]}
+
+
+def complete_episodes(out_dir, episodes, expect=None):
     """断点续跑：out_dir 是 collect() 完整跑完的产物时返回其中还在的 ep 目录（失控集可能已挪到 quarantine/），
-    否则 None。完整 = run.json 存在、failures 为空、episodes 数等于要求数、每个还在的 ep 有无 error 的 manifest。"""
+    否则 None。完整 = run.json 存在、failures 为空、episodes 数等于要求数、每个还在的 ep 有无 error 的 manifest，
+    且（给了 expect 时）run.json 的几何 gid / FOV / hold / 教师 / 动力学 / 起终点与 expected_run() 一致。"""
     run_json = os.path.join(out_dir, "run.json")
     if not os.path.isfile(run_json):
         return None
     info = json.load(open(run_json, encoding="utf-8"))
     if info.get("failures") or len(info.get("episodes", [])) != episodes:
         return None
+    if expect is not None:
+        got = {"geometry_gid": info.get("scene", {}).get("geometry_gid"), "fov_deg": info.get("renderer", {}).get("fov_deg"),
+               "hold_s": info.get("hold_s"), "policy": info.get("policy"), "dynamics": info.get("dynamics"),
+               "spawn": info.get("spawn"), "waypoint": info.get("waypoint")}
+        diff = {k: (got[k], v) for k, v in expect.items() if got[k] != v}
+        if diff:
+            print(f"### {out_dir}: run.json 与当前配置不同 {diff}，按旧产物处理不复用", flush=True)
+            return None
     eps = []
     for e in info["episodes"]:
         ep = os.path.join(out_dir, e["dir"])
@@ -149,9 +166,9 @@ def complete_episodes(out_dir, episodes):
     return eps
 
 
-def collect_or_reuse(out_dir, route, episodes, seed, jitter, steps, split):
-    """已完整采过就复用；半成品挪到 PILOT_OUT/incomplete/ 再重采（不删任何目录）。"""
-    eps = complete_episodes(out_dir, episodes)
+def collect_or_reuse(out_dir, route, episodes, seed, jitter, steps, split, expect=None):
+    """已完整采过就复用；半成品 / 别的配置采的挪到 PILOT_OUT/incomplete/ 再重采（不删任何目录）。"""
+    eps = complete_episodes(out_dir, episodes, expect)
     if eps is not None:
         print(f"### reuse {out_dir}: {len(eps)} 集已存在，跳过采集", flush=True)
         return eps
@@ -273,15 +290,17 @@ def phase_pilot(scene, checks):
     per_route = {r: 0 for r in ROUTES}
     for i in range(PILOT_EPISODES):          # 轮换：第 i 集用 ROUTES[i % n]
         per_route[ROUTES[i % len(ROUTES)]] += 1
+    import importlib
+    gid = importlib.import_module("sim.3dgs.collect_3dgs").scene_identity(scene)["geometry_gid"]   # 与 collect_3dgs 同一算法
     eps = []
     for r in ROUTES:
         if per_route[r]:
             eps += collect_or_reuse(os.path.join(PILOT_OUT, f"route_{r}"), r, per_route[r], PILOT_SEED0 + 100 * r,
-                                    PILOT_SPAWN_JITTER_M, STEPS, PILOT_SPLIT)
+                                    PILOT_SPAWN_JITTER_M, STEPS, PILOT_SPLIT, expected_run(scene, gid, r))
     # 上次运行留下的补采集（route_r_retry_seed*/）也复用，不然同 seed 重采会撞目录
     for name in sorted(os.listdir(PILOT_OUT)):
         if "_retry_seed" in name:
-            eps += complete_episodes(os.path.join(PILOT_OUT, name), 1) or []
+            eps += complete_episodes(os.path.join(PILOT_OUT, name), 1, expected_run(scene, gid, int(name.split("_")[1]))) or []
     # 失控集隔离 + 补采：标了 dynamics_anomaly 的集（FORWARD 下倒飞，标签与运动相反）移到 quarantine/ 留证据，
     # 不进 episodes.txt；同路线换 seed 补一集，直到没有异常集或用完 PILOT_RETRY_MAX 轮
     qdir = os.path.join(PILOT_OUT, "quarantine")
@@ -299,7 +318,8 @@ def phase_pilot(scene, checks):
             # shortcut: 上次运行在隔离之后、补采之前被打断的集不会再补（quarantine 里有、eps 里没有），
             # 集数会少 1–2；要补齐就删掉 pilot_manifest 后手动 collect 到 route_r_retry_seed<seed+10>
             eps += [e for e in collect_or_reuse(os.path.join(PILOT_OUT, f"route_{r}_retry_seed{new_seed}"), r, 1,
-                                                new_seed, PILOT_SPAWN_JITTER_M, STEPS, PILOT_SPLIT) if e not in eps]
+                                                new_seed, PILOT_SPAWN_JITTER_M, STEPS, PILOT_SPLIT, expected_run(scene, gid, r))
+                    if e not in eps]
     quarantined = []                         # 从目录重建，续跑时上次隔离的也在
     for name in sorted(os.listdir(qdir)) if os.path.isdir(qdir) else []:
         man = json.load(open(os.path.join(qdir, name, "episode_manifest.json"), encoding="utf-8"))

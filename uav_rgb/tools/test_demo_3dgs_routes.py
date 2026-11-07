@@ -42,6 +42,24 @@ class TestResume(unittest.TestCase):
                                                  "failures": [{"episode": 1}]})
             self.assertIsNone(demo.complete_episodes(d, 2))                      # run.json 记了失败
 
+    def test_complete_episodes_rejects_other_config(self):
+        """run.json 记的几何 gid / 起终点 / FOV / hold / 教师 / 动力学与当前配置不一致时不能复用
+        （默认 PILOT_OUT 里还躺着 t_z 修复前的 pilot v1：gid 893fc2a757638edf、离地 3.7 m）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = os.path.join(tmp, "route_0")
+            info = {"episodes": [{"dir": "ep_00000"}], "failures": [], "scene": {"geometry_gid": "893fc2a757638edf"},
+                    "renderer": {"fov_deg": 60.0}, "hold_s": 0.5, "policy": "astar", "dynamics": "cf_sitl",
+                    "spawn": {"x": -14.0, "y": 0.0, "z": 2.0, "yaw_deg": 0.0}, "waypoint": {"x": -6.0, "y": 0.0, "z": 2.0}}
+            _write(os.path.join(d, "run.json"), info)
+            _write(os.path.join(d, "ep_00000", "episode_manifest.json"), {"error": None})
+            expect = {"geometry_gid": "893fc2a757638edf", "fov_deg": 60.0, "hold_s": 0.5, "policy": "astar",
+                      "dynamics": "cf_sitl", "spawn": info["spawn"], "waypoint": info["waypoint"]}
+            self.assertEqual(demo.complete_episodes(d, 1, expect), [os.path.join(d, "ep_00000")])   # 同配置：复用
+            for k, v in (("geometry_gid", "86b0f5cb953fbb03"), ("fov_deg", 64.9), ("hold_s", 1.0), ("policy", "teacher"),
+                         ("dynamics", "cf_blackbox"), ("spawn", dict(info["spawn"], x=-2.0)), ("waypoint", dict(info["waypoint"], y=1.0))):
+                self.assertIsNone(demo.complete_episodes(d, 1, dict(expect, **{k: v})), k)
+            self.assertEqual(demo.complete_episodes(d, 1), [os.path.join(d, "ep_00000")])           # 不传 expect：老行为
+
     def test_no_duplicate_config(self):
         """配置区同名常量不能出现两次（上一版 PILOT_RETRY_MAX / anomaly_str 各写了两遍）。"""
         src = open(os.path.join(ROOT, "tools", "demo_3dgs_routes.py"), encoding="utf-8").read()
