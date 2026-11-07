@@ -1,6 +1,8 @@
 # progress.md（新开会话先读这个）
 
-- 更新：2026-11-07 05:30（Cursor 新会话接手，第三阶段：全库并行精读 + 修 bug + demo）
+- 更新：2026-11-07 16:50（第六阶段审核收口 + eval3 出数 + 方案盘点；最新一段见「第三阶段」列表末尾 15:30–16:50 条目）
+- **现在在跑（16:50）**：守护进程 ① 森林跨场景 lib v3 `xeval-forest-sparse-20261107-1600`（PGID 1195540）② 成功线截断 + L/R 可见化重采流水线 `e1-pipeline-20261107-1620-sgvis`（PGID 1216165，pilot→collect 300→训→20 seed 评，约 19:00 出）。子 agent 5 个：VIZ-LAYOUT 二轮、R2-UIDOCS、R2-REPRO、FIX-SITL（批次 C）、FIX-3DGS（批次 D）。**两个守护进程 DONE 之前不许改写 `tmp/build-cf-sitl`**（v3.1 就地重建等它们）。
+- 方案效果盘点：`docs/experiments/2026-11-07-approach-scoreboard.md`；方向计划最新一节：`docs/PLAN_2026-11-07_demo_and_paper.md` 「更新 16:40」；修复清单：`tmp/phase3-20261107/FIXLIST_R2.md`。
 
 ## 第三阶段（2026-11-07 05:10 起）
 
@@ -43,8 +45,17 @@
 - 根分区 `/` 只剩 4.8 GB（/tmp 1.1 GB 是 IDE AppImage 解包、/opt 13 GB，都不是我们的）；所有进程只写数据盘。
 - 15:10 R2-SITL 报告：approve、无 Must fix，固件假设逐条核实为真。两条 Should fix 待办（**eval3 结束后做**，因为 `sim/dynamics/e1_mini.json` 被跑着的 gz 每集读取，中途改会让 eval3 口径不一）：① `vel_ki` 0.15→0.30（FORWARD 稳态侧偏 b/ki 减半，7 m 航程偏 0.8→0.4 m；selftest 仍 33/33；dynamics_profile sha 会变，记为 lib v3.1）；② selftest 阈值按 40 种子扫描修（场景 1 加计链阈值 1.0° 实为 2σ、6a 缺光流随机游走项、6b 97 s 真饱和超 README 69 s 包络），脚本在 `tmp/agent7-r2-sitl/seeds/`。Nice：E1 模板护罩四角 0.120 m 伸出碰撞半径 0.102（交 VIZ-LAYOUT 二轮部件表时一并对齐）；`templates/uav_rgb_e1.118fa38c.sdf` 无代码引用但它是 0417 训练集的模板存档，**保留**（provenance）。
 - 15:20 R2-SIMTOOLS 报告：Must fix 1 条已修并合并（e1_pipeline.evaluate 等齐各组再查 eval.json，否则首组缺文件抛出留孤儿 gz；ac1d049）。审核后的修复批次汇总在 `tmp/phase3-20261107/FIXLIST_R2.md`（A：sim/tools 流水线 7 条，含**评测器在成功线停、metric_version 升版**、seed 清单单一来源、helper 去重、SPL 参考净空改机体半径；B：src 5 条；C：SITL v3.1 主会话做；D：3DGS 等 R2-3DGS）。批次 A/B 在 DEV-DATA、R2-3DGS 交付后派 2 个 FIX agent。
-- 主会话 worklog：`docs/worklog/2026-11-07-0515-phase3-main-session.md`（08:00 追加第五阶段小节）。
-- 待办：eval3 后做 SITL v3.1（ki 0.30 + selftest 阈值）并重建库；收 R2-SIMTOOLS / R2-3DGS / DEV-DATA / VIZ-LAYOUT-2 报告 → 合并 → 推 GitHub → 派 R2-3DGS / R2-UIDOCS / R2-REPRO；收 R2-SRC / R2-SITL / R2-SIMTOOLS；DEV-DATA（DISTILL ①②③ 的 opt-in 实现）→ 评审 → Gazebo 对照实验 → 按 Must fix 修/合并 review-* 分支的改动 → 收 TEACHER-P1 / SCENE-B 报告并合并 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
+- 15:35 GitHub 镜像推到 6d7c258（= uav_rgb 9dbe07b）。派 R2-UIDOCS / R2-REPRO（基于 9dbe07b，`BRIEF_REVIEW2` §4 已填）。
+- 15:50 R2-3DGS 报告：Ship、无 Must fix、Should fix 6 / Nice 7（A* 教师「对准后前向 0.4 m 被堵」L/R 死锁，voxel 0.1 场景构型真实存在，修法 `PLAN_HARD_M=0.1` 要升 TEACHER_VERSION → 并入 W2 教师改版；eval 学生集 `executed_by` 错标；video.py 标题恒 teacher；`step_probe` 重复实现；scene.json notes 未同步）。worklog 合并 6c4a0b5；拍板写进 `FIXLIST_R2.md` 批次 D（D5–D12）。
+- 15:40 **eval3 DONE rc=0**（lib v3、20 零重叠几何）：教师 20/20、**截断重训 13/20**（乱飞 2、碰撞 5、SPL 0.59）、硬标签 BC 10/20（乱飞 6、碰撞 2、SPL 0.39）、旧 X3 4/20、盲前进 2/20。配对：截断 vs BC b=6/c=3 p=0.51；Cochran's Q p<0.001。`stats/eval3.md`。填 demo-plan §3.3；新建 `docs/experiments/2026-11-07-approach-scoreboard.md`。
+- 16:00 森林跨场景 **lib v3 重跑**：`xeval-forest-sparse-20261107-1600/run_xeval.sh`，PGID 1195540，两车道（teacher→forward；e1-new→e1-trunc），冻结 worktree `tmp/wt-xeval-forest`@6c4a0b5，插件 `tmp/build-cf-sitl`（v3），infer 快照 `OUT/bin`。跳过条件 = eval.json 且 failed_count==0（lib v2 那轮学生组 20/20 EGL 失败的 eval.json 被当「已评」跳过，教训）。停：`kill -- -1195540`。
+- 16:10 DEV-DATA 交付（12 文件 +735/−37）：`collect --stop-at-goal`（成功线 = 最远柱 x+1.0）、`--tiebreak visible`、`--policy student` 影子教师 + `--beta/--dagger-round`；audit `episode_length`；默认 12000 帧逐位不变。主会话复跑六套件全绿后合并 **bd4f626**。派 FIX-SITL（批次 C，`tmp/wt-fix-sitl`，构建 `tmp/build-fix-sitl`）、FIX-3DGS（批次 D，`tmp/wt-fix-3dgs`），简报 `BRIEF_FIX.md`。
+- 16:17 **sgvis 流水线**：`e1-pipeline-20261107-1620-sgvis`，PGID 1216165，`E1_STOP_AT_GOAL=1 E1_TIEBREAK=visible E1_EXTRA_STUDENTS=student-e1-trunc=…`，从 pilot 起全流程；冻结 worktree `tmp/wt-e1-sgvis`@c8b9ccf（e1_pipeline CFG 加环境变量覆盖），`UAV_RGB_BUILD_DIR=OUT/bin`（train/infer 快照）；teacher / x3-old / forward / e1-trunc 四个 eval 目录软链到 eval3（同 seed 同库同二进制，按「已有 eval.json」跳过），只评本轮学生并录像。停：`kill -- -1216165`。预计 19:00。
+- 16:40 PLAN 追加更新（W2 实施顺序：标签定义层 → DAgger 层 → 统一代价模型层；M0 关闭；M3 过线判据相对 eval3 基准 n≥60）。
+- **异常**：`tmp/wt-fix-b`（分支 fix-b）+ `tmp/agent8-fix-b` 于 15:54:46 从 main 6c4a0b5 建出，空、无进程、无提交，不是本会话或其子 agent 建的（记录里都没有）。未删；派 FIX-B 前先确认来源与内容。
+- 主会话 worklog：`docs/worklog/2026-11-07-0515-phase3-main-session.md`（08:00 第五阶段、14:00 恢复与清理、16:50 审核收口与 eval3 小节）。
+- 待办（16:50 起）：收 VIZ-LAYOUT 二轮 → 合并 → D7（video.py 标题/结果字）与 D8（scene.json notes）→ 重录四组视频 → 短片 v2；收 R2-UIDOCS / R2-REPRO → 合并文档修补 → 按清单删废弃文件；收 FIX-SITL → 等两个守护进程 DONE → `mv tmp/build-cf-sitl tmp/build-cf-sitl-v3-20261107` 就地重建 v3.1 → 森林/后续评测都用 v3.1；收 FIX-3DGS → 合并；派 FIX-A（含评测器成功线停 + metric_version 升版，改完 eval3 五组同 seed 重算）/ FIX-B；sgvis 出数 → 对照截断臂 13/20 与碰撞 → 起 DAgger 第 0 轮（3 轮 × 100 集，β 0.5→0，带再采 300 集对照臂）；TEACHER-P1b 统一代价模型。
+- 旧待办：eval3 后做 SITL v3.1（ki 0.30 + selftest 阈值）并重建库；收 R2-SIMTOOLS / R2-3DGS / DEV-DATA / VIZ-LAYOUT-2 报告 → 合并 → 推 GitHub → 派 R2-3DGS / R2-UIDOCS / R2-REPRO；收 R2-SRC / R2-SITL / R2-SIMTOOLS；DEV-DATA（DISTILL ①②③ 的 opt-in 实现）→ 评审 → Gazebo 对照实验 → 按 Must fix 修/合并 review-* 分支的改动 → 收 TEACHER-P1 / SCENE-B 报告并合并 → 流水线结束后逐个合并分支到 main（先跑 check.sh）→ 真 Gazebo 验证 agent 列的清单 → 填四组对照数字 → demo 汇总页 → worklog → 镜像推送 GitHub（`bash tools/git_mirror_alvln.sh`）→ 清理 worktree。
 
 ---
 
@@ -57,7 +68,10 @@
 
 | 实验 | 启动 | 进程 | 看进度 | 停 |
 | --- | --- | --- | --- | --- |
-| 森林跨场景评测 `xeval-forest-sparse-20261107-1310/run_xeval.sh`（teacher → e1-new 学生 → forward，forest_e1 sparse 20 独立几何，一次 1 个 gz） | 2026-11-07 13:11 | PGID 941204，`$DATA_ROOT/uav_rgb/xeval-forest-sparse-20261107-1310/run.pid` | `tail -f …/run.log`、`…/eval-<组>.log`；结束落 `…/DONE` + `summary.md` | `kill -- -941204` |
+| **sgvis 流水线** `e1-pipeline-20261107-1620-sgvis`（`--stop-at-goal --tiebreak visible` 重采 300 集 → 审计 → 打包 → 训 30 轮 → 20 seed 评本轮学生 + 录像；其余四组软链 eval3） | 2026-11-07 16:17 | PGID 1216165，`…-sgvis/run.pid` | `tail -f …-sgvis/run.log`、`status.json`；结束落 `DONE` + `summary.md` | `kill -- -1216165` |
+| **森林跨场景 lib v3** `xeval-forest-sparse-20261107-1600/run_xeval.sh`（两车道：teacher→forward、e1-new→e1-trunc；forest_e1 sparse 20 独立几何） | 2026-11-07 16:00 | PGID 1195540，`…-1600/run.pid` | `tail -f …/run.log`、`…/eval-<组>.log`；结束落 `DONE` + `summary.md` | `kill -- -1195540` |
+| （已完成 15:40）eval3 `e1-pipeline-20261107-0417-eval3`（lib v3、20 零重叠几何、五组） | 14:11 | PGID 1032381 | `…-eval3/summary.md`、`stats/eval3.md` | — |
+| （已停，lib v2 部分）森林跨场景 `xeval-forest-sparse-20261107-1310-libv2-partial`（教师 13/20、盲前进 1/20；学生组因 EGL 后端 20/20 失败） | 13:11 | — | `summary.md` | — |
 | （已完成 08:46）第二轮四组重评 `e1-pipeline-20261107-0417-eval2`（20 独立几何，lib v2） | 2026-11-07 07:11 | PGID 694826 | `…-eval2/run.log` 末尾 summary；视频 `eval-teacher/videos/`、`eval-student-e1-new/videos/` | — |
 | （已完成 06:40）E1 流水线 `tools/e1_pipeline.py`（300 集采集 → 审计 → 打包 → 训练 30 轮 → 20 seed 四组闭环含三视角视频 → 汇总；pilot 已过） | 2026-11-07 04:25（`--from collect`） | PID/PGID 424699，`$DATA_ROOT/uav_rgb/e1-pipeline-20261107-0417/run.pid` | `tail -f …/run.log`；每步状态 `…/status.json`；结束落 `…/DONE`（rc + 最后一步）；评测各组日志 `…/eval-<组>.log`，视频 `…/eval-teacher/videos/`、`…/eval-student-e1-new/videos/` | `kill -- -424699`（collect_parallel 已装 SIGTERM 处理器，会把 gz 一起收掉） |
 | 子 agent「Gazebo forest_e1 场景接入」（随机圆柱森林三档密度接进 scene_gen/collect/eval/audit/e1_pipeline，真 Gazebo 测教师，录 1 段三视角） | 04:19 | 工作目录 `$DATA_ROOT/uav_rgb/tmp/agent-forest/`，断点 `PROGRESS.md` | 同左 | 它自己的 run.pid |

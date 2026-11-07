@@ -191,3 +191,46 @@ P1 的叙事「cost-to-go 软标签 + 信念边际化 + DAgger」保留，实施
 ### 第五阶段 agent（11-07 13:00 起，并发 6）
 
 REVIEW-P2 / REVIEW-SITL / REVIEW-EVAL / REVIEW-3DGS（独立审核，`BRIEF_REVIEW.md`）、DISTILL（蒸馏环节判断，`BRIEF_DISTILL.md`）、VIZ-LAYOUT（版式统一 + 短片 v1，`BRIEF_VIZ_LAYOUT.md`）。排队：TEACHER-P1b（W2 改向实现）、SCENE-A 续（第二个 Wanderland 场景）、SCENE-B 续（stump 路线 / treehill / flowers）。
+
+## 更新 2026-11-07 16:40（第六阶段审核收口中；eval3 出数；方案盘点见 `experiments/2026-11-07-approach-scoreboard.md`）
+
+### 事实变化
+
+- **固定基准建立**：eval3（SITL 库 v3，20 个与两个训练集零重叠的独立几何，SPL 列齐）：教师 20/20、新 E1 学生硬标签 BC 10/20、**成功线截断重训 13/20**、旧 X3 学生 4/20、盲前进 2/20（`experiments/2026-11-07-e1-demo-plan.md` §3.3）。此后所有 E1 学生都在这张表上比，seed 集 / 库版本 / infer 二进制冻结。
+- **DISTILL 三条建议的第一条闭环成立**：截断「过线后朝看不见的目标回正」的 18% 帧，乱飞 6→2、SR 10→13、SPL 0.39→0.59，碰撞 2→5（YAW 召回下降的代价）。p=0.51（n=20），方向成立、幅度待放量。
+- 教师上界不再是瓶颈：lib v3 后柱阵教师 20/20、碰撞 0。瓶颈完全在「监督信号 → 学生」这一环，与 D2 的 Q1 一致。
+- DEV-DATA 把三条建议落成默认关的开关（`collect --stop-at-goal / --tiebreak visible / --policy student --beta`，audit/preprocess/e1_pipeline 透传，默认行为 12000 帧逐位不变），已合并 main（bd4f626）。
+- 第六阶段审核：R2-SRC / R2-SITL / R2-SIMTOOLS / R2-3DGS 四份报告收齐，**全部无 Must fix**（R2-SIMTOOLS 的 1 条已修并合并）；Should fix 汇总为 `tmp/phase3-20261107/FIXLIST_R2.md` 四个批次，C（SITL v3.1）与 D（3DGS）两个修复 agent 16:10 已派，A（sim/tools）/ B（src）等 DEV-DATA 合并后派（已合并，下一步派）。R2-UIDOCS / R2-REPRO 15:45 已派。
+- 机器：eval3 期间 5 gz + 3 agent 可跑，cgroup 12 核是硬上限；根分区只剩 4.8 GB，一切输出在数据盘。
+
+### W2 教师算法：实施路径再具体一步
+
+叙事不变（cost-to-go 软标签 + 信念边际化 + DAgger），顺序改为「先把标签变成图像的函数，再谈软」：
+
+1. **标签定义层**（本周）：`--stop-at-goal`（已验证方向）+ `--tiebreak visible`（L/R 近平局按学生视锥内最近柱决定）重采 300 集 → 训 → 同 20 seed 评（**跑中**：`e1-pipeline-20261107-1620-sgvis`）。判据：SR ≥ 截断臂 13/20 且碰撞回到 ≤ 2。
+2. **DAgger 层**（sgvis 出数后）：影子教师 3 轮 × 100 集，β 0.5 → 0，带「再采 300 集教师数据」对照臂（排除「只是数据多了」）；每轮按 Wilson 区间定集数。prev-action 只在这之后开。
+3. **统一代价模型层**（M3 前）：给 `teacher.py` A* 与 3DGS `astar_occ` 实现逐动作 cost-to-go（四个原语各滚一步 → 同一测地场剩余代价 + 1），argmin 按构造 = 硬标签；R2-3DGS 发现的 A* 教师「对准后前向被堵」L/R 死锁（`PLAN_HARD_M` 0.1 修法）并入这次教师改版，`TEACHER_VERSION` 只升一次。软标签 vs 硬标签对照只在这一层做，先 Gazebo 后 3DGS。
+4. 信念边际化与 RL 微调不变，排在 3 之后。
+
+### W3 学生算法
+
+P2 代码在 main 但不进流水线（DISTILL 反事实探针：prev-action 在纯 BC 数据上是方向复读机）；`--prev-action` 的开启条件 = DAgger 数据到位；`--depth-aux` 的开启条件 = 有深度真值的 3DGS 集（Wanderland / garden）。双帧 `--two-frame` 合并后要做同样的反事实探针（把上一帧替换成当前帧）再决定。
+
+### W1 场景 / W4 评测
+
+- 森林跨场景矩阵一格在跑（lib v3：教师 / 两个学生 / 盲前进 → forest sparse 20 几何）；lib v2 部分结果教师 13/20 已说明 sparse 档对教师也只有 0.65。
+- 评测口径待改（FIXLIST 批次 A #1）：评测器在成功线停、`metric_version` 升版，让 SR 不随 `--steps` 变；SPL 参考路径净空改机体半径。改完 eval3 五组要在新口径下重算一次（同 seed，直接重跑）。
+
+### 里程碑
+
+| 里程碑 | 原日期 | 现状 |
+| --- | --- | --- |
+| M0 审计与基线 | 11-07 | **关闭**：四份 R2 审核无 Must fix；固定基准表建立 |
+| M1 场景 | 11-09 | 达成（4 场景）；Callinstrasse 2 m AGL 口径只对 r3/r4 成立，定量用 Wanderland / Mip-NeRF 360 |
+| M2 Demo | 11-12 | 不变；短片 v2（E1 实体机体 + VIDEO_QUALITY）VIZ-LAYOUT 二轮今日出 |
+| M3 算法 v1 | 11-20 | 内容定为上面 W2 的 1→2→3；过线判据改为「相对 eval3 硬标签 BC 10/20，n≥60 下区间不重叠」 |
+| M4 论文材料 | 12-05 | 不变 |
+
+### 第六阶段 agent（16:40 状态，并发 6）
+
+跑中：VIZ-LAYOUT 二轮、R2-UIDOCS、R2-REPRO、FIX-SITL（批次 C）、FIX-3DGS（批次 D）。排队：FIX-A（sim/tools 流水线，含评测器成功线停）、FIX-B（src）；TEACHER-P1b（统一代价模型）在 sgvis 出数后派。守护进程：森林跨场景 lib v3（PGID 1195540）、sgvis 流水线（PGID 1216165）。

@@ -89,3 +89,36 @@
 仓库：移除 13 个已合并 worktree（`tmp/wt-{3dgs,data,sitl,src,viz}-20261107`、`wt-eval-matrix`、`wt-scene-wanderland`、`wt-scene-mipnerf`、`wt-review-3dgs`、`wt-review-p2`、`wt-src-algo-20261106`、`wt-baseline-20261106`、`wt-fastlab-20261106`）与分支（fastlab 内容已在 main，版本更新；`git diff` 只差 test_scene_forest 24 行主干新增）。
 保留：`tmp/agent*-*/` 工作目录（报告证据）、`wt-teacher-p1`（未合并）、`wt-student-p2`（DISTILL 只读中，合并后删）、在跑 agent 的 worktree。
 仓库内代码/测试的废弃项交 R2 审核（R2-UIDOCS 仓库卫生）列清单后删。
+
+## 更新 2026-11-07 16:50（用户 15:26：审核代码、盘点方案效果、更新方向计划、git）
+
+### 做了什么
+
+- 推送：15:35 GitHub 镜像 `e8ed497..6d7c258`（R2-SITL / R2-SIMTOOLS 合并、e1_pipeline 等齐各组修复、progress）。
+- 审核：自审 R2-SIMTOOLS 的 Must fix 修复 `4e44e70`（`evaluate()` 先 wait 完所有组再统一 `need(eval.json)`，1 行；`tools/test_e1_pipeline.py` PASS；`stdout=open(...)` 句柄未显式关属 Nice）。收 R2-3DGS 报告（Ship、无 Must fix、Should fix 6、Nice 7；worklog 合并 6c4a0b5），拍板进 `FIXLIST_R2.md` 批次 D（D5–D12：`executed_by` 映射、`step_probe` 去重、video.py 标题/结果字等 VIZ 二轮后、scene.json notes 同步、A* 教师 `PLAN_HARD_M` 死锁修法并入 W2 教师改版、Nice 三条顺手、删 `demo_3dgs_callinstrasse.py`）。派 R2-UIDOCS（`a5f82e3b`）、R2-REPRO（`0ba16fa3`，从 ALVLN 镜像克隆按文档从零跑）。
+- DEV-DATA 交付审读：读 `teacher.py` / `collect.py` 全部 diff（`_global_path` 拆分等价、`_q_after_yaw` 用 `_body_hits_box` 与 0.11 m 漂移、`visible_pillar_side` 视锥判定、影子教师 label/executed 分离、`--stop-at-goal` 互斥校验与 `stop_radius` 作用域），自跑 test_collect 93 / test_collect_parallel 6 / test_audit_dataset / test_preprocess_split 19 / test_teacher_policy / teacher 自检全过；合并 `bd4f626`，worktree 清理。审计 `class_share` 对 DAgger 集按 `action_executed` 统计的问题记入批次 A。
+- eval3 收口：DONE rc=0（15:40），五组数字与配对检验（`tools/stats_report.py` → `…-eval3/stats/eval3.md`）填进 `docs/experiments/2026-11-07-e1-demo-plan.md` §3.3；新建方案盘点 `docs/experiments/2026-11-07-approach-scoreboard.md`（主表、三轮对照、3DGS 小实验、森林、各路线状态、没盘点什么）。
+- 新守护进程：① 森林跨场景 lib v3 重跑 `xeval-forest-sparse-20261107-1600`（PGID 1195540，两车道，4 组含截断臂；冻结 worktree `tmp/wt-xeval-forest`@6c4a0b5；跳过条件改为 eval.json 且 `failed_count==0`，上一轮 lib v2 学生组 20/20 EGL 失败的 eval.json 被当「已评」跳过是教训）；② `e1-pipeline-20261107-1620-sgvis`（PGID 1216165）：`E1_STOP_AT_GOAL=1 E1_TIEBREAK=visible` 从 pilot 起全流程，冻结 worktree `tmp/wt-e1-sgvis`@c8b9ccf，二进制快照 `OUT/bin`，teacher / x3-old / forward / e1-trunc 四组软链到 eval3 结果（同 seed 同库同二进制，evaluate 按「已有 eval.json」跳过，summary 仍五行齐）。
+- `tools/e1_pipeline.py` CFG `stop_at_goal` / `tiebreak` 加环境变量覆盖（默认值不变，c8b9ccf）。
+- 派修复 agent：FIX-SITL（批次 C，`121c8cc6`，构建目录 `tmp/build-fix-sitl`，不碰 `tmp/build-cf-sitl`）、FIX-3DGS（批次 D，`b3ccbe48`）；简报 `tmp/phase3-20261107/BRIEF_FIX.md`。
+- PLAN 追加 16:40 更新（W2 实施顺序 1→2→3、M0 关闭、M3 过线判据改为相对 eval3 基准 n≥60）。
+
+### 没做什么
+
+- SITL v3.1 的就地重建（`tmp/build-cf-sitl`）：森林评测与 sgvis 流水线都在加载它，等两者 DONE 后做（FIX-SITL 只在自己的构建目录验证）。
+- 批次 A / B 修复 agent 未派：DEV-DATA 刚合并，批次 A 的 `eval_closed_loop` 成功线停 + `metric_version` 升版会让 eval3 口径变化，决定等 sgvis 评完（同口径比完）再派；批次 B 的 `preprocess.py` 与 DEV-DATA 改动同文件，合并后再派。
+- 数据盘 `3dgs-scenes/callinstrasse/scene.json` notes 未改（D8）：VIZ-LAYOUT 二轮仍在渲染旧集。
+- `tmp/wt-fix-b` + `tmp/agent8-fix-b`（15:54:46 从 main 6c4a0b5 建出，空目录、无进程、无提交）不是本会话建的，所有子 agent 的记录里也没有；**未删**，待查明来源（可能是另一会话）。派 FIX-B 前先看它有没有内容。
+- eval3 的 `student-e1-new` 两集超时（seed 1 max_x 5.84、seed 1113）没有逐集看视频定性。
+
+### 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| `tools/test_e1_pipeline.py`（main） | PASS |
+| DEV-DATA 六套件（worktree 自跑） | test_collect 93 项通过；test_collect_parallel OK 6；test_audit_dataset PASS；test_preprocess_split OK 19（25 s）；test_teacher_policy PASS；teacher 自检全部通过 |
+| e1_pipeline dry-run | 默认命令行无 `--stop-at-goal`；`E1_STOP_AT_GOAL=1 E1_TIEBREAK=visible` 时末尾 `--stop-at-goal --tiebreak visible` |
+| `tools/stats_report.py` eval3 五组 | 生成 `…-eval3/stats/eval3.{md,json}`；Cochran's Q=38.67 p<0.001 |
+| 森林 lib v3 守护进程 | 16:00:28 两车道已起 gz（`run.log`） |
+| sgvis 流水线 | 16:17 pilot 4 实例已起 gz；`config.json` 记 stop_at_goal=True / tiebreak=visible / git c8b9ccf |
+| GitHub 推送 | `e8ed497..6d7c258` 成功；本节末再推一次 |
