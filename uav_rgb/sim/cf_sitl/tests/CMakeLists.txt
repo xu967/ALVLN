@@ -29,7 +29,10 @@ target_link_libraries(test_external_vs_standalone PRIVATE cf_sitl cf_sitl_tools_
 add_executable(test_forward_longrun test_forward_longrun.cpp)
 target_link_libraries(test_forward_longrun PRIVATE cf_sitl)
 
-foreach(t test_json_min test_params_file test_reset_determinism test_proc_protocol test_external_vs_standalone test_forward_longrun)
+add_executable(test_yaw_in_place test_yaw_in_place.cpp)
+target_link_libraries(test_yaw_in_place PRIVATE cf_sitl)
+
+foreach(t test_json_min test_params_file test_reset_determinism test_proc_protocol test_external_vs_standalone test_forward_longrun test_yaw_in_place)
   target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   target_compile_features(${t} PRIVATE cxx_std_17)
   target_compile_options(${t} PRIVATE -Wall -Wextra)
@@ -41,6 +44,7 @@ add_test(NAME cf_sitl_reset_determinism COMMAND test_reset_determinism "${CF_SIT
 add_test(NAME cf_sitl_proc_protocol COMMAND test_proc_protocol $<TARGET_FILE:cf_sitl_proc> "${CF_SITL_PARAMS}")
 add_test(NAME cf_sitl_external_vs_standalone COMMAND test_external_vs_standalone "${CF_SITL_PARAMS}")
 add_test(NAME cf_sitl_forward_longrun COMMAND test_forward_longrun "${CF_SITL_PARAMS}")
+add_test(NAME cf_sitl_yaw_in_place COMMAND test_yaw_in_place "${CF_SITL_PARAMS}")
 set_tests_properties(cf_sitl_params_file cf_sitl_reset_determinism cf_sitl_proc_protocol cf_sitl_external_vs_standalone cf_sitl_forward_longrun
-  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  cf_sitl_yaw_in_place PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 set_tests_properties(cf_sitl_json_min PROPERTIES TIMEOUT 30)

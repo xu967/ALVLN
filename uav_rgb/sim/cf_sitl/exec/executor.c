@@ -94,11 +94,19 @@ static float height_loop(cf_exec *e, float ref, float vref) {
 //      不修正的姿态估计漂移（陀螺零偏 × 时间）和阻力配平，不是机动——两者共用一个限幅时，漂移吃满限幅后
 //      速度环开环，FORWARD 会反向加速（3DGS route 5 seed 500 t≈44 s 倒飞的根因）。总倾角 ≤ tilt_max + tilt_int_max，
 //      由参数文件保证不超过固件杆量满程 tilt_per_stick。
-static void horizontal_loop(cf_exec *e, float vx_ref, float vy_ref, cf_exec_sticks *s) {
+static void horizontal_loop(cf_exec *e, const cf_exec_input *in, float vx_ref, float vy_ref, cf_exec_sticks *s) {
 	const cf_exec_params *p = &e->p;
 	const float tilt_max = p->tilt_max_deg * CF_EXEC_D2R, int_max = p->tilt_int_max_deg * CF_EXEC_D2R;
 	const float per_stick = p->tilt_per_stick_deg * CF_EXEC_D2R;
 	const float ref[2] = {vx_ref, vy_ref};
+	// 积分抵消的姿态估计误差在世界系固定（只积分陀螺：R̂ = R·exp(δ)，机体偏航 ψ 后机体系里 δ → Rz(−ψ)·δ），
+	// 而积分本身是机体系倾角：偏航时要随之反转（u̇ = −ω×u，同 position_hold 的 pos_err），否则转 180° 后补偿方向
+	// 全反、真倾角 = 2δ：飞 30 s（δ≈5°）后 YAW 6 s 侧移 1 m（tests/test_yaw_in_place.cpp）
+	{
+		const float wz = in->gyro[2], ix = e->vel_int[0], iy = e->vel_int[1];
+		e->vel_int[0] = ix + wz * iy * p->dt_s;
+		e->vel_int[1] = iy - wz * ix * p->dt_s;
+	}
 	float tilt[2];
 	for (int i = 0; i < 2; i++) {
 		const float err = ref[i] - e->vel_est[i];
@@ -159,7 +167,7 @@ void cf_exec_tick(cf_exec *e, const cf_exec_input *in) {
 		{
 			float vx = 0.0f, vy = 0.0f;   // 起飞段就保持起飞点（光流 ≥ flow_min_height 后生效）
 			position_hold(e, in, &vx, &vy);
-			horizontal_loop(e, vx, vy, &s);
+			horizontal_loop(e, in, vx, vy, &s);
 		}
 		if (e->height_valid && fabsf(e->height_est_m - e->target_height_m) < p->ready_height_tol_m &&
 		    fabsf(e->vz_est_mps) < p->ready_vz_tol_mps) {
@@ -177,9 +185,12 @@ void cf_exec_tick(cf_exec *e, const cf_exec_input *in) {
 		float vx = act == CF_EXEC_FORWARD ? p->forward_speed_mps : 0.0f, vy = 0.0f;
 		const float yaw = act == CF_EXEC_YAW_LEFT ? p->yaw_rate_rps : act == CF_EXEC_YAW_RIGHT ? -p->yaw_rate_rps : 0.0f;
 		s.throttle = height_loop(e, e->target_height_m, 0.0f);
-		if (act == CF_EXEC_SAFE) position_hold(e, in, &vx, &vy);   // SAFE / 无动作 = 原地保持，不只是速度归零
-		else e->holding = 0;                                        // 机动中不保持；下次 SAFE 从停下的位置重新起算
-		horizontal_loop(e, vx, vy, &s);
+		// SAFE / 无动作 / YAW 都是「原地」动作（cf_sitl.h 的约定：YAW 原地偏航），位置保持一起开：
+		// YAW 时 vx_ref=0 只能把速度压到 0，起步残速和光流噪声让 6 s 偏航末端离进入点 0.14 m，位置环后 0.05 m
+		// （REVIEW-SITL 2026-11-07 实验库实测）；教师 kino 模型也按 YAW 原地建模。FORWARD 清 holding，下次从停下的位置起算。
+		if (act != CF_EXEC_FORWARD) position_hold(e, in, &vx, &vy);
+		else e->holding = 0;
+		horizontal_loop(e, in, vx, vy, &s);
 		s.yaw = yaw_stick(p, yaw);
 		break;
 	}
