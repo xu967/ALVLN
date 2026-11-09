@@ -113,7 +113,7 @@
 ## 7 没做什么 / 风险
 
 - **尺度未核实**（`scale_unverified`）：只有相机高假设，不确定带 0.50–0.72 m/单位。航程、净空、速度的米数只在场景内部自洽，和真实世界可能差 10–20%。跨域评测和 pilot 里这个场景单列，不和 garden / bicycle / Callinstrasse 合并算米制指标。
-- **ToF 地形打标没跑**：FIX-SIM 第 8 条（`route_check` 的 `tof_terrain_m` / `agl_model_unverified`）还没进 main。r0、r2、r3 等路线从树桩（顶约 1.0 m）上方或旁边飞过，真机按 ToF 定高时会在树桩上方抬升，仿真按 `ground_z=0` 定高。合并后跑 `python -m sim.3dgs.planner --scene …/stump/scene.json --json` 补这一节。
+- **ToF 地形打标（2026-11-09 21:33 补跑，main 3a6dce5）**：`python -m sim.3dgs.planner --scene $DATA_ROOT/uav_rgb/3dgs-scenes/stump/scene.json --json`（输出 `$DATA_ROOT/uav_rgb/tmp/analysis-20261109/stump-tof/route_check.json`）。6 条路线都可达、净空达标（`feasible` / `clear_ok` 全真），但**全部** `agl_model_unverified=True`（原因 `tof_terrain`）：路径下方地物最高 r0 0.7、r1 0.5、r2 0.4、r3 0.7、r4 0.8、r5 1.2 m。真机按 ToF 定高会在这些地物上方抬升同样的高度，仿真按 `ground_z=0` 定高，所以这个场景的高度行为整场都与真机不一致。和尺度未核实一起，stump 只作外观多样性场景单独成包，不进米制结论；要进，得先让 cf_sitl 的 ToF 读地形高度（AUDIT_SIM #2 的完整修法，改 `sim/cf_sitl`，要升库版本号）。
 - 低不透明度的外围枝叶不在占据代理里：r1、r5 开局 1–3 帧机载画面一侧有近景虚化。实飞没碰（净空 ≥ 0.66 m），但「看得见、撞不着」的枝叶在真机上是会撞的。
 - r5 出生点正下方是地面重建空洞（§2 验证）。前视相机看不到它；俯视或低俯仰的相机配置不能用这个出生点。
 - 外围（r > 5 m）画质差，pilot 规模采集不要把路线往外延；要加路线，先跑 `scene_probe_quality --candidate` 并看拼图。

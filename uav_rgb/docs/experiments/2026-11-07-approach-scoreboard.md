@@ -1,10 +1,37 @@
 # 方案盘点：到 2026-11-07 16:30 为止各条路线的闭环效果与状态
 
-- 时间：2026-11-07 16:30（主会话整理；数字全部来自数据盘守护进程产物，路径在每张表下面）
+- 时间：2026-11-07 16:30（主会话整理；数字全部来自数据盘守护进程产物，路径在每张表下面）。更新 2026-11-09 22:50：新增 §0 eval4（新固定基准，含三个训练种子与 costmap 重标补臂），§1 改为历史表，§5 / §6 随之改。
 - 范围：E1 MINI 固件在环（Gazebo 柱阵 / 森林）与 3DGS Callinstrasse 上的教师、学生、蒸馏变体；SITL 库各版本；场景与可视化的交付状态
 - 读法：所有 E1 数字都是 `calibrated=false` 的草案参数；n=20 的 Wilson 95% 半宽约 ±0.2，只能分辨「0.35 vs ≥0.7」这种量级的差别（DISTILL §2.5）；同 seed 配对用 McNemar
 
-## 1. 主表：Gazebo 柱阵，20 个独立 test 几何，SITL 库 v3（eval3，15:40 DONE）
+## 0. eval4：新固定基准（2026-11-09 22:36 DONE；之后所有 Gazebo 新臂只和这张表比）
+
+条件：RTX 2080 Ti、SITL lib31（动力学数值同 v3.1，profile `cf_sitl_v1:1bc8fedf:lib31`）、`sim09.v2.coast1s`（到成功线即停，SR 不随 `--steps` 变）、同 20 个冻结 seed（`tools/eval_seeds.py`）、hold 1.0、observation、80 步上限；冻结 worktree `tmp/wt-eval4`（97ae04b）+ 二进制快照 `bin-snapshots/main-97ae04b`。SR 分母是请求的 20 集，失败集算不成功。
+
+| 组 | 权重 | SR | Wilson 95% | 碰撞率 | SPL | eval3 同权重（lib v3 + 4080 + sim09.v1） |
+| --- | --- | --- | --- | --- | --- | --- |
+| 教师 A* | — | 20/20 | [0.84, 1.00] | 0.00 | 0.95 | 20/20 |
+| 盲前进 | — | 0/20 | [0.00, 0.16] | 1.00 | 0.00 | 2/20 |
+| 旧 X3 学生 | `t6-full-1640` | 1/20 | [0.01, 0.24] | 0.50 | 0.04 | 4/20 |
+| 硬标签 BC | `e1-pipeline-20261107-0417` | 11/20 | [0.34, 0.74] | 0.25 | 0.40 | 10/20 |
+| 成功线截断（训练 seed 0） | `ckpt_trunc_distill.bin` | 11/20（完成 19；seed 122 起飞卡在 TAKEOFF 超时，0 步）；同条件补跑 seed 122 成功（39 步）→ 补齐 12/20 | [0.34, 0.74]（补齐 [0.39, 0.78]） | 0.16 | 0.54 | 13/20 |
+| 截断配置 · 训练 seed 1 | `exp-student-select-20261109/e1-noise/seed1` | **20/20** | [0.84, 1.00] | 0.00 | 0.78 | — |
+| 截断配置 · 训练 seed 2 | `…/seed2` | 10/20 | [0.30, 0.70] | 0.20 | 0.44 | — |
+| sgvis | `e1-pipeline-20261107-1620-sgvis` | 13/20 | [0.43, 0.82] | 0.10 | 0.51 | 10/20 |
+| costmap 重标（类权重 auto；补臂 `eval4-extra`） | `exp-teacher-cost-20261109/cl2/run-relabel-cw` | 11/20 | [0.34, 0.74] | 0.20 | 0.44 | —（TEACHER-COST 自己的条件 14/20） |
+
+配对（精确 McNemar，同 seed）：BC vs 截断 4:5 p=1.0；BC vs sgvis 3:5 p=0.73；截断 vs sgvis 4:5 p=1.0；重标 vs 截断 7:8（n=19）p=1.0，重标 vs BC 7:7 p=1.0；**截断配置 seed 1 vs seed 2 10:0 p=0.002**；教师 vs 截断 8:0 p=0.008（Holm 0.10）。Cochran's Q（8 组 × 19 共同 seed）p<0.001。三个训练种子当一个方法：IQM SR 0.69 [0.50, 1.00]，BC 0.55 [0.34, 0.74]，区间重叠。
+
+读法：
+1. **训练种子的影响比任何一条方案的差别都大**：同一份数据、同一套截断配置，只换训练种子，SR 0.50 → 1.00，两者区间不相交（p=0.002）；BC / 截断 / sgvis / 重标四个单种子臂之间最大差 2 集，全部 p ≥ 0.73。重标臂和截断臂在 19 个共同 seed 上有 15 个结果不同，逐集翻转量级与组间差相当（与 demo-plan §3.3 补记的换卡对拍同一现象）。所以单种子、n=20 的两臂比较不能用来判方案好坏；M3 的过线判据要按「每臂 ≥3 个训练种子（IQM）× n≥60」执行。
+2. 离线 val macro-F1 预测不了闭环：三个种子的 best F1 是 0.426 / 0.407 / 0.394（STUDENT-SELECT），闭环是 seed 0 12/20（补齐后）、seed 1 20/20、seed 2 10/20。
+3. TEACHER-COST 的「重标 14 vs 截断 12」换到 eval4 条件是 11 vs 12（截断补齐 seed 122 后），方向没有保持。
+4. 盲前进 0/20、20 集全撞（eval3 是 2/20）；旧 X3 学生 1/20，继续只作载具迁移参照。
+5. 截断臂的 seed 122 是负载下的起飞等待超时（`READY_TIMEOUT_S=90` 按墙钟计，当时 4–5 个 gz + 三视角录像），不是策略失败。同条件单独补跑（`eval4-extra/eval-student-e1-trunc-seed122/`，不录像）成功、39 步；同权重同 seed 在 TEACHER-COST 那轮（lib v3.1 + sim09.v1）是 x=1.6 m 撞柱，单集结果在重复运行之间会翻转。上面配对检验按原始 19 个共同 seed 算，没有并入补跑。修法（等待改按仿真时间计）已派给第九阶段 NICE-FIXES。
+
+来源：`$DATA_ROOT/uav_rgb/e1-pipeline-20261107-0417-eval4/{summary.md,stats/eval4.md,stats/eval4-trunc-3seed.md,eval-*/eval.json}`；重标补臂 `$DATA_ROOT/uav_rgb/e1-pipeline-20261107-0417-eval4-extra/eval-student-e1-relabel-cw/eval.json`（同冻结 worktree、同快照、同 seed）。
+
+## 1. 历史表：Gazebo 柱阵，20 个独立 test 几何，SITL 库 v3（eval3，2026-11-07 15:40 DONE；只作历史，不再加臂）
 
 同一批 seed `1,113,122,153,172,176,180,230,250,536,555,628,683,798,929,990,992,997,1113,1654`（与两个训练集的几何零重叠），同一动力学、同一 `uavrgb_infer`，80 步上限，observation 语义，hold 1.0 s。
 
@@ -93,22 +120,23 @@
 
 | 路线 | 状态 | 证据 | 结论 / 下一步 |
 | --- | --- | --- | --- |
-| A* 硬标签 BC（基线） | 已出数 | §1 10/20 | 乱飞 6 集是主要失败模式（空画面里转向），碰撞只 2 |
-| 成功线截断（标签定义改）| 已出数（离线截断重训） | §1 13/20，乱飞 2，碰撞 5 | 方向成立；碰撞上升要靠 L/R 可见化 + DAgger 补 |
-| 采集端 `--stop-at-goal` + `--tiebreak visible` | **已出数，判据不通过**（`e1-pipeline-20261107-1620-sgvis`，19:31 DONE） | §1 sgvis 行：10/20、碰撞 3、乱飞 4、SPL 0.42；vs 截断 p=0.508、vs BC p=1.000 | 采集端截断把「空画面回正」帧全删后学生把空画面映射成 FORWARD，一次错转就直飞离场（7 个超时里 5 个）；且训练数据同时换了 lib v1→v3 / 模板，不是单变量对照。结论：这一层单独不够，进 DAgger 层；下一步最便宜的靶子是「离场判据」（x 回退或 y 出界即停） |
-| DAgger（影子教师，专家唯一） | 代码就绪（Gazebo `collect --policy student --beta`，3DGS `collect_3dgs --policy student`，`dagger_pipeline.py`），**未跑 Gazebo 闭环**；Gazebo 流水线 `tools/dagger_gz_pipeline.py` 未写 | 3DGS 一轮 hard 13/17→13/17（样本太少） | 第 0 轮起点改为**截断臂 ckpt**（13/20，森林唯一非零），不用 sgvis：3 轮 × 100 集，β 0.5→0，带「再采 300 集」对照臂（DISTILL §3.2） |
+| A* 硬标签 BC（基线） | 已出数 | §1 10/20；§0 eval4 11/20 | 乱飞 6 集是主要失败模式（空画面里转向），碰撞只 2 |
+| 成功线截断（标签定义改）| 已出数（离线截断重训） | §1 13/20，乱飞 2，碰撞 5；§0 eval4 12/20（补齐），三个训练种子 12 / 20 / 10，IQM 0.69（stats_report 按原始 11/19 算） | eval3 的「方向成立」在 eval4 看不出来：对 BC 4:5 p=1.0；训练种子差 0.50 → 1.00 盖过了方案差 |
+| 采集端 `--stop-at-goal` + `--tiebreak visible` | **已出数，判据不通过**（`e1-pipeline-20261107-1620-sgvis`，19:31 DONE） | §1 sgvis 行：10/20、碰撞 3、乱飞 4、SPL 0.42；vs 截断 p=0.508、vs BC p=1.000；§0 eval4 13/20（vs BC 5:3 p=0.73） | 采集端截断把「空画面回正」帧全删后学生把空画面映射成 FORWARD，一次错转就直飞离场（7 个超时里 5 个）；且训练数据同时换了 lib v1→v3 / 模板，不是单变量对照。结论：这一层单独不够，进 DAgger 层；下一步最便宜的靶子是「离场判据」（x 回退或 y 出界即停） |
+| DAgger（影子教师，专家唯一） | Gazebo 流水线 `tools/dagger_gz_pipeline.py` 已合并（e5e2206，18 项测试，smoke 全链 rc=0）；**正式 3 轮 2026-11-09 22:36 起跑**（`exp-dagger-gz-20261109/full-1109/`，约 6 h），还没出数 | 3DGS 一轮 hard 13/17→13/17（样本太少） | 第 0 轮起点改为**截断臂 ckpt**（13/20，森林唯一非零），不用 sgvis：3 轮 × 100 集，β 0.5→0，带「再采 300 集」对照臂（DISTILL §3.2）；基线六组复用 eval4 |
 | P1 信念边际化软标签（`teacher_kino`） | **负结果，停** | §3 4/18；消融定位到代价模型 | 叙事保留，实施改为「统一代价模型」（PLAN 13:40 W2 改向）：给 `astar_occ` / `teacher.py` A* 实现逐动作 cost-to-go，先 Gazebo 后 3DGS；R2-3DGS 的 A* 教师 `PLAN_HARD_M` 死锁修法并入这次教师改版 |
+| 统一代价模型教师 `--teacher-planner costmap`（W2 层 3，Gazebo 侧） | **已出数**（TEACHER-COST，2026-11-09 合并 fda2923；条件 lib v3.1 + 2080 Ti + `sim09.v1`，对照臂同条件自跑，不是 eval4 条件） | 教师 20/20、碰撞 0（legacy 同条件 20/20，McNemar b=c=0）；0417 离线重标一致率 84.5%；重标学生（类权重 auto）14/20 vs 截断臂同条件重评 12/20，p=0.754；软标签 α=0.5（无类权重）5/20，vs 重标 p=0.022 | 教师可用但不更强（差在转弯晚约 10° 与过目标后停下）；重标学生方向对、样本不够说更好；软标签 + 无类权重线按预注册停，再试要先让训练器允许软标签 + 类权重。一键流水线用 `E1_TEACHER_PLANNER=costmap`（3a6dce5）。3DGS 侧的 `PLAN_HARD_M` 死锁没做（见 4b 的 hold 0.5 绕法）。详见 `2026-11-09-teacher-costmap.md` |
 | P2 双帧 + prev-action + 深度分带头 | 代码已合并（opt-in，CTest 30/30），**不进流水线** | DISTILL 反事实：prev L↔R 翻转使 YAW_L 帧预测 34:5→18:19（复读机）；无深度数据 | 等 DAgger 数据（prev = 学生真实执行）再开 `--prev-action`；`--depth-aux` 等 Wanderland/garden 有深度真值的集 |
 | `teacher_kino` kinodynamic A* | 保留为 Gazebo 教师线变体，不做 3DGS 标注 | §3 | 不再投入 |
 | RL 特权教师 | 未开始 | — | 按 PLAN：P1 平台期后做 RL 微调（第五阶段） |
-| SITL 库 v1 → v2 → v3 → v3.1 | **v3.1 在用**（2026-11-09 合并 a156800：`vel_ki` 0.30、selftest 阈值按 40 种子重算、两个新 CTest；`tmp/build-cf-sitl` 已重建，旧 v3 在 `build-cf-sitl-v3-20261107`） | 教师 10/11 → 19/20 → 20/20；YAW 原地漂移 0.141 → 0.02–0.10 m；v3.1 ctest 10/10、selftest 33/33、40 种子 0 红；FORWARD 稳态侧偏 b/ki 减半（30 集 \|vy\| 均值 1.29 → 0.80 cm/s） | v3.1 下的闭环数字随 eval4 出（2080 Ti + `sim09.v2`）；eval3 表不再加臂 |
-| 3DGS 场景 | 4 个可飞（Callinstrasse 6 路线、Wanderland 6、garden 6、bicycle 6） | 冒烟 11/12、11/12、23/24 | Callinstrasse 只有 r3/r4 能用 2 m AGL 口径；定量用 Wanderland / Mip-NeRF 360 |
+| SITL 库 v1 → v2 → v3 → v3.1 → lib31 | **lib31 在用**（2026-11-09 合并 a6b5eb6：动力学数值同 v3.1，只加 `CF_SITL_LIB_VERSION=31` 库指纹，profile `cf_sitl_v1:1bc8fedf:lib31`，Python 拒绝旧 proc / 旧插件；`tmp/build-cf-sitl` 21:23 原地重建为 lib31，旧 v3.1 在 `build-cf-sitl-v3.1-20261109`、旧 v3 在 `build-cf-sitl-v3-20261107`） | 教师 10/11 → 19/20 → 20/20；YAW 原地漂移 0.141 → 0.02–0.10 m；v3.1 ctest 10/10、selftest 33/33、40 种子 0 红；FORWARD 稳态侧偏 b/ki 减半（30 集 \|vy\| 均值 1.29 → 0.80 cm/s）；lib31 原地重建 ctest 10/10、selftest 33/33 | lib31 下的闭环数字随 eval4 出（2080 Ti + `sim09.v2`）；eval3 表不再加臂；profile 683e7400 及更早的集不能与 lib31 新采集混包 |
+| 3DGS 场景 | 5 个可飞（Callinstrasse 6 路线、Wanderland 6、garden 6、bicycle 6、stump 6 且尺度未核实） | 冒烟 11/12、11/12、23/24；数据集 B pilot（hold 0.5、lib31、出生扰动 ±0.5 m / ±10°）5 场景 × 20 集到达 99/100，唯一碰撞是 Wanderland r5 出生在栅栏边、第 4 步就撞 | Callinstrasse 只有 r3/r4 能用 2 m AGL 口径；定量用 Wanderland / Mip-NeRF 360；stump 数据单独成包；放量（≥300 集）等用户定 hold |
 | 可视化 | 版式统一 1280×720；**短片 v2 已出**（2026-11-09：E1 实体机体两域统一、FOLLOW 1.1 m 近机位、TOP 四旋翼图标、high 档 2560×1440 libx264） | `demo-e1-20261107/reel/demo_reel_v2.mp4`（239 s）、`demo_reel_v2_short.mp4`（57 s）、`stills_v2/` 11 张；片中柱阵片段仍是 eval2 录像，片尾表为 eval3 数字 | 用户验收 → tag `demo-2026-11-12`；eval4 出数并重录四组后出 v3 |
 | 旧 X3 学生 | 历史 0.90（X3 机体）/ E1 上 0.20 | §1 | 只作载具迁移差距的参照，不再训 |
 
 ## 6. 没盘点什么
 
 - 没有任何一格 n ≥ 60：DISTILL §2.5 算过 0.35→0.60 每臂 62 集才有 0.8 功效；现在每格 20 只能看量级。
-- 训练种子只有 1 个（seed 0）：§1 两个学生臂的差里有训练噪声成分（DISTILL §2.4：ckpt_best 是在一条噪声序列上选出来的）。
+- 训练种子：只有截断配置有 3 个（§0：12 / 20 / 10，seed 1 vs seed 2 p=0.002）；BC、sgvis、costmap 重标仍是单种子，它们之间的差不能和训练噪声分开（DISTILL §2.4：ckpt_best 是在一条噪声序列上选出来的）。
 - 3DGS 学生没有在 20 独立几何级别的评测；§3 的 n=18 是 6 路线各 3 集，路线间不独立。
 - 没有真机数据；所有数字都在 `calibrated=false` 的 E1 参数下。

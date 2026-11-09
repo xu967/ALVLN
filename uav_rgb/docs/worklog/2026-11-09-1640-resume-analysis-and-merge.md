@@ -2,7 +2,7 @@
 
 - 时间：2026-11-09 16:40 起（Cursor 主会话）
 - 范围：`uav_rgb` 全仓（合并 `wt-r2-uidocs` / `wt-viz-layout` / `wt-fix-sitl` / `wt-fix-3dgs`）、`docs/`、`progress.md`、SITL 库重建、两个守护进程、第八阶段 6 个开发 agent
-- 结论：部分完成（合并与入档完成并推 GitHub；eval4 基准、第八阶段 agent 的产物待收）
+- 结论：部分完成（第八阶段 7 个分支全部合并；eval4 基准出数入档；DAgger 正式跑与第九阶段 3 个 agent 在跑，见文末「更新 22:50」）
 
 ## 做了什么
 
@@ -86,3 +86,47 @@
 | 驱动首场景加载 | garden / bicycle 各 71–72 s，`dynamics_profile=cf_sitl_v1:683e7400`；之后每路线 15–50 s |
 | 下载测速 | `curl` 直连 20 MB 区间 60 s 超时，28.8 KB/s；代理端口无监听 |
 | GPU 对拍 | `DONE rc=1`；summary 见 demo-plan §3.3 补记 |
+
+## 更新 2026-11-09 22:50（TEACHER-COST 合并、lib31 原地重建、eval4 出数、第九阶段派工）
+
+### 做了什么
+
+- 合并 TEACHER-COST（fda2923）；`tools/e1_pipeline.py` 加 CFG `teacher_planner`（`E1_TEACHER_PLANNER`，默认 `astar`）透传到采集与评测 teacher 组，`tools/test_e1_pipeline.py` 加 `test_teacher_planner_passthrough`（3a6dce5）。
+- `tmp/build-cf-sitl` 原地重建为 lib31（旧 v3.1 先 `cp -a` 到 `tmp/build-cf-sitl-v3.1-20261109`）。
+- 3DGS 数据集 B pilot 收数（5 场景 99/100）；stump ToF 地形打标补跑并写进 `docs/experiments/3dgs-site-stump.md` §7。
+- eval4 补臂：costmap 重标学生同条件重评（`e1-pipeline-20261107-0417-eval4-extra/run_extra.sh`）；截断臂 seed 122 同条件补跑（`run_trunc_seed122.sh`）。两个脚本都按 §6.10 把配置集中在顶部。
+- eval4 结果进 `docs/experiments/2026-11-07-approach-scoreboard.md` §0（新固定基准），§1 改为历史表，§5 / §6 对应行更新；W2 层 3 的 Gazebo 侧结论进 §5 新行；SITL、DAgger、3DGS 场景三行改成现状。
+- `docs/PLAN_2026-11-07_demo_and_paper.md` 补「22:50 之后」；`progress.md` 头部与待办重写。
+- 第九阶段任务书 `$DATA_ROOT/uav_rgb/tmp/phase9-20261109/BRIEF.md`，派 3 个 agent（TEACHER-3DGS / REFACTOR-TOOLS / NICE-FIXES），各自 worktree 基于 3a6dce5。
+
+### 没做什么
+
+- 没把 seed 122 的补跑并进 eval4 的 `eval.json` 和配对检验。原因：原始目录是守护进程产物，改它会让 `inputs.sha256` 与内容对不上；表里两种写法并列（原始 11/20、补齐 12/20）。
+- 没动正在跑的 DAgger（冻结 worktree `tmp/wt-eval4`）。原因：可复现性；起飞等待超时的修法只进 main（NICE-FIXES）。
+- 没有起 3DGS 数据集 B 放量。原因：hold 与 val / test 划分待用户拍板；TEACHER-3DGS 的 hold 1.0 结果会影响 hold 的建议。
+- D4（E1 护罩方框四角约 0.122 m vs 3DGS 碰撞半径 0.102 m）没改。原因：要真机尺寸。
+- 没删任何 worktree 和旧库目录。原因：用户还没决定；旧库备份给冻结 worktree 复现旧结果用。
+- 没推 GitHub。原因：等这次文档提交后跑 `check.sh`，与第九阶段合并一起推，减少镜像次数。
+
+### 待确认
+
+- M3 判据是否加「每臂 ≥3 个训练种子 IQM」（eval4：截断配置三个种子 12 / 20 / 10）。
+- 3DGS 数据集 B 的 hold 与 val / test 划分（建议整场景留出）。
+- 其余见 progress.md「用户待拍板」。
+
+### 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| `tools/test_e1_pipeline.py`（含新测试） | `test_e1_pipeline: PASS`；去掉实现后新测试红：`ValueError: '--teacher-planner' is not in list` |
+| `tools/test_dagger_gz_pipeline.py` | `Ran 18 tests … OK` |
+| `check.sh --python-only`（fda2923） | `check rc=0` |
+| lib31 原地重建 | `cmake --build` rc=0（28 s）；ctest `100% tests passed, 0 tests failed out of 10`；selftest `== 结果: 0 项失败，33 项通过，0 项跳过`；`probe_lib_version` 新目录 31、备份被拒 |
+| eval4 | `DONE rc=1`（截断臂 seed 122 `arm_takeoff→READY超时 90s`）；其余 7 组 `failed_count=0` |
+| 补臂 / 补跑 | relabel-cw `DONE rc=0`，11/20；trunc seed 122 `rc=0`，success，39 步 |
+| 3DGS pilot | `DONE rc=0`，5 个 `pilot_manifest.json` 的 `health.ok` 全为 True |
+
+### 风险与遗留
+
+- DAgger 每轮评测只要有一集失败就抛错停下；负载下的起飞等待超时（墙钟 90 s）可能触发。要盯 `status.json`，停了就同 `--out` 重起。
+- eval4 显示同权重同 seed 的单集结果会在重复运行之间翻转（seed 122：TEACHER-COST 那轮撞柱，这次成功），n=20 单种子的结论都只能看量级。
