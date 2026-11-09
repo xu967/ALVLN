@@ -85,6 +85,15 @@ def check_commands():
     assert cmd[cmd.index("--hold") + 1] == "0.2", cmd
     assert cmd[cmd.index("--appearance") + 1] == "v1", cmd
     assert "--record-video" in cmd and cmd[cmd.index("--out") + 1] == "/run/closed_loop_eval_x"
+    assert "--vehicle" not in cmd, cmd   # 非 cf_sitl 不传，旧命令行逐字不变
+
+    # cf_sitl（E1 MINI 固件在环）数据集：eval_closed_loop 要求显式 --vehicle e1_mini，否则 argparse 退出 2
+    e1 = {"task": "base", "split": "test", "dynamics": "cf_sitl", "episodes": 1,
+          "window_from": "observation", "hold_s": 1.0}
+    cmd = cli.build_eval_command("/py", "/eval.py", "/run/ckpt_best.bin",
+                                 "/run/closed_loop_eval_x", e1)
+    assert cmd[cmd.index("--dynamics") + 1] == "cf_sitl", cmd
+    assert cmd[cmd.index("--vehicle") + 1] == "e1_mini", cmd
 
     gs = {"task": "3dgs", "split": "val", "dynamics": "cf_blackbox",
           "episodes": 1, "renderer": "3dgs", "data": "/d/ds/dataset.uavr",

@@ -178,6 +178,9 @@ def build_eval_command(python, eval_script, ckpt, out_dir, params):
            "--ckpt", str(ckpt), "--task", params["task"], "--split", params["split"],
            "--dynamics", params["dynamics"], "--episodes", str(params.get("episodes", 1)),
            "--record-video", "--out", str(out_dir)]
+    if params["dynamics"] == "cf_sitl":
+        # eval_closed_loop.resolve_vehicle：cf_sitl 必须显式 --vehicle，缺了直接 argparse 退出 2（REVIEW2_UIDOCS M1）
+        cmd += ["--vehicle", "e1_mini"]
     if params.get("window_from"):
         cmd += ["--window-from", str(params["window_from"])]
     if params.get("hold_s") is not None:
