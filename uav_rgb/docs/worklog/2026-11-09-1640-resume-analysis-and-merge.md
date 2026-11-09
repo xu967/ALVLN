@@ -130,3 +130,30 @@
 
 - DAgger 每轮评测只要有一集失败就抛错停下；负载下的起飞等待超时（墙钟 90 s）可能触发。要盯 `status.json`，停了就同 `--out` 重起。
 - eval4 显示同权重同 seed 的单集结果会在重复运行之间翻转（seed 122：TEACHER-COST 那轮撞柱，这次成功），n=20 单种子的结论都只能看量级。
+
+## 更新 2026-11-09 23:05（用户定 M3 判据、n=60 口径、3DGS 数据集 B 划分）
+
+### 做了什么
+
+- 用户决定：M3 判据维持原样不补种子；n=60 用 E1 口径；3DGS 数据集 B 整场景留出、bicycle 只作 test。写进 PLAN「22:50 之后」、scoreboard §0 读法第 1 条、progress「关键决策」。
+- `tools/eval_seeds.py` 加 `EVAL_SEEDS_BASE_60`（冻结 20 + 按 seed 升序补 40 个 test 几何）与 `EVAL_SEEDS_BASE_X3_40`（71 个 test 几何去掉 t5 train/val 碰过的 31 个）；`tools/test_eval_seeds.py` 加 `test_base_60_and_x3_40`。
+- 给正在跑的 DAgger 预写 `$DATA_ROOT/uav_rgb/exp-dagger-gz-20261109/full-1109/eval_seeds60.json`：冻结 worktree 里 `seeds60()` 见文件存在就直接读，只在 eval60 那一步用，前面几轮的采集排除逻辑不受影响。
+
+### 没做什么
+
+- main 的 `tools/dagger_gz_pipeline.py` 的 `seeds60` 还是严格排除规则。原因：该文件在 REFACTOR-TOOLS 的域里，合并后再改为直接用 `EVAL_SEEDS_BASE_60`。
+- 基线在 n=60 上的评测没起。原因：eval60 是 M3 的事，等 DAgger 跑完再和 DAgger 臂一起排 gz（每臂约 2 h / gz）。
+- 3DGS 数据集 B 的 split_policy 没实现。原因：`collect_3dgs.py` 在 TEACHER-3DGS 的域里；hold 也还没定。
+
+### 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| `tools/test_eval_seeds.py` | 加常量前红：`AttributeError: module 'eval_seeds' has no attribute 'EVAL_SEEDS_BASE_60'`；加后 `test_eval_seeds: PASS` |
+| `tools/test_pick_test_seeds.py` | `test_pick_test_seeds: PASS (20 seeds, 20 gids)` |
+| 清单复算 | seed 0–49999 扫描：test 几何 71；t5 train/val ∩ test 31；X3 没见过 40；冻结 20 全在两张清单里 |
+| 预写的 `eval_seeds60.json` | 60 个 seed、60 个不同 gid |
+
+### 风险与遗留
+
+- DAgger 各轮只避开 eval20 的几何，可能采到另外 40 个里的几何（落各自数据集的 test 分区、不进训练）。按 E1 口径可以接受，已写进 `eval_seeds60.json` 的 `rule` 字段。
