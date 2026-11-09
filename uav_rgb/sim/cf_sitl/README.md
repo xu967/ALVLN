@@ -35,6 +35,9 @@ BUILD="$DATA_ROOT/uav_rgb/tmp/build-cf-sitl"                                 # �
 cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release -DCF_DRONE_DIR="$CF_DRONE_DIR"   # 可加 -DCF_SITL_BUILD_GZ=ON
 cmake --build "$BUILD" --parallel 8                                          # 产物：$BUILD/libcf_sitl.so、$BUILD/cf_sitl_smoke；-j4 实测约 1 min
 "$BUILD"/cf_sitl_smoke [e1_mini.json 路径] [seed]                            # 到 READY 退出码 0，否则 1
+ctest --test-dir "$BUILD" --output-on-failure                                 # 9 项；-DCF_SITL_BUILD_GZ=ON 时多一项 gz test_flatten_state
+"$BUILD"/cf_sitl_selftest --params sim/dynamics/e1_mini.json --out "$BUILD"/selftest-out [--seed 1]   # 33 项，退出码 = 失败数
+sim/cf_sitl/selftest/sweep_seeds.sh "$BUILD"                                 # 种子 1..40 全量自检，汇总每种子 PASS/FAIL；改阈值/执行器参数后必跑
 ```
 
 编译选项：Release（`-O3 -DNDEBUG`）加 `-ffp-contract=off -fno-fast-math`（两种模式、两次 reset 逐位一致），`-fvisibility=hidden -fvisibility-inlines-hidden
@@ -99,17 +102,26 @@ cmake --build "$BUILD" --parallel 8                                          # �
 - **光流约定**（`sensors.h` 与 `executor.c: observe()` 一致）：`flow[0] = vx/h − ω_y`，`flow[1] = vy/h + ω_x`（机体 FLU 系、rad/s），
   速度 = `(flow[0] + gyro_y)·h`、`(flow[1] − gyro_x)·h`；高度不在 [`flow_min_height`, `flow_max_height`]（0.08–2.5 m）或角速率 > 7.4 rad/s 无效，
   无效帧按速度 0、积分冻结。**真机 PMW3901 的两轴符号与安装朝向未测**，移植时先在地面手推机体标定这两个符号。
-- **速度环**：PI → 倾角目标：kp 0.22 rad/(m/s)、ki 0.15 rad/m。P 项限 ±`tilt_max_deg`（10°，机动倾角），I 项**单独**限 ±`tilt_int_max_deg`（20°），
-  P 饱和时积分冻结；两者之和 ≤ 30° = 杆量满程。积分吸收的是固件飞行中不修正的姿态估计漂移（陀螺零偏 0.1 °/s 1σ，seed 500 的 pitch 轴 0.22 °/s）
-  与阻力配平。2026-11-07 之前积分与 P 共用 10° 限幅：姿态漂移吃满 10° 后速度环开环，FORWARD 反向加速（3DGS route 5 seed 500 t≈44 s 倒飞、
-  −3 m/s 撞树），`tests/test_forward_longrun.cpp` 用同一噪声流复现并验证修复。20° 在 3σ 零偏（0.29 °/s）下可撑 69 s，覆盖 3DGS 单集 ≤ 47 s；
-  更长的飞行要靠固件在飞行中估零偏（待办）。积分抵消的姿态估计误差在世界系固定（只积分陀螺），积分本身是机体系倾角，
+- **速度环**：PI → 倾角目标：kp 0.22 rad/(m/s)、ki 0.30 rad/m（lib v3.1 起；之前 0.15）。P 项限 ±`tilt_max_deg`（10°，机动倾角），I 项**单独**限
+  ±`tilt_int_max_deg`（20°），P 饱和时积分冻结；两者之和 ≤ 30° = 杆量满程。积分吸收的是固件飞行中不修正的姿态估计漂移（陀螺零偏 0.1 °/s 1σ，
+  seed 500 的 pitch 轴 0.22 °/s）与阻力配平。2026-11-07 之前积分与 P 共用 10° 限幅：姿态漂移吃满 10° 后速度环开环，FORWARD 反向加速
+  （3DGS route 5 seed 500 t≈44 s 倒飞、−3 m/s 撞树），`tests/test_forward_longrun.cpp` 用同一噪声流复现并验证修复。20° 在 3σ 零偏（0.29 °/s）下
+  可撑 69 s，覆盖 3DGS 单集 ≤ 47 s；selftest 场景 6 全程约 98 s，两轴合成零偏 ≥ 0.2 °/s（约 12% 的种子，40 个里 2 个）会在末段真饱和，
+  场景 6b 只在 (20° − 4° 配平/卷绕余量)/|b| > 总时长 时才要求未饱和，否则记信息行（`selftest_config.h kLongrunInt*`；
+  CTest `tests/test_longrun_int_budget.cpp` 用同一判据兜底）。更长的飞行要靠固件在飞行中估零偏（待办）。
+  **FORWARD 侧偏（b/ki）**：PI 环追零偏斜坡的稳态误差是 b/ki，估计速度被压到 0 时真速度 = b_x/ki（侧向）、−b_y/ki（前向）；SAFE/YAW 有位置环把它
+  变成常值偏离，FORWARD 没有，航迹相对机头偏一个固定角。R2-SITL 2026-11-07 实测：Gazebo seed 190 集 26 个稳态 FORWARD 步侧向速度均值 +0.033 m/s
+  （7 m 航程偏 0.8 m，偏角 6.3°，该集零偏 0.27 °/s）；独立积分 30 集 FORWARD 30 s 稳态机体 |vy| 均值 ki 0.15 → 1.29 cm/s（2/30 超 3 cm/s，
+  航迹偏角 1σ 2.5°），ki 0.30 → 0.80 cm/s（最大 2.0，0/30 超 3 cm/s），ki 0.45 → 0.64 但 FORWARD 欠调（3 s 末 0.271 m/s、交替段最小 vx 0.225）。
+  所以取 0.30；代价：悬停倾角 RMS 0.43 → 0.49°，FORWARD 到 90% 0.72 → 0.61 s，场景 3 稳态 0.313 → 0.295 m/s。CTest `tests/test_forward_lateral.cpp`
+  守住 30 集 |vy| 均值 < 1.0 cm/s、每集 < 3 cm/s。积分抵消的姿态估计误差在世界系固定（只积分陀螺），积分本身是机体系倾角，
   所以机体偏航时积分按 u̇ = −ω×u 随之反转（2026-11-07 审核补）：不反转时飞 30 s 后 YAW 6 s（≈206°）侧移 0.4–1.9 m，反转后 0.02–0.13 m
   （`tests/test_yaw_in_place.cpp`）。
 - **位置保持**（2026-11-07 新增）：SAFE / 无动作 / 起飞段都保持进入时的位置：机体系偏离 `ṗ = v_est − ω×p` 积分光流速度，外环 P（`pos_kp` 0.5 1/s）
-  给速度环参考（限 ±`pos_vmax_mps` 0.3），光流无效时冻结。只有速度环时姿态漂移让 SAFE 以 零偏/ki ≈ 1.1 cm/s（1σ）匀速漂走，有位置环后变成
-  常值偏离 零偏/(pos_kp·ki) ≈ 2.3 cm。**剩余漂移**：光流用带零偏的固件 `rates` 补偿旋转，估计速度偏 `b×h`，速度环把它压到 0 时真速度 = −b×h
-  （2 m 高、0.1 °/s → 0.35 cm/s，30 s 约 10 cm），位置环看不见，要消掉得估零偏（见 selftest 场景 6 的判据与报告）。
+  给速度环参考（限 ±`pos_vmax_mps` 0.3），光流无效时冻结。只有速度环时姿态漂移让 SAFE 以 零偏/ki 匀速漂走（ki 0.15 时 ≈ 1.1 cm/s、ki 0.30 时
+  ≈ 0.6 cm/s，1σ），有位置环后变成常值偏离 零偏/(pos_kp·ki)（≈ 2.3 / 1.1 cm）。**剩余漂移**：光流用带零偏的固件 `rates` 补偿旋转，估计速度偏
+  `b×h`，速度环把它压到 0 时真速度 = −b×h（2 m 高、0.1 °/s → 0.35 cm/s，30 s 约 10 cm），位置环看不见，要消掉得估零偏；另有光流白噪声
+  经位置环积成的随机游走（30 s 约 0.15 m，与零偏无关），selftest 场景 6a 的真值漂移判据是 0.20 m + 1.5·|b|·h·T（见 `selftest_config.h`）。
 - **状态机**：DISARMED →(arm_takeoff)→ TAKEOFF（解锁手势 → 斜坡爬升；|h − 目标| < 0.1 m 且 |vz| < 0.1 m/s 持续 1 s）→ READY ↔ ACTING（动作未过期）；
   任一飞行状态 ToF 失效 > 0.5 s → FAILSAFE（只能 reset 退出）。
 - 真机上还缺的：解锁前 2 s 静止让固件校准陀螺零偏（SITL 里立刻解锁，零偏残差就是 `gyro_bias_residual` 的抽样）；电池 L1 3.5 V 不解锁的处理；
@@ -136,3 +148,8 @@ seed 1–8 全部到 READY（6.5–8.1 s），高度误差 0.011–0.016 m，xy 
 
 2026-11-07 加位置保持后同一命令 seed 1–8：READY 用时不变，xy 漂移 0.015–0.193 m（之前 0.097–0.487 m）；剩余部分主要是光流陀螺补偿零偏 `b×h`
 （见「位置保持」一节）。`cf_sitl_selftest` 33 项通过，新增场景 6（SAFE 保持 30 s + FORWARD/YAW 交替 60 s）与 CTest `cf_sitl_forward_longrun`。
+
+2026-11-07 **lib v3.1**（`e1_mini.json` `vel_ki` 0.15 → 0.30，`dynamics_profile` `cf_sitl_v1:cec5d6b0` → `cf_sitl_v1:683e7400`，旧数据按口径不能混包）：
+FORWARD 稳态侧偏 b/ki 减半（见「速度环」）；selftest 阈值按 40 种子扫描修（场景 1 加计链 1.0° → 2.0°；6a 真值漂移常数项 0.05 → 0.20 m 补光流随机游走；
+6b 积分饱和改成按零偏判断），`selftest/sweep_seeds.sh` seed 1..40：改前 11 红（6b 3、6a 4、场景 1 5），改后 40/40 全绿；seed 1 仍 33/33；
+ctest 10/10（新增 `cf_sitl_forward_lateral`、`cf_sitl_longrun_int_budget`）。没做（待办）：飞行中估零偏（根治 b/ki 侧偏、SAFE 剩余漂移与积分饱和三件事）。

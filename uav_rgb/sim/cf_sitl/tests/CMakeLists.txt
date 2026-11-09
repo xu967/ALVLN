@@ -1,4 +1,5 @@
-# cf_sitl 的 CTest：json 读写、参数文件约定、reset 确定性、proc 协议往返、外部/独立模式一致性。
+# cf_sitl 的 CTest：json 读写、参数文件约定、reset 确定性、proc 协议往返、外部/独立模式一致性、长航时倒飞/原地偏航、
+# FORWARD 侧偏预算（vel_ki）、速度环积分预算 vs 零偏。
 # 顶层已 enable_testing()。依赖参数文件/真库的测试在条件不满足时退出 77 → CTest 显示 Skipped 而不是 Failed。
 if(NOT TARGET cf_sitl_tools_json)
   add_library(cf_sitl_tools_json STATIC ${CMAKE_CURRENT_SOURCE_DIR}/../src/json_min.cpp)
@@ -32,7 +33,14 @@ target_link_libraries(test_forward_longrun PRIVATE cf_sitl)
 add_executable(test_yaw_in_place test_yaw_in_place.cpp)
 target_link_libraries(test_yaw_in_place PRIVATE cf_sitl)
 
-foreach(t test_json_min test_params_file test_reset_determinism test_proc_protocol test_external_vs_standalone test_forward_longrun test_yaw_in_place)
+add_executable(test_forward_lateral test_forward_lateral.cpp)
+target_link_libraries(test_forward_lateral PRIVATE cf_sitl)
+
+add_executable(test_longrun_int_budget test_longrun_int_budget.cpp)
+target_link_libraries(test_longrun_int_budget PRIVATE cf_sitl cf_sitl_tools_json)
+
+foreach(t test_json_min test_params_file test_reset_determinism test_proc_protocol test_external_vs_standalone test_forward_longrun test_yaw_in_place
+          test_forward_lateral test_longrun_int_budget)
   target_include_directories(${t} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   target_compile_features(${t} PRIVATE cxx_std_17)
   target_compile_options(${t} PRIVATE -Wall -Wextra)
@@ -45,6 +53,8 @@ add_test(NAME cf_sitl_proc_protocol COMMAND test_proc_protocol $<TARGET_FILE:cf_
 add_test(NAME cf_sitl_external_vs_standalone COMMAND test_external_vs_standalone "${CF_SITL_PARAMS}")
 add_test(NAME cf_sitl_forward_longrun COMMAND test_forward_longrun "${CF_SITL_PARAMS}")
 add_test(NAME cf_sitl_yaw_in_place COMMAND test_yaw_in_place "${CF_SITL_PARAMS}")
+add_test(NAME cf_sitl_forward_lateral COMMAND test_forward_lateral "${CF_SITL_PARAMS}")
+add_test(NAME cf_sitl_longrun_int_budget COMMAND test_longrun_int_budget "${CF_SITL_PARAMS}")
 set_tests_properties(cf_sitl_params_file cf_sitl_reset_determinism cf_sitl_proc_protocol cf_sitl_external_vs_standalone cf_sitl_forward_longrun
-  cf_sitl_yaw_in_place PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+  cf_sitl_yaw_in_place cf_sitl_forward_lateral cf_sitl_longrun_int_budget PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
 set_tests_properties(cf_sitl_json_min PROPERTIES TIMEOUT 30)
