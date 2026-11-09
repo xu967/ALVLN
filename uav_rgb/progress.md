@@ -56,7 +56,7 @@
 
 ### 未完成的待办
 
-- GitHub：已推到 97ae04b；之后的提交（84fe768 起，含 fda2923、3a6dce5 与本次文档提交）待 `check.sh` 后推（`bash tools/git_mirror_alvln.sh`）。
+- GitHub：22:55 已推到本地 23c6212（ALVLN `462a3c3..b76c37e`；推之前 `check.sh --python-only` rc=0，日志 `tmp/analysis-20261109/check-py-23c6212.log`）。之后的提交随第九阶段合并一起推（`bash tools/git_mirror_alvln.sh`）。
 - 第九阶段 3 个 agent 交付 → 审 diff → 合并 → `check.sh` → 推 GitHub。TEACHER-3DGS 过线后：`demo_3dgs_routes` 加 CFG 透传 `--teacher-planner`，数据集 B 的 hold 按结果给用户建议。
 - DAgger 正式 3 轮（见头部）：盯 `status.json`；若因评测失败集停下，同 `--out` 重起。跑完在最终聚合数据上补 2 个训练种子再下结论（PLAN「22:50 之后」）。eval60 默认用现行严格排除（24 个几何），用户若改口径，改 CFG.eval60_exclude 后同 --out 续跑。
 - eval4 的教师与截断新录像（`eval-teacher/videos/`、`eval-student-e1-trunc/videos/`）给短片 v3；短片 v3 等用户验收 v2 后再做。
