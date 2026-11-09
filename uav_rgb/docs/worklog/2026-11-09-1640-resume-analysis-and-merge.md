@@ -59,3 +59,30 @@
 - FIX-SIM 的「profile 加库指纹」会再换一次 profile 字符串，要在 DAgger 正式跑之前合并。
 - 第八阶段 6 个 agent 并行改 `eval_closed_loop.py`（FIX-A 成功判定 / TEACHER-COST choices）与 `src/`（FIX-B / STUDENT-SELECT），合并时可能有小冲突，主会话解。
 - 短片 v2 片中柱阵片段仍是 eval2（lib v2）录像，片尾表是 eval3 数字，字幕已注明；eval4 出数后可再出 v3。
+
+## 更新 2026-11-09 19:30（用户追问后：3DGS 场景评测、下载、GPU 对拍）
+
+### 做了什么
+
+- 盘点已下载的 3DGS 数据：已配路线 4 个场景（Callinstrasse、Wanderland 1MlUucug、garden、bicycle），已下载未建场景 1 个（stump，`downloads/inria-3dgs-pretrained/stump/`，SCENE-B 只做了重力对齐，缺尺度参照）。
+- 3DGS 跨域闭环矩阵守护进程 `$DATA_ROOT/uav_rgb/xeval-3dgs-20261109/`（PGID 321059）：Gazebo 柱阵训的 E1 学生（BC / 截断 / sgvis）+ 教师 A* + 盲前进 × 4 场景 × 6 路线 × 5 集，hold 1.0（学生训练口径），同 seed 同出生位姿可配对；冻结 worktree `tmp/wt-xeval-3dgs`（77927d4）；本轮专用驱动 `xeval_3dgs_driver.py` 每场景只加载一次；汇总 `summarize.py` 报 SR(stop)（到点即停口径，与 sim09.v2 同义）与 SR(v2)、碰撞、SPL、配对 McNemar、Callinstrasse AGL 可核子集。汇总脚本先在 garden 冒烟集上空跑通过。
+- 对照轮 `xeval-3dgs-20261109-teacher-h05/`（PGID 337265）：等主轮 DONE 后只跑教师 hold 0.5（同出生位姿），给 3DGS 数据集 B 的 hold 决策。
+- gsplat sm_75 缓存放到 `$DATA_ROOT/uav_rgb/torch-cache/extensions-sm75-20261109`（AUDIT-SIM 重编好的副本）；外层脚本写死的 `extensions-sm89-20261106` 不动，等 FIX-SIM 改成按算力拼目录名。
+- GPU 对拍结果写进 demo-plan §3.3 补记与 scoreboard §1（BC 7/17、截断 15/17，逐集成功一致 13/17；6 集墙钟超时）。
+- SCENE-3DGS 任务书写进 `tmp/phase8-20261109/BRIEF.md` §9（本轮只接 stump），等 agent 空位派。
+
+### 没做什么
+
+- treehill / flowers / truck / train 与第二个 Wanderland 场景的下载。原因：本机代理 127.0.0.1:7897 无进程监听，HuggingFace / GitHub 直连超时，Inria 直连实测 29 KB/s（一个场景约 8 h）；按用户指示放弃。下载脚本留在 `downloads/inria-3dgs-pretrained/_dl-20261109/run.sh`，代理恢复后可直接重跑。
+- 3DGS 教师数据 pilot / 放量 / S_B 训练。原因：FIX-SIM 正在修三处会写进数据的问题（碰后穿模帧不标碰撞、pilot 碰撞即停与 preprocess 拒收的矛盾、`dynamics_profile` 不含库版本），合并前采的数据要么带这些问题、要么以后不能和新数据混包；另外 hold（0.5 / 1.0）待用户拍板。
+- 跨域评测里没放旧 X3 学生、没录三视角视频。原因：控制时长；每集 rgb / actions / oracle / trace 都保留，之后可用 `python -m sim.3dgs.video --ep` 挑集合成。
+- SCENE-3DGS agent 没有立即派。原因：已有 6 个 agent 在跑，沿用并发上限 6。
+
+### 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| `summarize.py` 在 garden 冒烟集空跑 | 表格正常输出，2 分 9 秒（建占据栅格为主） |
+| 驱动首场景加载 | garden / bicycle 各 71–72 s，`dynamics_profile=cf_sitl_v1:683e7400`；之后每路线 15–50 s |
+| 下载测速 | `curl` 直连 20 MB 区间 60 s 超时，28.8 KB/s；代理端口无监听 |
+| GPU 对拍 | `DONE rc=1`；summary 见 demo-plan §3.3 补记 |

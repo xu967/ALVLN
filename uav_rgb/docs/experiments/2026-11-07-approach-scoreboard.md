@@ -32,7 +32,7 @@
 
 来源：`$DATA_ROOT/uav_rgb/e1-pipeline-20261107-0417-eval3/{summary.md,eval-*/eval.json,stats/eval3.md}`；sgvis 行来自 `$DATA_ROOT/uav_rgb/e1-pipeline-20261107-1620-sgvis/{summary.md,eval-student-e1-new/eval.json}`，配对表在 `$DATA_ROOT/uav_rgb/tmp/analysis-20261109/stats/`。sgvis 的预注册判据「SR ≥ 13/20 且碰撞 ≤ 2」不通过；且它的训练数据同时换了 SITL 库（v1 → v3）、世界模板、教师碰撞步（182 → 0），不是对截断臂的单变量对照，详见 `2026-11-07-e1-demo-plan.md` §3.4。
 
-硬件前提（2026-11-09）：本表全部学生臂与三个 ckpt 的训练都在 RTX 4080 SUPER（PTX JIT）上产生；本机已换回 RTX 2080 Ti（原生 sm_75）。新臂与本表比之前先同 seed 重跑一臂对拍（demo-plan §3.3 补记）。
+硬件前提（2026-11-09）：本表全部学生臂与三个 ckpt 的训练都在 RTX 4080 SUPER（PTX JIT）上产生；本机已换回 RTX 2080 Ti（原生 sm_75）。对拍已做（demo-plan §3.3 补记）：同权重同 seed 只换卡，BC 7/17（碰撞 7）、截断 15/17（碰撞 1），逐集成功一致 13/17，翻转量级与本表的组间差相当。结论：本表只作 lib v3 + 4080 的历史基准，新臂一律进 eval4（2080 Ti 同机重跑全部臂）。
 
 怎么读：
 

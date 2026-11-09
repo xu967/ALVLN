@@ -1,7 +1,7 @@
 # progress.md（新开会话先读这个）
 
-- 更新：2026-11-09 18:05（第八阶段 6 个开发 agent 17:55 派出；main 2899428 已推 GitHub 1e1a2ce）
-- **现在在跑**：守护进程 GPU 对拍 `$DATA_ROOT/uav_rgb/eval3-gpucheck-20261109/`（PGID 188213，2 个 gz，eval3 的 BC / 截断两臂在 2080 Ti + lib v3 同条件重跑，约 19:00 出 `summary.md`；停 `kill -- -188213`）。子 agent 6 个：FIX-A / TEACHER-COST / DAGGER-GZ / STUDENT-SELECT / FIX-B / FIX-SIM（简报 `tmp/phase8-20261109/BRIEF.md`，断点 `tmp/agent10-<名>/PROGRESS.md`，报告 `tmp/phase8-20261109/reports/`）。短片 v2 已出（`demo-e1-20261107/reel/demo_reel_v2.mp4` 239 s + `_short.mp4` 57 s + `stills_v2/`）。
+- 更新：2026-11-09 19:30（3DGS 跨域评测与对照轮守护进程起跑；GPU 对拍出数；下载因代理失效放弃）
+- **现在在跑**：① 3DGS 跨域闭环矩阵 `$DATA_ROOT/uav_rgb/xeval-3dgs-20261109/`（PGID 321059；教师 / 截断 / BC / sgvis / 盲前进 × garden、bicycle、Wanderland、Callinstrasse × 6 路线 × 5 集，hold 1.0；`run.log`、`driver-<场景>.log`，结束落 `DONE` + `summary.md`；停 `kill -- -321059`）② 对照轮 `xeval-3dgs-20261109-teacher-h05/`（PGID 337265；等①落 DONE 后自动起，只跑教师 hold 0.5，给 3DGS 数据集 B 的 hold 决策用；停 `kill -- -337265`）。子 agent 6 个：FIX-A / TEACHER-COST / DAGGER-GZ / STUDENT-SELECT / FIX-B / FIX-SIM（简报 `tmp/phase8-20261109/BRIEF.md`，断点 `tmp/agent10-<名>/PROGRESS.md`，报告 `tmp/phase8-20261109/reports/`）；排队 SCENE-3DGS（BRIEF §9，本轮只接 stump）。短片 v2：`demo-e1-20261107/reel/demo_reel_v2.mp4` + `_short.mp4` + `stills_v2/`。
 - 本机 **GPU 换回 RTX 2080 Ti**（驱动 580.119.02）；每次会话先 `nvidia-smi -L`。SITL 库现为 **v3.1**（`tmp/build-cf-sitl`，`e1_mini.json` 683e7400；旧 v3 在 `tmp/build-cf-sitl-v3-20261107`）。eval3 / sgvis / 森林基准都是 4080 + lib v3 的，新臂只和 eval4（FIX-A 合并后起）或同条件对照臂比。
 - 方案效果盘点：`docs/experiments/2026-11-07-approach-scoreboard.md`；方向计划最新一节：`docs/PLAN_2026-11-07_demo_and_paper.md` 「更新 2026-11-09」；修复清单：`tmp/phase3-20261107/FIXLIST_R2.md`（A/B/C/D 批次状态见下）；本轮 6 份只读分析报告：`$DATA_ROOT/uav_rgb/tmp/analysis-20261109/{PLAN_STATUS,WORKTREES,EXPERIMENTS,AUDIT_SRC,AUDIT_SIMTOOLS,AUDIT_SIM}.md`；主会话 worklog：`docs/worklog/2026-11-09-1640-resume-analysis-and-merge.md`。
 
@@ -22,6 +22,12 @@
 - 17:22 起 GPU 对拍守护进程 `eval3-gpucheck-20261109`（见头部）。
 - 17:55 第八阶段 6 个开发 agent 派出（`tmp/phase8-20261109/BRIEF.md`）；worktree `tmp/wt-{fix-a,teacher-cost,dagger-gz,student-select,fix-b,fix-sim}` 基于 2899428；空的 `wt-fix-b` 已删并重建。FIXLIST 状态：A → FIX-A 做中；B → FIX-B 做中；C 完成；D 的 D1/D5/D6 完成、其余 → FIX-SIM 做中；E 完成。
 
+- 18:40 用户追问：短片路径、worktree 暂不删、代码未改完、3DGS 场景要一起跑。盘点已下载 3DGS：已配路线 4 个（Callinstrasse / Wanderland 1MlUucug / garden / bicycle）、已下载未建场景 1 个（stump，缺尺度参照）；luigi / synthetic 是玩具场景。
+- 18:47 下载 treehill / flowers / truck / train（Inria models.zip 按 Range）守护进程；19:18 停：代理 127.0.0.1:7897 无进程监听，HuggingFace / GitHub 直连超时，Inria 直连 29 KB/s（一个场景约 8 h），按用户「下载不出来就放弃」处理，只留 treehill 的 cameras.json / cfg_args / input.ply。第二个 Wanderland 场景同因放弃。
+- 18:57–19:10 3DGS 跨域评测：先按路线调 `eval_3dgs`，每次调用加载约 200 s（每集只要 4–12 s），停掉改成每场景加载一次的驱动 `xeval_3dgs_driver.py`（逐集仍调 `collect_3dgs.run_episode`，参数照 eval_3dgs / collect_3dgs 主函数）；第一次重起时脚本变量叫 `GROUPS`（bash 内置只读数组）导致组名变 '0'，改名 `EVAL_GROUPS` 后 19:10 正式起跑。gsplat 用 `torch-cache/extensions-sm75-20261109`（sm_75 缓存，热身确认不重编）。
+- 19:16 GPU 对拍 DONE（rc=1，6 集墙钟超时）：BC 7/17（碰撞 7）、截断 15/17（碰撞 1），逐集成功一致 13/17 → 写进 demo-plan §3.3 补记与 scoreboard §1；结论：eval4 同机重跑全部臂、用 sim09.v2、放宽超时。
+- 19:15 早期观察：3DGS 教师在 hold 1.0 下目标附近左右来回转（bicycle r1 / r5、garden r4 多集耗尽步数），是已知 L/R 死锁（FIXLIST D9）在大步长下更易触发；截断学生在 garden 前 4 条路线 20 集撞 19 集。
+
 ### 关键决策
 
 - 见 PLAN「更新 2026-11-09」决策 1–5。
@@ -29,11 +35,11 @@
 
 ### 未完成的待办
 
-- 收 GPU 对拍 `eval3-gpucheck-20261109/summary.md` → 写进 demo-plan §3.3 补记（逐 seed 一致数；若大面积翻转，eval4 之前先查推理数值）。
-- 收 6 个 agent 报告 → 审 diff → 合并（顺序建议：FIX-A → FIX-SIM → FIX-B → STUDENT-SELECT → TEACHER-COST → DAGGER-GZ；`eval_closed_loop.py` 与 `src/` 可能有小冲突）→ `check.sh` → 推 GitHub。
-- FIX-A 合并后起 **eval4** 守护进程（2080 Ti + lib v3.1 + `sim09.v2`，六臂：教师 / 盲前进 / 旧 X3 / BC / 截断 / sgvis，同 20 seed，≤3 gz，`E1_EXTRA_STUDENTS` 带截断与 sgvis ckpt）→ scoreboard 新开 eval4 表 → STUDENT-SELECT 三个 seed ckpt 与 TEACHER-COST 重标学生排进同一口径。
-- FIX-SIM（profile 加库指纹）合并后再起 DAgger 正式 3 轮（DAGGER-GZ 交付的一行命令）。
-- 用户：看短片 v2（先看 `stills_v2/`）→ 验收 → tag `demo-2026-11-12`；拍板 PLAN §8 四项；点头后删已合并 worktree（`wt-fix-sitl` / `wt-fix-3dgs` / `wt-r2-uidocs` / `wt-viz-layout`）与 `wt-e1-sgvis`（`wt-xeval-forest` 留给 gpucheck 复现）。
+- 收 3DGS 跨域评测 `xeval-3dgs-20261109/summary.md`（约 19:50）与教师 hold 0.5 对照轮（约 20:20）→ 新建 `docs/experiments/2026-11-09-xeval-3dgs.md`，scoreboard 加 3DGS 跨域一节，PLAN W4 填列。
+- 收 6 个 agent 报告 → 审 diff → 合并（建议顺序：FIX-B → FIX-A → FIX-SIM → STUDENT-SELECT → TEACHER-COST → DAGGER-GZ；`eval_closed_loop.py` 与 `src/` 可能有小冲突）→ `check.sh` → 推 GitHub。第一个 agent 交付后派 SCENE-3DGS（stump）。
+- FIX-A 合并后起 **eval4**（2080 Ti + lib v3.1 + sim09.v2，六臂同 20 seed，≤3 gz，单集超时放宽；最好等 agent 的 gz 少一些再起，满载时每步 6–8 s 墙钟）。
+- FIX-SIM 合并后：3DGS 教师数据 pilot（每场景 20 集）→ 放量（数据集 B ≥300 集）→ S_B 训练 → 跨域矩阵 S_B 行；hold 等用户拍板。DAgger 正式 3 轮同样等 FIX-SIM（profile 加库指纹）。
+- 用户：看短片 v2 → 验收 → tag `demo-2026-11-12`；拍板 3DGS 数据集 hold、stump 尺度假设、PLAN §8 四项；worktree 删除暂不做（用户 18:36「还没确定」）；要下载新场景需先恢复代理 127.0.0.1:7897。
 
 ## 第三阶段（2026-11-07 05:10 起）
 
