@@ -113,6 +113,7 @@ ENV = dict(os.environ)           # main() 补 TORCH_EXTENSIONS_DIR / CF_SITL_PRO
 
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "tools"))
+import pipeline_common as pc  # noqa: E402
 
 
 def log(msg):
@@ -141,15 +142,10 @@ def run(cmd, what):
 
 
 def torch_ext_dir():
-    """gsplat JIT 缓存按 GPU 架构分目录（目录里混了别的架构会重编或加载失败）：extensions-sm<compute_cap>。"""
-    if os.environ.get("TORCH_EXTENSIONS_DIR"):
-        return os.environ["TORCH_EXTENSIONS_DIR"]
-    try:
-        cap = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"], capture_output=True,
-                             text=True, timeout=60).stdout.split()[0].replace(".", "")
-    except (OSError, IndexError, subprocess.SubprocessError):
-        cap = "unknown"
-    return os.path.join(DATA_ROOT, "uav_rgb", "torch-cache", f"extensions-sm{cap}")
+    """gsplat JIT 缓存按 GPU 架构分目录（目录里混了别的架构会重编或加载失败）：环境里已有 TORCH_EXTENSIONS_DIR 就用它，
+    否则按 PY 问到的算力命名（pipeline_common.torch_extensions_dir），问不到回退 extensions-smunknown。"""
+    return (os.environ.get("TORCH_EXTENSIONS_DIR") or pc.torch_extensions_dir(python=PY)
+            or os.path.join(DATA_ROOT, "uav_rgb", "torch-cache", "extensions-smunknown"))
 
 
 # ---------------------------------------------------------------- 1 对齐：重力 / 地面 / 尺度 / nav_to_world

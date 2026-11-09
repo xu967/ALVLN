@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""三条流水线（tools/e1_pipeline.py / tools/dagger_pipeline.py / tools/compare_datasets.py）共用的小件。
+"""流水线（tools/e1_pipeline.py / tools/dagger_pipeline.py / tools/dagger_gz_pipeline.py / tools/compare_datasets.py）共用的小件。
 
 续跑判定（AUDIT_SIMTOOLS 2026-11-09 Must 1/2）：
   train_finished(run_dir)  训练完成 = run/metrics.jsonl 末行是 status "done: …"。trainer 每个 epoch 都写 ckpt.bin，
@@ -16,6 +16,8 @@
 共享 helper（A4，以前三份各抄一遍）：log / run_cmd / sh / read_json / write_json / mark / need / wilson_ci。
   DRY 是本模块的全局开关：流水线 main 里 `pc.DRY = DRY = a.dry_run` 一行同步；dry-run 下 run_cmd 只打印、
   mark 不落盘、need 只提醒。
+gsplat 缓存目录：torch_extensions_dir（dagger_pipeline / demo_3dgs_routes / scene_import_mipnerf 共用；3DGS venv 也
+  import 本模块，所以只能用标准库）。
 单测：tools/test_pipeline_common.py。
 """
 import json
@@ -26,6 +28,7 @@ import subprocess
 import time
 
 DRY = False
+DATA_ROOT = os.environ.get("DATA_ROOT", "/root/rivermind-data")
 
 
 def log(msg):
@@ -216,3 +219,19 @@ def retire_unfinished_eval(eval_dir):
         dest = f"{eval_dir}.failed-{time.strftime('%Y%m%d-%H%M%S')}-{n}"
     os.rename(eval_dir, dest)
     return dest
+
+
+def torch_extensions_dir(capability=None, python=None):
+    """gsplat JIT 缓存目录 $DATA_ROOT/uav_rgb/torch-cache/extensions-sm<major><minor>：按 GPU 计算能力分目录，不同卡的 .so 不混用。
+    capability 缺省时用 python（3DGS venv）问 torch.cuda.get_device_capability()；问不到（没卡 / 没 venv / 超时）返回 None，
+    怎么处理由调用方定。目录名进 torch 扩展的版本哈希：复制或改名都会整目录重编（docs/HANDOFF_3DGS_20261105.md 坑 1）。"""
+    if capability is None:
+        try:
+            r = subprocess.run([python, "-c", "import torch; print(*torch.cuda.get_device_capability())"],
+                               capture_output=True, text=True, timeout=120)
+            capability = tuple(int(x) for x in r.stdout.split()) if r.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            capability = None
+    if not capability or len(capability) != 2:
+        return None
+    return os.path.join(DATA_ROOT, "uav_rgb", "torch-cache", f"extensions-sm{capability[0]}{capability[1]}")

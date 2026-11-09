@@ -56,15 +56,17 @@ VIDEO_QUALITY = "medium"        # 画质档（sim/tools/view_layout.VIDEO_QUALIT
                                 # high=2560×1440 画布、显示视角 2× 渲染、CRF 18（demo 用；编码约 3× 慢）。环境变量 UAVRGB_VIDEO_QUALITY 可覆盖
 ACTIONS = ("SAFE", "FORWARD", "YAW_L", "YAW_R")
 
+sys.path.insert(0, os.path.join(REPO, "tools"))
+import pipeline_common as pc  # noqa: E402
+
 
 def torch_extensions_dir(capability=None):
-    """gsplat JIT 缓存目录 = $DATA_ROOT/uav_rgb/torch-cache/extensions-sm<算力>，算力缺省用 PY 问 torch.cuda.get_device_capability()。
+    """gsplat JIT 缓存目录（pipeline_common.torch_extensions_dir），算力缺省用 PY 问 torch；问不到就报错：env() 要把目录写进子进程环境。
     AUDIT_SIM #5：以前写死 extensions-sm89-20261106，显卡换回 2080 Ti（sm_75）后目录名与里面的 cubin 对不上。换卡后首个进程重新 JIT（约 4 min）。"""
-    if capability is None:
-        out = subprocess.run([PY, "-c", "import torch; print(*torch.cuda.get_device_capability())"],
-                             capture_output=True, text=True, check=True).stdout.split()
-        capability = (int(out[0]), int(out[1]))
-    return os.path.join(DATA_ROOT, "uav_rgb", "torch-cache", "extensions-sm%d%d" % tuple(capability))
+    ext_dir = pc.torch_extensions_dir(capability, PY)
+    if ext_dir is None:
+        raise RuntimeError(f"问不到 GPU 算力（{PY} 里 torch.cuda.get_device_capability() 失败或超时），gsplat 缓存目录没法按卡命名")
+    return ext_dir
 
 
 _ENV = None

@@ -83,22 +83,9 @@ def run(cmd, env_extra=None, log_path=None, cwd=REPO):
 
 
 def torch_extensions_dir(capability=None, python=None):
-    """gsplat JIT 缓存目录 <DATA_ROOT>/uav_rgb/torch-cache/extensions-sm<major><minor>，按 GPU 计算能力命名。
-
-    capability 缺省问 3DGS venv 里的 torch（torch.cuda.get_device_capability）；问不到（没卡 / 没 venv）返回 None，
-    调用方就不设 TORCH_EXTENSIONS_DIR，用 torch 默认缓存。以前按 sm_89 写死目录名：换到 sm_75 的卡上会把别的架构的
-    .so 装进同名目录。
-    """
-    if capability is None:
-        try:
-            r = subprocess.run([python or PY3DGS, "-c", "import torch; print(*torch.cuda.get_device_capability())"],
-                               capture_output=True, text=True, timeout=120)
-            capability = tuple(int(x) for x in r.stdout.split()) if r.returncode == 0 else None
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            capability = None
-    if not capability or len(capability) != 2:
-        return None
-    return os.path.join(DATA_ROOT, "uav_rgb", "torch-cache", f"extensions-sm{capability[0]}{capability[1]}")
+    """gsplat JIT 缓存目录（pipeline_common.torch_extensions_dir），算力缺省问 PY3DGS 里的 torch；问不到返回 None，
+    main 就不设 TORCH_EXTENSIONS_DIR，用 torch 默认缓存。"""
+    return pc.torch_extensions_dir(capability, python or PY3DGS)
 
 
 # ───────────────────────────── 各步 ─────────────────────────────

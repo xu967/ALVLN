@@ -9,6 +9,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _DATA_TMP = os.path.join(os.environ.get("DATA_ROOT", "/root/rivermind-data"), "uav_rgb", "tmp")
@@ -77,6 +78,20 @@ class TestResume(unittest.TestCase):
             src = open(os.path.join(ROOT, "tools", name), encoding="utf-8").read()
             self.assertNotIn('"extensions-sm89', src, name)       # 不再有写死的目录名字面量（注释里提历史可以）
             self.assertNotIn("sm_89 编", src, name)
+
+    def test_torch_cache_dir_shared_rule_raises_without_gpu(self):
+        """规则只在 pipeline_common.torch_extensions_dir（dagger_pipeline / scene_import_mipnerf 同一份），算力用 PY 问；
+        问不到就报错：env() 要把目录写进子进程环境，本脚本不回退 torch 默认缓存。"""
+        pc = demo.pc
+        self.assertEqual(demo.torch_extensions_dir((7, 5)), pc.torch_extensions_dir((7, 5)))
+        calls = []
+        with mock.patch.object(pc, "torch_extensions_dir",
+                               lambda capability=None, python=None: calls.append((capability, python)) or "/spy/extensions-sm75"):
+            self.assertEqual(demo.torch_extensions_dir(), "/spy/extensions-sm75")
+        self.assertEqual(calls, [(None, demo.PY)])
+        with mock.patch.object(pc, "torch_extensions_dir", lambda capability=None, python=None: None):
+            with self.assertRaises(RuntimeError):
+                demo.torch_extensions_dir()
 
 
 if __name__ == "__main__":

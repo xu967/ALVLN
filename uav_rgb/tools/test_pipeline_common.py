@@ -116,6 +116,26 @@ def test_signal_handlers_and_child_groups():
     print("ok 信号处理：子进程组 SIGTERM → 宽限 → SIGKILL；Interrupted rc=128+signum")
 
 
+def test_torch_extensions_dir():
+    """gsplat JIT 缓存目录：同一算力同一路径（2080 Ti = $DATA_ROOT/uav_rgb/torch-cache/extensions-sm75）；
+    问不到算力（python 不存在 / 退出非零 / 输出不是两个整数）返回 None。假 python 是 shell 脚本，不起 torch。"""
+    root = os.path.join(os.environ.get("DATA_ROOT", "/root/rivermind-data"), "uav_rgb", "torch-cache")
+    assert pc.torch_extensions_dir((7, 5)) == os.path.join(root, "extensions-sm75")
+    assert pc.torch_extensions_dir((8, 9)) == os.path.join(root, "extensions-sm89")
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+        def fake_python(name, body):
+            path = os.path.join(tmp, name)
+            _write(path, "#!/bin/sh\n" + body + "\n")
+            os.chmod(path, 0o755)
+            return path
+
+        assert pc.torch_extensions_dir(python=fake_python("ok", "echo 7 5")) == os.path.join(root, "extensions-sm75")
+        for py in (fake_python("fail", "exit 1"), fake_python("junk", "echo no cuda"), fake_python("three", "echo 7 5 0"),
+                   os.path.join(tmp, "missing-python")):
+            assert pc.torch_extensions_dir(python=py) is None, py
+    print("ok torch_extensions_dir：同一算力同一路径，问不到返回 None")
+
+
 def test_shared_helpers():
     """log/need/read_json/write_json/mark/wilson_ci 只在 pipeline_common 里有一份（A4），三条流水线直接用它的。"""
     import io
@@ -130,6 +150,9 @@ def test_shared_helpers():
         for name in ("log", "need", "read_json", "write_json", "mark", "sh"):
             assert getattr(mod, name) is getattr(pc, name), f"{mod.__name__}.{name} 不是 pipeline_common 的那一份"
         assert not hasattr(mod, "wilson"), f"{mod.__name__} 还有自己的 wilson"
+    import dagger_gz_pipeline as dg
+    for name in ("log", "read_json", "write_json"):   # run/sh/mark/need 在 dagger_gz 里语义不同，见该文件注释
+        assert getattr(dg, name) is getattr(pc, name), f"dagger_gz_pipeline.{name} 不是 pipeline_common 的那一份"
     assert sr.wilson_ci is pc.wilson_ci, "stats_report 应直接用 pipeline_common.wilson_ci"
     for k, n in ((0, 1), (3, 12), (11, 12), (20, 20), (7, 20)):
         lo, hi = pc.wilson_ci(k, n)
@@ -165,6 +188,7 @@ def main():
     test_eval_finished()
     test_retire_unfinished_eval()
     test_signal_handlers_and_child_groups()
+    test_torch_extensions_dir()
     test_shared_helpers()
     print("test_pipeline_common: PASS")
     return 0

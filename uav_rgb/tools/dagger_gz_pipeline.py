@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
 sys.path.insert(0, os.path.join(REPO, "sim", "tools"))
 import e1_pipeline  # noqa: E402  评测 seed 单源、GZ_ENV、训练配置的出处
 import pick_test_seeds as pts  # noqa: E402
+import pipeline_common as pc  # noqa: E402
 import split_manifest as sm  # noqa: E402
 import cf_sitl_exec  # noqa: E402  当前 e1_mini.json 的 dynamics_profile，与 collect.py 同一函数
 import stats_report  # noqa: E402  McNemar / 配对结果
@@ -99,11 +100,9 @@ ACTIONS = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 
 DRY = False
 CHILDREN = set()   # 在跑的子进程：SIGTERM 时转发，DONE 写真实 rc
-
-
-# shortcut: log/run/sh/read_json/write_json/mark/need 与 e1_pipeline 同文；FIX-A 合并 tools/pipeline_common.py 后改为 import
-def log(msg):
-    print(time.strftime("%F %T"), msg, flush=True)
+log, read_json, write_json = pc.log, pc.read_json, pc.write_json
+# run/sh/mark/need 与 pipeline_common 同名不同义，不能换：run 的子进程留在本进程组、由 _on_term 转发 SIGTERM（pc.run 另起进程组）；
+# mark 合并同一步的旧字段（preflight 的 dynamics_profiles 靠它保留）；need 在 dry-run 下不打印提醒
 
 
 def run(cmd, env_extra=None, log_path=None):
@@ -129,18 +128,6 @@ def sh(cmd, **kw):
     rc = run(cmd, **kw)
     if rc != 0:
         raise RuntimeError(f"退出码 {rc}: {' '.join(os.path.basename(c) for c in cmd[:3])}")
-
-
-def read_json(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def write_json(path, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
 
 
 def mark(out, step, state, **extra):

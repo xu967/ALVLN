@@ -132,6 +132,21 @@ def test_no_dead_gazebo_branch_and_no_hardcoded_paths():
     print("ok 无 gazebo_commands 死代码；dynamics_params 相对仓库；缓存名按 GPU 计算能力")
 
 
+def test_torch_extensions_dir_uses_pipeline_common():
+    """缓存目录规则只在 pipeline_common.torch_extensions_dir：这里只补默认的 PY3DGS；问不到返回 None（main 不设，用 torch 默认缓存）。"""
+    import pipeline_common as pc
+    assert dp.torch_extensions_dir((7, 5)) == pc.torch_extensions_dir((7, 5))
+    calls, saved = [], pc.torch_extensions_dir
+    pc.torch_extensions_dir = lambda capability=None, python=None: calls.append((capability, python))
+    try:
+        assert dp.torch_extensions_dir() is None
+        assert dp.torch_extensions_dir(python="/x/python") is None
+    finally:
+        pc.torch_extensions_dir = saved
+    assert calls == [(None, dp.PY3DGS), (None, "/x/python")], calls
+    print("ok torch_extensions_dir 走 pipeline_common：默认问 PY3DGS，问不到返回 None")
+
+
 def test_dry_run_creates_nothing():
     """A6：--dry-run 只打印命令，不建 --out / round_0、不写 config.json/summary.json/DONE、不去问 torch。"""
     import signal
@@ -167,6 +182,7 @@ def main():
     test_evaluate_resume_by_eval_finished()
     test_main_records_interrupt_with_real_rc()
     test_no_dead_gazebo_branch_and_no_hardcoded_paths()
+    test_torch_extensions_dir_uses_pipeline_common()
     test_dry_run_creates_nothing()
     print("test_dagger_pipeline: PASS")
     return 0

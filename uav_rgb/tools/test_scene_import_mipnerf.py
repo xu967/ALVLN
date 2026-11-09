@@ -12,6 +12,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -175,6 +176,29 @@ class TestAlign(unittest.TestCase):
         with self.assertRaises(ValueError):                  # 猜测高附近没有稀疏点 = 参照物没找到，不能静默给个尺度
             imp.align_scene(self.src, dict(method="object_height", ref="x", ref_h_m=0.75, ref_h_guess=5.0,
                                            center_r=1.5, band=0.08, confidence="medium", source="t"))
+
+
+class TestTorchExtDir(unittest.TestCase):
+    """gsplat 缓存目录：环境里已有 TORCH_EXTENSIONS_DIR 就用它；否则用 PY 问算力，规则在 pipeline_common.torch_extensions_dir
+    （demo_3dgs_routes / dagger_pipeline 同一份）；问不到回退 extensions-smunknown。"""
+
+    def test_env_then_shared_rule_then_unknown(self):
+        calls = []
+
+        def spy(result):
+            return lambda capability=None, python=None: calls.append((capability, python)) or result
+
+        with mock.patch.dict(os.environ, {"TORCH_EXTENSIONS_DIR": "/given/ext"}), \
+                mock.patch.object(imp.pc, "torch_extensions_dir", spy("/spy/extensions-sm75")):
+            self.assertEqual(imp.torch_ext_dir(), "/given/ext")
+            self.assertEqual(calls, [])
+            del os.environ["TORCH_EXTENSIONS_DIR"]
+            self.assertEqual(imp.torch_ext_dir(), "/spy/extensions-sm75")
+            self.assertEqual(calls, [(None, imp.PY)])
+        with mock.patch.dict(os.environ), mock.patch.object(imp.pc, "torch_extensions_dir", spy(None)):
+            os.environ.pop("TORCH_EXTENSIONS_DIR", None)
+            self.assertEqual(imp.torch_ext_dir(),
+                             os.path.join(imp.DATA_ROOT, "uav_rgb", "torch-cache", "extensions-smunknown"))
 
 
 class TestEndToEndMock(unittest.TestCase):
