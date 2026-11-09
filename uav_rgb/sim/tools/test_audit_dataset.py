@@ -747,6 +747,38 @@ def main():
             assert c23["status"] == want, (label, tiebreak, c23)
             shutil.rmtree(root23)
         ad.set_vehicle("x3")
+
+        # 24) planner=costmap 集按 plan_action_costmap 复算，版本常量是 TEACHER_COST_VERSION：
+        #     门柱正前 1.5 m（0,0,0）costmap 默认 tol=25 的 argmin 是 FWD、legacy A* 是 YAW_LEFT、costmap tol=0 是 YAW_LEFT；
+        #     写 legacy 版本号的 costmap 集 → 跳过（SKIP）；manifest.costmap_tol_deg 必须参与复算。
+        gate = [{"name": "p0", "x": 1.5, "y": 0.0, "z": 1.5, "size": [0.4, 0.4, 3.0]}]
+        ad.set_vehicle("e1_mini", "base")
+        try:
+            cm, cinfo = ad.plan_action_costmap(0.0, 0.0, 0.0, gate)
+            leg24, _ = ad.plan_action_global_tiebreak(0.0, 0.0, 0.0, gate, "legacy")
+            cm_t0, _ = ad.plan_action_costmap(0.0, 0.0, 0.0, gate, tol=0.0)
+        finally:
+            ad.set_vehicle("x3")
+        assert cinfo["fallback"] is None and (cm, leg24, cm_t0) == (1, 2, 2), (cm, leg24, cm_t0, cinfo)
+        base24 = {"vehicle": "e1_mini", "dynamics": "cf_sitl", "planner": "costmap",
+                  "teacher_version": ad.TEACHER_COST_VERSION}
+        for label, man_over, want in ((cm, {}, "PASS"), (leg24, {}, "FAIL"),
+                                      (cm, {"teacher_version": TEACHER_VERSION}, "SKIP"),
+                                      (cm_t0, {"costmap_tol_deg": 0.0}, "PASS")):
+            root24 = tempfile.mkdtemp(prefix="audit_test_")
+            write_ep(root24, "train", 1, [label] * 4, pillars=gate, man_extra=dict(base24, **man_over))
+            p24 = os.path.join(root24, "train", "1", "actions.jsonl")
+            with open(p24, encoding="utf-8") as f:
+                rows24 = [json.loads(line) for line in f]
+            for r in rows24:
+                r.update({"action_expert": label, "pose_before": {"x": 0.0, "y": 0.0, "z": 2.0},
+                          "yaw_before": 0.0, "q_costs": cinfo["q"]})
+            with open(p24, "w", encoding="utf-8") as f:
+                f.writelines(json.dumps(r) + "\n" for r in rows24)
+            c24 = details(root24)["label_recompute"]
+            assert c24["status"] == want, (label, man_over, c24)
+            shutil.rmtree(root24)
+        ad.set_vehicle("x3")
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

@@ -401,6 +401,12 @@ def collect_command(task, args):
         cmd += ["--policy", args.policy]
     if args.teacher_planner != "astar":
         cmd += ["--teacher-planner", args.teacher_planner]
+    if args.teacher_planner == "costmap":
+        # costmap 的两个显式参数只在非默认时传（collect.py 拒绝非 costmap 时带这两项）
+        if getattr(args, "costmap_tol", 25.0) != 25.0:
+            cmd += ["--costmap-tol", str(args.costmap_tol)]
+        if getattr(args, "costmap_lookahead_steps", 1) != 1:
+            cmd += ["--costmap-lookahead-steps", str(args.costmap_lookahead_steps)]
     if args.policy == "teacher-rl":
         cmd += ["--rl-checkpoint", args.rl_checkpoint]
     if args.policy == "student":
@@ -620,7 +626,12 @@ def main():
                    help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）；旧数据复现请显式 legacy")
     p.add_argument("--policy", choices=("teacher", "forward", "teacher-rl", "student"), default="teacher",
                    help="student=DAgger 自采：学生闭环飞、A* 影子教师给标签（需 --student-ckpt）")
-    p.add_argument("--teacher-planner", choices=("astar", "predictive"), default="astar")
+    p.add_argument("--teacher-planner", choices=("astar", "predictive", "costmap"), default="astar",
+                   help="透传给 collect.py：costmap=测地场代价 argmin 教师（每行多记 q_costs）")
+    p.add_argument("--costmap-tol", type=float, default=25.0,
+                   help="透传给 collect.py：costmap 教师航向罚死区（度）；仅 --teacher-planner costmap")
+    p.add_argument("--costmap-lookahead-steps", type=int, default=1,
+                   help="透传给 collect.py：costmap 教师前瞻步数；仅 --teacher-planner costmap")
     p.add_argument("--rl-checkpoint", default="")
     p.add_argument("--student-ckpt", default=None, help="透传给 collect.py：--policy student 的 checkpoint")
     p.add_argument("--infer-bin", default=None,
@@ -683,6 +694,10 @@ def main():
     if args.tiebreak != "legacy" and not (args.policy == "student"
                                           or (args.policy == "teacher" and args.teacher_planner == "astar")):
         p.error("--tiebreak visible 只对 A* 教师有意义（--policy teacher/astar 或 student）")
+    if args.teacher_planner == "costmap" and args.policy != "teacher":
+        p.error("--teacher-planner costmap 只能和 --policy teacher 一起用")
+    if args.teacher_planner != "costmap" and (args.costmap_tol != 25.0 or args.costmap_lookahead_steps != 1):
+        p.error("--costmap-tol/--costmap-lookahead-steps 只能和 --teacher-planner costmap 一起用")
     if args.dynamics == "cf_blackbox":
         p.error("cf_blackbox 是纯 Python 模型档，Gazebo 并行采集未接入；"
                 "请让 3DGS collector 直接调用 cf_blackbox，或改用 cf_stab/x3_velocity")

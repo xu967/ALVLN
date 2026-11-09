@@ -744,6 +744,11 @@ def run_episode(seed, args, workdir, seen_gids):
             cmd += ["--rl-checkpoint", args.rl_checkpoint]
         if args.policy == "teacher" and args.teacher_planner != "astar":
             cmd += ["--teacher-planner", args.teacher_planner]
+        if args.policy == "teacher" and args.teacher_planner == "costmap":
+            if args.costmap_tol != 25.0:
+                cmd += ["--costmap-tol", str(args.costmap_tol)]
+            if args.costmap_lookahead_steps != 1:
+                cmd += ["--costmap-lookahead-steps", str(args.costmap_lookahead_steps)]
         if getattr(args, "vehicle", None) and args.vehicle != "x3":
             cmd += ["--vehicle", args.vehicle]   # x3 不传：旧命令行逐字不变
         env = cp.gz_env(partition)
@@ -947,7 +952,12 @@ def main():
                    help="student=模型闭环；forward=盲前进基线（T7）；"
                         "teacher-nn=特权教师网络闭环（可解性闸门）；"
                         "teacher=柱子真值 A* 专家闭环（新动力学下的可解性上界）")
-    p.add_argument("--teacher-planner", choices=("astar", "predictive"), default="astar")
+    p.add_argument("--teacher-planner", choices=("astar", "predictive", "costmap"), default="astar",
+                   help="--policy teacher 的规划器：costmap=测地场代价 argmin（teacher.plan_action_costmap）")
+    p.add_argument("--costmap-tol", type=float, default=25.0,
+                   help="透传给 collect.py：costmap 教师航向罚死区（度）；仅 --teacher-planner costmap")
+    p.add_argument("--costmap-lookahead-steps", type=int, default=1,
+                   help="透传给 collect.py：costmap 教师前瞻步数；仅 --teacher-planner costmap")
     p.add_argument("--rl-checkpoint", default="")
     p.add_argument("--teacher-ckpt", default=None,
                    help="PrivilegedTeacher checkpoint（--policy teacher-nn 必填）")
@@ -1096,6 +1106,10 @@ def main():
         p.error("新 Teacher 需要 --dynamics cf_stab --hold 0.2 --task campus_assets/campus")
     if args.policy == "teacher-rl" and not args.rl_checkpoint:
         p.error("teacher-rl 需要 --rl-checkpoint")
+    if args.teacher_planner == "costmap" and args.policy != "teacher":
+        p.error("--teacher-planner costmap 只能和 --policy teacher 一起用")
+    if args.teacher_planner != "costmap" and (args.costmap_tol != 25.0 or args.costmap_lookahead_steps != 1):
+        p.error("--costmap-tol/--costmap-lookahead-steps 只能和 --teacher-planner costmap 一起用")
     if args.text_mode != "keep" and args.policy != "student":
         p.error("--text-mode 只对 --policy student 有意义")
     infer_bin = None

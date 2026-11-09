@@ -14,6 +14,7 @@
 纯 stdlib，不依赖 numpy；合成深度/柱阵即可单测。
 """
 import heapq
+import json
 import math
 
 SAFE_NEUTRAL, FORWARD_SLOW, YAW_LEFT, YAW_RIGHT = 0, 1, 2, 3
@@ -332,6 +333,24 @@ def _point_blocked(x, y, pillars, clearance):
     return False
 
 
+# A* 与测地场共用的 8 邻接移动集（dx, dy, 步长倍数）；斜向 1.41421356 是历史常量，改成 math.sqrt(2) 会让
+# 路长与 tie_margin 的数值变化（sgvis 行内 tie_margin_steps 逐位回归会炸）。
+_MOVES = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
+          (1, 1, 1.41421356), (1, -1, 1.41421356),
+          (-1, 1, 1.41421356), (-1, -1, 1.41421356))
+
+
+def _grid_spec(pillars, step):
+    """astar_path / geodesic_field 共用的栅格 (x0, y0, nx, ny)：边界由柱子派生，避免改 PILLAR_X_RANGE 后 A* 静默退回局部规划。"""
+    x0 = min(-1.5, min(float(p["x"]) for p in pillars) - 1.5)
+    x1 = max(7.0, max(float(p["x"]) for p in pillars) + 3.0)
+    y1 = max(2.8, max(abs(float(p["y"])) for p in pillars) + 1.5)
+    y0 = -y1
+    nx = int(round((x1 - x0) / step)) + 1
+    ny = int(round((y1 - y0) / step)) + 1
+    return x0, y0, nx, ny
+
+
 def astar_path(pillars, start, goal, clearance=0.5, step=0.1):
     """柱区 2D 栅格 A*，返回 [(x,y), ...] 或 None。
 
@@ -339,13 +358,7 @@ def astar_path(pillars, start, goal, clearance=0.5, step=0.1):
     T1 实测 24 集里 15 集擦柱。A* 从全局找一条净空路径，代价函数只是距离；
     障碍按柱方框 + clearance 膨胀，8 邻接且禁止斜穿角点。
     """
-    # 边界由柱子派生，避免改 PILLAR_X_RANGE 后 A* 静默退回局部规划。
-    x0 = min(-1.5, min(float(p["x"]) for p in pillars) - 1.5)
-    x1 = max(7.0, max(float(p["x"]) for p in pillars) + 3.0)
-    y1 = max(2.8, max(abs(float(p["y"])) for p in pillars) + 1.5)
-    y0 = -y1
-    nx = int(round((x1 - x0) / step)) + 1
-    ny = int(round((y1 - y0) / step)) + 1
+    x0, y0, nx, ny = _grid_spec(pillars, step)
 
     def idx(px, py):
         return int(round((px - x0) / step)), int(round((py - y0) / step))
@@ -370,9 +383,7 @@ def astar_path(pillars, start, goal, clearance=0.5, step=0.1):
     open_heap = [(0.0, 0, sx, sy)]
     gscore = {(sx, sy): 0.0}
     parent = {}
-    moves = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
-             (1, 1, 1.41421356), (1, -1, 1.41421356),
-             (-1, 1, 1.41421356), (-1, -1, 1.41421356))
+    moves = _MOVES
     while open_heap:
         _f, _g, i, j = heapq.heappop(open_heap)
         if (i, j) == (gx, gy):
@@ -492,6 +503,8 @@ def plan_action_global(x, y, yaw_deg, pillars, clearance=None, step=0.1,
 # < 0.5 步，学生拿到的 L/R 监督互相矛盾，val 上 L/R 召回逐轮翻转 0.19，ckpt_best 把 test 19.5% 的 YAW 帧预测成反向。
 # 近平局的度量照搬 agent6-distill/q1_cost_to_go.py：对 YAW_LEFT / YAW_RIGHT 各滚出一步，
 #   Q(a) = 1 + D(x′,y′)/v + max(0, |err′| − tol)/ω，D = 滚出点到目标的 A* 路长（同栅格、同膨胀、同目标）。
+# 下面五个常量是「一步原语模型」的唯一来源：tie-break 的 |Q_L−Q_R|（lr_tie_margin_steps）与 costmap 教师（plan_costs）
+# 都经 _rollout / _q_from 用它们；改任何一个都会同时改两边（sgvis 的行内 tie_margin_steps 回归会报）。
 TIE_V_STEP_M = 0.25          # v：E1 cf_sitl hold 1.0 s 前飞稳态位移/步（DATA 报告实测中位）。X3 约 0.27，未按载具分：
 TIE_YAW_STEP_DEG = 27.0      # ω：E1 偏航转角/步（同上）。X3 约 34°。平局阈值 0.5 步很粗，10% 的尺度差不改判定
 TIE_YAW_DRIFT_M = 0.11       # 偏航一步沿新航向的平移（E1 实测；SAFE 后仍滑行 0.07–0.21 m）
@@ -501,12 +514,31 @@ STUDENT_HFOV_DEG = 60.0      # 学生相机水平视场：sim/worlds 模板 <hor
 TIEBREAKS = ("legacy", "visible")
 
 
+def _rollout(x, y, yaw_deg, action):
+    """一步原语后的位姿 (x', y', yaw')：FORWARD 沿航向 TIE_V_STEP_M；YAW ±TIE_YAW_STEP_DEG 并沿新航向平移 TIE_YAW_DRIFT_M；SAFE 原地。"""
+    if action == FORWARD_SLOW:
+        return (x + TIE_V_STEP_M * math.cos(math.radians(yaw_deg)),
+                y + TIE_V_STEP_M * math.sin(math.radians(yaw_deg)), yaw_deg)
+    if action in (YAW_LEFT, YAW_RIGHT):
+        nyaw = yaw_deg + (TIE_YAW_STEP_DEG if action == YAW_LEFT else -TIE_YAW_STEP_DEG)
+        return (x + TIE_YAW_DRIFT_M * math.cos(math.radians(nyaw)),
+                y + TIE_YAW_DRIFT_M * math.sin(math.radians(nyaw)), nyaw)
+    return x, y, yaw_deg
+
+
+def _q_from(dist_m, err_deg, tol):
+    """Q = 1 步 + 剩余路长/v + 航向罚 max(0, |err| − tol)/ω（单位：步）。"""
+    return 1.0 + dist_m / TIE_V_STEP_M + max(0.0, err_deg - tol) / TIE_YAW_STEP_DEG
+
+
 def _q_after_yaw(x, y, yaw_deg, action, pillars, clearance, step, lookahead, tol,
                  waypoint=None, stop_at_waypoint=False):
-    """DISTILL §2.1 的 Q(a)（单位：步）：滚出一步 YAW 后的 A* 路长 + 航向罚；撞柱 / 无路 = TIE_COLLISION_STEPS。"""
-    nyaw = yaw_deg + (TIE_YAW_STEP_DEG if action == YAW_LEFT else -TIE_YAW_STEP_DEG)
-    nx = x + TIE_YAW_DRIFT_M * math.cos(math.radians(nyaw))
-    ny = y + TIE_YAW_DRIFT_M * math.sin(math.radians(nyaw))
+    """DISTILL §2.1 的 Q(a)（单位：步）：滚出一步 YAW 后的 A* 路长 + 航向罚；撞柱 / 无路 = TIE_COLLISION_STEPS。
+
+    剩余路长用 A* 路径（_global_path）而不是 geodesic_field：两者最优长度只差浮点舍入，但 0.7 m 胡萝卜方向在
+    等长路径之间可能不同；sgvis 集的行内 tie_margin_steps 是按这条算的，必须逐位不变。
+    """
+    nx, ny, nyaw = _rollout(x, y, yaw_deg, action)
     if any(_body_hits_box(nx, ny, nyaw, p, 0.2) for p in pillars):
         return TIE_COLLISION_STEPS
     path = _global_path(nx, ny, pillars, clearance, step, waypoint, stop_at_waypoint)
@@ -514,7 +546,7 @@ def _q_after_yaw(x, y, yaw_deg, action, pillars, clearance, step, lookahead, tol
         return TIE_COLLISION_STEPS
     length = sum(math.hypot(bx - ax, by - ay) for (ax, ay), (bx, by) in zip(path, path[1:]))
     err = abs(_pursuit_err_deg(path, nx, ny, nyaw, lookahead))
-    return 1.0 + length / TIE_V_STEP_M + max(0.0, err - tol) / TIE_YAW_STEP_DEG
+    return _q_from(length, err, tol)
 
 
 def lr_tie_margin_steps(x, y, yaw_deg, pillars, clearance=None, step=0.1, lookahead=0.7, tol=25.0,
@@ -578,6 +610,197 @@ def plan_action_global_tiebreak(x, y, yaw_deg, pillars, tiebreak="legacy", clear
         if side:
             action = YAW_RIGHT if side > 0 else YAW_LEFT
     return action, margin
+
+
+# ---------------------------------------------------------------- 统一代价模型教师（BRIEF_ALGO 2026-11-07 §1；DISTILL §2.1）
+# legacy 教师（A* + 纯追踪 25° 容差）不是任何自然时间代价的 argmin：q1_cost_to_go 在 0417 的 12000 帧上量到逐动作
+# cost-to-go 的 argmin 与 legacy 标签只有 72.2% 一致，P1 的失败根因是「示范专家 ≠ 标注专家」。这里让示范教师本身
+# 就是 argmin_a Q(s,a)：Q 建在同一张测地场上（栅格 / 膨胀 / 移动集与 astar_path 同一套 helper），软标签只从这一个 Q 来。
+# 版本独立于 TEACHER_VERSION：costmap 集的 manifest 写这个，audit 按 planner 字段选复算函数。
+TEACHER_COST_VERSION = "uavrgb.teacher_cost.v1"
+COST_TIE_EPS = 1e-6          # |ΔQ| 小于它算平局（先按可见柱侧，再按动作枚举顺序）
+_FIELD_CACHE_MAX = 16        # 每个场景一张场（柱子静态）；relabel 逐集扫 300 个场景时只保留最近的几张
+_FIELD_CACHE = {}
+_FIELD_ORDER = []
+
+
+class GeodesicField:
+    """目标出发的 Dijkstra 测地距离场（米）；不可行格 = inf。栅格 / 膨胀 / 8 邻接禁斜穿与 astar_path 同一套。"""
+    __slots__ = ("x0", "y0", "nx", "ny", "step", "goal", "dist")
+
+    def __init__(self, pillars, goal, clearance, step):
+        self.x0, self.y0, self.nx, self.ny = _grid_spec(pillars, step)
+        self.step, self.goal = step, (float(goal[0]), float(goal[1]))
+        free = [[not _point_blocked(self.x0 + i * step, self.y0 + j * step, pillars, clearance)
+                 for j in range(self.ny)] for i in range(self.nx)]
+        dist = [[math.inf] * self.ny for _ in range(self.nx)]
+        gi, gj = self.cell(*self.goal)
+        if 0 <= gi < self.nx and 0 <= gj < self.ny and free[gi][gj]:
+            dist[gi][gj] = 0.0
+            heap = [(0.0, gi, gj)]
+            while heap:
+                d, i, j = heapq.heappop(heap)
+                if d > dist[i][j]:
+                    continue
+                for di, dj, w in _MOVES:
+                    ni, nj = i + di, j + dj
+                    if not (0 <= ni < self.nx and 0 <= nj < self.ny) or not free[ni][nj]:
+                        continue
+                    if di and dj and not (free[i + di][j] and free[i][j + dj]):
+                        continue
+                    nd = d + w * step
+                    if nd < dist[ni][nj]:
+                        dist[ni][nj] = nd
+                        heapq.heappush(heap, (nd, ni, nj))
+        self.dist = dist
+
+    def cell(self, x, y):
+        return int(round((x - self.x0) / self.step)), int(round((y - self.y0) / self.step))
+
+    def lookup(self, x, y):
+        """(D, 起算格)：落在膨胀带内时取 3×3 邻域里「D + 一跳」最小的格（A* 教师把起点强制为自由，等价于先离开余量）；出界 → (inf, None)。"""
+        i, j = self.cell(x, y)
+        if not (0 <= i < self.nx and 0 <= j < self.ny):
+            return math.inf, None
+        if not math.isinf(self.dist[i][j]):
+            return self.dist[i][j], (i, j)
+        best, cell = math.inf, None
+        for di in (-1, 0, 1):
+            for dj in (-1, 0, 1):
+                ii, jj = i + di, j + dj
+                if 0 <= ii < self.nx and 0 <= jj < self.ny and not math.isinf(self.dist[ii][jj]):
+                    d = self.dist[ii][jj] + self.step * math.hypot(di, dj)
+                    if d < best:
+                        best, cell = d, (ii, jj)
+        return best, cell
+
+    def descent_dir(self, cell, lookahead):
+        """D 在 cell 处的「胡萝卜方向」（度）：沿最陡下降走到累计 lookahead 米处，取起点→终点的方位角；已在目标格 → None。
+
+        8 邻域单步下降方向被量化到 45°，直接用会让航向项误差 ±22°、把开阔走廊里的 FWD 判成该转；
+        沿测地线走 0.7 m 再取方向与 _path_carrot 的做法一致。
+        下降率按**单位长度**比（octile 距离下直走与斜走每米降得一样多），同率先直走：若按邻格 D 最小取，
+        只要有一点横向偏差就永远选斜格，开阔走廊里 7 cm 偏差会给出 45° 的胡萝卜（0417 复算时 2297 帧
+        legacy FWD 被判成 YAW 的来源）；先直后斜与 astar_path 的阶梯顺序一致，远处目标的方向 ≈ 真实方位。
+        """
+        i, j = cell
+        ci, cj, acc = i, j, 0.0
+        while acc < lookahead:
+            here, best_slope, nxt, w_best = self.dist[ci][cj], 1e-9, None, 0.0
+            for di, dj, w in _MOVES:          # 轴向 4 个在前：同率时保留先遇到的直走
+                ni, nj = ci + di, cj + dj
+                if 0 <= ni < self.nx and 0 <= nj < self.ny:
+                    slope = (here - self.dist[ni][nj]) / w
+                    if slope > best_slope + 1e-9:
+                        best_slope, nxt, w_best = slope, (ni, nj), w
+            if nxt is None:
+                break
+            ci, cj = nxt
+            acc += w_best * self.step
+        if (ci, cj) == (i, j):
+            return None
+        return math.degrees(math.atan2(cj - j, ci - i))
+
+
+def _pillars_key(pillars):
+    return json.dumps(pillars, sort_keys=True, default=str)
+
+
+def geodesic_field(pillars, goal, clearance, step=0.1):
+    """按 (柱子, 目标, 膨胀, 栅格) 缓存的 GeodesicField；每个场景只算一次（E1 柱阵约 5000 格、10 ms）。"""
+    key = (_pillars_key(pillars), (float(goal[0]), float(goal[1])), float(clearance), float(step))
+    field = _FIELD_CACHE.get(key)
+    if field is None:
+        field = GeodesicField(pillars, goal, clearance, step)
+        _FIELD_CACHE[key] = field
+        _FIELD_ORDER.append(key)
+        while len(_FIELD_ORDER) > _FIELD_CACHE_MAX:
+            _FIELD_CACHE.pop(_FIELD_ORDER.pop(0), None)
+    return field
+
+
+def _costmap_goal(pillars, waypoint, stop_at_waypoint):
+    """costmap 的目标点：base 任务 (最远柱 x + 2.0, 0)（与 _global_path 同）；goal-stop 任务就是 waypoint。"""
+    if waypoint is None:
+        return (max(float(p["x"]) for p in pillars) + 2.0, 0.0)
+    if not stop_at_waypoint:
+        raise ValueError("costmap 教师只支持 goal-stop 的 waypoint 任务，不支持旧 route-choice 两段目标")
+    return (float(waypoint["x"]), float(waypoint["y"]))
+
+
+def _q_value(field, pillars, x, y, yaw_deg, lookahead, tol, remaining):
+    """位姿 (x,y,yaw) 的 Q（步）：撞机身方框 / 落进不可行格 → TIE_COLLISION_STEPS；remaining>1 时再向前枚举一步取最小。"""
+    if any(_body_hits_box(x, y, yaw_deg, p, 0.2) for p in pillars):
+        return TIE_COLLISION_STEPS
+    d, cell = field.lookup(x, y)
+    if cell is None or math.isinf(d):
+        return TIE_COLLISION_STEPS
+    if remaining <= 1:
+        ddir = field.descent_dir(cell, lookahead)
+        err = 0.0 if ddir is None else abs((ddir - yaw_deg + 180.0) % 360.0 - 180.0)
+        return _q_from(d, err, tol)
+    return 1.0 + min(_q_value(field, pillars, *_rollout(x, y, yaw_deg, a), lookahead, tol, remaining - 1)
+                     for a in range(4))
+
+
+def plan_costs(x, y, yaw_deg, pillars, clearance=None, step=0.1, lookahead=0.7, tol=25.0,
+               waypoint=None, stop_at_waypoint=False, lookahead_steps=1):
+    """四个原语各滚一步后的 cost-to-go（单位：步）。返回 (Q[4], info)。
+
+    Q(a) = 1 + D(x',y')/v + max(0, |err'| − tol)/ω：D 是目标出发的测地场（栅格 0.1、膨胀 ASTAR_CLEARANCE_M、与 A* 同移动集），
+    err' 是滚出后航向与 D 在 (x',y') 处 0.7 m 下降方向之差，v/ω 与 tie-break 同一组 TIE_* 常量。撞机身方框或落进不可行格
+    → TIE_COLLISION_STEPS。tol 是显式参数（默认 25° = legacy 容差；tol=0 为允许的变体）；lookahead_steps=2 时
+    Q(a) = min_{a2} [2 + D(after a,a2)/v + 罚]（16 条序列查表，仍是毫秒级）。接口只吃 (位姿, 柱子/目标)，3DGS 占据栅格
+    可以换一张 field 复用（见报告接口说明）。
+    """
+    if not pillars:
+        raise ValueError("plan_costs 需要柱子真值；没有柱子时用 plan_action")
+    if lookahead_steps < 1:
+        raise ValueError("lookahead_steps 必须 ≥ 1")
+    if clearance is None:
+        clearance = ASTAR_CLEARANCE_M
+    goal = _costmap_goal(pillars, waypoint, stop_at_waypoint)
+    field = geodesic_field(pillars, goal, clearance, step)
+    q = [_q_value(field, pillars, *_rollout(x, y, yaw_deg, a), lookahead, tol, lookahead_steps)
+         for a in range(4)]
+    d_now, _cell = field.lookup(x, y)
+    return q, {"goal": goal, "d_now_m": d_now, "tol": tol, "lookahead_steps": lookahead_steps}
+
+
+def plan_action_costmap(x, y, yaw_deg, pillars, clearance=None, step=0.1, lookahead=0.7, tol=25.0,
+                        waypoint=None, stop_at_waypoint=False, stop_radius=0.5, lookahead_steps=1):
+    """argmin_a Q(s,a) 的示范教师。返回 (动作, info)，info = {"q": Q[4] 或 None, "tie": bool, "fallback": None|原因}。
+
+    平局（|ΔQ| < COST_TIE_EPS）：左右都在平局集里时按 visible_pillar_side 取「视锥内最近柱的反侧」（柱在左就右转，
+    标签成为图像的函数），看不到柱或柱正对机头时按动作枚举顺序取第一个；其它平局同样按枚举顺序。
+    FORWARD / YAW_L / YAW_R 三个运动原语全是 TIE_COLLISION_STEPS（已漂进余量 ≥ 2 格或贴柱）时退回 plan_action 做局部脱困
+    并标 fallback：SAFE 原地不会撞、Q 常常有限，若只在「四个全撞」时退回，机器会在柱前 0.4 m 原地保持到超时
+    （门柱正对 x=0.9 实测 Q=[15.9, 40, 40, 40]）。不做换动作惩罚、不做滞回（teacher_kino 死在前者上；后者是 hack）。
+    """
+    info = {"q": None, "tie": False, "fallback": None}
+    if not pillars:
+        return plan_action(x, y, yaw_deg, [], tol=tol), dict(info, fallback="no_pillars")
+    if waypoint is not None and stop_at_waypoint:
+        try:
+            wp = (float(waypoint["x"]), float(waypoint["y"]))
+        except (KeyError, TypeError, ValueError):
+            return plan_action(x, y, yaw_deg, pillars, tol=tol), dict(info, fallback="bad_waypoint")
+        if math.hypot(x - wp[0], y - wp[1]) <= stop_radius:
+            return SAFE_NEUTRAL, dict(info, fallback="goal_stop")
+    q, _ = plan_costs(x, y, yaw_deg, pillars, clearance=clearance, step=step, lookahead=lookahead, tol=tol,
+                      waypoint=waypoint, stop_at_waypoint=stop_at_waypoint, lookahead_steps=lookahead_steps)
+    info["q"] = q
+    if min(q[FORWARD_SLOW], q[YAW_LEFT], q[YAW_RIGHT]) >= TIE_COLLISION_STEPS:
+        return plan_action(x, y, yaw_deg, pillars, tol=tol), dict(info, fallback="all_collide")
+    q_min = min(q)
+    cands = [a for a in range(4) if q[a] - q_min < COST_TIE_EPS]
+    if len(cands) > 1:
+        info["tie"] = True
+        if YAW_LEFT in cands and YAW_RIGHT in cands:
+            side = visible_pillar_side(x, y, yaw_deg, pillars)
+            if side:
+                return (YAW_RIGHT if side > 0 else YAW_LEFT), info
+    return cands[0], info
 
 
 def _make(w, h, left_d, center_d, right_d):

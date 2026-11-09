@@ -57,8 +57,8 @@ import scene_forest as sf  # noqa: E402
 import campus  # noqa: E402
 from instruction import parse_target_color  # noqa: E402
 from split_manifest import SPLIT_SALT, geometry_gid  # noqa: E402
-from teacher import (TEACHER_VERSION, plan_action, plan_action_global_tiebreak,
-                     astar_path, _point_blocked, set_vehicle,
+from teacher import (TEACHER_VERSION, TEACHER_COST_VERSION, plan_action, plan_action_global_tiebreak,
+                     plan_action_costmap, astar_path, _point_blocked, set_vehicle,
                      teacher_version, task_of_scene)  # noqa: E402
 
 # scene.json 里落盘的全局几何常量；与当前 scene_gen 不一致说明改了几何但没
@@ -262,6 +262,9 @@ def episode_facts(ep_dir):
         "goal_line_x": man.get("goal_line_x"),
         "teacher_tiebreak": man.get("teacher_tiebreak"),
         "executed_by": man.get("executed_by"),
+        # costmap 教师（planner=costmap）的两个显式参数；旧集没有 = 默认值，label_recompute 按它复算。
+        "costmap_tol_deg": man.get("costmap_tol_deg", 25.0),
+        "costmap_lookahead_steps": man.get("costmap_lookahead_steps", 1),
         "oracle_x": oracle_x,
         "waypoint_min_dist": wp_min,
         "final_waypoint_dist": final_wp,
@@ -913,8 +916,12 @@ def audit(facts, pre_excluded=(), quarantined=()):
         # 旧几何/旧教师版本数据没有版本字段；用当前算法复算会假 FAIL。版本按任务档位比：
         # forest_e1 集要求 forest 档版本（v6），旧森林集（写 v5、按 0.40/0.30 方框算）自动跳过。
         teacher_task = task_of_scene(f.get("scene_metadata"))
+        # costmap 集（--teacher-planner costmap / relabel_costmap.py）的版本是独立常量：
+        # 它的标签是测地场 Q 的 argmin，不随 legacy 教师版本走，也不能用 legacy 复算。
+        is_costmap = f.get("planner") == "costmap"
+        want_version = TEACHER_COST_VERSION if is_costmap else teacher_version(teacher_task)
         if (f.get("geometry_version") not in RECOMPUTE_GEOMETRY_VERSIONS or
-                f.get("teacher_version") != teacher_version(teacher_task)):
+                f.get("teacher_version") != want_version):
             old_version += len(f["steps"])
             continue
         # 脱困段的机身方框与规划余量按采集时的 (载具, 任务) 算：E1 数据用 X3 半宽复算会在 0.36 m
@@ -930,7 +937,16 @@ def audit(facts, pre_excluded=(), quarantined=()):
             # 普通集用 A*，safe 出生集用局部规划；manifest.planner 是唯一开关。
             # 近平局口径按 manifest.teacher_tiebreak（旧数据没有 = legacy，与旧 plan_action_global 逐位相同）：
             # visible 集的标签多了「按可见柱定左右」，用 legacy 复算会把 DISTILL 量到的 ~0.7% 帧报成不一致。
-            if f.get("planner") == "astar":
+            if is_costmap:
+                # 两个显式参数按 manifest 复算（旧字段缺省 = 默认 tol 25° / 单步）
+                want, _info = plan_action_costmap(
+                    pb["x"], pb["y"], yb, f["pillars"],
+                    tol=f.get("costmap_tol_deg", 25.0),
+                    lookahead_steps=f.get("costmap_lookahead_steps", 1),
+                    waypoint=f.get("waypoint"),
+                    stop_at_waypoint=bool(f.get("stop_radius")),
+                    stop_radius=f.get("stop_radius") or 0.5)
+            elif f.get("planner") == "astar":
                 want, _margin = plan_action_global_tiebreak(
                     pb["x"], pb["y"], yb, f["pillars"],
                     tiebreak=f.get("teacher_tiebreak") or "legacy",

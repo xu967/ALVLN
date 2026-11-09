@@ -72,6 +72,19 @@ class CommandTests(unittest.TestCase):
         self.assertNotIn("--stop-at-goal", cmd)
         self.assertNotIn("--tiebreak", cmd)
 
+    def test_costmap_pass_through(self):
+        # --teacher-planner costmap：默认 tol/前瞻不传（collect.py 默认值相同），非默认才追加
+        cmd = parallel.collect_command(task(), args_ns(teacher_planner="costmap"))
+        self.assertEqual(cmd[cmd.index("--teacher-planner") + 1], "costmap")
+        self.assertNotIn("--costmap-tol", cmd)
+        self.assertNotIn("--costmap-lookahead-steps", cmd)
+        cmd = parallel.collect_command(task(), args_ns(teacher_planner="costmap", costmap_tol=0.0,
+                                                       costmap_lookahead_steps=2))
+        self.assertEqual(cmd[cmd.index("--costmap-tol") + 1], "0.0")
+        self.assertEqual(cmd[cmd.index("--costmap-lookahead-steps") + 1], "2")
+        cmd = parallel.collect_command(task(), args_ns(costmap_tol=0.0))   # astar 下不透传
+        self.assertNotIn("--costmap-tol", cmd)
+
 
 class StopTests(unittest.TestCase):
     """AUDIT Q1/Q2：停止位置位后 worker 不重试、不起下一集，否则 Ctrl-C/SIGTERM 之后还会起新 gz。"""

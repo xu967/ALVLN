@@ -62,7 +62,8 @@ import time
 import zlib
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from teacher import (expert_action, plan_action, plan_action_global_tiebreak, TIEBREAKS,
+from teacher import (expert_action, plan_action, plan_action_global_tiebreak, plan_action_costmap,
+                     TIEBREAKS, TEACHER_COST_VERSION,
                      SAFE_NEUTRAL, FORWARD_SLOW, YAW_LEFT, YAW_RIGHT, ACTIONS,
                      teacher_version, task_of_scene)
 import gz_io
@@ -804,7 +805,8 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 stop_at_waypoint=False, stop_radius=0.5, save_depth=False,
                 teacher_nn=None, text_ids=None, contact_seq0=None, dyn=None,
                 predictive_teacher=None, rl_teacher=None, sil=None,
-                tiebreak="legacy", beta=0.0, rng=None, prev_executed=None):
+                tiebreak="legacy", beta=0.0, rng=None, prev_executed=None,
+                costmap_opts=None):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。
 
     dyn=None 为 x3_velocity 旧行为（定速 + 窗口末刹停）；给 CfStab 时按摇杆模型
@@ -814,10 +816,13 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     tiebreak：A* 教师左右近平局的决定方式（teacher.TIEBREAKS；legacy 逐位等于旧 plan_action_global）。
     beta / rng / prev_executed 只在 policy == "student" 且有柱子真值时起作用（DAgger 影子教师）：
     每步以概率 beta 改执行教师动作，prev_executed 是上一步真正执行的动作（喂给 prev-action 模型）。
+    costmap_opts：--teacher-planner costmap 时给 dict（plan_action_costmap 的 tol / lookahead_steps），
+    教师改为测地场代价 argmin，每行多记 q_costs（4 个浮点，步）；None = 不启用。
     """
     if window_from not in ("dispatch", "observation"):
         raise ValueError(f"window_from 无效: {window_from!r}")
     tie_margin = None          # 只有 tiebreak=visible 的 A* 教师会填；legacy 不多算也不落盘
+    q_costs = None             # 只有 costmap 教师会填：Q[SAFE, FWD, L, R]（步）
     executed_by = None         # 只有 DAgger 影子教师模式会填 "student"/"expert"
     label = None               # 标签（action_expert）；None = 与执行的动作相同（除影子教师外都如此）
     t_step = time.perf_counter()
@@ -869,6 +874,13 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                     return None, "predictive teacher 需要 cf_stab 动力学档"
                 action = predictive_teacher.act(pose_before["x"], pose_before["y"],
                     yaw_before, dyn.vx, dyn.vy, active=dyn.active, latency=dyn.latency_s)
+            elif costmap_opts is not None:
+                # 测地场代价 argmin（BRIEF_ALGO §1）：标签是 Q 最小的动作，Q 一并落盘给软标签用。
+                action, cinfo = plan_action_costmap(
+                    pose_before["x"], pose_before["y"], yaw_before, pillars,
+                    waypoint=waypoint, stop_at_waypoint=stop_at_waypoint,
+                    stop_radius=stop_radius, **costmap_opts)
+                q_costs = cinfo["q"]
             elif global_plan:
                 action, tie_margin = plan_action_global_tiebreak(
                     pose_before["x"], pose_before["y"], yaw_before, pillars, tiebreak,
@@ -1129,6 +1141,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         # 下面两项为 None 时 action_row 不落盘（默认采集的字段集与旧版完全一致）。
         "tie_margin_steps": tie_margin,
         "executed_by": executed_by,
+        "q_costs": q_costs,
         "pose_gt": pose_after,
         "pose_ts": pose_ts,
         # 动作前位姿：audit 用它 + scene 柱子真值复算标签，验证「标签=该帧该做的动作」。
@@ -1209,8 +1222,9 @@ def action_row(r, save_depth=False):
     if save_depth:
         row["depth_file"] = r["depth_file"]
     # 可选字段只在开了对应开关时出现：tie_margin_steps 来自 --tiebreak visible（|Q_L−Q_R|，步），
-    # executed_by 来自 --policy student 的影子教师（本步执行者 student/expert）。
-    for k in ("tie_margin_steps", "executed_by"):
+    # executed_by 来自 --policy student 的影子教师（本步执行者 student/expert），
+    # q_costs 来自 --teacher-planner costmap（Q[SAFE, FWD, L, R]，步）。
+    for k in ("tie_margin_steps", "executed_by", "q_costs"):
         if r.get(k) is not None:
             row[k] = r[k]
     return row
@@ -1295,8 +1309,13 @@ def main():
     p.add_argument("--flight-log-csv", default=None,
                    help="cf_sil 参数辨识用 CSV（t,qw/qx/qy/qz,wx/wy/wz,thrust/motor,x/y/z）")
     p.add_argument("--no-takeoff", action="store_true")
-    p.add_argument("--teacher-planner", choices=("astar", "predictive"), default="astar",
-                   help="--policy teacher 的 T0/T1 规划器；predictive 需要 cf_stab + scene-meta")
+    p.add_argument("--teacher-planner", choices=("astar", "predictive", "costmap"), default="astar",
+                   help="--policy teacher 的 T0/T1 规划器；predictive 需要 cf_stab + scene-meta；"
+                        "costmap=测地场代价 argmin（teacher.plan_action_costmap，每行多记 q_costs）")
+    p.add_argument("--costmap-tol", type=float, default=25.0,
+                   help="costmap 教师的航向罚死区（度）；仅 --teacher-planner costmap")
+    p.add_argument("--costmap-lookahead-steps", type=int, default=1,
+                   help="costmap 教师的前瞻步数（1=单步 rollout）；仅 --teacher-planner costmap")
     p.add_argument("--rl-checkpoint", default="", help="teacher-rl 离线 PPO 模型路径")
     p.add_argument("--policy", choices=("teacher", "forward", "student", "teacher-nn", "teacher-rl"),
                    default="teacher",
@@ -1362,6 +1381,12 @@ def main():
             (args.policy == "teacher" and args.teacher_planner == "astar") or args.policy == "student")):
         p.error("--tiebreak visible 只对柱子真值 A* 教师有意义：需要 --scene-meta，"
                 "且 --policy teacher（astar）或 --policy student")
+    if args.teacher_planner == "costmap" and not (args.policy == "teacher" and args.scene_meta):
+        p.error("--teacher-planner costmap 需要 --policy teacher 与 --scene-meta（测地场由柱子真值算）")
+    if args.teacher_planner != "costmap" and (args.costmap_tol != 25.0 or args.costmap_lookahead_steps != 1):
+        p.error("--costmap-tol/--costmap-lookahead-steps 只能和 --teacher-planner costmap 一起用")
+    if args.teacher_planner == "costmap" and (args.costmap_lookahead_steps < 1 or args.costmap_tol < 0.0):
+        p.error("--costmap-lookahead-steps ≥ 1、--costmap-tol ≥ 0")
     if args.dynamics == "cf_blackbox":
         # 纯模型档只在这里做参数校验：Gazebo collect 没有它的状态闭环，
         # 继续跑会拿 x3 物理冒充 cf_blackbox 数据。3DGS collector 直接 import 模型。
@@ -1512,6 +1537,9 @@ def main():
             p.error("predictive teacher 需要 scene-meta 的 pillars/waypoint")
         from teacher_predictive import PredictiveTeacher
         predictive_teacher = PredictiveTeacher(pillars, waypoint)
+    # costmap 教师：只在 planner_kind == "costmap" 时给 collect_one 传选项（其余档位 None，行为不变）。
+    costmap_opts = ({"tol": args.costmap_tol, "lookahead_steps": args.costmap_lookahead_steps}
+                    if planner_kind == "costmap" else None)
     text_ids = None
     cam_info = None
     rows_written = 0
@@ -1629,7 +1657,7 @@ def main():
                                     predictive_teacher=predictive_teacher,
                                     rl_teacher=rl_teacher, sil=sil,
                                     tiebreak=args.tiebreak, beta=args.beta, rng=rng,
-                                    prev_executed=prev_executed)
+                                    prev_executed=prev_executed, costmap_opts=costmap_opts)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -1788,12 +1816,16 @@ def main():
             "teacher": teacher_kind,
             # 教师实现版本：改规划参数/前向安全门后必须能区分新旧标签。
             "teacher_version": ("uavrgb.predictive_teacher.v1" if planner_kind == "predictive"
+                                else TEACHER_COST_VERSION if planner_kind == "costmap"
                                 else "uavrgb.rlteacher.v1" if teacher_kind == "teacher_rl"
                                 else teacher_version(teacher_task) if teacher_kind in ("plan_action",
                                                                                    "expert_action") else None),
             # plan_action 的具体实现：astar=全局路径（普通集），plan_action=局部
-            # （safe 出生集，保留真 SAFE 标签）。audit 复算必须按这个字段选。
+            # （safe 出生集，保留真 SAFE 标签），costmap=测地场代价 argmin。audit 复算必须按这个字段选。
             "planner": planner_kind,
+            # costmap 教师的两个显式参数（BRIEF_ALGO §1 允许的变体：tol=0、两步前瞻）；其他 planner 不写。
+            **({"costmap_tol_deg": args.costmap_tol, "costmap_lookahead_steps": args.costmap_lookahead_steps}
+               if planner_kind == "costmap" else {}),
             # A* 教师近平局的决定方式（--tiebreak）：legacy 与旧标签逐位相同；visible 的标签多了
             # 「按可见柱定左右」这一步，audit 复算与训练数据溯源都要按它选。
             "teacher_tiebreak": args.tiebreak,

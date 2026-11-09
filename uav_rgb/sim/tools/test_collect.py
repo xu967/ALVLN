@@ -820,7 +820,58 @@ def switch_checks():
         and [a["executed_by"] for a in acts] == ["student", "expert", "student"])
     out["--beta 只配 student"] = run_main(["--beta", "0.5"], rows)[2] == 2
     out["--tiebreak visible 只配 A* 教师"] = run_main(["--tiebreak", "visible", "--policy", "forward"], rows)[2] == 2
+    # 5) --teacher-planner costmap（BRIEF_ALGO §1）：manifest planner/teacher_version/两个显式参数；行多 q_costs
+    rows_c = [fake_row(i, 1.0 + 0.25 * i, q_costs=[17.0, 16.0, 16.5, 18.0]) for i in range(3)]
+    man_c, acts_c, code_c, _ = run_main(["--teacher-planner", "costmap"], rows_c)
+    out["costmap manifest：planner/teacher_version/tol/前瞻"] = (
+        code_c is None and man_c["planner"] == "costmap" and man_c["teacher"] == "plan_action"
+        and man_c["teacher_version"] == collect.TEACHER_COST_VERSION
+        and man_c["costmap_tol_deg"] == 25.0 and man_c["costmap_lookahead_steps"] == 1
+        and man_c["experimental_policy"] is False and man_c["teacher_tiebreak"] == "legacy")
+    out["costmap 行多 q_costs（4 浮点）"] = all(set(a) == ROW_KEYS_LEGACY | {"q_costs"} and len(a["q_costs"]) == 4
+                                              for a in acts_c)
+    man_c2, _, code_c2, _ = run_main(["--teacher-planner", "costmap", "--costmap-tol", "0", "--costmap-lookahead-steps", "2"], rows_c)
+    out["costmap 变体参数进 manifest"] = (code_c2 is None and man_c2["costmap_tol_deg"] == 0.0
+                                         and man_c2["costmap_lookahead_steps"] == 2)
+    out["legacy manifest 不带 costmap 字段"] = "costmap_tol_deg" not in man and "costmap_lookahead_steps" not in man
+    out["costmap 只配 --policy teacher"] = run_main(["--teacher-planner", "costmap", "--policy", "forward"], rows_c)[2] == 2
+    out["costmap 参数只配 costmap"] = run_main(["--costmap-tol", "0"], rows)[2] == 2
+    out["costmap 前瞻 ≥ 1"] = run_main(["--teacher-planner", "costmap", "--costmap-lookahead-steps", "0"], rows_c)[2] == 2
+    with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()), \
+            patch.object(sys, "argv", ["collect.py", "--out", os.path.join(d, "x"), "--teacher-planner", "costmap"]):
+        try:
+            collect.main()
+            out["costmap 没有 scene-meta 拒绝"] = False
+        except SystemExit as e:
+            out["costmap 没有 scene-meta 拒绝"] = e.code == 2
+    # 6) 真 collect_one 走 costmap 分支：正前方 0.8 m 一根柱 → 标签是转向，q_costs 里 FWD = 撞柱代价
+    row_c, err_c = costmap_teacher_step()
+    out["collect_one costmap：标签=argmin Q，q_costs 落 row"] = (
+        err_c is None and row_c["action_expert"] in (collect.YAW_LEFT, collect.YAW_RIGHT)
+        and row_c["action_executed"] == row_c["action_expert"] and len(row_c["q_costs"]) == 4
+        and row_c["q_costs"][collect.FORWARD_SLOW] == max(row_c["q_costs"])
+        and row_c["tie_margin_steps"] is None and row_c["executed_by"] is None)
     return out
+
+
+def costmap_teacher_step():
+    """真 collect_one + --teacher-planner costmap（costmap_opts）+ 正前方一根柱。"""
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    pose = ClockPoseSub(pose_msg(10.2))
+    subs = {"rgb": FakeSub(after=rgb), "depth": FakeSub(frames=[(1, _fresh_depth(w, h))]),
+            "pose": pose, "contact": FakeSub()}
+
+    def advance(_secs):
+        pose.current = pose_msg(11.2)
+
+    pillars = [{"x": 0.8, "y": 0.0, "z": 1.5, "size": [0.4, 0.4, 3.0]}]
+    with tempfile.TemporaryDirectory() as d, \
+            patch.object(collect, "write_rgb_png", return_value=(True, None)), \
+            patch.object(collect.time, "sleep", side_effect=advance):
+        row, err = collect.collect_one(d, 0, 1.0, "teacher", subs, FakePub(), pillars=pillars,
+                                       costmap_opts={"tol": 25.0, "lookahead_steps": 1})
+    return row, err
 
 
 def main():
