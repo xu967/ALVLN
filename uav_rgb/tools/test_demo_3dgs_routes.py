@@ -66,6 +66,18 @@ class TestResume(unittest.TestCase):
         self.assertEqual(src.count("\nPILOT_RETRY_MAX ="), 1)
         self.assertEqual(src.count("\ndef anomaly_str("), 1)
 
+    def test_torch_cache_dir_named_by_gpu_capability(self):
+        """AUDIT_SIM #5：gsplat JIT 缓存目录按本机算力拼（以前写死 extensions-sm89-20261106，换回 2080 Ti 后目录名与 cubin 对不上）。
+        同一规则也用于 tools/scene_import_wanderland.py；两个脚本源码里都不能再有 sm89 字面量。"""
+        self.assertEqual(os.path.basename(demo.torch_extensions_dir((7, 5))), "extensions-sm75")
+        self.assertEqual(os.path.basename(demo.torch_extensions_dir((8, 9))), "extensions-sm89")
+        self.assertEqual(os.path.dirname(demo.torch_extensions_dir((7, 5))),
+                         os.path.join(demo.DATA_ROOT, "uav_rgb", "torch-cache"))
+        for name in ("demo_3dgs_routes.py", "scene_import_wanderland.py"):
+            src = open(os.path.join(ROOT, "tools", name), encoding="utf-8").read()
+            self.assertNotIn('"extensions-sm89', src, name)       # 不再有写死的目录名字面量（注释里提历史可以）
+            self.assertNotIn("sm_89 编", src, name)
+
 
 if __name__ == "__main__":
     unittest.main()

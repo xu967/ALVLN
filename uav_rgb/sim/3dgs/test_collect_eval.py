@@ -15,6 +15,8 @@ import sys
 import tempfile
 import unittest
 
+import numpy as np
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "sim", "tools"))
@@ -44,15 +46,19 @@ def _load(path):
         return json.load(f)
 
 
+# AUDIT_SIM #9 之后 --dynamics 默认 cf_sitl（要 cf_sitl_proc）；mock 链路显式走黑盒。
+BLACKBOX = ["--dynamics", "cf_blackbox"]
+
+
 def _collect(scene_json, out, *extra):
     return _run(["sim.3dgs.collect_3dgs", "--scene", scene_json, "--out", out,
-                 "--steps", "3", "--mock-renderer", *extra])
+                 "--steps", "3", "--mock-renderer", *BLACKBOX, *extra])
 
 
 def _eval(scene_json, out, *extra):
     return _run(["sim.3dgs.eval_3dgs", "--scene", scene_json, "--out", out,
                  "--policy", "forward", "--mock-renderer", "--episodes", "1",
-                 "--steps", "3", *extra])
+                 "--steps", "3", *BLACKBOX, *extra])
 
 
 class TestCollect3dgs(unittest.TestCase):
@@ -106,7 +112,7 @@ class TestCollect3dgs(unittest.TestCase):
             scene_mod.save_scene({k: v for k, v in scene.items() if not k.startswith("_") and k not in ("path", "dir", "ply_path")}, scene_json)
             out = os.path.join(tmp, "r1")
             r = _run(["sim.3dgs.collect_3dgs", "--scene", scene_json, "--out", out, "--mock-renderer",
-                      "--policy", "astar", "--route", "1"])
+                      *BLACKBOX, "--policy", "astar", "--route", "1"])
             self.assertEqual(r.returncode, 0, r.stderr[-2000:])
             m = _load(os.path.join(out, "ep_00000", "episode_manifest.json"))
             self.assertEqual((m["route"]["index"], m["route"]["name"]), (1, "r1"))
@@ -121,7 +127,7 @@ class TestCollect3dgs(unittest.TestCase):
             self.assertEqual(rows[0]["action_executed"], 3)      # YAW_RIGHT：航向 +y，目标在 +x
             # 默认 route（None）= 顶层 spawn/waypoint = routes[0]；task_id 与 route 1 不同
             r0 = _run(["sim.3dgs.collect_3dgs", "--scene", scene_json, "--out", os.path.join(tmp, "r0"),
-                       "--mock-renderer", "--policy", "forward", "--steps", "2"])
+                       "--mock-renderer", *BLACKBOX, "--policy", "forward", "--steps", "2"])
             self.assertEqual(r0.returncode, 0, r0.stderr[-2000:])
             m0 = _load(os.path.join(tmp, "r0", "ep_00000", "episode_manifest.json"))
             self.assertEqual(m0["route"]["index"], 0)
@@ -130,7 +136,7 @@ class TestCollect3dgs(unittest.TestCase):
             self.assertNotEqual(m0["task_id"], m["task_id"])
             self.assertEqual(m0["geometry_gid"], m["geometry_gid"])
             bad = _run(["sim.3dgs.collect_3dgs", "--scene", scene_json, "--out", os.path.join(tmp, "bad"),
-                        "--mock-renderer", "--route", "2", "--steps", "1"])
+                        "--mock-renderer", *BLACKBOX, "--route", "2", "--steps", "1"])
             self.assertNotEqual(bad.returncode, 0)
             self.assertIn("route 2", bad.stderr)
 
@@ -157,6 +163,27 @@ class TestCollect3dgs(unittest.TestCase):
             self.assertEqual(m["frame_quality"]["n_low"], sum(x["frame_quality"]["low"] for x in rows))
             self.assertEqual(m["camera"]["fov_deg"], 60.0)              # 合成场景 scene.camera.fov_deg
             self.assertEqual(m["camera"]["mount"]["pitch_deg"], 0.0)
+
+    def test_dynamics_default_is_cf_sitl(self):
+        """AUDIT_SIM #9：不给 --dynamics 走 cf_sitl（固件在环，proc 缺失要明确报错而不是悄悄退回黑盒）；
+        cf_blackbox 只能显式指定。collect / eval 两个入口同口径。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_dir = os.path.join(tmp, "scene")
+            scene_mod.make_corridor(scene_dir, seed=2, length=12.0)
+            scene_json = os.path.join(scene_dir, "scene.json")
+            env = dict(os.environ, CF_SITL_PROC=os.path.join(tmp, "no_such_cf_sitl_proc"))
+            cases = (("sim.3dgs.collect_3dgs", ["--policy", "forward", "--steps", "2"]),
+                     ("sim.3dgs.eval_3dgs", ["--policy", "forward", "--steps", "2", "--hold", "0.5", "--episodes", "1"]))
+            for i, (mod, extra) in enumerate(cases):
+                base = [mod, "--scene", scene_json, "--mock-renderer", *extra]
+                r = _run(base + ["--out", os.path.join(tmp, f"default{i}")], env=env)
+                self.assertNotEqual(r.returncode, 0, f"{mod} 默认应是 cf_sitl，proc 缺失必须失败")
+                self.assertIn("cf_sitl_proc 不存在", r.stderr, mod)
+                self.assertFalse(os.path.isdir(os.path.join(tmp, f"default{i}", "ep_00000")))
+                r = _run(base + ["--out", os.path.join(tmp, f"bb{i}"), "--dynamics", "cf_blackbox"], env=env)
+                self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+            run = _load(os.path.join(tmp, "bb0", "run.json"))
+            self.assertEqual(run["dynamics"], "cf_blackbox")
 
 
 class TestSceneIdentity(unittest.TestCase):
@@ -301,7 +328,7 @@ class TestEval3dgs(unittest.TestCase):
             scene_json = os.path.join(scene_dir, "scene.json")
             out = os.path.join(tmp, "eval")
             r = _run(["sim.3dgs.eval_3dgs", "--scene", scene_json, "--out", out,
-                      "--policy", "forward", "--mock-renderer", "--episodes", "1",
+                      "--policy", "forward", "--mock-renderer", *BLACKBOX, "--episodes", "1",
                       "--steps", "4", "--hold", "0.2", "--record-video"])
             self.assertEqual(r.returncode, 0, r.stderr[-2000:])
             e = _load(os.path.join(out, "eval.json"))
@@ -637,7 +664,7 @@ class TestEpisodeFailureExit(unittest.TestCase):
             env = dict(os.environ, PYTHONPATH=hook + os.pathsep + ROOT)
             out = os.path.join(tmp, "eval")
             r = _run(["sim.3dgs.eval_3dgs", "--scene", scene_json, "--out", out,
-                      "--policy", "forward", "--mock-renderer", "--episodes", "3",
+                      "--policy", "forward", "--mock-renderer", *BLACKBOX, "--episodes", "3",
                       "--steps", "2", "--hold", "0.5"], env=env)
             self.assertEqual(r.returncode, 1, r.stderr[-2000:])
             self.assertIn("FAILED episode=1", r.stderr)
@@ -648,6 +675,208 @@ class TestEpisodeFailureExit(unittest.TestCase):
             self.assertEqual(e["episodes_done"], 2)
             self.assertEqual(e["episodes_requested"], 3)
             self.assertEqual([p["episode"] for p in e["per_episode"]], [0, 2])
+
+
+class ScriptedOcc:
+    """真占据代理的包装：第 hit_step 步的 sweep 强制判碰撞，其余步按真代理（走廊畅通 = 不撞）。"""
+
+    def __init__(self, occ, hit_step):
+        self._occ, self.hit_step, self.calls = occ, hit_step, 0
+
+    def sweep(self, p0, p1):
+        i, self.calls = self.calls, self.calls + 1
+        return (True, [float(v) for v in p1]) if i == self.hit_step else self._occ.sweep(p0, p1)
+
+    def __getattr__(self, name):
+        return getattr(self._occ, name)
+
+
+class TestCollisionRows(unittest.TestCase):
+    """AUDIT_SIM #3 + FIXLIST D2：3DGS 没有接触物理，撞后机体穿模继续飞；撞后每一行都要 collision=True
+    （--drop-collision 一并丢），--truncate-on-collision 撞到就结束本集但不算闭环评测产物（stopped_on_collision 不变）。"""
+
+    HIT = 2
+
+    def _episode(self, tmp, name, steps, **kw):
+        scene, renderer, occ, params, identity = _mock_env(tmp)
+        occ = ScriptedOcc(occ, self.HIT)
+        # 深度教师（teacher=expert_action）：preprocess 的教师门禁只收教师标签，forward 对照集会被拒
+        m, err = collect.run_episode(scene, os.path.join(tmp, name), renderer, occ, params, collect.DepthTeacher(),
+                                     steps, 0.5, split=identity["split"], identity=identity, **kw)
+        self.assertIsNone(err)
+        return m, _rows(os.path.join(tmp, name))
+
+    def _preprocess(self, tmp, name, ep_dir):
+        try:
+            import PIL  # noqa: F401
+        except ImportError:
+            self.skipTest("无 PIL，不跑 preprocess")
+        out = os.path.join(tmp, name)
+        r = _run_script(os.path.join(ROOT, "tools", "preprocess.py"), ["--out", out, "--drop-collision", ep_dir])
+        if r.returncode != 0:
+            return r, None
+        with open(os.path.join(out, "dataset.uavr"), "rb") as f:     # meta JSON 在文件尾部（DATASET_FORMAT §1.4）
+            data = f.read()
+        import struct
+        meta_off, meta_len = struct.unpack_from("<QI", data, 4 + 2 + 2 + 4 + 2 + 2 + 4 + 8 + 8)
+        return r, json.loads(data[meta_off:meta_off + meta_len].decode("utf-8"))
+
+    def test_rows_after_collision_all_flagged_and_dropped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m, rows = self._episode(tmp, "cont", self.HIT + 4)
+            self.assertEqual(m["num_steps"], self.HIT + 4)
+            self.assertEqual([r["collision"] for r in rows], [False] * self.HIT + [True] * 4)
+            self.assertEqual(rows[self.HIT]["src"], "voxel_proxy")                     # 真撞的那一步
+            self.assertEqual([r["src"] for r in rows[self.HIT + 1:]], ["post_collision"] * 3)   # 之后穿模的三步
+            self.assertIsNotNone(rows[self.HIT]["collision_point"])
+            self.assertFalse(m["stopped_on_collision"])
+            self.assertFalse(m["truncated_on_collision"])
+            self.assertTrue(m["validity"]["physics_verified"])
+            r, meta = self._preprocess(tmp, "ds", os.path.join(tmp, "cont"))
+            self.assertEqual(r.returncode, 0, r.stderr[-2000:] + r.stdout[-1000:])
+            self.assertEqual((meta["num_samples"], meta["collision_dropped"]), (self.HIT, 4))
+
+    def test_truncate_on_collision_keeps_episode_and_drops_only_hit_row(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            m, rows = self._episode(tmp, "trunc", self.HIT + 4, truncate_on_collision=True)
+            self.assertEqual(m["num_steps"], self.HIT + 1)                             # 撞的那一步写完就结束
+            self.assertEqual([r["collision"] for r in rows], [False] * self.HIT + [True])
+            self.assertEqual((m["stopped_on_collision"], m["truncated_on_collision"]), (False, True))
+            self.assertTrue(m["validity"]["physics_verified"])
+            r, meta = self._preprocess(tmp, "ds", os.path.join(tmp, "trunc"))
+            self.assertEqual(r.returncode, 0, r.stderr[-2000:] + r.stdout[-1000:])
+            self.assertEqual((meta["num_samples"], meta["collision_dropped"]), (self.HIT, 1))
+            # 对照：--stop-on-collision 仍是闭环评测语义，preprocess 照旧整集拒收
+            m2, rows2 = self._episode(tmp, "stop", self.HIT + 4, stop_on_collision=True)
+            self.assertEqual((m2["num_steps"], m2["stopped_on_collision"], m2["truncated_on_collision"]),
+                             (self.HIT + 1, True, False))
+            r2, _ = self._preprocess(tmp, "ds2", os.path.join(tmp, "stop"))
+            self.assertNotEqual(r2.returncode, 0)
+            self.assertIn("stopped_on_collision", r2.stderr + r2.stdout)
+            with self.assertRaises(ValueError):
+                self._episode(tmp, "both", 3, stop_on_collision=True, truncate_on_collision=True)
+
+    def test_completed_aligned_with_gazebo(self):
+        """AUDIT_SIM Nice 7：manifest.completed = 跑满请求步数 or goal-stop（与 sim/tools/collect.py 同义）；
+        validity.physics_verified 保持「有帧、无 error、无动力学异常」：碰撞截断 / 评测即停的集 completed=False
+        但 physics_verified 仍 true（截断集可打包）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            m, _ = self._episode(tmp, "full", self.HIT + 4)                                  # 撞了但跑满
+            self.assertEqual((m["completed"], m["validity"]["physics_verified"]), (True, True))
+            m, _ = self._episode(tmp, "trunc", self.HIT + 4, truncate_on_collision=True)
+            self.assertEqual((m["completed"], m["validity"]["physics_verified"]), (False, True))
+            m, _ = self._episode(tmp, "stop", self.HIT + 4, stop_on_collision=True)
+            self.assertEqual((m["completed"], m["stopped_on_collision"]), (False, True))
+            # goal-stop：出生点就在 waypoint 半径内，教师连续 3 步 SAFE 提前结束，也算 completed
+            scene, renderer, occ, params, identity = _mock_env(tmp)
+            scene["waypoint"] = {"x": scene["spawn"]["x"], "y": scene["spawn"]["y"], "z": 2.0}
+
+            class HoverAtGoal:
+                name, stop_radius = "plan_action", 0.5
+
+                def __call__(self, rgb, depth, dyn):
+                    return collect.SAFE_NEUTRAL, None
+
+            m, err = collect.run_episode(scene, os.path.join(tmp, "goal"), renderer, occ, params, HoverAtGoal(),
+                                         8, 0.5, split=identity["split"], identity=identity)
+            self.assertIsNone(err)
+            self.assertEqual((m["stopped_on_goal"], m["num_steps"], m["completed"]), (True, 3, True))
+        with open(os.path.join(ROOT, "tools", "DATASET_FORMAT.md"), encoding="utf-8") as f:
+            doc = f.read()
+        self.assertIn("`completed`", doc)
+        self.assertIn("physics_verified", doc)
+
+    def test_cli_flag_and_pilot_uses_truncate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_dir = os.path.join(tmp, "scene")
+            scene_mod.make_corridor(scene_dir, seed=2, length=12.0)
+            r = _collect(os.path.join(scene_dir, "scene.json"), os.path.join(tmp, "c"), "--policy", "forward",
+                         "--truncate-on-collision")
+            self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+            m = _load(os.path.join(tmp, "c", "ep_00000", "episode_manifest.json"))
+            self.assertEqual((m["truncated_on_collision"], m["stopped_on_collision"]), (False, False))   # 畅通：没撞
+            bad = _collect(os.path.join(scene_dir, "scene.json"), os.path.join(tmp, "b"), "--policy", "forward",
+                           "--truncate-on-collision", "--stop-on-collision")
+            self.assertNotEqual(bad.returncode, 0)
+        with open(os.path.join(ROOT, "tools", "demo_3dgs_routes.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('"--truncate-on-collision"', src)
+        self.assertNotIn('"--stop-on-collision"', src)       # 教师 pilot 不再用闭环评测语义采训练数据
+
+
+class TestTofTerrain(unittest.TestCase):
+    """AUDIT_SIM #2：SITL 的 ToF 是平地模型（(z-ground_z)/cos），飞行层以下的桌面/长椅在仿真里不存在，真机 ToF 到
+    桌面会读短、执行器按「离地 2 m」爬升。只打标不改 ToF 输入：route_check 用同一份几何在 [TOF_TERRAIN_Z_MIN, z_slice 下沿)
+    再切一层占据，沿路径查有没有东西 → tof_terrain_m（最高格顶）；它不为 None 或路线名含 over_ → agl_model_unverified，
+    写进 manifest 与 planner CLI 输出（场地文档据此标注）。"""
+
+    WP = {"x": 10.0, "y": 0.0, "z": 2.0}
+
+    def _scene(self, tmp, table):
+        scene_dir = os.path.join(tmp, "scene_table" if table else "scene_plain")
+        scene_mod.make_corridor(scene_dir, seed=2, length=12.0)
+        if table:
+            # 桌面：x∈[3.5,4.5] 横贯走廊 y∈[-3.5,3.5]、z=0.75 的一层高斯（σ 0.06）；到 waypoint 的任何路都从它上方过
+            ply = os.path.join(scene_dir, "scene.ply")
+            g = scene_mod.read_gaussian_ply(ply)
+            xs, ys = np.meshgrid(np.arange(3.5, 4.5, 0.1), np.arange(-3.5, 3.5, 0.1))
+            tab = np.stack([xs.ravel(), ys.ravel(), np.full(xs.size, 0.75)], 1).astype(np.float32)
+            n = len(tab)
+            scene_mod.write_gaussian_ply(
+                ply, np.vstack([g["means"], tab]), np.vstack([g["colors"], np.tile([0.6, 0.4, 0.2], (n, 1))]),
+                np.vstack([g["scales"], np.full((n, 3), 0.06, np.float32)]),
+                np.vstack([g["quats"], np.tile([1.0, 0, 0, 0], (n, 1))]),
+                np.concatenate([np.full(len(g["means"]), 4.6, np.float32), np.full(n, 4.6, np.float32)]))   # logit 4.6 ≈ 0.99
+        return os.path.join(scene_dir, "scene.json")
+
+    def test_route_check_flags_low_furniture_and_over_routes(self):
+        collision = importlib.import_module("sim.3dgs.collision")
+        planner = importlib.import_module("sim.3dgs.planner")
+        with tempfile.TemporaryDirectory() as tmp:
+            for table in (False, True):
+                scene = scene_mod.load_scene(self._scene(tmp, table))
+                occ = collision.from_scene(scene)
+                terrain = collision.terrain_from_scene(scene)
+                self.assertEqual(terrain.z_range, (collision.TOF_TERRAIN_Z_MIN, 1.65))   # 走廊 z_slice 下沿 1.65
+                self.assertEqual(terrain.voxel, occ.voxel)
+                pl = planner.OccPlanner(occ)
+                r = planner.route_check(pl, scene["spawn"], self.WP, terrain_occ=terrain, route_name="r9_straight")
+                self.assertTrue(r["feasible"], r)
+                if table:
+                    self.assertIsNotNone(r["tof_terrain_m"])
+                    self.assertTrue(0.7 <= r["tof_terrain_m"] <= 1.1, r["tof_terrain_m"])   # 桌面 0.75 + 3σ 外扩，格顶
+                    self.assertEqual((r["agl_model_unverified"], r["agl_model_unverified_reason"]), (True, ["tof_terrain"]))
+                else:
+                    self.assertEqual((r["tof_terrain_m"], r["agl_model_unverified"], r["agl_model_unverified_reason"]),
+                                     (None, False, []))
+                    r2 = planner.route_check(pl, scene["spawn"], self.WP, terrain_occ=terrain,
+                                             route_name="r3_north_south_over_table")
+                    self.assertEqual((r2["tof_terrain_m"], r2["agl_model_unverified"], r2["agl_model_unverified_reason"]),
+                                     (None, True, ["route_name"]))
+                    r3 = planner.route_check(pl, scene["spawn"], self.WP)            # 不给 terrain：不判，字段仍在
+                    self.assertEqual((r3["tof_terrain_m"], r3["agl_model_unverified"]), (None, False))
+
+    def test_manifest_and_planner_cli_carry_agl_flags(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_json = self._scene(tmp, True)
+            raw = _load(scene_json)
+            raw["routes"] = [{"name": "r0_over_table", "spawn": raw["spawn"], "waypoint": self.WP, "max_steps": 6},
+                             {"name": "r1_plain_name", "spawn": raw["spawn"], "waypoint": self.WP, "max_steps": 6}]
+            scene_mod.save_scene(raw, scene_json)
+            r = _collect(scene_json, os.path.join(tmp, "a"), "--policy", "astar", "--route", "0", "--steps", "2")
+            self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+            m = _load(os.path.join(tmp, "a", "ep_00000", "episode_manifest.json"))
+            self.assertEqual((m["agl_model_unverified"], m["agl_model_unverified_reason"]), (True, ["tof_terrain", "route_name"]))
+            self.assertTrue(0.7 <= m["tof_terrain_m"] <= 1.1, m["tof_terrain_m"])
+            # 非 A* 策略没有路径：沿 spawn→waypoint 直线段查
+            r = _collect(scene_json, os.path.join(tmp, "f"), "--policy", "forward", "--route", "1", "--steps", "2")
+            self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+            m = _load(os.path.join(tmp, "f", "ep_00000", "episode_manifest.json"))
+            self.assertEqual((m["agl_model_unverified"], m["agl_model_unverified_reason"]), (True, ["tof_terrain"]))
+            out = _run(["sim.3dgs.planner", "--scene", scene_json, "--json"])
+            rows = json.loads(out.stdout)
+            self.assertEqual([x["agl_model_unverified_reason"] for x in rows], [["tof_terrain", "route_name"], ["tof_terrain"]])
+            self.assertTrue(all(0.7 <= x["tof_terrain_m"] <= 1.1 for x in rows))
 
 
 class TestDyawUnits(unittest.TestCase):

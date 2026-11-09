@@ -27,6 +27,12 @@ if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 
 
+# 近/远裁剪（米）：与 Gazebo 学生相机一致（sim/worlds/uav_rgb_e1.sdf <clip> 0.05 / 50）。gsplat 默认 0.01 / 1e10，
+# 贴脸 1–5 cm 的高斯只会出现在 3DGS 画面里（D10）。
+NEAR_PLANE_M = 0.05
+FAR_PLANE_M = 50.0
+
+
 def _save_rgb(path, rgb):
     import save_frame
     h, w, nch = rgb.shape
@@ -129,6 +135,7 @@ class GsplatRenderer:
                 self.means, self.quats, self.scales, self.opacities, self.colors,
                 vm, ks, width * s, height * s,
                 sh_degree=self.sh_degree if self.sh_degree > 0 else None,
+                near_plane=NEAR_PLANE_M, far_plane=FAR_PLANE_M,
                 render_mode="RGB+ED", backgrounds=None, packed=True)
             out = colors[0].detach()
             alpha = alphas[0].detach().float()              # [H*s, W*s, 1]
@@ -161,6 +168,7 @@ class GsplatRenderer:
                 "max_scale_m": self.max_scale_m, "supersample": self.supersample,
                 "width": self.width, "height": self.height, "fov_deg": self.fov_deg,
                 "sh_degree": self.sh_degree, "device": str(self.device),
+                "near_plane_m": NEAR_PLANE_M, "far_plane_m": FAR_PLANE_M,
                 "samples": self.samples,
                 "mean_ms": self.total_ms / self.samples if self.samples else None}
 

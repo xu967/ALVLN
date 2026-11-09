@@ -30,11 +30,8 @@ from . import scene as scene_mod
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _REPO = os.path.dirname(os.path.dirname(_HERE))
-# 参数单源：SITL lib agent 写出的 e1_mini.json；还没有时退回硬件 agent 的草案（同键名）。
-# TODO(e1_mini.json 落地后删掉草案回退)。
+# 参数单源：sim/dynamics/e1_mini.json（collision_envelope.value）；没有别的回退。
 E1_MINI_PARAMS = os.path.join(_REPO, "sim", "dynamics", "e1_mini.json")
-E1_MINI_DRAFT = os.path.join(os.environ.get("DATA_ROOT", "/root/rivermind-data"),
-                             "uav_rgb", "tmp", "research-hw", "e1_mini_params_draft.json")
 # 旧 Gazebo X3 的机体尺寸（转子半径 0.1 + 机臂，外径约 0.71 m -> 以前代理用 0.3 m），
 # 只给旧数据复现：scene.json collision.envelope = {"radius_m":0.3,"half_height_m":0.3}。
 X3_ENVELOPE = {"radius_m": 0.3, "half_height_m": 0.3, "source": "legacy x3 proxy"}
@@ -161,11 +158,18 @@ def _ascii_lines(f, count):
     return out
 
 
-def sample_mesh_surface(xyz, faces, spacing, seed=0):
-    """三角网格 -> 面上均匀撒点（含原顶点），相邻点间距约 <= spacing（米）。
+MESH_SAMPLE_MAX_POINTS = 200_000_000     # 撒点上限（约 4.8 GB float64），超过说明 spacing 太小或网格太大
 
-    每个三角形撒 ceil(面积 / spacing²) 个点（单位面积点数 1/spacing²，再加三个顶点），
-    用固定种子的重心坐标采样，结果可复现；只用于占据体素化，不是表面重建。
+
+def sample_mesh_surface(xyz, faces, spacing):
+    """三角网格 -> 面上确定性格点撒点（含原顶点），相邻点间距 <= spacing（米）。
+
+    每个三角形按 n = ceil(最长边 / spacing) 等分，取重心格点 {(i/n, j/n) : i + j <= n}
+    （(n+1)(n+2)/2 个，含三个顶点和三条边），格点沿三条边方向的步长都 <= spacing；没有随机数，
+    同输入同输出。以前是固定种子的随机重心撒点（每格期望 4 点，按泊松分布 e^-4 ≈ 2% 的格一个点
+    都没有，R2 实测 20×1 m 墙 voxel 0.1 漏 1.9%、0.2 漏 3.75%）；格点撒法下轴对齐面在
+    voxel = 2·spacing 时每个被穿过的体素至少 4 个点，漏格 0；斜面只在体素内的切片窄于 spacing 时
+    才可能漏。只用于占据体素化，不是表面重建。
     """
     xyz = np.asarray(xyz, dtype=np.float64)
     faces = np.asarray(faces, dtype=np.int64).reshape(-1, 3)
@@ -174,41 +178,46 @@ def sample_mesh_surface(xyz, faces, spacing, seed=0):
     if len(faces) == 0:
         return xyz.copy()
     a, b, c = xyz[faces[:, 0]], xyz[faces[:, 1]], xyz[faces[:, 2]]
-    area = 0.5 * np.linalg.norm(np.cross(b - a, c - a), axis=1)
-    n_per = np.ceil(area / (spacing * spacing)).astype(np.int64)
-    n_per = np.where(area > 0, np.maximum(n_per, 1), 0)
-    total = int(n_per.sum())
-    rng = np.random.default_rng(seed)
-    tri = np.repeat(np.arange(len(faces)), n_per)
-    u, v = rng.random(total), rng.random(total)
-    flip = u + v > 1.0                       # 把单位正方形折成三角形，重心坐标均匀
-    u[flip], v[flip] = 1.0 - u[flip], 1.0 - v[flip]
-    pts = a[tri] + u[:, None] * (b[tri] - a[tri]) + v[:, None] * (c[tri] - a[tri])
-    return np.concatenate([xyz, pts], axis=0)
+    longest = np.max([np.linalg.norm(b - a, axis=1), np.linalg.norm(c - b, axis=1),
+                      np.linalg.norm(a - c, axis=1)], axis=0)
+    ok = np.isfinite(longest)
+    a, b, c = a[ok], b[ok], c[ok]
+    n_div = np.maximum(np.ceil(longest[ok] / spacing).astype(np.int64), 1)
+    total = int(((n_div + 1) * (n_div + 2) // 2).sum())
+    if total > MESH_SAMPLE_MAX_POINTS:
+        raise ValueError(f"网格撒点 {total} 个超过上限 {MESH_SAMPLE_MAX_POINTS}；放大 spacing/voxel_m 或裁剪网格")
+    chunks = [xyz]
+    for n in np.unique(n_div):
+        sel = n_div == n
+        i, j = np.meshgrid(np.arange(n + 1), np.arange(n + 1), indexing="ij")
+        keep = (i + j) <= n
+        u, v = i[keep] / n, j[keep] / n                                   # 重心坐标格点 [K]
+        pts = (a[sel][:, None, :] + u[None, :, None] * (b[sel] - a[sel])[:, None, :]
+               + v[None, :, None] * (c[sel] - a[sel])[:, None, :])        # [M, K, 3]
+        chunks.append(pts.reshape(-1, 3))
+    return np.concatenate(chunks, axis=0)
 
 
 def load_body_envelope(path=None):
     """读 E1 MINI collision_envelope -> {"radius_m","half_height_m","source"}。
 
-    草案键：value.radius_from_center / value.z_min / value.z_max（米）。
+    键：collision_envelope.value.radius_from_center / z_min / z_max（米）；默认文件 E1_MINI_PARAMS。
     """
-    candidates = [path] if path else [E1_MINI_PARAMS, E1_MINI_DRAFT]
-    for cand in candidates:
-        if cand and os.path.isfile(cand):
-            with open(cand, "r", encoding="utf-8") as f:
-                doc = json.load(f)
-            env = doc.get("collision_envelope")
-            val = env.get("value") if isinstance(env, dict) else None
-            if not isinstance(val, dict):
-                raise ValueError(f"{cand}: 缺 collision_envelope.value")
-            radius = float(val["radius_from_center"])
-            half_h = max(abs(float(val["z_min"])), abs(float(val["z_max"])))
-            if not (radius > 0 and half_h > 0):
-                raise ValueError(f"{cand}: collision_envelope 数值无效 {val}")
-            return {"radius_m": radius, "half_height_m": half_h, "source": cand}
-    raise FileNotFoundError(
-        f"找不到 E1 MINI 参数：{E1_MINI_PARAMS} 或草案 {E1_MINI_DRAFT}；"
-        "也可在 scene.json collision.envelope 里显式给 radius_m/half_height_m")
+    cand = path or E1_MINI_PARAMS
+    if not os.path.isfile(cand):
+        raise FileNotFoundError(
+            f"找不到 E1 MINI 参数 {cand}；也可在 scene.json collision.envelope 里显式给 radius_m/half_height_m")
+    with open(cand, "r", encoding="utf-8") as f:
+        doc = json.load(f)
+    env = doc.get("collision_envelope")
+    val = env.get("value") if isinstance(env, dict) else None
+    if not isinstance(val, dict):
+        raise ValueError(f"{cand}: 缺 collision_envelope.value")
+    radius = float(val["radius_from_center"])
+    half_h = max(abs(float(val["z_min"])), abs(float(val["z_max"])))
+    if not (radius > 0 and half_h > 0):
+        raise ValueError(f"{cand}: collision_envelope 数值无效 {val}")
+    return {"radius_m": radius, "half_height_m": half_h, "source": cand}
 
 
 def quat_to_rotmat(q):
@@ -514,10 +523,10 @@ def from_points(points, *, nav_to_world=None, z_range=(1.65, 2.35), voxel_m=0.1,
                      max_scale_m=None, ground_z=ground_z, min_points=min_points, source=source)
 
 
-def from_mesh(xyz, faces, *, voxel_m=0.1, seed=0, **kw):
-    """三角网格（世界系，米）-> 面上按半体素间距撒点 -> from_points；min_points 固定 1
+def from_mesh(xyz, faces, *, voxel_m=0.1, **kw):
+    """三角网格（世界系，米）-> 面上按半体素间距确定性撒点 -> from_points；min_points 固定 1
     （撒点密度由我们控制，不存在噪点）。"""
-    pts = sample_mesh_surface(xyz, faces, spacing=0.5 * float(voxel_m), seed=seed)
+    pts = sample_mesh_surface(xyz, faces, spacing=0.5 * float(voxel_m))
     kw.pop("min_points", None)
     return from_points(pts, voxel_m=voxel_m, min_points=1, source="mesh", **kw)
 
@@ -571,6 +580,29 @@ def from_scene(scene, envelope=None, gaussians=None, source=None):
         occ.geometry_source = c["geometry"]
     occ.envelope_source = env.get("source")
     return occ
+
+
+# ToF 地形层下沿（nav 米）：SITL 的 ToF 是平地模型（(z − ground_z)/cos），飞行层以下的桌面/长椅在仿真里不存在，
+# 真机 ToF 到它们上方会读短、执行器按「离地 2 m」爬升。planner.route_check 用 [TOF_TERRAIN_Z_MIN, z_slice 下沿)
+# 这一层占据沿路径查有没有东西，只打标（tof_terrain_m / agl_model_unverified），不改 ToF 输入（AUDIT_SIM #2）。
+# 0.3 m：避开地面本身与草、路缘（Wanderland LiDAR 地面 nav z −0.13…+0.06，garden 草坪 0.1–0.2 m）。
+TOF_TERRAIN_Z_MIN = 0.3
+
+
+def terrain_from_scene(scene, gaussians=None, z_min=TOF_TERRAIN_Z_MIN, source=None):
+    """同一份几何、同一 voxel/source/min_points，只把 z 切层换成 [z_min, z_slice 下沿)：飞行层以下的「地形」占据。
+
+    返回 Occupancy（可能为空：grid.size == 0）；z_slice 下沿 <= z_min 时报错（没有可切的层）。
+    """
+    c = dict(scene.get("collision", {}))
+    z_lo = float(c.get("z_slice", (1.65, 2.35))[0])
+    if not (z_min < z_lo):
+        raise ValueError(f"地形层 [{z_min}, {z_lo}) 为空：z_slice 下沿必须高于 TOF_TERRAIN_Z_MIN")
+    c["z_slice"] = (float(z_min), z_lo)
+    c.pop("margin_m", None)                                   # 地形层只看原始占据，不做机体膨胀
+    scene2 = dict(scene)
+    scene2["collision"] = c
+    return from_scene(scene2, gaussians=gaussians, source=source)
 
 
 def _selftest():

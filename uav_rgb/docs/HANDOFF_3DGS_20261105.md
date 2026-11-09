@@ -53,7 +53,7 @@ source env.sh
 $DATA_ROOT/uav_rgb/3dgs-venv/bin/pip install \
   'https://mirrors.aliyun.com/pytorch-wheels/cu128/torch-2.7.1%2Bcu128-cp312-cp312-manylinux_2_28_x86_64.whl'
 $DATA_ROOT/uav_rgb/3dgs-venv/bin/pip install gsplat==1.5.3 numpy scipy pillow opencv-python-headless ninja jaxtyping rich packaging
-unset TORCH_CUDA_ARCH_LIST   # pilot 文档里的 TORCH_CUDA_ARCH_LIST=7.5 是 2080 Ti 时期的；现在按本机 sm_89 JIT，带着会编错架构
+unset TORCH_CUDA_ARCH_LIST   # 不要写死架构：gsplat 按本机 GPU JIT（显卡换过两次，型号以 nvidia-smi -L 为准），带着旧变量会编错架构
 ```
 
 - 场景数据也只在数据盘。没有 Callinstrasse（下载地址见 pilot 文档 §场景表，MIT）时可先用仓库自带的
@@ -62,8 +62,10 @@ unset TORCH_CUDA_ARCH_LIST   # pilot 文档里的 TORCH_CUDA_ARCH_LIST=7.5 是 2
   `collect_3dgs --episodes 1 --steps 10 --policy teacher` 7 s，首次 gsplat JIT 另计）。
 - 学生 C++ 推理：`src/build/uavrgb_infer`（`build/check` 也可，用 `UAV_RGB_BUILD_DIR`）。
 - 数据工具 venv：`.venv-tools`（已装 opencv-python-headless）。
-- 首次 gsplat 会 JIT 编译 CUDA 扩展，本机 sm_75 约 **228–235 s**；
-  之后走 `$DATA_ROOT/uav_rgb/torch-cache/extensions/gsplat_cuda`。
+- 首次 gsplat 会 JIT 编译 CUDA 扩展，按本机 GPU 编（2080 Ti 实测约 **228–235 s**）；
+  之后走 `$TORCH_EXTENSIONS_DIR/gsplat_cuda`。流水线脚本（`tools/demo_3dgs_routes.py`、`tools/scene_import_wanderland.py`）
+  把缓存目录定成 `$DATA_ROOT/uav_rgb/torch-cache/extensions-sm<算力>`（`torch.cuda.get_device_capability()`），换卡后
+  自动落到新目录重新 JIT，不会拿别的架构的 cubin 跑。
 - 下载/安装前建议：
 
 ```bash
@@ -108,11 +110,12 @@ $DATA_ROOT/uav_rgb/3dgs-venv/bin/python -m sim.3dgs.renderer \
   --pose=-14,0,2,0,0 --width 320 --height 240 --fov 60 \
   --out /tmp/frame.png --depth-out /tmp/depth.npy --bench 10
 
-# 2) 在线采集（teacher 标签）
+# 2) 在线采集（teacher 标签）。--dynamics 默认 cf_sitl（2026-11-09 起，要 $CF_SITL_PROC 指向
+#    按当前 sim/cf_sitl 构建的 cf_sitl_proc）；只想冒烟链路可加 --dynamics cf_blackbox。
 $DATA_ROOT/uav_rgb/3dgs-venv/bin/python -m sim.3dgs.collect_3dgs \
   --scene $DATA_ROOT/uav_rgb/3dgs-scenes/callinstrasse/scene.json \
   --out $DATA_ROOT/uav_rgb/run/collect-train \
-  --episodes 1 --steps 10 --policy teacher --split train --seed 0
+  --episodes 1 --steps 10 --policy teacher --split train --seed 0 --truncate-on-collision
 
 # 3) 打包（会复制 scene.json 到数据集根，自动绝对化 PLY 路径）
 .venv-tools/bin/python tools/preprocess.py --drop-collision \

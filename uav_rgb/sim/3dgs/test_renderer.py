@@ -67,6 +67,19 @@ class TestGeometry(unittest.TestCase):
         self.assertTrue(np.all(g["sh"][:, 1:] == 0))
         np.testing.assert_allclose(g["sh"][:, 0] * scene_mod.C0 + 0.5, colors, atol=2e-3)
 
+    def test_read_gaussian_ply_rejects_non_float_property(self):
+        """D10：以前只收 property float、其它类型静默跳过，二进制表会整体错位读成垃圾；现在直接报错。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "rgb.ply")
+            header = ["ply", "format ascii 1.0", "element vertex 1", "property float x", "property float y",
+                      "property float z", "property uchar red", "property float f_dc_0", "property float f_dc_1",
+                      "property float f_dc_2", "property float opacity", "end_header"]
+            with open(path, "w", encoding="ascii") as f:
+                f.write("\n".join(header) + "\n0 0 0 255 0 0 0 1\n")
+            with self.assertRaises(ValueError) as cm:
+                scene_mod.read_gaussian_ply(path)
+            self.assertIn("uchar", str(cm.exception))
+
     def test_render_options_and_scale_mask(self):
         self.assertEqual(scene_mod.render_options({}), scene_mod.RENDER_DEFAULTS)
         opts = scene_mod.render_options({"render": {"sh_degree": 0, "bogus": 1}})
@@ -76,6 +89,33 @@ class TestGeometry(unittest.TestCase):
         scales = np.array([[0.1, 0.1, 0.1], [0.1, 5.0, 0.1], [2.9, 0.2, 0.2]], np.float32)
         np.testing.assert_array_equal(scene_mod.scale_keep_mask(scales, 3.0), [True, False, True])
         np.testing.assert_array_equal(scene_mod.scale_keep_mask(scales, None), [True, True, True])
+
+
+class TestClipPlanes(unittest.TestCase):
+    """D10：gsplat 默认近/远裁剪 0.01 / 1e10，Gazebo 学生相机是 0.05 / 50 m（uav_rgb_e1.sdf），
+    贴脸 1–5 cm 的高斯只会出现在 3DGS 画面里。renderer 固定传 Gazebo 的值并写进 stats()。"""
+
+    def test_render_view_passes_gazebo_clip_planes(self):
+        self.assertEqual((renderer_mod.NEAR_PLANE_M, renderer_mod.FAR_PLANE_M), (0.05, 50.0))
+        try:
+            import torch   # noqa: F401
+        except ImportError:
+            self.skipTest("无 torch（3dgs-venv）")
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_mod.make_corridor(tmp, seed=0, length=12.0)
+            scene = scene_mod.load_scene(os.path.join(tmp, "scene.json"))
+            r = renderer_mod.GsplatRenderer(scene, device="cpu")      # 不碰 GPU：rasterization 换成记参桩
+            seen = {}
+
+            def fake_rasterization(means, quats, scales, opacities, colors, vm, ks, w, h, **kw):
+                seen.update(kw)
+                return r.torch.zeros(1, h, w, 4), r.torch.zeros(1, h, w, 1), {}
+
+            r.rasterization = fake_rasterization
+            r.render_pose(1.0, 0.0, 2.0, 0.0)
+            self.assertEqual((seen["near_plane"], seen["far_plane"]), (0.05, 50.0))
+            st = r.stats()
+            self.assertEqual((st["near_plane_m"], st["far_plane_m"]), (0.05, 50.0))
 
 
 @unittest.skipUnless(os.environ.get("RUN_3DGS_REAL") == "1",

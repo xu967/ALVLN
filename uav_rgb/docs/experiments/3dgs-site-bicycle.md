@@ -86,3 +86,18 @@
 - 尺度参照是长椅座高 0.45 m（公园长椅 0.43–0.46），靠背 0.89 m 自洽；自行车轮径没量（车轮在稀疏点里不成平面峰）。尺度误差估计 ±4%。
 - 相机离地 p10 只有 0.60 m，2 m 高度处在采集带上沿（p90 2.54 m），树冠下沿在 2.5–3 m，所以 z_slice [1.8,2.2] 的树丛占据主要是树干 + 低垂枝，3 m 以上没验证。
 - 旧的 `scene.json.bak-20261107-scene-b`（7k mini + 轴翻转）保留着没删；`bicycle_v2.json/bicycle_real.json/scene_flip*.json` 指向的 7k PLY 也没删（共 0.7 GB），是否清理由用户定。
+
+## 8 ToF 地形打标（2026-11-09，AUDIT_SIM #2，`python -m sim.3dgs.planner --scene … --json`）
+
+口径同 garden §8：`[0.3 m, 1.8 m)` 层沿 A* 路径查正下方最高占据格顶 → `tof_terrain_m`；不为 None 或路线名含 `over_` → `agl_model_unverified`（写进 manifest / eval.json，不改 ToF 输入）。
+
+| 路线 | tof_terrain_m | agl_model_unverified | 原因 |
+| --- | --- | --- | --- |
+| r0_path_west_east | — | 否 | |
+| r1_west_ese_past_bench | — | 否 | |
+| r2_east_north_turn_west | 0.8 | 是 | tof_terrain |
+| r3_north_south_over_bench | 1.1 | 是 | tof_terrain, route_name |
+| r4_south_north_turn_west | — | 否 | |
+| r5_se_nw_around_tree | 1.3 | 是 | tof_terrain |
+
+r3 从长椅上方掠过（座 0.45 / 靠背 0.89 m，格顶 1.1 m）；r2、r5 脚下是树丛低枝 / 自行车。r0/r1/r4 脚下 0.3 m 以上为空，是本场地里可以当「2 m AGL」的三条。

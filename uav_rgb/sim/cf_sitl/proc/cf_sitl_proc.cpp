@@ -55,6 +55,7 @@ Json state_json() {
 	j.set("quat", arr(s.quat, 4));
 	j.set("vel", arr(s.vel, 3));
 	add_sticks(j, s);
+	j.set("lib_version", Json::number(s.lib_version));   // Python 侧 dynamics_profile 的 lib<N>
 	return j;
 }
 

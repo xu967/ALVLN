@@ -14,11 +14,12 @@ namespace uavrgb {
 // [32] gz_sim_s（gz 仿真秒；Double_V 没有 header，订阅方用它当时间戳）
 // [33] late_actions（到达时窗口已过期的动作累计数）  [34] step_errors（step_external 非 0 次数）
 // [35..38] sticks roll/pitch/yaw/throttle（cf_sitl.h 2026-11-06 追加）
+// [39] lib_version = CF_SITL_LIB_VERSION（2026-11-09 追加；采集侧拼 dynamics_profile 的 lib<N>）
 // 完整索引表见 README.md；改顺序必须同步改 README 与 tests/test_flatten_state.cc。
 void FlattenState(const cf_sitl_state& st, double gz_sim_s, uint64_t late_actions,
                   uint64_t step_errors, gz::msgs::Double_V* out);
 constexpr int kStateBaseFields = 32;
-constexpr int kStateFields = kStateBaseFields + 3 + 4;
+constexpr int kStateFields = kStateBaseFields + 3 + 4 + 1;
 
 }  // namespace uavrgb
 

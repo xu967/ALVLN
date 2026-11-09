@@ -20,6 +20,12 @@
 extern "C" {
 #endif
 
+// 库版本（手工递增整数，2026-11-09 起；31 = lib v3.1）。改了会让同一参数文件下轨迹不同的东西
+// （执行器/控制律/传感器模型/积分器、固件源码版本）就 +1，并在 README「版本记录」写一行。
+// 经 cf_sitl_get_state().lib_version → cf_sitl_proc state / gz 插件 state[39] 带出，Python 侧拼进
+// dynamics_profile = cf_sitl_v1:<参数 value sha8>:lib<N>，preprocess 据此拒绝换库不换参数的数据混包。
+#define CF_SITL_LIB_VERSION 31
+
 // 执行器状态
 enum cf_sitl_exec_state {
   CF_SITL_DISARMED = 0,
@@ -68,6 +74,8 @@ typedef struct {
   double vel[3];
   // 2026-11-06 追加（只能在末尾加字段）：执行器最近一个 tick 输出的杆量 roll, pitch, yaw ∈[-1,1]、throttle ∈[0,1]
   double sticks[4];
+  // 2026-11-09 追加：= CF_SITL_LIB_VERSION（init 前也填），proc state / gz state[39] 原样带出
+  int lib_version;
 } cf_sitl_state;
 
 // params_json：sim/dynamics/e1_mini.json 路径。seed：噪声随机数种子。失败返回非 0，错误写 stderr。

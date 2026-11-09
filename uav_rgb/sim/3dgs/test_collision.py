@@ -321,6 +321,53 @@ class TestTruthFromPoints(unittest.TestCase):
         sparse = col.from_points(xyz, voxel_m=0.1, min_points=1, **E1)
         self.assertFalse(sparse.collides(5.0, 0.0, 2.0))      # 对照：只用 4 个顶点中间是空的
 
+    def test_mesh_sampling_deterministic_no_holes(self):
+        """D3：随机重心撒点每格期望 4 点但按泊松分布，e^-4 ≈ 2% 的 raw 格一个点都没有
+        （R2 实测 20×1 m 墙 voxel 0.1 漏 27/1400、0.2 漏 15/400）；改成确定性格点后 0 漏。"""
+        # 20×1 m 墙 x=5.03，y/z 端点都不落在体素边界上，墙穿过的 raw 格集合可以按几何算出来
+        y0, y1, z0, z1 = -9.97, 10.01, 1.5, 2.5
+        xyz = np.array([[5.03, y0, z0], [5.03, y1, z0], [5.03, y1, z1], [5.03, y0, z1]], dtype=np.float64)
+        faces = np.array([[0, 1, 2], [0, 2, 3]])
+        for voxel in (0.1, 0.2):
+            occ = col.from_mesh(xyz, faces, voxel_m=voxel, **E1)
+            ix = occ._cell([5.03, 0.0, 2.0])[0]
+            iy0, iy1 = occ._cell([5.03, y0, 2.0])[1], occ._cell([5.03, y1, 2.0])[1]
+            expected = np.zeros(occ.shape, dtype=bool)
+            expected[ix, iy0:iy1 + 1, :] = True                 # z∈[1.5,2.5] 盖满整个 z_slice
+            self.assertEqual(int(expected.sum()), (iy1 - iy0 + 1) * occ.shape[2])
+            missing = int((expected & ~occ.raw).sum())
+            self.assertEqual(missing, 0, f"voxel {voxel}: 墙穿过的 {int(expected.sum())} 格里漏 {missing} 格")
+            self.assertTrue(np.array_equal(occ.raw, expected), f"voxel {voxel}: 撒点落到墙外的格")
+        # 确定性：没有随机数，同输入两次逐位相同；格点含三顶点、都在三角形平面内且在三角形里
+        tri = np.array([[0.0, 0.0, 1.0], [0.7, 0.1, 1.2], [0.2, 0.9, 1.5]])
+        p1 = col.sample_mesh_surface(tri, [[0, 1, 2]], spacing=0.1)
+        p2 = col.sample_mesh_surface(tri, [[0, 1, 2]], spacing=0.1)
+        self.assertTrue(np.array_equal(p1, p2))
+        self.assertNotIn("seed", col.sample_mesh_surface.__code__.co_varnames[:col.sample_mesh_surface.__code__.co_argcount])
+        a, b, c = tri
+        nrm = np.cross(b - a, c - a)
+        self.assertTrue(np.allclose((p1 - a) @ nrm, 0.0, atol=1e-9))
+        m = np.linalg.lstsq(np.stack([b - a, c - a], 1), (p1 - a).T, rcond=None)[0]   # 重心坐标 (u, v)
+        self.assertTrue((m >= -1e-9).all() and (m.sum(axis=0) <= 1 + 1e-9).all())
+        for v in tri:
+            self.assertTrue((np.linalg.norm(p1 - v, axis=1) < 1e-12).any())
+        # 相邻点间距 <= spacing：每个点到最近另一点的距离不超过 spacing
+        d = np.linalg.norm(p1[:, None, :] - p1[None, :, :], axis=2)
+        np.fill_diagonal(d, np.inf)
+        self.assertLessEqual(float(d.min(axis=1).max()), 0.1 + 1e-9)
+
+    def test_body_envelope_single_source_no_draft_fallback(self):
+        """D10：机体包络只认 sim/dynamics/e1_mini.json；草案回退（E1_MINI_DRAFT）已删，找不到就报错。"""
+        self.assertFalse(hasattr(col, "E1_MINI_DRAFT"))
+        env = col.load_body_envelope()
+        self.assertEqual(env["source"], col.E1_MINI_PARAMS)
+        self.assertAlmostEqual(env["radius_m"], 0.102)
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(FileNotFoundError) as cm:
+                col.load_body_envelope(os.path.join(tmp, "nope.json"))
+        self.assertNotIn("草案", str(cm.exception))
+        self.assertNotIn("草案", col.load_body_envelope.__doc__ or "")
+
     def test_read_ply_vertices_formats(self):
         xyz = np.array([[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]], dtype=np.float64) + 0.25
         faces = np.array([[0, 1, 2], [0, 2, 3]])

@@ -38,7 +38,9 @@ SEED0 = 0                       # 路线 r 第 k 集 seed = SEED0 + 100*r + k（
 HOLD_S = 0.5                    # 与 scene.step_s / Gazebo 训练数据窗口一致
 POLICY = "astar"                # 占据栅格 A* + 纯追踪 + goal-stop（sim/3dgs/planner.py）；深度教师在开阔路线全程 FORWARD
 DYNAMICS = "cf_sitl"            # E1 MINI 固件在环（cf_sitl_proc，路径见 sim/3dgs/dynamics.py）
-STOP_ON_COLLISION = True        # 代理碰撞即停（真机撞了就是结束）
+TRUNCATE_ON_COLLISION = True    # 代理碰撞就截断本集：撞前的步是合格训练数据，撞的那一步 collision=True 由 preprocess
+                                # --drop-collision 丢掉（FIXLIST D2）。以前用 --stop-on-collision，那是闭环评测语义
+                                # （manifest stopped_on_collision=true），preprocess 会把整集拒收
 STEPS = None                    # None = 用 scene.routes[r].max_steps（按航程算，见 planner.route_check）；整数则全路线统一
 PILOT_EPISODES = 20             # pilot 规模：6 路线轮换 -> 路线 0,1 各 4 集、其余各 3 集
 PILOT_SEED0 = 1000              # 与 routes 阶段的 seed 不重叠；路线 r 第 k 集 seed = PILOT_SEED0 + 100*r + k
@@ -52,21 +54,40 @@ PILOT_SPLIT = os.environ.get("PILOT_SPLIT", "train")   # pilot 是训练数据�
 # 视频超参数（帧率 / 跟随距离 / 顶视范围）在 sim/3dgs/video.py 顶部配置区，这里不重复。
 VIDEO_QUALITY = "medium"        # 画质档（sim/tools/view_layout.VIDEO_QUALITY）：low=1280×720/CRF 28（预览）；medium=1280×720/CRF 22；
                                 # high=2560×1440 画布、显示视角 2× 渲染、CRF 18（demo 用；编码约 3× 慢）。环境变量 UAVRGB_VIDEO_QUALITY 可覆盖
-ENV = dict(os.environ, TORCH_EXTENSIONS_DIR=os.path.join(DATA_ROOT, "uav_rgb", "torch-cache", "extensions-sm89-20261106"),
-           TMPDIR=os.path.join(DATA_ROOT, "uav_rgb", "tmp"))
-ENV.pop("TORCH_CUDA_ARCH_LIST", None)     # gsplat JIT 按本机 sm_89 编；带着旧变量会重编/编错架构
 ACTIONS = ("SAFE", "FORWARD", "YAW_L", "YAW_R")
+
+
+def torch_extensions_dir(capability=None):
+    """gsplat JIT 缓存目录 = $DATA_ROOT/uav_rgb/torch-cache/extensions-sm<算力>，算力缺省用 PY 问 torch.cuda.get_device_capability()。
+    AUDIT_SIM #5：以前写死 extensions-sm89-20261106，显卡换回 2080 Ti（sm_75）后目录名与里面的 cubin 对不上。换卡后首个进程重新 JIT（约 4 min）。"""
+    if capability is None:
+        out = subprocess.run([PY, "-c", "import torch; print(*torch.cuda.get_device_capability())"],
+                             capture_output=True, text=True, check=True).stdout.split()
+        capability = (int(out[0]), int(out[1]))
+    return os.path.join(DATA_ROOT, "uav_rgb", "torch-cache", "extensions-sm%d%d" % tuple(capability))
+
+
+_ENV = None
+
+
+def env():
+    """子进程环境（首次调用时问一次 GPU 算力，导入本模块不碰 GPU）。"""
+    global _ENV
+    if _ENV is None:
+        _ENV = dict(os.environ, TORCH_EXTENSIONS_DIR=torch_extensions_dir(), TMPDIR=os.path.join(DATA_ROOT, "uav_rgb", "tmp"))
+        _ENV.pop("TORCH_CUDA_ARCH_LIST", None)     # gsplat JIT 按本机 GPU 算力编；带着旧变量会重编/编错架构
+    return _ENV
 
 
 def run(cmd, what, capture=False):
     print(f"\n### {what}: {' '.join(cmd)}", flush=True)
     t0 = time.time()
     if capture:
-        res = subprocess.run(cmd, cwd=REPO, env=ENV, text=True, capture_output=True)
+        res = subprocess.run(cmd, cwd=REPO, env=env(), text=True, capture_output=True)
         print(res.stderr[-3000:], flush=True)
         rc, out = res.returncode, res.stdout
     else:
-        rc, out = subprocess.call(cmd, cwd=REPO, env=ENV), None
+        rc, out = subprocess.call(cmd, cwd=REPO, env=env()), None
     print(f"### {what} rc={rc} wall={time.time() - t0:.1f}s", flush=True)
     if rc != 0:
         raise SystemExit(f"{what} 失败 rc={rc}")
@@ -95,6 +116,7 @@ def episode_row(ep, reach_radius):
     return {"dir": ep, "route": man.get("route"), "seed": man["seed"], "steps": len(acts),
             "requested_steps": man["requested_steps"], "reached": bool(dists and min(dists) <= reach_radius),
             "collision": any(a["collision"] for a in acts), "stopped_on_collision": man["stopped_on_collision"],
+            "truncated_on_collision": man.get("truncated_on_collision", False),   # 旧 manifest 没有该字段
             "stopped_on_goal": man.get("stopped_on_goal"), "min_dist_m": round(min(dists), 2) if dists else None,
             "final_dist_m": round(dists[-1], 2) if dists else None,
             "min_clearance_m": round(min(a["clearance_m"] for a in acts), 2) if acts else None,
@@ -124,7 +146,7 @@ def collect(out_dir, route, episodes, seed, jitter=0.0, steps=None, split=None):
            "--hold", str(HOLD_S)]
     cmd += ["--steps", str(steps)] if steps else []
     cmd += ["--spawn-jitter", str(jitter)] if jitter > 0 else []
-    cmd += ["--stop-on-collision"] if STOP_ON_COLLISION else []
+    cmd += ["--truncate-on-collision"] if TRUNCATE_ON_COLLISION else []
     cmd += ["--split", split] if split else []
     run(cmd, f"collect route {route}")
     return [os.path.join(out_dir, "ep_%05d" % i) for i in range(episodes)]
@@ -243,7 +265,7 @@ def phase_routes(scene, checks):
 
 
 def health_check(rows):
-    """pilot 健康检查：碰撞即停、四类动作占比、位姿/图像配对、validity、步数。"""
+    """pilot 健康检查：碰撞截断（不是闭环评测的即停）、四类动作占比、位姿/图像配对、validity、步数。"""
     problems = []
     for x in rows:
         tag = f"{os.path.basename(os.path.dirname(x['dir']))}/{os.path.basename(x['dir'])}"
@@ -251,8 +273,10 @@ def health_check(rows):
             problems.append(f"{tag}: error={x['error']}")
         if not (x["n_rgb"] == x["steps"] == x["n_oracle"]):
             problems.append(f"{tag}: rgb {x['n_rgb']} / actions {x['steps']} / oracle {x['n_oracle']} 不配对")
-        if x["collision"] and not x["stopped_on_collision"]:
-            problems.append(f"{tag}: 有碰撞但没有即停")
+        if x["stopped_on_collision"]:
+            problems.append(f"{tag}: stopped_on_collision=true（闭环评测语义，preprocess 会整集拒收）")
+        if TRUNCATE_ON_COLLISION and x["collision"] and not x["truncated_on_collision"]:
+            problems.append(f"{tag}: 有碰撞但没有截断")
         if not all(x["validity"].values()):
             problems.append(f"{tag}: validity={x['validity']}")
         if x["anomaly"]:
@@ -333,7 +357,7 @@ def phase_pilot(scene, checks):
     man0 = json.load(open(os.path.join(eps[0], "episode_manifest.json"), encoding="utf-8"))
     meta = {"schema": "uavrgb.3dgs_pilot.v1", "scene": SCENE, "routes": ROUTES, "episodes_per_route": per_route,
             "policy": POLICY, "dynamics": DYNAMICS, "hold_s": HOLD_S, "spawn_jitter_m": PILOT_SPAWN_JITTER_M,
-            "seed_rule": f"seed = {PILOT_SEED0} + 100*route + k", "stop_on_collision": STOP_ON_COLLISION,
+            "seed_rule": f"seed = {PILOT_SEED0} + 100*route + k", "truncate_on_collision": TRUNCATE_ON_COLLISION,
             "pilot_split": PILOT_SPLIT or None,
             "split": man0["split"], "split_policy": man0["split_policy"], "geometry_gid": man0["geometry_gid"],
             "geometry_version": man0["geometry_version"], "teacher_version": man0.get("teacher_version"),
@@ -344,7 +368,8 @@ def phase_pilot(scene, checks):
         f.write("\n".join(eps) + "\n")
     lines = [f"# E1 3DGS Callinstrasse pilot（{PILOT_EPISODES} 集，路线轮换 {ROUTES}，出生扰动 ±{PILOT_SPAWN_JITTER_M} m / ±10°，"
              f"seed = {PILOT_SEED0} + 100*route + k）", "",
-             f"- 采集：{POLICY} 教师 + {DYNAMICS}，hold {HOLD_S}s，碰撞即停 {STOP_ON_COLLISION}；步数上限 = scene.routes[r].max_steps，goal-stop 连续 3 步 SAFE 提前结束",
+             f"- 采集：{POLICY} 教师 + {DYNAMICS}，hold {HOLD_S}s，碰撞截断 {TRUNCATE_ON_COLLISION}（撞的那一步 collision=True，preprocess --drop-collision 丢）；"
+             f"步数上限 = scene.routes[r].max_steps，goal-stop 连续 3 步 SAFE 提前结束",
              f"- split={man0['split']}（split_policy={man0['split_policy']}，geometry_gid={man0['geometry_gid']}）：整个 Callinstrasse 是一个几何组；"
              + (f"PILOT_SPLIT={PILOT_SPLIT} 与哈希所得不同，记为诊断划分，preprocess 要 --allow-diagnostic-split" if man0["split_policy"] != "geometry_gid"
                 else (f"PILOT_SPLIT={PILOT_SPLIT} 与哈希所得一致，preprocess 直接打包" if PILOT_SPLIT
@@ -353,7 +378,7 @@ def phase_pilot(scene, checks):
              "## 健康检查", "",
              f"- 集数 {health['episodes']}，帧数 {health['frames']}，到达 {health['reached']}/{health['episodes']}，碰撞集 {health['collisions']}，goal-stop {health['stopped_on_goal']}",
              f"- 动作合计 {actions_str(health['action_totals'])}；占比 {actions_str(health['action_fractions'])}；四类都出现：{health['all_actions_present']}",
-             f"- 最小净空 {health['min_clearance_m']} m；位姿/图像配对、timestamp 递增、validity、碰撞即停、无动力学异常：{'全部通过' if health['ok'] else '有问题'}",
+             f"- 最小净空 {health['min_clearance_m']} m；位姿/图像配对、timestamp 递增、validity、碰撞截断、无动力学异常：{'全部通过' if health['ok'] else '有问题'}",
              f"- 低质量帧（lapvar < {man0.get('frame_quality', {}).get('lapvar_min')}，雾/糊，只标记不丢）：{health['low_quality_frames']} / {health['frames']}"
              f"（{health['low_quality_frac']}）；每帧 actions.jsonl frame_quality",
              f"- 失控隔离（quarantine/，不在 episodes.txt）：{len(quarantined)} 集"

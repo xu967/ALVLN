@@ -97,8 +97,10 @@ CMake 选项：`CF_SITL_GZ_STUB`（OFF）、`CF_SITL_TARGET`（父工程里的�
 | 33 | `late_actions` | 到达时窗口已过期的动作累计数 |
 | 34 | `step_errors` | `cf_sitl_step_external` 返回非 0 的累计次数 |
 | 35..38 | `sticks` | 执行器杆量 roll pitch yaw ∈[-1,1]、throttle ∈[0,1]（`cf_sitl.h` 2026-11-06 追加） |
+| 39 | `lib_version` | `CF_SITL_LIB_VERSION`（`cf_sitl.h`，2026-11-09 追加，31 = v3.1）；采集侧拼 `dynamics_profile = cf_sitl_v1:<参数 value sha8>:lib<N>` |
 
-Python 侧常量在 `sim/tools/cf_sitl_exec.py`（`IDX_*`、`STATE_FIELDS=39`）。
+Python 侧常量在 `sim/tools/cf_sitl_exec.py`（`IDX_*`、`STATE_FIELDS=40`）。插件比 Python 旧（帧只有 39 个值）时
+`CfSitlExecutor.error()` 直接报「重建插件」，不会静默等到超时。
 
 ## 时钟与坐标
 

@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""3DGS 在线采集：位姿 -> 动作 -> 黑盒动力学 -> 碰撞代理 -> gsplat 渲染 RGB。
+"""3DGS 在线采集：位姿 -> 动作 -> 动力学 -> 碰撞代理 -> gsplat 渲染 RGB。
 
 与 sim/tools/collect.py 的 episode 格式对齐（episode_manifest.json / actions.jsonl /
-oracle.jsonl / rgb_%05d.png），但**不启动 Gazebo**：位姿由 sim/tools/cf_blackbox.py
-推进，高度固定 2 m，碰撞由 collision.py 的导航系 3D 占据代理沿每步位移扫掠给出
-（近似，不是真值）。
+oracle.jsonl / rgb_%05d.png），但**不启动 Gazebo**：位姿默认由 E1 MINI 固件在环子进程
+cf_sitl_proc 推进（--dynamics cf_sitl，固件定高；可执行文件取 $CF_SITL_PROC），
+--dynamics cf_blackbox 才是 sim/tools/cf_blackbox.py 的一阶黑盒、高度固定 2 m（冒烟/单测用）。
+碰撞由 collision.py 的导航系 3D 占据代理沿每步位移扫掠给出（近似，不是真值）。
 
 每步顺序（与 collect.py 的 M1 一致）：渲染动作前 RGB -> 策略出动作 -> 动力学推进
 -> 碰撞 -> 落盘。actions.jsonl 的 timestamp_ns 是动作前渲染时刻。
@@ -12,7 +13,7 @@ oracle.jsonl / rgb_%05d.png），但**不启动 Gazebo**：位姿由 sim/tools/c
 用法：
   python -m sim.3dgs.collect_3dgs --scene $SCENES/synthetic/scene.json \
       --out $DATA_ROOT/uav_rgb/3dgs-pilot-... --steps 8 --policy teacher
-  python -m sim.3dgs.collect_3dgs --scene ... --out ... --mock-renderer --steps 3
+  python -m sim.3dgs.collect_3dgs --scene ... --out ... --mock-renderer --dynamics cf_blackbox --steps 3
   DAgger（学生执行、astar 教师打标签；tools/dagger_pipeline.py 调用）：
   python -m sim.3dgs.collect_3dgs --scene ... --route 1 --out ... --policy student --ckpt run/ckpt_best.bin \
       --beta 0.5 --dagger-round 1 --dynamics cf_sitl --hold 0.5
@@ -231,16 +232,26 @@ def _spawn_for_episode(scene, occ, jitter_m, rng):
 def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, dagger=None,
                 split="train", seed=0, episode_id=None,
                 save_depth=False, stop_on_collision=False, dynamics_path=None,
+                truncate_on_collision=False,
                 spawn_jitter=0.0, identity=None, split_policy=None,
-                dynamics="cf_blackbox"):
+                dynamics="cf_blackbox", agl=None):
     """跑一集，返回 (manifest, error)。产物写 out_dir；异常也尽量落 manifest。
 
     identity：scene_identity() 的结果（gid/scene_id/task_id）；None 时现算。
+    agl：planner.agl_flags 的结果（tof_terrain_m / agl_model_unverified / reason，AUDIT_SIM #2 打标）；
+    None 时按「不知道」写（tof_terrain_m None、agl_model_unverified False、reason []），直接调用方自己负责。
     split_policy：None -> "geometry_gid"（split 必须等于 identity["split"]）；
     调用方强行指定别的 split 时传 "diag-manual-split"，preprocess 要 --allow-diagnostic-split。
     dynamics："cf_blackbox"（params 是 CfBlackboxParams，z 固定）或 "cf_sitl"（params 是
     CfSitlParams，E1 MINI 固件在环子进程，相机位姿用完整四元数，另写 trace.jsonl）。
+    碰撞（AUDIT_SIM #3 / FIXLIST D2）：3DGS 没有接触物理，撞后机体穿模继续飞，所以第一次撞之后
+    的每一行都写 collision=True（src=post_collision），preprocess --drop-collision 一并丢掉。
+    stop_on_collision = 闭环评测语义（manifest stopped_on_collision=true，preprocess 整集拒收）；
+    truncate_on_collision = 训练采集语义：撞的那一步写完就结束本集，只有那一行被 --drop-collision 丢，
+    manifest 记 truncated_on_collision=true，stopped_on_collision 保持 false。两者互斥。
     """
+    if stop_on_collision and truncate_on_collision:
+        raise ValueError("stop_on_collision（闭环评测）与 truncate_on_collision（训练采集）互斥")
     os.makedirs(out_dir, exist_ok=True)
     identity = identity or scene_identity(scene)
     if split_policy is None:
@@ -269,7 +280,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
         raise ValueError(f"dynamics 必须是 cf_blackbox 或 cf_sitl，得到 {dynamics!r}")
     actions, oracle, render_ms = [], [], []
     rows_ok, all_rgb_ok = 0, True
-    stopped = False
+    stopped, truncated, hit_once = False, False, False
     # goal-stop（与 sim/tools/collect.py 同口径）：教师带 stop_radius（planner.OccAstarTeacher）时，
     # 连续 3 步 SAFE 且动作前位姿在 waypoint 半径内就提前结束，避免后 20+ 步全是悬停 SAFE 把类别
     # 分布拉偏；cf_sitl 悬停还会漂 2–4 cm/s，窄巷里挂着不动 10 s 就漂进树篱（smoke_r3 实测）。
@@ -324,6 +335,9 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             x, y, yaw = state["x"], state["y"], state["yaw_deg"]
             # 沿整段位移扫掠（AUDIT #3）：只查终点时 0.69 m 一步能穿过 0.6 m 的障碍。
             collided, hit_pt = occ.sweep((x0, y0, z0), (x, y, state["z"]))
+            # 撞过一次之后机体已在障碍里/穿过障碍，后续画面与标签都不可信：整段都标碰撞（src 区分真撞与穿模）。
+            src = "voxel_proxy" if collided else ("post_collision" if hit_once else None)
+            hit_once = hit_once or bool(collided)
             dist = math.hypot(x - x0, y - y0)
             # yaw 是 state["yaw_deg"]（度），yaw0 是 dyn.yaw（弧度）：先统一成度再求 [-180,180) 环绕差。
             # 以前直接相减再 degrees()，实测左转 9.65° 记成 553°。
@@ -345,9 +359,9 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                 "timestamp_ns": ts0,
                 "action_expert": expert,
                 "action_executed": action,
-                "collision": bool(collided),
-                # 与 collect.py 对齐：src 区分碰撞来源；这里只有代理栅格。
-                "src": "voxel_proxy" if collided else None,
+                "collision": hit_once,
+                # 与 collect.py 对齐：src 区分碰撞来源；voxel_proxy = 本步扫掠撞到，post_collision = 撞后穿模的步。
+                "src": src,
                 "collision_point": hit_pt,
                 "rgb_ok": rgb_ok,
                 "frame": "rgb_%05d.png" % i,
@@ -384,6 +398,10 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             if stop_on_collision and collided:
                 stopped = True
                 print(f"step {i}: 碰撞，提前结束", file=sys.stderr)
+                break
+            if truncate_on_collision and collided:
+                truncated = True
+                print(f"step {i}: 碰撞，本集到此截断（这一行留给 --drop-collision）", file=sys.stderr)
                 break
             if stop_radius is not None:
                 at_goal = math.hypot(x0 - float(wp["x"]), y0 - float(wp["y"])) <= stop_radius
@@ -480,11 +498,14 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             "renderer": renderer.stats(),
             "collision_proxy": occ.summary(),
             "validity": {
-                # 碰撞提前结束时也认为本集执行过；只要求每步都有帧、无异常。
+                # 碰撞提前结束时也认为本集执行过；只要求每步都有帧、无异常。「跑没跑完」看 completed。
                 "camera_verified": bool(all_rgb_ok and rows_ok > 0),
                 "physics_verified": bool(rows_ok > 0 and error is None and anomaly is None),
                 "episode_executed": bool(rows_ok > 0),
             },
+            # 与 sim/tools/collect.py 同义：跑满请求步数 或 goal-stop。碰撞截断 / 评测即停 / 动力学异常 /
+            # error 的集都是 false；physics_verified 不含这层意思（AUDIT_SIM Nice 7，tools/DATASET_FORMAT.md §1.5）。
+            "completed": bool(rows_ok > 0 and error is None and (rows_ok == steps or stopped_on_goal)),
             "dynamics_anomaly": anomaly,
             "num_steps": rows_ok,
             "requested_steps": steps,
@@ -495,7 +516,13 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                               "p95": _percentile(render_ms, 95)},
                 "wall_s": round(time.perf_counter() - t_wall, 3),
             },
+            # ToF 平地模型打标（AUDIT_SIM #2）：飞行层以下有桌面/长椅（tof_terrain_m = 最高格顶，nav 米）或路线名
+            # 含 over_* 时 agl_model_unverified=true——真机 ToF 会按它爬升，这些集不算「2 m AGL」。ToF 输入没改。
+            "tof_terrain_m": (agl or {}).get("tof_terrain_m"),
+            "agl_model_unverified": bool((agl or {}).get("agl_model_unverified", False)),
+            "agl_model_unverified_reason": list((agl or {}).get("agl_model_unverified_reason", [])),
             "stopped_on_collision": stopped,
+            "truncated_on_collision": truncated,   # 训练采集撞后截断（不是闭环评测产物，preprocess 照收）
             "stop_radius": stop_radius,            # 教师 goal-stop 半径（深度教师/forward 为 None）
             "stopped_on_goal": stopped_on_goal,
             # A* 教师 fail-closed 输出 SAFE 的步数（被围死 / waypoint 在占据里）：这些 SAFE 在画面里没有
@@ -543,10 +570,14 @@ def main():
                    help="默认按几何组哈希决定（同一 PLY 只能在一个 split）；显式指定且与之"
                         "不同时记为诊断划分 diag-manual-split，打包要 --allow-diagnostic-split")
     p.add_argument("--save-depth", action="store_true")
-    p.add_argument("--stop-on-collision", action="store_true")
-    p.add_argument("--dynamics", choices=("cf_blackbox", "cf_sitl"), default="cf_blackbox",
-                   help="cf_sitl = E1 MINI 固件在环子进程（参数默认 sim/dynamics/e1_mini.json，"
-                        "可执行文件取 $CF_SITL_PROC）")
+    p.add_argument("--stop-on-collision", action="store_true",
+                   help="闭环评测语义：撞到即停，manifest stopped_on_collision=true（preprocess 拒收这种集）")
+    p.add_argument("--truncate-on-collision", action="store_true",
+                   help="训练采集语义：撞到就结束本集，只有撞的那一行 collision=True 留给 preprocess --drop-collision；"
+                        "不给时撞后继续飞，之后每行都 collision=True")
+    p.add_argument("--dynamics", choices=("cf_blackbox", "cf_sitl"), default="cf_sitl",
+                   help="默认 cf_sitl = E1 MINI 固件在环子进程（参数默认 sim/dynamics/e1_mini.json，"
+                        "可执行文件取 $CF_SITL_PROC，缺失直接报错）；cf_blackbox = 一阶黑盒、z 固定，只用于冒烟/单测")
     p.add_argument("--dynamics-params", default=None)
     p.add_argument("--spawn-jitter", type=float, default=0.0)
     args = p.parse_args()
@@ -567,24 +598,37 @@ def main():
         p.error("--policy student 需要存在的 --ckpt")
     if not (0.0 <= args.beta <= 1.0):
         p.error("--beta 必须在 [0,1]")
-    params = (CfSitlParams.from_json(args.dynamics_params) if args.dynamics == "cf_sitl"
-              else CfBlackboxParams.from_json(args.dynamics_params))
+    if args.stop_on_collision and args.truncate_on_collision:
+        p.error("--stop-on-collision（闭环评测）与 --truncate-on-collision（训练采集）只能选一个")
+    try:
+        params = (CfSitlParams.from_json(args.dynamics_params) if args.dynamics == "cf_sitl"
+                  else CfBlackboxParams.from_json(args.dynamics_params))
+    except (FileNotFoundError, RuntimeError) as e:   # cf_sitl_proc 缺失 / 库版本探测失败：不悄悄退回黑盒
+        p.error(f"--dynamics {args.dynamics}: {e}")
     identity = scene_identity(scene)
     split, split_policy = identity["split"], "geometry_gid"
     if args.split is not None and args.split != split:
         split, split_policy = args.split, "diag-manual-split"
         print(f"警告: --split {args.split} 与几何组应属的 {identity['split']} 不同，"
               "manifest 记为 diag-manual-split（只能作诊断数据打包）", file=sys.stderr)
-    occ = collision_mod.from_scene(scene)
+    # 高斯源只读一次 PLY：飞行层占据 + 飞行层以下的 ToF 地形层（AUDIT_SIM #2 打标）共用。
+    gaussians = (scene_mod.read_gaussian_ply(scene["ply_path"])
+                 if scene.get("collision", {}).get("source", "gaussians") == "gaussians" else None)
+    occ = collision_mod.from_scene(scene, gaussians=gaussians)
+    terrain = collision_mod.terrain_from_scene(scene, gaussians=gaussians)
+    del gaussians
+    route_name = (scene.get("route") or {}).get("name")
     renderer = renderer_mod.make_renderer(scene, args.mock_renderer, args.width,
                                           args.height, args.fov, args.device)
     student, dagger = None, None
     if args.policy in ("astar", "student"):
         occ_planner = planner_mod.OccPlanner(occ)
         policy = planner_mod.OccAstarTeacher(occ_planner, scene["waypoint"])
-        check = planner_mod.route_check(occ_planner, scene["spawn"], scene["waypoint"])
+        check = planner_mod.route_check(occ_planner, scene["spawn"], scene["waypoint"],
+                                        terrain_occ=terrain, route_name=route_name)
         if not check["feasible"]:
             p.error(f"route {scene.get('route')}: spawn/waypoint 不可达 {check}")
+        agl = {k: check[k] for k in ("tof_terrain_m", "agl_model_unverified", "agl_model_unverified_reason")}
         print(f"astar 教师: route={scene.get('route')} 航程 {check['path_m']} m 转向 {check['turn_deg']}° "
               f"最小净空 {check['min_clearance_m']} m 步数预算 {check['steps_estimate']}（--steps {steps}）",
               file=sys.stderr)
@@ -597,6 +641,14 @@ def main():
                       "student_ckpt": os.path.abspath(args.ckpt), "student_ckpt_sha256": _sha256(args.ckpt)}
     else:
         policy = DepthTeacher() if args.policy == "teacher" else ForwardPolicy()
+        # 没有 A* 路径：沿 spawn→waypoint 直线段查地形
+        agl = planner_mod.agl_flags(terrain, planner_mod.segment_points(
+            (scene["spawn"]["x"], scene["spawn"]["y"]), (scene["waypoint"]["x"], scene["waypoint"]["y"]), occ.voxel),
+            route_name)
+    if agl["agl_model_unverified"]:
+        print(f"注意: route={scene.get('route')} agl_model_unverified {agl}（飞行层以下有桌面/长椅类地形或路线名 over_*：ToF 平地"
+              "模型在真机上不成立，这些集只能当外观数据，不算 2 m AGL）", file=sys.stderr)
+    del terrain
     os.makedirs(args.out, exist_ok=True)
     episodes, failures = [], []
     for ep in range(args.episodes):
@@ -609,9 +661,10 @@ def main():
                 split=split, seed=args.seed + ep,
                 episode_id=args.seed + ep, save_depth=args.save_depth,
                 stop_on_collision=args.stop_on_collision,
+                truncate_on_collision=args.truncate_on_collision,
                 dynamics_path=args.dynamics_params,
                 spawn_jitter=args.spawn_jitter, identity=identity,
-                split_policy=split_policy, dynamics=args.dynamics)
+                split_policy=split_policy, dynamics=args.dynamics, agl=agl)
             episodes.append({"episode": ep, "dir": os.path.basename(ep_dir),
                              "steps": manifest["num_steps"],
                              "collision": any(a["collision"] for a in

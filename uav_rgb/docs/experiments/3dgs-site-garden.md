@@ -92,3 +92,18 @@ Mip-NeRF 360 的 COLMAP 世界系是任意的：garden 的重力方向相对 −
 - 尺度只用桌面一个参照（0.75 m 标准高，实物可能 0.72–0.78 m → 尺度误差 ±4%）；没有第二个已知尺寸交叉验证。
 - 飞行高度沿用项目口径 2.0 m（在采集高度带 1.2–2.3 m 内）。1 m 高度会把桌子/花盆变成障碍、路线更有意思，但相机轨道下沿只到 1.18 m，1 m 以下视角外推，没试。
 - 占据代理 v2 只看 opacity ≥ 0.3 的椭球，花盆的细叶、遮阳伞边缘可能漏掉；清晰但有漂浮碎片的外围（东墙、北侧棚屋 >4 m 处）路线都避开了。
+
+## 8 ToF 地形打标（2026-11-09，AUDIT_SIM #2，`python -m sim.3dgs.planner --scene … --json`）
+
+SITL 的 ToF 是平地模型（`(z − ground_z)/cos`），飞行层以下的桌面/花盆在仿真里不存在；真机 ToF 到桌面上方会读短约 0.75 m、执行器按「离地 2 m」爬升再降回，画面高度与俯仰在这几步与仿真不同。只打标不改 ToF：`planner.route_check` 用同一份高斯在 `[0.3 m, z_slice 下沿 1.8 m)` 再切一层占据，沿 A* 路径查正下方那一列最高占据格的格顶 → `tof_terrain_m`；它不为 None 或路线名含 `over_` → `agl_model_unverified`，写进每集 manifest / eval.json。
+
+| 路线 | tof_terrain_m | agl_model_unverified | 原因 |
+| --- | --- | --- | --- |
+| r0_south_lane_east | 1.1 | 是 | tof_terrain |
+| r1_sw_ne_around_tree | 1.4 | 是 | tof_terrain |
+| r2_nw_se_past_table | 1.3 | 是 | tof_terrain |
+| r3_north_south_over_table | 1.3 | 是 | tof_terrain, route_name |
+| r4_east_return_west | 1.4 | 是 | tof_terrain |
+| r5_west_edge_north | 0.7 | 是 | tof_terrain |
+
+六条全部打标：桌面 0.75 m 之外，花盆/灌木（≤1.4 m）和树的低枝都在 0.3–1.8 m 层里，garden 的中部没有一条路线脚下是空的。所以 garden 的集都不算「2 m AGL」口径，只当外观数据；要当等高飞行数据得给 SITL 加「机体正下方地面高度」输入（AUDIT_SIM #2 的完整修法，未做）。

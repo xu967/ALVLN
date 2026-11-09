@@ -25,6 +25,8 @@ from cf_blackbox import (  # noqa: E402,F401  统一从参数单源导入
     CfBlackbox, CfBlackboxParams, DEFAULT_PARAMS_PATH,
     SAFE_NEUTRAL, FORWARD_SLOW, YAW_LEFT, YAW_RIGHT, VALID_ACTIONS,
 )
+# profile 算法与 Gazebo 链路（sim/tools/cf_sitl_exec.py）同一份：cf_sitl_v1:<参数 value sha8>:lib<N>
+from cf_sitl_exec import PROFILE_PREFIX as SITL_PROFILE_PREFIX, format_profile, params_values_sha256  # noqa: E402
 from . import scene as scene_mod  # noqa: E402
 
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -34,7 +36,6 @@ CF_SITL_PROC = os.environ.get("CF_SITL_PROC", os.path.join(
     os.environ.get("DATA_ROOT", "/root/rivermind-data"), "uav_rgb", "tmp",
     "build-cf-sitl", "cf_sitl_proc"))
 SITL_DT_S = 0.001            # 固件 1 kHz 锁步，cf_sitl 只接受 1 ms 步
-SITL_PROFILE_PREFIX = "cf_sitl_v1"   # 与 sim/tools/cf_sitl_exec.py 同前缀：同一参数文件两条链路 profile 一致
 EXEC_STATES = {0: "DISARMED", 1: "TAKEOFF", 2: "READY", 3: "ACTING", 4: "FAILSAFE"}
 EXEC_READY, EXEC_FAILSAFE = 2, 4
 
@@ -56,37 +57,71 @@ def _quat_to_euler_deg(q):
     return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
 
 
-class CfSitlParams:
-    """e1_mini.json 的只读视图：sha、标定位、相机安装、执行器速度；manifest 写进 episode。"""
+def probe_lib_version(proc_path, params_path):
+    """起一次 cf_sitl_proc 读 state.lib_version（CF_SITL_LIB_VERSION）后 quit。没有该键 = 旧库，直接拒绝。"""
+    if not os.path.isfile(proc_path):
+        raise FileNotFoundError(f"cf_sitl_proc 不存在: {proc_path}（可用环境变量 CF_SITL_PROC 指定）")
+    try:
+        out = subprocess.run([proc_path, "--params", params_path, "--seed", "0"],
+                             input='{"cmd":"state"}\n{"cmd":"quit"}\n', capture_output=True, text=True, timeout=30.0)
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"cf_sitl_proc 读 state 超时: {proc_path}") from e
+    lines = [ln for ln in out.stdout.splitlines() if ln.strip()]
+    if out.returncode != 0 or not lines:
+        raise RuntimeError(f"cf_sitl_proc 起不来 rc={out.returncode}: {out.stderr.strip()[-500:]}")
+    resp = json.loads(lines[0])
+    if not resp.get("ok"):
+        raise RuntimeError(f"cf_sitl_proc state 失败: {resp.get('error')}")
+    v = resp["state"].get("lib_version")
+    if not isinstance(v, (int, float)) or v != int(v) or int(v) < 1:
+        raise RuntimeError(f"{proc_path} 的 state 没有 lib_version（库早于 CF_SITL_LIB_VERSION=31，按当前 sim/cf_sitl 重建）")
+    return int(v)
 
-    def __init__(self, path, raw, obj):
+
+class CfSitlParams:
+    """e1_mini.json 的只读视图：sha、标定位、相机安装、执行器速度；manifest 写进 episode。
+
+    profile = cf_sitl_v1:<各项 value 规范化 JSON 的 sha8>:lib<N>（AUDIT_SIM #1，与 cf_sitl_exec 同算法）：
+    改注释不换 profile，改 value 或换库才换。lib_version 来自 cf_sitl_proc 的 state（from_json 默认起一次进程探测）。
+    """
+
+    def __init__(self, path, raw, obj, lib_version=None):
         if not isinstance(obj, dict):
             raise ValueError(f"{path}: 顶层必须是对象")
         self.path, self.obj = os.path.abspath(path), obj
-        self.sha256 = hashlib.sha256(raw).hexdigest()
+        self.sha256 = hashlib.sha256(raw).hexdigest()          # 文件字节 sha（追溯用，不进 profile）
+        self.values_sha256 = params_values_sha256(obj)
+        self.lib_version = None if lib_version is None else int(lib_version)
         self.calibrated = bool(obj.get("calibrated", False))
         self.camera_mount = self.value("camera_mount")
         if not (isinstance(self.camera_mount, dict) and len(self.camera_mount.get("xyz", ())) == 3):
             raise ValueError(f"{path}: camera_mount.value 需要 xyz[3] 与 pitch_deg")
 
     @classmethod
-    def from_json(cls, path=None):
+    def from_json(cls, path=None, lib_version=None, proc=None):
+        """lib_version 不给时起一次 cf_sitl_proc（proc 或 $CF_SITL_PROC）读 state.lib_version。"""
         path = E1_MINI_PARAMS_PATH if path is None else path
         with open(path, "rb") as f:
             raw = f.read()
-        return cls(path, raw, json.loads(raw.decode("utf-8")))
+        if lib_version is None:
+            lib_version = probe_lib_version(proc or CF_SITL_PROC, path)
+        return cls(path, raw, json.loads(raw.decode("utf-8")), lib_version)
 
     def value(self, key):
         v = self.obj.get(key)
         return v.get("value") if isinstance(v, dict) and "value" in v else v
 
     def profile(self):
-        return f"{SITL_PROFILE_PREFIX}:{self.sha256[:8]}"
+        if self.lib_version is None:
+            raise RuntimeError("cf_sitl 库版本未知：CfSitlParams.from_json() 会起 cf_sitl_proc 读 state.lib_version，"
+                               "直接构造时请传 lib_version")
+        return format_profile(self.values_sha256, self.lib_version)
 
     def manifest(self):
         ex = self.value("executor") or {}
         return {"dynamics": "cf_sitl", "vehicle": "e1_mini", "profile": self.profile(),
                 "params_file": self.path, "params_sha256": self.sha256,
+                "params_values_sha256": self.values_sha256, "lib_version": self.lib_version,
                 "calibrated": self.calibrated, "firmware": self.obj.get("firmware"),
                 "camera_mount": self.camera_mount,
                 "collision_envelope": self.value("collision_envelope"),
@@ -139,6 +174,18 @@ class CfSitlDynamics:
             text=True, bufsize=1)
         # stderr 单独线程收尾巴：进程崩溃时把原因带进异常，也避免它写满管道阻塞。
         threading.Thread(target=self._pump_stderr, daemon=True).start()
+        # 这个进程的库版本必须就是 params.profile() 声称的那个（params 可能用别的 proc 探测过）
+        try:
+            lib_version = int(self._call({"cmd": "state"})["state"].get("lib_version") or 0)
+            if lib_version < 1:
+                raise RuntimeError(f"{self.proc_path} 的 state 没有 lib_version（旧库，按当前 sim/cf_sitl 重建）")
+            if self.params.lib_version is None:
+                self.params.lib_version = lib_version
+            elif self.params.lib_version != lib_version:
+                raise RuntimeError(f"cf_sitl_proc lib_version={lib_version} 与 params.lib_version={self.params.lib_version} 不一致")
+        except BaseException:
+            self.close()
+            raise
 
     def _pump_stderr(self):
         try:

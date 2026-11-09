@@ -28,8 +28,9 @@
 | `{"cmd":"quit"}` | `{"ok":true}` | 之后进程以 0 退出；stdin 关闭等同 quit |
 
 `state` 字段 = `include/cf_sitl.h` 里 `cf_sitl_state` 的全部字段，键名同字段名，数组用 JSON 数组，顺序同头文件：
-`t_s, exec_state, fw_mode, armed, action, action_until_s, motors[4], battery_v, att_est[4], tof_m, flow_vel[2], height_est_m, vel_est[2], hover_thrust, pos[3], quat[4], vel[3], sticks[4]`
-（`sticks` = 执行器输出的 roll/pitch/yaw/throttle 杆量，是头文件后加的字段；`cf_sitl_proc.cpp` 用模板探测该成员，旧头文件也能编，只是没有这一项）。
+`t_s, exec_state, fw_mode, armed, action, action_until_s, motors[4], battery_v, att_est[4], tof_m, flow_vel[2], height_est_m, vel_est[2], hover_thrust, pos[3], quat[4], vel[3], sticks[4], lib_version`
+（`sticks` = 执行器输出的 roll/pitch/yaw/throttle 杆量，是头文件后加的字段；`cf_sitl_proc.cpp` 用模板探测该成员，旧头文件也能编，只是没有这一项。
+`lib_version` = `CF_SITL_LIB_VERSION`（2026-11-09 追加，31 = v3.1），`sim/3dgs/dynamics.py` 起进程先读一次它拼 `dynamics_profile` 的 `lib<N>`；没有这一项的旧进程会被拒绝）。
 数字以 `%.17g` 输出（往返无损），整数字段（`exec_state` 等）也是 JSON 数字。头文件末尾再追加新字段时要同步 `cf_sitl_proc.cpp` 的 `state_json()`。
 
 ## Python 调用示例

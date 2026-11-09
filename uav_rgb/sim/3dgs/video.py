@@ -405,16 +405,44 @@ def _sha256(path):
         return hashlib.sha256(f.read()).hexdigest()
 
 
-def episode_result(man):
-    """结尾大字：与 Gazebo eval_closed_loop._write_video 同一套词（SUCCESS / COLLISION / …）。"""
+def video_policy(man):
+    """标题里的策略名 = 谁执行了动作（manifest executed_by：teacher / student / forward）。
+    旧 manifest 没有 executed_by 时按 teacher 字段（= 策略名）推断；以前只要有 teacher 字段就写 teacher，
+    学生 eval 集（teacher=student）也被标成 teacher（FIXLIST D7）。"""
+    if man.get("executed_by"):
+        return str(man["executed_by"])
+    name = man.get("teacher") or man.get("policy") or "student"
+    return name if name in ("student", "forward") else "teacher"
+
+
+def episode_result(man, oracle=None, reach_radius_m=None, collided=False):
+    """结尾大字：与 Gazebo eval_closed_loop._write_video 同一套词（SUCCESS / COLLISION / …）。
+
+    没有 goal-stop 的集（深度教师 / forward / 学生 eval）给 oracle 与 reach_radius_m 时按 eval_3dgs 同口径：
+    轨迹任一点到 waypoint 的欧氏距离 <= reach_radius_m 就是 SUCCESS。碰撞（即停 / 截断 / 任一行 collision）优先于到达：
+    撞后穿模飞到目标不算到。
+    """
     if man.get("stopped_on_goal"):
         return "SUCCESS reached"
-    if man.get("stopped_on_collision"):
+    if man.get("stopped_on_collision") or man.get("truncated_on_collision") or collided:
         return "COLLISION"
     if man.get("dynamics_anomaly"):
         return "ANOMALY %s" % (man["dynamics_anomaly"].get("kind") if isinstance(man["dynamics_anomaly"], dict)
                                else man["dynamics_anomaly"])
+    wp = man.get("waypoint") or {}
+    if oracle and reach_radius_m is not None and "x" in wp and "y" in wp:
+        dmin = min(math.hypot(float(o["pose_gt"]["x"]) - float(wp["x"]), float(o["pose_gt"]["y"]) - float(wp["y"]))
+                   for o in oracle if isinstance(o.get("pose_gt"), dict))
+        if dmin <= float(reach_radius_m):
+            return "SUCCESS reached (min %.2f m)" % dmin
     return "NOT REACHED (%s steps)" % man.get("num_steps")
+
+
+def _read_jsonl(path):
+    if not os.path.isfile(path):
+        return []
+    with open(path, encoding="utf-8") as f:
+        return [json.loads(line) for line in f if line.strip()]
 
 
 def main():
@@ -449,11 +477,13 @@ def main():
         ep_scene = dict(scene, **{k: man["scene"][k] for k in ("spawn", "waypoint") if man.get("scene", {}).get(k)})
         if isinstance(man.get("route"), dict):
             ep_scene["route"] = man["route"]
-        policy = "teacher" if man.get("teacher") else man.get("policy", "student")
         dyn = man.get("dynamics_backend") or man["dynamics_params"].get("dynamics", "?")
+        oracle = _read_jsonl(os.path.join(ep, "oracle.jsonl"))
+        collided = any(a.get("collision") for a in _read_jsonl(os.path.join(ep, "actions.jsonl")))
+        result = episode_result(man, oracle, float(ep_scene.get("reach_radius_m", 1.5)), collided)
         r = compose_views_video(ep, ep_scene, renderer, mount, occ, out_path=os.path.join(ep, args.out_name),
-                                title=f"{policy} | {dyn} | {scene_short} | seed {man.get('seed')}",   # 与 Gazebo 标题同格式
-                                result=episode_result(man), quality=args.video_quality,
+                                title=f"{video_policy(man)} | {dyn} | {scene_short} | seed {man.get('seed')}",   # 与 Gazebo 标题同格式
+                                result=result, quality=args.video_quality,
                                 log=lambda m: print(m, file=sys.stderr, flush=True))
         print(json.dumps(r, ensure_ascii=False))
 

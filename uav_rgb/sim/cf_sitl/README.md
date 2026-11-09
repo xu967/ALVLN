@@ -67,6 +67,10 @@ sim/cf_sitl/selftest/sweep_seeds.sh "$BUILD"                                 # �
   - `hover_thrust` 是执行器当前悬停油门**杆量**（前馈 + 积分，∈[0,1]），不是占空比；
   - `pos/quat/vel`：独立模式为内部刚体，外部模式为插件最近传入的值；
   - `sticks[4]`（2026-11-06 追加在末尾）：执行器最近一个 tick 的 roll, pitch, yaw ∈[−1,1]、throttle ∈[0,1]。
+  - `lib_version`（2026-11-09 追加在末尾）：= 头文件 `CF_SITL_LIB_VERSION`（31 = v3.1），init 前也填。采集侧（`sim/3dgs/dynamics.py`、
+    `sim/tools/cf_sitl_exec.py`）把它拼进 `dynamics_profile = cf_sitl_v1:<e1_mini.json 各项 value 规范化 JSON 的 sha8>:lib<N>`：
+    改参数注释不换 profile，改 value 或改库（版本号 +1）才换，`tools/preprocess.py` 据此拒绝混包。**改了会让同一参数下轨迹不同的代码就把
+    版本号 +1**，并在下面「版本记录」写一行。
 - FAILSAFE：飞行中 ToF 连续无效 > `executor.tof_timeout_s`（0.5 s）→ 执行器输出油门 = 当前悬停杆、水平、偏航 0，不再闭环；
   高度估计停止外推。头文件注释写的「固件 descend() 接管」在这版里**没有**发生（RC 流每 tick 都在刷新，固件不会判 RC 丢失），
   由调用方把 FAILSAFE 当作终止条件。目标高度 3 m（超 ToF 量程 2.5 m）的实测：5.0 s ToF 失效，5.5 s 进 FAILSAFE，之后以 ~0.5 m/s 开环漂升。
@@ -153,3 +157,11 @@ seed 1–8 全部到 READY（6.5–8.1 s），高度误差 0.011–0.016 m，xy 
 FORWARD 稳态侧偏 b/ki 减半（见「速度环」）；selftest 阈值按 40 种子扫描修（场景 1 加计链 1.0° → 2.0°；6a 真值漂移常数项 0.05 → 0.20 m 补光流随机游走；
 6b 积分饱和改成按零偏判断），`selftest/sweep_seeds.sh` seed 1..40：改前 11 红（6b 3、6a 4、场景 1 5），改后 40/40 全绿；seed 1 仍 33/33；
 ctest 10/10（新增 `cf_sitl_forward_lateral`、`cf_sitl_longrun_int_budget`）。没做（待办）：飞行中估零偏（根治 b/ki 侧偏、SAFE 剩余漂移与积分饱和三件事）。
+
+2026-11-09 **`CF_SITL_LIB_VERSION = 31`**（AUDIT_SIM #1；控制律不变，只加版本常量与 `cf_sitl_state.lib_version`）：profile 从
+`cf_sitl_v1:<文件字节 sha8>`（683e7400）改成 `cf_sitl_v1:<value sha8>:lib31`。此前所有数据集（bd0dcd43 / cec5d6b0 / 683e7400）与新采集按 `preprocess`
+口径都不能混包；gz 插件与 `cf_sitl_proc` 必须用本版头文件重建（state 多一个字段，Python 侧 `STATE_FIELDS=40`，旧插件会被明确拒绝）。
+
+2026-11-09 **`CF_SITL_LIB_VERSION = 31`**（AUDIT_SIM #1；控制律不变，只加版本常量与 `cf_sitl_state.lib_version`）：profile 从
+`cf_sitl_v1:<文件字节 sha8>`（683e7400）改成 `cf_sitl_v1:<value sha8>:lib31`。此前所有数据集（bd0dcd43 / cec5d6b0 / 683e7400）与新采集按 `preprocess`
+口径都不能混包；gz 插件与 `cf_sitl_proc` 必须用本版头文件重建（state 多一个字段，Python 侧 `STATE_FIELDS=40`，旧插件会被明确拒绝）。

@@ -61,13 +61,62 @@ class TestViewmatFromQuat(unittest.TestCase):
 
 class TestCfSitlParams(unittest.TestCase):
     def test_manifest(self):
-        p = dyn.CfSitlParams.from_json()
+        p = dyn.CfSitlParams.from_json(lib_version=31)     # 不起进程：库版本直接给
         m = p.manifest()
         self.assertEqual((m["dynamics"], m["vehicle"]), ("cf_sitl", "e1_mini"))
         self.assertEqual(len(m["params_sha256"]), 64)
         self.assertFalse(m["calibrated"])
         self.assertEqual(m["camera_mount"]["xyz"], [0.045, 0.0, 0.015])
-        self.assertTrue(p.profile().startswith("cf_sitl_v1:"))
+        self.assertRegex(p.profile(), r"^cf_sitl_v1:[0-9a-f]{8}:lib31$")
+        self.assertEqual((m["lib_version"], m["params_values_sha256"]), (31, p.values_sha256))
+
+    def test_profile_fingerprint(self):
+        """AUDIT_SIM #1：参数 sha 只算 value（改 basis 注释不变），改 vel_ki 变，库版本变也变；
+        与 Gazebo 侧 sim/tools/cf_sitl_exec.py 同一算法，同一参数文件两条链路 profile 一致。"""
+        import json
+        import importlib
+        ce = importlib.import_module("cf_sitl_exec")
+        p0 = dyn.CfSitlParams.from_json(lib_version=31)
+        with open(dyn.E1_MINI_PARAMS_PATH, encoding="utf-8") as f:
+            obj = json.load(f)
+        with tempfile.TemporaryDirectory() as tmp:
+            def variant(name, mutate):
+                o = json.loads(json.dumps(obj))
+                mutate(o)
+                path = os.path.join(tmp, name)
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(o, f, ensure_ascii=False, indent=1)
+                return dyn.CfSitlParams.from_json(path, lib_version=31)
+            p_doc = variant("basis.json", lambda o: o["executor"].__setitem__("basis", "换个说法"))
+            self.assertNotEqual(p_doc.sha256, p0.sha256)
+            self.assertEqual(p_doc.profile(), p0.profile())
+            p_ki = variant("ki.json", lambda o: o["executor"]["value"].__setitem__("vel_ki", 0.15))
+            self.assertNotEqual(p_ki.profile(), p0.profile())
+        self.assertNotEqual(dyn.CfSitlParams.from_json(lib_version=32).profile(), p0.profile())
+        gz = ce.CfSitlParams.from_json(dyn.E1_MINI_PARAMS_PATH)
+        gz.lib_version = 31
+        self.assertEqual(gz.profile(), p0.profile())
+        with open(dyn.E1_MINI_PARAMS_PATH, "rb") as f:
+            raw = f.read()
+        with self.assertRaises(RuntimeError):            # 版本未知时 3DGS 侧不给出可写进 manifest 的 profile
+            dyn.CfSitlParams(dyn.E1_MINI_PARAMS_PATH, raw, obj).profile()
+        with self.assertRaises(FileNotFoundError):       # 探测用的进程不存在：早在构造参数时就报，不等到第一集
+            dyn.CfSitlParams.from_json(proc=os.path.join("/nonexistent", "cf_sitl_proc"))
+
+    @unittest.skipUnless(HAVE_PROC, f"无 cf_sitl_proc: {dyn.CF_SITL_PROC}")
+    def test_probe_lib_version_from_proc(self):
+        p = dyn.CfSitlParams.from_json()                    # 起一次 cf_sitl_proc 读 state.lib_version
+        self.assertGreaterEqual(p.lib_version, 31)
+        self.assertRegex(p.profile(), r"^cf_sitl_v1:[0-9a-f]{8}:lib\d+$")
+        d = dyn.CfSitlDynamics(SCENE, params=p, seed=0)
+        try:
+            self.assertEqual(d.profile(), p.profile())
+            self.assertEqual(d.manifest()["lib_version"], p.lib_version)
+        finally:
+            d.close()
+        wrong = dyn.CfSitlParams.from_json(lib_version=p.lib_version + 1)
+        with self.assertRaises(RuntimeError):            # 进程的库版本与 params 声称的不一致
+            dyn.CfSitlDynamics(SCENE, params=wrong, seed=0)
 
 
 @unittest.skipUnless(HAVE_PROC, f"无 cf_sitl_proc: {dyn.CF_SITL_PROC}")

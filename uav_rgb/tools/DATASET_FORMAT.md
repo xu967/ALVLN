@@ -99,6 +99,20 @@
   "depth":true|false,"depth_grid":[15,20]|null,"band_edges_m":[...],"envelope_radius_m":0.102}`，
   记录同目录侧车的存在与口径（见 §6）。旧数据集没有该字段也没有侧车，读端照常。
 
+### 1.5 episode_manifest.json 的「有效」与「完整」是两个字段
+
+打包只读 `validity`（三项都要 true），「跑没跑完」另看 `completed`，不要混用：
+
+| 字段 | 含义 | Gazebo `sim/tools/collect.py` | 3DGS `sim/3dgs/collect_3dgs.py` |
+| --- | --- | --- | --- |
+| `validity.physics_verified` | 帧与位姿可信：有帧、无 `error`、无动力学异常 | 还要求跑满/goal-stop（历史口径，评测集 validity 全 false） | 只看帧/异常：碰撞截断（`truncated_on_collision`）、评测即停（`stopped_on_collision`）的集也是 true |
+| `completed` | 跑满 `requested_steps` 或 goal-stop（`stopped_on_goal`） | 内部变量 `completed`，决定 validity | 顶层字段（2026-11-09 起）；碰撞截断 / 评测即停 / 异常 / error 都是 false |
+
+- 训练打包（`preprocess.py`）看 `validity` + `stopped_on_collision`（闭环评测产物拒收），**不看 `completed`**：
+  `--truncate-on-collision` 采的集 `completed=false` 照样可打包，撞的那一行由 `--drop-collision` 丢。
+- 统计「到达 / 跑满」用 `completed` 与 `stopped_on_goal`，不要拿 `physics_verified` 代替。
+- 旧 3DGS manifest 没有 `completed`，读端按 `num_steps == requested_steps or stopped_on_goal` 补算。
+
 ## 2. 读取顺序（C++）
 
 1. 读 48 字节头，校验 `magic=="UAVR"`、`version==1`、`header_size==48`、

@@ -69,12 +69,30 @@ ROUTES = [
     {"name": "r5_bend_south", "spawn": {"x": 44.0, "y": -11.0, "yaw_deg": -30.0}, "waypoint": {"x": 51.5, "y": -15.5},
      "note": "步道末端向南的弯 9 m：栅栏角 + 树，转向约 45°"},
 ]
-ENV = dict(os.environ, TORCH_EXTENSIONS_DIR=os.path.join(DATA_ROOT, "uav_rgb", "torch-cache", "extensions-sm89-20261106"),
-           TMPDIR=os.path.join(DATA_ROOT, "uav_rgb", "tmp"))
-ENV.pop("TORCH_CUDA_ARCH_LIST", None)     # gsplat JIT 按本机 sm_89 编；带着旧变量会重编/编错架构
-
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "tools"))
+
+
+def torch_extensions_dir(capability=None):
+    """gsplat JIT 缓存目录 = $DATA_ROOT/uav_rgb/torch-cache/extensions-sm<算力>（与 tools/demo_3dgs_routes.py 同一规则）。
+    AUDIT_SIM #5：以前写死 extensions-sm89-20261106，显卡换回 2080 Ti（sm_75）后目录名与里面的 cubin 对不上。"""
+    if capability is None:
+        out = subprocess.run([PY, "-c", "import torch; print(*torch.cuda.get_device_capability())"],
+                             capture_output=True, text=True, check=True).stdout.split()
+        capability = (int(out[0]), int(out[1]))
+    return os.path.join(DATA_ROOT, "uav_rgb", "torch-cache", "extensions-sm%d%d" % tuple(capability))
+
+
+_ENV = None
+
+
+def env():
+    """子进程环境（首次调用时问一次 GPU 算力，导入本模块不碰 GPU）。"""
+    global _ENV
+    if _ENV is None:
+        _ENV = dict(os.environ, TORCH_EXTENSIONS_DIR=torch_extensions_dir(), TMPDIR=os.path.join(DATA_ROOT, "uav_rgb", "tmp"))
+        _ENV.pop("TORCH_CUDA_ARCH_LIST", None)     # gsplat JIT 按本机 GPU 算力编；带着旧变量会重编/编错架构
+    return _ENV
 
 
 def log(msg):
@@ -85,12 +103,12 @@ def run(cmd, what, capture=False):
     log(f"### {what}: {' '.join(str(c) for c in cmd)}")
     t0 = time.time()
     if capture:
-        res = subprocess.run(cmd, cwd=REPO, env=ENV, text=True, capture_output=True)
+        res = subprocess.run(cmd, cwd=REPO, env=env(), text=True, capture_output=True)
         if res.stderr:
             print(res.stderr[-3000:], flush=True)
         rc, out = res.returncode, res.stdout
     else:
-        rc, out = subprocess.call(cmd, cwd=REPO, env=ENV), None
+        rc, out = subprocess.call(cmd, cwd=REPO, env=env()), None
     log(f"### {what} rc={rc} wall={time.time() - t0:.1f}s")
     if rc != 0:
         raise SystemExit(f"{what} 失败 rc={rc}")

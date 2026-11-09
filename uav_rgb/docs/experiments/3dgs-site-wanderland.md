@@ -72,3 +72,18 @@
 - `scene.json.license` 写 "Apache-2.0 (Wanderland, ai4ce)"，`source` 写 HF 路径；进论文前需在致谢/引用里加 Wanderland（arXiv 2511.20620）。
 - 地面 1.58° 倾斜与沿路 0.2 m 高差未校正；若要严格 2.0 m，可在 `scene_import_wanderland.step_align` 把 `nav_to_world` 改成拟合平面旋转。
 - r5 seed 500 的停滞是 A* 教师在拐角 YAW 抖动 + cf_sitl 零位移的组合，与 Callinstrasse route 5 seed 500 同类；`planner.py`/`collect_3dgs.py` 本任务只读，没改。
+
+## ToF 地形打标（2026-11-09，AUDIT_SIM #2，`python -m sim.3dgs.planner --scene … --json`）
+
+口径见 `3dgs-site-garden.md` §8，这里几何是 LiDAR 点云（`source=points`，min_points 3）：`[0.3 m, z_slice 下沿 1.8 m)` 层沿 A* 路径查正下方最高占据格顶 → `tof_terrain_m`；不为 None 或路线名含 `over_` → `agl_model_unverified`（写进 manifest / eval.json，不改 ToF 输入）。
+
+| 路线 | tof_terrain_m | agl_model_unverified | 原因 |
+| --- | --- | --- | --- |
+| r0_path_east | 0.5 | 是 | tof_terrain |
+| r1_tree_row_south | — | 否 | |
+| r2_face_fence_left | — | 否 | |
+| r3_reverse_west | — | 否 | |
+| r4_face_tree_turn | 0.5 | 是 | tof_terrain |
+| r5_bend_south | — | 否 | |
+
+r0/r4 脚下 0.3–0.5 m 有 LiDAR 点（路缘 / 低矮植被，0.2 m 体素所以格顶 0.5）；其余四条脚下 0.3 m 以上为空。地面 1.58° 倾斜与沿路 0.2 m 高差（上文「未做」）不在这项里，仍未校正。

@@ -1,5 +1,5 @@
 // test_flatten_state.cc：FlattenState 的索引表必须与 README.md / cf_sitl.h 字段顺序一致。
-// 每个字段填一个独一无二的值，再按 README 的索引逐个核对；长度 = 32 + 3 个插件字段。
+// 每个字段填一个独一无二的值，再按 README 的索引逐个核对；长度 = 32 + 3 个插件字段 + 4 sticks + 1 lib_version。
 #include <cstdio>
 #include <cstdlib>
 
@@ -26,6 +26,7 @@ int main() {
   for (double& q : st.quat) q = v++;              // 121..124
   for (double& w : st.vel) w = v++;               // 125..127
   for (double& s : st.sticks) s = v++;            // 128..131
+  st.lib_version = CF_SITL_LIB_VERSION;           // 31（lib v3.1）
 
   gz::msgs::Double_V msg;
   uavrgb::FlattenState(st, 12.5, 7, 3, &msg);
@@ -70,6 +71,11 @@ int main() {
   expect(34, 3, "step_errors");
   expect(35, 128, "sticks roll");
   expect(38, 131, "sticks throttle");
+  expect(39, CF_SITL_LIB_VERSION, "lib_version");
+  if (CF_SITL_LIB_VERSION < 31) {
+    std::fprintf(stderr, "FAIL CF_SITL_LIB_VERSION %d < 31（2026-11-09 起从 31 = v3.1 手工递增）\n", CF_SITL_LIB_VERSION);
+    ++fails;
+  }
   if (fails) return 1;
   std::printf("test_flatten_state: PASS (%d fields)\n", msg.data_size());
   return 0;

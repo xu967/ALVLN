@@ -41,7 +41,10 @@ SIM_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # sim/dynamics/e1_mini.json，按 $UAVRGB_REPO_ROOT（缺省本仓库）解析，两边永远读同一个文件。
 DEFAULT_PARAMS = os.path.join(os.environ.get("UAVRGB_REPO_ROOT") or os.path.dirname(SIM_DIR),
                               "sim", "dynamics", "e1_mini.json")
-PROFILE_PREFIX = "cf_sitl_v1"   # manifest.dynamics_profile = cf_sitl_v1:<参数 sha8>，换参数后旧包不混入
+# manifest.dynamics_profile = cf_sitl_v1:<参数 value 规范化 JSON 的 sha8>:lib<库版本>（见 format_profile）。
+# 2026-11-09 之前是 cf_sitl_v1:<e1_mini.json 原始字节 sha8>：改注释就换 profile、换库不换 profile（AUDIT_SIM #1）；
+# 旧值 bd0dcd43 / cec5d6b0 / 683e7400 的数据集按 preprocess 口径都不能与新采集混包。
+PROFILE_PREFIX = "cf_sitl_v1"
 TAKEOFF_HEIGHT_M = 2.0   # 任务规定巡航高度；固件定高，不走 collect 的 altitude_vz
 STATE_WAIT_S = 20.0      # 等 state 首帧：软件渲染下世界起来 + 插件 Configure 实测 5~10 s，留 2 倍
 RESET_ACK_S = 5.0        # reset 后等 exec_state 回 DISARMED 且 SITL 时钟归零；200 Hz 下正常 <50 ms
@@ -62,7 +65,8 @@ IDX_T, IDX_EXEC, IDX_FW_MODE, IDX_ARMED, IDX_ACTION, IDX_UNTIL = 0, 1, 2, 3, 4, 
 IDX_HEIGHT, IDX_POS, IDX_QUAT, IDX_VEL = 18, 22, 25, 29
 IDX_SIM_T, IDX_LATE, IDX_ERRORS = 32, 33, 34
 IDX_STICKS = 35          # [35..38] roll pitch yaw throttle（cf_sitl.h 2026-11-06 追加）
-STATE_FIELDS = 39
+IDX_LIB_VERSION = 39     # CF_SITL_LIB_VERSION（cf_sitl.h 2026-11-09 追加）；start() 读到首帧后填进 params.lib_version
+STATE_FIELDS = 40
 EXEC_STATES = {0: "DISARMED", 1: "TAKEOFF", 2: "READY", 3: "ACTING", 4: "FAILSAFE"}
 EXEC_DISARMED, EXEC_TAKEOFF, EXEC_READY, EXEC_ACTING, EXEC_FAILSAFE = range(5)
 
@@ -79,15 +83,31 @@ def state_stamp_ns(msg):
         return 0
 
 
+def params_values_sha256(obj):
+    """e1_mini.json 各项 value 的指纹：{键: value}（只取形如 {"value": ...} 的项）按键排序、紧凑分隔的 JSON 的 sha256。
+    unit/source/status/basis 注释与没有 value 的顶层项（schema/date/provenance/hover_check…）都不算。
+    sim/3dgs/dynamics.py 复用本函数，同一参数文件两条链路 profile 一致。"""
+    values = {k: v["value"] for k, v in obj.items() if isinstance(v, dict) and "value" in v}
+    canon = json.dumps(values, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()
+
+
+def format_profile(values_sha256, lib_version):
+    """lib_version 为 None 时写 lib?：只该出现在 start() 之前的日志里，manifest 写出时版本已从 state 读到。"""
+    return f"{PROFILE_PREFIX}:{values_sha256[:8]}:lib{'?' if lib_version is None else int(lib_version)}"
+
+
 class CfSitlParams:
     """e1_mini.json 的只读视图：collect 只关心 sha、标定位与少数展示字段。"""
 
     altitude_assumption = "firmware_height_hold"   # 高度由固件定高，不是真值 P 控制
     altitude_target = TAKEOFF_HEIGHT_M
 
-    def __init__(self, path, raw, obj):
+    def __init__(self, path, raw, obj, lib_version=None):
         self.path, self.raw, self.obj = path, raw, obj
-        self.sha256 = hashlib.sha256(raw).hexdigest()
+        self.sha256 = hashlib.sha256(raw).hexdigest()            # 文件字节 sha（追溯用，不进 profile）
+        self.values_sha256 = params_values_sha256(obj) if isinstance(obj, dict) else self.sha256
+        self.lib_version = lib_version                          # 插件 state[IDX_LIB_VERSION]；None = 还没读到 state
         # 单源 JSON 里没有标定位时按未标定处理：数字全是草案/假设值，manifest 必须说清。
         self.calibrated = bool(obj.get("calibrated", False)) if isinstance(obj, dict) else False
 
@@ -101,7 +121,7 @@ class CfSitlParams:
         return cls(path, raw, obj)
 
     def profile(self):
-        return f"{PROFILE_PREFIX}:{self.sha256[:8]}"
+        return format_profile(self.values_sha256, self.lib_version)
 
     def _value(self, key):
         v = self.obj.get(key)
@@ -109,6 +129,7 @@ class CfSitlParams:
 
     def manifest(self):
         return {"params_path": os.path.abspath(self.path), "params_sha256": self.sha256,
+                "params_values_sha256": self.values_sha256, "lib_version": self.lib_version,
                 "calibrated": self.calibrated, "mass_flight": self._value("mass_flight"),
                 "inertia_diag": self._value("inertia_diag"),
                 "takeoff_height_m": self.altitude_target}
@@ -292,6 +313,10 @@ class CfSitlExecutor:
         msg = self._sub.latest() if self._sub is not None else None
         data = msg.get("data") if isinstance(msg, dict) else None
         if not isinstance(data, list) or len(data) < STATE_FIELDS:
+            if isinstance(data, list) and data and self._err is None:
+                # 插件比本文件旧（如缺 [39] lib_version）：明确报错，不要等 STATE_WAIT_S 超时再报「无 state」
+                self._err = (f"state 帧只有 {len(data)} 个值（需要 {STATE_FIELDS}）：gz 插件 CfSitlSystem 与 cf_sitl_exec.py "
+                             f"字段表不一致，按当前 sim/cf_sitl 重建插件")
             return None
         return data
 
@@ -333,6 +358,8 @@ class CfSitlExecutor:
             if not self._sub.healthy():
                 raise RuntimeError(f"{what}: state 订阅进程已退出")
             st = self.state()
+            if st is None and self._err:
+                raise RuntimeError(f"{what}: {self._err}")
             if st is not None:
                 stamp = st[IDX_SIM_T]
                 if stamp != last_stamp:
@@ -382,7 +409,12 @@ class CfSitlExecutor:
         """等 state → reset → arm_takeoff → READY。失败抛 RuntimeError（已尽量停桨）。"""
         self._sub = gz_io.TopicSub(STATE_TOPIC, buf=4, stamp_fn=state_stamp_ns)
         try:
-            self._wait_state(lambda st: True, STATE_WAIT_S, "等 cf_sitl state 首帧")
+            st = self._wait_state(lambda st: True, STATE_WAIT_S, "等 cf_sitl state 首帧")
+            # 库版本进 params：manifest 的 dynamics_profile 要带 lib<N>。同一执行器对象只认一个版本。
+            lib_version = int(st[IDX_LIB_VERSION])
+            if self.params.lib_version not in (None, lib_version):
+                raise RuntimeError(f"插件 lib_version={lib_version} 与 params 已记录的 {self.params.lib_version} 不同")
+            self.params.lib_version = lib_version
             self._pub = open_publisher()
             self._log(f"cf_sitl 发布: {self._pub.mode}")
             for attempt in range(1 + TAKEOFF_RETRIES):
@@ -452,8 +484,10 @@ class CfSitlExecutor:
 def _self_check():
     p = CfSitlParams("x.json", b'{"mass_flight": {"value": 0.102}, "inertia_diag": {"value": [1, 2, 3]}}',
                      {"mass_flight": {"value": 0.102}, "inertia_diag": {"value": [1, 2, 3]}})
-    assert p.profile().startswith(PROFILE_PREFIX + ":") and len(p.profile()) == len(PROFILE_PREFIX) + 9
-    assert p.calibrated is False and p.manifest()["mass_flight"] == 0.102
+    assert p.profile() == f"{PROFILE_PREFIX}:{p.values_sha256[:8]}:lib?", p.profile()   # start() 前库版本未知
+    p.lib_version = 31
+    assert p.profile() == f"{PROFILE_PREFIX}:{p.values_sha256[:8]}:lib31", p.profile()
+    assert p.calibrated is False and p.manifest()["mass_flight"] == 0.102 and p.manifest()["lib_version"] == 31
     assert state_stamp_ns({"data": [0.0] * IDX_SIM_T + [1.25]}) == 1_250_000_000
     assert state_stamp_ns({"data": []}) == 0 and state_stamp_ns({}) == 0
     ex = CfSitlExecutor(p, hold_s=0.5, episode=7)

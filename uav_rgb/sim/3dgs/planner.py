@@ -234,11 +234,52 @@ class OccAstarTeacher:
         return FORWARD_SLOW, None
 
 
-def route_check(planner, spawn, waypoint, body_radius_m=None, margin_m=0.3):
-    """离线可达性：A* 路径是否存在、航程、转向总量、沿路最小净空、步数预算。
+def terrain_under_path(terrain_occ, pts):
+    """沿 pts（导航系 (x, y) 序列）查地形层原始占据：正下方那一列最高占据格的格顶高度（nav 米）；没有返回 None。
+
+    terrain_occ 来自 collision.terrain_from_scene（[TOF_TERRAIN_Z_MIN, z_slice 下沿) 那一层）。只查机体正下方
+    一列（ToF 光斑几厘米），不含机体半径。
+    """
+    if terrain_occ is None or terrain_occ.raw.size == 0 or not pts:
+        return None
+    nx, ny, nz = terrain_occ.shape
+    cells = terrain_occ._cell([(float(x), float(y), terrain_occ.z_range[0]) for x, y in pts])
+    ok = (cells[:, 0] >= 0) & (cells[:, 0] < nx) & (cells[:, 1] >= 0) & (cells[:, 1] < ny)
+    if not ok.any():
+        return None
+    cols = terrain_occ.raw[cells[ok, 0], cells[ok, 1], :]              # [M, nz]
+    if not cols.any():
+        return None
+    k_top = int(np.max(np.nonzero(cols.any(axis=0))[0]))               # 最高的占据层
+    return round(float(terrain_occ.origin[2] + (k_top + 1) * terrain_occ.voxel), 3)
+
+
+def segment_points(p, q, step):
+    """直线段 p->q 按 step 米取点（含两端），给没有 A* 路径的策略（teacher/forward）查地形用。"""
+    p, q = np.asarray(p[:2], dtype=np.float64), np.asarray(q[:2], dtype=np.float64)
+    n = max(2, int(math.ceil(np.linalg.norm(q - p) / step)) + 1)
+    return [tuple(map(float, p + t * (q - p))) for t in np.linspace(0.0, 1.0, n)]
+
+
+def agl_flags(terrain_occ, pts, route_name=None):
+    """AUDIT_SIM #2 的打标：tof_terrain_m（沿 pts 的地形最高格顶，None = 飞行层以下没东西）；
+    agl_model_unverified = 有地形 或 路线名含 over_（场地文档里「飞越桌面/长椅」的命名约定）；reason 按这个顺序列出。
+    只是标记：ToF 仍按平地模型算，真机在这些路线上的高度/俯仰会与仿真不同。"""
+    terrain_m = terrain_under_path(terrain_occ, pts)
+    reason = []
+    if terrain_m is not None:
+        reason.append("tof_terrain")
+    if route_name and "over_" in str(route_name):
+        reason.append("route_name")
+    return {"tof_terrain_m": terrain_m, "agl_model_unverified": bool(reason), "agl_model_unverified_reason": reason}
+
+
+def route_check(planner, spawn, waypoint, body_radius_m=None, margin_m=0.3, terrain_occ=None, route_name=None):
+    """离线可达性：A* 路径是否存在、航程、转向总量、沿路最小净空、步数预算，以及 ToF 地形打标（agl_flags）。
 
     净空 = occ.clearance（到最近原始占据格中心的水平距离）；要求 >= 机体半径 + margin_m 才算 clear_ok。
     转向量在 2×LOOKAHEAD_M 抽稀后的折线上累计（8 邻接栅格路径的 45° 锯齿大部分被抹掉，仍偏保守）。
+    terrain_occ（collision.terrain_from_scene）给了就沿 A* 路径查飞行层以下的桌面/长椅；没给只按路线名判。
     """
     occ = planner.occ
     body = float(body_radius_m if body_radius_m is not None else occ.body_radius)
@@ -249,7 +290,10 @@ def route_check(planner, spawn, waypoint, body_radius_m=None, margin_m=0.3):
     path = planner.plan((sx, sy), (float(waypoint["x"]), float(waypoint["y"])))
     if path is None:
         out["reason"] = "A* 无路径"
+        out.update(agl_flags(terrain_occ, segment_points((sx, sy), (waypoint["x"], waypoint["y"]), planner.voxel),
+                             route_name))
         return out
+    out.update(agl_flags(terrain_occ, path, route_name))
     # 抽稀：每 2×LOOKAHEAD_M 取一点，首尾保留（按 LOOKAHEAD_M 抽会把 45° 锯齿计成 200°+ 的转向量）
     thin, acc = [path[0]], 0.0
     for (ax, ay), (bx, by) in zip(path, path[1:]):
@@ -322,12 +366,17 @@ def main(argv=None):
     scene_mod = importlib.import_module("sim.3dgs.scene")
     collision = importlib.import_module("sim.3dgs.collision")
     scene = scene_mod.load_scene(args.scene)
-    planner = OccPlanner(collision.from_scene(scene))
+    # 高斯源只读一次 PLY（飞行层占据 + 飞行层以下的 ToF 地形层共用）；点云/网格源由 from_scene 自己读两遍。
+    gaussians = (scene_mod.read_gaussian_ply(scene["ply_path"])
+                 if scene.get("collision", {}).get("source", "gaussians") == "gaussians" else None)
+    planner = OccPlanner(collision.from_scene(scene, gaussians=gaussians))
+    terrain = collision.terrain_from_scene(scene, gaussians=gaussians)
     idxs = args.route if args.route else list(range(max(1, len(scene.get("routes") or []))))
     rows = []
     for i in idxs:
         sc = scene_mod.apply_route(dict(scene), i)
-        r = route_check(planner, sc["spawn"], sc["waypoint"])
+        r = route_check(planner, sc["spawn"], sc["waypoint"], terrain_occ=terrain,
+                        route_name=(sc.get("route") or {}).get("name"))
         r.pop("path", None)
         rows.append({"route": i, "name": (sc.get("route") or {}).get("name"), "spawn": sc["spawn"],
                      "waypoint": sc["waypoint"], "max_steps": sc.get("max_steps"), **r})

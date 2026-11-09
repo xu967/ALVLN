@@ -30,6 +30,7 @@ void FlattenState(const cf_sitl_state& st, double gz_sim_s, uint64_t late_action
   add(static_cast<double>(step_errors));         // [34] 插件：step_external 返回非 0 的次数
   // cf_sitl.h 2026-11-06 末尾追加的字段放在插件字段之后，保证 [32] 永远是 gz 时间。
   for (double s : st.sticks) add(s);             // [35..38] 杆量 roll pitch yaw ∈[-1,1], throttle ∈[0,1]
+  add(st.lib_version);                           // [39] CF_SITL_LIB_VERSION（2026-11-09 追加）
 }
 
 }  // namespace uavrgb

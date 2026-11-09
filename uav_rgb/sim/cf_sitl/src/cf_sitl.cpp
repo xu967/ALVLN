@@ -158,6 +158,7 @@ int cf_sitl_step_standalone(int n_steps) {
 
 void cf_sitl_get_state(cf_sitl_state *o) {
 	std::memset(o, 0, sizeof *o);
+	o->lib_version = CF_SITL_LIB_VERSION;   // 编译期常量，init 前也有效
 	if (!g || !g->inited) return;
 	const Sitl &s = *g;
 	o->t_s = s.t; o->exec_state = s.exec.state; o->fw_mode = s.fw.mode; o->armed = s.fw.armed;

@@ -2,6 +2,7 @@
 // state / reset / act / step / takeoff → ok=true 且字段合理；quit 后进程退出码 0。参数文件不存在退出 77（SKIP）。
 // 用法：test_proc_protocol <cf_sitl_proc> <e1_mini.json>
 #include "../src/json_min.h"
+#include "cf_sitl.h"
 
 #include <cmath>
 #include <cstdio>
@@ -86,6 +87,8 @@ int main(int argc, char **argv) {
 	             s->get("fw_mode") && s->get("armed") && s->get("action") && s->get("action_until_s") && s->get("battery_v") &&
 	             s->get("tof_m") && s->get("height_est_m") && s->get("hover_thrust") && s->get("vel");
 	CHECK(shape, "state 含 cf_sitl_state 全部字段，数组长度正确");
+	// 库版本（AUDIT_SIM 2026-11-09 #1）：Python 侧拿它拼 dynamics_profile 的 lib<N>，缺了就不能区分换库不换参数的数据
+	CHECK(st_num(r, "lib_version") == CF_SITL_LIB_VERSION && CF_SITL_LIB_VERSION >= 31, "state.lib_version == CF_SITL_LIB_VERSION（>= 31）");
 	r = p.call("{\"cmd\":\"reset\",\"episode\":1,\"spawn\":[0,0,0],\"yaw\":0.25}");
 	CHECK(ok_of(r) && st_num(r, "t_s") == 0, "reset → ok=true，t_s 归零");
 	r = p.call("{\"cmd\":\"reset\",\"episode\":-1}");

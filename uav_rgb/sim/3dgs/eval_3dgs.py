@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""3DGS 在线评测：gsplat 渲染 320x240 RGB -> student.py 的 C++ 推理 -> 黑盒推进。
+"""3DGS 在线评测：gsplat 渲染 320x240 RGB -> student.py 的 C++ 推理 -> 动力学推进。
 
 学生推理链路**完全复用** sim/tools/student.py（常驻 uavrgb_infer 子进程，自己把
-320x240 缩到模型输入 160x120），本文件只负责在线环境。碰撞用 collision.py 的导航系
-3D 占据代理（沿每步位移扫掠）。
+320x240 缩到模型输入 160x120），本文件只负责在线环境。动力学默认 --dynamics cf_sitl
+（E1 MINI 固件在环子进程，$CF_SITL_PROC 缺失直接报错），cf_blackbox 只用于冒烟/单测。
+碰撞用 collision.py 的导航系 3D 占据代理（沿每步位移扫掠）。
 成功（3dgs.pilot.v2）= 无碰撞且轨迹曾进入 waypoint 的欧氏半径 reach_radius_m
 （scene.json，缺省 eval_closed_loop.REACH_RADIUS=1.5 m）；不再看 max_x（AUDIT #10）。
 
@@ -16,7 +17,7 @@ hold（每步动作窗口）必须显式给：--hold，或 --data 指向采集 r
       --ckpt $DATA_ROOT/uav_rgb/airsim10k-run/ckpt_best.bin --episodes 1 --steps 20 \
       --data $DATA_ROOT/uav_rgb/run/ds/dataset.uavr
   # 无学生权重时先冒烟链路：
-  ... --policy forward --mock-renderer --episodes 1 --steps 3 --hold 0.5
+  ... --policy forward --mock-renderer --dynamics cf_blackbox --episodes 1 --steps 3 --hold 0.5
 """
 import argparse
 import hashlib
@@ -170,8 +171,9 @@ def main():
     p.add_argument("--device", default="cuda")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--save-depth", action="store_true")
-    p.add_argument("--dynamics", choices=("cf_blackbox", "cf_sitl"), default="cf_blackbox",
-                   help="cf_sitl = E1 MINI 固件在环子进程（参数默认 sim/dynamics/e1_mini.json）")
+    p.add_argument("--dynamics", choices=("cf_blackbox", "cf_sitl"), default="cf_sitl",
+                   help="默认 cf_sitl = E1 MINI 固件在环子进程（参数默认 sim/dynamics/e1_mini.json，"
+                        "可执行文件取 $CF_SITL_PROC，缺失直接报错）；cf_blackbox 只用于冒烟/单测")
     p.add_argument("--dynamics-params", default=None)
     p.add_argument("--spawn-jitter", type=float, default=0.0)
     p.add_argument("--record-video", action="store_true",
@@ -198,9 +200,20 @@ def main():
         p.error(str(e))
     if args.episodes < 1 or steps < 1 or not (math.isfinite(hold) and hold > 0):
         p.error("episodes/steps 必须 >=1，hold 必须有限正数")
-    params = (CfSitlParams.from_json(args.dynamics_params) if args.dynamics == "cf_sitl"
-              else CfBlackboxParams.from_json(args.dynamics_params))
-    occ = collision_mod.from_scene(scene)
+    try:
+        params = (CfSitlParams.from_json(args.dynamics_params) if args.dynamics == "cf_sitl"
+                  else CfBlackboxParams.from_json(args.dynamics_params))
+    except (FileNotFoundError, RuntimeError) as e:   # cf_sitl_proc 缺失 / 库版本探测失败：不悄悄退回黑盒
+        p.error(f"--dynamics {args.dynamics}: {e}")
+    gaussians = (scene_mod.read_gaussian_ply(scene["ply_path"])
+                 if scene.get("collision", {}).get("source", "gaussians") == "gaussians" else None)
+    occ = collision_mod.from_scene(scene, gaussians=gaussians)
+    # ToF 平地模型打标（AUDIT_SIM #2）：评测集 manifest 也带 tof_terrain_m / agl_model_unverified（沿 spawn→waypoint 直线段）
+    agl = planner_mod.agl_flags(collision_mod.terrain_from_scene(scene, gaussians=gaussians),
+                                planner_mod.segment_points((scene["spawn"]["x"], scene["spawn"]["y"]),
+                                                           (scene["waypoint"]["x"], scene["waypoint"]["y"]), occ.voxel),
+                                (scene.get("route") or {}).get("name"))
+    del gaussians
     renderer = renderer_mod.make_renderer(scene, args.mock_renderer, args.width,
                                           args.height, args.fov, args.device)
     # 身份（AUDIT #1）：scene_id/geometry_gid 来自 PLY 指纹，不随 seed 变。评测集固定写
@@ -238,7 +251,7 @@ def main():
                     dynamics_path=args.dynamics_params,
                     spawn_jitter=args.spawn_jitter,
                     identity=identity, split_policy=split_policy,
-                    dynamics=args.dynamics)
+                    dynamics=args.dynamics, agl=agl)
             except Exception as e:  # noqa: BLE001 - 单集失败要进报告
                 failures.append({"episode": ep, "seed": args.seed + ep,
                                  "error": f"{type(e).__name__}: {e}"})
@@ -302,6 +315,8 @@ def main():
         "success_criterion": SUCCESS_CRITERION,
         "reach_radius_m": reach_radius_of(scene),
         "spl_reference": SPL_REFERENCE if occ_planner is not None else None,
+        # ToF 平地模型打标（AUDIT_SIM #2）：true 的路线真机高度/俯仰与仿真不同，评测数字不能当「2 m AGL」口径
+        **agl,
         # 任务身份：同一 PLY 改了 waypoint/spawn 就是另一个任务；以前 eval.json 只有 PLY 指纹，
         # 目标从 -6 挪到 -7.5 的两次评测在报告层面完全一样（AUDIT #17）。
         "scene": {"name": scene.get("name"), "path": scene["path"],

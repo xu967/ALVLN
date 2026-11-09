@@ -58,8 +58,11 @@ def read_gaussian_ply(path):
                 count = int(text.split()[2])
             elif text.startswith("property "):
                 parts = text.split()
-                if len(parts) == 3 and parts[1] == "float":
-                    props.append(parts[2])
+                # INRIA 3DGS PLY 全是 float；别的类型（uchar 颜色、list 面）进不了 dtype，二进制表会整体
+                # 错位读成垃圾而不报错，所以直接拒绝（D10）。
+                if len(parts) != 3 or parts[1] != "float":
+                    raise ValueError(f"{path}: 不支持的属性类型 {' '.join(parts[1:])}（3DGS PLY 只收 property float）")
+                props.append(parts[2])
             elif text == "end_header":
                 header_done = True
                 break

@@ -29,4 +29,19 @@
 - demo 视频：6 条路线都可用，字幕写「真实校园外观」，不写「2 m 低空」。
 - 定量「2 m AGL」口径：只用 r3/r4。r0/r1/r2/r5 的集在 pilot 数据说明里标 `agl_unverified`，与 Gazebo 2 m 数据或真机 2 m 飞行对比时排除。
 - P2 深度分带辅助目标：Callinstrasse 下半幅（近地面）深度不可信，辅助头训练优先用 Wanderland（LiDAR 真值地面）、garden / bicycle（俯视核 ≤0.1 m）；要用 Callinstrasse 就把近地面行掩成 255 未知。
-- 「有真值地面」的主场地让位给 Wanderland；Callinstrasse 保留为外观多样性场景。`scene.json` 的 notes[1] 等 VIZ-LAYOUT 渲染结束后同步改写（渲染中不动数据盘文件）。
+- 「有真值地面」的主场地让位给 Wanderland；Callinstrasse 保留为外观多样性场景。`scene.json` 的 notes[1]/[4] 已于 2026-11-09 18:46 按本文改写（FIXLIST D8；备份 `scene.json.bak-20261109-1846`，sha256 `fe81af52…` → `1d02d9f4…`，只动 notes 两条，spawn/waypoint/routes/camera/collision 不变）。影响：之后采的集 manifest `scene.json_sha256` 变；`sim/3dgs/video.py` 重合成 11-09 之前的集要带 `--allow-scene-mismatch`（它按 sha 核对 episode 目录内的 scene.json 副本与当前文件）；`tools/demo_3dgs_routes.py` 的 `complete_episodes` 复用不比对 scene sha，旧集照常复用。
+
+## ToF 地形打标（2026-11-09，AUDIT_SIM #2，`python -m sim.3dgs.planner --scene … --json`）
+
+口径见 `3dgs-site-garden.md` §8：`[0.3 m, z_slice 下沿 1.8 m)` 层（voxel 0.2 m，所以格顶是 0.5/0.7/0.9/1.1）沿 A* 路径查正下方最高占据格顶 → `tof_terrain_m`；不为 None 或路线名含 `over_` → `agl_model_unverified`（写进 manifest / eval.json，不改 ToF 输入）。
+
+| 路线 | tof_terrain_m | agl_model_unverified | 原因 |
+| --- | --- | --- | --- |
+| r0_straight_east | 0.7 | 是 | tof_terrain |
+| r1_hedge_left_turn | 1.1 | 是 | tof_terrain |
+| r2_dogleg_plaza | 0.5 | 是 | tof_terrain |
+| r3_crossing_left_north | 0.5 | 是 | tof_terrain |
+| r4_crossing_right_south | 0.5 | 是 | tof_terrain |
+| r5_west_field_s | 0.9 | 是 | tof_terrain |
+
+六条都打标，但原因不同：r3/r4 的 0.5 m 是路口重建地面（nav +0.15 众数）的高斯厚度（1.5σ）顶到了 0.3 m 层，不是家具——这一层的 0.3 m 下沿分不开「厚地面」与「矮障碍」；r0/r1/r5 脚下 0.7–1.1 m 是树篱/浮子。与上文「只有 r3/r4 能核 2 m AGL」的结论不矛盾：那是按有无地面核高度，这里是按 ToF 会不会被脚下东西带偏；两项都成立的路线本场地没有。
