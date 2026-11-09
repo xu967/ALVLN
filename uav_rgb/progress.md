@@ -28,6 +28,12 @@
 - 19:16 GPU 对拍 DONE（rc=1，6 集墙钟超时）：BC 7/17（碰撞 7）、截断 15/17（碰撞 1），逐集成功一致 13/17 → 写进 demo-plan §3.3 补记与 scoreboard §1；结论：eval4 同机重跑全部臂、用 sim09.v2、放宽超时。
 - 19:15 早期观察：3DGS 教师在 hold 1.0 下目标附近左右来回转（bicycle r1 / r5、garden r4 多集耗尽步数），是已知 L/R 死锁（FIXLIST D9）在大步长下更易触发；截断学生在 garden 前 4 条路线 20 集撞 19 集。
 
+- 19:25 STUDENT-SELECT 交付并合并（11fefde）：`--save-every-epoch`、`tools/select_ckpt.py`、`tools/probe_two_frame_cf.py`；三 seed best val macro-F1 0.426/0.407/0.394；双帧不进流水线。eval4 加三个额外臂（闭环看训练噪声）：`$DATA_ROOT/uav_rgb/exp-student-select-20261109/e1-noise/seed{0,1,2}/run/ckpt_best.bin`（seed0 权重 = `ckpt_trunc_distill.bin`，可与截断臂合并）；可选 select_epoch 版 `seed0/ckpt_ep20.bin`、`seed1/ckpt_ep11.bin`、`seed2/ckpt_ep29.bin`。
+- 19:27 派 SCENE-3DGS（只接 stump；worktree `tmp/wt-scene-3dgs`，断点 `tmp/agent10-scene-3dgs/PROGRESS.md`；用户若给尺寸参照写进 `tmp/agent10-scene-3dgs/USER_SCALE.txt`）。
+
+- 19:35 DAGGER-GZ 交付并合并（e5e2206）：`tools/dagger_gz_pipeline.py` + 18 项测试、`preprocess --allow-mixed-dynamics` + 红测；smoke 全链 rc=0。正式 3 轮约 6 h，等 FIX-A / FIX-SIM 合并与 eval4 后由主会话起（报告 §0 有一行命令，起之前改成从 main 跑）。
+- 19:38 「60 个独立 test 几何」核实：base 任务总共约 794 种几何（seed 扫到 12000 也没有新的），v5 test 分区 71 个；0417 / sgvis 碰到的 24 个全在它们的 test 分区（按几何组划分，E1 学生从没训练过）；旧 X3 学生（v3 salt）在 train/val 用过其中 31 个。现行排除规则（三个采集集碰过的全排）剩 24；只排 X3 学生训练过的剩 40；E1 学生之间比较可用全部 71。**待用户定 M3 的 n=60 口径**（建议：E1 臂用 71 个里的 60 个，旧 X3 学生只在它没见过的 40 个上评或不进 n=60 表）。
+
 ### 关键决策
 
 - 见 PLAN「更新 2026-11-09」决策 1–5。
