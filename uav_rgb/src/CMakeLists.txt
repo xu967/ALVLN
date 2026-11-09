@@ -204,3 +204,19 @@ add_test(NAME test_run_owner COMMAND test_run_owner)
 add_executable(test_save_every_epoch tests/test_save_every_epoch.cpp)
 target_link_libraries(test_save_every_epoch PRIVATE uavrgb_core)
 add_test(NAME test_save_every_epoch COMMAND test_save_every_epoch)
+
+# 训练启动只算一次数据集 SHA256（config / 契约 / 软标签 / 侧车共用），按进程读字节数验证。
+add_executable(test_sha_once tests/test_sha_once.cpp)
+target_link_libraries(test_sha_once PRIVATE uavrgb_core)
+add_test(NAME test_sha_once COMMAND test_sha_once)
+
+# warmup 覆盖全程的告警；resume 时 ckpt_best.bin 比 ckpt.bin 新/旧的处理。
+add_executable(test_resume_best_warn tests/test_resume_best_warn.cpp)
+target_link_libraries(test_resume_best_warn PRIVATE uavrgb_core)
+add_test(NAME test_resume_best_warn COMMAND test_resume_best_warn)
+
+# uavrgb_train 入口的退出码（eval-only 目录归属 / 坏 config 不 abort / --seed 范围 / eval+resume 互斥）。
+add_executable(test_train_cli tests/test_train_cli.cpp)
+target_link_libraries(test_train_cli PRIVATE uavrgb_core)
+add_dependencies(test_train_cli uavrgb_train)
+add_test(NAME test_train_cli COMMAND test_train_cli $<TARGET_FILE:uavrgb_train>)

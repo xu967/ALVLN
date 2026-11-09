@@ -157,9 +157,12 @@ episode 相机尺寸必须一致。
 
 ## 6. UAVRAUX1 侧车 `dataset.aux`（STUDENT-P2：上一帧链 / prev-action / 深度分带目标）
 
-与 `dataset.uavr` 同目录、同名换后缀（`<name>.aux`），新版 `tools/preprocess.py` 总是写；
-`dataset.uavr` 的字节与 v1 完全一致。读端（`src/aux_sidecar.cpp`、`tools/read_dataset.cpp`）
-文件不存在 → 当旧数据集；存在但不自洽 → 直接报错，不半读。
+与 `dataset.uavr` 同目录、同名换后缀（`<name>.aux`），新版 `tools/preprocess.py` 总是写。
+`dataset.uavr` 的头、像素区、标签区与 v1 逐字节相同，旧读端照常读；但 meta JSON 多了
+`aux_sidecar` 键，所以**同一批 episode 重打包后整文件 SHA256 与旧包不同**——按该 SHA 绑定的
+P1 软标签（UAVSOFT1）要对新包重新 `join_soft_targets`，旧 `.bin` 会被训练器拒绝。
+读端（`src/aux_sidecar.cpp`、`tools/read_dataset.cpp`）文件不存在 → 当旧数据集；存在但不自洽 →
+直接报错，不半读。
 
 ### 6.1 头（128 字节，little-endian）
 
@@ -183,13 +186,13 @@ episode 相机尺寸必须一致。
 
 | 段 | 类型 | 说明 |
 |---|---|---|
-| prev_index | `u32[N]` | 全局样本下标：同 episode 内 step−1 的样本；首帧、或上一步被 `--drop-collision` 丢掉时 = 自身下标（训练器据此标记 first_frame） |
+| prev_index | `u32[N]` | 全局样本下标：同 episode 内 step−1 的样本；首帧、或上一步被打包侧 `--drop-collision` 丢掉时 = 自身下标。读端由此派生 `first_frame[i] = (prev_index[i] == i)` 供工具/分析用；训练器目前直接按 prev_index 取上一帧，不读 first_frame |
 | prev_action | `u8[N]` | 上一步**执行**的动作（`actions.jsonl` 的 `action_executed`，旧数据退回 `action_expert`）；首帧 = 0（SAFE_NEUTRAL）。注意：上一步被丢掉时它仍取该步真实执行的动作 |
 | depth（flags bit0） | `u8[N·depth_h·depth_w]` | 行优先 `[n][r][c]`，0..K−1 为分带（K−1 含「没打到东西」），255 = 未知（损失屏蔽） |
 
 深度目标的生成（`preprocess.aux_payload`）：源分辨率深度图 → 每格（源图按 H/8×W/8 均分）
 取最小已知深度 → 按机体包络膨胀（深度 z 的格把 z 扩散到像素半径 `f·r_env/z` 内的邻格，
-f 取 manifest `camera.fx`，没有则按 60° HFOV 推算）→ `searchsorted(band_edges)`。
+f 取**该样本所属 episode** 的 manifest `camera.fx`，没有则按 60° HFOV 推算；多相机混包时逐 episode 分别膨胀）→ `searchsorted(band_edges)`。
 
 **深度 0 的语义按来源区分**，判据是 manifest 的 `depth_format`（它同时决定解码方式；不按文件扩展名猜）：
 
@@ -206,3 +209,13 @@ f 取 manifest `camera.fx`，没有则按 60° HFOV 推算）→ `searchsorted(b
 
 `--two-frame` / `--prev-action` 需要侧车存在，`--depth-aux` 需要 flags bit0；缺了直接报错，
 不静默降级。旧数据集（无侧车）不带这些开关时训练行为与之前逐字节一致。
+
+两处 `--drop-collision` 对上一帧链的作用不同，别混用：
+
+| 丢碰撞步的位置 | 碰撞步在文件里 | 下一步的 prev_index | 下一步的 prev_action |
+|---|---|---|---|
+| 打包侧 `preprocess.py --drop-collision` | 不在（N 已减少） | 指向自身（当首帧） | 仍是碰撞步真实执行的动作 |
+| 训练器侧 `--drop-collision`（`LoadOptions`） | 在，只是不进 train/val/test 下标 | **仍指向碰撞步**，双帧输入照样把它当上一帧读进来 | 同上 |
+
+也就是说训练器侧过滤只影响「哪些样本当目标」，不改侧车链；想让上一帧链也绕开碰撞步，
+必须在打包时丢。

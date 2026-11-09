@@ -63,7 +63,15 @@ int main(int argc, char** argv) {
       } else if (a == "--resume") {
         cfg.resume = next("--resume");
       } else if (a == "--seed") {
-        cfg.seed = static_cast<unsigned>(std::stoul(next("--seed")));
+        // std::stoul 接受 "-1"（折成 2^64-1）再截成 uint32，config.json 里记的 seed 和用户敲的对不上。
+        const std::string s = next("--seed");
+        std::size_t used = 0;
+        const bool digits = !s.empty() && s[0] >= '0' && s[0] <= '9';
+        const unsigned long long v = digits ? std::stoull(s, &used) : 0ull;
+        if (!digits || used != s.size() || v > 4294967295ull) {
+          throw std::invalid_argument("--seed 必须是 0..4294967295 的整数: " + s);
+        }
+        cfg.seed = static_cast<unsigned>(v);
         cfg.seed_set = true;
       } else if (a == "--max-grad-norm") {
         cfg.max_grad_norm = std::stof(next("--max-grad-norm"));
@@ -95,6 +103,7 @@ int main(int argc, char** argv) {
         cfg.strict_distill = true;
       } else if (a == "--augment") {
         cfg.augment = next("--augment");
+        cfg.augment_set = true;
         std::stringstream ss(cfg.augment);
         for (std::string tok; std::getline(ss, tok, ',');) {
           if (tok != "all" && tok != "photo" && tok != "shift" && tok != "flip") {
@@ -104,16 +113,20 @@ int main(int argc, char** argv) {
       } else if (a == "--warmup") {
         cfg.warmup_steps = std::stoi(next("--warmup"));
         if (cfg.warmup_steps < 0) throw std::invalid_argument("--warmup 不能为负");
+        cfg.warmup_steps_set = true;
       } else if (a == "--cosine-lr") {
         cfg.cosine_lr = true;
+        cfg.cosine_lr_set = true;
       } else if (a == "--weight-decay") {
         cfg.weight_decay = std::stof(next("--weight-decay"));
         if (!(cfg.weight_decay >= 0.0f)) throw std::invalid_argument("--weight-decay 不能为负");
+        cfg.weight_decay_set = true;
       } else if (a == "--label-smoothing") {
         cfg.label_smoothing = std::stof(next("--label-smoothing"));
         if (!(cfg.label_smoothing >= 0.0f) || !(cfg.label_smoothing < 1.0f)) {
           throw std::invalid_argument("--label-smoothing 必须在 [0,1)");
         }
+        cfg.label_smoothing_set = true;
       } else if (a == "--two-frame") {
         cfg.two_frame = true;
         cfg.two_frame_set = true;
@@ -156,6 +169,21 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "--batch 必须为正\n");
       return 2;
     }
+    if (!cfg.resume.empty()) {
+      std::fprintf(stderr, "--eval-only 与 --resume 不能同给（评估不续训；多半是命令拼错）\n");
+      usage();
+      return 2;
+    }
+    // --out 是别的已完成 run 目录（有 config.json，而 ckpt 不在其中）时拒绝：
+    // 否则另一模型的 validation 事件会被追加进那个 run 的 metrics.jsonl，事后分不出来。
+    if (std::filesystem::exists(std::filesystem::path(cfg.out_dir) / "config.json") &&
+        !uavrgb::same_run_dir(cfg.out_dir, eval_ckpt)) {
+      std::fprintf(stderr,
+                   "eval-only: %s 已是另一个 run 的目录（有 config.json），而 %s 不在其中；"
+                   "请 --out 指向 ckpt 自己的 run 目录或一个新目录\n",
+                   cfg.out_dir.c_str(), eval_ckpt.c_str());
+      return 2;
+    }
     // 输出目录通常就是训练 run-dir（非空），允许在已有产物上追加评估事件；
     // 仍用 RunOwner 防止与正在写同一目录的训练并发。
     std::optional<uavrgb::RunOwner> eval_owner;
@@ -165,9 +193,10 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "%s\n", e.what());
       return 2;
     }
-    // 碰撞过滤是数据身份的一部分：eval-only 默认继承训练 run 的 drop_collision，
-    // 显式传入但与训练 config 不一致时拒绝（否则同权重同数据的指标对不上）。
-    {
+    try {
+      // 碰撞过滤是数据身份的一部分：eval-only 默认继承训练 run 的 drop_collision，
+      // 显式传入但与训练 config 不一致时拒绝（否则同权重同数据的指标对不上）。
+      // 放在 try 里：config.json 字段损坏时 read_run_config 的 stof/stoi 会抛，不能 abort。
       const std::filesystem::path ckpt_dir =
           std::filesystem::path(eval_ckpt).parent_path().empty()
               ? std::filesystem::path(".")
@@ -187,15 +216,13 @@ int main(int argc, char** argv) {
                      "警告: %s 的 config 无 drop_collision，无法继承（按命令行值）\n",
                      ckpt_dir.string().c_str());
       }
-    }
-    try {
       uavrgb::Trainer tr(cfg);
       tr.eval_only(eval_ckpt, eval_split != "test", eval_split != "val");
       // test 评估单独留痕：查询次数/日期/数据身份，不改历史 metrics。
+      // 数据集 SHA 由 eval_only 加载时算好（config().dataset_sha256），这里不再读一遍。
       if (eval_split != "val") {
         uavrgb::append_test_eval_record(cfg.out_dir, "eval_only", eval_ckpt, cfg.data_path,
-                                        uavrgb::file_sha256_hex(cfg.data_path),
-                                        cfg.drop_collision, 0);
+                                        tr.config().dataset_sha256, cfg.drop_collision, 0);
       }
     } catch (const std::exception& e) {
       std::fprintf(stderr, "评估失败: %s\n", e.what());

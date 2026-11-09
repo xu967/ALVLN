@@ -869,12 +869,21 @@ def aux_payload(episodes, size, envelope_radius_m):
                 die("%s: 深度尺寸 %r 与相机 %dx%d 不一致"
                     % (s["depth"], d.shape, ep["src_w"], ep["src_h"]))
             cells[k] = cell_min_depth(d, grid)
-        ep0 = part[0][0]
-        fx = ep0.get("camera_fx")
-        focal = float(fx) if fx else (ep0["src_w"] / 2.0) / np.tan(np.radians(DEFAULT_HFOV_DEG / 2))
-        cells = dilate_by_envelope(cells, focal, ep0["src_w"] / grid[1], envelope_radius_m)
+        # 焦距按每条 episode 自己的 camera.fx 取：一块里可能混着不同相机的 episode，
+        # 套第一条的焦距会让其余样本的膨胀半径按错的相机算（src_w 已在 collect 时强制一致）。
+        focals = np.array([episode_focal_px(ep) for ep, _ in part], dtype=np.float64)
+        for focal in np.unique(focals):
+            sel = focals == focal
+            cells[sel] = dilate_by_envelope(cells[sel], float(focal), part[0][0]["src_w"] / grid[1],
+                                            envelope_radius_m)
         depth[start:start + len(part)] = depth_bands(cells)
     return prev_index, prev_action, depth, grid
+
+
+def episode_focal_px(ep):
+    """episode 的水平焦距（px）：manifest camera.fx，缺省按 DEFAULT_HFOV_DEG 由 src_w 反推。"""
+    fx = ep.get("camera_fx")
+    return float(fx) if fx else (ep["src_w"] / 2.0) / np.tan(np.radians(DEFAULT_HFOV_DEG / 2))
 
 
 def write_aux_sidecar(out_dir, uavr_path, prev_index, prev_action, depth, grid,

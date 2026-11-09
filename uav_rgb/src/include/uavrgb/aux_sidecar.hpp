@@ -1,7 +1,10 @@
 #pragma once
 // UAVRAUX1 侧车（STUDENT-P2 双帧 / prev-action / 深度分带目标），格式见 tools/DATASET_FORMAT.md §6。
 // 与 UAVSOFT1 同一套绑定方式：头里记 dataset.uavr 整文件 SHA256，不匹配直接拒绝。
-// dataset.uavr 本身字节不变，旧读端（join_soft_targets / baseline_priors / 视频训练脚本）不受影响。
+// 侧车不改 dataset.uavr 的像素/标签区字节；但打包时 meta 多了 aux_sidecar 键，文件 SHA 与旧包不同，
+// 旧读端（join_soft_targets / baseline_priors / 视频训练脚本）照常读，按 SHA 绑定的 P1 软标签要重新 join。
+#include "uavrgb/sha256.hpp"
+
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -30,7 +33,8 @@ std::string aux_sidecar_path(const std::string& uavr_path);
 
 // 读取并校验（N/H/W 与 uavr 头、两个 SHA256、payload 取值范围）；文件不存在返回 present=false，
 // 存在但不自洽抛 std::runtime_error——半坏的侧车比没有更危险。
+// uavr_sha256 非空时直接用调用方已算好的整文件 SHA（load_uavr 顺手算的那份），空则自己读一遍。
 AuxSidecar load_aux_sidecar(const std::string& uavr_path, int n, int h, int w,
-                            std::uint32_t num_classes);
+                            std::uint32_t num_classes, const Sha256* uavr_sha256 = nullptr);
 
 }  // namespace uavrgb

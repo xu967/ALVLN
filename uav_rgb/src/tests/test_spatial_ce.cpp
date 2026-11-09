@@ -108,6 +108,15 @@ int main() {
     std::cout << "spatial_ce cuda parity: |Δloss|=" << std::fabs(lh - ld) << " max|Δgrad|=" << dg << "\n";
     expect(dg < 1e-6, "CUDA grad 与 CPU 一致");
     expect(gradcheck_spatial_ce(big, t, 1e-4) < 1e-5, "大张量 gradcheck < 1e-5");
+    // 全 255（整批没有一个有效深度格，3DGS 空洞帧会出现）：CUDA 版必须给 loss=0、梯度全 0，
+    // 不能是 0/0=NaN——trainer 的 aux_loss 只在 valid==0 时把 scale 置 0，这条路径以前没单测（B3）。
+    const std::vector<std::uint8_t> none(t.size(), kSpatialIgnore);
+    const float l0 = spatial_ce_loss_cuda(big, none);
+    expect(l0 == 0.0f, "CUDA 全屏蔽 loss=0（不是 NaN）");
+    const Tensor g0 = spatial_ce_grad_cuda(big, none);
+    bool zero = g0.numel() == big.numel();
+    for (std::size_t i = 0; zero && i < g0.numel(); ++i) zero = g0[i] == 0.0f;
+    expect(zero, "CUDA 全屏蔽梯度全 0（不是 NaN）");
   }
   // 非法输入：rank、targets 数量、target 越界、K 撞屏蔽码。
   expect(throws_invalid([&] { (void)spatial_ce_loss(Tensor::zeros({2, 3}), {0, 1}); }), "rank!=4 抛");

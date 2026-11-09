@@ -3,7 +3,8 @@
 // kernel 经 ops_dev.hpp 的设备指针级函数暴露给常驻路径；host Tensor 包装只做分配/拷贝/同步，
 // 供 CPU/CUDA 对拍。
 #include "uavrgb/linear_cuda.hpp"
-#include "uavrgb/cuda_alloc.hpp"
+
+#include "cuda_check.hpp"
 #include "uavrgb/ops_dev.hpp"
 
 #include <cuda_runtime.h>
@@ -15,44 +16,6 @@
 
 namespace uavrgb {
 namespace {
-
-// 统一 CUDA API 错误检查：抛 std::runtime_error 而不是 std::exit，调用方可以 catch 后
-// 降 batch/重试；栈上 DeviceBuf 等 RAII 正常析构，checkpoint 落盘不会被跳过。
-#define CUDA_CHECK(call)                                                          \
-  do {                                                                            \
-    const cudaError_t err_ = (call);                                              \
-    if (err_ != cudaSuccess) {                                                    \
-      throw std::runtime_error(std::string("CUDA error ") + __FILE__ + ":" +      \
-                               std::to_string(__LINE__) + ": " +                  \
-                               cudaGetErrorString(err_));                         \
-    }                                                                             \
-  } while (0)
-
-// launch 后立刻查配置错误；执行期错误留给调用方的同步点。
-void launched(const char* name) {
-  const cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    throw std::runtime_error(std::string("CUDA kernel ") + name + ": " + cudaGetErrorString(err));
-  }
-}
-
-// 极简设备缓冲 RAII：析构自动释放，异常路径也不泄漏。
-struct DeviceBuf {
-  float* p = nullptr;
-  DeviceBuf() = default;
-  explicit DeviceBuf(std::size_t bytes) {
-    if (cudaMalloc(&p, bytes) != cudaSuccess) throw_alloc_failure(bytes, __FILE__, __LINE__);
-  }
-  ~DeviceBuf() {
-    if (p) cudaFree(p);
-  }
-  DeviceBuf(DeviceBuf&& o) noexcept : p(o.p) { o.p = nullptr; }
-  DeviceBuf(const DeviceBuf&) = delete;
-  DeviceBuf& operator=(const DeviceBuf&) = delete;
-};
-
-constexpr int kThreads = 256;
-int blocks_for(std::int64_t total) { return static_cast<int>((total + kThreads - 1) / kThreads); }
 
 // 元素数一律先用 int64 计算并校验上限：超过 INT_MAX 直接抛异常，绝不静默回绕后少算输出。
 std::int64_t check_elems(std::int64_t total, const char* what) {
@@ -118,8 +81,8 @@ __global__ void linear_dx_kernel(const float* __restrict__ dlogits,
   dx[i * in + j] = acc;
 }
 
-DeviceBuf upload(const Tensor& t) {
-  DeviceBuf d(t.numel() * sizeof(float));
+DeviceBuf<float> upload(const Tensor& t) {
+  DeviceBuf<float> d(t.numel() * sizeof(float));
   CUDA_CHECK(cudaMemcpy(d.p, t.data(), t.numel() * sizeof(float), cudaMemcpyHostToDevice));
   return d;
 }
@@ -166,10 +129,10 @@ Tensor linear_forward_cuda(const Linear& m, const Tensor& x) {
   check_elems(static_cast<std::int64_t>(m.out) * m.in, "W 元素数");
   Tensor y = Tensor::zeros({n64, m.out});
   if (n64 == 0) return y;  // 空 batch：直接返回形状正确的空张量。
-  const DeviceBuf d_x = upload(x);
-  const DeviceBuf d_w = upload(m.W);
-  const DeviceBuf d_b = upload(m.b);
-  DeviceBuf d_y(y.numel() * sizeof(float));
+  const DeviceBuf<float> d_x = upload(x);
+  const DeviceBuf<float> d_w = upload(m.W);
+  const DeviceBuf<float> d_b = upload(m.b);
+  DeviceBuf<float> d_y(y.numel() * sizeof(float));
   dev::linear_forward(static_cast<int>(n64), m.in, m.out, d_x.p, d_w.p, d_b.p, d_y.p);
   CUDA_CHECK(cudaDeviceSynchronize());
   download(y, d_y.p);
@@ -193,12 +156,12 @@ LinearGrad linear_backward_cuda(const Linear& m, const Tensor& x, const Tensor& 
   g.db = Tensor::zeros({m.out});
   g.dx = Tensor::zeros({n64, m.in});
   if (n64 == 0) return g;  // 空 batch：全零梯度，不 launch kernel（0 block 非法）。
-  const DeviceBuf d_x = upload(x);
-  const DeviceBuf d_w = upload(m.W);
-  const DeviceBuf d_dl = upload(dlogits);
-  DeviceBuf d_dw(g.dW.numel() * sizeof(float));
-  DeviceBuf d_db(g.db.numel() * sizeof(float));
-  DeviceBuf d_dx(g.dx.numel() * sizeof(float));
+  const DeviceBuf<float> d_x = upload(x);
+  const DeviceBuf<float> d_w = upload(m.W);
+  const DeviceBuf<float> d_dl = upload(dlogits);
+  DeviceBuf<float> d_dw(g.dW.numel() * sizeof(float));
+  DeviceBuf<float> d_db(g.db.numel() * sizeof(float));
+  DeviceBuf<float> d_dx(g.dx.numel() * sizeof(float));
   dev::linear_backward(static_cast<int>(n64), m.in, m.out, d_x.p, d_w.p, d_dl.p, d_dw.p, d_db.p,
                        d_dx.p);
   CUDA_CHECK(cudaDeviceSynchronize());

@@ -131,20 +131,33 @@ bool read_run_config(const std::string& run_dir, RunConfigSnapshot* out) {
   os << f.rdbuf();
   const std::string js = os.str();
   auto str = [&](const char* k) { return raw_field(js, k); };
+  // 手改/截断的 config 会让 stof/stoi 抛 "stof" 这种没上下文的异常：统一在这里补上文件和字段名。
+  auto num = [&](const char* k, auto conv) {
+    try {
+      return conv(str(k));
+    } catch (const std::logic_error& e) {
+      throw std::runtime_error("读 " + run_dir + " 的 config 失败：字段 " + k + " 不是合法数值（" +
+                               e.what() + "）");
+    }
+  };
+  auto to_f = [](const std::string& v) { return std::stof(v); };
+  auto to_i = [](const std::string& v) { return std::stoi(v); };
   out->has_lr = !str("lr").empty();
-  if (out->has_lr) out->lr = std::stof(str("lr"));
+  if (out->has_lr) out->lr = num("lr", to_f);
   out->has_batch = !str("batch").empty();
-  if (out->has_batch) out->batch = std::stoi(str("batch"));
+  if (out->has_batch) out->batch = num("batch", to_i);
   out->has_seed = !str("seed").empty();
-  if (out->has_seed) out->seed = static_cast<unsigned>(std::stoul(str("seed")));
+  if (out->has_seed) {
+    out->seed = num("seed", [](const std::string& v) { return static_cast<unsigned>(std::stoul(v)); });
+  }
   out->has_drop_collision = !str("drop_collision").empty();
   if (out->has_drop_collision) out->drop_collision = str("drop_collision") == "true";
   out->soft_targets = str("soft_targets");
   out->has_soft_targets = !out->soft_targets.empty();
   out->has_distill_alpha = !str("distill_alpha").empty();
-  if (out->has_distill_alpha) out->distill_alpha = std::stof(str("distill_alpha"));
+  if (out->has_distill_alpha) out->distill_alpha = num("distill_alpha", to_f);
   out->has_text_dim = !str("text_dim").empty();
-  if (out->has_text_dim) out->text_dim = std::stoi(str("text_dim"));
+  if (out->has_text_dim) out->text_dim = num("text_dim", to_i);
   out->has_vision_only = !str("vision_only").empty();
   out->vision_only = str("vision_only") == "true";
   out->dataset_sha256 = str("dataset_sha256");
@@ -155,7 +168,18 @@ bool read_run_config(const std::string& run_dir, RunConfigSnapshot* out) {
   out->has_depth_aux = !str("depth_aux").empty();
   out->depth_aux = str("depth_aux") == "true";
   out->has_aux_lambda = !str("aux_lambda").empty();
-  if (out->has_aux_lambda) out->aux_lambda = std::stof(str("aux_lambda"));
+  if (out->has_aux_lambda) out->aux_lambda = num("aux_lambda", to_f);
+  // 算法开关（B2）：augment 为 "" 时 raw_field 返回空串 = 视作未记录，继承结果同样是「关」。
+  out->augment = str("augment");
+  out->has_augment = !out->augment.empty();
+  out->has_warmup_steps = !str("warmup_steps").empty();
+  if (out->has_warmup_steps) out->warmup_steps = num("warmup_steps", to_i);
+  out->has_cosine_lr = !str("cosine_lr").empty();
+  out->cosine_lr = str("cosine_lr") == "true";
+  out->has_weight_decay = !str("weight_decay").empty();
+  if (out->has_weight_decay) out->weight_decay = num("weight_decay", to_f);
+  out->has_label_smoothing = !str("label_smoothing").empty();
+  if (out->has_label_smoothing) out->label_smoothing = num("label_smoothing", to_f);
   return true;
 }
 

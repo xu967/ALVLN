@@ -62,6 +62,8 @@ class DeviceCnn {
   };
   template <typename T>
   T* alloc(std::size_t count);
+  // 构造函数的分配+上传部分；单独成函数是为了失败时能在一处释放已分配的段。
+  void allocate_and_upload(const CnnModel& model, const TrainState* state);
   std::size_t seg_bytes(std::size_t k, std::size_t numel) const;  // 校验元素数后换算字节
   void film_forward(int n);
   void film_backward(int n);

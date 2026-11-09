@@ -60,12 +60,7 @@ std::string quote(const std::string& s) {
   return o + '"';
 }
 
-std::string hex_sha(const Sha256& h) {
-  static const char* d = "0123456789abcdef";
-  std::string s;
-  for (unsigned char b : h) { s += d[b >> 4]; s += d[b & 15]; }
-  return s;
-}
+std::string hex_sha(const Sha256& h) { return sha256_hex(h); }
 
 std::string file_sha256_hex_impl(const std::string& path) { return hex_sha(sha256_file(path)); }
 
@@ -169,9 +164,10 @@ std::string detect_git_sha() {
   return {};
 }
 
-CheckpointContract make_contract(const TrainConfig& cfg) {
+// dataset_sha 由 load_uavr 顺手算好传进来，这里不再读一遍 681 MB 的文件（AUDIT_SRC #6）。
+CheckpointContract make_contract(const TrainConfig& cfg, const Sha256& dataset_sha) {
   CheckpointContract c;
-  c.dataset_sha256 = sha256_file(cfg.data_path);
+  c.dataset_sha256 = dataset_sha;
   c.drop_collision = cfg.drop_collision;
   if (!cfg.soft_targets.empty()) c.soft_targets_sha256 = sha256_file(cfg.soft_targets);
   c.distill_alpha = cfg.distill_alpha;
@@ -239,6 +235,16 @@ void merge_resume_config(TrainConfig* cfg) {
   if (!cfg->prev_action_set && snap.has_prev_action) cfg->prev_action = snap.prev_action;
   if (!cfg->depth_aux_set && snap.has_depth_aux) cfg->depth_aux = snap.depth_aux;
   if (!cfg->aux_lambda_set && snap.has_aux_lambda) cfg->aux_lambda = snap.aux_lambda;
+  // 算法开关同样继承，否则续训静默换算法（AdamW 退回 Adam、余弦退火变常数 lr）而 config 看不出来。
+  if (!cfg->augment_set && snap.has_augment) cfg->augment = snap.augment;
+  if (!cfg->warmup_steps_set && snap.has_warmup_steps) cfg->warmup_steps = snap.warmup_steps;
+  // shortcut: --cosine-lr 是开关型参数，CLI 没有「显式关掉」的写法；源 run 开了就一直开
+  //           （与 --drop-collision 同一处理）。
+  if (!cfg->cosine_lr_set && snap.has_cosine_lr) cfg->cosine_lr = snap.cosine_lr;
+  if (!cfg->weight_decay_set && snap.has_weight_decay) cfg->weight_decay = snap.weight_decay;
+  if (!cfg->label_smoothing_set && snap.has_label_smoothing) {
+    cfg->label_smoothing = snap.label_smoothing;
+  }
   if (!(std::isfinite(cfg->lr) && cfg->lr > 0.0f && cfg->lr <= 1.0f)) {
     throw std::invalid_argument("resume: 源 config 的 lr 非法（" + num(cfg->lr) + "）");
   }
@@ -247,11 +253,12 @@ void merge_resume_config(TrainConfig* cfg) {
 
 // resume 的历史 best 必须能在新目录独立交付：同目录核对文件存在且状态一致；
 // 跨目录先核对再复制，绝不能让新 run 继承一个分数却没有对应权重文件。
-void carry_resume_best(const std::string& resume_path, const std::string& out_dir,
-                       const CnnModel& like, std::uint32_t seed, float lr,
-                       const TrainState& state) {
+// 返回非空 = 需要写进 metrics.jsonl 的告警正文（调用时 metrics 还没打开）。
+std::string carry_resume_best(const std::string& resume_path, const std::string& out_dir,
+                              const CnnModel& like, std::uint32_t seed, float lr,
+                              TrainState& state) {
   namespace fs = std::filesystem;
-  if (!(state.best_macro_f1 >= 0.0f)) return;  // 旧格式/从未评估过，无 best 可带
+  if (!(state.best_macro_f1 >= 0.0f)) return {};  // 旧格式/从未评估过，无 best 可带
   const fs::path rp(resume_path);
   const fs::path src_dir = rp.has_parent_path() ? rp.parent_path() : fs::path(".");
   const fs::path src_best = src_dir / "ckpt_best.bin";
@@ -266,20 +273,30 @@ void carry_resume_best(const std::string& resume_path, const std::string& out_di
                         like.aux_classes, like.prev_dim);
   TrainState s = make_train_state(m, lr);
   load_checkpoint(src_best.string(), m, s);
-  if (s.best_macro_f1 != state.best_macro_f1 || s.class_weights != state.class_weights) {
+  std::string warning;
+  if (s.class_weights != state.class_weights || s.best_macro_f1 < state.best_macro_f1) {
     throw std::runtime_error("resume: " + src_best.string() +
-                             " 与 checkpoint 记录的历史 best 不一致（分数/类别权重对不上）");
+                             " 与 checkpoint 记录的历史 best 不一致（分数/类别权重对不上）；"
+                             "若确认该 best 是想要的权重，可改用 --resume " + src_best.string());
+  }
+  if (s.best_macro_f1 > state.best_macro_f1) {
+    // epoch 末先写 ckpt_best.bin 再写 ckpt.bin，两次写之间被杀就是这个状态：best 文件是真的，
+    // 只是 ckpt.bin 还没记上。接过更高的分数，新 run 才不会用一个更差的结果覆盖它。
+    warning = "ckpt_best.bin 记录的 best_macro_f1=" + num(s.best_macro_f1) + " 高于 checkpoint 的 " +
+              num(state.best_macro_f1) + "（上次在两次写盘之间中断），按 ckpt_best.bin 为准";
+    state.best_macro_f1 = s.best_macro_f1;
   }
   std::error_code ec1;
   std::error_code ec2;
   const auto rc = fs::weakly_canonical(src_dir, ec1);
   const auto oc = fs::weakly_canonical(out_dir, ec2);
-  if (!ec1 && !ec2 && rc == oc) return;  // 同目录：文件已经在目标位置
+  if (!ec1 && !ec2 && rc == oc) return warning;  // 同目录：文件已经在目标位置
   if (fs::exists(dst_best)) {
     throw std::runtime_error("resume: 目标目录已有 " + dst_best.string() +
                              "；跨目录续训不会覆盖它");
   }
   fs::copy_file(src_best, dst_best);
+  return warning;
 }
 
 std::uint64_t count_correct(const Tensor& logits, const std::vector<int>& labels) {
@@ -352,12 +369,15 @@ void Trainer::run() {
   if (cfg_.epochs <= 0 || cfg_.batch <= 0) {
     throw std::invalid_argument("trainer: epochs/batch 必须为正");
   }
-  UavrDataset ds = load_uavr(cfg_.data_path, LoadOptions{cfg_.drop_collision});
+  LoadOptions load_opts;
+  load_opts.drop_collision = cfg_.drop_collision;
+  load_opts.want_file_sha256 = true;  // 整文件 SHA 只在这里算一次，下面四处共用
+  UavrDataset ds = load_uavr(cfg_.data_path, load_opts);
   if (ds.train_idx.empty()) throw std::runtime_error("trainer: 数据集没有 train split");
   std::filesystem::create_directories(cfg_.out_dir);
 
   // 事实字段：写进 config.json，也是 resume 契约的比较基准。
-  cfg_.dataset_sha256 = file_sha256_hex_impl(cfg_.data_path);
+  cfg_.dataset_sha256 = hex_sha(ds.file_sha256);
   const DatasetFacts facts = read_dataset_facts(cfg_.data_path);
   cfg_.split_scheme = facts.split_scheme;
   cfg_.window_from = facts.window_from;
@@ -413,15 +433,23 @@ void Trainer::run() {
     class_weights_source_ = merge_resume_weights(cfg_.class_weights, class_weights_,
                                                  state_.class_weights);
   }
+  // 互斥查最终生效的权重而不是 CLI 原文：resume 时权重由 checkpoint 带入，否则 config/metrics
+  // 记着一组权重而 loss 走软标签分支一个都没用上（AUDIT_SRC #2）。
+  if (!soft_targets_.empty() && !class_weights_.empty()) {
+    throw std::invalid_argument("trainer: --soft-targets 与类别权重互斥（本次权重来源 " +
+                                class_weights_source_ + "；两种 loss 的归一化口径不同）");
+  }
   state_.class_weights = class_weights_;
   // 本次运行的事实写入之后的所有 checkpoint（含 ckpt_best.bin）。
-  state_.contract = make_contract(cfg_);
+  state_.contract = make_contract(cfg_, ds.file_sha256);
   state_.contract_present = true;
   cfg_.adam_beta1 = state_.adam[0].beta1;
   cfg_.adam_beta2 = state_.adam[0].beta2;
   cfg_.adam_eps = state_.adam[0].eps;
+  std::string best_warning;
   if (!cfg_.resume.empty()) {
-    carry_resume_best(cfg_.resume, cfg_.out_dir, model_, cfg_.seed, cfg_.lr, state_);
+    best_warning = carry_resume_best(cfg_.resume, cfg_.out_dir, model_, cfg_.seed, cfg_.lr, state_);
+    if (!best_warning.empty()) std::fprintf(stderr, "警告: %s\n", best_warning.c_str());
   }
   write_run_config(cfg_.out_dir, cfg_, class_weights_, class_weights_source_);
   dev_ = std::make_unique<DeviceCnn>(model_, cfg_.batch, &state_);
@@ -460,6 +488,18 @@ void Trainer::run() {
     metrics << metrics_json(make_error(Severity::kWarn, "DEV_SPLIT_EMPTY", step,
                                        "数据集没有 val split，dev 指标回退到 train 集"))
             << '\n';
+  }
+  if (!best_warning.empty()) {
+    metrics << metrics_json(make_error(Severity::kWarn, "RESUME_BEST_NEWER", step, best_warning)) << '\n';
+  }
+  // warmup 覆盖了全部步数时 lr 一路线性爬升、从不到达设定值（余弦段也不会开始）：
+  // 短 smoke run 上拿默认 warmup 跑，结果看着像「学不动」，其实是 lr 没到位。只告警不拒绝。
+  if (cfg_.warmup_steps > 0 && static_cast<std::uint32_t>(cfg_.warmup_steps) >= total_steps) {
+    const std::string msg = "warmup_steps=" + std::to_string(cfg_.warmup_steps) +
+                            " ≥ 总步数 " + std::to_string(total_steps) +
+                            "：lr 全程处于 warmup，到不了 --lr 设定值";
+    std::fprintf(stderr, "警告: %s\n", msg.c_str());
+    metrics << metrics_json(make_error(Severity::kWarn, "WARMUP_EXCEEDS_STEPS", step, msg)) << '\n';
   }
   metrics.flush();
   check_out(metrics, "metrics.jsonl");

@@ -3,7 +3,8 @@
 // kernel 经 ops_dev.hpp 的设备指针级函数暴露给常驻路径；本文件末尾的 host Tensor 包装
 // 只负责分配/拷贝/同步，供 CPU/CUDA 对拍。
 #include "uavrgb/conv_cuda.hpp"
-#include "uavrgb/cuda_alloc.hpp"
+
+#include "cuda_check.hpp"
 #include "uavrgb/ops_dev.hpp"
 
 #include <cuda_runtime.h>
@@ -16,46 +17,8 @@
 namespace uavrgb {
 namespace {
 
-// 统一 CUDA API 错误检查：抛 std::runtime_error 而不是 std::exit，调用方可以 catch 后
-// 降 batch/重试；栈上 DeviceBuf 等 RAII 正常析构，checkpoint 落盘不会被跳过。
-#define CUDA_CHECK(call)                                                          \
-  do {                                                                            \
-    const cudaError_t err_ = (call);                                              \
-    if (err_ != cudaSuccess) {                                                    \
-      throw std::runtime_error(std::string("CUDA error ") + __FILE__ + ":" +      \
-                               std::to_string(__LINE__) + ": " +                  \
-                               cudaGetErrorString(err_));                         \
-    }                                                                             \
-  } while (0)
-
-// launch 后立刻查配置错误（0 block、grid 超限）；执行期错误留给调用方的同步点。
-void launched(const char* name) {
-  const cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    throw std::runtime_error(std::string("CUDA kernel ") + name + ": " + cudaGetErrorString(err));
-  }
-}
-
-// 极简设备缓冲 RAII：析构自动释放，异常路径也不泄漏。
-struct DeviceBuf {
-  float* p = nullptr;
-  DeviceBuf() = default;
-  explicit DeviceBuf(std::size_t bytes) {
-    if (cudaMalloc(&p, bytes) != cudaSuccess) throw_alloc_failure(bytes, __FILE__, __LINE__);
-  }
-  ~DeviceBuf() {
-    if (p) cudaFree(p);
-  }
-  DeviceBuf(DeviceBuf&& o) noexcept : p(o.p) { o.p = nullptr; }
-  DeviceBuf(const DeviceBuf&) = delete;
-  DeviceBuf& operator=(const DeviceBuf&) = delete;
-};
-
-constexpr int kThreads = 256;
 // dW 每线程只累加一个样本的 kDwRows 行：c1 在 batch 128 下从 432 个线程变成 432×128×8 个。
 constexpr int kDwRows = 16;
-
-int blocks_for(std::int64_t total) { return static_cast<int>((total + kThreads - 1) / kThreads); }
 
 // 元素数一律先用 int64 计算并校验上限：超过 INT_MAX 直接抛异常，绝不静默回绕后少算输出。
 std::int64_t check_elems(std::int64_t total, const char* what) {
@@ -209,8 +172,8 @@ dev::ConvShape check_dims(const Conv2d& m, const Tensor& x) {
   return d;
 }
 
-DeviceBuf upload(const float* src, std::int64_t count) {
-  DeviceBuf d(static_cast<std::size_t>(count) * sizeof(float));
+DeviceBuf<float> upload(const float* src, std::int64_t count) {
+  DeviceBuf<float> d(static_cast<std::size_t>(count) * sizeof(float));
   CUDA_CHECK(cudaMemcpy(d.p, src, static_cast<std::size_t>(count) * sizeof(float),
                         cudaMemcpyHostToDevice));
   return d;
@@ -269,10 +232,10 @@ Tensor conv2d_forward_cuda(const Conv2d& m, const Tensor& x) {
   const dev::ConvShape d = check_dims(m, x);
   Tensor y = Tensor::zeros({d.n, m.out, d.oh, d.ow});
   if (d.n == 0) return y;  // 空 batch：0 个 block 的 launch 会报 invalid configuration。
-  const DeviceBuf d_x = upload(x.data(), static_cast<std::int64_t>(x.numel()));
-  const DeviceBuf d_w = upload(m.W.data(), static_cast<std::int64_t>(m.W.numel()));
-  const DeviceBuf d_b = upload(m.b.data(), m.out);
-  DeviceBuf d_y(y.numel() * sizeof(float));
+  const DeviceBuf<float> d_x = upload(x.data(), static_cast<std::int64_t>(x.numel()));
+  const DeviceBuf<float> d_w = upload(m.W.data(), static_cast<std::int64_t>(m.W.numel()));
+  const DeviceBuf<float> d_b = upload(m.b.data(), m.out);
+  DeviceBuf<float> d_y(y.numel() * sizeof(float));
   dev::conv2d_forward(d, d_x.p, d_w.p, d_b.p, d_y.p);
   CUDA_CHECK(cudaDeviceSynchronize());
   download(y, d_y.p);
@@ -290,13 +253,13 @@ ConvGrad conv2d_backward_cuda(const Conv2d& m, const Tensor& x, const Tensor& dy
   g.db = Tensor::zeros({m.out});
   g.dx = Tensor::zeros({d.n, d.c_in, d.h, d.w});
   if (d.n == 0) return g;  // 空 batch：全零梯度，不 launch kernel（0 block 非法）。
-  const DeviceBuf d_x = upload(x.data(), static_cast<std::int64_t>(x.numel()));
-  const DeviceBuf d_w = upload(m.W.data(), static_cast<std::int64_t>(m.W.numel()));
-  const DeviceBuf d_dy = upload(dy.data(), static_cast<std::int64_t>(dy.numel()));
-  DeviceBuf d_dw(g.dW.numel() * sizeof(float));
-  DeviceBuf d_db(g.db.numel() * sizeof(float));
-  DeviceBuf d_dx(need_dx ? g.dx.numel() * sizeof(float) : sizeof(float));
-  DeviceBuf d_ws(dev::conv2d_backward_workspace(d) * sizeof(float));
+  const DeviceBuf<float> d_x = upload(x.data(), static_cast<std::int64_t>(x.numel()));
+  const DeviceBuf<float> d_w = upload(m.W.data(), static_cast<std::int64_t>(m.W.numel()));
+  const DeviceBuf<float> d_dy = upload(dy.data(), static_cast<std::int64_t>(dy.numel()));
+  DeviceBuf<float> d_dw(g.dW.numel() * sizeof(float));
+  DeviceBuf<float> d_db(g.db.numel() * sizeof(float));
+  DeviceBuf<float> d_dx(need_dx ? g.dx.numel() * sizeof(float) : sizeof(float));
+  DeviceBuf<float> d_ws(dev::conv2d_backward_workspace(d) * sizeof(float));
   dev::conv2d_backward(d, d_x.p, d_w.p, d_dy.p, d_dw.p, d_db.p, need_dx ? d_dx.p : nullptr,
                        d_ws.p);
   CUDA_CHECK(cudaDeviceSynchronize());

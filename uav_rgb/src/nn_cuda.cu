@@ -2,7 +2,8 @@
 // 只针对 sm_75（Turing）；接口与 nn.hpp 的 CPU 参考一一对称，供 CPU/CUDA 对拍（doc 04 §6 N3）。
 // kernel 经 ops_dev.hpp 的设备指针级函数暴露给常驻路径；host Tensor 包装只做分配/拷贝/同步。
 #include "uavrgb/nn.hpp"
-#include "uavrgb/cuda_alloc.hpp"
+
+#include "cuda_check.hpp"
 #include "uavrgb/ops_dev.hpp"
 
 #include <cuda_runtime.h>
@@ -14,46 +15,6 @@
 
 namespace uavrgb {
 namespace {
-
-// 统一 CUDA API 错误检查：抛 runtime_error 而不是 std::exit——与 conv/linear/softmax
-// 三个 .cu 保持一致。训练中途显存或驱动出错时栈上 RAII 能正常析构，train_main 的
-// catch 能收到，`save_checkpoint` 不会被静默跳过。
-#define CUDA_CHECK(call)                                                        \
-  do {                                                                          \
-    cudaError_t err_ = (call);                                                  \
-    if (err_ != cudaSuccess) {                                                  \
-      throw std::runtime_error(std::string("CUDA error ") + __FILE__ + ":" +    \
-                               std::to_string(__LINE__) + ": " +                \
-                               cudaGetErrorString(err_));                       \
-    }                                                                           \
-  } while (0)
-
-// launch 后立刻查配置错误；执行期错误留给调用方的同步点。
-void launched(const char* name) {
-  const cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    throw std::runtime_error(std::string("CUDA kernel ") + name + ": " + cudaGetErrorString(err));
-  }
-}
-
-// 极简设备缓冲 RAII：析构自动释放，异常路径也不泄漏。
-template <typename T>
-struct DeviceBuf {
-  T* p = nullptr;
-  DeviceBuf() = default;
-  explicit DeviceBuf(std::size_t bytes) {
-    if (cudaMalloc(&p, bytes) != cudaSuccess) throw_alloc_failure(bytes, __FILE__, __LINE__);
-  }
-  ~DeviceBuf() {
-    if (p) cudaFree(p);
-  }
-  DeviceBuf(DeviceBuf&& o) noexcept : p(o.p) { o.p = nullptr; }
-  DeviceBuf(const DeviceBuf&) = delete;
-  DeviceBuf& operator=(const DeviceBuf&) = delete;
-};
-
-constexpr int kThreads = 256;
-int blocks_for(int total) { return (total + kThreads - 1) / kThreads; }
 
 // ReLU 前向：x==0 → 0；NaN 继续传播（压成 0 会把坏权重藏起来）。
 __global__ void relu_forward_kernel(const float* __restrict__ x, float* __restrict__ y,

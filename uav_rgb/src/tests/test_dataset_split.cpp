@@ -61,6 +61,16 @@ int main() {
   run("wrong_policy", "split_policy\":\"scene_id", "split_policy\":\"frame", false);
   run("large_scene", "scene_id\":2", "scene_id\":9223372036854775807", true);
   run("signed_scene", "scene_id\":2", "scene_id\":-42", true);
+  // json.dumps 默认分隔符（": " / ", "）写出的 meta 是合法 JSON，扫描器必须接受（AUDIT_SRC #4）；
+  // preprocess 用紧凑分隔符所以自家数据不触发，手改/indent 重写一次就撞上。
+  run("spaced_int", "sample_start\":0", "sample_start\": 0", true);
+  run("spaced_str", "split\":\"train", "split\": \"train", true);
+  run("spaced_scene", "scene_id\":2", "scene_id\": 2", true);
+  run("spaced_collision_flags", "split_policy\":\"scene_id",
+      "collision_flags\": \"0000\",\"split_policy\":\"scene_id", true, uavrgb::LoadOptions{true});
+  // 字符串值里的 '}' 不是 episode 项的结尾（REVIEW2_SRC #7）：version 排在 split/sample_* 之前，
+  // 按首个 '}' 截断会让后面的必填字段「缺失」。
+  run("brace_in_string", "version\":\"synthetic", "version\":\"syn}thetic", true);
 
   // 诊断性划分默认拒绝；显式 opt-in 才允许读取。
   run("diag_scheme", "split_policy\":\"scene_id",

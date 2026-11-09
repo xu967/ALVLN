@@ -53,14 +53,43 @@ struct EpisodeSpan {
   std::string gid; // geometry_gid；旧数据没有，空串
 };
 
+// "key": 之后第一个非空白字符的位置；缺字段返回 npos。preprocess 写紧凑的 "key":0，
+// json.dumps 默认写 "key": 0，两种都是合法 JSON，所有字段扫描都经这里跳空白。
+std::size_t value_pos(const std::string& obj, const char* key) {
+  const std::string pat = std::string("\"") + key + "\":";
+  const std::size_t p = obj.find(pat);
+  if (p == std::string::npos) return p;
+  std::size_t b = p + pat.size();
+  while (b < obj.size() && (obj[b] == ' ' || obj[b] == '\t' || obj[b] == '\n' || obj[b] == '\r')) ++b;
+  return b;
+}
+
+// 从 '{' 走到配对的 '}'：字符串字面量（含 \" 转义）整段跳过，值里的 '}' 不是项结尾；
+// 找不到返回 npos。
+std::size_t object_end(const std::string& s, std::size_t open) {
+  int depth = 0;
+  bool in_str = false;
+  for (std::size_t i = open; i < s.size(); ++i) {
+    const char c = s[i];
+    if (in_str) {
+      if (c == '\\') ++i;
+      else if (c == '"') in_str = false;
+    } else if (c == '"') {
+      in_str = true;
+    } else if (c == '{') {
+      ++depth;
+    } else if (c == '}' && --depth == 0) {
+      return i;
+    }
+  }
+  return std::string::npos;
+}
+
 // 取标量原值（字符串去引号，数字原样）；缺字段返回空串。用于 episode_id 绑定，
 // 不能要求所有旧数据集都有该字段。
 std::string scalar_field(const std::string& obj, const char* key) {
-  const std::string pat = std::string("\"") + key + "\":";
-  const std::size_t p = obj.find(pat);
-  if (p == std::string::npos) return {};
-  std::size_t b = p + pat.size();
-  while (b < obj.size() && obj[b] == ' ') ++b;
+  std::size_t b = value_pos(obj, key);
+  if (b == std::string::npos) return {};
   if (b < obj.size() && obj[b] == '"') {
     const std::size_t e = obj.find('"', b + 1);
     if (e == std::string::npos) fail(std::string("字段未闭合 ") + key);
@@ -81,21 +110,19 @@ std::string opt_field(const std::string& obj, const char* key) {
 }
 
 std::string str_field(const std::string& obj, const char* key) {
-  const std::string pat = std::string("\"") + key + "\":\"";
-  const std::size_t p = obj.find(pat);
-  if (p == std::string::npos) fail(std::string("episodes[] 缺字段 ") + key);
-  const std::size_t b = p + pat.size();
-  const std::size_t e = obj.find('"', b);
+  const std::size_t b = value_pos(obj, key);
+  if (b == std::string::npos) fail(std::string("episodes[] 缺字段 ") + key);
+  if (b >= obj.size() || obj[b] != '"') fail(std::string("episodes[] 字段非字符串 ") + key);
+  const std::size_t e = obj.find('"', b + 1);
   if (e == std::string::npos) fail(std::string("episodes[] 字段未闭合 ") + key);
-  return obj.substr(b, e - b);
+  return obj.substr(b + 1, e - b - 1);
 }
 
 std::int64_t int_field(const std::string& obj, const char* key) {
-  const std::string pat = std::string("\"") + key + "\":";
-  const std::size_t p = obj.find(pat);
-  if (p == std::string::npos) fail(std::string("episodes[] 缺字段 ") + key);
-  const std::size_t b = p + pat.size();
-  const std::size_t e = obj.find_first_not_of("0123456789", b + (obj[b] == '-' ? 1 : 0));
+  const std::size_t b = value_pos(obj, key);
+  if (b == std::string::npos) fail(std::string("episodes[] 缺字段 ") + key);
+  const std::size_t e =
+      obj.find_first_not_of("0123456789", b + (b < obj.size() && obj[b] == '-' ? 1 : 0));
   const std::string digits = obj.substr(b, e == std::string::npos ? e : e - b);
   if (digits.empty()) fail(std::string("episodes[] 字段非整数 ") + key);
   if (e != std::string::npos && obj[e] != ',' && obj[e] != '}' && obj[e] != ' ') {
@@ -120,7 +147,7 @@ std::vector<EpisodeSpan> parse_episodes(const std::string& meta) {
   std::vector<EpisodeSpan> out;
   for (std::size_t i = lb + 1; i < meta.size() && meta[i] != ']'; ++i) {
     if (meta[i] != '{') continue;
-    const std::size_t e = meta.find('}', i);  // episode 项内无嵌套对象
+    const std::size_t e = object_end(meta, i);
     if (e == std::string::npos) fail("meta episodes 项未闭合");
     const std::string obj = meta.substr(i + 1, e - i - 1);
     EpisodeSpan s;
@@ -231,13 +258,11 @@ void assign_split(UavrDataset& ds, const std::vector<EpisodeSpan>& eps,
 // meta 追加字段 collision_flags 是 N 个 '0'/'1'（preprocess.py 写），1 = 碰撞步。
 // 字段缺失返回空串：只有真要按它过滤时才强制要求。
 std::string read_collision_flags(const std::string& meta) {
-  const std::string key = "\"collision_flags\":\"";
-  const std::size_t p = meta.find(key);
-  if (p == std::string::npos) return {};
-  const std::size_t b = p + key.size();
-  const std::size_t e = meta.find('"', b);
+  const std::size_t b = value_pos(meta, "collision_flags");
+  if (b == std::string::npos || b >= meta.size() || meta[b] != '"') return {};  // 缺字段或 null
+  const std::size_t e = meta.find('"', b + 1);
   if (e == std::string::npos) fail("meta collision_flags 未闭合");
-  return meta.substr(b, e - b);
+  return meta.substr(b + 1, e - b - 1);
 }
 
 // 校验并统计 flags 里 '1' 的个数；格式不合规直接报错。
@@ -497,7 +522,11 @@ UavrDataset load_uavr(const std::string& path, const LoadOptions& opts) {
     warn_collision_kept(ds, meta);
   }
   load_text_sidecar(ds, path, eps);  // 无侧车时 text_ids 保持空
-  ds.aux = load_aux_sidecar(path, ds.n, ds.h, ds.w, ds.num_classes);  // 无侧车时 present=false
+  if (opts.want_file_sha256) ds.file_sha256 = sha256_file(path);
+  // 侧车绑定复用上面这份 SHA；未要求时传 nullptr 让它自己算（只有不带 want_file_sha256 的
+  // 工具/测试会走到）。无侧车时 present=false。
+  ds.aux = load_aux_sidecar(path, ds.n, ds.h, ds.w, ds.num_classes,
+                            opts.want_file_sha256 ? &ds.file_sha256 : nullptr);
   return ds;
 }
 

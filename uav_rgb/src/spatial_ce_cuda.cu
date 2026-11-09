@@ -17,7 +17,6 @@
 namespace uavrgb {
 namespace {
 
-constexpr int kThreads = 256;
 
 // 每线程一格 (sample, p)：stable softmax 后写 K 个梯度（屏蔽格写 0）、double 原子累加 CE、
 // 统计 argmax 命中。K 很小（8），一格一线程比一元素一线程少算 K 倍 softmax。
@@ -54,20 +53,6 @@ __global__ void add_inplace_kernel(float* __restrict__ y, const float* __restric
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i < total) y[i] += x[i];
 }
-
-template <typename T>
-struct DeviceBuf {
-  T* p = nullptr;
-  explicit DeviceBuf(std::size_t count) {
-    const std::size_t bytes = (count == 0 ? 1 : count) * sizeof(T);
-    if (cudaMalloc(&p, bytes) != cudaSuccess) throw_alloc_failure(bytes, __FILE__, __LINE__);
-  }
-  ~DeviceBuf() {
-    if (p) cudaFree(p);
-  }
-  DeviceBuf(const DeviceBuf&) = delete;
-  DeviceBuf& operator=(const DeviceBuf&) = delete;
-};
 
 struct Dims {
   int n, k, hw;
@@ -118,9 +103,9 @@ void add_inplace(float* y, const float* x, int total) {
 float spatial_ce_loss_cuda(const Tensor& logits, const std::vector<std::uint8_t>& targets) {
   const Dims d = check(logits, targets);
   if (d.valid == 0) return 0.0f;
-  DeviceBuf<float> x(logits.numel());
+  DeviceBuf<float> x(logits.numel() * sizeof(float));
   DeviceBuf<std::uint8_t> t(targets.size());
-  DeviceBuf<double> loss(1);
+  DeviceBuf<double> loss(sizeof(double));
   CUDA_CHECK(cudaMemcpy(x.p, logits.data(), logits.numel() * sizeof(float), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(t.p, targets.data(), targets.size(), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemset(loss.p, 0, sizeof(double)));
@@ -134,9 +119,9 @@ Tensor spatial_ce_grad_cuda(const Tensor& logits, const std::vector<std::uint8_t
   const Dims d = check(logits, targets);
   Tensor g = Tensor::zeros(logits.dims());
   if (d.valid == 0) return g;
-  DeviceBuf<float> x(logits.numel());
+  DeviceBuf<float> x(logits.numel() * sizeof(float));
   DeviceBuf<std::uint8_t> t(targets.size());
-  DeviceBuf<float> dg(logits.numel());
+  DeviceBuf<float> dg(logits.numel() * sizeof(float));
   CUDA_CHECK(cudaMemcpy(x.p, logits.data(), logits.numel() * sizeof(float), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(t.p, targets.data(), targets.size(), cudaMemcpyHostToDevice));
   dev::spatial_ce(x.p, t.p, d.n, d.k, d.hw, 1.0f / static_cast<float>(d.valid), dg.p, nullptr,

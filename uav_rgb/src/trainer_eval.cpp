@@ -75,7 +75,13 @@ void Trainer::eval_only(const std::string& ckpt_path, bool eval_val, bool eval_t
   if (cfg_.batch <= 0) throw std::invalid_argument("eval_only: batch 必须为正");
   // 不读 train split 也可以评估；drop_collision 与训练期保持一致，否则同权重同数据
   // 的指标对不上（碰撞步在两边的去留不同）。
-  UavrDataset ds = load_uavr(cfg_.data_path, LoadOptions{cfg_.drop_collision});
+  LoadOptions load_opts;
+  load_opts.drop_collision = cfg_.drop_collision;
+  // test 评估要留痕数据身份：这里顺手算一次 SHA 填回 cfg_，train_main 读 config() 复用，
+  // 不再对同一文件再读一遍。
+  load_opts.want_file_sha256 = eval_test;
+  UavrDataset ds = load_uavr(cfg_.data_path, load_opts);
+  if (eval_test) cfg_.dataset_sha256 = sha256_hex(ds.file_sha256);
   std::filesystem::create_directories(cfg_.out_dir);
   // 模型结构以 checkpoint 为准；--text-dim / --two-frame 等只影响训练，不覆盖 checkpoint 记录。
   const CheckpointMeta meta = read_checkpoint_meta(ckpt_path);

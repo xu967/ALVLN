@@ -149,6 +149,31 @@ int main() {
     both.out_dir = root + "/run_both";
     both.class_weights = "auto";
     check(throws_any([&] { Trainer(both).run(); }), "软标签与类别权重同用未抛异常");
+
+    // 蒸馏分支不看 ε：同开时 ε 被静默丢掉而 config.json 却记着它（AUDIT_SRC #1）。
+    TrainConfig smooth = ok;
+    smooth.out_dir = root + "/run_smooth";
+    smooth.label_smoothing = 0.2f;
+    check(throws_any([&] { Trainer(smooth).run(); }), "软标签与标签平滑同用未抛异常");
+  }
+
+  // ---- 3b) 类别权重不能从 checkpoint 溜进蒸馏 run（AUDIT_SRC #2）----
+  // 互斥检查若只看 CLI 原文，--resume 时 merge_resume_weights 带入的权重会被记成「生效」，
+  // 而 loss 走的是软标签分支，一个权重都没用上。
+  {
+    TrainConfig cw = base;
+    cw.out_dir = root + "/run_cw";
+    cw.class_weights = "auto";
+    cw.epochs = 1;
+    Trainer(cw).run();
+    TrainConfig rs = base;
+    rs.out_dir = root + "/run_cw_soft";
+    rs.resume = cw.out_dir + "/ckpt.bin";
+    rs.soft_targets = root + "/soft_ok.bin";
+    rs.allow_resume_mismatch = true;
+    rs.epochs = 1;
+    check(throws_any([&] { Trainer(rs).run(); }),
+          "resume 从 checkpoint 带入类别权重后仍放行了 --soft-targets");
   }
 
   // ---- 4) config.json 落盘 + 蒸馏来源审计 ----

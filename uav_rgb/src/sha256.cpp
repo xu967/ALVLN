@@ -76,4 +76,12 @@ Sha256 sha256_file(const std::string& path) {
   if (!f) throw std::runtime_error("SHA256: 无法打开 " + path);
   return sha256(f);
 }
+
+std::string sha256_hex(const Sha256& h) {
+  static const char* d = "0123456789abcdef";
+  std::string s;
+  s.reserve(64);
+  for (const std::uint8_t b : h) { s += d[b >> 4]; s += d[b & 15]; }
+  return s;
+}
 }  // namespace uavrgb

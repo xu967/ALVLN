@@ -370,6 +370,32 @@ class PreprocessSplitTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("部分缺失", r.stderr)
 
+    def test_aux_sidecar_dilation_uses_each_episodes_focal(self):
+        # FIXLIST_R2 B1：包络膨胀的焦距按每条 episode 自己的 camera.fx 取，不能拿分块里第一条的
+        # 焦距套给整块——否则多相机混包时一半样本的膨胀半径是错的，而写出来的侧车看不出来。
+        # ep1 给极小 fx=50（半径 50·0.102/0.4/16 ≈ 0.8 格 < 1 → 不膨胀），ep2/ep3 保持默认 277 → ≈4.4 格。
+        import numpy as np
+
+        def frame(step):
+            d = np.full((240, 320), 3000, dtype=np.uint16)
+            d[:, :160] = 400
+            return d
+        self.write_depth("png16_mm", frame)
+        man = self.man(self.eps[0])
+        man["camera"]["fx"] = 50.0
+        self.save(self.eps[0], man)
+        r = self.run_pre(self.tmp / "ds_focal", self.eps)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        bands = self.bands_of(self.tmp / "ds_focal")
+        narrow = set()
+        for ep in read_meta(self.tmp / "ds_focal" / "dataset.uavr")["episodes"]:
+            if Path(ep["source_dir"]).resolve() == self.eps[0].resolve():
+                narrow.update(range(ep["sample_start"], ep["sample_start"] + ep["sample_count"]))
+        self.assertTrue(narrow and len(narrow) < bands.shape[0], "ep1 应只占一部分样本")
+        wide = sorted(set(range(bands.shape[0])) - narrow)
+        self.assertTrue((bands[sorted(narrow)][:, :, 10:] == 6).all(), "fx=50 的 episode 不该膨胀")
+        self.assertTrue((bands[wide][:, :, 10:14] == 1).all(), "默认焦距的 episode 仍膨胀 ≥4 格")
+
     def test_dilate_by_envelope_bounded_by_grid(self):
         # 一个极近的格（3DGS 深度 1e-6 m：相机贴着/钻进 splat）会让膨胀半径算到 1.8e6 格；
         # 偏移循环若按该半径走是 (2r+1)^2 ≈ 1e13 次，preprocess 卡死不报错。

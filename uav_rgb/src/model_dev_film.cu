@@ -11,9 +11,6 @@
 namespace uavrgb {
 namespace {
 
-constexpr int kThreads = 256;
-int blocks_for(std::size_t total) { return static_cast<int>((total + kThreads - 1) / kThreads); }
-
 // FiLM 条件向量 cond[n, cdim] = [文本特征 tfeat | prev one-hot]（与 model.cpp 一致）：
 // 文本段 <pad>(0) 与越界 id 的槽位置 0；prev 段只有 prev[s] 那一位是 1。
 __global__ void cond_gather_kernel(const std::uint8_t* __restrict__ ids,

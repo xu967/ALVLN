@@ -536,6 +536,39 @@ int main() {
       }
       check(ok, "旧 config 缺新字段时应兼容续训");
     }
+
+    // FIXLIST_R2 B2：resume 继承全部训练开关。augment/warmup/cosine/weight_decay/label_smoothing
+    // 不继承的话，续训会静默换成默认算法（例如 AdamW 退回 Adam），config.resume.json 却记成默认值。
+    {
+      TrainConfig sw = c2;
+      sw.out_dir = root + "/run_sw";
+      sw.epochs = 1;
+      sw.augment = "photo";
+      sw.warmup_steps = 3;
+      sw.cosine_lr = true;
+      sw.weight_decay = 0.5f;
+      sw.label_smoothing = 0.25f;
+      Trainer(sw).run();
+      TrainConfig rs;  // 只给必填项，其余都该从源 run 的 config.json 带过来
+      rs.data_path = sd2.path;
+      rs.out_dir = root + "/run_sw_resume";
+      rs.resume = sw.out_dir + "/ckpt.bin";
+      rs.epochs = 1;
+      bool ok = true;
+      try {
+        Trainer(rs).run();
+      } catch (const std::exception& e) {
+        ok = false;
+        std::cerr << "  开关继承 resume 失败: " << e.what() << "\n";
+      }
+      check(ok, "继承训练开关的 resume 应能跑完");
+      const std::string js = read_file(rs.out_dir + "/config.resume.json");
+      for (const char* want : {"\"augment\":\"photo\"", "\"warmup_steps\":3", "\"cosine_lr\":true",
+                               "\"weight_decay\":0.5", "\"label_smoothing\":0.25"}) {
+        check(js.find(want) != std::string::npos,
+              std::string("resume 未继承训练开关 ") + want + "（config.resume.json 记成了默认值）");
+      }
+    }
   }
 
   // 数据集带 text_ids 侧车却没给 --text-dim：必须报错，不能静默训成纯视觉模型。

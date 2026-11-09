@@ -3,6 +3,7 @@
 // H/W/C 一律从 48 B 文件头读，不假定 160x120；train/val/test 划分取 meta JSON 的
 // episodes[].sample_start/sample_count/split（按 scene_id 隔离，不按帧随机拆）。
 #include "uavrgb/aux_sidecar.hpp"
+#include "uavrgb/sha256.hpp"
 #include "uavrgb/tensor.hpp"
 #include "uavrgb/text.hpp"  // kTextLen
 
@@ -21,6 +22,9 @@ struct LoadOptions {
   // true：允许 split_scheme 为 map-hash:*/diag* 的诊断性划分。默认拒绝：这类
   // 划分无视地图/拓扑族归属，混进常规训练会让跨族结论失效。
   bool allow_diagnostic_split = false;
+  // true：加载时顺手算一次整文件 SHA256 填进 UavrDataset::file_sha256，供 config / checkpoint
+  // 契约 / 软标签 / aux 侧车四处共用——训练器只读这一次，不再各算各的（E1 集 681 MB 每遍约 4 s）。
+  bool want_file_sha256 = false;
 };
 
 struct UavrDataset {
@@ -41,6 +45,8 @@ struct UavrDataset {
   std::vector<std::uint8_t> text_ids;
   // UAVRAUX1 侧车（dataset.aux）：上一帧下标 / prev-action / 深度分带目标；没有时 present=false。
   AuxSidecar aux;
+  // 整文件 SHA256；只在 LoadOptions::want_file_sha256 时计算，否则全零（= 未算）。
+  Sha256 file_sha256{};
   std::vector<std::uint32_t> train_idx;     // 全局样本下标
   std::vector<std::uint32_t> val_idx;
   std::vector<std::uint32_t> test_idx;

@@ -94,6 +94,19 @@ DeviceCnn::DeviceCnn(const CnnModel& model, int max_batch, const TrainState* sta
   if (total_params_ > static_cast<std::size_t>(std::numeric_limits<int>::max())) {
     throw std::invalid_argument("DeviceCnn: 参数量超出 int 范围");
   }
+  // 构造函数抛出后析构不会跑：中途某次 cudaMalloc 失败（max_batch 太大最常见）时，
+  // 前面已成功的段要在这里放掉，否则重试更小的 batch 时显存已被泄漏的段占着。
+  try {
+    allocate_and_upload(model, state);
+  } catch (...) {
+    for (void* p : owned_) cudaFree(p);
+    owned_.clear();
+    throw;
+  }
+}
+
+void DeviceCnn::allocate_and_upload(const CnnModel& model, const TrainState* state) {
+  const int cin = layer_[2].c_out;
   params_ = alloc<float>(total_params_);
   grads_ = alloc<float>(total_params_);
   m_ = alloc<float>(total_params_);

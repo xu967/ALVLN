@@ -1,7 +1,8 @@
 // softmax 交叉熵 loss/grad 的 CUDA 实现：行内 stable softmax + double atomicAdd 归约。
 // 只针对 sm_75（Turing）；纯手写 kernel，供 CPU/CUDA 对拍（doc 04 §6 N3）。
 #include "uavrgb/softmax_cuda.hpp"
-#include "uavrgb/cuda_alloc.hpp"
+
+#include "cuda_check.hpp"
 
 #include <cuda_runtime.h>
 
@@ -14,44 +15,6 @@
 
 namespace uavrgb {
 namespace {
-
-// 统一 CUDA API 错误检查：抛 std::runtime_error 而不是 std::exit，调用方可以 catch 后
-// 降 batch/重试；栈上 DeviceBuf 等 RAII 正常析构，checkpoint 落盘不会被跳过。
-#define CUDA_CHECK(call)                                                          \
-  do {                                                                            \
-    const cudaError_t err_ = (call);                                              \
-    if (err_ != cudaSuccess) {                                                    \
-      throw std::runtime_error(std::string("CUDA error ") + __FILE__ + ":" +      \
-                               std::to_string(__LINE__) + ": " +                  \
-                               cudaGetErrorString(err_));                         \
-    }                                                                             \
-  } while (0)
-
-// 每次 kernel launch 后必查：先 cudaGetLastError 抓异步错误，再同步等 kernel 结束。
-void check_after_kernel(const char* name) {
-  const cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    throw std::runtime_error(std::string("CUDA kernel ") + name + ": " + cudaGetErrorString(err));
-  }
-  CUDA_CHECK(cudaDeviceSynchronize());
-}
-
-// 极简设备缓冲 RAII：析构自动释放，异常路径也不泄漏。模板版用于 labels 的 int 缓冲。
-template <typename T>
-struct DeviceBuf {
-  T* p = nullptr;
-  DeviceBuf() = default;
-  explicit DeviceBuf(std::size_t bytes) {
-    if (cudaMalloc(&p, bytes) != cudaSuccess) throw_alloc_failure(bytes, __FILE__, __LINE__);
-  }
-  ~DeviceBuf() {
-    if (p) cudaFree(p);
-  }
-  DeviceBuf(const DeviceBuf&) = delete;
-  DeviceBuf& operator=(const DeviceBuf&) = delete;
-};
-
-constexpr int kThreads = 256;
 
 // 元素数一律先用 int64 计算并校验上限：超过 INT_MAX 直接抛异常，绝不静默回绕。
 std::int64_t check_elems(std::int64_t total, const char* what) {

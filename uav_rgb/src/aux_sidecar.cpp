@@ -35,7 +35,7 @@ std::string aux_sidecar_path(const std::string& uavr_path) {
 }
 
 AuxSidecar load_aux_sidecar(const std::string& uavr_path, int n, int h, int w,
-                            std::uint32_t num_classes) {
+                            std::uint32_t num_classes, const Sha256* uavr_sha256) {
   AuxSidecar aux;
   const std::string path = aux_sidecar_path(uavr_path);
   std::error_code ec;
@@ -59,7 +59,7 @@ AuxSidecar load_aux_sidecar(const std::string& uavr_path, int n, int h, int w,
   } else if (aux.depth_h != 0 || aux.depth_w != 0) {
     fail("无深度目标时 depth_h/depth_w 必须为 0");
   }
-  const Sha256 uavr_sha = sha256_file(uavr_path);
+  const Sha256 uavr_sha = uavr_sha256 ? *uavr_sha256 : sha256_file(uavr_path);
   if (!std::equal(uavr_sha.begin(), uavr_sha.end(), hb + 28)) {
     fail("UAVR SHA256 不匹配：侧车不是从这份 dataset.uavr 生成的，请重新 preprocess");
   }

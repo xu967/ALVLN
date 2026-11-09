@@ -60,6 +60,9 @@ struct TrainConfig {
   bool cosine_lr = false;        // warmup 之后余弦退火到 0
   float weight_decay = 0.0f;     // AdamW 解耦权重衰减（0 = 原 Adam）
   float label_smoothing = 0.0f;  // 标签平滑 ε（与类别权重叠加；与蒸馏互斥，蒸馏优先）
+  // 同上：resume 时未显式给出的开关从源 run 继承，否则续训会静默换算法（AdamW 退回 Adam 等）。
+  bool augment_set = false, warmup_steps_set = false, cosine_lr_set = false,
+       weight_decay_set = false, label_smoothing_set = false;
   // STUDENT-P2（都需要 dataset.aux 侧车；旧数据集没有侧车时这些开关直接报错，不静默降级）：
   bool two_frame = false;    // 输入 6 通道 [I_t ; I_{t-1}]（上一帧按侧车 prev_index 读）
   bool prev_action = false;  // 上一步执行的动作 one-hot 经 FiLM 进第三层
@@ -95,6 +98,12 @@ struct RunConfigSnapshot {
        has_aux_lambda = false;
   bool two_frame = false, prev_action = false, depth_aux = false;
   float aux_lambda = 0.0f;
+  bool has_augment = false, has_warmup_steps = false, has_cosine_lr = false,
+       has_weight_decay = false, has_label_smoothing = false;
+  std::string augment;
+  int warmup_steps = 0;
+  bool cosine_lr = false;
+  float weight_decay = 0.0f, label_smoothing = 0.0f;
 };
 bool read_run_config(const std::string& run_dir, RunConfigSnapshot* out);
 
