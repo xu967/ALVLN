@@ -1,7 +1,7 @@
 # progress.md（新开会话先读这个）
 
 - 更新：2026-11-09 20:50（eval4 起跑；DAgger 正式 3 轮挂在 eval4 之后自动起；第八阶段只剩 TEACHER-COST）
-- **现在在跑**：① **eval4** `$DATA_ROOT/uav_rgb/e1-pipeline-20261107-0417-eval4/`（PGID 441083；8 组 × 20 seed，2080 Ti + lib31 + sim09.v2，3 条车道，教师与截断录三视角；`run.log`、`eval-<组>.log`，结束落 `DONE` + `summary.md` + `stats/`；停 `kill -- -441083`；预计 22:30 前后）② **DAgger 正式跑等待中** `$DATA_ROOT/uav_rgb/exp-dagger-gz-20261109/full-1109/`（PGID 444652，`run_after_eval4.sh` 等 eval4 的 DONE 后自动起 `tools/dagger_gz_pipeline.py`，约 6 h；基线六组复用 eval4；停 `kill -- -444652`）③ TEACHER-COST（闭环 ② 与软标签一臂，用**旧库** `tmp/build-cf-sitl`，约 21:45 结束）。
+- **现在在跑**：① **eval4** `$DATA_ROOT/uav_rgb/e1-pipeline-20261107-0417-eval4/`（PGID 441083；8 组 × 20 seed，2080 Ti + lib31 + sim09.v2，3 条车道，教师与截断录三视角；`run.log`、`eval-<组>.log`，结束落 `DONE` + `summary.md` + `stats/`；停 `kill -- -441083`；预计 22:30 前后）② **DAgger 正式跑等待中** `$DATA_ROOT/uav_rgb/exp-dagger-gz-20261109/full-1109/`（PGID 444652，`run_after_eval4.sh` 等 eval4 的 DONE 后自动起 `tools/dagger_gz_pipeline.py`，约 6 h；基线六组复用 eval4；停 `kill -- -444652`）③ **3DGS 数据集 B pilot** `$DATA_ROOT/uav_rgb/datasets/e1-3dgs-pilot-20261109/`（PGID 448856；garden / Wanderland / stump ‖ bicycle / Callinstrasse，各 20 集 A* 示范，hold 0.5 **暂定**、`--truncate-on-collision`、lib31 proc；每场景 `<场景>/pilot/report.md`、`episodes.txt`；结束落 `DONE`；停 `kill -- -448856`；约 21:40）④ TEACHER-COST（闭环 ② 与软标签一臂，用**旧库** `tmp/build-cf-sitl`，约 21:45 结束）。
 - **SITL 库过渡**：main 已是 lib31（profile `cf_sitl_v1:1bc8fedf:lib31`，Python 拒绝旧 proc / 旧插件），新库在 `tmp/build-cf-sitl-lib31`。eval4 / DAgger 用冻结 worktree `tmp/wt-eval4`（97ae04b）+ 二进制快照 `bin-snapshots/main-97ae04b`（infer b5458338）+ `build-cf-sitl-lib31` 的路径。**TEACHER-COST 结束后在 `tmp/build-cf-sitl` 原地重建 lib31，不要 mv lib31 目录**（eval4 / DAgger 正按路径用它）；其它新实验在那之前带 `CF_SITL_PROC=…/build-cf-sitl-lib31/cf_sitl_proc UAVRGB_CF_SITL_PLUGIN_DIR=…/build-cf-sitl-lib31/gz E1_CF_SITL_PLUGIN_DIR=…/build-cf-sitl-lib31/gz`。
 - 本机 **GPU 换回 RTX 2080 Ti**（驱动 580.119.02）；每次会话先 `nvidia-smi -L`。SITL 库现为 **v3.1**（`tmp/build-cf-sitl`，`e1_mini.json` 683e7400；旧 v3 在 `tmp/build-cf-sitl-v3-20261107`）。eval3 / sgvis / 森林基准都是 4080 + lib v3 的，新臂只和 eval4（FIX-A 合并后起）或同条件对照臂比。
 - 方案效果盘点：`docs/experiments/2026-11-07-approach-scoreboard.md`；方向计划最新一节：`docs/PLAN_2026-11-07_demo_and_paper.md` 「更新 2026-11-09」；修复清单：`tmp/phase3-20261107/FIXLIST_R2.md`（A/B/C/D 批次状态见下）；本轮 6 份只读分析报告：`$DATA_ROOT/uav_rgb/tmp/analysis-20261109/{PLAN_STATUS,WORKTREES,EXPERIMENTS,AUDIT_SRC,AUDIT_SIMTOOLS,AUDIT_SIM}.md`；主会话 worklog：`docs/worklog/2026-11-09-1640-resume-analysis-and-merge.md`。
@@ -50,7 +50,7 @@
 - TEACHER-COST 交付 → 审 diff → 合并；之后换 `tmp/build-cf-sitl` 为 lib31（见头部）。
 - eval4 出数（约 22:30）→ scoreboard 新开 eval4 表（新固定基准；eval3 只作历史）、三个训练种子的 IQM（`stats/eval4-trunc-3seed.md`）、教师与截断的新录像给短片 v3。
 - DAgger 正式 3 轮已挂在 eval4 之后（见头部）；eval60 默认用现行严格排除（24 个几何），用户若改口径，改 CFG.eval60_exclude 后同 --out 续跑。
-- **3DGS 数据集 B**（每场景 20 集 pilot → 放量 ≥300 集 → S_B）：等用户定 hold（证据：教师 hold 0.5 = 0.98、1.0 = 0.83）；用 `--truncate-on-collision`、lib31 的 `cf_sitl_proc`。
+- **3DGS 数据集 B**：pilot 已按 hold 0.5 暂定起跑（见头部）；pilot 过审后放量 ≥300 集 → 打包 → 训 S_B → 两域评测。放量前要用户定 hold（选 1.0 则 pilot 重跑、且要先做 D9）。
 - 用户待拍板：① 3DGS 数据集 hold；② M3 n=60 的几何口径（建议 E1 臂用 71 个 test 几何里的 60 个）；③ 短片 v2 验收与 tag；④ worktree 删除（暂不做）；⑤ PLAN §8 四项。
 
 ## 第三阶段（2026-11-07 05:10 起）
