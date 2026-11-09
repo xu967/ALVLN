@@ -34,8 +34,10 @@ CFG = dict(
     vehicle="e1_mini",       # 选 sim/worlds/uav_rgb_e1.sdf；cf_sitl 必须显式给
     hold=1.0,                # 每动作仿真秒。沿用 X3 基线 1.0 便于对比；固件里杆量保持到下一次派发
     window_from="observation",   # 唯一被采纳的基线语义；dispatch 只用于复现 T7-R，数字不可混报
-    plugin_dir=f"{DATA_ROOT}/uav_rgb/tmp/build-cf-sitl/gz",   # 真库插件（sim/cf_sitl/gz/README 的构建路径）。
-                                                                # 显式给，免得 collect_parallel 兜底找到桩库 build-gz-stub
+    plugin_dir=os.environ.get("E1_CF_SITL_PLUGIN_DIR", f"{DATA_ROOT}/uav_rgb/tmp/build-cf-sitl/gz"),
+                             # 真库插件（sim/cf_sitl/gz/README 的构建路径）。显式给，免得 collect_parallel 兜底找到桩库 build-gz-stub。
+                             # 环境变量覆盖用于换库过渡期：库升版要重建这个目录，但正在跑的旧代码实验还在加载旧插件时，
+                             # 新实验先指向另建的目录（2026-11-09 lib31：tmp/build-cf-sitl-lib31/gz）
     # 采集（pilot 先过 audit 再放量；seed 段都避开下面 eval_seeds，它们最大 1282）
     pilot_episodes=20,       # 4 实例 × 5 集；只做闸门，不进训练集
     pilot_seed=3000,
