@@ -165,7 +165,9 @@ gsplat 用例默认 skip，`RUN_3DGS_REAL=1` 开启）；其余单测全过。
 ## 七、已知坑
 
 1. **gsplat 首次 JIT 慢**（约 4 分钟）。不要并发两个 JIT 进程到同一个
-   `TORCH_EXTENSIONS_DIR`，会 ninja 竞态。
+   `TORCH_EXTENSIONS_DIR`，会 ninja 竞态。编好的缓存**不能复制到别的目录名下复用**：torch 的 JIT 版本哈希含
+   `build_directory`（`torch/utils/_cpp_extension_versioner.py`），换了目录名第一次用必定整目录重编（2026-11-09
+   `extensions-sm75-20261109`、`extensions-sm75` 各重编过一次）。新目录先单进程跑一集，编完再并行。
 2. **坐标系**：gsplat viewmat 是 COLMAP/OpenCV 约定（相机 +z 朝前）。
    真实 3DGS 常是 y-up；用 `splat_to_ply.py --flip-height --scale --z-offset`
    对齐后，先用 `renderer` 看一帧再采集。`room`/`kitchen` 尚未校准好。
