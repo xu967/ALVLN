@@ -59,6 +59,10 @@ CFG = dict(
                              # DISTILL §3.3：A* 教师左右近平局（|Q_L−Q_R|<0.5 步，转弯帧 ~10%）的口径。"visible" 改向学生视锥内
                              # 最近柱的反侧（0417 的 12000 帧里会改 85 帧）；"legacy" 与旧标签逐位相同。默认 legacy；对照实验用
                              # E1_TIEBREAK=visible 启动
+    teacher_planner=os.environ.get("E1_TEACHER_PLANNER", "astar"),
+                             # 示范教师（采集与评测 teacher 组同一个）：astar = 真值 A* + 纯追踪（现有全部数据）；costmap = 测地场
+                             # 代价 argmin（TEACHER-COST 2026-11-09：闭环 20/20、碰撞 0；用它重标的学生 14/20 vs 截断臂 12/20，
+                             # p=0.754）。默认 astar 时命令行逐字不变；对照实验用 E1_TEACHER_PLANNER=costmap 启动
     instances=4,             # gz agent 实测：4 实例 6.8 核 0.55 s/步；6 实例 8.6 核吞吐只多 10%（cgroup 12 核）
     no_aux_cameras=True,     # 采集不要 chase/top 相机：RTF 锁 1.0 时每步快 17%；录像只在评测时开
     collect_min_ok=0.95,     # 偶发丢首条起飞指令属正常（collect_parallel 自带重试一次）；低于 95% 说明环境坏了，停
@@ -150,6 +154,8 @@ def collect_into(col, episodes, base_seed, spec="base"):
         cmd.append("--stop-at-goal")
     if CFG["tiebreak"] != "legacy":
         cmd += ["--tiebreak", CFG["tiebreak"]]
+    if CFG["teacher_planner"] != "astar":
+        cmd += ["--teacher-planner", CFG["teacher_planner"]]
     run(cmd, env_extra=GZ_ENV)
     if DRY:
         return
@@ -261,6 +267,8 @@ def evaluate(out):
                *vehicle_flags()]
         if ckpt_key:
             cmd += ["--ckpt", ckpts[ckpt_key], "--infer-bin", f"{BUILD}/uavrgb_infer"]
+        if policy == "teacher" and CFG["teacher_planner"] != "astar":
+            cmd += ["--teacher-planner", CFG["teacher_planner"]]
         if name in CFG["record_groups"]:
             cmd += ["--record-video", "--video-quality", CFG["VIDEO_QUALITY"]]   # 需要 chase/top 相机：评测模板不加 --no-aux-cameras
         log_path = os.path.join(out, f"eval-{name}.log")

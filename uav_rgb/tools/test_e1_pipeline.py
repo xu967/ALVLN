@@ -230,7 +230,54 @@ def test_dry_run_creates_nothing():
     print("ok --dry-run 不建目录不写文件")
 
 
+def test_teacher_planner_passthrough():
+    """CFG teacher_planner：默认 astar 时采集 / 评测命令行逐字不变；costmap 时采集与 teacher 组带 --teacher-planner，学生组不带。"""
+    tmp = tempfile.mkdtemp(prefix="test_e1_pipeline_")
+    real_run, real_popen, real_ckpt = ep.run, subprocess.Popen, ep.CFG["old_x3_ckpt"]
+    real_planner, real_dry = ep.CFG.get("teacher_planner"), ep.DRY
+    seen = {}
+    try:
+        ep.run = lambda cmd, **_kw: seen.setdefault("collect", []).append(cmd) or 0
+        ep.DRY = True
+        for planner in ("astar", "costmap"):
+            ep.CFG["teacher_planner"] = planner
+            ep.collect_into(os.path.join(tmp, f"col-{planner}"), 4, 3100)
+        a, c = seen["collect"]
+        assert "--teacher-planner" not in a, a
+        assert c[c.index("--teacher-planner") + 1] == "costmap", c
+        same_out = lambda cmd: [("OUT" if i and cmd[i - 1] == "--out" else x) for i, x in enumerate(cmd)]
+        assert [x for x in same_out(c) if x not in ("--teacher-planner", "costmap")] == same_out(a), "costmap 只多这两项"
+        ep.DRY = False
+        for rel in ("old_x3.bin", os.path.join("run", "ckpt_best.bin")):
+            os.makedirs(os.path.dirname(os.path.join(tmp, rel)) or tmp, exist_ok=True)
+            open(os.path.join(tmp, rel), "wb").close()
+        ep.CFG["old_x3_ckpt"] = os.path.join(tmp, "old_x3.bin")
+        cmds = {}
+
+        def fake_popen(cmd, **_kw):
+            edir = cmd[cmd.index("--out") + 1]
+            name = os.path.basename(edir)[len("eval-"):]
+            cmds[name] = cmd
+            return FakeProc(name, edir, write_eval=True)
+
+        subprocess.Popen = fake_popen
+        ep.evaluate(tmp)
+        for name, cmd in cmds.items():
+            policy = cmd[cmd.index("--policy") + 1]
+            if policy == "teacher":
+                assert cmd[cmd.index("--teacher-planner") + 1] == "costmap", (name, cmd)
+            else:
+                assert "--teacher-planner" not in cmd, (name, cmd)
+    finally:
+        ep.run, subprocess.Popen, ep.CFG["old_x3_ckpt"], ep.DRY = real_run, real_popen, real_ckpt, real_dry
+        ep.CFG["teacher_planner"] = real_planner
+        FakeProc.waited.clear()   # 类级记录：别让后面 test_evaluate_waits_all_groups 看到本测试等过的组
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("ok teacher_planner：astar 命令行不变，costmap 只给采集与 teacher 组加 --teacher-planner")
+
+
 def main():
+    test_teacher_planner_passthrough()
     test_evaluate_waits_all_groups()
     test_summary_marks_mixed_metric_version()
     test_train_resume_by_metrics_done()
