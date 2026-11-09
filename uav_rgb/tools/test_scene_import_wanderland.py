@@ -91,5 +91,38 @@ class TestAlign(unittest.TestCase):
         self.assertTrue(np.isnan(g[2]))                            # 远处没有点 -> NaN，调用方必须处理
 
 
+class TestProbe(unittest.TestCase):
+    def test_step_probe_delegates_to_scene_probe_quality_and_adds_ground_depth(self):
+        """step_probe 调 tools/scene_probe_quality.run（判据/阈值单源，R2-3DGS #4），只加俯视高度复核，
+        结果并进同一份 OUT/probe_quality/routes_quality.json；mock 渲染器 + 合成走廊，不需要 GPU。"""
+        import json
+        scene_mod = importlib.import_module("sim.3dgs.scene")
+        renderer_mod = importlib.import_module("sim.3dgs.renderer")
+        pq = importlib.import_module("scene_probe_quality")
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_mod.make_corridor(os.path.join(tmp, "scene"), seed=0)
+            real = renderer_mod.make_renderer
+            renderer_mod.make_renderer = lambda scene, mock=False, *a, **k: real(scene, True, *a, **k)
+            saved = imp.SCENE_JSON, imp.OUT
+            imp.SCENE_JSON, imp.OUT = os.path.join(tmp, "scene", "scene.json"), os.path.join(tmp, "out")
+            try:
+                with self.assertRaises(SystemExit):           # mock 渐变帧 lapvar≈0.2 全判低质：门槛不过要停，但 JSON 先落盘
+                    imp.step_probe()
+            finally:
+                renderer_mod.make_renderer = real
+                imp.SCENE_JSON, imp.OUT = saved
+            with open(os.path.join(tmp, "out", "probe_quality", "routes_quality.json"), encoding="utf-8") as f:
+                rep = json.load(f)
+            self.assertEqual(rep["schema"], "uavrgb.3dgs_routes_quality.v1")
+            self.assertEqual(rep["lapvar_min_threshold"], pq.FRAME_LAPVAR_MIN)
+            r0 = rep["routes"][0]
+            self.assertEqual((r0["pass"], r0["low_frac"], r0["n_low"]), (False, 1.0, r0["n_frames"]))
+            self.assertGreaterEqual(r0["n_frames"], 2)
+            g = r0["ground_depth_3dgs_m"]                       # step_probe 独有：俯视 -90° 中央 1/3 期望深度中位
+            self.assertEqual((g["min"], g["med"], g["max"]), (5.0, 5.0, 5.0))   # mock 深度常量 5 m
+            self.assertGreaterEqual(g["n"], 1)
+            self.assertFalse(os.path.exists(os.path.join(tmp, "out", "routes_quality.json")))   # 旧独立实现的产物不再写
+
+
 if __name__ == "__main__":
     unittest.main()

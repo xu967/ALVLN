@@ -41,9 +41,13 @@ from teacher import ACTIONS, TEACHER_VERSION, expert_action  # noqa: E402
 import split_manifest as sm  # noqa: E402
 
 GEOMETRY_VERSION = "3dgs.v1"
-# FORWARD 下沿航向后退超过这个距离判执行器失控（见 run_episode 注释）；cf_sitl 悬停漂移实测 1–2 cm/步，
-# FORWARD 首步也至少 +3 cm，5 cm 留出两倍余量。
-ANOMALY_BACK_M = 0.05
+# 倒飞保护（见 run_episode 注释）：FORWARD 下窗口末**机体系**前向速度 vx_b < -ANOMALY_BACK_VX 连续 ANOMALY_BACK_WINDOWS
+# 个动作窗口判执行器失控。量机体系速度而不是世界位移沿起始航向的投影（REVIEW-3DGS #3）：拐角处连续 YAW 后机体还带着
+# 横向动量，世界位移沿新航向的分量可以到 -0.06 m 而机体并没有后退（r1 ep0 第 94 步 vx_b -0.066 / vy_b +0.275 被旧判据
+# 隔离）。阈值 0.10 m/s：cf_sitl 悬停漂移 1–2 cm/s、拐角残留 |vx_b| ≤ 0.07 m/s 都在内；真倒飞（route 5 seed 500，t≈44 s
+# 光流速度环反向积分）首窗末 vx_b 已 < -0.1 且一路加速到 -2.5 m/s，第二窗就停。连续两窗是为了放过单窗口的瞬时负值。
+ANOMALY_BACK_VX = 0.10
+ANOMALY_BACK_WINDOWS = 2
 # 低质量帧阈值：渲染帧灰度 4 邻域拉普拉斯方差（320x240）。Callinstrasse pilot 1306 帧（2026-11-07）
 # 双峰：朝未观测植被背面的"雾墙"帧 1–30（18 帧，全在 route 1/4 出生点），30–60 一帧没有，正常帧 ≥100
 # （p5=150，中位 415）。取空带上沿 60：只标雾帧，不碰 60–100 的 6 帧轻微糊。只标记不丢帧，丢不丢由
@@ -272,7 +276,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
     stop_radius = getattr(policy, "stop_radius", None)
     wp = scene.get("waypoint") or {}
     stop_streak, stopped_on_goal = 0, False
-    anomaly = None
+    anomaly, back_streak = None, 0
     n_low_quality = 0
     error = None
     if hasattr(policy, "prev"):        # 每集重置教师滞回
@@ -309,8 +313,11 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                 raise RuntimeError(f"写 RGB 失败: {e}") from e
 
             action, infer_ms = policy(rgb, depth, dyn)
-            # DAgger：执行的是学生（或 β 抽中的教师）动作，标签始终是教师的；其它策略两者相同。
-            expert = policy.last_expert if isinstance(policy, DaggerPolicy) else action
+            # DAgger：执行的是学生（或 β 抽中的教师）动作，标签始终是教师的；教师/forward 策略两者相同；
+            # 非 DAgger 的学生集（eval_3dgs 的 StudentAdapter）没有教师标签，action_expert 写 None，不再把学生动作记成标签
+            # （preprocess 按 teacher 门禁拒收这类集，不会读到 None）。
+            expert = (policy.last_expert if isinstance(policy, DaggerPolicy)
+                      else None if policy.name == "student" else action)
             x0, y0, yaw0 = dyn.x, dyn.y, dyn.yaw
             z0 = dyn.z
             state = dyn.step(action, hold_s)
@@ -321,14 +328,16 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             # yaw 是 state["yaw_deg"]（度），yaw0 是 dyn.yaw（弧度）：先统一成度再求 [-180,180) 环绕差。
             # 以前直接相减再 degrees()，实测左转 9.65° 记成 553°。
             dyaw = (yaw - math.degrees(yaw0) + 180.0) % 360.0 - 180.0
-            # 固件在环失控保护：FORWARD 命令下机体沿航向后退 ≥ ANOMALY_BACK_M（悬停漂移只有 1–2 cm/步）。
+            # 固件在环失控保护：FORWARD 命令下机体系前向速度连续 ANOMALY_BACK_WINDOWS 窗 < -ANOMALY_BACK_VX（判据见常量注释）。
             # route 5 seed 500 实测：飞到 t≈44 s 光流速度环反向积分，FORWARD 下倒飞加速到 2.5 m/s，
             # 18 m 外撞树才被碰撞代理停下，中间 45 步标签 FORWARD 与运动相反。这里标记并结束本集，
             # validity.physics_verified=False 让 preprocess 拒收；不改 cf_sitl。
-            along = (x - x0) * math.cos(yaw0) + (y - y0) * math.sin(yaw0)
-            if action == FORWARD_SLOW and along < -ANOMALY_BACK_M:
-                anomaly = {"step": i, "kind": "backward_under_forward",
-                           "along_m": round(along, 3), "displacement_m": round(dist, 3)}
+            # state 的 vx/vy 是世界(nav)系（cf_blackbox / cf_sitl_proc 都是），投影到窗口末航向得机体系前向分量。
+            vx_body = state["vx"] * math.cos(state["yaw"]) + state["vy"] * math.sin(state["yaw"])
+            back_streak = back_streak + 1 if (action == FORWARD_SLOW and vx_body < -ANOMALY_BACK_VX) else 0
+            if back_streak >= ANOMALY_BACK_WINDOWS:
+                anomaly = {"step": i, "kind": "backward_under_forward", "windows": back_streak,
+                           "vx_body_mps": round(vx_body, 3), "displacement_m": round(dist, 3)}
             ts0 = int(round(t_rgb * 1e9))
             ts1 = int(round(state["t"] * 1e9))
             actions.append({
@@ -434,11 +443,13 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             "trace_ref": "trace.jsonl" if getattr(dyn, "trace", None) is not None else None,
             "teacher": policy.name,
             "planner": getattr(policy, "planner_name", None),
-            # 谁执行了动作：teacher = 教师自采（默认），student = DAgger 学生自采（标签仍是教师）。
-            # preprocess 只认 teacher 标签，executed_by/dagger_round/beta 进 episodes 表供训练数据溯源。
-            "executed_by": (dagger or {}).get("executed_by", "forward" if policy.name == "forward" else "teacher"),
+            # 谁执行了动作：缺省按策略名（forward 对照 / student = 学生自采或 eval_3dgs / 其余教师），DAgger 由 dagger
+            # 字典覆盖；β = 执行教师动作的概率，学生执行缺省 0。以前学生 eval 集缺省写 teacher、β 1.0，与 teacher=student
+            # 自相矛盾（R2-3DGS #2）。preprocess 只认 teacher 标签，executed_by/dagger_round/beta 进 episodes 表供溯源。
+            "executed_by": (dagger or {}).get("executed_by",
+                                              {"forward": "forward", "student": "student"}.get(policy.name, "teacher")),
             "dagger_round": (dagger or {}).get("dagger_round", 0),
-            "beta": (dagger or {}).get("beta", 1.0),
+            "beta": (dagger or {}).get("beta", 0.0 if policy.name == "student" else 1.0),
             "student_ckpt": (dagger or {}).get("student_ckpt"),
             "student_ckpt_sha256": (dagger or {}).get("student_ckpt_sha256"),
             "n_expert_executed": getattr(policy, "n_expert_exec", None),

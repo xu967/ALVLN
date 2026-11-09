@@ -8,6 +8,7 @@
 import hashlib
 import importlib
 import json
+import math
 import os
 import subprocess
 import sys
@@ -325,6 +326,156 @@ class TestEval3dgs(unittest.TestCase):
             self.assertEqual(e["scene"]["scene_json_sha256"], want_sha)
             self.assertEqual(e["scene"]["waypoint"], raw["waypoint"])
             self.assertEqual(e["scene"]["spawn"], raw["spawn"])
+
+
+def _rows(ep_dir):
+    with open(os.path.join(ep_dir, "actions.jsonl"), encoding="utf-8") as f:
+        return [json.loads(x) for x in f if x.strip()]
+
+
+def _mock_env(tmp, seed=2):
+    """合成走廊 + mock 渲染器 + cf_blackbox，直接调 run_episode 用。"""
+    scene_dir = os.path.join(tmp, "scene")
+    scene_mod.make_corridor(scene_dir, seed=seed, length=12.0)
+    scene = scene_mod.load_scene(os.path.join(scene_dir, "scene.json"))
+    renderer = importlib.import_module("sim.3dgs.renderer").make_renderer(scene, True)
+    occ = importlib.import_module("sim.3dgs.collision").from_scene(scene)
+    params = importlib.import_module("sim.3dgs.dynamics").CfBlackboxParams.from_json(None)
+    return scene, renderer, occ, params, collect.scene_identity(scene)
+
+
+class FakeStudent:
+    """student.StudentPolicy 的最小替身：恒定动作，不起 uavrgb_infer。"""
+
+    def __init__(self, action):
+        self.action, self.resets = action, 0
+
+    def reset(self):
+        self.resets += 1
+
+    def act(self, msg):
+        return self.action, 1.0, [0.0] * 4
+
+
+class TestExecutedBy(unittest.TestCase):
+    """R2-3DGS #2：executed_by 缺省按策略名；非 DAgger 学生集（eval_3dgs）action_expert=None、beta=0；
+    以前缺省写 teacher / beta 1.0，117 步学生动作被记成「教师标签、教师执行」。"""
+
+    def test_student_adapter_episode_is_marked_student(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            scene, renderer, occ, params, identity = _mock_env(tmp)
+            policy = collect.StudentAdapter(FakeStudent(action=2))
+            m, err = collect.run_episode(scene, os.path.join(tmp, "s"), renderer, occ, params, policy,
+                                         3, 0.5, split=identity["split"], identity=identity)
+            self.assertIsNone(err)
+            self.assertEqual((m["teacher"], m["executed_by"], m["beta"], m["dagger_round"], m["n_expert_executed"]),
+                             ("student", "student", 0.0, 0, None))
+            rows = _rows(os.path.join(tmp, "s"))
+            self.assertEqual([r["action_executed"] for r in rows], [2, 2, 2])
+            self.assertEqual([r["action_expert"] for r in rows], [None, None, None])   # 学生动作不是标签
+            # 对照：forward 对照集 / 深度教师的缺省不变
+            m_f, _ = collect.run_episode(scene, os.path.join(tmp, "f"), renderer, occ, params, collect.ForwardPolicy(),
+                                         1, 0.5, split=identity["split"], identity=identity)
+            self.assertEqual((m_f["executed_by"], m_f["beta"]), ("forward", 1.0))
+            m_t, _ = collect.run_episode(scene, os.path.join(tmp, "t"), renderer, occ, params, collect.DepthTeacher(),
+                                         2, 0.5, split=identity["split"], identity=identity)
+            self.assertEqual((m_t["teacher"], m_t["executed_by"], m_t["beta"]), ("expert_action", "teacher", 1.0))
+            self.assertTrue(all(r["action_expert"] == r["action_executed"] for r in _rows(os.path.join(tmp, "t"))))
+
+    def test_dagger_beta_one_executes_expert_every_step(self):
+        import random
+        planner = importlib.import_module("sim.3dgs.planner")
+        with tempfile.TemporaryDirectory() as tmp:
+            scene, renderer, occ, params, _ = _mock_env(tmp)
+            scene["waypoint"] = {"x": 10.0, "y": 0.0, "z": 2.0}      # 走廊默认 waypoint x=30 在尽头墙里，A* 无路
+            identity = collect.scene_identity(scene)
+            expert = planner.OccAstarTeacher(planner.OccPlanner(occ), scene["waypoint"])
+            # 学生恒 SAFE；β=1 每步都换成教师动作，β=0 每步都执行学生动作，两种情况标签都是教师的
+            for beta, out in ((1.0, "b1"), (0.0, "b0")):
+                policy = collect.DaggerPolicy(FakeStudent(action=0), expert, beta, random.Random(0))
+                dagger = {"executed_by": "student", "dagger_round": 1, "beta": beta}
+                m, err = collect.run_episode(scene, os.path.join(tmp, out), renderer, occ, params, policy, 6, 0.5,
+                                             dagger=dagger, split=identity["split"], identity=identity)
+                self.assertIsNone(err)
+                rows = _rows(os.path.join(tmp, out))
+                self.assertEqual(m["num_steps"], 6)
+                self.assertEqual((m["teacher"], m["planner"], m["executed_by"], m["beta"], m["dagger_round"]),
+                                 ("plan_action", "astar_occ", "student", beta, 1))
+                self.assertTrue(any(r["action_expert"] != 0 for r in rows))       # 走廊畅通：教师不是全程 SAFE
+                if beta == 1.0:
+                    self.assertTrue(all(r["action_executed"] == r["action_expert"] for r in rows), rows)
+                    self.assertEqual(m["n_expert_executed"], m["num_steps"])
+                else:
+                    self.assertEqual([r["action_executed"] for r in rows], [0] * 6)
+                    self.assertEqual(m["n_expert_executed"], 0)
+
+
+class ScriptedDyn:
+    """假动力学：每步按脚本给世界系位移 (dx, dy) 与窗口末世界系速度 (vx, vy)，航向不变；测倒飞判据用。"""
+
+    def __init__(self, moves):
+        self.moves, self.i = moves, 0
+        self.x = self.y = self.t = 0.0
+        self.z, self.yaw = 2.0, 0.0
+
+    def step(self, action, dt):
+        dx, dy, vx, vy = self.moves[self.i % len(self.moves)]
+        self.i += 1
+        self.x, self.y, self.t = self.x + dx, self.y + dy, self.t + dt
+        return {"t": self.t, "x": self.x, "y": self.y, "z": self.z, "vx": vx, "vy": vy,
+                "yaw": self.yaw, "yaw_deg": math.degrees(self.yaw)}
+
+    def profile(self):
+        return "scripted"
+
+    def manifest(self):
+        return {"dynamics": "scripted"}
+
+
+class TestBackwardAnomaly(unittest.TestCase):
+    """REVIEW-3DGS #3：倒飞判据用机体系前向速度连续两窗为负，不用世界位移沿起始航向的投影。
+    拐角后机体带着横向动量时位移沿航向分量可为 -0.06 m（旧判据误判隔离），机体并没有后退。"""
+
+    def _run(self, tmp, name, moves, spawn_yaw=0.0, steps=4):
+        scene, renderer, occ, params, _ = _mock_env(tmp)
+        scene["spawn"]["yaw_deg"] = spawn_yaw
+        identity = collect.scene_identity(scene)
+        real = collect.make_blackbox
+        collect.make_blackbox = lambda scene, path, params: ScriptedDyn(moves)
+        try:
+            m, err = collect.run_episode(scene, os.path.join(tmp, name), renderer, occ, params, collect.ForwardPolicy(),
+                                         steps, 0.5, split=identity["split"], identity=identity)
+        finally:
+            collect.make_blackbox = real
+        self.assertIsNone(err)
+        return m
+
+    def test_lateral_momentum_is_not_backward(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # 航向 +x：每窗位移 (-0.06, +0.14)（沿航向 -6 cm，旧阈值 5 cm 会判倒飞），窗口末速度 (+0.05, +0.20) 机体前向为正
+            m = self._run(tmp, "lat", [(-0.06, 0.14, 0.05, 0.20)])
+            self.assertIsNone(m["dynamics_anomaly"])
+            self.assertEqual((m["num_steps"], m["validity"]["physics_verified"]), (4, True))
+            # 航向 +y：世界系 -x 的速度是横向，不是后退
+            m = self._run(tmp, "lat90", [(-0.15, 0.0, -0.3, 0.0)], spawn_yaw=90.0)
+            self.assertIsNone(m["dynamics_anomaly"])
+            # 单个窗口后退再恢复：不连续两窗，不判
+            m = self._run(tmp, "once", [(-0.15, 0.0, -0.3, 0.0), (0.15, 0.0, 0.3, 0.0)])
+            self.assertIsNone(m["dynamics_anomaly"])
+            self.assertEqual(m["num_steps"], 4)
+
+    def test_true_backward_flight_is_flagged_on_second_window(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for yaw, moves in ((0.0, [(-0.15, 0.0, -0.3, 0.0)]),            # 航向 +x，世界 -x 后退
+                               (90.0, [(0.0, -0.15, 0.0, -0.3)])):          # 航向 +y，世界 -y 后退
+                m = self._run(tmp, f"back{int(yaw)}", moves, spawn_yaw=yaw)
+                a = m["dynamics_anomaly"]
+                self.assertIsNotNone(a, m)
+                self.assertEqual((a["kind"], a["step"]), ("backward_under_forward", 1))
+                self.assertLess(a["vx_body_mps"], -collect.ANOMALY_BACK_VX)
+                self.assertEqual(m["num_steps"], 2)                           # 第二窗判定后本集结束
+                self.assertFalse(m["validity"]["physics_verified"])
+                self.assertEqual(len(_rows(os.path.join(tmp, f"back{int(yaw)}"))), 2)
 
 
 class TestHoldSource(unittest.TestCase):

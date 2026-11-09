@@ -51,7 +51,7 @@ LIDAR_SUBSAMPLE = 4               # raw_pcd 9 亿字节 ≈ 3,000 万点；每 4
 HOLD_S = 0.5                      # 与 scene.step_s / Gazebo 训练数据窗口一致
 SMOKE_EPISODES = 2                # 每路线 2 集冒烟（DATASET_3DGS_SELF_CAPTURE §3 步 8：到达 >=1/2、0 碰撞）
 SEED0 = 0                         # 路线 r 第 k 集 seed = SEED0 + 100*r + k
-PROBE_LAPVAR_LOW = 60.0           # collect_3dgs.frame_quality 同阈值；低质帧 <10% 过线
+# 清晰度探测的阈值（lapvar 60、低质帧 10%）不在这里：step_probe 调 tools/scene_probe_quality.py，它从采集端 import
 # 路线（nav 系，米；z 固定 FLY_Z）：先跑到 align 步看 OUT/map_*.png 与 align.json 再填；空列表时 scene 步只写
 # 顶层 spawn/waypoint 占位并停下。max_steps 由 planner.route_check 算出后回填（None = 由本脚本回填）。
 ROUTES = [
@@ -595,78 +595,36 @@ def draw_occ_routes(occ, paths, path, align, px_per_m=20, margin_m=6.0):
 
 
 # ---------------------------------------------------------------- 5 沿路线渲染清晰度探测
-PROBE_SPACING_M = 1.0       # 每 1 m 一个机载位姿（航向 = 路径向前 1 m 的方向，首帧用出生 yaw）
-PROBE_LOW_FRAC_MAX = 0.10   # DATASET_3DGS_SELF_CAPTURE §3 步 7：每条路线低质帧 <10% 过线
-
-
 def step_probe():
-    """沿每条路线的 A* 路径渲染机载帧，算 collect_3dgs.frame_quality 的 lapvar，写 routes_quality.json +
-    每路线 contact sheet。临时实现（SCENE-B 在转正 tools/scene_probe_quality.py，这里不建同名文件）。"""
+    """沿每条路线渲染机载帧量清晰度：全部交给 tools/scene_probe_quality.run（采样间距、航向、lapvar 阈值、低质帧门槛、
+    拼图都只有那一份），产物在 OUT/probe_quality/。这里只多做一项它没有的高度复核（独立于 LiDAR）：沿路每隔一个
+    探测位姿垂直向下渲染，中心 1/3 画面的期望深度中位数 = 3DGS 里的离地高度，并进同一份 routes_quality.json。"""
     import importlib
+    pq = importlib.import_module("scene_probe_quality")
     scene_mod = importlib.import_module("sim.3dgs.scene")
     renderer_mod = importlib.import_module("sim.3dgs.renderer")
-    collect = importlib.import_module("sim.3dgs.collect_3dgs")
-    from PIL import Image, ImageDraw
-    scene = scene_mod.load_scene(SCENE_JSON)
-    paths = json.load(open(os.path.join(OUT, "routes_paths.json"), encoding="utf-8"))
-    rd = renderer_mod.make_renderer(scene)
-    log(f"probe: 渲染器 {rd.stats()}")
-    summary, bad = {}, []
-    for i, r in enumerate(scene["routes"]):
-        path = paths.get(str(i))
-        if not path:
-            continue
-        sp = r["spawn"]
-        poses, acc = [(sp["x"], sp["y"], sp["yaw_deg"])], 0.0
-        for k in range(1, len(path)):
-            acc += math.hypot(path[k][0] - path[k - 1][0], path[k][1] - path[k - 1][1])
-            if acc >= PROBE_SPACING_M:
-                j = min(len(path) - 1, k + 5)
-                yaw = (math.degrees(math.atan2(path[j][1] - path[k][1], path[j][0] - path[k][0]))
-                       if j > k else poses[-1][2])
-                poses.append((path[k][0], path[k][1], yaw))
-                acc = 0.0
-        frames, tiles = [], []
-        for (x, y, yaw) in poses:
-            rgb, depth, _ms = rd.render_pose(x, y, FLY_Z, yaw)
-            q = collect.frame_quality(rgb, depth)
-            frames.append({"pose": [round(x, 2), round(y, 2), round(yaw, 1)], **q,
-                           "depth_med_m": round(float(np.median(depth[depth > 0])), 2) if (depth > 0).any() else None})
-            im = Image.fromarray(rgb)
-            ImageDraw.Draw(im).text((4, 4), f"({x:.1f},{y:.1f},{yaw:.0f}) lap={q['lapvar']:.0f}",
-                                    fill=(255, 255, 0) if not q["low"] else (255, 60, 60))
-            tiles.append(im)
-        cols = 6
-        rows_n = (len(tiles) + cols - 1) // cols
-        sheet = Image.new("RGB", (cols * CAMERA["width"], rows_n * CAMERA["height"]))
-        for k, t in enumerate(tiles):
-            sheet.paste(t, ((k % cols) * CAMERA["width"], (k // cols) * CAMERA["height"]))
-        sheet.save(os.path.join(OUT, f"probe_r{i}_{r['name']}.png"))
-        # 高度复核（独立于 LiDAR）：沿路每隔一个位姿垂直向下渲染，中心 1/3 画面的期望深度中位数 = 3DGS 里的离地高度。
+    out_dir = os.path.join(OUT, "probe_quality")
+    rows, ok = pq.run(SCENE_JSON, out_dir=out_dir)
+    rd = renderer_mod.make_renderer(scene_mod.load_scene(SCENE_JSON))
+    for row in rows:
         down = []
-        for (x, y, _yaw) in poses[::2]:
-            _rgb, dep, _ms = rd.render_pose(x, y, FLY_Z, 0.0, pitch_deg=-90.0)
+        for f in row["frames"][::2]:
+            _rgb, dep, _ms = rd.render_pose(f["pose"][0], f["pose"][1], f["pose"][2], 0.0, pitch_deg=-90.0)
             h, w = dep.shape
             c = dep[h // 3: 2 * h // 3, w // 3: 2 * w // 3]
             if (c > 0).any():
                 down.append(float(np.median(c[c > 0])))
-        laps = [f["lapvar"] for f in frames]
-        low_frac = float(np.mean([f["low"] for f in frames]))
-        summary[r["name"]] = {"route": i, "n_frames": len(frames), "lapvar_min": min(laps),
-                              "lapvar_med": float(np.median(laps)), "low_frac": round(low_frac, 3),
-                              "hole_frac_mean": round(float(np.mean([f["hole_frac"] for f in frames])), 4),
-                              "ground_depth_3dgs_m": {"min": round(min(down), 2), "med": round(float(np.median(down)), 2),
-                                                      "max": round(max(down), 2), "n": len(down)} if down else None,
-                              "frames": frames}
-        ok = low_frac < PROBE_LOW_FRAC_MAX
-        log(f"probe: r{i} {r['name']}: {len(frames)} 帧 lapvar min/med {min(laps):.0f}/{np.median(laps):.0f} "
-            f"low {low_frac:.0%} {'OK' if ok else 'BAD'}  俯视 3DGS 离地 {summary[r['name']]['ground_depth_3dgs_m']}"
-            f"  per-frame {[int(v) for v in laps]}")
-        if not ok:
-            bad.append(r["name"])
-    write_json(os.path.join(OUT, "routes_quality.json"), summary)
-    if bad:
-        raise SystemExit(f"路线低质帧比例 >= {PROBE_LOW_FRAC_MAX:.0%}：{bad}（看 OUT/probe_r*.png 改路线）")
+        row["ground_depth_3dgs_m"] = ({"min": round(min(down), 2), "med": round(float(np.median(down)), 2),
+                                       "max": round(max(down), 2), "n": len(down)} if down else None)
+        log(f"probe: {row['name']}: {row['n_frames']} 帧 low {row.get('low_frac')} {'OK' if row['pass'] else 'BAD'}"
+            f"  俯视 3DGS 离地 {row['ground_depth_3dgs_m']}")
+    path = os.path.join(out_dir, "routes_quality.json")
+    with open(path, encoding="utf-8") as f:
+        report = json.load(f)
+    report["routes"] = rows
+    write_json(path, report)
+    if not ok:
+        raise SystemExit(f"有路线低质帧比例 > {pq.LOW_FRAC_MAX:.0%}（看 {out_dir}/route_*.png 改路线）")
 
 
 # ---------------------------------------------------------------- 6 教师冒烟 + 7 三视角视频
