@@ -86,13 +86,17 @@ def self_check():
 def main():
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     p.add_argument("--count", type=int, default=COUNT)
-    p.add_argument("--task", default=TASK)
-    p.add_argument("--density", default=None, choices=(None, "sparse", "medium", "dense"))
+    p.add_argument("--task", default=TASK, choices=("base", "l1", "campus", "campus_assets", "forest_e1"))
+    p.add_argument("--density", default=None, choices=("sparse", "medium", "dense"))
     p.add_argument("--split", default=SPLIT, choices=("train", "val", "test"))
     p.add_argument("--exclude-collection", action="append", default=None,
                    help="collection_manifest.json；可重复；缺省用配置区 EXCLUDE_COLLECTIONS")
     p.add_argument("--self-check", action="store_true")
     args = p.parse_args()
+    if (args.task == "forest_e1") != (args.density is not None):
+        p.error("--density 与 --task forest_e1 必须同时给")
+    if args.count < 1:
+        p.error("--count 必须 >= 1")
     if args.self_check:
         self_check()
         return

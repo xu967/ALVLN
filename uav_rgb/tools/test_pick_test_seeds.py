@@ -5,6 +5,8 @@
 
 运行（仓库根）：.venv-tools/bin/python tools/test_pick_test_seeds.py
 """
+import contextlib
+import io
 import os
 import sys
 
@@ -40,8 +42,29 @@ def test_missing_exclude_is_error():
     print("ok 排除清单缺失 → 报错退出")
 
 
+def test_cli_rejects_bad_args():
+    """坏参数由 argparse 报一句话退出（rc=2），不是 split_manifest 的 ValueError traceback，也不静默照跑。"""
+    saved = sys.argv
+    try:
+        for argv in (["--task", "foo"], ["--task", "forest_e1"], ["--task", "base", "--density", "sparse"],
+                     ["--count", "0"]):
+            sys.argv = ["pick_test_seeds.py", *argv]
+            err = io.StringIO()
+            try:
+                with contextlib.redirect_stderr(err):
+                    pts.main()
+            except SystemExit as e:
+                assert e.code == 2, (argv, e.code)
+            else:
+                raise AssertionError(f"{argv} 应被拒绝")
+    finally:
+        sys.argv = saved
+    print("ok CLI 坏参数 → argparse 一句话退出")
+
+
 def main():
     test_missing_exclude_is_error()
+    test_cli_rejects_bad_args()
     # 1. 默认排除清单必须含旧 X3 学生的训练集合，不只是 E1 集合。
     assert X3_TRAIN_MANIFEST in pts.EXCLUDE_COLLECTIONS, pts.EXCLUDE_COLLECTIONS
     seeds = [int(s) for s in e1_pipeline.CFG["eval_seeds"].split(",")]

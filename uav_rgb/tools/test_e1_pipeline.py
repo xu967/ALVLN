@@ -146,24 +146,29 @@ def test_train_resume_by_metrics_done():
 
 
 def test_evaluate_resume_by_eval_finished():
-    """eval.json 在但 failed_count>0 的组不算完成：目录改名 .failed-* 后重跑；完成的组跳过。"""
+    """eval.json 在但 failed_count>0 的组、录像组中断后只剩 videos/ 的组都不算完成：目录改名 .failed-* 后重跑；
+    完成的组跳过。"""
     tmp = tempfile.mkdtemp(prefix="test_e1_pipeline_")
     real_popen, real_ckpt = subprocess.Popen, ep.CFG["old_x3_ckpt"]
     FakeProc.waited = []
-    started = []
+    started, cmds = [], {}
     try:
         for rel in ("old_x3.bin", os.path.join("run", "ckpt_best.bin")):
             _touch(os.path.join(tmp, rel))
         ep.CFG["old_x3_ckpt"] = os.path.join(tmp, "old_x3.bin")
         groups = [g[0] for g in ep.eval_groups()]
-        finished, broken = groups[0], groups[1]
+        finished, broken, recorded = groups[0], groups[1], ep.CFG["record_groups"][-1]
+        assert recorded not in (finished, broken), (finished, broken, recorded)
         _touch(os.path.join(tmp, f"eval-{finished}", "eval.json"), json.dumps({"episodes_done": 20, "failed_count": 0}))
         _touch(os.path.join(tmp, f"eval-{broken}", "eval.json"), json.dumps({"episodes_done": 19, "failed_count": 1}))
+        # eval_closed_loop 一启动就建 videos/，录像暂存帧在 videos/.frames_<seed>/；中断在写 eval.json 之前
+        _touch(os.path.join(tmp, f"eval-{recorded}", "videos", ".frames_7", "chase_000001.png"))
 
         def fake_popen(cmd, **_kw):
             edir = cmd[cmd.index("--out") + 1]
             name = os.path.basename(edir)[len("eval-"):]
             started.append(name)
+            cmds[name] = cmd
             assert not os.path.exists(edir), f"{edir} 应先让出来（eval_closed_loop 要求 --out 为空）"
             return FakeProc(name, edir, write_eval=True)
 
@@ -173,10 +178,13 @@ def test_evaluate_resume_by_eval_finished():
         assert broken in started, f"failed_count>0 的组没重跑：{started}"
         retired = [d for d in os.listdir(tmp) if d.startswith(f"eval-{broken}.failed-")]
         assert len(retired) == 1 and os.path.isfile(os.path.join(tmp, retired[0], "eval.json")), os.listdir(tmp)
+        assert recorded in started and "--record-video" in cmds[recorded], f"只剩 videos/ 的录像组没重跑：{started}"
+        retired = [d for d in os.listdir(tmp) if d.startswith(f"eval-{recorded}.failed-")]
+        assert len(retired) == 1 and os.path.isdir(os.path.join(tmp, retired[0], "videos")), os.listdir(tmp)
     finally:
         subprocess.Popen, ep.CFG["old_x3_ckpt"] = real_popen, real_ckpt
         shutil.rmtree(tmp, ignore_errors=True)
-    print("ok evaluate：按 eval_finished 续跑，未完成目录改名重跑")
+    print("ok evaluate：按 eval_finished 续跑，未完成目录（含只剩 videos/ 的录像组）改名重跑")
 
 
 def test_main_records_interrupt_with_real_rc():

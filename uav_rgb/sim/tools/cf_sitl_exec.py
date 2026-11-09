@@ -49,13 +49,20 @@ TAKEOFF_HEIGHT_M = 2.0   # 任务规定巡航高度；固件定高，不走 coll
 STATE_WAIT_S = 20.0      # 等 state 首帧：软件渲染下世界起来 + 插件 Configure 实测 5~10 s，留 2 倍
 RESET_ACK_S = 5.0        # reset 后等 exec_state 回 DISARMED 且 SITL 时钟归零；200 Hz 下正常 <50 ms
 RESET_RESEND_S = 1.0     # 这么久没确认就重发 reset：正常 <50 ms 到达，1 s 远大于抖动，又给 5 s 内 4 次重发机会
-READY_TIMEOUT_S = 90.0   # arm_takeoff→READY：爬升 2 m 约 3~4 s 仿真，RTF 0.05 兜底 ≈ 80 s 墙钟
+# arm_takeoff→READY 的上限按 state 的 gz 仿真秒计：实测 775 集 reset→READY 的 SITL 时钟 6.5–9.5 s、p99 9.0 s，
+# 同 seed 两次采集逐位相同（与负载无关）；20 s 约为最长的 2 倍，也覆盖 e1_mini.json 的设计预算（4 s 爬升 + ~10 s 稳定）
+READY_SIM_S = 20.0
+# 按仿真秒等待时的墙钟兜底：多实例 + 三视角录像满载时 action_rtf 实测最低 0.083，9.5 s 仿真的起飞要约 115 s 墙钟；
+# 300 s 小于外层 --episode-timeout 600 s，仿真几乎不走时先报这里的具体原因
+SIM_WAIT_WALL_S = 300.0
+PLUGIN_STEP_S = 0.001    # CfSitlSystem 只接受 1 ms 物理步长：不符时只在 gz 日志 gzerr 一次，不步进、不发 state
+STATS_WAIT_S = 10.0      # 首帧超时后读一帧 gz /stats 的上限（stats 约 5 Hz）；只在失败路径上花
 # 起飞阶段进 FAILSAFE 的兜底重试（reset→落地→再 arm），次数记进 takeoff_failsafes / manifest。
 # 历史原因：机体原点离地 0.02 m 时 ToF 读数在量程下限 0.04 m 边缘，噪声偶给一个有效样本后又连续无效
 # >0.5 s，执行器误判 FAILSAFE（2026-11-06 真库冒烟 2/6 次复现）；库侧已改为高度估计曾 ≥ tof_airborne_m
 # =0.15 m 才算离地（e1_mini.json executor 新键）。重试只防回归，正常应为 0 次。
 TAKEOFF_RETRIES = 3      # 上限 3 次：偶发问题 3 次都中的概率可忽略；再失败就是别的问题，交给调用方
-SETTLE_S = 3.0           # 重试前等机体落回地面（z<0.1 m 且 |vz|<0.05）：FAILSAFE 最多漂升 0.5 s，落回 <1 s
+SETTLE_S = 3.0           # 重试前等机体落回地面的仿真秒（z<0.1 m 且 |vz|<0.05）：FAILSAFE 最多漂升 0.5 s，落回 <1 s
 ZERO_UNTIL_S = 3600.0    # zero_now 的 SAFE 截止相对量：远大于任何步间隔；到期后固件也仍悬停
 POLL_S = 0.02            # 等 state 变化的轮询间隔：state 200 Hz，20 ms 内必有新帧
 STATE_STALE_S = 3.0      # state 多久没新帧算停更（墙钟）：gz 卡死/插件崩溃时不要死等
@@ -81,6 +88,34 @@ def state_stamp_ns(msg):
         return int(round(float(msg["data"][IDX_SIM_T]) * 1e9))
     except (KeyError, TypeError, IndexError, ValueError):
         return 0
+
+
+def world_step_s(timeout=STATS_WAIT_S):
+    """读一帧 gz /stats（当前 GZ_PARTITION），返回世界物理步长 simTime / iterations（秒）；读不到返回 None。"""
+    # shortcut: 世界暂停（iterations=0）时按读不到处理；采集端用 gz sim -s -r 起世界，正常不会暂停
+    try:
+        r = subprocess.run(["gz", "topic", "-e", "-t", "/stats", "-n", "1", "--json-output"],
+                           capture_output=True, text=True, timeout=timeout)
+        stats = json.loads(r.stdout.strip().splitlines()[0])
+        sim = stats.get("simTime") or {}
+        return (int(sim.get("sec", 0)) + int(sim.get("nsec", 0)) / 1e9) / int(stats["iterations"])
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, IndexError, TypeError, ZeroDivisionError):
+        return None
+
+
+def no_state_reason():
+    """首帧超时的原因：世界步长不是插件要求的 1 ms 就直接说出来，否则指到 gz 日志。"""
+    dt = world_step_s()
+    if dt is not None and abs(dt - PLUGIN_STEP_S) > 1e-6:
+        return (f"世界物理步长 {dt:g} s ≠ CfSitlSystem 要求的 {PLUGIN_STEP_S:g} s，插件拒绝步进、不发 state；"
+                f"把世界 <max_step_size> 改成 {PLUGIN_STEP_S:g}")
+    seen = f"世界步长 {dt:g} s 正常" if dt is not None else "读不到 gz /stats"
+    return f"{seen}；看 gz sim 日志里的 [CfSitlSystem] 行（插件没加载或 Configure 失败）"
+
+
+def _where(st):
+    return (f"exec_state={EXEC_STATES.get(int(st[IDX_EXEC]), st[IDX_EXEC])} "
+            f"height={st[IDX_HEIGHT]:.2f} z={st[IDX_POS + 2]:.2f}" if st else "无 state")
 
 
 def params_values_sha256(obj):
@@ -351,9 +386,12 @@ class CfSitlExecutor:
         return self._err
 
     # -- 生命周期
-    def _wait_state(self, pred, timeout, what, abort_check=None):
-        deadline = time.monotonic() + timeout
-        last_stamp, last_change = None, time.monotonic()
+    def _wait_state(self, pred, timeout, what, abort_check=None, sim_timeout=None):
+        """timeout 是墙钟秒。给 sim_timeout 时按 state 的 gz 仿真秒判超时（从本次等待见到的第一帧起），
+        timeout 只兜底：满载 RTF 低时同样的仿真过程要多花几倍墙钟。STATE_STALE_S 停更检测两种都照旧按墙钟。"""
+        t0 = time.monotonic()
+        deadline = t0 + timeout
+        last_stamp, last_change, sim_t0 = None, t0, None
         while time.monotonic() < deadline:
             if not self._sub.healthy():
                 raise RuntimeError(f"{what}: state 订阅进程已退出")
@@ -368,6 +406,10 @@ class CfSitlExecutor:
                     raise RuntimeError(f"{what}: 固件进入 FAILSAFE")
                 if pred(st):
                     return st
+                sim_t0 = stamp if sim_t0 is None else sim_t0
+                if sim_timeout is not None and stamp - sim_t0 > sim_timeout:
+                    raise WaitTimeout(f"{what}超时：仿真 {stamp - sim_t0:.1f}s > {sim_timeout:g}s"
+                                      f"（墙钟 {time.monotonic() - t0:.0f}s）：{_where(st)}")
             if time.monotonic() - last_change > STATE_STALE_S and last_stamp is not None:
                 raise RuntimeError(f"{what}: state 停更 {STATE_STALE_S:.0f}s（仿真暂停或插件卡死）")
             if abort_check is not None:
@@ -376,9 +418,9 @@ class CfSitlExecutor:
                     raise RuntimeError(f"{what}: {reason}")
             time.sleep(POLL_S)
         st = self.state()
-        where = (f"exec_state={EXEC_STATES.get(int(st[IDX_EXEC]), st[IDX_EXEC])} "
-                 f"height={st[IDX_HEIGHT]:.2f} z={st[IDX_POS + 2]:.2f}" if st else "无 state")
-        raise WaitTimeout(f"{what}超时 {timeout:.0f}s：{where}")
+        wall = (f"（墙钟兜底，仿真只走了 {st[IDX_SIM_T] - sim_t0:.1f}s）"
+                if sim_timeout is not None and st and sim_t0 is not None else "")
+        raise WaitTimeout(f"{what}超时 {timeout:.0f}s{wall}：{_where(st)}")
 
     def _reset_until_ack(self):
         """发 reset 直到 state 确认（DISARMED 且 SITL 时钟归零）。
@@ -409,7 +451,10 @@ class CfSitlExecutor:
         """等 state → reset → arm_takeoff → READY。失败抛 RuntimeError（已尽量停桨）。"""
         self._sub = gz_io.TopicSub(STATE_TOPIC, buf=4, stamp_fn=state_stamp_ns)
         try:
-            st = self._wait_state(lambda st: True, STATE_WAIT_S, "等 cf_sitl state 首帧")
+            try:
+                st = self._wait_state(lambda st: True, STATE_WAIT_S, "等 cf_sitl state 首帧")
+            except WaitTimeout as e:
+                raise WaitTimeout(f"{e}；{no_state_reason()}") from None
             # 库版本进 params：manifest 的 dynamics_profile 要带 lib<N>。同一执行器对象只认一个版本。
             lib_version = int(st[IDX_LIB_VERSION])
             if self.params.lib_version not in (None, lib_version):
@@ -421,11 +466,11 @@ class CfSitlExecutor:
                 self._reset_until_ack()   # reset 后 SITL 时钟归零、exec_state 回 DISARMED
                 if attempt:   # FAILSAFE 后 reset 停桨，等机体落回地面再解锁
                     self._wait_state(lambda st: st[IDX_POS + 2] < 0.1 and abs(st[IDX_VEL + 2]) < 0.05,
-                                     SETTLE_S, "等机体落地")
+                                     SIM_WAIT_WALL_S, "等机体落地", sim_timeout=SETTLE_S)
                 self._pub.cmd(f"arm_takeoff {self.takeoff_height:g}")
                 try:
-                    st = self._wait_state(lambda st: int(st[IDX_EXEC]) == EXEC_READY, READY_TIMEOUT_S,
-                                          "arm_takeoff→READY", abort_check)
+                    st = self._wait_state(lambda st: int(st[IDX_EXEC]) == EXEC_READY, SIM_WAIT_WALL_S,
+                                          "arm_takeoff→READY", abort_check, sim_timeout=READY_SIM_S)
                     break
                 except RuntimeError as e:
                     if "FAILSAFE" not in str(e) or attempt == TAKEOFF_RETRIES:

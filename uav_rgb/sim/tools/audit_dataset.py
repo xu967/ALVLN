@@ -905,13 +905,18 @@ def audit(facts, pre_excluded=(), quarantined=()):
     others = Counter(f.get("teacher") for f in ok if f.get("teacher") != "plan_action")
     # 逐集/逐步统计覆盖：混了新旧格式时要能看出「验了多少」，不能因为一集是
     # 旧格式就把整条检查降级成 SKIP，也不能把没进 given 的集算作已验。
-    no_pose = no_truth = old_version = 0  # 因缺字段/版本跳过的步数
+    no_pose = no_truth = old_version = not_recomputable = 0  # 因缺字段/版本/教师类型跳过的步数
     uncovered = sum(len(f["steps"]) for f in ok if f.get("teacher") != "plan_action")
     total = mism = 0
     samples = []
     for f in given:
         if not f["pillars"]:
             no_truth += len(f["steps"])
+            continue
+        # predictive 教师（--teacher-planner predictive）的输入含 cf_stab 模型速度与在途动作，actions.jsonl 不记，
+        # 复算不了；先于版本比对单列，也不能落到下面的 plan_action 分支去比。
+        if f.get("planner") == "predictive":
+            not_recomputable += len(f["steps"])
             continue
         # 旧几何/旧教师版本数据没有版本字段；用当前算法复算会假 FAIL。版本按任务档位比：
         # forest_e1 集要求 forest 档版本（v6），旧森林集（写 v5、按 0.40/0.30 方框算）自动跳过。
@@ -960,7 +965,8 @@ def audit(facts, pre_excluded=(), quarantined=()):
                 if len(samples) < 5:
                     samples.append({"dir": f["dir"], "recorded": s["action_expert"],
                                     "recomputed": want})
-    skipped = no_pose + no_truth + old_version
+    skipped = no_pose + no_truth + old_version + not_recomputable
+    pred = f"、predictive 教师不可复算 {not_recomputable} 步" if not_recomputable else ""
     if not ok:
         checks.append(check("label_recompute", "SKIP", "没有可读的集"))
     elif not given:
@@ -971,7 +977,7 @@ def audit(facts, pre_excluded=(), quarantined=()):
         # 「一步都没复算成」不等于「全错」。旧格式/缺真值走这里，别报成 100% 不一致。
         checks.append(check("label_recompute", "SKIP",
                             f"没有可复算的步：缺动作前位姿 {no_pose} 步、"
-                            f"缺柱子真值 {no_truth} 步、旧几何或教师版本 {old_version} 步"
+                            f"缺柱子真值 {no_truth} 步、旧几何或教师版本 {old_version} 步{pred}"
                             f"（共 {len(given)} 集）",
                             skipped=skipped))
     else:
@@ -981,7 +987,7 @@ def audit(facts, pre_excluded=(), quarantined=()):
                             f"{mism}/{total} 步复算标签与原标签不一致（{share:.1%}，"
                             f"阈值 {MAX_LABEL_MISMATCH:.0%}；跳过 {skipped} 步"
                             f"（缺位姿 {no_pose}、缺真值 {no_truth}、"
-                            f"旧几何或教师版本 {old_version}）；"
+                            f"旧几何或教师版本 {old_version}{pred}）；"
                             f"另有 {uncovered} 步来自非 plan_action 的集未参与）",
                             samples=samples, mismatch=round(share, 4),
                             covered_steps=total, skipped=skipped))

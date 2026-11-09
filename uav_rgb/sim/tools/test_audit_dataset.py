@@ -779,6 +779,43 @@ def main():
             assert c24["status"] == want, (label, man_over, c24)
             shutil.rmtree(root24)
         ad.set_vehicle("x3")
+
+        # 25) planner=predictive 集（collect.py --teacher-planner predictive）复算不了：教师输入含 cf_stab 模型速度与在途动作，
+        #     actions.jsonl 不记。必须单列「predictive 教师不可复算」，不能记成旧版本；版本串碰巧等于 legacy 时
+        #     也不能落到 plan_action 分支去比（那是另一个教师，必然假 FAIL）。
+        want25 = ad.plan_action(0.0, 0.0, 0.0, PILLARS)
+        other25 = next(a for a in range(4) if a != want25)
+        pred_man = {"planner": "predictive", "teacher_version": "uavrgb.predictive_teacher.v1", "dynamics": "cf_stab"}
+
+        def write_pred_ep(root, eid, man_over=None):
+            write_ep(root, "train", eid, [other25] * 4, man_extra=dict(pred_man, **(man_over or {})))
+            p25 = os.path.join(root, "train", str(eid), "actions.jsonl")
+            with open(p25, encoding="utf-8") as f:
+                rows25 = [json.loads(line) for line in f]
+            for r in rows25:
+                r.update({"action_expert": other25, "pose_before": {"x": 0.0, "y": 0.0, "z": 2.0}, "yaw_before": 0.0})
+            with open(p25, "w", encoding="utf-8") as f:
+                f.writelines(json.dumps(r) + "\n" for r in rows25)
+
+        for man_over in ({}, {"teacher_version": TEACHER_VERSION}):
+            root25 = tempfile.mkdtemp(prefix="audit_test_")
+            write_pred_ep(root25, 1, man_over)
+            c25 = details(root25)["label_recompute"]
+            assert c25["status"] == "SKIP", (man_over, c25)
+            assert "predictive 教师不可复算 4 步" in c25["detail"] and "旧几何或教师版本 0 步" in c25["detail"], (man_over, c25)
+            shutil.rmtree(root25)
+        root25 = tempfile.mkdtemp(prefix="audit_test_")   # 混一集可复算的：照常复算，predictive 步数在「跳过」里单列
+        write_plan_ep(root25, "train", 1)
+        write_pred_ep(root25, 2)
+        c25 = details(root25)["label_recompute"]
+        assert c25["status"] == "PASS" and c25["covered_steps"] == 12 and c25["skipped"] == 4, c25
+        assert "predictive 教师不可复算 4 步" in c25["detail"], c25
+        shutil.rmtree(root25)
+        # 不含 predictive 集时报告逐字不变（不多出 predictive 字样）
+        root25 = tempfile.mkdtemp(prefix="audit_test_")
+        write_plan_ep(root25, "train", 1)
+        assert "predictive" not in details(root25)["label_recompute"]["detail"]
+        shutil.rmtree(root25)
     finally:
         shutil.rmtree(root, ignore_errors=True)
 

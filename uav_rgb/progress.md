@@ -51,6 +51,7 @@
 - 22:55 文档提交 23c6212，`check.sh --python-only` rc=0，推 GitHub（ALVLN b76c37e）。
 - 23:10 REFACTOR-TOOLS 交付并合并（002b7bc）：gsplat 缓存目录三份实现收进 `pipeline_common.torch_extensions_dir`，`dagger_gz_pipeline` 的 log/read_json/write_json 改用 pc（run/sh/mark/need 同名不同义保留）；主会话复跑 6 组测试通过。
 - 23:15 合并后续（主会话，各带红测）：`dagger_gz_pipeline.eval_done` 改为 `pc.eval_finished`（半成品 partial eval.json 不再当评完，修前红 `True is not false`）；`seeds60` 直接取 `EVAL_SEEDS_BASE_60`，删 `pick_up_to` 与 CFG `eval60_exclude`（修前红：返回严格规则的 24 个）；`scene_import_wanderland` 的第四份缓存目录函数收进 pc（修前红 `has no attribute 'pc'`）。main 上 DAgger `--dry-run` rc=0。
+- 23:35 NICE-FIXES 交付并合并：AUDIT_SIMTOOLS Nice #8 已不复现（e1_pipeline 续跑会把只剩 `videos/` 的录像组目录挪开重跑，补锁测）；#9 audit 把 predictive 教师集单列「不可复算」；#10 `pick_test_seeds` 坏参数由 argparse 报错；AUDIT_SIM Nice #6 首帧超时后读 gz `/stats` 报世界步长不符（只改 Python）；起飞等待改按仿真 20 s 计（775 集实测 reset→READY 最长 9.49 s），墙钟 300 s 兜底，等落地改仿真 3 s。主会话审了 `/stats` 读取（10 s 超时、与 TopicSub 同一进程环境、本机 gz-transport13 支持 `--json-output`）与 `--task` 可选值（与 split_manifest 支持的五个任务一致）。
 - 22:55 用户定三件事（见关键决策）→ `tools/eval_seeds.py` 加 `EVAL_SEEDS_BASE_60` / `EVAL_SEEDS_BASE_X3_40` + `test_base_60_and_x3_40`（修前红 `AttributeError: … no attribute 'EVAL_SEEDS_BASE_60'`）；71 个 test 几何、X3 train/val 碰过 31 个、剩 40 个，与 19:38 的核实一致。给正在跑的 DAgger 预写 `full-1109/eval_seeds60.json`（60 个、几何两两不同）。
 
 ### 关键决策
@@ -68,6 +69,7 @@
 - eval4 的教师与截断新录像（`eval-teacher/videos/`、`eval-student-e1-trunc/videos/`）给短片 v3；短片 v3 等用户验收 v2 后再做。
 - **3DGS 数据集 B**：pilot 过审（99/100）；划分已定（bicycle 只作 test，val 按路线留出）；TEACHER-3DGS 合并后实现 split_policy（`collect_3dgs` + `preprocess`），再按定下的 hold 放量 ≥300 集 → 打包 → 训 S_B → 两域评测。
 - D4（E1 护罩方框四角离中心约 0.122 m，3DGS 碰撞圆柱半径 0.102 m）需要真机尺寸（118 mm 轴距 + 桨）才能定，未动。
+- NICE-FIXES 留下的小项（都不挡当前实验）：`sim/tools/smoke_gz.py` 自己的 90 s 墙钟起飞等待没改；`/stats` 读法没在真 gz 上跑过（失败路径的诊断信息）；predictive 教师集要复算得先补记 cf_stab 速度与在途动作，`campus_identity` 仍拒收 predictive 采的 campus.v1 数据（predictive 现在没有流水线在用）。
 - 用户待拍板：① 3DGS 数据集 B 的 hold（等 TEACHER-3DGS：hold 1.0 教师过线就建议 1.0 以便和 Gazebo 混训，否则 0.5）；② 短片 v2 验收与 tag `demo-2026-11-12`；③ worktree 删除（暂不做）；④ PLAN §8 四项。
 
 ## 第三阶段（2026-11-07 05:10 起）

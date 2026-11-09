@@ -179,3 +179,24 @@
 | REFACTOR-TOOLS 补丁在 main 上 | `git apply --check` 通过；test_pipeline_common / test_dagger_pipeline / test_e1_pipeline PASS，test_dagger_gz_pipeline / test_demo_3dgs_routes / test_scene_import_mipnerf OK |
 | 三条新红测 | 修前：`AssertionError: True is not false`（partial）、`'1,113,…,2506' != '1,37,58,…,1711'`（seeds60）、`AttributeError: module 'scene_import_wanderland' has no attribute 'pc'`；修后 `Ran 18 tests … OK`、`Ran 7 tests … OK` |
 | main 上 DAgger `--dry-run` | rc=0，走到 eval60，不建目录 |
+
+## 更新 2026-11-09 23:35（NICE-FIXES 合并）
+
+### 做了什么
+
+- 审 NICE-FIXES 的 diff（7 个文件 + worklog）：`cf_sitl_exec._wait_state` 新增 `sim_timeout`（从本次等待的第一帧起按 state 仿真秒计，墙钟 `SIM_WAIT_WALL_S=300` 兜底，`STATE_STALE_S` 停更检测不变）；起飞 `READY_SIM_S=20`、等落地仿真 3 s；首帧超时后 `world_step_s()` 读一帧 gz `/stats`（`subprocess.run` 带 10 s 超时，任何异常返回 None）；audit 对 predictive 集单列计数；`pick_test_seeds` 的 `--task` / `--density` / `--count` 校验。
+- 核对：`/stats` 读取与 `gz_io.TopicSub` 都继承进程环境，读同一个 GZ_PARTITION；`gz topic -h` 有 `--json-output` 与 `-n`；`--task` 五个可选值与 `split_manifest.group_id_for_task` 支持的任务一致。
+- 补丁应用到 main。
+
+### 没做什么
+
+- `smoke_gz.py` 的 90 s 墙钟等待、predictive 复算所需字段、`campus_identity` 对 predictive campus.v1 的拒收：没改，原因与去向见 progress「未完成的待办」。
+- `/stats` 读法没在真 gz 上验证。原因：本轮不起 gz；它只在首帧超时的失败路径上用，读不到时退回原来的提示。
+
+### 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| NICE-FIXES 补丁在 main 上 | `git apply --check` 通过 |
+| `sim/tools/test_cf_sitl_exec.py` | `Ran 13 tests in 0.096s` / `OK`（假时钟，无真实等待） |
+| `test_audit_dataset` / `test_pick_test_seeds` / `test_e1_pipeline` | `PASS` / `PASS (20 seeds, 20 gids)` / `PASS` |
