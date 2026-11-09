@@ -10,6 +10,11 @@ Gazebo 仍负责刚体物理和 4 个 MulticopterMotorModel；`MulticopterVeloci
 这里的高度保持用的是 Gazebo 真值 odometry 的位置 PID（altitude_assumption =
 companion_hold），属于仿真假设，不能当成固件能力。
 
+许可：`_mix` / `_desaturate` 逐行移植自 CF-Drone `control.ino`（e7f507f，GPLv3 + 附加条款 v1.1，
+见 `../CF-Drone/LICENSE`），是 `sim/cf_sitl/`（GPLv3 隔离目录）之外唯一含该固件代码的文件
+（AUDIT_SIM 2026-11-09 #4）。本文件已退出默认动力学矩阵，ROADMAP 阶段 1 过 G4 后整体删除；
+在那之前对外分发时按 GPLv3 处理这两个函数，或按数学定义重写（平均值、等比缩放偏差）。
+
 归一化约定（对齐 CF-Drone control.ino）：
   油门/电机输出 u ∈ [0,1]；本骨架按线性 ESC->转速映射发布 omega = u * max_omega
   （rad/s）。真机的油门->转速/推力曲线未实测，JSON 的 hardware.thrust_curve 为
