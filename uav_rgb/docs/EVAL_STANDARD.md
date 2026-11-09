@@ -256,8 +256,11 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
   保证旧 run 可复现。示例：`{"window_from":"observation","hold_s":0.2,"steps":80,
   "task":"l1","appearance_version":"v1","dynamics":"cf_sil",
   "camera_profile":"rgb320x240_fov60_v1"}`；未知键（如 `protocol_id`）忽略。
-- **动力学档**：`--dynamics` 接受 `x3_velocity` / `cf_stab` / `cf_sil`；
-  `cf_sil` 的控制器由 collect 实现，eval 只透传并记录，未实现前不得当作已验证档。
+- **动力学档**：`--dynamics` 接受 `x3_velocity` / `cf_stab` / `cf_blackbox` / `cf_sitl`
+  （`collect_parallel.DYNAMICS_CHOICES`；`cf_sitl` 必须配 `--vehicle e1_mini`）。`cf_sil` 已退出
+  collect_parallel / eval 的矩阵，只在 `collect.py` 保留手动入口，不得当作已验证档。
+  `cf_sitl` 的 `false_forward` 改为「碰撞前 1 s 窗口内下过 FORWARD」，`metric_version` 带后缀
+  `sim09.v1.coast1s`（`COAST_WINDOW_S`），与无后缀的 X3 数字不混报。
 - **报告规则**：`task_success` / `reach_ever` 与旧 `success` 不可混报；
   没有速度证据时 `stable_termination` 只能报未知。
 
@@ -317,7 +320,8 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
 - **seed ≠ 几何**：请求集按 seed 给，完成集按 `geometry_gid` 去重。base 任务 0..2999 内双盐
   （v3 & v5）都是 test 的 53 个 seed 只有 15 个独立几何，固定 20 seed 的请求集实际只跑出 11 个
   几何、9 个 skipped，`requested_success_rate` 的分母因此偏大。论文表的 n 以独立几何数为准，
-  请求集要直接用独立几何 seed 清单（`tools/compare_datasets.py` CFG 里的 15 个）。
+  请求集要直接用独立几何 seed 清单，唯一来源是 `tools/e1_pipeline.py` `CFG["eval_seeds"]`
+  （`tools/pick_test_seeds.py` 挑的 20 个：几何两两不同、v5 下都是 test、与 E1/X3 训练集零重叠）。
 
 ## 6. 下一步（按优先级）
 

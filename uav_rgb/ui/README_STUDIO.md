@@ -55,7 +55,7 @@ $DATA_ROOT/uav_rgb/studio_runs/<timestamp>-<run-id>/
 
 - **task**：`task_version` 为 `campus.assets*` → `campus_assets`，`campus*` → `campus`，`l1*` → `l1`；没有 `task_version` 但 `geometry_version` 是 `uavrgb.geom.*` → `base`；
 - **split**：`splits.test > 0` 用 `test`，否则 `splits.val > 0` 用 `val`，两者都空则跳过；
-- **dynamics**：`x3_v1*` → `x3_velocity`，`cf_stab*` / `cf_sil*` / `cf_blackbox*` 保留原名；旧数据缺该字段按 `x3_velocity`。
+- **dynamics**：`x3_v1*` → `x3_velocity`，`cf_stab*` / `cf_sitl*` / `cf_sil*` / `cf_blackbox*` 保留原名；旧数据缺该字段按 `x3_velocity`。`cf_blackbox`（或 meta `renderer_backend=gsplat`）走 3DGS 评测器 `sim.3dgs.eval_3dgs`。`forest_e1` 数据集没有 `task_version`，自动录像推不出任务会跳过；手动评测页选 `forest_e1` 会自动补 `--density`、`--dynamics cf_sitl --vehicle e1_mini`。
 
 任务无法确定时跳过并写告警。录像评测命令为 `eval_closed_loop.py --policy student --record-video --episodes 1`，输出到 `<run>/closed_loop_eval_<UTCstamp>/`。视频合成依赖 `cv2`（`.venv-tools` 已安装 `opencv-python-headless`）；缺 cv2 时评测指标仍会保存，只是单集出现 `video_error`。评测失败只写入 `studio_summary.json` 的 `notes` 和训练日志，不会把训练状态改成失败。完成后 `studio_summary.json` 记录 `video_dir` / `videos`，`experiment_report.md` 追加视频相对链接。手动「运行正式闭环评测」的行为不变（仍会询问并读取界面参数）。
 
@@ -75,11 +75,13 @@ python3 tools/train_student_with_video.py --data <dataset.uavr> --out <run_dir> 
 1. **第三人称跟随视角**：订阅 `/uav/chase_camera`。这是新增的虚拟追踪相机，刚体固定在 X3 的 `base_link` 后上方（相对位姿 `(-2.5, 0, 1.2 m)`），随无人机运动和姿态一起倾斜，不是稳定云台；不参与学生模型输入。
 2. **第一人称 RGB**：订阅原有 `/uav/camera`，原始输出 320×240 RGB；学生模型实际输入为预处理后的 160×120。
 3. **真实顶视相机**：订阅 `/uav/top_camera`。这是固定在世界坐标 `(2.5, 0, 6 m)` 的 Gazebo camera sensor，输出 480×360 渲染图像；80° HFOV 在 z=0 地面覆盖约 10.1×7.6 m。更大地图需要调整 SDF 中的相机高度、中心点或 FOV；它只用于观察整个场景，不参与学生模型输入。
-4. **二维轨迹分析地图（补充）**：订阅 `/model/x3/pose`，并从当前 SDF 的 collision 几何提取障碍物俯视轮廓，绘制无人机航迹、朝向和可用的 waypoint。
+4. **二维轨迹分析地图（补充）**：订阅 `/model/<vehicle>/pose`（载具按所选 world 推断：X3 世界 `x3`，E1 世界 `e1_mini`），并从当前 SDF 的 collision 几何提取障碍物俯视轮廓，绘制无人机航迹、朝向和可用的 waypoint。
+
+以上相机位姿与分辨率是 X3 世界 `sim/worlds/uav_rgb.sdf` 的。E1 世界 `sim/worlds/uav_rgb_e1.sdf`（`scene_gen.py --vehicle e1_mini` / `forest_e1`）不同：顶视相机在 `(3.25, 0, 7 m)`、640×360；追踪相机是独立的 `chase_cam` 模型，由 `CfSitlSystem` 插件按位置 + 偏航跟随（不随姿态倾斜）；`--no-aux-cameras` 生成的世界没有这两路。
 
 操作：
 
-- 可先在「快速生成场景」中选择 `campus/base/l1` 与 seed，点击「生成 SDF + metadata」；生成成功后会自动填入对应 world 和 scene metadata；也可以手动选择已有文件；
+- 可先在「快速生成场景」中选择 `base/l1/campus/forest_e1` 与 seed（`forest_e1` 还要选 Density，生成的是 E1 世界）点击「生成 SDF + metadata」；生成成功后会自动填入对应 world 和 scene metadata；也可以手动选择已有文件；
 - 点击「启动 Gazebo GUI」，或先在其他终端启动 Gazebo 后点击「连接当前仿真」；
 - 如连接外部默认分区 Gazebo，`GZ_PARTITION` 留空；如连接自定义分区，填入相同值。由 Studio 启动 Gazebo 时，留空会自动生成一个隔离分区并回填到输入框；
 - 旧的 world SDF 不包含新增 chase/top cameras。需要用更新后的 `sim/worlds/uav_rgb.sdf` 重新生成/启动场景，`/uav/chase_camera` 和 `/uav/top_camera` 才会出现；Studio 启动 Gazebo 时会把 `sim/worlds` 加入 `GZ_SIM_RESOURCE_PATH`；
