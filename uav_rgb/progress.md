@@ -1,7 +1,8 @@
 # progress.md（新开会话先读这个）
 
-- 更新：2026-11-09 19:30（3DGS 跨域评测与对照轮守护进程起跑；GPU 对拍出数；下载因代理失效放弃）
-- **现在在跑**：① 3DGS 跨域闭环矩阵 `$DATA_ROOT/uav_rgb/xeval-3dgs-20261109/`（PGID 321059；教师 / 截断 / BC / sgvis / 盲前进 × garden、bicycle、Wanderland、Callinstrasse × 6 路线 × 5 集，hold 1.0；`run.log`、`driver-<场景>.log`，结束落 `DONE` + `summary.md`；停 `kill -- -321059`）② 对照轮 `xeval-3dgs-20261109-teacher-h05/`（PGID 337265；等①落 DONE 后自动起，只跑教师 hold 0.5，给 3DGS 数据集 B 的 hold 决策用；停 `kill -- -337265`）。子 agent 6 个：FIX-A / TEACHER-COST / DAGGER-GZ / STUDENT-SELECT / FIX-B / FIX-SIM（简报 `tmp/phase8-20261109/BRIEF.md`，断点 `tmp/agent10-<名>/PROGRESS.md`，报告 `tmp/phase8-20261109/reports/`）；排队 SCENE-3DGS（BRIEF §9，本轮只接 stump）。短片 v2：`demo-e1-20261107/reel/demo_reel_v2.mp4` + `_short.mp4` + `stills_v2/`。
+- 更新：2026-11-09 20:45（第八阶段 7 个 agent 中 6 个的改动已合进 main，只剩 TEACHER-COST；3DGS 跨域评测出数）
+- **现在在跑**：TEACHER-COST（闭环 ② 与软标签一臂，用**旧库** `tmp/build-cf-sitl`，约 21:45 结束；之前**不许重建 tmp/build-cf-sitl**）；全量 `check.sh`（`tmp/analysis-20261109/check-full-dabac32.log`）。无主会话守护进程在跑。
+- **SITL 库过渡**：main 已是 lib31（FIX-SIM：profile `cf_sitl_v1:1bc8fedf:lib31`，Python 拒绝旧 proc / 旧插件），新库在 `tmp/build-cf-sitl-lib31`（ctest 10/10、selftest 33/33）。新实验一律带 `CF_SITL_PROC=$DATA_ROOT/uav_rgb/tmp/build-cf-sitl-lib31/cf_sitl_proc UAVRGB_CF_SITL_PLUGIN_DIR=…/build-cf-sitl-lib31/gz E1_CF_SITL_PLUGIN_DIR=…/build-cf-sitl-lib31/gz`；TEACHER-COST 结束后 `mv tmp/build-cf-sitl tmp/build-cf-sitl-v31-pre-lib31 && mv tmp/build-cf-sitl-lib31 tmp/build-cf-sitl`，再去掉这三个变量。
 - 本机 **GPU 换回 RTX 2080 Ti**（驱动 580.119.02）；每次会话先 `nvidia-smi -L`。SITL 库现为 **v3.1**（`tmp/build-cf-sitl`，`e1_mini.json` 683e7400；旧 v3 在 `tmp/build-cf-sitl-v3-20261107`）。eval3 / sgvis / 森林基准都是 4080 + lib v3 的，新臂只和 eval4（FIX-A 合并后起）或同条件对照臂比。
 - 方案效果盘点：`docs/experiments/2026-11-07-approach-scoreboard.md`；方向计划最新一节：`docs/PLAN_2026-11-07_demo_and_paper.md` 「更新 2026-11-09」；修复清单：`tmp/phase3-20261107/FIXLIST_R2.md`（A/B/C/D 批次状态见下）；本轮 6 份只读分析报告：`$DATA_ROOT/uav_rgb/tmp/analysis-20261109/{PLAN_STATUS,WORKTREES,EXPERIMENTS,AUDIT_SRC,AUDIT_SIMTOOLS,AUDIT_SIM}.md`；主会话 worklog：`docs/worklog/2026-11-09-1640-resume-analysis-and-merge.md`。
 
@@ -34,6 +35,10 @@
 - 19:35 DAGGER-GZ 交付并合并（e5e2206）：`tools/dagger_gz_pipeline.py` + 18 项测试、`preprocess --allow-mixed-dynamics` + 红测；smoke 全链 rc=0。正式 3 轮约 6 h，等 FIX-A / FIX-SIM 合并与 eval4 后由主会话起（报告 §0 有一行命令，起之前改成从 main 跑）。
 - 19:38 「60 个独立 test 几何」核实：base 任务总共约 794 种几何（seed 扫到 12000 也没有新的），v5 test 分区 71 个；0417 / sgvis 碰到的 24 个全在它们的 test 分区（按几何组划分，E1 学生从没训练过）；旧 X3 学生（v3 salt）在 train/val 用过其中 31 个。现行排除规则（三个采集集碰过的全排）剩 24；只排 X3 学生训练过的剩 40；E1 学生之间比较可用全部 71。**待用户定 M3 的 n=60 口径**（建议：E1 臂用 71 个里的 60 个，旧 X3 学生只在它没见过的 40 个上评或不进 n=60 表）。
 
+- 19:33 / 19:42 3DGS 跨域评测与教师 hold 0.5 对照轮 DONE；20:26 stump 两轮 DONE。结论写进 `docs/experiments/2026-11-09-xeval-3dgs.md`、scoreboard §4b、PLAN「19:30 之后」：柱阵学生在 4 个真实场景 SR(stop) 0.24–0.32 ≈ 盲前进 0.31（p 0.13–1.0），教师 0.83；教师 hold 0.5 = 0.98 / hold 1.0 = 0.83（D9 左右来回转）。
+- 20:20–20:40 合并（agent 未发最终回复的三个按 worktree 现状由主会话验证后合并）：FIX-B 392b3db（与 STUDENT-SELECT 的 CMakeLists 冲突两边都留；合并后 src 构建 0 warning、ctest 34/34）、FIX-A b3737c4（10 组测试含 DAGGER-GZ 18 项通过）、FIX-SIM a6b5eb6（3DGS 86 OK、cf_sitl_exec 5 OK、lib31 ctest 10/10 selftest 33/33）、SCENE-3DGS 5cace61（stump，8 OK）、e1_pipeline 插件目录环境变量覆盖 dabac32。
+- 待合并后清理：三处「按 GPU 算力拼 gsplat 缓存目录」的函数（demo_3dgs_routes / dagger_pipeline / scene_import_mipnerf）合一；dagger_gz_pipeline 的 helper 改为 import pipeline_common；stump 补 ToF 地形打标（route_check）。
+
 ### 关键决策
 
 - 见 PLAN「更新 2026-11-09」决策 1–5。
@@ -41,11 +46,12 @@
 
 ### 未完成的待办
 
-- 收 3DGS 跨域评测 `xeval-3dgs-20261109/summary.md`（约 19:50）与教师 hold 0.5 对照轮（约 20:20）→ 新建 `docs/experiments/2026-11-09-xeval-3dgs.md`，scoreboard 加 3DGS 跨域一节，PLAN W4 填列。
-- 收 6 个 agent 报告 → 审 diff → 合并（建议顺序：FIX-B → FIX-A → FIX-SIM → STUDENT-SELECT → TEACHER-COST → DAGGER-GZ；`eval_closed_loop.py` 与 `src/` 可能有小冲突）→ `check.sh` → 推 GitHub。第一个 agent 交付后派 SCENE-3DGS（stump）。
-- FIX-A 合并后起 **eval4**（2080 Ti + lib v3.1 + sim09.v2，六臂同 20 seed，≤3 gz，单集超时放宽；最好等 agent 的 gz 少一些再起，满载时每步 6–8 s 墙钟）。
-- FIX-SIM 合并后：3DGS 教师数据 pilot（每场景 20 集）→ 放量（数据集 B ≥300 集）→ S_B 训练 → 跨域矩阵 S_B 行；hold 等用户拍板。DAgger 正式 3 轮同样等 FIX-SIM（profile 加库指纹）。
-- 用户：看短片 v2 → 验收 → tag `demo-2026-11-12`；拍板 3DGS 数据集 hold、stump 尺度假设、PLAN §8 四项；worktree 删除暂不做（用户 18:36「还没确定」）；要下载新场景需先恢复代理 127.0.0.1:7897。
+- `check.sh` 通过后推 GitHub（本地 main 领先 ALVLN 9 个提交）。
+- TEACHER-COST 交付 → 审 diff → 合并；之后换 `tmp/build-cf-sitl` 为 lib31（见头部）。
+- **eval4**（2080 Ti + lib31 + sim09.v2，同 20 seed）：`e1_pipeline.py --from eval` 到 `$DATA_ROOT/uav_rgb/e1-pipeline-20261107-0417-eval4/`（run/ ds/ 软链 0417），`E1_EXTRA_STUDENTS` 带截断、sgvis、STUDENT-SELECT 的 seed1 / seed2；单集超时放宽；写 `inputs.sha256`（DAGGER-GZ 复用基线要它）。
+- **DAgger 正式 3 轮**（约 6 h）：eval4 之后，从 main 起（不是从 wt-dagger-gz），一行命令见 `tmp/phase8-20261109/reports/DAGGER_GZ_20261109.md` §0，加上 lib31 三个环境变量。
+- **3DGS 数据集 B**（每场景 20 集 pilot → 放量 ≥300 集 → S_B）：等用户定 hold（证据：教师 hold 0.5 = 0.98、1.0 = 0.83）；用 `--truncate-on-collision`、lib31 的 `cf_sitl_proc`。
+- 用户待拍板：① 3DGS 数据集 hold；② M3 n=60 的几何口径（建议 E1 臂用 71 个 test 几何里的 60 个）；③ 短片 v2 验收与 tag；④ worktree 删除（暂不做）；⑤ PLAN §8 四项。
 
 ## 第三阶段（2026-11-07 05:10 起）
 

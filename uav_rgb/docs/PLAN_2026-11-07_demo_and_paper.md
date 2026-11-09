@@ -265,3 +265,11 @@ P2 代码在 main 但不进流水线（DISTILL 反事实探针：prev-action 在
 | M2 Demo | 11-12 | 短片 v2 生成中；一页数字齐；待用户验收并打 tag `demo-2026-11-12` |
 | M3 算法 v1 | 11-20 | 层 1 关闭（负结果）；层 2 / 层 3 本日开工；过线判据改为「相对 **eval4** 硬标签 BC，n≥60 下区间不重叠」 |
 | M4 论文材料 | 12-05 | 不变；W4 矩阵已有柱阵 6 臂 + 森林 sparse 4 臂 |
+
+### 19:30 之后（同日补）
+
+- W4「柱阵 → 3DGS 真实外观」一列有数（`experiments/2026-11-09-xeval-3dgs.md`）：三个柱阵学生 0.24–0.32，与盲前进 0.31 没有可检出差别，教师 0.83；迁移约为零。D2 的 Q3 第一个答案是否定的，S_B / S_AB 成为 M3 之后的主线之一。
+- 3DGS 教师 hold 0.5 = 0.98、hold 1.0 = 0.83（同出生位姿）：数据集 B 用 hold 0.5 才有干净示范；要用 1.0 与 Gazebo 混训，先做 D9（3DGS 教师逐动作代价 + `PLAN_HARD_M`）。**待用户拍板**。
+- 第六个真实场景 stump 接入（尺度未核实，单列）；treehill / flowers / truck / train 与第二个 Wanderland 因代理不可用、直连过慢，本轮放弃。
+- M3 的 n=60：按现行排除规则只有 24 个独立 test 几何（base 任务总几何约 794、test 分区 71）；E1 学生之间比较可用全部 71。**待用户拍板口径**（progress 19:38 条）。
+- 合并：FIX-A（sim09.v2 等）、FIX-B（src 15 项）、FIX-SIM（3DGS 碰后标记、profile 带库版本）、STUDENT-SELECT、DAGGER-GZ、SCENE-3DGS；SITL 新库 lib31 在 `tmp/build-cf-sitl-lib31`，`tmp/build-cf-sitl` 等 TEACHER-COST 的旧库闭环结束后再换。
