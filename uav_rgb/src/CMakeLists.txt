@@ -199,3 +199,8 @@ add_test(NAME test_checkpoint_versions COMMAND test_checkpoint_versions)
 add_executable(test_run_owner tests/test_run_owner.cpp)
 target_link_libraries(test_run_owner PRIVATE uavrgb_core)
 add_test(NAME test_run_owner COMMAND test_run_owner)
+
+# STUDENT-SELECT：--save-every-epoch 的逐轮 ckpt 文件名 / 内容 / 默认关。
+add_executable(test_save_every_epoch tests/test_save_every_epoch.cpp)
+target_link_libraries(test_save_every_epoch PRIVATE uavrgb_core)
+add_test(NAME test_save_every_epoch COMMAND test_save_every_epoch)

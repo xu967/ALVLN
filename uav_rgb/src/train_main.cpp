@@ -1,10 +1,11 @@
 // 训练器 CLI：
 //   uavrgb_train --data <dataset.uavr> --epochs N --batch B --lr L --out <run_dir>
 //                [--resume <ckpt>] [--seed S] [--max-grad-norm G]
-//                [--class-weights auto|<w0,w1,w2,w3>] [--drop-collision]
+//                [--class-weights auto|<w0,w1,w2,w3>] [--drop-collision] [--save-every-epoch]
 //   uavrgb_train --data <dataset.uavr> --eval-only <ckpt> --out <run_dir>
 //                [--batch B] [--split val|test|all] [--drop-collision]
-// 落盘：<run_dir>/results.csv、metrics.jsonl、config.json、ckpt.bin（每 epoch 覆盖）。
+// 落盘：<run_dir>/results.csv、metrics.jsonl、config.json、ckpt.bin（每 epoch 覆盖）；
+// --save-every-epoch 时每轮再留一份 ckpt_epNN.bin。
 // eval-only 只向 metrics.jsonl 追加 validation 事件，不写 results.csv、不更新权重。
 #include <cmath>
 #include <cstdio>
@@ -29,6 +30,7 @@ void usage() {
                "[--allow-resume-mismatch] [--strict-distill] "
                "[--augment all|photo,shift,flip] [--warmup N] [--cosine-lr] [--weight-decay W] [--label-smoothing E]\n"
                "       [--two-frame] [--prev-action] [--depth-aux [--aux-lambda L]]  （需要 dataset.aux 侧车）\n"
+               "       [--save-every-epoch]  （每轮另存 <run_dir>/ckpt_epNN.bin）\n"
                "  或: uavrgb_train --data <dataset.uavr> --eval-only <ckpt> --out "
                "<run_dir> [--batch B] [--split val|test|all] [--drop-collision]\n");
 }
@@ -125,6 +127,8 @@ int main(int argc, char** argv) {
         cfg.aux_lambda = std::stof(next("--aux-lambda"));
         if (!(cfg.aux_lambda >= 0.0f)) throw std::invalid_argument("--aux-lambda 不能为负");
         cfg.aux_lambda_set = true;
+      } else if (a == "--save-every-epoch") {
+        cfg.save_every_epoch = true;
       } else if (a == "--eval-only") {
         eval_ckpt = next("--eval-only");
       } else if (a == "--split") {

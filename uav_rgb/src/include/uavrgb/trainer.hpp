@@ -67,6 +67,10 @@ struct TrainConfig {
   float aux_lambda = 0.5f;
   bool two_frame_set = false, prev_action_set = false, depth_aux_set = false,
        aux_lambda_set = false;
+  // 每轮多写一份 <out>/ckpt_ep{NN}.bin（NN = results.csv 的 epoch 列，格式同 ckpt.bin）。
+  // 选模研究要对每一轮做离线探针/闭环（DISTILL §2.4：ckpt_best 是噪声序列上的最大值），
+  // 默认关：30 轮 × 1.2 MB 对流水线 run 是多余的。
+  bool save_every_epoch = false;
   // 以下由 trainer 在 run() 里按实际数据/环境补齐，再落进 config.json。
   std::string dataset_sha256, split_scheme, window_from, hold_s;
   std::string soft_targets_sha256, teacher_ckpt_sha256, teacher_select_split, source_git;

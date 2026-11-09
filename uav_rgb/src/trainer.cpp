@@ -601,6 +601,12 @@ void Trainer::run() {
     }
     // 必须在更新 best 之后写：否则续训从 ckpt.bin 读到的 best 比 ckpt_best.bin 落后一轮。
     save_checkpoint(ckpt_path, model_, state_);
+    if (cfg_.save_every_epoch) {
+      // 逐轮留档（选模研究用）：与 ckpt.bin 同一份权重/状态；编号用 state_.epoch，续训时与 results.csv 对齐。
+      char name[32];
+      std::snprintf(name, sizeof name, "/ckpt_ep%02d.bin", state_.epoch);
+      save_checkpoint(cfg_.out_dir + name, model_, state_);
+    }
     samples_seen_ += seen;
   }
 
