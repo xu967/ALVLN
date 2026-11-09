@@ -1,9 +1,9 @@
 # progress.md（新开会话先读这个）
 
-- 更新：2026-11-09 17:30（Cursor 会话接手；上一会话 11-07 17:18 中断后两天零进展）
-- **现在在跑**：短片 v2 守护进程 `$DATA_ROOT/uav_rgb/demo-e1-20261107/reel/v2-run/`（PGID 163808，`run.log`，结束落 `DONE`；停 `kill -- -163808`）。11-07 的两个守护进程都已 DONE（森林 17:47 rc=1、sgvis 19:31 rc=0），结果 11-09 才入文档：`docs/experiments/2026-11-07-e1-demo-plan.md` §3.4 / §3.5。
-- 本机 **GPU 换回 RTX 2080 Ti**（驱动 580.119.02）；每次会话先 `nvidia-smi -L`。eval3 / sgvis / 森林基准都在 4080 SUPER 上产生，新臂比之前先对拍一臂（demo-plan §3.3 补记）。
-- 方案效果盘点：`docs/experiments/2026-11-07-approach-scoreboard.md`；方向计划最新一节：`docs/PLAN_2026-11-07_demo_and_paper.md` 「更新 2026-11-09」；修复清单：`tmp/phase3-20261107/FIXLIST_R2.md`；本轮 6 份只读分析报告：`$DATA_ROOT/uav_rgb/tmp/analysis-20261109/{PLAN_STATUS,WORKTREES,EXPERIMENTS,AUDIT_SRC,AUDIT_SIMTOOLS,AUDIT_SIM}.md`。
+- 更新：2026-11-09 18:05（第八阶段 6 个开发 agent 17:55 派出；main 2899428 已推 GitHub 1e1a2ce）
+- **现在在跑**：守护进程 GPU 对拍 `$DATA_ROOT/uav_rgb/eval3-gpucheck-20261109/`（PGID 188213，2 个 gz，eval3 的 BC / 截断两臂在 2080 Ti + lib v3 同条件重跑，约 19:00 出 `summary.md`；停 `kill -- -188213`）。子 agent 6 个：FIX-A / TEACHER-COST / DAGGER-GZ / STUDENT-SELECT / FIX-B / FIX-SIM（简报 `tmp/phase8-20261109/BRIEF.md`，断点 `tmp/agent10-<名>/PROGRESS.md`，报告 `tmp/phase8-20261109/reports/`）。短片 v2 已出（`demo-e1-20261107/reel/demo_reel_v2.mp4` 239 s + `_short.mp4` 57 s + `stills_v2/`）。
+- 本机 **GPU 换回 RTX 2080 Ti**（驱动 580.119.02）；每次会话先 `nvidia-smi -L`。SITL 库现为 **v3.1**（`tmp/build-cf-sitl`，`e1_mini.json` 683e7400；旧 v3 在 `tmp/build-cf-sitl-v3-20261107`）。eval3 / sgvis / 森林基准都是 4080 + lib v3 的，新臂只和 eval4（FIX-A 合并后起）或同条件对照臂比。
+- 方案效果盘点：`docs/experiments/2026-11-07-approach-scoreboard.md`；方向计划最新一节：`docs/PLAN_2026-11-07_demo_and_paper.md` 「更新 2026-11-09」；修复清单：`tmp/phase3-20261107/FIXLIST_R2.md`（A/B/C/D 批次状态见下）；本轮 6 份只读分析报告：`$DATA_ROOT/uav_rgb/tmp/analysis-20261109/{PLAN_STATUS,WORKTREES,EXPERIMENTS,AUDIT_SRC,AUDIT_SIMTOOLS,AUDIT_SIM}.md`；主会话 worklog：`docs/worklog/2026-11-09-1640-resume-analysis-and-merge.md`。
 
 ## 2026-11-09（Cursor 会话接手）
 
@@ -16,6 +16,12 @@
 - 17:15 修 REVIEW2_UIDOCS M1：`train_student_with_video` 对 cf_sitl 加 `--vehicle e1_mini`（85eb7ef，修前红 ValueError）。
 - 17:30 文档落地：sgvis（不通过判据）与森林 lib v3 进 demo-plan §3.4/§3.5、scoreboard §1/§4/§5；demo-plan §3.1 的 dev F1 0.38→0.396（抄了 epoch 20）、外径 0.18→0.20；PLAN「更新 2026-11-09」（决策：层 1 关闭、DAgger 起点 = 截断臂、基准换代 eval4 = 2080 Ti + lib v3.1 + 新口径、第七阶段重派）；CLAUDE/README/sim-README 的 GPU 改回 2080 Ti。
 
+- 17:40 合并 FIX-SITL（a156800，lib v3.1）：`tmp/build-cf-sitl` 重建 v3.1（ctest 10/10、selftest 33/33、40 种子 0 红），旧 v3 移 `build-cf-sitl-v3-20261107`；`sweep_seeds.sh` 构建目录改必填；worklog `docs/worklog/2026-11-07-1610-fix-sitl.md`。
+- 17:50 合并 FIX-3DGS D1/D5/D6（2899428；21 + 6 测试 OK）；worklog `2026-11-07-1610-fix-3dgs.md`。全量 `check.sh` PASS（CTest 30/30、cf_sitl 9/9、selftest 33/33）；`git_mirror_alvln.sh` 推 GitHub d875daf → 1e1a2ce。
+- 17:13 短片 v2 DONE rc=0（239 s 2560×1440 h264 61.7 MB；短版 57 s；`stills_v2/` 11 张）。
+- 17:22 起 GPU 对拍守护进程 `eval3-gpucheck-20261109`（见头部）。
+- 17:55 第八阶段 6 个开发 agent 派出（`tmp/phase8-20261109/BRIEF.md`）；worktree `tmp/wt-{fix-a,teacher-cost,dagger-gz,student-select,fix-b,fix-sim}` 基于 2899428；空的 `wt-fix-b` 已删并重建。FIXLIST 状态：A → FIX-A 做中；B → FIX-B 做中；C 完成；D 的 D1/D5/D6 完成、其余 → FIX-SIM 做中；E 完成。
+
 ### 关键决策
 
 - 见 PLAN「更新 2026-11-09」决策 1–5。
@@ -23,12 +29,11 @@
 
 ### 未完成的待办
 
-- 合并 `wt-fix-sitl`（C1/C2；补 worklog、`sweep_seeds.sh` 默认路径）→ 重建 `tmp/build-cf-sitl` 为 v3.1（旧 v3 改名 `build-cf-sitl-v3-20261107`）；合并 `wt-fix-3dgs`（D1/D5/D6；补 worklog）；丢弃 `wt-fix-b`；删冻结快照 `wt-e1-sgvis` / `wt-xeval-forest`。
-- `check.sh --python-only` + 全量 `check.sh` → 推 GitHub（`bash tools/git_mirror_alvln.sh`）。
-- 派 FIX-A（评测器成功线停 + metric_version + 流水线续跑判定 Must 1–3 + SIGTERM + seed 单源 + SPL 净空）、TEACHER-COST、DAGGER-GZ（round0 = 截断臂）、STUDENT-SELECT、FIX-B（含 AUDIT_SRC 新发现）。
-- FIX-A 合并后起 **eval4** 守护进程（2080 Ti + lib v3.1 + 新口径，六臂同 20 seed，≤3 gz）；出数后 scoreboard 新开 eval4 表。
-- 短片 v2 DONE 后：核对 `reel/demo_reel_v2.mp4` / `_short.mp4` / `stills_v2/`，scoreboard §5 可视化行改 done，demo 汇总页，用户验收，tag `demo-2026-11-12`。
-- 本会话 worklog：`docs/worklog/2026-11-09-1640-resume-analysis-and-merge.md`。
+- 收 GPU 对拍 `eval3-gpucheck-20261109/summary.md` → 写进 demo-plan §3.3 补记（逐 seed 一致数；若大面积翻转，eval4 之前先查推理数值）。
+- 收 6 个 agent 报告 → 审 diff → 合并（顺序建议：FIX-A → FIX-SIM → FIX-B → STUDENT-SELECT → TEACHER-COST → DAGGER-GZ；`eval_closed_loop.py` 与 `src/` 可能有小冲突）→ `check.sh` → 推 GitHub。
+- FIX-A 合并后起 **eval4** 守护进程（2080 Ti + lib v3.1 + `sim09.v2`，六臂：教师 / 盲前进 / 旧 X3 / BC / 截断 / sgvis，同 20 seed，≤3 gz，`E1_EXTRA_STUDENTS` 带截断与 sgvis ckpt）→ scoreboard 新开 eval4 表 → STUDENT-SELECT 三个 seed ckpt 与 TEACHER-COST 重标学生排进同一口径。
+- FIX-SIM（profile 加库指纹）合并后再起 DAgger 正式 3 轮（DAGGER-GZ 交付的一行命令）。
+- 用户：看短片 v2（先看 `stills_v2/`）→ 验收 → tag `demo-2026-11-12`；拍板 PLAN §8 四项；点头后删已合并 worktree（`wt-fix-sitl` / `wt-fix-3dgs` / `wt-r2-uidocs` / `wt-viz-layout`）与 `wt-e1-sgvis`（`wt-xeval-forest` 留给 gpucheck 复现）。
 
 ## 第三阶段（2026-11-07 05:10 起）
 

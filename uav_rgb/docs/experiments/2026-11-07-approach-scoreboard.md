@@ -86,9 +86,9 @@
 | P2 双帧 + prev-action + 深度分带头 | 代码已合并（opt-in，CTest 30/30），**不进流水线** | DISTILL 反事实：prev L↔R 翻转使 YAW_L 帧预测 34:5→18:19（复读机）；无深度数据 | 等 DAgger 数据（prev = 学生真实执行）再开 `--prev-action`；`--depth-aux` 等 Wanderland/garden 有深度真值的集 |
 | `teacher_kino` kinodynamic A* | 保留为 Gazebo 教师线变体，不做 3DGS 标注 | §3 | 不再投入 |
 | RL 特权教师 | 未开始 | — | 按 PLAN：P1 平台期后做 RL 微调（第五阶段） |
-| SITL 库 v1 → v2 → v3 | v3 在用；v3.1（`vel_ki` 0.30 + selftest 阈值）FIX-SITL 做中 | 教师 10/11 → 19/20 → 20/20；YAW 原地漂移 0.141 → 0.02–0.10 m；v3 ctest 7/7、selftest 33/33 | v3.1 等森林评测与 sgvis 流水线 DONE 后就地重建 `tmp/build-cf-sitl` |
+| SITL 库 v1 → v2 → v3 → v3.1 | **v3.1 在用**（2026-11-09 合并 a156800：`vel_ki` 0.30、selftest 阈值按 40 种子重算、两个新 CTest；`tmp/build-cf-sitl` 已重建，旧 v3 在 `build-cf-sitl-v3-20261107`） | 教师 10/11 → 19/20 → 20/20；YAW 原地漂移 0.141 → 0.02–0.10 m；v3.1 ctest 10/10、selftest 33/33、40 种子 0 红；FORWARD 稳态侧偏 b/ki 减半（30 集 \|vy\| 均值 1.29 → 0.80 cm/s） | v3.1 下的闭环数字随 eval4 出（2080 Ti + `sim09.v2`）；eval3 表不再加臂 |
 | 3DGS 场景 | 4 个可飞（Callinstrasse 6 路线、Wanderland 6、garden 6、bicycle 6） | 冒烟 11/12、11/12、23/24 | Callinstrasse 只有 r3/r4 能用 2 m AGL 口径；定量用 Wanderland / Mip-NeRF 360 |
-| 可视化 | 版式统一 1280×720、短片 v1 239 s；v2（E1 实体机体、近机位、VIDEO_QUALITY）VIZ-LAYOUT 二轮做中 | `demo-e1-20261107/reel/demo_reel_v1.mp4` | 二轮合并后重录四组视频 |
+| 可视化 | 版式统一 1280×720；**短片 v2 已出**（2026-11-09：E1 实体机体两域统一、FOLLOW 1.1 m 近机位、TOP 四旋翼图标、high 档 2560×1440 libx264） | `demo-e1-20261107/reel/demo_reel_v2.mp4`（239 s）、`demo_reel_v2_short.mp4`（57 s）、`stills_v2/` 11 张；片中柱阵片段仍是 eval2 录像，片尾表为 eval3 数字 | 用户验收 → tag `demo-2026-11-12`；eval4 出数并重录四组后出 v3 |
 | 旧 X3 学生 | 历史 0.90（X3 机体）/ E1 上 0.20 | §1 | 只作载具迁移差距的参照，不再训 |
 
 ## 6. 没盘点什么
