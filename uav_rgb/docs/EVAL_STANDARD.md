@@ -273,7 +273,7 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
 | 字段 | 定义 | 分母 / 备注 |
 | --- | --- | --- |
 | `path_length_m`（p_i） | oracle `pose_gt` 的 xy 折线长，从首个位姿起、**截到第一次进入目标区**的那一点（线性插值到区边界）；从未到达则整条轨迹 | 每集；只有带 xy 的 oracle 才有，旧数据 None |
-| `shortest_path_m`（l_i） | **教师参考路径长**，不是几何最短路。Gazebo：`teacher.astar_path`（0.1 m 栅格，柱方框按教师余量 `CLEARANCE_BY_VEHICLE[(vehicle, task)][0]` 膨胀，E1 base 0.40 m）再做视线抽捷径（string pulling，只走原路径经过的自由区）；3DGS：`sim.3dgs.planner.route_check` 的 A* 路径（软余量 0.4 m / 代价 4.0）在硬栅格∪软余量上抽捷径。waypoint 任务同样**截到目标区边界**（与 p_i 同口径） | 每集；来源与膨胀余量写在 `eval.json` 顶层 `spl_reference`，不同载具/任务不得混报 |
+| `shortest_path_m`（l_i） | **物理可行最短路的下界**（2026-11-09 起）。Gazebo：`teacher.astar_path`（0.1 m 栅格，柱方框按**机体半径** `teacher.BODY_HALF_BY_VEHICLE[vehicle]` 膨胀：e1_mini 0.102 m / x3 0.235 m，机心离柱表面 ≥ 这个值就是碰撞模型下可行）再做视线抽捷径（string pulling，只走原路径经过的自由区）；2026-11-09 前膨胀用教师规划余量 `CLEARANCE_BY_VEHICLE`（E1 base 0.40 m），那是「教师参考路径」，两版 l_i / SPL 不可直接比。3DGS：`sim.3dgs.planner.route_check` 的 A* 路径（软余量 0.4 m / 代价 4.0）在硬栅格∪软余量上抽捷径（未改）。waypoint 任务同样**截到目标区边界**（与 p_i 同口径） | 每集；`eval.json` 顶层 `spl_reference` 写 `clearance_m`（实际膨胀）、`clearance_basis`、`teacher_clearance_m`（教师余量，只供对照），不同载具/任务/版本不得混报 |
 | `spl` | `S_i · l_i / max(p_i, l_i)`，S_i = 该集旧 `success`（Anderson et al. 2018） | 每集；p_i 或 l_i 缺一个就是 None |
 | 汇总 `spl` / `spl_n` | 有 `spl` 的完成集平均 / 个数 | `requested_spl` 只在全部完成集都有 spl 时给（请求集分母，skipped/failed 计 0） |
 | CR | 就是已有的 `collision_rate`（contact 碰撞集比例）；**不新增字段**。stuck / 超时不算碰撞 | `episodes_done` |
@@ -292,15 +292,18 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
   `stopped_on_goal=true` + `goal_line_x`，`validity` 按完整集填。它只改**训练数据**的集长（0417 的 12000 帧里
   过线后的 2155 帧 93% 视锥内无柱、38% 标签是 YAW，DISTILL §1.2），不改评测：评测仍跑 `eval_steps`、SPL 仍按上面的截断口径。
   用这类数据训出的学生与旧数据学生对照时，要在报告里写明训练集是否开了该开关（`collection_manifest.json`
-  的 `stop_at_goal`），别把集长差异当成模型差异。
-- **为什么 l_i 是教师参考路径**：膨胀余量 0.40 m 比机身半宽 0.10 m 大得多，学生贴柱抄近路时
-  p_i < l_i 会出现，公式里的 `max(p_i, l_i)` 把它截成 S_i；因此 SPL=1 的含义是「不比教师绕」，
-  不是「几何最优」。栅格 A* 只有 0°/45° 两种走向，不抽捷径时阶梯路径最多长 8%，几乎所有成功集
-  都会被截成 1，这一列就没有区分度，所以必须抽。
+  的 `stop_at_goal`），别把集长差异当成模型差异。（2026-11-09 起评测器对 route_choice 任务也在这条线上
+  结束本集，见 §5.4。）
+- **为什么 l_i 用机体半径而不是教师余量**：教师规划余量 0.40 m 比机身半宽 0.102 m 大得多，按它算的
+  l_i 是「教师参考路径」，学生贴柱抄近路时 p_i < l_i 常见，`max(p_i, l_i)` 把一大片成功集截成 SPL=1，
+  列失去区分度，而且 SPL=1 只表示「不比教师绕」。按机体半径膨胀，l_i 是碰撞模型下可行路的下界，
+  p_i < l_i 只会差在 0.1 m 栅格 + 抽捷径的离散误差（几 cm）上，SPL 恢复「几何最优为 1」的本义。
+  栅格 A* 只有 0°/45° 两种走向，不抽捷径时阶梯路径最多长 8%，所以必须抽。
 - **哪些任务有 SPL**：`SPL_TASKS = (base, l1, forest_e1)` 和 3DGS 路线；campus 的建筑不在 `pillars`
   里，A* 算出来是错的，留 None。
-- **历史 eval.json 不能补算 SPL**：`eval_closed_loop.py` 不带 `--keep-work` 时每集 oracle 随工作目录
-  删除，`per_episode` 里没有轨迹。要能复算，评测时加 `--keep-work`。
+- **历史 eval.json 不能补算 SPL**：2026-11-09 前的 `eval_closed_loop.py` 不带 `--keep-work` 时每集 oracle 随
+  工作目录删除，`per_episode` 里没有轨迹。sim09.v2 起每集 `actions.jsonl` / `oracle.jsonl` 保留在
+  `<out>/episodes/seed_<seed>/`（§5.4），之后的评测可以复算。
 - **E1 的 SAFE 是滑行不是停**（DATA 报告 2026-11-07 §结论 3）：cf_sitl 杆量回中后首步仍滑行
   中位 0.065 m、最大 0.208 m，悬停漂移 0.012–0.027 m/步。所以 E1 上 `stop_action_issued` 只说明
   「下过 SAFE」，`final_in_radius` / `task_success` 不能当「停稳」报；`stable_termination` 有
@@ -314,14 +317,33 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
     与 `scipy.stats.trim_mean(x, 0.25)` 一致）+ **分层 bootstrap**（每个任务/run 内重采样）95%。
     多 run 的格不做配对检验。
   - 两方法同一 seed 集：**McNemar**（不一致对 b+c < 25 用精确二项，否则带连续性校正的卡方）；
-    ≥3 方法先 **Cochran's Q**，显著再两两 McNemar + **Holm** 校正。配对只用共同 seed。
+    ≥3 方法另给 **Cochran's Q**（全体共同 seed）作总体检验；两两 McNemar 照做、不以 Q 显著为前提，
+    **Holm** 族 = 同一场景、同一指标的全部两两行（`stats_report.py` 就是这么做的，表注会写）。配对只用共同 seed。
+    默认表列 SR/CR/false_forward/SPL；`task_success` 在没有 waypoint 的 base 任务恒为 0，要显式 `--metrics` 加。
   - 样本量：两比例功效估算（正态近似，另给 Fleiss 连续性校正）。0.80 vs 0.90、α=0.05、功效 0.8
     每臂约 199 集（校正后 219）；配对设计可更少。n < 20 的格只算 pilot。
 - **seed ≠ 几何**：请求集按 seed 给，完成集按 `geometry_gid` 去重。base 任务 0..2999 内双盐
   （v3 & v5）都是 test 的 53 个 seed 只有 15 个独立几何，固定 20 seed 的请求集实际只跑出 11 个
   几何、9 个 skipped，`requested_success_rate` 的分母因此偏大。论文表的 n 以独立几何数为准，
-  请求集要直接用独立几何 seed 清单，唯一来源是 `tools/e1_pipeline.py` `CFG["eval_seeds"]`
-  （`tools/pick_test_seeds.py` 挑的 20 个：几何两两不同、v5 下都是 test、与 E1/X3 训练集零重叠）。
+  请求集要直接用独立几何 seed 清单，唯一来源是 `tools/eval_seeds.py`（`EVAL_SEEDS_BASE_20` /
+  `FOREST_SPARSE_SEEDS_20`，`tools/pick_test_seeds.py` 挑的各 20 个：几何两两不同、按各自 salt 都是 test、与 E1/X3
+  训练集零重叠；`e1_pipeline.CFG["eval_seeds"]`、`compare_datasets`、`compare_teachers` 都从它读，`tools/test_eval_seeds.py` 锁定）。
+
+### 5.4 sim09.v2：成功线即停（`metric_version="sim09.v2"` / `sim09.v2.coast1s`，2026-11-09）
+
+**sim09.v2：成功线即停，SR 不随 `--steps` 变；v1 的数字过线后继续飞，碰撞可能发生在过线之后。**
+`eval_closed_loop.py` 对 route_choice 任务（base / forest_e1，场景没有 waypoint/stop_radius）给
+`collect.py` 加 `--stop-at-goal`：真值 `pose_gt.x` 首次 ≥ `goal_x`（最远柱 x + `collect.GOAL_MARGIN_M` = 1.0 m，
+`--goal-margin` 只接受这个值）的那一步保留、本集结束，之后不再有碰撞、也不会超时。v1 下机体过线后继续飞到
+`--steps` 用完，过线后的碰撞一样记成 collision、把 success 判成 False，所以 v1 的 SR/CR 随 `--steps` 变、系统性
+偏低（偏多）；v2 与 v1 的 SR/CR **不可直接比**，`tools/stats_report.py` / `tools/e1_pipeline.py summary` 遇到
+混合版本会在表头标出。goal_reach 类任务（l1 / campus）的 `stop_radius` goal-stop 逻辑不变，只是版本号同步成 v2。
+每集新增字段：`stopped_on_goal`（collect manifest：route_choice = 首次过线结束；waypoint 任务 = goal-stop 连续
+3 步 SAFE 结束）、`steps_to_goal`（第一次进入目标区用的步数，从未进入 None；v2 下 route_choice 成功集等于 `steps`）。
+SPL 的 p_i 本来就截到第一次进入目标区，v2 下与整条轨迹一致，数值口径不变。cf_sitl 仍带 `.coast1s` 后缀。
+中断（SIGTERM / Ctrl-C / 异常）时 eval.json 也会写出，带 `partial=true` 与已完成的 `per_episode`，不得当完整结果报；
+正常结束时每集的 `actions.jsonl` / `oracle.jsonl` / `episode_manifest.json` 保留在 `<out>/episodes/seed_<seed>/`（帧仍删），
+所以 v2 起的 eval.json 可以复算 SPL。
 
 ## 6. 下一步（按优先级）
 

@@ -3,7 +3,8 @@
 
 背景：2026-11-07 E1 流水线用的 20 个「冻结 test seed」按 gid 去重后只剩 11 个独立几何
 （eval_closed_loop 会跳过重复 gid：`跳过: 已评测 <gid>`），四组对照实际 n=11。这是 TASKS.md D-GEODUP
-一直没做的检查。本脚本按几何组 ID 挑，输出能直接贴进 e1_pipeline.CFG["eval_seeds"] 的逗号串。
+一直没做的检查。本脚本按几何组 ID 挑，输出逗号串；冻结结果写进 tools/eval_seeds.py（唯一来源），流水线从那里读。
+排除清单任一文件不存在时报错退出（A5）：少排一份就会挑出「零重叠」其实没排除的清单。
 
 运行（仓库根）：
   .venv-tools/bin/python tools/pick_test_seeds.py                          # 默认配置，打印 20 个 seed
@@ -16,6 +17,7 @@ import os
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_ROOT = os.environ.get("DATA_ROOT", "/root/rivermind-data")
 sys.path.insert(0, os.path.join(REPO, "sim", "tools"))
 import split_manifest as sm  # noqa: E402
 
@@ -25,9 +27,9 @@ SEED_START = 0        # 从这个 seed 起向上扫；采集段 3000–3399 / 41
 SEED_MAX = 50_000     # 扫描上限，防写错 split 时死循环
 TASK = "base"         # 柱阵 base 任务；forest_e1 要配 --density
 SPLIT = "test"
-EXCLUDE_COLLECTIONS = (   # 训练集合的 collection_manifest.json：其中出现过的几何组一律排除（哪怕它落 test）
-    "/root/rivermind-data/uav_rgb/e1-pipeline-20261107-0417/collection/collection_manifest.json",   # 新 E1 学生
-    "/root/rivermind-data/uav_rgb/t5-full-1155/collection_manifest.json",   # 旧 X3 学生（T6 ckpt）的训练数据，v3 盐分的 split；
+EXCLUDE_COLLECTIONS = (   # 训练集合的 collection_manifest.json：其中出现过的几何组一律排除（哪怕它落 test）。缺一个就报错退出（A5）
+    f"{DATA_ROOT}/uav_rgb/e1-pipeline-20261107-0417/collection/collection_manifest.json",   # 新 E1 学生
+    f"{DATA_ROOT}/uav_rgb/t5-full-1155/collection_manifest.json",   # 旧 X3 学生（T6 ckpt）的训练数据，v3 盐分的 split；
     #   四组对照里它也是被评测的学生，不排除时 2026-11-07 第二轮的 20 个 seed 有 10 个几何在它的 train 里（tools/test_pick_test_seeds.py）
 )
 # ──────────────────────────────────────────────────────────────────────────
@@ -59,6 +61,18 @@ def pick(count, task, split, exclude_gids, density=None, seed_start=SEED_START, 
     raise SystemExit(f"扫到 seed {seed_max} 只凑到 {len(seeds)}/{count} 个独立 {split} 几何")
 
 
+def exclude_gids_for(paths, task, density=None):
+    """合并各排除清单里的几何组。文件不在 → 直接退出：少排一份就会挑出「零重叠」其实根本没排除的清单（A5）。"""
+    missing = [p for p in paths if not os.path.isfile(p)]
+    if missing:
+        sys.exit("排除清单不存在（少一份就等于没排除，拒绝继续）：\n  " + "\n  ".join(missing)
+                 + "\n挂载/修正 DATA_ROOT，或用 --exclude-collection 明确指定存在的清单")
+    gids = set()
+    for p in paths:
+        gids |= gids_in_collection(p, task, density)
+    return gids
+
+
 def self_check():
     seeds, gids = pick(5, "base", "test", set())
     assert len(seeds) == 5 and len(set(gids)) == 5, (seeds, gids)
@@ -83,12 +97,7 @@ def main():
         self_check()
         return
     excludes = args.exclude_collection if args.exclude_collection is not None else list(EXCLUDE_COLLECTIONS)
-    exclude_gids = set()
-    for path in excludes:
-        if os.path.isfile(path):
-            exclude_gids |= gids_in_collection(path, args.task, args.density)
-        else:
-            print(f"警告：排除清单不存在，跳过：{path}", file=sys.stderr)
+    exclude_gids = exclude_gids_for(excludes, args.task, args.density)
     seeds, gids = pick(args.count, args.task, args.split, exclude_gids, args.density)
     print(json.dumps({"task": args.task, "density": args.density, "split": args.split, "count": len(seeds),
                       "excluded_gids": len(exclude_gids), "seeds": seeds, "gids": gids}, ensure_ascii=False, indent=1))

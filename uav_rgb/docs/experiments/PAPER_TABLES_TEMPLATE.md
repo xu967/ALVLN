@@ -5,7 +5,7 @@
 - 生成：所有表由 `tools/stats_report.py` 从各组 `eval.json` 生成（`--out-dir` 下 `<stem>.md/.json`），
   手改数字一律不许；表里的「生成命令」直接可复制，`$O` 是该实验的输出根。
 - 统计（§5.3）：二值指标 Wilson 95%；SPL 百分位 bootstrap；多训练种子 IQM + 分层 bootstrap；
-  两方法 McNemar（共同 seed）；≥3 方法 Cochran's Q → 两两 McNemar + Holm；功效按 `--power p1 p2`。
+  两方法 McNemar（共同 seed）；≥3 方法另给 Cochran's Q 作总体检验，两两 McNemar 照做（不以 Q 显著为前提）+ Holm（族 = 同场景同指标的全部两两行）；功效按 `--power p1 p2`。
 - 标注必写：hold（Gazebo 1.0 s / 3DGS 0.5 s）、window_from（observation / render_observation）、
   载具（E1 外径 0.20 m vs X3 0.71 m）、`metric_version`。两域 hold 不同，跨域列不可直接比。
 - E1 的 SAFE 是滑行不是停（§5.3）：task_success 列对 E1 必须加脚注，或等执行器位置保持后复跑。
@@ -31,7 +31,7 @@
 - 每格实际是 5 个子格（SR / CR / false_forward / SPL / task_success），排版时按 `stats_report` 的
   `cells` JSON 展开成 5 列一组。
 - n：每个场景组 ≥ 20 个独立几何（M4 门槛），目标 ≥ 200 集/格（Wilson 半宽 p=0.8 时 ±5.5 pp）。
-- 检验：每个场景组内 Cochran's Q（所有方法 × 共同 seed），显著再两两 McNemar + Holm；写在表注。
+- 检验：每个场景组内 Cochran's Q（所有方法 × 共同 seed）作总体检验 + 全部两两 McNemar + Holm（族 = 本场景本指标的两两行）；写在表注。
 - 训练种子：每方法 3 个种子，同名多次 `--eval`，格内自动变 IQM + 分层 bootstrap。
 - 生成命令：
 

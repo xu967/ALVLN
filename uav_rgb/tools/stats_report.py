@@ -9,8 +9,10 @@
   连续指标（SPL）: 均值 + 百分位 bootstrap 95%；
   同一 (方法, 场景) 多个 run（训练种子）: IQM + 分层 bootstrap 95%（Agarwal et al. NeurIPS 2021）；
   两方法配对（同 seed 集）: McNemar（b+c<25 精确二项，否则带连续性校正的卡方）；
-  ≥3 方法: Cochran's Q，显著再两两 McNemar + Holm 校正；
+  ≥3 方法: 另给 Cochran's Q（全体共同 seed）作总体检验；两两 McNemar 照做、不以 Q 显著为前提；
+    Holm 族 = 同一场景、同一指标的全部两两行（k 方法 → k(k-1)/2 个 p）；
   样本量: 两比例功效估算（正态近似 + Fleiss 连续性校正）。
+默认列 SR/CR/false_forward/SPL；task_success 要显式 --metrics 加（base 任务没有 waypoint，恒为 0）。
 
 用法（仓库根，.venv-tools 的 python）：
   python tools/stats_report.py --out-dir $T/agent4-eval-matrix/e1-four-groups \
@@ -30,6 +32,9 @@ import time
 
 import numpy as np
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pipeline_common  # noqa: E402  - wilson_ci 只此一份
+
 # 表头名 -> (per_episode 字段, 类型, 方向)。CR 就是 collision（contact 口径，stuck/超时不算碰撞），不另起字段。
 METRICS = {
     "SR": ("success", "binary", "↑"),
@@ -41,10 +46,9 @@ METRICS = {
     "stop_success": ("stop_success", "binary", "↑"),
     "SPL": ("spl", "mean", "↑"),
 }
-DEFAULT_METRICS = ("SR", "CR", "false_forward", "SPL", "task_success")
+DEFAULT_METRICS = ("SR", "CR", "false_forward", "SPL")   # task_success 只在有 waypoint 的任务（l1/campus）有意义，显式 --metrics 加
 PILOT_N = 20            # e1-demo-plan §3：n<20 标 pilot
 EXACT_MCNEMAR_MAX = 25  # 不一致对 b+c 小于此用精确二项，否则卡方（Agresti 的常用阈值）
-Z95 = 1.96              # 与 eval_closed_loop.wilson_ci 同一个 z，数字能对上 HANDOFF 的 [0.276, 0.547]
 _NORMAL = statistics.NormalDist()
 
 
@@ -98,15 +102,7 @@ def chi2_sf(x, df):
 
 
 # ───────────────────────────── 区间与检验 ─────────────────────────────
-def wilson_ci(k, n, z=Z95):
-    """Wilson 95% 区间 (lo, hi)；n=0 返回 None。与 eval_closed_loop.wilson_ci 同式。"""
-    if not n:
-        return None
-    p = k / n
-    denom = 1.0 + z * z / n
-    center = (p + z * z / (2.0 * n)) / denom
-    half = z * math.sqrt(p * (1.0 - p) / n + z * z / (4.0 * n * n)) / denom
-    return max(0.0, center - half), min(1.0, center + half)
+wilson_ci = pipeline_common.wilson_ci   # Wilson 95% (lo, hi)；n=0 → None。一份公式（与 eval_closed_loop.wilson_ci 同式）
 
 
 def mcnemar(b, c):
@@ -378,6 +374,8 @@ def build_report(entries, metrics=DEFAULT_METRICS, pair_metrics=("SR",), n_boot=
         "schema": "uavrgb.stats_report.v1", "title": title, "generated": time.strftime("%F %T"),
         "metrics": list(metrics), "pair_metrics": list(pair_metrics), "methods": methods, "scenes": scenes,
         "n_boot": n_boot, "seed": seed,
+        # 全表出现过的 metric_version；>1 个就是混合（sim09.v1 过线后继续飞 vs v2 成功线即停），表头要标。
+        "metric_versions": sorted({str(ev["metric_version"]) for _, _, ev in loaded}),
         "cells": cells, "all_scenes": all_scenes, "paired": paired, "protocol": protocol,
         "entries": [{"method": m, "scene": s, **{k: v for k, v in ev.items() if k != "per_episode"}}
                     for m, s, ev in loaded],
@@ -404,7 +402,10 @@ def to_markdown(rep):
     lines = []
     if rep.get("title"):
         lines += [f"# {rep['title']}", ""]
-    header = ["方法"] + [f"{s} {m}{METRICS[m][2]}" for s in rep["scenes"] for m in rep["metrics"]]
+    versions = rep.get("metric_versions") or []
+    mixed = (f" ⚠ metric_version 混合：{' / '.join(versions)}（v1 过线后继续飞、碰撞可能发生在过线之后；"
+             "v2 成功线即停；SR/CR 不可直接比，见 EVAL_STANDARD §5）" if len(versions) > 1 else "")
+    header = ["方法" + mixed] + [f"{s} {m}{METRICS[m][2]}" for s in rep["scenes"] for m in rep["metrics"]]
     if rep["all_scenes"]:
         header += [f"全场景 IQM {m}{METRICS[m][2]}" for m in rep["metrics"]]
     lines += ["| " + " | ".join(header) + " |", "|" + " --- |" * len(header)]
@@ -421,10 +422,11 @@ def to_markdown(rep):
         kv = "；".join(f"{k}={'/'.join(v)}" for k, v in pr["values"].items())
         warn = f" **协议不一致：{', '.join(pr['inconsistent'])}**" if pr["inconsistent"] else ""
         lines.append(f"- 场景 `{scene}` 口径：{kv}{warn}")
-    lines += ["", "| 方法 | 场景 | 请求 | 完成 | 失败 | 跳过 | eval.json |", "| --- | --- | --- | --- | --- | --- | --- |"]
+    lines += ["", "| 方法 | 场景 | 请求 | 完成 | 失败 | 跳过 | metric_version | eval.json |",
+              "| --- | --- | --- | --- | --- | --- | --- | --- |"]
     for e in rep["entries"]:
         lines.append(f"| {e['method']} | {e['scene']} | {e['episodes_requested']} | {e['episodes_done']} | "
-                     f"{e['failed']} | {e['skipped']} | `{e['path']}` |")
+                     f"{e['failed']} | {e['skipped']} | {e['metric_version']} | `{e['path']}` |")
     for scene, tests in rep["paired"].items():
         for pm in rep["pair_metrics"]:
             t = tests[pm]
@@ -440,6 +442,8 @@ def to_markdown(rep):
             for r in t["pairwise"]:
                 lines.append(f"| {r['A']} | {r['B']} | {r['n_common']} | {r['rate_A']:.2f} | {r['rate_B']:.2f} | "
                              f"{r['b']} | {r['c']} | {_p(r['p_value'])} | {_p(r['p_holm'])} | {r['method']} |")
+            lines.append(f"\n注：两两 McNemar 不以 Q 显著为前提（Q 只是总体检验）；Holm 族 = 本表全部 {len(t['pairwise'])} 行"
+                         f"（场景 `{scene}` × {pm}），跨指标/跨场景不合并校正。")
         if tests.get("skipped_multi_run"):
             lines.append(f"\n多 run 分组不做配对检验：{', '.join(tests['skipped_multi_run'])}")
     if rep.get("power"):

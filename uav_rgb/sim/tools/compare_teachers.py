@@ -21,6 +21,8 @@ import time
 
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(TOOLS)), "tools"))
+import eval_seeds                                  # noqa: E402  - 冻结评测 seed 的唯一来源（tools/eval_seeds.py）
 import landmarks                                   # noqa: E402
 import scene_gen                                   # noqa: E402
 import teacher                                     # noqa: E402
@@ -29,9 +31,8 @@ from teacher_predictive import PredictiveTeacher   # noqa: E402
 
 # ---------------------------------------------------------------- 配置区
 SEEDS = [int(s) for s in os.environ.get(
-    "UAV_RGB_COMPARE_SEEDS",
-    "180,206,250,485,503,555,586,708,715,721,799,855,932,992,1113,1116,1123,1145,1246,1282"
-).split(",")]                                      # v3/v5 下都是 test 的 20 个 seed
+    "UAV_RGB_COMPARE_SEEDS", eval_seeds.csv(eval_seeds.EVAL_SEEDS_BASE_20)
+).split(",")]                                      # 冻结的 20 个独立几何 test seed（2026-11-09 前是旧的 180,206,… 清单，按 gid 只有 11 个几何）
 OUT_DIR = os.environ.get("UAV_RGB_COMPARE_OUT",
                          "/root/rivermind-data/uav_rgb/tmp/agent-fastlab-a/compare")  # 数据盘，不写 /tmp
 STEP_S = 1.0           # hold 窗口（BRIEF §4）

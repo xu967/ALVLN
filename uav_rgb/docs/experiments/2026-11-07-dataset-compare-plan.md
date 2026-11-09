@@ -13,7 +13,7 @@
 | 教师 | 柱子真值 A*（E1 余量 0.40/0.30 + 脱困 v2） | 体素占据 A*（同一套 teacher.plan_action_global，占据代理当柱子） |
 | 规模 | base 300 集（进行中）+ 森林 ≥150 集 | 先 20 集 pilot（进行中），过检后放到 ≥300 集（4 路线 × 出生扰动 × seed） |
 | 观测 | 320×240 RGB，10 Hz 相机 | 320×240 RGB，3DGS 渲染（SH3 + 2× 超采样） |
-| 测试集 | 20 个固定 seed（v3/v5 双 test）：`180,206,…,1282`；森林按其 salt 的 test | 留出路线/留出出生扰动（route 列表里标 split=test） |
+| 测试集 | 20 个冻结 seed = `tools/eval_seeds.EVAL_SEEDS_BASE_20`（20 独立几何，与两个学生的训练几何零重叠；2026-11-09 起唯一来源，计划初稿写的 `180,206,…,1282` 按 gid 只有 11 个几何、已淘汰）；森林 `FOREST_SPARSE_SEEDS_20` | 留出路线/留出出生扰动（route 列表里标 split=test） |
 | 产物目录 | `$DATA_ROOT/uav_rgb/e1-pipeline-20261107-0417/`（base）+ forest agent 的目录 | `$DATA_ROOT/uav_rgb/datasets/e1-3dgs-callinstrasse-*` |
 
 两者 episode 目录格式都是 `collect.py` 口径（`episode_manifest.json` + `actions.jsonl` + `rgb_*.png`），`tools/preprocess.py` 直接打包；B 的 manifest 多出 3DGS 身份字段，preprocess 已支持（HANDOFF_3DGS §五 3）。

@@ -588,8 +588,9 @@ max|y| 从 0.69 涨到 1.86）。`teacher.py:112-119` 注释同结论：**真正
 ```bash
 DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg python3 sim/tools/collect_parallel.py \
   --instances 4 --episodes-per-instance 5 --steps 40 --hold 1.0 \
-  --seeds 23,25,36,45,48,49,50,54,57,84,88,99,114,116,129,137,147,171,173,180 \
+  --seeds "$(.venv-tools/bin/python -c 'import sys; sys.path.insert(0, "tools"); import eval_seeds as e; print(e.csv(e.EVAL_SEEDS_BASE_20))')" \
   --split test --policy teacher --out /tmp/t1-teacher
+# 冻结 seed 唯一来源 tools/eval_seeds.py（2026-11-09 起；当年第 8/10 轮用的 23,25,…,180 是 lib v3 时代的旧清单，已淘汰）
 # 然后跑 sim/tools/traverse_rate.py --min-rate 0.9（safe 出生集自动剔除）
 ```
 
@@ -939,10 +940,10 @@ build/check/uavrgb_train --data /tmp/ds/dataset.uavr --epochs 10 --batch 128 --l
 # 数据验收闸门（FAIL 即非零退出）
 python3 sim/tools/audit_dataset.py --dataset /tmp/dataset
 
-# 闭环评测（学生；T7 的 20 个冻结 seed）
+# 闭环评测（学生；20 个冻结 test seed 的唯一来源是 tools/eval_seeds.py，别手抄数字）
 python3 sim/tools/eval_closed_loop.py --policy student --ckpt <ckpt.bin> \
   --steps 80 --hold 1.0 --split test \
-  --seeds 23,25,36,45,48,49,50,54,57,84,88,99,114,116,129,137,147,171,173,180 \
+  --seeds "$(.venv-tools/bin/python -c 'import sys; sys.path.insert(0, "tools"); import eval_seeds as e; print(e.csv(e.EVAL_SEEDS_BASE_20))')" \
   --out /tmp/eval1
 # 盲前进基线：把 --policy student --ckpt ... 换成 --policy forward
 ```

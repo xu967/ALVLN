@@ -15,10 +15,33 @@ import e1_pipeline  # noqa: E402
 import pick_test_seeds as pts  # noqa: E402
 import split_manifest as sm  # noqa: E402
 
-X3_TRAIN_MANIFEST = "/root/rivermind-data/uav_rgb/t5-full-1155/collection_manifest.json"   # 旧 X3 学生（T6）训练数据
+X3_TRAIN_MANIFEST = f"{pts.DATA_ROOT}/uav_rgb/t5-full-1155/collection_manifest.json"   # 旧 X3 学生（T6）训练数据
+
+
+def test_missing_exclude_is_error():
+    """A5：排除清单文件不在 → 报错退出，不能只警告然后挑出一份「零重叠」其实没排除任何东西的清单。"""
+    try:
+        pts.exclude_gids_for(["/nonexistent/collection_manifest.json"], "base", None)
+    except SystemExit as e:
+        assert e.code not in (0, None) and "nonexistent" in str(e), e
+    else:
+        raise AssertionError("排除清单缺失应 SystemExit")
+    saved = sys.argv
+    try:
+        sys.argv = ["pick_test_seeds.py", "--count", "1", "--exclude-collection", "/nonexistent/x.json"]
+        try:
+            pts.main()
+        except SystemExit as e:
+            assert e.code not in (0, None), e.code
+        else:
+            raise AssertionError("main 也应报错退出")
+    finally:
+        sys.argv = saved
+    print("ok 排除清单缺失 → 报错退出")
 
 
 def main():
+    test_missing_exclude_is_error()
     # 1. 默认排除清单必须含旧 X3 学生的训练集合，不只是 E1 集合。
     assert X3_TRAIN_MANIFEST in pts.EXCLUDE_COLLECTIONS, pts.EXCLUDE_COLLECTIONS
     seeds = [int(s) for s in e1_pipeline.CFG["eval_seeds"].split(",")]

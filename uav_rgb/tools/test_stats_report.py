@@ -179,9 +179,52 @@ def test_report_end_to_end():
             pass
 
 
+def test_mixed_metric_version_header():
+    """sim09.v1（过线后继续飞）与 sim09.v2（成功线即停）的 eval.json 同表：表头与清单表都要标出混合版本。"""
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+        seeds = list(range(1, 7))
+        v1 = _fake_eval(os.path.join(tmp, "v1.json"), seeds, [1, 1, 0, 1, 1, 0])
+        v2 = _fake_eval(os.path.join(tmp, "v2.json"), seeds, [1, 1, 1, 1, 1, 0], metric_version="sim09.v2.coast1s")
+        rep = sr.build_report([("teacher", "gazebo", v1), ("student", "gazebo", v2)], n_boot=100, seed=0)
+        assert rep["metric_versions"] == ["sim09.v1.coast1s", "sim09.v2.coast1s"], rep.get("metric_versions")
+        md = sr.to_markdown(rep)
+        table_header = next(line for line in md.splitlines() if line.startswith("| 方法"))
+        assert "sim09.v1.coast1s" in table_header and "sim09.v2.coast1s" in table_header, table_header
+        entries_header = next(line for line in md.splitlines() if line.startswith("| 方法 | 场景 |"))
+        assert "metric_version" in entries_header, entries_header
+        assert "| teacher | gazebo |" in md and "sim09.v1.coast1s |" in md, md
+        # 同一版本：表头不带警告。
+        same = sr.build_report([("teacher", "gazebo", v1), ("student", "gazebo", v1)], n_boot=100, seed=0)
+        header = next(line for line in sr.to_markdown(same).splitlines() if line.startswith("| 方法"))
+        assert same["metric_versions"] == ["sim09.v1.coast1s"] and "sim09" not in header, header
+
+
+def test_default_metrics_and_test_procedure_doc():
+    """REVIEW2 #8：默认表不带 base 任务下结构性为 0 的 task_success；文档写实际做法（两两 McNemar 不以 Q 显著为前提，
+    Holm 族 = 同一场景同一指标的全部两两行），并在配对表的表注写明 Holm 族。"""
+    assert "task_success" not in sr.DEFAULT_METRICS and sr.DEFAULT_METRICS == ("SR", "CR", "false_forward", "SPL"), \
+        sr.DEFAULT_METRICS
+    assert "task_success" in sr.METRICS   # 还能用 --metrics ...,task_success 显式要（有 waypoint 的 l1/campus 任务）
+    doc = sr.__doc__
+    assert "显著再两两" not in doc and "Holm" in doc and "族" in doc, doc
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+        seeds = list(range(1, 9))
+        a = _fake_eval(os.path.join(tmp, "a.json"), seeds, [1, 1, 1, 1, 1, 1, 0, 0])
+        b = _fake_eval(os.path.join(tmp, "b.json"), seeds, [1, 1, 0, 0, 0, 0, 0, 0])
+        c = _fake_eval(os.path.join(tmp, "c.json"), seeds, [1, 0, 0, 0, 0, 0, 0, 0])
+        rep = sr.build_report([("A", "gz", a), ("B", "gz", b), ("C", "gz", c)], n_boot=50, seed=0)
+        assert list(rep["metrics"]) == list(sr.DEFAULT_METRICS), rep["metrics"]
+        md = sr.to_markdown(rep)
+        assert "task_success" not in md.splitlines()[0], md.splitlines()[0]
+        assert "Holm 族" in md and "不以 Q 显著为前提" in md, md
+        # 两两行不因 Q 不显著而消失：3 方法 → 3 行。
+        assert len(rep["paired"]["gz"]["SR"]["pairwise"]) == 3
+
+
 def main():
     for fn in (test_distributions, test_wilson, test_mcnemar, test_cochran_holm, test_iqm_bootstrap,
-               test_power, test_report_end_to_end):
+               test_power, test_report_end_to_end, test_mixed_metric_version_header,
+               test_default_metrics_and_test_procedure_doc):
         fn()
         print("ok", fn.__name__)
     print("test_stats_report: PASS")

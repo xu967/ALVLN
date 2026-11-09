@@ -13,7 +13,6 @@
 """
 import argparse
 import glob
-import json
 import math
 import os
 import subprocess
@@ -24,6 +23,9 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA_ROOT = os.environ.get("DATA_ROOT", "/root/rivermind-data")
 BUILD = os.environ.get("UAV_RGB_BUILD_DIR", os.path.join(REPO, "build", "check"))  # check.sh 的构建目录
 PY = sys.executable   # 用 $UAV_RGB_PYTHON 启动本脚本，子进程继承它（preprocess/eval 需要 PIL、numpy、cv2）
+sys.path.insert(0, os.path.join(REPO, "tools"))
+import eval_seeds  # noqa: E402  - 冻结评测 seed 的唯一来源
+import pipeline_common as pc  # noqa: E402  - 三条流水线共用：续跑判定等
 
 # ───────────────────────────── 配置区（改这里） ─────────────────────────────
 CFG = dict(
@@ -74,12 +76,9 @@ CFG = dict(
     class_weights="auto",    # 训练集逆频率。FORWARD 占 ~75%，不加权 SAFE/YAW 召回归零（EVAL_STANDARD §0）
     text_dim=0,              # base 任务无指令。l1 用 16
     # 评测（四组同一批 test 场景；E1 机体、observation 语义、hold 1.0）
-    eval_seeds="1,113,122,153,172,176,180,230,250,536,555,628,683,798,929,990,992,997,1113,1654",
-                             # tools/pick_test_seeds.py 挑的 20 个：几何组两两不同、v5 下都是 test、与新 E1 学生的 collection/（300 集）
-                             # 和旧 X3 学生的 t5-full-1155（600 集）的几何都零重叠（tools/test_pick_test_seeds.py 锁定）。
-                             # 0417-eval2 用的 1,58,113,…,536 只排除了 E1 集合，10/20 的几何在 X3 学生的 train 里，x3-old 那行不是留出集。
-                             # 更早的 180,206,…,1282 虽然都是 test，但按 gid 去重只剩 11 个独立几何（eval 会「跳过: 已评测」），
-                             # 0417 那轮四组对照实际 n=11（docs/experiments/2026-11-07-e1-demo-plan.md §3 已注明）
+    eval_seeds=eval_seeds.csv(eval_seeds.EVAL_SEEDS_BASE_20),
+                             # 20 个独立几何的冻结 test seed；数字与来源（pick_test_seeds 排除清单、淘汰的旧清单）只写在
+                             # tools/eval_seeds.py。这里保持逗号串：其它 agent/脚本从 CFG["eval_seeds"] 读。
     eval_steps=80,           # 给足全程余量（T7 起 80）；碰撞/到达会提前结束
     old_x3_ckpt=f"{DATA_ROOT}/uav_rgb/t6-full-1640/run/ckpt_best.bin",   # T6 best（epoch 8）：X3 / x3_velocity / hold 1.0 训的
     record_groups=("teacher", "student-e1-new"),   # 这两组录三视角视频（≈10 MB/仿真秒暂存，合成后删）
@@ -116,57 +115,8 @@ GZ_ENV = {"UAVRGB_RENDER_BACKEND": "software", "DISPLAY": ":20",
 STEPS = ("pilot", "collect", "audit", "preprocess", "train", "eval", "summary")
 # ──────────────────────────────────────────────────────────────────────────
 
-DRY = False
-
-
-def log(msg):
-    print(time.strftime("%F %T"), msg, flush=True)
-
-
-def run(cmd, env_extra=None, log_path=None):
-    """跑一条命令；stdout/stderr 进 run.log（或 log_path）；返回退出码，由调用方决定要不要停。"""
-    log("$ " + " ".join(cmd) + (f"  > {log_path}" if log_path else ""))
-    if DRY:
-        return 0
-    env = dict(os.environ, **(env_extra or {}))
-    if log_path:
-        with open(log_path, "ab") as f:
-            return subprocess.run(cmd, env=env, stdout=f, stderr=subprocess.STDOUT).returncode
-    return subprocess.run(cmd, env=env).returncode
-
-
-def sh(cmd, env_extra=None):
-    """非零退出就抛异常 → 流水线停。"""
-    rc = run(cmd, env_extra)
-    if rc != 0:
-        raise RuntimeError(f"退出码 {rc}: {os.path.basename(cmd[0])} {cmd[1] if len(cmd) > 1 else ''}")
-
-
-def read_json(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def write_json(path, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
-
-
-def mark(out, step, state, **extra):
-    """每步落一次 status.json：新会话一看就知道跑到哪。"""
-    if DRY:
-        return
-    path = os.path.join(out, "status.json")
-    status = read_json(path) if os.path.isfile(path) else {}
-    status[step] = dict(state=state, at=time.strftime("%F %T"), **extra)
-    write_json(path, status)
-
-
-def need(path, hint):
-    if not DRY and not os.path.exists(path):
-        raise RuntimeError(f"缺 {path}（{hint}）")
+DRY = False   # main 里与 pipeline_common.DRY 一起置位；helper 都在 tools/pipeline_common.py（A4）
+log, run, sh, read_json, write_json, mark, need = pc.log, pc.run_cmd, pc.sh, pc.read_json, pc.write_json, pc.mark, pc.need
 
 
 def vehicle_flags():
@@ -264,8 +214,12 @@ def preprocess(out):
 def train(out):
     ds, run_dir = os.path.join(out, "ds"), os.path.join(out, "run")
     need(os.path.join(ds, "dataset.uavr"), "先跑 preprocess")
+    if pc.train_finished(run_dir):   # 续跑：完成 = metrics.jsonl 末行 done:（ckpt 文件每轮都写，不算）
+        log(f"跳过 train：{run_dir}/metrics.jsonl 已记 done")
+        return
     if os.path.isdir(run_dir) and os.listdir(run_dir):
-        raise RuntimeError(f"{run_dir} 非空：uavrgb_train 的 RunOwner 拒绝复用；删掉或换 --out")
+        raise RuntimeError(f"{run_dir} 非空且训练没跑完（metrics.jsonl 末行不是 done:）："
+                           "uavrgb_train 的 RunOwner 拒绝复用；删掉或换 --out")
     cmd = [f"{BUILD}/uavrgb_train", "--data", f"{ds}/dataset.uavr", "--out", run_dir,
            "--epochs", str(CFG["epochs"]), "--batch", str(CFG["batch"]), "--lr", repr(float(CFG["lr"])),
            "--seed", str(CFG["seed"]), "--class-weights", CFG["class_weights"]]
@@ -290,9 +244,13 @@ def evaluate(out):
     procs = {}
     for name, policy, ckpt_key in eval_groups():
         edir = os.path.join(out, f"eval-{name}")
-        if os.path.isfile(os.path.join(edir, "eval.json")):
-            log(f"跳过 {name}：已有 eval.json")
+        if pc.eval_finished(edir):   # 完成 = eval.json 在、failed_count==0、episodes_done>0、非 partial
+            log(f"跳过 {name}：eval.json 完整")
             continue
+        if not DRY:
+            moved = pc.retire_unfinished_eval(edir)   # 有 eval.json 但没完成（失败集/中断）：让出目录重跑
+            if moved:
+                log(f"{name} 上次没跑完，旧目录挪到 {moved}，重跑")
         cmd = [PY, f"{REPO}/sim/tools/eval_closed_loop.py", "--policy", policy, "--task", "base",
                "--split", "test", "--seeds", CFG["eval_seeds"],
                "--episodes", str(len(CFG["eval_seeds"].split(","))),
@@ -306,8 +264,8 @@ def evaluate(out):
         log_path = os.path.join(out, f"eval-{name}.log")
         log("$ " + " ".join(cmd) + f"  > {log_path}")
         if not DRY:
-            procs[name] = subprocess.Popen(cmd, env=dict(os.environ, **GZ_ENV),
-                                           stdout=open(log_path, "ab"), stderr=subprocess.STDOUT)
+            procs[name] = pc.popen(cmd, env=dict(os.environ, **GZ_ENV),   # 登记：SIGTERM 时连 gz 一起收
+                                   stdout=open(log_path, "ab"), stderr=subprocess.STDOUT)
     for name, proc in procs.items():
         rc = proc.wait()
         log(f"eval-{name} rc={rc}" + ("（有失败/跳过集，见 eval.json 的 failed）" if rc else ""))
@@ -331,12 +289,19 @@ def summary(out):
         rows[name]["infer_p95_ms"] = (e.get("inference_ms") or {}).get("p95")
     if not DRY:
         write_json(os.path.join(out, "summary.json"), {"cfg": CFG, "groups": rows})
-    fmt = "%-16s %6s %6s %6s %6s %5s %5s %8s"
-    lines = [fmt % ("group", "SR", "coll", "stuck", "ffwd", "done", "fail", "p50ms")]
+    fmt = "%-16s %6s %6s %6s %6s %5s %5s %8s  %s"
+    versions = sorted({str(r["metric_version"]) for r in rows.values()})
+    lines = []
+    if len(versions) > 1:
+        # sim09.v1 过线后继续飞（碰撞可能发生在过线之后）、v2 成功线即停：SR/coll 不可直接比。
+        lines.append(f"⚠ metric_version 混合：{' / '.join(versions)}（v1 过线后继续飞，v2 成功线即停；"
+                     "各组按自己那列的版本读，见 docs/EVAL_STANDARD.md §5）")
+    lines.append(fmt % ("group", "SR", "coll", "stuck", "ffwd", "done", "fail", "p50ms", "metric_version"))
     for name, r in rows.items():
         f = lambda v, d=2: "-" if v is None else f"{v:.{d}f}"   # noqa: E731
         lines.append(fmt % (name, f(r["requested_success_rate"]), f(r["collision_rate"]), f(r["stuck_rate"]),
-                            f(r["false_forward_rate"]), r["episodes_done"], r["failed_count"], f(r["infer_p50_ms"], 1)))
+                            f(r["false_forward_rate"]), r["episodes_done"], r["failed_count"], f(r["infer_p50_ms"], 1),
+                            r["metric_version"]))
     lines.append(f"口径：SR 分母 = 请求集 {len(CFG['eval_seeds'].split(','))}（失败集计入分母）；四组同一批 seed、"
                  f"E1 机体 {CFG['dynamics']} / {CFG['window_from']} / hold {CFG['hold']}；"
                  "E1 外径 0.20 m vs X3 0.71 m，与历史 X3 数字不可比；详见 docs/EVAL_STANDARD.md")
@@ -371,10 +336,10 @@ def main():
     p.add_argument("--from", dest="start", choices=STEPS, default="pilot", help="从哪一步开始（续跑）")
     p.add_argument("--dry-run", action="store_true", help="只打印命令")
     a = p.parse_args()
-    DRY = a.dry_run
+    pc.DRY = DRY = a.dry_run
     out = os.path.abspath(a.out)
-    os.makedirs(out, exist_ok=True)
-    if not DRY:
+    if not DRY:   # dry-run 不建目录、不写文件（A6）
+        os.makedirs(out, exist_ok=True)
         write_json(os.path.join(out, "config.json"),   # 这次实验到底用了哪套参数，事后不用翻 manifest
                    {"cfg": CFG, "groups": eval_groups(), "gz_env": GZ_ENV, "argv": sys.argv,
                     "repo": REPO, "build": BUILD, "python": PY,
@@ -382,6 +347,7 @@ def main():
                                           capture_output=True, text=True).stdout.strip()})
         if os.path.exists(os.path.join(out, "DONE")):
             os.remove(os.path.join(out, "DONE"))   # 续跑时先摘掉旧标记，免得外面的等待脚本误判
+    pc.install_signal_handlers()   # SIGTERM/Ctrl-C → Interrupted：收子进程组、status 标 interrupted、DONE 写真实 rc
     rc, last = 0, None
     try:
         preflight()
@@ -393,6 +359,11 @@ def main():
             RUN[step](out)
             mark(out, step, "ok", seconds=round(time.monotonic() - t0, 1))
             log(f"==== {step} 完成 {time.monotonic() - t0:.0f}s")
+    except pc.Interrupted as e:
+        rc = e.rc
+        n = pc.terminate_children()
+        mark(out, last or "preflight", "interrupted", signal=e.name, children_terminated=n)
+        log(f"!!!! {e}：已收掉 {n} 个子进程组，{last or 'preflight'} 标 interrupted，rc={rc}")
     except Exception as e:   # noqa: BLE001 - 任一步失败就停，原因进 status/DONE
         rc = 1
         mark(out, last or "preflight", "failed", error=f"{type(e).__name__}: {e}")

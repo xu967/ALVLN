@@ -21,8 +21,9 @@
      跨域评测时两域 hold 不同也会在 summary 里标出（学生面对的每步位移不同：0.25 m vs 0.12 m）。
   ② 3DGS 教师组：eval_3dgs 没有 teacher 策略，用 collect_3dgs --policy astar（占据栅格 A*，与 B 采集同一教师）
      + --stop-on-collision 采，再按 eval_3dgs.summarize_3dgs_episode / aggregate 写成同格式 eval.json。
-  ③ Gazebo 固定 seed：0–2999 中 v3/v5 双 salt 都是 test 的 seed 只有 15 个独立几何；e1-demo-plan 的 20 个里 9 个与别的
-     同几何，eval 会 dedup 跳过，requested_SR 的分母被虚增成 20。这里直接请求 15 个独立几何（请求数 = 完成数）。
+  ③ Gazebo 固定 seed：tools/eval_seeds.EVAL_SEEDS_BASE_20（pick_test_seeds 挑的 20 个独立几何，v5 下都是 test，与新 E1
+     学生和旧 X3 学生的训练几何都零重叠）。2026-11-09 前这里是另一张「v3/v5 双 salt 都是 test」的 15 个 seed 清单；
+     双 salt 只保证旧 X3 学生按它自己的 split 没见过，不如直接排除它的训练几何，且两张表的 n 不同不便对照，故收成同一来源。
 """
 import argparse
 import glob
@@ -40,6 +41,8 @@ PY = sys.executable
 sys.path.insert(0, os.path.join(REPO, "tools"))
 sys.path.insert(0, REPO)
 import stats_report  # noqa: E402
+import eval_seeds  # noqa: E402  - 冻结评测 seed 的唯一来源
+import pipeline_common as pc  # noqa: E402  - 三条流水线共用：续跑判定等
 
 # ───────────────────────────── 配置区（改这里） ─────────────────────────────
 CFG = dict(
@@ -64,9 +67,8 @@ CFG = dict(
     # 评测域 1：Gazebo 柱阵、E1 机体、observation、hold 1.0
     gazebo=dict(
         dynamics="cf_sitl", vehicle="e1_mini", hold=1.0, window_from="observation",
-        seeds="180,250,485,555,586,708,721,992,1113,1116,1145,1654,1873,2087,2506",
-        #   0–2999 中 v3 与 v5 两个 salt 下都是 test 且几何互不相同的全部 15 个 seed（见文件头 ③；复算脚本见 EVAL 报告）。
-        #   只要新 E1 学生、不要旧 X3 学生时可换 v5-only 的 71 个独立几何里的前 20 个（旧 X3 学生见过其中一部分）。
+        seeds=eval_seeds.csv(eval_seeds.EVAL_SEEDS_BASE_20),
+        #   与 e1_pipeline 同一批 20 个独立几何（tools/eval_seeds.py 唯一来源；见文件头 ③）。
         steps=80, sim_timeout=120.0, episode_timeout=600.0,
         parallel=4,          # 同时起几个 gz（各 1 实例）：4 实例 6.8 核（cgroup 12 核）；用户 YOLO 占 2 核
         env={"UAVRGB_RENDER_BACKEND": "software", "DISPLAY": ":20", "XDG_RUNTIME_DIR": "/tmp/xdg",
@@ -84,7 +86,7 @@ CFG = dict(
         spawn_jitter=0.0,    # 同一路线多集靠出生扰动区分；0 = 每集同出生点（只在 pilot 口径）
         env={"TORCH_CUDA_ARCH_LIST": ""},
     ),
-    metrics=("SR", "CR", "false_forward", "SPL", "task_success"),   # 表列（stats_report.METRICS 的键）
+    metrics=stats_report.DEFAULT_METRICS,   # 表列 SR/CR/false_forward/SPL；base 任务没有 waypoint，task_success 恒 0 不进表
     n_boot=2000,
 )
 # 评测组：(名字, policy, ckpt 来源)。None=无模型；"old_x3_ckpt"=CFG 里的路径；"A"/"B"/"AB"=本脚本训出的学生（每个训练种子一个 run）。
@@ -100,58 +102,8 @@ EVAL_DOMAINS = ("gazebo", "3dgs")
 STEPS = ("pack", "train", "eval", "summary")
 # ──────────────────────────────────────────────────────────────────────────
 
-DRY = False
-
-
-def log(msg):
-    print(time.strftime("%F %T"), msg, flush=True)
-
-
-def run(cmd, env_extra=None, log_path=None):
-    log("$ " + " ".join(cmd) + (f"  > {log_path}" if log_path else ""))
-    if DRY:
-        return 0
-    env = dict(os.environ, **(env_extra or {}))
-    if log_path:
-        with open(log_path, "ab") as f:
-            return subprocess.run(cmd, env=env, stdout=f, stderr=subprocess.STDOUT).returncode
-    return subprocess.run(cmd, env=env).returncode
-
-
-def sh(cmd, env_extra=None, log_path=None):
-    rc = run(cmd, env_extra, log_path)
-    if rc != 0:
-        raise RuntimeError(f"退出码 {rc}: {' '.join(cmd[:3])}" + (f"，看 {log_path}" if log_path else ""))
-
-
-def read_json(path):
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def write_json(path, obj):
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(obj, f, indent=2, ensure_ascii=False)
-    os.replace(tmp, path)
-
-
-def mark(out, step, state, **extra):
-    if DRY:
-        return
-    path = os.path.join(out, "status.json")
-    status = read_json(path) if os.path.isfile(path) else {}
-    status[step] = dict(state=state, at=time.strftime("%F %T"), **extra)
-    write_json(path, status)
-
-
-def need(path, hint):
-    """真跑缺就停；dry-run 只提醒，让主会话在起守护进程前知道还缺什么。"""
-    if os.path.exists(path):
-        return
-    if not DRY:
-        raise RuntimeError(f"缺 {path}（{hint}）")
-    log(f"[dry] 缺 {path}（{hint}）")
+DRY = False   # main 里与 pipeline_common.DRY 一起置位；helper 都在 tools/pipeline_common.py（A4）
+log, run, sh, read_json, write_json, mark, need = pc.log, pc.run_cmd, pc.sh, pc.read_json, pc.write_json, pc.mark, pc.need
 
 
 def expand_braces(pattern):
@@ -253,11 +205,11 @@ def train(out):
         ds = os.path.join(ds_dir(out, ds_name), "dataset.uavr")
         need(ds, f"先跑 pack（{ds_name}）")
         for label, run_dir in train_runs(out, ds_name):
-            if os.path.isfile(os.path.join(run_dir, "ckpt_best.bin")):
-                log(f"跳过 train {ds_name}/{label}：已有 ckpt_best.bin")
+            if pc.train_finished(run_dir):   # 完成 = metrics.jsonl 末行 done:（ckpt 文件每轮都写，不算）
+                log(f"跳过 train {ds_name}/{label}：metrics.jsonl 已记 done")
                 continue
             if os.path.isdir(run_dir) and os.listdir(run_dir):
-                raise RuntimeError(f"{run_dir} 非空且没有 ckpt_best.bin：uavrgb_train 拒绝复用，删掉后重跑")
+                raise RuntimeError(f"{run_dir} 非空且训练没跑完（metrics.jsonl 末行不是 done:）：uavrgb_train 拒绝复用，删掉后重跑")
             seed = int(label[1:])
             cmd = [f"{BUILD}/uavrgb_train", "--data", ds, "--out", run_dir,
                    "--epochs", str(CFG["epochs"]), "--batch", str(CFG["batch"]), "--lr", repr(float(CFG["lr"])),
@@ -375,9 +327,14 @@ def evaluate(out):
     jobs = eval_jobs(out)
     pending = []
     for domain, name, suffix, cmd, env, edir, route in jobs:
-        if os.path.isfile(os.path.join(edir, "eval.json")):
-            log(f"跳过 {domain}/{name}{suffix}" + (f" route {route}" if route is not None else "") + "：已有 eval.json")
+        tag = f"{domain}/{name}{suffix}" + (f" route {route}" if route is not None else "")
+        if pc.eval_finished(edir):   # 完成 = eval.json 在、failed_count==0、episodes_done>0、非 partial
+            log(f"跳过 {tag}：eval.json 完整")
             continue
+        if not DRY:
+            moved = pc.retire_unfinished_eval(edir)   # 有 eval.json 但没完成（失败集/中断）：让出目录重跑
+            if moved:
+                log(f"{tag} 上次没跑完，旧目录挪到 {moved}，重跑")
         pending.append((domain, name, suffix, cmd, env, edir, route))
     gz = [j for j in pending if j[0] == "gazebo"]
     par = max(1, int(CFG["gazebo"]["parallel"]))
@@ -387,11 +344,12 @@ def evaluate(out):
             log_path = os.path.join(out, f"eval-gazebo-{name}{suffix}.log")
             log("$ " + " ".join(cmd) + f"  > {log_path}")
             if not DRY:
-                procs.append((name + suffix, edir, subprocess.Popen(cmd, env=dict(os.environ, **env),
-                                                                 stdout=open(log_path, "ab"), stderr=subprocess.STDOUT)))
+                procs.append((name + suffix, edir, pc.popen(cmd, env=dict(os.environ, **env),   # 登记：SIGTERM 时连 gz 一起收
+                                                            stdout=open(log_path, "ab"), stderr=subprocess.STDOUT)))
         for label, edir, proc in procs:
             rc = proc.wait()
             log(f"eval-gazebo/{label} rc={rc}" + ("（有失败/跳过集，见 eval.json 的 failed/skipped）" if rc else ""))
+        for label, edir, _proc in procs:   # 等齐这一批再查：中途抛出会让 main 写 DONE 退出，其余组的 gz 留成孤儿（AUDIT Must 3）
             need(os.path.join(edir, "eval.json"), f"{label} 没写出 eval.json，看 {out}/eval-gazebo-{label}.log")
     for _d, name, suffix, cmd, env, edir, route in [j for j in pending if j[0] == "3dgs"]:
         log_path = os.path.join(out, f"eval-3dgs-{name}{suffix}-route{route}.log")
@@ -485,7 +443,7 @@ def main():
     p.add_argument("--from", dest="start", choices=STEPS, default="pack", help="从哪一步开始（续跑）")
     p.add_argument("--dry-run", action="store_true", help="只打印命令，不执行、不写文件")
     a = p.parse_args()
-    DRY = a.dry_run
+    pc.DRY = DRY = a.dry_run
     out = os.path.abspath(a.out)
     if not DRY:
         os.makedirs(out, exist_ok=True)
@@ -495,6 +453,7 @@ def main():
                                           capture_output=True, text=True).stdout.strip()})
         if os.path.exists(os.path.join(out, "DONE")):
             os.remove(os.path.join(out, "DONE"))
+    pc.install_signal_handlers()   # SIGTERM/Ctrl-C → Interrupted：收子进程组、status 标 interrupted、DONE 写真实 rc
     rc, last = 0, None
     try:
         preflight(STEPS[STEPS.index(a.start):])
@@ -507,6 +466,11 @@ def main():
             if step != "pack":   # pack 自己按 blocked 情况标 ok/partial
                 mark(out, step, "ok", seconds=round(time.monotonic() - t0, 1))
             log(f"==== {step} 完成 {time.monotonic() - t0:.0f}s")
+    except pc.Interrupted as e:
+        rc = e.rc
+        n = pc.terminate_children()
+        mark(out, last or "preflight", "interrupted", signal=e.name, children_terminated=n)
+        log(f"!!!! {e}：已收掉 {n} 个子进程组，{last or 'preflight'} 标 interrupted，rc={rc}")
     except Exception as e:   # noqa: BLE001
         rc = 1
         mark(out, last or "preflight", "failed", error=f"{type(e).__name__}: {e}")

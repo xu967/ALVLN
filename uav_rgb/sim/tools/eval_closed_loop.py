@@ -46,7 +46,10 @@ WAYPOINT_RADIUS = 1.0
 #   必须 < 出生点到 waypoint 的最小距离 2.50 m，否则原地不动也算成功。
 REACH_RADIUS = 1.5
 # 新指标合同版本（SIM-09）。旧 success 定义不变，新字段单独按此版本解释。
-METRIC_VERSION = "sim09.v1"
+# v2（2026-11-09，FIXLIST_R2 A1）：route_choice 任务（base/forest_e1）首次 x ≥ goal_x 即结束本集
+# （collect.py --stop-at-goal），过线后不再有碰撞/超时，SR 不随 --steps 变；每集多记
+# stopped_on_goal / steps_to_goal。v1 的数字过线后继续飞，碰撞可能发生在过线之后，不可与 v2 混报。
+METRIC_VERSION = "sim09.v2"
 # cf_sitl（固件在环）下 FORWARD 到期后机体还会滑行，碰撞步的 action 多半已是 SAFE/YAW；
 # false_forward 改成「碰撞前 1 s 仿真内下过 FORWARD」。metric_version 带后缀，数字不与旧档混报。
 COAST_WINDOW_S = {"cf_sitl": 1.0}
@@ -70,9 +73,12 @@ import split_manifest as sm  # noqa: E402
 import campus  # noqa: E402
 import asset_campus  # noqa: E402
 import teacher  # noqa: E402
+import collect  # noqa: E402  - 只为 GOAL_MARGIN_M：成功线与 collect --stop-at-goal 的停线必须是同一条
 
 # 与 collect_parallel 共用同一份默认矩阵（cf_sil 已退出；cf_blackbox 只留名字）。
 DYNAMICS_PROFILES = cp.DYNAMICS_CHOICES
+# route_choice 成功线 = 最远柱 x + GOAL_MARGIN_M（单一来源 collect.GOAL_MARGIN_M = 1.0）。
+GOAL_MARGIN_M = collect.GOAL_MARGIN_M
 
 
 def load_jsonl(path):
@@ -293,8 +299,9 @@ def teacher_shortest_path_m(pillars, start, goal_x=None, waypoint=None, clearanc
     waypoint 任务（l1）目标是 waypoint 点，radius 给了就把路径截到进入半径那一点（与 p_i 同口径，
     见 truncate_at_goal）；base/forest 目标是验收线 x=goal_x 上的任意点，对 y 每 goal_y_step 取候选终点、
     取栅格路径最短的那条再抽捷径（A* 边界与 astar_path 内部同一算式）。
-    这不是几何最短路：膨胀用的是教师规划余量（E1 base 0.40 m，机身半宽只有 0.10 m），所以 l_i 是
-    「教师参考路径」；学生贴柱抄近路时 p_i < l_i 仍可能出现，SPL 公式的 max(p_i, l_i) 把它截成 S_i。
+    clearance 由调用方给：评测器传机体半径（spl_clearance，E1 0.102 / X3 0.235），l_i 就是碰撞模型下可行的
+    最短路下界（0.1 m 栅格 + 抽捷径，离散误差几 cm）；p_i < l_i 只会差在离散误差上，SPL 的 max(p_i, l_i) 兜住。
+    不给 clearance 时退回教师规划余量 ASTAR_CLEARANCE_M（旧「教师参考路径」口径，离线脚本用）。
     """
     if not pillars:
         return None
@@ -383,6 +390,26 @@ def goal_path_length_m(traj, goal_x=None, waypoint=None, radius=None):
     return path_length_m(truncate_at_goal(traj, goal_x, waypoint, radius))
 
 
+def first_goal_step(oracle, goal_x=None, waypoint=None, radius=None):
+    """steps_to_goal：第一次进入目标区的那一步的步数（oracle 行号 + 1，pose_gt 是该步动作后的真值位姿）。
+
+    目标区与 success / p_i 同口径：waypoint 任务 = 距 waypoint <= radius；验收线任务 = x >= goal_x。
+    从未进入返回 None。sim09.v2 下 route_choice 集在这一步就结束，所以它也等于 steps。
+    """
+    for i, o in enumerate(oracle):
+        pg = o.get("pose_gt") if isinstance(o, dict) else None
+        if not (isinstance(pg, dict) and pg.get("x") is not None):
+            continue
+        if waypoint is not None:
+            if pg.get("y") is None:
+                continue
+            if math.hypot(float(pg["x"]) - waypoint["x"], float(pg["y"]) - waypoint["y"]) <= radius:
+                return i + 1
+        elif goal_x is not None and float(pg["x"]) >= goal_x:
+            return i + 1
+    return None
+
+
 def spl_of(success, path_m, shortest_m):
     """单集 SPL：S_i · l_i / max(p_i, l_i)；缺任一长度为 None。两长度都为 0 时退化成 S_i。"""
     if path_m is None or shortest_m is None:
@@ -426,6 +453,7 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
     shortest_path_m（2026-11-07 起，只加不改）：调用方算好的 l_i（teacher_shortest_path_m /
     3DGS planner.route_check）；写 path_length_m（oracle xy 折线，截到首次到达，见 goal_path_length_m）、
     shortest_path_m、spl = success · l_i / max(p_i, l_i)。没给 l_i 时 spl 为 None，旧字段逐位不变。
+    steps_to_goal（sim09.v2）：第一次进入目标区用的步数（first_goal_step），从未进入 None。
     """
     goal_radius_stop = float(stop_radius) if stop_radius is not None else None
     metric_version = (METRIC_VERSION if coast_window_s is None
@@ -442,7 +470,8 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
                 "metric_version": metric_version,
                 "goal_radius_reach": REACH_RADIUS,
                 "goal_radius_stop": goal_radius_stop,
-                "path_length_m": None, "shortest_path_m": shortest_path_m, "spl": None}
+                "path_length_m": None, "shortest_path_m": shortest_path_m, "spl": None,
+                "steps_to_goal": None}
     collision = any(bool(a.get("collision")) and _src(a) != "stuck" for a in actions)
     stuck = any(bool(a.get("collision")) and "stuck" in _src(a) for a in actions)
     if coast_window_s is None:
@@ -501,10 +530,12 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
     task_success = bool(reach_ever and final_in_radius and stop_action_issued
                         and collision_free and not timed_out)
     # p_i 截到第一次到达（与 success 同口径）：waypoint 任务用 success 用的那个 radius，验收线任务用 goal_x。
-    p_i = goal_path_length_m(trajectory_xy(oracle), goal_x=goal_x,
-                             waypoint=waypoint if stop_radius is not None else None,
-                             radius=(REACH_RADIUS if goal_radius is None else goal_radius)
-                             if stop_radius is not None else None)
+    goal_region = dict(goal_x=goal_x,
+                       waypoint=waypoint if stop_radius is not None else None,
+                       radius=(REACH_RADIUS if goal_radius is None else goal_radius)
+                       if stop_radius is not None else None)
+    p_i = goal_path_length_m(trajectory_xy(oracle), **goal_region)
+    steps_to_goal = first_goal_step(oracle, **goal_region)
     infer = [float(a["infer_ms"]) for a in actions if a.get("infer_ms") is not None]
     return {"steps": len(actions), "collision": collision, "stuck": stuck,
             "false_forward": false_forward, "success": success,
@@ -522,7 +553,8 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
             "goal_radius_stop": goal_radius_stop,
             # SPL 三件：p_i（oracle xy 折线，截到首次到达）、l_i（调用方给的教师参考路长）、S_i·l_i/max(p_i,l_i)。
             "path_length_m": p_i, "shortest_path_m": shortest_path_m,
-            "spl": spl_of(success, p_i, shortest_path_m)}
+            "spl": spl_of(success, p_i, shortest_path_m),
+            "steps_to_goal": steps_to_goal}
 
 
 def aggregate(episodes, requested=None, attempted=None, failed_count=0, skipped_count=0):
@@ -601,7 +633,16 @@ def aggregate(episodes, requested=None, attempted=None, failed_count=0, skipped_
 
 
 def spl_clearance(vehicle, task):
-    """l_i 用的 A* 膨胀余量 = 该 (载具, 任务) 的教师 A* 余量（teacher.CLEARANCE_BY_VEHICLE 的第一项）。"""
+    """l_i 用的 A* 膨胀余量 = 机体半径 teacher.BODY_HALF_BY_VEHICLE[vehicle]（e1_mini 0.102 / x3 0.235）：
+    机心离柱表面 ≥ 这个值就是碰撞模型下可行的路，所以 l_i 是物理可行最短路的下界（栅格 0.1 m 离散误差内），
+    不是教师规划余量（CLEARANCE_BY_VEHICLE，E1 base 0.40）那条「教师参考路径」。task 不影响机体尺寸，参数留着
+    是为了调用方把 (vehicle, task) 一起传、spl_reference 里两者并列好对照（见 teacher_clearance）。"""
+    del task
+    return teacher.BODY_HALF_BY_VEHICLE[vehicle]
+
+
+def teacher_clearance(vehicle, task):
+    """该 (载具, 任务) 的教师 A* 规划余量（CLEARANCE_BY_VEHICLE 第一项）；只写进 spl_reference 供对照，不参与 l_i。"""
     return teacher.CLEARANCE_BY_VEHICLE.get(
         (vehicle, task), teacher.CLEARANCE_BY_VEHICLE[(vehicle, "base")])[0]
 
@@ -662,6 +703,9 @@ def run_episode(seed, args, workdir, seen_gids):
             json.dump(eval_meta, f, ensure_ascii=False)
 
     goal_x = max(float(p["x"]) for p in meta["pillars"]) + args.goal_margin
+    # sim09.v2：route_choice 任务（没有 waypoint/stop_radius 的场景）让 collect.py 在首次 x ≥ goal_x
+    # 结束本集；waypoint 任务（l1/campus）仍按 stop_radius 的 goal-stop 结束，collect 也拒绝两者同开。
+    stop_at_goal = meta.get("stop_radius") is None and meta.get("waypoint") is None
     partition = f"uavrgb_eval_{os.getpid()}_{seed}"
     log_path = os.path.join(workdir, "logs", f"sim_{seed}.log")
     ep_dir = os.path.join(workdir, f"ep_{seed}")
@@ -686,6 +730,8 @@ def run_episode(seed, args, workdir, seen_gids):
                "--scene-id", str(seed), "--seed", str(seed),
                "--scene-meta", eval_meta_path, "--split", split,
                "--window-from", args.window_from, "--dynamics", args.dynamics]
+        if stop_at_goal:
+            cmd += ["--stop-at-goal"]
         if args.save_depth:
             cmd += ["--save-depth"]
         if args.policy == "student":
@@ -749,6 +795,9 @@ def run_episode(seed, args, workdir, seen_gids):
         "waypoint_radius": WAYPOINT_RADIUS,
         "stop_radius": meta.get("stop_radius"),
         "pillars": meta.get("pillar_count"), "goal_x": goal_x,
+        # sim09.v2：collect 是否在目标处提前结束（manifest 字段：route_choice = 首次过成功线；
+        # waypoint 任务 = goal-stop 连续 3 步 SAFE；采集失败/旧 collect 没有该字段为 False）。
+        "stopped_on_goal": bool(manifest.get("stopped_on_goal", False)),
         "collect_rc": rc, "wall_s": round(time.monotonic() - t0, 1),
         "performance": manifest.get("performance"),
         "render_backend_requested": manifest.get("render_backend_requested"),
@@ -762,13 +811,17 @@ def run_episode(seed, args, workdir, seen_gids):
     for a in actions:
         k = int(a.get("action_executed", -1))
         summary["actions"][k] = summary["actions"].get(k, 0) + 1
+    if getattr(args, "episodes_dir", None):
+        keep_dir = os.path.join(args.episodes_dir, f"seed_{seed}")
+        keep_episode_logs(ep_dir, keep_dir)
+        summary["episode_dir"] = os.path.relpath(keep_dir, os.path.dirname(args.episodes_dir))
     if frames_dir:
         _write_video(summary, frames_dir, ep_dir, world, args, seed, goal_x, meta)
         summary["video_patch"] = video_patch
     return summary, None
 
 
-def scan_episodes(seed_list, episodes, run_fn, log=print):
+def scan_episodes(seed_list, episodes, run_fn, log=print, state=None):
     """固定请求集扫描（AUDIT #11）：成功与采集失败都占一个名额，不再为失败补扫新 seed。
 
     之前按 len(results) 停：1 集失败就多扫 1 个 seed 补上，requested_SR 的分母名义上是
@@ -776,12 +829,19 @@ def scan_episodes(seed_list, episodes, run_fn, log=print):
     completion 0.75 自相矛盾）。现在按 len(attempted) 停：失败进分母、单列 failed。
     跳过（split 不符 / 重复几何）不占名额。run_fn(seed, seen) -> (summary, skip_reason)。
     返回 (results, failures, skips, scanned, attempted)。
+    state（可选 dict）：开扫前就挂上这五个列表和正在跑的 current seed，SIGTERM/Ctrl-C
+    （SystemExit/KeyboardInterrupt 不在这里捕获）打断后调用方仍拿得到已完成的部分（A2）。
     """
     results, seen, failures, skips, scanned, attempted = [], set(), [], [], [], []
+    if state is not None:
+        state.update(results=results, failures=failures, skips=skips, scanned=scanned,
+                     attempted=attempted, current=None)
     for seed in seed_list:
         if len(attempted) >= episodes:
             break
         scanned.append(seed)
+        if state is not None:
+            state["current"] = seed
         try:
             summary, skip = run_fn(seed, seen)
         except Exception as e:  # noqa: BLE001 - 单集失败要记录，不能拖垮整轮
@@ -808,7 +868,39 @@ def scan_episodes(seed_list, episodes, run_fn, log=print):
         log(f"[seed {seed}] steps={summary['steps']} "
             f"collision={summary['collision']} success={summary['success']} "
             f"max_x={summary['max_x']} rc={summary['collect_rc']}", flush=True)
+    if state is not None:
+        state["current"] = None
     return results, failures, skips, scanned, attempted
+
+
+def interruption(exc, state):
+    """把打断扫描的 SystemExit(143)/KeyboardInterrupt/异常翻译成 eval.json 的 interrupted 记录 + 退出码。
+
+    正在跑的 seed 记进 failed（error=interrupted: …）并占请求名额：它被尝试过但没有结果。
+    """
+    if isinstance(exc, SystemExit) and exc.code == 143:
+        reason, rc = "SIGTERM", 143
+    elif isinstance(exc, KeyboardInterrupt):
+        reason, rc = "KeyboardInterrupt", 130
+    elif isinstance(exc, SystemExit):
+        reason, rc = f"SystemExit({exc.code})", exc.code if isinstance(exc.code, int) else 1
+    else:
+        reason, rc = f"{type(exc).__name__}: {exc}", 1
+    seed = state.get("current")
+    if seed is not None:
+        state["failures"].append({"seed": seed, "error": f"interrupted: {reason}"})
+        state["attempted"].append(seed)
+    return {"seed": seed, "reason": reason, "rc": rc}
+
+
+def keep_episode_logs(ep_dir, keep_dir):
+    """正常结束也保留每集的逐步日志（actions/oracle/manifest；帧不留）到 <out>/episodes/seed_<seed>/，
+    SPL 等指标事后可复算（EVAL_STANDARD §5.3「历史 eval.json 不能补算 SPL」）。"""
+    os.makedirs(keep_dir, exist_ok=True)
+    for name in ("actions.jsonl", "oracle.jsonl", "episode_manifest.json"):
+        src = os.path.join(ep_dir, name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(keep_dir, name))
 
 
 def record_views_quality(name):
@@ -906,8 +998,10 @@ def main():
     p.add_argument("--template", default=None,
                    help="模板 SDF（缺省按 --vehicle 选；x3 为 sim/worlds/uav_rgb.sdf）")
     p.add_argument("--infer-bin", default=None)
-    p.add_argument("--goal-margin", type=float, default=1.0,
-                   help="成功 = 无碰撞且 max_x >= 最远柱 x + 该余量")
+    p.add_argument("--goal-margin", type=float, default=GOAL_MARGIN_M,
+                   help="成功 = 无碰撞且 max_x >= 最远柱 x + 该余量。sim09.v2 起 collect.py --stop-at-goal "
+                        f"在同一条线上结束本集，余量只接受 collect.GOAL_MARGIN_M={GOAL_MARGIN_M:g}（改它会让"
+                        "停线与评测线不一致）")
     p.add_argument("--sim-timeout", type=float, default=120.0)
     p.add_argument("--episode-timeout", type=float, default=600.0)
     p.add_argument("--keep-work", action="store_true", help="保留 world/每集原始文件")
@@ -977,6 +1071,9 @@ def main():
         value = getattr(args, name)
         if not (math.isfinite(value) and value > 0):
             p.error(f"--{name.replace('_', '-')} 必须是有限正数")
+    if abs(args.goal_margin - GOAL_MARGIN_M) > 1e-9:
+        p.error(f"--goal-margin 只接受 {GOAL_MARGIN_M:g}：collect.py --stop-at-goal 的停线是最远柱 x + "
+                f"collect.GOAL_MARGIN_M，评测线必须与它重合（sim09.v2）")
     if args.policy == "teacher-nn":
         if not args.teacher_ckpt:
             p.error("--policy teacher-nn 需要 --teacher-ckpt")
@@ -1032,6 +1129,7 @@ def main():
         p.error(f"--out {out} 非空；请用新目录")
     os.makedirs(out, exist_ok=True)
     args.video_dir = os.path.join(out, "videos")
+    args.episodes_dir = os.path.join(out, "episodes")   # 每集 actions/oracle/manifest 的保留处（帧不留）
     if args.record_video:
         os.makedirs(args.video_dir, exist_ok=True)
     try:
@@ -1051,13 +1149,33 @@ def main():
     if not seed_list:
         seed_list = list(range(args.base_seed, args.base_seed + args.max_seeds))
     started = time.monotonic()
+    # A2：SIGTERM(SystemExit 143)/Ctrl-C/意外异常都先写出部分 eval.json（partial=true）再退出；
+    # 工作目录无论怎么结束都删（--keep-work 除外）。第二次信号会打断写报告——那就没有 eval.json。
+    state = dict(results=[], failures=[], skips=[], scanned=[], attempted=[], current=None)
+    interrupted = None
     try:
-        results, failures, skips, scanned_seeds, attempted_seeds = scan_episodes(
-            seed_list, args.episodes,
-            lambda seed, seen: run_episode(seed, args, workdir, seen))
+        try:
+            scan_episodes(seed_list, args.episodes,
+                          lambda seed, seen: run_episode(seed, args, workdir, seen), state=state)
+        except BaseException as e:  # noqa: BLE001 - 见上
+            interrupted = interruption(e, state)
+            print(f"中断：{interrupted['reason']}（seed {interrupted['seed']}）；"
+                  f"写出部分结果 eval.json partial=true", file=sys.stderr, flush=True)
+        finally:
+            cp.cleanup_all()
+        rc = write_report(args, out, state, interrupted, protocol, mismatches, ood, text_dim, infer_bin, started)
     finally:
-        cp.cleanup_all()
+        if args.keep_work:
+            print(f"原始文件保留在 {workdir}")
+        else:
+            shutil.rmtree(workdir, ignore_errors=True)
+    return rc
 
+
+def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_dim, infer_bin, started):
+    """汇总 + 写 <out>/eval.json + 打印；返回进程退出码（中断时是 143/130/1）。"""
+    results, failures, skips = state["results"], state["failures"], state["skips"]
+    scanned_seeds, attempted_seeds = state["scanned"], state["attempted"]
     agg = aggregate(results, requested=args.episodes,
                     attempted=len(attempted_seeds),
                     failed_count=len(failures), skipped_count=len(skips))
@@ -1093,7 +1211,11 @@ def main():
               # SPL 口径（EVAL_STANDARD §5.3）：l_i 的来源与膨胀余量写死在报告里，免得跨载具混报。
               "spl_reference": (None if args.task not in SPL_TASKS else {
                   "l_i": "teacher.astar_path + LOS shortcut, truncated at goal region", "step_m": 0.1,
+                  # 2026-11-09 起 l_i 的膨胀 = 机体半径（物理可行下界）；之前是教师规划余量（E1 0.40），
+                  # 两版 l_i 不同、SPL 不可直接比：对照时先看这两个字段。
                   "clearance_m": spl_clearance(args.vehicle or "x3", args.task),
+                  "clearance_basis": "body half-width teacher.BODY_HALF_BY_VEHICLE (physically feasible lower bound)",
+                  "teacher_clearance_m": teacher_clearance(args.vehicle or "x3", args.task),
                   # SPL_TASKS 里只有 l1 走 waypoint 分支，到达半径就是 REACH_RADIUS（campus 不算 SPL）。
                   "goal": (f"disk r={REACH_RADIUS:g} around waypoint" if stop_radius_used is not None
                            else f"line x=max_pillar_x+{args.goal_margin:g} (y step {SPL_GOAL_Y_STEP:g})"),
@@ -1128,6 +1250,10 @@ def main():
               # 20 集可能只覆盖 3 张图（2026-11-03 审计）。不写出来会被当 20 个样本。
               "unique_maps": len({e["geometry_gid"] for e in results}),
               "wall_s": round(time.monotonic() - started, 1),
+              # A2：中断（SIGTERM/Ctrl-C/异常）写出的部分结果；partial=true 的 eval.json 不得当完整结果报。
+              "partial": interrupted is not None,
+              "interrupted": (None if interrupted is None else
+                              {"seed": interrupted["seed"], "reason": interrupted["reason"]}),
               **agg, "failed": failures, "skipped": skips,
               "per_episode": [{k: v for k, v in e.items() if k != "infer_ms"}
                               for e in results]}
@@ -1161,12 +1287,9 @@ def main():
     print(f"inference p50={im['p50']}ms p95={im['p95']}ms "
           f"(warm n={im['n_warm']}; cold first={im['cold_first_ms']})")
     print(f"action distribution: {agg['action_distribution']}")
-    print(f"-> {path}")
-
-    if args.keep_work:
-        print(f"原始文件保留在 {workdir}")
-    else:
-        shutil.rmtree(workdir, ignore_errors=True)
+    print(f"-> {path}" + ("  （partial=true：中断写出的部分结果）" if interrupted else ""))
+    if interrupted:
+        return interrupted["rc"]
     return 0 if agg["episodes_done"] == args.episodes else 1
 
 
