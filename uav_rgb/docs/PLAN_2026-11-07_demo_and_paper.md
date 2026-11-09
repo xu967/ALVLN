@@ -277,10 +277,12 @@ P2 代码在 main 但不进流水线（DISTILL 反事实探针：prev-action 在
 ### 22:50 之后（同日补）
 
 - **eval4 出数**（`experiments/2026-11-07-approach-scoreboard.md` §0，新固定基准）：教师 20/20、盲前进 0/20、旧 X3 1/20、BC 11/20、截断 12/20（补齐 seed 122）、sgvis 13/20、costmap 重标 11/20；单种子学生臂两两 p ≥ 0.73。**截断配置换训练种子：seed 0 / 1 / 2 = 12 / 20 / 10，seed 1 vs seed 2 p=0.002**。训练种子带来的差别比目前任何一条方案的差别都大，离线 val mF1（0.426 / 0.407 / 0.394）也排不出闭环顺序。
-- 由此的建议（**待用户确认**，改的是预注册门槛）：M3 过线判据从「相对 eval4 BC，n≥60 下区间不重叠」改为「每臂 ≥3 个训练种子取 IQM，n≥60 下区间不重叠」；BC 基线也补到 3 个种子。代价：每多一个种子约 8 min 训练 + 40 min 评测（1 个 gz）。
+- 主会话建议过把 M3 过线判据改成「每臂 ≥3 个训练种子取 IQM，n≥60 下区间不重叠」；**用户 22:55 决定维持原判据、不补种子**。训练种子噪声的证据留在 scoreboard §0，读 M3 结果时按单种子看。
+- **用户 22:55 定 n=60 口径**：E1 学生之间用 71 个 test 分区几何里的 60 个（冻结 20 + 按 seed 升序补 40），旧 X3 学生只在它没见过的 40 个上评。清单进 `tools/eval_seeds.py`（`EVAL_SEEDS_BASE_60` / `EVAL_SEEDS_BASE_X3_40`，测试锁定）；正在跑的 DAgger 已预写 `full-1109/eval_seeds60.json`（`seeds60()` 见文件存在即直接读，不改冻结代码）。
+- **用户 22:55 定 3DGS 数据集 B 划分**：整场景留出，bicycle 只作 test，其余场景训练（stump 仍单独成包）。val 用于选 ckpt，打算按路线留出（每个训练场景留 1 条路线），实现放在 TEACHER-3DGS 合并之后（`collect_3dgs` 是它的文件域），`preprocess` 要认新的 split_policy。
 - **W2 层 3（Gazebo 侧）收口**：costmap 教师 20/20 可用但不更强；重标学生在 TEACHER-COST 自己的条件下 14 vs 12，换到 eval4 条件 11 vs 12，方向没保持；软标签 + 无类权重 5/20 已按预注册停。3DGS 侧（D9 的 `PLAN_HARD_M` + 占据栅格上的逐动作代价教师）派给第九阶段 TEACHER-3DGS，目标是 hold 1.0 下教师 ≥114/120，过了才能让数据集 B 用 hold 1.0、和 Gazebo 数据混训。一键流水线已能用 `E1_TEACHER_PLANNER=costmap`（3a6dce5）。
 - **DAgger 正式 3 轮 22:36 起跑**（`exp-dagger-gz-20261109/full-1109/`，约 6 h）。每轮只训一个种子，结果会和训练噪声混在一起；跑完后按上一条在最终聚合数据上补 2 个种子再下结论。截断基线因 seed 122 不完整，流水线会自己同条件重评一次。
 - SITL：`tmp/build-cf-sitl` 21:23 原地重建为 lib31（ctest 10/10、selftest 33/33、`lib_version=31`），旧 v3.1 备份 `build-cf-sitl-v3.1-20261109`。
 - 3DGS 数据集 B pilot（hold 0.5）5 场景 99/100 到达；stump ToF 打标 6 条路线全部 `agl_model_unverified`（路径下地物 0.4–1.2 m），与尺度未核实一起单独成包。
 - 第九阶段 3 个 agent（任务书 `$DATA_ROOT/uav_rgb/tmp/phase9-20261109/BRIEF.md`）：TEACHER-3DGS（上面）、REFACTOR-TOOLS（gsplat 缓存目录三份实现合一、dagger_gz_pipeline 改用 pipeline_common）、NICE-FIXES（AUDIT_SIMTOOLS Nice 8–10、AUDIT_SIM Nice 6、起飞等待改按仿真时间计）。
-- 新增待拍板：3DGS 数据集 B 的 val / test 怎么划（AUDIT_SIM Nice 8：4 个真实场景按几何哈希全在 train，S_B 没有保留域可评）。建议整场景留出（例如 bicycle 只作 test），按路线划分会共享外观。
+- 3DGS 数据集 B 的 val / test 划分（AUDIT_SIM Nice 8：4 个真实场景按几何哈希全在 train，S_B 没有保留域可评）已由用户 22:55 定为整场景留出，见上。

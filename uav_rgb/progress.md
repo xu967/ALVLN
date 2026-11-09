@@ -48,21 +48,25 @@
 - 21:40 第九阶段任务书 `tmp/phase9-20261109/BRIEF.md`；三个 worktree 基于 3a6dce5（`wt-teacher-3dgs` / `wt-refactor-tools` / `wt-nice-fixes`）。22:42 三个 agent 派出（会话在 21:45–22:39 中断过一次，22:39 用户要求恢复）。
 - 22:36 eval4 DONE rc=1（截断臂 seed 122 `arm_takeoff→READY超时 90s`，0 步；其余 7 组完整）→ 同条件补跑 seed 122（PGID 581057）22:44 成功 39 步。结论进 scoreboard §0：训练种子 0 / 1 / 2 = 12 / 20 / 10（seed 1 vs 2 p=0.002），单种子方案臂两两 p ≥ 0.73；PLAN「22:50 之后」。
 - 22:36 DAgger 正式 3 轮由等待脚本自动起（等待脚本只看 DONE 存在，不看 rc；截断基线不复用、流水线自己重评）。
+- 22:55 文档提交 23c6212，`check.sh --python-only` rc=0，推 GitHub（ALVLN b76c37e）。
+- 22:55 用户定三件事（见关键决策）→ `tools/eval_seeds.py` 加 `EVAL_SEEDS_BASE_60` / `EVAL_SEEDS_BASE_X3_40` + `test_base_60_and_x3_40`（修前红 `AttributeError: … no attribute 'EVAL_SEEDS_BASE_60'`）；71 个 test 几何、X3 train/val 碰过 31 个、剩 40 个，与 19:38 的核实一致。给正在跑的 DAgger 预写 `full-1109/eval_seeds60.json`（60 个、几何两两不同）。
 
 ### 关键决策
 
 - 见 PLAN「更新 2026-11-09」决策 1–5。
+- 用户 22:55：① M3 过线判据维持原样（相对 eval4 BC，n≥60 区间不重叠），不补训练种子；② n=60 用 E1 口径（E1 臂用 71 个 test 几何里的 60 个 = `EVAL_SEEDS_BASE_60`，旧 X3 只评 `EVAL_SEEDS_BASE_X3_40`）；③ 3DGS 数据集 B 整场景留出，bicycle 只作 test。
 - 合并顺序：先文档与可视化（不碰 `sim/cf_sitl`、`sim/3dgs`），等 AUDIT-SIM 收尾再合并 fix-sitl / fix-3dgs，避免审计读到半合并状态。
 
 ### 未完成的待办
 
 - GitHub：22:55 已推到本地 23c6212（ALVLN `462a3c3..b76c37e`；推之前 `check.sh --python-only` rc=0，日志 `tmp/analysis-20261109/check-py-23c6212.log`）。之后的提交随第九阶段合并一起推（`bash tools/git_mirror_alvln.sh`）。
 - 第九阶段 3 个 agent 交付 → 审 diff → 合并 → `check.sh` → 推 GitHub。TEACHER-3DGS 过线后：`demo_3dgs_routes` 加 CFG 透传 `--teacher-planner`，数据集 B 的 hold 按结果给用户建议。
-- DAgger 正式 3 轮（见头部）：盯 `status.json`；若因评测失败集停下，同 `--out` 重起。跑完在最终聚合数据上补 2 个训练种子再下结论（PLAN「22:50 之后」）。eval60 默认用现行严格排除（24 个几何），用户若改口径，改 CFG.eval60_exclude 后同 --out 续跑。
+- DAgger 正式 3 轮（见头部）：盯 `status.json`；若因评测失败集停下，同 `--out` 重起。eval60 读预写的 `eval_seeds60.json`（E1 口径 60 个），只评 DAgger 臂；M3 表里的基线（BC / 截断 / sgvis）在 `EVAL_SEEDS_BASE_60` 上另起评测，旧 X3 在 `EVAL_SEEDS_BASE_X3_40` 上评。
+- REFACTOR-TOOLS 合并后：main 的 `dagger_gz_pipeline.seeds60` 改为直接用 `eval_seeds.EVAL_SEEDS_BASE_60`（现在 main 里还是严格排除规则，文件在该 agent 的域里，先不动）。
 - eval4 的教师与截断新录像（`eval-teacher/videos/`、`eval-student-e1-trunc/videos/`）给短片 v3；短片 v3 等用户验收 v2 后再做。
-- **3DGS 数据集 B**：pilot 过审（99/100）；放量 ≥300 集 → 打包 → 训 S_B → 两域评测。放量前要用户定 hold 和 val / test 划分。
+- **3DGS 数据集 B**：pilot 过审（99/100）；划分已定（bicycle 只作 test，val 按路线留出）；TEACHER-3DGS 合并后实现 split_policy（`collect_3dgs` + `preprocess`），再按定下的 hold 放量 ≥300 集 → 打包 → 训 S_B → 两域评测。
 - D4（E1 护罩方框四角离中心约 0.122 m，3DGS 碰撞圆柱半径 0.102 m）需要真机尺寸（118 mm 轴距 + 桨）才能定，未动。
-- 用户待拍板：① 3DGS 数据集 B 的 hold（等 TEACHER-3DGS：hold 1.0 教师过线就建议 1.0 以便和 Gazebo 混训，否则 0.5）；② M3 n=60 的几何口径（建议 E1 臂用 71 个 test 几何里的 60 个）；③ M3 判据加「每臂 ≥3 个训练种子 IQM」（PLAN「22:50 之后」）；④ 3DGS 数据集 B 的 val / test 划分（建议整场景留出）；⑤ 短片 v2 验收与 tag `demo-2026-11-12`；⑥ worktree 删除（暂不做）；⑦ PLAN §8 四项。
+- 用户待拍板：① 3DGS 数据集 B 的 hold（等 TEACHER-3DGS：hold 1.0 教师过线就建议 1.0 以便和 Gazebo 混训，否则 0.5）；② 短片 v2 验收与 tag `demo-2026-11-12`；③ worktree 删除（暂不做）；④ PLAN §8 四项。
 
 ## 第三阶段（2026-11-07 05:10 起）
 
