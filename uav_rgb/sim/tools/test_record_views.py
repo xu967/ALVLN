@@ -27,15 +27,19 @@ class _FakeCv2:
     """只记录绘制调用，用来验证判据/投影逻辑，不需要真实渲染。"""
     FONT_HERSHEY_SIMPLEX = 0
     MARKER_TILTED_CROSS = 0
+    LINE_AA = 16
 
     def __init__(self):
-        self.lines, self.circles, self.texts, self.markers = [], [], [], []
+        self.lines, self.circles, self.texts, self.markers, self.polys = [], [], [], [], []
 
-    def line(self, _img, a, b, color, _width):
+    def line(self, _img, a, b, color, _width, *_rest):
         self.lines.append((a, b, color))
 
-    def circle(self, _img, p, r, color, _width):
+    def circle(self, _img, p, r, color, _width, *_rest):
         self.circles.append((p, r, color))
+
+    def polylines(self, _img, pts, _closed, color, *_rest):
+        self.polys.append((pts, color))
 
     def putText(self, _img, text, *_args):
         self.texts.append(text)
@@ -278,6 +282,67 @@ def check_e1_top_coverage():
     print(f"  ok  E1 顶视相机 {cam[:3]} {cam[4]}x{cam[5]} 盖住森林走廊与柱阵区")
 
 
+def check_top_icon_and_yaw(cam):
+    """当前位置画按比例四旋翼图标（保护罩方框 + 机头线），不再是圆点；机头线只在有 yaw 时画。"""
+    cv2, img = _FakeCv2(), _FakeImage()
+    track = [(10 * S, 1.0, 0.0, 2.2)]
+    rv._draw_top(cv2, img, cam, track, 10 * S, None, None, None, None, yaw=0.3)
+    assert len(cv2.polys) == 2 and all(len(p[0]) == 4 for p, _c in cv2.polys), "保护罩方框（黑描边 + 白线）"
+    assert len([c for c in cv2.circles if c[2] == (200, 200, 200)]) == 4, "4 个桨盘"
+    nose = [l for l in cv2.lines if l[2] == (0, 0, 255)]
+    assert len(nose) == 1 and nose[0][0] == rv.project_top(cam, 1.0, 0.0, 2.2), nose
+    assert not [c for c in cv2.circles if c[2] == (0, 255, 255)], "不再画黄圆点"
+    cv2 = _FakeCv2()
+    rv._draw_top(cv2, img, cam, track, 10 * S, None, None, None, None)
+    assert not [l for l in cv2.lines if l[2] == (0, 0, 255)], "yaw=None 不画机头线"
+    acts = [{"pose_ts": 10 * S, "yaw_before": 0.1}, {"pose_ts": 12 * S, "yaw_before": 0.2},
+            {"pose_ts": 11 * S}, {"pose_before": {}}]
+    yaws = rv._yaws(acts)
+    assert yaws == [(10 * S, 0.1), (12 * S, 0.2)], yaws
+    assert rv._yaw_at(yaws, 9 * S) is None and rv._yaw_at(yaws, 11 * S) == 0.1 and rv._yaw_at(yaws, 13 * S) == 0.2
+    print("  ok  顶视当前位置画四旋翼图标；航向取 actions 的 yaw_before")
+
+
+def check_chase_patch():
+    """录像时的追尾相机补丁只动 chase_cam 的 5 个值，模板文件本身不改；x3 模板没有 chase_offset 就不动。"""
+    import hashlib
+    import shutil
+    with open(WORLD_E1, "rb") as f:
+        tpl_sha = hashlib.sha256(f.read()).hexdigest()
+    with tempfile.TemporaryDirectory() as d:
+        w = os.path.join(d, "scene_1.sdf")
+        shutil.copy(WORLD_E1, w)
+        patch = rv.patch_chase_cam(w, "high")
+        assert patch["chase_size"] == [1280, 720] and patch["chase_hfov_deg"] == 60.0, patch
+        assert patch["chase_offset"] == "-1.0 0 0.45" and patch["quality"] == "high"
+        with open(WORLD_E1, encoding="utf-8") as f:
+            before = f.read().splitlines()
+        with open(w, encoding="utf-8") as f:
+            after = f.read().splitlines()
+        assert len(before) == len(after)
+        changed = [(a, b) for a, b in zip(before, after) if a != b]
+        tags = sorted(b.strip().split(">")[0] + ">" for _a, b in changed)
+        assert tags == ["<chase_offset>", "<height>", "<horizontal_fov>", "<width>"], changed
+        assert "<chase_offset>-1.0 0 0.5</chase_offset>" in "".join(a for a, _b in changed)
+        assert rv.top_camera_pose("\n".join(after)) == rv.top_camera_pose("\n".join(before)), "顶视相机不动"
+        assert abs(rv.student_camera_fov("\n".join(after)) - 60.0) < 1e-6, "机载相机不动"
+        with open(w, "rb") as f:
+            assert patch["world_sha256"] == hashlib.sha256(f.read()).hexdigest()
+        # medium 档：分辨率保持 640x360
+        shutil.copy(WORLD_E1, w)
+        assert rv.patch_chase_cam(w, "medium")["chase_size"] == [640, 360]
+        # x3 模板没有 chase_offset：不改、返回 None
+        shutil.copy(WORLD, w)
+        with open(w, "rb") as f:
+            x3 = f.read()
+        assert rv.patch_chase_cam(w, "high") is None
+        with open(w, "rb") as f:
+            assert f.read() == x3
+    with open(WORLD_E1, "rb") as f:
+        assert hashlib.sha256(f.read()).hexdigest() == tpl_sha, "模板 sha 不能变"
+    print("  ok  追尾相机补丁只改 chase_offset / HFOV / 分辨率 4 行，模板不动，x3 模板跳过")
+
+
 def write_cam(d, cam, frames, w=8, h=6):
     with open(os.path.join(d, cam + ".rgb"), "wb") as data, \
             open(os.path.join(d, cam + ".idx.jsonl"), "w") as idx:
@@ -308,6 +373,8 @@ def main():
     check_out_of_view_marker(cam)
     check_e1_top_coverage()
     check_ascii_overlay(cam)
+    check_top_icon_and_yaw(cam)
+    check_chase_patch()
     check_record_buckets_and_overwrite()
 
     with tempfile.TemporaryDirectory() as d:
@@ -370,6 +437,22 @@ def main():
         cap.release()
         assert n == 16 and back == 16, (n, back)
         print("  ok  .webm 合成为 VP8/WebM，回读 16 帧")
+        # high 档：2560x1440 画布；有 ffmpeg 时 .mp4 是 libx264（avc1），否则回退 cv2 并打日志
+        logs = []
+        hi = os.path.join(d, "hi.mp4")
+        n = rv.compose(d, ep, WORLD, hi, title="t", result="COLLISION", goal_x=5.0,
+                       hold_end_s=0.5, quality="high", log=logs.append)
+        cap = cv2.VideoCapture(hi)
+        ok, frame = cap.read()
+        assert ok and frame.shape == (1440, 2560, 3) and int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) == 16
+        cap.release()
+        with open(hi, "rb") as f:
+            head = f.read(4096)
+        if rv.vl.find_ffmpeg():
+            assert b"avc1" in head and not logs, (head[:40], logs)
+        else:
+            assert logs and "回退" in logs[0], logs
+        print(f"  ok  high 档合成 2560x1440（{'libx264' if rv.vl.find_ffmpeg() else 'cv2 回退'}）")
     print("test_record_views: PASS")
     return 0
 

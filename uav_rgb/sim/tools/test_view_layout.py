@@ -81,10 +81,103 @@ def check_panel_layout():
 def check_onboard_label():
     class _Img:
         shape = (240, 320, 3)
+
+    class _Img2:
+        shape = (480, 640, 3)
     assert vl.onboard_label(None) == "ONBOARD"
     assert vl.onboard_label(_Img()) == "ONBOARD 320x240 camera (model input is resized)"
     assert vl.onboard_label(_Img(), 59.8) == "ONBOARD 320x240 HFOV 60deg camera (model input is resized)"
+    # high 档：显示帧是 2× 渲染，标题仍写模型输入 320x240
+    assert vl.onboard_label(_Img2(), 60.0, display=2, rendered_at=2) == "ONBOARD 320x240 HFOV 60deg (model input; display 2x)"
+    # Gazebo 的机载帧是原生 320x240、由 paste 放大：rendered_at 默认 1
+    assert vl.onboard_label(_Img(), 60.0, display=2) == "ONBOARD 320x240 HFOV 60deg (model input; display 2x)"
     print("  ok  机载标题")
+
+
+def check_quality_and_scale():
+    """画质表三档；环境变量覆盖；grid(2) 是 2560x1440；paste/panel 的 s=2 坐标、字号、线宽全部翻倍。"""
+    assert set(vl.VIDEO_QUALITY) == {"low", "medium", "high"}
+    for name, q in vl.VIDEO_QUALITY.items():
+        assert q["canvas"] == (vl.W * q["scale"], vl.H * q["scale"]) and q["ssaa"] >= 1 and 0 < q["crf"] < 52, (name, q)
+    assert vl.VIDEO_QUALITY["high"]["crf"] < vl.VIDEO_QUALITY["medium"]["crf"] < vl.VIDEO_QUALITY["low"]["crf"]
+    old = os.environ.pop(vl.QUALITY_ENV, None)
+    try:
+        assert vl.quality()["name"] == vl.DEFAULT_QUALITY and vl.quality("high")["canvas"] == (2560, 1440)
+        os.environ[vl.QUALITY_ENV] = "low"
+        assert vl.quality("high")["name"] == "low", "环境变量应覆盖传入的档位"
+        try:
+            del os.environ[vl.QUALITY_ENV]
+            vl.quality("ultra")
+            raise AssertionError("未知档位应报错")
+        except ValueError:
+            pass
+    finally:
+        if old is not None:
+            os.environ[vl.QUALITY_ENV] = old
+    w, h, cw, ch, tl, tr, bl, br = vl.grid(2)
+    assert (w, h, cw, ch) == (2560, 1440, 1280, 720) and (tl, tr, bl, br) == ((0, 0), (1280, 0), (0, 720), (1280, 720))
+    assert vl.grid(1) == (vl.W, vl.H, vl.CW, vl.CH, vl.CELL_TL, vl.CELL_TR, vl.CELL_BL, vl.CELL_BR)
+    # panel s=2：每个坐标 = s=1 的两倍（面板原点同为 0,0），字号、线宽也翻倍
+    one, two = _FakeCv2(), _FakeCv2()
+    args = (["t", "u"], 1, [("COLLISION", (0, 0, 255))], [(0.0, 1.0, 1)], 0.5, 1.0, "SUCCESS")
+    vl.panel(one, None, 0, 0, *args)
+    vl.panel(two, None, 0, 0, *args, s=2)
+    assert len(one.texts) == len(two.texts) and len(one.rects) == len(two.rects)
+    for (t1, o1, s1, c1, th1), (t2, o2, s2, c2, th2) in zip(one.texts, two.texts):
+        assert t1 == t2 and o2 == (o1[0] * 2, o1[1] * 2) and abs(s2 - 2 * s1) < 1e-9 and th2 == 2 * th1 and c1 == c2, (t1, o1, o2)
+    for (p0, p1, c), (q0, q1, d) in zip(one.rects, two.rects):
+        assert q0 == (p0[0] * 2, p0[1] * 2) and q1 == (p1[0] * 2, p1[1] * 2) and c == d, (p0, q0)
+    # paste s=2：标签/角标位置与字号翻倍（NO FRAME 路径不需要图像）
+    one, two = _FakeCv2(), _FakeCv2()
+    vl.paste(one, None, None, 0, 0, vl.CW, vl.CH, "CHASE")
+    vl.paste(two, None, None, 0, 0, vl.CW * 2, vl.CH * 2, "CHASE", s=2)
+    (t1, o1, s1, _c, th1), (t2, o2, s2, _d, th2) = one.texts[0], two.texts[0]
+    assert t1 == t2 and o2 == (o1[0] * 2, o1[1] * 2) and abs(s2 - 2 * s1) < 1e-9 and th2 == 2 * th1
+    print("  ok  画质三档 / 环境变量覆盖 / grid(2) / panel、paste 的 s=2 全部翻倍")
+
+
+def check_video_sink():
+    """VideoSink：.mp4 有 ffmpeg 走 libx264（回读帧数、尺寸、avc1）；强制无 ffmpeg 时回退 cv2 并写日志；.webm 走 VP8。"""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        print("  skip 无 cv2/numpy：跳过 VideoSink")
+        return
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="vl-sink-", dir=os.environ.get("TMPDIR"))
+    frames = [np.full((72, 128, 3), (10 * i, 50, 200), np.uint8) for i in range(6)]
+
+    def run(path, **kw):
+        logs = []
+        sink = vl.VideoSink(cv2, path, 10, (128, 72), 22, log=logs.append, **kw)
+        assert sink.isOpened()
+        for f in frames:
+            sink.write(f)
+        backend = sink.release()
+        cap = cv2.VideoCapture(path)
+        n = 0
+        while cap.read()[0]:
+            n += 1
+        cap.release()
+        return backend, n, logs
+
+    backend, n, logs = run(os.path.join(tmp, "fallback.mp4"), ffmpeg="")
+    assert backend.startswith("cv2 mp4v") and n == 6 and logs and "回退" in logs[0], (backend, n, logs)
+    backend, n, logs = run(os.path.join(tmp, "vp8.webm"))
+    assert backend.startswith("cv2 VP80") and n == 6 and not logs, (backend, n, logs)
+    exe = vl.find_ffmpeg()
+    if exe:
+        backend, n, logs = run(os.path.join(tmp, "x264.mp4"))
+        with open(os.path.join(tmp, "x264.mp4"), "rb") as f:
+            head = f.read(4096)
+        assert backend == "ffmpeg libx264 crf 22" and n == 6 and not logs and b"avc1" in head, (backend, n, head[:64])
+        print(f"  ok  VideoSink：libx264（{os.path.basename(exe)}）/ 回退 cv2 mp4v 有日志 / .webm VP8")
+    else:
+        print("  ok  VideoSink：回退 cv2 mp4v 有日志 / .webm VP8（本机没有 ffmpeg，libx264 路径未测）")
+    for f in os.listdir(tmp):
+        os.remove(os.path.join(tmp, f))
+    os.rmdir(tmp)
 
 
 def check_paste_pixels():
@@ -124,7 +217,9 @@ def main():
     check_grid()
     check_panel_layout()
     check_onboard_label()
+    check_quality_and_scale()
     check_paste_pixels()
+    check_video_sink()
     print("test_view_layout: PASS")
     return 0
 

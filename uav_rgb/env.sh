@@ -11,6 +11,9 @@ export DATA_ROOT="${DATA_ROOT:-/root/rivermind-data}"
 # 直接使用解释器路径，避免备份后 activate / pip 中的旧绝对路径。
 export UAV_RGB_PYTHON="${UAV_RGB_PYTHON:-$UAV_RGB_ROOT/.venv-tools/bin/python}"
 export UAVRGB_GZ_PYTHON="${UAVRGB_GZ_PYTHON:-/usr/bin/python3}"
+# 三视角录像 .mp4 编码用的 ffmpeg：默认取 PATH 上的 ffmpeg，否则用解释器里 imageio-ffmpeg（tools/requirements.txt；
+# .venv-tools 与 $DATA_ROOT/uav_rgb/3dgs-venv 都装了）自带的静态 ffmpeg；要指定别的二进制就设 UAVRGB_FFMPEG=/path/to/ffmpeg。
+# 录像画质档 UAVRGB_VIDEO_QUALITY=low|medium|high 覆盖各入口脚本顶部的 VIDEO_QUALITY（见 sim/tools/view_layout.py）。
 
 # 幂等追加函数：只有目标目录尚未出现时才前置
 __uav_rgb_prepend() {

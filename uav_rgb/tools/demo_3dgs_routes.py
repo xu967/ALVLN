@@ -50,6 +50,8 @@ PILOT_SPLIT = os.environ.get("PILOT_SPLIT", "train")   # pilot 是训练数据�
                                 # 86b0f5cb953fbb03 恰好落 train）；不一致时标 diag-manual-split，preprocess 要 --allow-diagnostic-split。
                                 # 3DGS 测试集走闭环 eval_3dgs 的留出路线，不靠 split 字段。设 PILOT_SPLIT= 空串则按哈希（旧行为）
 # 视频超参数（帧率 / 跟随距离 / 顶视范围）在 sim/3dgs/video.py 顶部配置区，这里不重复。
+VIDEO_QUALITY = "medium"        # 画质档（sim/tools/view_layout.VIDEO_QUALITY）：low=1280×720/CRF 28（预览）；medium=1280×720/CRF 22；
+                                # high=2560×1440 画布、显示视角 2× 渲染、CRF 18（demo 用；编码约 3× 慢）。环境变量 UAVRGB_VIDEO_QUALITY 可覆盖
 ENV = dict(os.environ, TORCH_EXTENSIONS_DIR=os.path.join(DATA_ROOT, "uav_rgb", "torch-cache", "extensions-sm89-20261106"),
            TMPDIR=os.path.join(DATA_ROOT, "uav_rgb", "tmp"))
 ENV.pop("TORCH_CUDA_ARCH_LIST", None)     # gsplat JIT 按本机 sm_89 编；带着旧变量会重编/编错架构
@@ -187,9 +189,9 @@ def phase_routes(scene, checks):
     # 1. 每条路线采 EPISODES_PER_ROUTE 集
     for r in ROUTES:
         all_eps[r] = collect(os.path.join(OUT, "collect", f"route_{r}"), r, EPISODES_PER_ROUTE, SEED0 + 100 * r, steps=STEPS)
-    # 2. 三视角视频（一个进程渲染全部集：每集 views.webm + views_key_*.png）
+    # 2. 三视角视频（一个进程渲染全部集：每集 views.mp4 + views_key_*.png）
     eps_flat = [e for r in ROUTES for e in all_eps[r]]
-    run([PY, "-m", "sim.3dgs.video", "--scene", SCENE, "--ep", *eps_flat], "video")
+    run([PY, "-m", "sim.3dgs.video", "--scene", SCENE, "--ep", *eps_flat, "--video-quality", VIDEO_QUALITY], "video")
     # 3. 报告 + 每路线挑 1 集视频汇总到 OUT/videos/
     vid_dir = os.path.join(OUT, "videos")
     os.makedirs(vid_dir, exist_ok=True)
@@ -197,14 +199,14 @@ def phase_routes(scene, checks):
     for r in ROUTES:
         for ep in all_eps[r]:
             row = episode_row(ep, reach)
-            row["video"] = os.path.join(ep, "views.webm")
+            row["video"] = os.path.join(ep, "views.mp4")
             row["keyframes"] = sorted(os.path.join(ep, f) for f in os.listdir(ep) if f.startswith("views_key_"))
             rows.append(row)
         # 挑：到达且无碰撞/失控里步数最多的（转弯最多）；都没到就挑第一集
         good = [x for x in rows if x["route"]["index"] == r and x["reached"] and not x["collision"] and not x["anomaly"]]
         pick = max(good, key=lambda x: x["steps"]) if good else [x for x in rows if x["route"]["index"] == r][0]
         name = routes_meta[r]["name"]
-        dst = os.path.join(vid_dir, f"route{r}_{name}_seed{pick['seed']}.webm")
+        dst = os.path.join(vid_dir, f"route{r}_{name}_seed{pick['seed']}.mp4")
         shutil.copy2(pick["video"], dst)
         for k, kf in enumerate(pick["keyframes"]):
             shutil.copy2(kf, os.path.join(vid_dir, f"route{r}_{name}_seed{pick['seed']}_key{k:02d}.png"))

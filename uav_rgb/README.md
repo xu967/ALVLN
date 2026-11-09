@@ -37,6 +37,9 @@ CUDA 12.8、Gazebo 8.15.0。早期记录的 RTX 2080 Ti / sm_75 是 2026-11-05 �
 默认构建与推理统一使用 `build/check`；`UAV_RGB_BUILD_DIR` 可同时覆盖两者。旧 `src/build` 不再是默认推理入口，保留用于历史复现。
 `UAV_RGB_BUILD_JOBS` 默认 8。Python 工具用 `UAV_RGB_PYTHON`，Gazebo helper 用
 `UAVRGB_GZ_PYTHON`（默认系统 `/usr/bin/python3`），避免混用 conda 与系统绑定。
+三视角录像的 `.mp4` 由 `imageio-ffmpeg` 自带的静态 ffmpeg（libx264，`tools/requirements.txt`）编码，
+`.venv-tools` 与 `$DATA_ROOT/uav_rgb/3dgs-venv` 都要装；没有时回退 cv2 mp4v 并打日志，`UAVRGB_FFMPEG`
+可指定别的 ffmpeg。画质档 `low/medium/high` 见 `sim/tools/view_layout.py`（`UAVRGB_VIDEO_QUALITY` 覆盖）。
 
 ## 数据与训练
 

@@ -6,8 +6,10 @@
   compose  读帧 + actions/oracle.jsonl，按同一分桶网格合成 1280x720 视频：
            追尾 | 顶视（叠加轨迹、碰撞点、终点线） / 机载 | 状态面板（动作、速度、碰撞）。
            网格、贴图、面板的版式在 view_layout.py，与 3DGS 的 sim/3dgs/video.py 共用同一份。
-           --out 以 .webm 结尾用 VP8（浏览器可直接播放）；其他扩展名用 mp4v（浏览器放不了，
-           只为兼容旧调用）。本机 cv2 没有 H.264 编码器。需要 cv2+numpy（.venv-tools / 3dgs-venv）。
+           顶视当前位置画按比例的 E1 四旋翼图标（e1_body.draw_top_icon，机头朝向取 actions 的 yaw_before）。
+           --out 以 .mp4 结尾走 view_layout.VideoSink：ffmpeg libx264、CRF 按 --video-quality 档（没 ffmpeg 回退
+           cv2 mp4v 并打日志）；.webm 用 cv2 VP8（浏览器可直接播放）。需要 cv2+numpy（.venv-tools / 3dgs-venv）。
+  patch_chase_cam  eval_closed_loop --record-video 时对本集生成的 world 打追尾相机补丁（CHASE_PATCH），模板不改。
 
 用法：
   python3 record_views.py record --out FRAMES_DIR            # 需在 sim 的 GZ_PARTITION 环境下
@@ -24,6 +26,7 @@ import sys
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import e1_body
 import gz_io
 import save_frame
 import view_layout as vl
@@ -63,13 +66,43 @@ def _frame_note(ts, idx, old_idx, t):
     return f"sim {ts / 1e9:.2f}s | age {age:.2f}s{tag}", color
 
 
-def fourcc_for(path):
-    """按扩展名选编码：.webm 用 VP8，浏览器直接能放；其他用 mp4v（只是兼容旧调用，浏览器放不了）。
+fourcc_for = vl.fourcc_for   # cv2 回退编码的 fourcc 选择归版式模块；名字保留给旧调用与测试
 
-    实测 .venv-tools 与 3dgs-venv 的 cv2 5.0.0 都没有 H.264 编码器（avc1/H264 打不开），
-    VP80/VP90 可用；VP90 在 1280x720 下约 190 ms/帧，太慢，选 VP80（约 50 ms/帧）。
+# 录像时对生成场景 SDF 打的追尾相机补丁（只动 chase_cam，模板文件本身不改）。
+# 机位：机体后 1.0 m、上 0.45 m（模板是后 1.0 上 0.5），HFOV 80° -> 60°：
+# 60° 下 f = 320/tan30° ≈ 554 px，0.172 m 宽的机体在 1.0 m 处约 95 px（80° 时 ≈ 55 px，看不清机体）。
+# chase_cam 的位姿由 CfSitlSystem 插件按 <chase_offset>/<chase_pitch> 每步重设，所以改的是插件参数，
+# 不是 chase_cam 模型的 <pose>；分辨率按画质档的显示倍率放大，让 2× 画布上追尾视角也是原生渲染。
+CHASE_PATCH = {"offset": "-1.0 0 0.45", "pitch": "0.45", "hfov": "1.0471975512", "size": (640, 360)}
+
+
+def patch_chase_cam(world_path, quality=None):
+    """就地改写 world_path 里的追尾相机参数，返回补丁描述（写进 eval.json 的 video 字段）。
+
+    只替换 <plugin ... CfSitlSystem> 的 chase_offset/chase_pitch 和 <sensor name="chase_camera"> 的
+    horizontal_fov/width/height 这 5 个值；文件其余字节不动。模板里没有这些节点（旧 x3 模板）则不改、返回 None。
     """
-    return "VP80" if str(path).lower().endswith(".webm") else "mp4v"
+    import hashlib
+    q = vl.quality(quality)
+    s = q["scale"]
+    with open(world_path, encoding="utf-8") as f:
+        text = f.read()
+    m = re.search(r'<sensor name="chase_camera" type="camera">.*?</sensor>', text, re.S)
+    if not m or "<chase_offset>" not in text:
+        return None
+    cam = m.group(0)
+    cam = re.sub(r"<horizontal_fov>[^<]*</horizontal_fov>", f"<horizontal_fov>{CHASE_PATCH['hfov']}</horizontal_fov>", cam, 1)
+    cam = re.sub(r"<width>\d+</width>", f"<width>{CHASE_PATCH['size'][0] * s}</width>", cam, 1)
+    cam = re.sub(r"<height>\d+</height>", f"<height>{CHASE_PATCH['size'][1] * s}</height>", cam, 1)
+    text = text[:m.start()] + cam + text[m.end():]
+    text = re.sub(r"<chase_offset>[^<]*</chase_offset>", f"<chase_offset>{CHASE_PATCH['offset']}</chase_offset>", text, 1)
+    text = re.sub(r"<chase_pitch>[^<]*</chase_pitch>", f"<chase_pitch>{CHASE_PATCH['pitch']}</chase_pitch>", text, 1)
+    with open(world_path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return {"chase_offset": CHASE_PATCH["offset"], "chase_pitch": float(CHASE_PATCH["pitch"]),
+            "chase_hfov_deg": round(math.degrees(float(CHASE_PATCH["hfov"])), 1),
+            "chase_size": [CHASE_PATCH["size"][0] * s, CHASE_PATCH["size"][1] * s],
+            "quality": q["name"], "world_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}
 
 
 def record(out_dir):
@@ -217,6 +250,24 @@ def _track(actions, oracle):
     return [(t, *pts[t]) for t in sorted(pts)]
 
 
+def _yaws(actions):
+    """机头朝向 [(ts, yaw_rad)]：只有 actions 的 yaw_before 带航向（oracle 没有），按时间排序。"""
+    pts = {r["pose_ts"]: r["yaw_before"] for r in actions
+           if r.get("pose_ts") and isinstance(r.get("yaw_before"), (int, float))}
+    return [(t, pts[t]) for t in sorted(pts)]
+
+
+def _yaw_at(yaws, t):
+    """t 时刻的最新已知航向；没有返回 None（顶视图标就不画机头线）。"""
+    cur = None
+    for ts, yaw in yaws:
+        if ts <= t:
+            cur = yaw
+        else:
+            break
+    return cur
+
+
 def sample_grid(t_first, t_end):
     """(period, 各帧区间起点)。第 k 帧代表 [t0+k*period, t0+(k+1)*period)，t0 对齐到
     record 的 ts//period 分桶；每帧取区间里最新的那张，15 Hz 的 chase 每格都有新帧。"""
@@ -227,18 +278,24 @@ def sample_grid(t_first, t_end):
 
 def compose(frames_dir, ep_dir, world_path, out_path, title="", result="",
             goal_x=None, waypoint=None, hold_end_s=1.5,
-            success_criterion=None, goal_radius=None):
+            success_criterion=None, goal_radius=None, quality=None, log=print):
     """合成视频，返回写出的帧数。没有任何机载帧时抛 RuntimeError。
 
     success_criterion=None 保持旧行为（有 goal_x 就画终点线）；显式传
     goal_reach_ever/visible_goal_reach_v1 时只画 waypoint 及其 goal_radius。
+    quality 是 view_layout.VIDEO_QUALITY 的档名（None = 默认档 / 环境变量）：决定画布尺寸、
+    显示视角的放大倍率（机载 320x240 模型输入不变，只是显示放大）和 .mp4 的 CRF。
     """
     import cv2
     import numpy as np
+    q = vl.quality(quality)
+    W, H, CW, CH, tl, tr, bl, br = vl.grid(q["scale"])
+    s = q["scale"]
     actions = sorted(_jsonl(os.path.join(ep_dir, "actions.jsonl")),
                      key=lambda r: r.get("action_start_ns") or 0)
     oracle = _jsonl(os.path.join(ep_dir, "oracle.jsonl"))
     track = _track(actions, oracle)
+    yaws = _yaws(actions)
     with open(world_path, encoding="utf-8") as f:
         world_text = f.read()
     top_cam, hfov_deg = top_camera_pose(world_text), student_camera_fov(world_text)
@@ -252,31 +309,29 @@ def compose(frames_dir, ep_dir, world_path, out_path, title="", result="",
     stuck = stuck_step(actions)
     hit_mark = _step_mark(hit, oracle, t_end)
     stuck_mark = _step_mark(stuck, oracle, t_end)
-    writer = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*fourcc_for(out_path)), FPS,
-                             (vl.W, vl.H))
+    writer = vl.VideoSink(cv2, out_path, FPS, (W, H), q["crf"], log=log)
     if not writer.isOpened():
-        raise RuntimeError(f"cv2.VideoWriter 打不开 {out_path}（fourcc={fourcc_for(out_path)}）")
+        raise RuntimeError(f"视频写不开 {out_path}（{writer.backend}）")
     n_end = int(hold_end_s * FPS)
     frames = 0
     try:
         for k, t in enumerate(times + [t_end] * n_end):
-            canvas = np.zeros((vl.H, vl.W, 3), np.uint8)
+            canvas = np.zeros((H, W, 3), np.uint8)
             old = {key: readers[key].i for key in CAMS}
             images = {key: readers[key].at(t + period - 1) for key in CAMS}
             notes = {key: _frame_note(readers[key].ts, readers[key].i, old[key], t)
                      for key in CAMS}
-            vl.paste(cv2, canvas, images["chase"], *vl.CELL_TL, vl.CW, vl.CH, "CHASE",
-                     *notes["chase"])
+            vl.paste(cv2, canvas, images["chase"], *tl, CW, CH, "CHASE", *notes["chase"], s=s)
             top = images["top"]
             if top is not None:
                 top = top.copy()
                 _draw_top(cv2, top, top_cam, track, t, hit_mark, stuck_mark, goal_x,
-                          waypoint, success_criterion, goal_radius)
-            vl.paste(cv2, canvas, top, *vl.CELL_TR, vl.CW, vl.CH, "TOP", *notes["top"])
-            vl.paste(cv2, canvas, images["uav"], *vl.CELL_BL, vl.CW, vl.CH,
-                     onboard_label(images["uav"], hfov_deg), *notes["uav"])
-            _panel(cv2, canvas, *vl.CELL_BR, t, t0, t_end, actions, track, hit, stuck, title,
-                   result if k >= len(times) else "")
+                          waypoint, success_criterion, goal_radius, yaw=_yaw_at(yaws, t))
+            vl.paste(cv2, canvas, top, *tr, CW, CH, "TOP", *notes["top"], s=s)
+            vl.paste(cv2, canvas, images["uav"], *bl, CW, CH,
+                     onboard_label(images["uav"], hfov_deg, display=s), *notes["uav"], s=s)
+            _panel(cv2, canvas, *br, t, t0, t_end, actions, track, hit, stuck, title,
+                   result if k >= len(times) else "", s=s)
             writer.write(canvas)
             frames += 1
     finally:
@@ -298,8 +353,8 @@ def _step_mark(step, oracle, t_end):
 
 
 def _draw_top(cv2, img, cam, track, t, hit_mark, stuck_mark, goal_x, waypoint,
-              success_criterion=None, goal_radius=None):
-    """顶视图叠加：轨迹（黄）、当前位置、contact（红 X）、stuck（橙 X）。
+              success_criterion=None, goal_radius=None, yaw=None):
+    """顶视图叠加：轨迹（黄）、当前位置（按比例的四旋翼图标，yaw 给机头方向）、contact（红 X）、stuck（橙 X）。
 
     goal 线只在 success_criterion 为 route_choice（或旧调用未传判据）时画；
     L1/campus 的 goal_reach 判据改画 waypoint 及其半径。
@@ -334,7 +389,11 @@ def _draw_top(cv2, img, cam, track, t, hit_mark, stuck_mark, goal_x, waypoint,
     for a, b in zip(pts, pts[1:]):
         cv2.line(img, a, b, (0, 255, 255), 2)
     if pts:
-        cv2.circle(img, pts[-1], 5, (0, 255, 255), -1)
+        # 机体图标按真实比例（6 m 高顶视相机下 0.172 m 只有约 12 px，不够看，图标最小 18 px）；
+        # 顶视相机 yaw=90°，图像右 = 世界 +X，和 e1_body.draw_top_icon 的约定一致，yaw 直接用。
+        cx, cy, cz, hfov, w, _h = cam
+        px_per_m = (w / 2) / math.tan(hfov / 2) / max(cz - z, 1e-6)
+        e1_body.draw_top_icon(cv2, img, pts[-1], yaw, px_per_m)
     if pts and not in_image(cam, pts[-1]):
         # 机体飞出顶视相机视野（旧模板 6 m 高 80° 只盖到 x≈5.9 m，森林任务终点在 6–7 m）：
         # 轨迹被裁在图边、机体点画不出来，不说明的话像是停在边上。把点夹到图边并标注。
@@ -387,8 +446,8 @@ def _active(actions, t):
     return cur
 
 
-def _panel(cv2, canvas, x, y, t, t0, t_end, actions, track, hit, stuck, title, result):
-    """把本集数据整理成公共面板的几行字 / 动作段；版式本身在 view_layout.panel。"""
+def _panel(cv2, canvas, x, y, t, t0, t_end, actions, track, hit, stuck, title, result, s=1):
+    """把本集数据整理成公共面板的几行字 / 动作段；版式本身在 view_layout.panel（s 是画布放大倍率）。"""
     # 与各视角角标同一口径：绝对仿真时间；括号里才是从视频第一帧起算的时长。
     # 以前面板只写相对时长，角标写绝对时间，同一画面两个数差 t0（基线 demo 差 5.6 s）。
     lines = [title, f"sim t = {t / 1e9:.2f} s  (video +{(t - t0) / 1e9:.1f} s)"]
@@ -411,11 +470,11 @@ def _panel(cv2, canvas, x, y, t, t0, t_end, actions, track, hit, stuck, title, r
     # 动作时间条：每步一段，起止 = 本步/下步的 action_start_ns，最后一步到 t_end。
     segments = []
     for r, nxt in zip(actions, actions[1:] + [None]):
-        s = (r.get("action_start_ns") or t0) - t0
-        e = ((nxt.get("action_start_ns") if nxt else t_end) or t_end) - t0
-        segments.append((s, e, r.get("action_executed", 0)))
+        st = (r.get("action_start_ns") or t0) - t0
+        en = ((nxt.get("action_start_ns") if nxt else t_end) or t_end) - t0
+        segments.append((st, en, r.get("action_executed", 0)))
     vl.panel(cv2, canvas, x, y, lines, None if cur is None else cur.get("action_executed", 0),
-             flags, segments, t - t0, max(t_end - t0, 1), result)
+             flags, segments, t - t0, max(t_end - t0, 1), result, s=s)
 
 
 def main():
@@ -435,6 +494,8 @@ def main():
                    help="eval.json 的 success_criterion；route_choice 才画 goal 线")
     c.add_argument("--goal-radius", type=float, default=None,
                    help="goal_reach 判据的 waypoint 半径（米），用于顶视图圆圈")
+    c.add_argument("--video-quality", default=None, choices=sorted(vl.VIDEO_QUALITY),
+                   help=f"画质档（view_layout.VIDEO_QUALITY；默认 {vl.DEFAULT_QUALITY}，环境变量 {vl.QUALITY_ENV} 覆盖）")
     args = p.parse_args()
     if args.cmd == "record":
         record(args.out)
@@ -442,7 +503,7 @@ def main():
         n = compose(args.frames, args.episode, args.world, args.out, args.title,
                     args.result, args.goal_x,
                     success_criterion=args.success_criterion,
-                    goal_radius=args.goal_radius)
+                    goal_radius=args.goal_radius, quality=args.video_quality)
         print(f"wrote {args.out} ({n} frames @ {FPS} fps)")
 
 

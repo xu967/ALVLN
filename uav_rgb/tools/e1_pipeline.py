@@ -83,6 +83,9 @@ CFG = dict(
     eval_steps=80,           # 给足全程余量（T7 起 80）；碰撞/到达会提前结束
     old_x3_ckpt=f"{DATA_ROOT}/uav_rgb/t6-full-1640/run/ckpt_best.bin",   # T6 best（epoch 8）：X3 / x3_velocity / hold 1.0 训的
     record_groups=("teacher", "student-e1-new"),   # 这两组录三视角视频（≈10 MB/仿真秒暂存，合成后删）
+    VIDEO_QUALITY="medium",  # 录像画质档（sim/tools/view_layout.VIDEO_QUALITY）：low=1280×720/CRF 28（预览）；medium=1280×720/CRF 22；
+                             # high=2560×1440 画布、显示视角 2× 渲染、CRF 18（demo 用；编码约 3× 慢，追尾相机 1280×720 软件渲染
+                             # 会把 gz RTF 砍一半，评测批量别用）。环境变量 UAVRGB_VIDEO_QUALITY 可覆盖
     extra_students=os.environ.get("E1_EXTRA_STUDENTS", ""),   # 探索臂："名=ckpt路径;名=路径"，每臂多起 1 个 gz；默认空。
                              # 例：DISTILL 2026-11-07 建议 1 的「成功线截断重训」ckpt 与四组同 seed 同动力学对照
     episode_timeout=600.0,   # 80 步 × ~1.1 s + 起飞 15 s，留 5 倍余量
@@ -299,7 +302,7 @@ def evaluate(out):
         if ckpt_key:
             cmd += ["--ckpt", ckpts[ckpt_key], "--infer-bin", f"{BUILD}/uavrgb_infer"]
         if name in CFG["record_groups"]:
-            cmd.append("--record-video")   # 需要 chase/top 相机：评测模板不加 --no-aux-cameras
+            cmd += ["--record-video", "--video-quality", CFG["VIDEO_QUALITY"]]   # 需要 chase/top 相机：评测模板不加 --no-aux-cameras
         log_path = os.path.join(out, f"eval-{name}.log")
         log("$ " + " ".join(cmd) + f"  > {log_path}")
         if not DRY:

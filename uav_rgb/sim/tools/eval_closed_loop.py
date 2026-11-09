@@ -636,6 +636,12 @@ def run_episode(seed, args, workdir, seen_gids):
     r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
     if r.returncode != 0:
         raise RuntimeError(f"scene_gen seed={seed} 失败：{r.stderr.strip()}")
+    video_patch = None
+    if args.record_video:
+        # 录像时只对这一集生成的 world 打追尾相机补丁（机位更近、HFOV 60°、分辨率随画质档）；
+        # 模板文件不动，template_sha256 不变；补丁内容记进 eval.json 的 video_patch。
+        import record_views
+        video_patch = record_views.patch_chase_cam(world, args.video_quality)
     with open(meta_path, "r", encoding="utf-8") as f:
         meta = json.load(f)
     gid = sm.geometry_gid(meta["pillars"])
@@ -758,6 +764,7 @@ def run_episode(seed, args, workdir, seen_gids):
         summary["actions"][k] = summary["actions"].get(k, 0) + 1
     if frames_dir:
         _write_video(summary, frames_dir, ep_dir, world, args, seed, goal_x, meta)
+        summary["video_patch"] = video_patch
     return summary, None
 
 
@@ -804,6 +811,12 @@ def scan_episodes(seed_list, episodes, run_fn, log=print):
     return results, failures, skips, scanned, attempted
 
 
+def record_views_quality(name):
+    """录像画质档的生效名（环境变量可覆盖），写进 eval.json；不录像的评测不导入 record_views。"""
+    import record_views
+    return record_views.vl.quality(name)["name"]
+
+
 def _write_video(summary, frames_dir, ep_dir, world, args, seed, goal_x, meta):
     """三视图视频 -> <out>/videos/seed_<seed>.mp4。失败只记 video_error，不影响评测结论。"""
     import record_views
@@ -821,9 +834,12 @@ def _write_video(summary, frames_dir, ep_dir, world, args, seed, goal_x, meta):
         n = record_views.compose(frames_dir, ep_dir, world, path,
                                  title=f"{args.policy} | {args.dynamics} | seed {seed}",
                                  result=result, goal_x=goal_x, waypoint=meta.get("waypoint"),
-                                 success_criterion=criterion, goal_radius=goal_radius)
+                                 success_criterion=criterion, goal_radius=goal_radius,
+                                 quality=args.video_quality,
+                                 log=lambda m: print(f"[seed {seed}] {m}", flush=True))
         summary["video"] = os.path.relpath(path, os.path.dirname(args.video_dir))
         summary["video_frames"] = n
+        summary["video_quality"] = record_views_quality(args.video_quality)
     except Exception as e:  # noqa: BLE001 - 视频是诊断产物，不能让评测失败
         summary["video_error"] = f"{type(e).__name__}: {e}"
     if not args.keep_work:
@@ -897,7 +913,11 @@ def main():
     p.add_argument("--keep-work", action="store_true", help="保留 world/每集原始文件")
     p.add_argument("--record-video", action="store_true",
                    help="每集录 机载/追尾/顶视 三视图视频到 <out>/videos/seed_<seed>.mp4"
-                        "（原始帧约 10 MB/仿真秒，暂存 <out>/videos/.frames_*，合成后删除）")
+                        "（原始帧约 10 MB/仿真秒，暂存 <out>/videos/.frames_*，合成后删除；"
+                        "本集 world 的追尾相机会被打补丁：机位更近、HFOV 60°，模板文件不动）")
+    p.add_argument("--video-quality", default=None,
+                   help="录像画质档 low/medium/high（sim/tools/view_layout.VIDEO_QUALITY；"
+                        "默认 medium，环境变量 UAVRGB_VIDEO_QUALITY 覆盖）")
     p.add_argument("--save-depth", action="store_true",
                    help="保留每步 16 位深度 PNG（诊断闭环失败用；配合 --keep-work）")
     args = p.parse_args()
@@ -1079,6 +1099,8 @@ def main():
                            else f"line x=max_pillar_x+{args.goal_margin:g} (y step {SPL_GOAL_Y_STEP:g})"),
                   "p_i": "oracle pose_gt xy polyline, first pose -> first entry into goal region"}),
               "template_sha256": sha256_file(args.template),
+              # 录像档位；每集 world 的追尾相机补丁在 episodes[i].video_patch（模板 sha 不受影响）
+              "video_quality": (record_views_quality(args.video_quality) if args.record_video else None),
               # requested_seeds 只含真正尝试过的 seed；扫描过的另存，避免把未处理
               # 的扫描尾巴当成已请求集。
               "requested_seeds": list(attempted_seeds),

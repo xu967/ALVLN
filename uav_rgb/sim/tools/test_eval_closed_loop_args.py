@@ -99,6 +99,24 @@ def main():
         else:
             raise AssertionError("protocol 顶层不是对象必须报错")
 
+    # 录像画质档：写进 eval.json 的是生效档名（环境变量 UAVRGB_VIDEO_QUALITY 覆盖），未知档名报错
+    import view_layout as vl
+    saved = os.environ.pop(vl.QUALITY_ENV, None)
+    try:
+        assert ec.record_views_quality(None) == vl.DEFAULT_QUALITY and ec.record_views_quality("high") == "high"
+        os.environ[vl.QUALITY_ENV] = "low"
+        assert ec.record_views_quality("high") == "low"
+        del os.environ[vl.QUALITY_ENV]
+        try:
+            ec.record_views_quality("ultra")
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("未知画质档必须报错")
+    finally:
+        if saved is not None:
+            os.environ[vl.QUALITY_ENV] = saved
+
     print("test_eval_closed_loop_args: PASS")
     return 0
 

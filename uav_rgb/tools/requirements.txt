@@ -4,3 +4,6 @@ Pillow>=9.1,<14
 # check.sh 跑的 tools/test_scene_probe_quality.py、sim/tools/record_views.py、tools/make_demo_reel.py 都 import cv2；
 # 缺它时 check.sh 4 min 后在一个 3DGS 工具测试上红（R2-REPRO 2026-11-07 从零克隆实测）。本机 .venv-tools 装的是 5.0.0.93。
 opencv-python-headless>=4.8,<6
+# 三视角录像 .mp4 的 H.264 编码（sim/tools/view_layout.VideoSink）：自带静态 ffmpeg（含 libx264），不需要 apt。
+# 3dgs-venv 也要装（sim/3dgs/video.py 用同一套）；没装时回退 cv2 mp4v 并打日志，环境变量 UAVRGB_FFMPEG 可指定别的 ffmpeg。
+imageio-ffmpeg>=0.5,<1
