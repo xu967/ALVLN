@@ -325,17 +325,22 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
     }
 
 
-def _check_uniform_keys(episodes, allow_mixed=False):
+def _check_uniform_keys(episodes, allow_mixed=False, allow_mixed_dynamics=False):
     """同一数据集不能混 observation/dispatch、不同 hold 或不同任务版本，否则
     eval.json / 训练日志里的数字无法归因。缺字段的旧数据与有字段的数据也不能混。
 
     allow_mixed=True 只放开族身份键（FAMILY_KEYS）；口径键（STRICT_KEYS）仍必须一致，
     camera_profile 允许部分缺、不允许两种值。
+    allow_mixed_dynamics=True 只放开 dynamics_profile 的「两种值」（DAgger 并集：round0 lib v1 + 新轮次 v3.1，
+    标签来自 A* 只依赖位姿，混的是状态分布）；部分集缺该字段仍拒绝，meta.dynamics_profiles 记全部值。
     """
     for key in STRICT_KEYS + (CAMERA_KEY,) + FAMILY_KEYS:
         vals = {ep.get(key) for ep in episodes if ep.get(key) is not None}
         missing = any(ep.get(key) is None for ep in episodes)
         if allow_mixed and key in FAMILY_KEYS:
+            continue
+        if allow_mixed_dynamics and key == "dynamics_profile" and len(vals) > 1 and not missing:
+            print("preprocess: 警告：dynamics_profile 混包 %s（--allow-mixed-dynamics）" % sorted(vals))
             continue
         if len(vals) > 1:
             die("episode 的 %s 不一致: %s（不同口径不能混包%s）"
@@ -353,7 +358,8 @@ def _check_uniform_keys(episodes, allow_mixed=False):
 
 
 def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
-         split_salt=None, allow_frozen=False, allow_diagnostic=False, allow_mixed=False):
+         split_salt=None, allow_frozen=False, allow_diagnostic=False, allow_mixed=False,
+         allow_mixed_dynamics=False):
     """加载全部 episode 索引，并检查 scene_id 的 split 唯一性。"""
     episodes, scene_split, gid_split, total, dropped = [], {}, {}, 0, 0
     skipped = 0
@@ -392,7 +398,7 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
         print("preprocess: 跳过整集 %d 个（--exclude-collision-episodes）" % skipped)
     if total == 0:
         die("没有可写样本")
-    _check_uniform_keys(episodes, allow_mixed)
+    _check_uniform_keys(episodes, allow_mixed, allow_mixed_dynamics)
     # L0：指令要么全有、要么全无。部分集有指令会让「文本是否可用」变成静默偏置。
     have = [bool(ep.get("instruction") and ep["instruction"].strip()) for ep in episodes]
     if any(have) and not all(have):
@@ -554,6 +560,8 @@ def build_meta(episodes, total, size, dropped=0, split_scheme=None,
         "goal_radius": pick(episodes, "goal_radius"),
         "window_from": _uniform(episodes, "window_from"),
         "hold_s": _uniform(episodes, "hold_s"),
+        # 包里出现过的全部动力学档（通常 1 个；--allow-mixed-dynamics 的 DAgger 并集会有 2 个）。
+        "dynamics_profiles": sorted({ep.get("dynamics_profile") for ep in episodes} - {None}),
         # 3DGS 数据：记录渲染后端与每集 scene.json，自动评测据此走 eval_3dgs。
         "renderer_backend": _uniform(episodes, "renderer_backend"),
         "scene_json": _uniform(episodes, "scene_json"),
@@ -936,6 +944,9 @@ def main():
                    help="【跨族合并实验】允许不同几何族（柱阵/森林/3DGS）混包：只放开族身份字段"
                         "（geometry/appearance/split_salt/task_version…），hold_s/window_from/"
                         "dynamics_profile 仍必须一致；meta.geometry_versions 记每族计数与 salt")
+    p.add_argument("--allow-mixed-dynamics", action="store_true",
+                   help="【DAgger 并集】允许两种 dynamics_profile 混包（round0 旧库 + 新轮次新库；标签来自 A* 只依赖位姿）："
+                        "stdout 告警一行，meta.dynamics_profiles 记全部值；部分集缺字段仍拒绝")
     p.add_argument("--envelope-radius", type=float, default=DEFAULT_ENVELOPE_RADIUS_M,
                    metavar="M", help="深度分带目标的包络膨胀半径（m），E1 机体 0.102；0 = 不膨胀")
     p.add_argument("episodes", nargs="+", help="一个或多个 collect.py episode 目录")
@@ -948,7 +959,7 @@ def main():
     episodes, total, dropped, skipped = scan(
         args.episodes, args.drop_collision, args.exclude_collision_episodes,
         args.split_by_map, args.allow_frozen_geometry, args.allow_diagnostic_split,
-        args.allow_mixed_geometry)
+        args.allow_mixed_geometry, args.allow_mixed_dynamics)
     split_scheme = "map-hash:%s" % args.split_by_map if args.split_by_map else None
     collision_filter = {
         "drop_collision_steps": bool(args.drop_collision),

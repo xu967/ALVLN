@@ -774,6 +774,23 @@ R3 最小转向评分，约 +110–130 行。**故意排在数据采集之后**�
     `executed_by=student` + `beta`（执行教师动作的概率，默认 0）+ `dagger_round`，与
     `sim/3dgs/collect_3dgs.py` 同名）。`collect_parallel.py` 同名透传，`tools/e1_pipeline.py` CFG
     `stop_at_goal` / `tiebreak`。依据与 Gazebo 验证：`docs/worklog/2026-11-07-*-dev-data.md`。
+14. **Gazebo DAgger 流水线 `tools/dagger_gz_pipeline.py`（2026-11-09 DAGGER-GZ）**：round0 =
+    截断臂（`tmp/agent6-distill/trunc/col` + eval3 `ckpt_trunc_distill.bin`），3 轮 × 100 集 β=(0.5,0,0)，
+    采集开关从 round0 的逐集 manifest 继承（round0 是截断集 ⇒ 新轮次 `--stop-at-goal`），按 gid 排除
+    20 个 test seed 的几何；并集重训 = dagger 臂，教师再采帧数对齐 = more_demos 臂；每轮
+    `round_k/stats.json` 记学生步上的专家不一致率。起（守护进程，二进制走 `UAV_RGB_BUILD_DIR`
+    快照 `$DATA_ROOT/uav_rgb/exp-dagger-gz-20261109/bin`）：
+    `OUT=...; mkdir -p $OUT; setsid nohup $UAV_RGB_PYTHON tools/dagger_gz_pipeline.py --out $OUT > $OUT/run.log 2>&1 < /dev/null & echo $! > $OUT/run.pid`；
+    看：`tail -f $OUT/run.log`、`$OUT/status.json`、`$OUT/summary.md`，结束落 `$OUT/DONE`（rc）；
+    停：`kill -- -$(cat $OUT/run.pid)`（PGID，脚本把 SIGTERM 转发给子进程），同一 `--out` 再起即按产物续跑
+    （采完 = `collection_manifest.json`，训完 = `metrics.jsonl` 末行 `done:`，评完 = `eval.json` 且
+    `failed_count==0`）。三个坑：round0 与新轮次 `dynamics_profile` 不同（lib v1 vs v3.1），并集走
+    `preprocess.py --allow-mixed-dynamics`（meta `dynamics_profiles` 记全部值，缺字段仍拒）；eval4 基线行
+    要复用须在其目录或上级有插件 sha 记录（`inputs.json` 键 `libCfSitlSystem.so`，或 sha256sum 格式的
+    `inputs.sha256`），否则一律重评；「60 个独立 test 几何」不存在——base 任务 test 分区只有 71 个几何，
+    排掉 0417 / t5 / sgvis 后剩 24（冻结 20 个 + 4），`eval_seeds60.json` 记 `requested/count`，summary 标注。
+    smoke：`--rounds 1 --eps-per-round 4 --steps 12 --instances 2 --eval-seeds 1,113 --epochs 2 --baselines trunc --eval60-arms ""`。
+    预注册与结果：`docs/experiments/2026-11-09-dagger-gz.md`。
 
 ### 模型/数据格式
 

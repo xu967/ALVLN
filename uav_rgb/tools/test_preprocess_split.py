@@ -485,6 +485,37 @@ class PreprocessSplitTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("camera_profile", r.stderr)
 
+    def test_mixed_dynamics_requires_flag_and_records_profiles(self):
+        """DAgger 并集：round0（lib v1，cf_sitl_v1:bd0dcd43）+ 新轮次（v3.1，683e7400）。默认仍拒绝（STRICT_KEYS）；
+        --allow-mixed-dynamics 才放行，meta 记 dynamics_profiles 全部值并在 stdout 告警。部分集缺 profile 仍拒绝。"""
+        for ep, prof in zip(self.eps, ("cf_sitl_v1:bd0dcd43", "cf_sitl_v1:bd0dcd43", "cf_sitl_v1:683e7400")):
+            man = self.man(ep)
+            man.update(dynamics_profile=prof, geometry_gid=gid_for(man["split"], ep.name))
+            self.save(ep, man)
+        r = self.run_pre(self.tmp / "ds_dyn", self.eps)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("dynamics_profile", r.stderr)
+        r = self.run_pre(self.tmp / "ds_dyn", self.eps, "--allow-mixed-dynamics")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("dynamics_profile", r.stdout)   # 告警行
+        meta = read_meta(self.tmp / "ds_dyn" / "dataset.uavr")
+        self.assertEqual(meta["dynamics_profiles"], ["cf_sitl_v1:683e7400", "cf_sitl_v1:bd0dcd43"])
+        self.assertFalse(meta["mixed_geometry"])   # 只放开了动力学档，几何族仍是一族
+        # 单一 profile 时也写（单元素），开关不影响其它口径键
+        man = self.man(self.eps[2])
+        man["dynamics_profile"] = "cf_sitl_v1:bd0dcd43"
+        self.save(self.eps[2], man)
+        r = self.run_pre(self.tmp / "ds_one", self.eps, "--allow-mixed-dynamics")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(read_meta(self.tmp / "ds_one" / "dataset.uavr")["dynamics_profiles"], ["cf_sitl_v1:bd0dcd43"])
+        # 部分集缺 dynamics_profile：开关也不放行（缺字段的集动力学未知）
+        man = self.man(self.eps[2])
+        del man["dynamics_profile"]
+        self.save(self.eps[2], man)
+        r = self.run_pre(self.tmp / "ds_missing", self.eps, "--allow-mixed-dynamics")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("dynamics_profile", r.stderr)
+
     def test_legacy_episodes_record_scene_id_scheme(self):
         r = self.run_pre(self.tmp / "ds_legacy", self.eps)
         self.assertEqual(r.returncode, 0, r.stderr)
