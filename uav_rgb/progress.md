@@ -45,7 +45,7 @@
 - 21:24 3DGS 数据集 B pilot DONE rc=0：5 场景 × 20 集到达 99/100，唯一碰撞是 Wanderland r5 seed 1501 出生在栅栏边、第 4 步撞（截断会丢）；四个动作都出现，低质帧 ≤ 1.1%。放量等用户定 hold。
 - 21:29 eval4 补臂（`e1-pipeline-20261107-0417-eval4-extra/`，PGID 505946）：costmap 重标学生按 eval4 条件重评 → 22:01 DONE，11/20。
 - 21:33 stump ToF 地形打标：6 条路线全部 `agl_model_unverified`（路径下地物 0.4–1.2 m），写进 `docs/experiments/3dgs-site-stump.md` §7。
-- 21:40 第九阶段任务书 `tmp/phase9-20261109/BRIEF.md`；三个 worktree 基于 3a6dce5（`wt-teacher-3dgs` / `wt-refactor-tools` / `wt-nice-fixes`）。22:42 三个 agent 派出（会话在 21:45–22:39 中断过一次，22:39 用户要求恢复）。
+- 21:40 第九阶段任务书 `tmp/phase9-20261109/BRIEF.md`；三个 worktree 基于 3a6dce5（`wt-teacher-3dgs` / `wt-refactor-tools` / `wt-nice-fixes`）。22:42 三个 agent 派出（21:35 第一次派 TEACHER-3DGS 时报「账户余额不足」立即退出，没有任何改动；会话随后 21:45–22:39 中断，22:39 用户要求恢复后重派）。23:05 核对 TEACHER-COST / FIX-A 的最终回复：两个 worktree 的改动全部已在 main（TEACHER-COST 收尾修的锁测试浮点容差也在 fda2923 里）。
 - 22:36 eval4 DONE rc=1（截断臂 seed 122 `arm_takeoff→READY超时 90s`，0 步；其余 7 组完整）→ 同条件补跑 seed 122（PGID 581057）22:44 成功 39 步。结论进 scoreboard §0：训练种子 0 / 1 / 2 = 12 / 20 / 10（seed 1 vs 2 p=0.002），单种子方案臂两两 p ≥ 0.73；PLAN「22:50 之后」。
 - 22:36 DAgger 正式 3 轮由等待脚本自动起（等待脚本只看 DONE 存在，不看 rc；截断基线不复用、流水线自己重评）。
 - 22:55 文档提交 23c6212，`check.sh --python-only` rc=0，推 GitHub（ALVLN b76c37e）。
