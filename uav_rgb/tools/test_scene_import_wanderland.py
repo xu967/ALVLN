@@ -91,6 +91,22 @@ class TestAlign(unittest.TestCase):
         self.assertTrue(np.isnan(g[2]))                            # 远处没有点 -> NaN，调用方必须处理
 
 
+class TestTorchCacheDir(unittest.TestCase):
+    def test_shared_rule_raises_without_gpu(self):
+        """规则只在 pipeline_common.torch_extensions_dir（与 demo_3dgs_routes 同一写法）；问不到算力就报错，env() 要把目录写进子进程环境。"""
+        from unittest import mock
+        pc = imp.pc
+        self.assertEqual(imp.torch_extensions_dir((7, 5)), pc.torch_extensions_dir((7, 5)))
+        calls = []
+        with mock.patch.object(pc, "torch_extensions_dir",
+                               lambda capability=None, python=None: calls.append((capability, python)) or "/spy/extensions-sm75"):
+            self.assertEqual(imp.torch_extensions_dir(), "/spy/extensions-sm75")
+        self.assertEqual(calls, [(None, imp.PY)])
+        with mock.patch.object(pc, "torch_extensions_dir", lambda capability=None, python=None: None):
+            with self.assertRaises(RuntimeError):
+                imp.torch_extensions_dir()
+
+
 class TestProbe(unittest.TestCase):
     def test_step_probe_delegates_to_scene_probe_quality_and_adds_ground_depth(self):
         """step_probe 调 tools/scene_probe_quality.run（判据/阈值单源，R2-3DGS #4），只加俯视高度复核，

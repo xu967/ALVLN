@@ -71,16 +71,16 @@ ROUTES = [
 ]
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "tools"))
+import pipeline_common as pc  # noqa: E402
 
 
 def torch_extensions_dir(capability=None):
-    """gsplat JIT 缓存目录 = $DATA_ROOT/uav_rgb/torch-cache/extensions-sm<算力>（与 tools/demo_3dgs_routes.py 同一规则）。
-    AUDIT_SIM #5：以前写死 extensions-sm89-20261106，显卡换回 2080 Ti（sm_75）后目录名与里面的 cubin 对不上。"""
-    if capability is None:
-        out = subprocess.run([PY, "-c", "import torch; print(*torch.cuda.get_device_capability())"],
-                             capture_output=True, text=True, check=True).stdout.split()
-        capability = (int(out[0]), int(out[1]))
-    return os.path.join(DATA_ROOT, "uav_rgb", "torch-cache", "extensions-sm%d%d" % tuple(capability))
+    """gsplat JIT 缓存目录（pipeline_common.torch_extensions_dir，与 tools/demo_3dgs_routes.py 同一写法），算力缺省用 PY 问 torch；
+    问不到就报错：env() 要把目录写进子进程环境。AUDIT_SIM #5：以前写死 extensions-sm89-20261106，换卡后目录名与 cubin 对不上。"""
+    ext_dir = pc.torch_extensions_dir(capability, PY)
+    if ext_dir is None:
+        raise RuntimeError(f"问不到 GPU 算力（{PY} 里 torch.cuda.get_device_capability() 失败或超时），gsplat 缓存目录没法按卡命名")
+    return ext_dir
 
 
 _ENV = None

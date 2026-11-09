@@ -11,7 +11,7 @@
   echo $! > "$OUT/run.pid"; ps -o pid,pgid,etime,cmd -p "$(cat "$OUT/run.pid")"    # 停：kill -- -<PGID>
 看进度：tail -f $OUT/run.log；每步 $OUT/status.json；结束落 $OUT/DONE（rc + 时间 + 最后一步）。
 续跑：同一 --out 重跑；产物齐的步骤跳过（采集 = collection_manifest.json；训练 = run/metrics.jsonl 末行 done:；
-评测 = eval.json 且 failed_count==0 且 episodes_done>0）。半成品的采集/训练目录要手动删（脚本会指出是哪个），
+评测 = eval.json 且 failed_count==0 且 episodes_done>0 且不是 partial）。半成品的采集/训练目录要手动删（脚本会指出是哪个），
 半成品评测目录自动挪到 <目录>.failed-<时间> 再重评。
 --dry-run 只打印命令、不建目录；--stop-after-preflight 只查缺件、写 inputs.json 与两份 dynamics_profile。
 smoke：--rounds 1 --eps-per-round 4 --steps 12 --instances 2 --eval-seeds 1,113 --epochs 2 --baselines trunc --eval60-arms ""
@@ -38,7 +38,7 @@ PY = sys.executable
 sys.path.insert(0, os.path.join(REPO, "tools"))
 sys.path.insert(0, os.path.join(REPO, "sim", "tools"))
 import e1_pipeline  # noqa: E402  评测 seed 单源、GZ_ENV、训练配置的出处
-import pick_test_seeds as pts  # noqa: E402
+import eval_seeds as es  # noqa: E402  60 seed 清单单源
 import pipeline_common as pc  # noqa: E402
 import split_manifest as sm  # noqa: E402
 import cf_sitl_exec  # noqa: E402  当前 e1_mini.json 的 dynamics_profile，与 collect.py 同一函数
@@ -75,13 +75,8 @@ CFG = dict(
     eval_steps=e1_pipeline.CFG["eval_steps"],
     eval_parallel=2,           # 同时起的评测数：BRIEF §0 每个 agent ≤2 个 gz；正式跑 eval4 结束后可改 3
     gz_total_max=6,            # 起 gz 前全机 `gz sim` 总数超过它就等（BRIEF §0 闸门）；0 = 不等
-    eval60_count=60,           # 60 seed 清单：pick_test_seeds 逻辑，排除 0417 / t5 / sgvis / 各轮 DAgger / more_demos 的几何
+    eval60_count=60,           # 60 seed 清单 = eval_seeds.EVAL_SEEDS_BASE_60 的前 eval60_count 个（用户 2026-11-09 定的 E1 口径）
     eval60_arms=("dagger",),   # 60 seed 只评最终臂（约 2 h/臂/gz）；"" 跳过
-    eval60_exclude=(
-        f"{D}/e1-pipeline-20261107-0417/collection/collection_manifest.json",   # 新 E1 学生（round0 的来源）
-        f"{D}/t5-full-1155/collection_manifest.json",                             # 旧 X3 学生的训练数据
-        f"{D}/e1-pipeline-20261107-1620-sgvis/collection/collection_manifest.json",
-    ),
     # 基线行 名 -> (policy, ckpt, 可复用的 eval 目录)。复用四条件：seeds 同 + metric_version 同 + 插件 sha 同
     # （eval 目录或其父目录的 inputs.json / sha256sum 格式 inputs.sha256）+ infer sha 同（学生臂）；e1_mini.json 用 per_episode.dynamics_profile 比。缺一就重评
     baselines={
@@ -189,12 +184,8 @@ def train_done(run_dir):
 
 
 def eval_done(edir):
-    """评完 = eval.json 存在且 failed_count == 0 且 episodes_done > 0（森林 run_xeval.sh 的 done_ok）。"""
-    path = os.path.join(edir, "eval.json")
-    if not os.path.isfile(path):
-        return False
-    e = read_json(path)
-    return e.get("failed_count", 1) == 0 and e.get("episodes_done", 0) > 0
+    """评完 = pipeline_common.eval_finished：eval.json 在、failed_count == 0、episodes_done > 0、不是中断写出的 partial。"""
+    return pc.eval_finished(edir)
 
 
 # ───────────────────────────── round0 / seed / 命令行 ─────────────────────────────
@@ -286,7 +277,7 @@ def more_demos_n(new_frames, frames_per_episode, instances):
 def reusable(edir, seeds, metric_version, plugin_sha, infer_sha, profile):
     """基线行能否直接用现成 eval.json：四项缺一不复用。返回 (bool, 原因)。"""
     if not eval_done(edir):
-        return False, "没有完整的 eval.json（failed_count==0 且 episodes_done>0）"
+        return False, "没有完整的 eval.json（failed_count==0 且 episodes_done>0 且不是 partial）"
     e = read_json(os.path.join(edir, "eval.json"))
     if set(e.get("seeds") or []) != set(seeds):
         return False, "seeds 不同"
@@ -576,7 +567,7 @@ def evaluate(out, arms, seeds_csv, prefix, settings):
         f.close()
     bad = [n for n in launched if not DRY and not eval_done(os.path.join(out, f"{prefix}-{n}"))]
     if bad:
-        raise RuntimeError(f"{bad} 没评完（eval.json 缺失或 failed_count>0），看 {out}/{prefix}-<名>.log；"
+        raise RuntimeError(f"{bad} 没评完（eval.json 缺失、failed_count>0 或 partial），看 {out}/{prefix}-<名>.log；"
                            "同一 --out 重跑会把该臂目录挪开重评")
 
 
@@ -612,47 +603,20 @@ def baselines(out, names, seeds_csv, settings):
     return decisions
 
 
-def seeds60(out, settings, collections):
-    """60 seed 评测清单：pick_test_seeds 的 gid 逻辑，排除所有训练集合（round0、各轮 DAgger、more_demos、CFG.eval60_exclude）。"""
+def seeds60(out):
+    """60 seed 评测清单 = eval_seeds.EVAL_SEEDS_BASE_60（用户 2026-11-09 定的 E1 口径：71 个 test 分区几何里的 60 个，含冻结 20）。
+    test 分区几何按几何组分区从不进训练，各轮 DAgger / more_demos 采到其中几何也只落各自数据集的 test 分区，所以不按采集集合
+    排除（按集合排除只剩 24 个）。out 里已有 eval_seeds60.json 就用它（续跑与主会话预写的清单）。"""
     path = os.path.join(out, "eval_seeds60.json")
     if DRY:
         return "<eval_seeds60>"
     if os.path.isfile(path):
         return ",".join(map(str, read_json(path)["seeds"]))
-    excl, used, missing = set(settings["gids"]), [CFG["round0_collection"]], []
-    for m in list(CFG["eval60_exclude"]) + [os.path.join(c, "collection_manifest.json") for c in collections]:
-        (used if os.path.isfile(m) else missing).append(m)
-        if os.path.isfile(m):
-            excl |= pts.gids_in_collection(m, "base", None)
-    if missing:
-        log(f"警告：排除清单不存在，跳过 {missing}")
-    want = CFG["eval60_count"]
-    seeds, gids = pick_up_to(want, "test", excl)
-    if len(seeds) < want:
-        # base 任务 seed 0–49999 一共只有 71 个 test 几何，排掉 0417 / t5 / sgvis 后剩 24（含冻结 20 个）：
-        # 「60 个独立 test 几何」按现行口径不存在。记下缺口，清单取能取到的，让流水线走完 summary
-        log(f"警告：独立 test 几何只凑到 {len(seeds)}/{want}（排除 {len(excl)} 个 gid）；eval60 用这 {len(seeds)} 个，summary 标注缺口")
-    write_json(path, {"seeds": seeds, "gids": gids, "requested": want, "count": len(seeds), "excluded_gids": len(excl),
-                      "excluded_from": used, "missing": missing, "eval_seeds20": CFG["eval_seeds"]})
+    seeds = list(es.EVAL_SEEDS_BASE_60[:CFG["eval60_count"]])
+    write_json(path, {"seeds": seeds, "gids": [sm.group_id_for_task(s, "base") for s in seeds],
+                      "requested": CFG["eval60_count"], "count": len(seeds), "rule": "eval_seeds.EVAL_SEEDS_BASE_60（E1 口径）",
+                      "eval_seeds20": CFG["eval_seeds"]})
     return ",".join(map(str, seeds))
-
-
-def pick_up_to(count, split, exclude_gids, seed_max=pts.SEED_MAX):
-    """pts.pick 凑不够就 SystemExit；这里返回能凑到的（几何两两不同、分区 split、不在 exclude_gids）。
-    shortcut: 等 pick_test_seeds.pick 加 partial 参数后删掉这份复制。"""
-    seeds, gids, seen = [], [], set(exclude_gids)
-    for seed in range(pts.SEED_START, seed_max):
-        if len(seeds) >= count:
-            break
-        if sm.split_for_seed(seed, "base") != split:
-            continue
-        gid = sm.group_id_for_task(seed, "base")
-        if gid in seen:
-            continue
-        seen.add(gid)
-        seeds.append(seed)
-        gids.append(gid)
-    return seeds, gids
 
 
 def summary(out, rounds, arms, decisions, seeds60_csv):
@@ -807,8 +771,7 @@ def main(argv=None):
         last = "baselines"
         decisions = step(out, "baselines", baselines, out, names, CFG["eval_seeds"], settings)
         last = "eval60"
-        cols = [os.path.join(out, f"round_{k}", "collect") for k in range(1, CFG["rounds"] + 1)] + [os.path.join(out, "more_demos", "collect")]
-        csv60 = step(out, "eval60.seeds", seeds60, out, settings, cols)
+        csv60 = step(out, "eval60.seeds", seeds60, out)
         arm60 = [(n, "student", ckpt if n == "dagger" else md_ckpt) for n in CFG["eval60_arms"]]
         if arm60:
             step(out, "eval60", evaluate, out, arm60, csv60, "eval60", settings)

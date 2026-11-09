@@ -157,3 +157,25 @@
 ### 风险与遗留
 
 - DAgger 各轮只避开 eval20 的几何，可能采到另外 40 个里的几何（落各自数据集的 test 分区、不进训练）。按 E1 口径可以接受，已写进 `eval_seeds60.json` 的 `rule` 字段。
+
+## 更新 2026-11-09 23:15（REFACTOR-TOOLS 合并与后续三处）
+
+### 做了什么
+
+- 审 REFACTOR-TOOLS 的 diff（9 个 tools 文件 + worklog）：缓存目录逻辑是从 `dagger_pipeline` 原样搬进 `pipeline_common`；pc 的 log / read_json / write_json 与 dagger_gz 删掉的三份逐行相同；`json` / `time` 仍有别的用处。补丁应用到 main，提交 002b7bc。
+- 采纳 agent 提的两点：`dagger_gz_pipeline.eval_done` 改为 `pc.eval_finished`；mipnerf 改用 torch 问算力（3DGS venv 坏了 gsplat 本来也跑不了，退成 `smunknown` 不影响结果）。
+- `seeds60` 改为直接取 `eval_seeds.EVAL_SEEDS_BASE_60`，参数只剩 `out`；`pick_up_to`、CFG `eval60_exclude`、`pick_test_seeds` 的 import 成了死代码，删掉；`docs/experiments/2026-11-09-dagger-gz.md` 对应一句改成已定的口径。
+- `scene_import_wanderland.torch_extensions_dir` 收进 pc（agent 文件域外的第四份）。
+
+### 没做什么
+
+- 没改 `wt-eval4` 里正在跑的 DAgger 副本。原因：冻结；风险写进 progress「未完成的待办」（手动停再续跑前先挪开 partial 目录）。
+- `pc.torch_extensions_dir(python=None)` 且不给 capability 时会因 `subprocess.run([None, …])` 抛 TypeError。没改：现有调用方都传 python。
+
+### 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| REFACTOR-TOOLS 补丁在 main 上 | `git apply --check` 通过；test_pipeline_common / test_dagger_pipeline / test_e1_pipeline PASS，test_dagger_gz_pipeline / test_demo_3dgs_routes / test_scene_import_mipnerf OK |
+| 三条新红测 | 修前：`AssertionError: True is not false`（partial）、`'1,113,…,2506' != '1,37,58,…,1711'`（seeds60）、`AttributeError: module 'scene_import_wanderland' has no attribute 'pc'`；修后 `Ran 18 tests … OK`、`Ran 7 tests … OK` |
+| main 上 DAgger `--dry-run` | rc=0，走到 eval60，不建目录 |

@@ -107,16 +107,18 @@ class SeedAndCommandTests(unittest.TestCase):
         gids = dg.test_gids("1,113,122")
         self.assertEqual(gids, {sm.group_id_for_task(s, "base") for s in (1, 113, 122)})
 
-    def test_pick_up_to_returns_partial_list_instead_of_dying(self):
-        # base 任务全部只有 71 个 test 几何，排掉训练集合后不足 60：清单取能取到的，不能让跑了几小时的流水线在这一步退出
-        seeds, gids = dg.pick_up_to(5, "test", set(), seed_max=400)
-        self.assertEqual(len(seeds), 5)
-        self.assertEqual(len(set(gids)), 5)
-        self.assertTrue(all(sm.split_for_seed(s, "base") == "test" for s in seeds))
-        self.assertEqual(seeds, sorted(seeds))
-        few, few_gids = dg.pick_up_to(10_000, "test", set(gids), seed_max=400)   # 要得太多：拿到剩余全部，不抛
-        self.assertLess(len(few), 10_000)
-        self.assertTrue(set(few_gids).isdisjoint(gids))
+    def test_seeds60_is_e1_rule_list(self):
+        # 用户 2026-11-09 定的 E1 口径：eval60 = eval_seeds.EVAL_SEEDS_BASE_60，不再按采集集合排除（那样只剩 24 个）
+        import eval_seeds as es
+        out = tempfile.mkdtemp(prefix="test_dagger_gz_")
+        try:
+            self.assertEqual(dg.seeds60(out), es.csv(es.EVAL_SEEDS_BASE_60))
+            with open(os.path.join(out, "eval_seeds60.json"), encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertEqual(doc["seeds"], list(es.EVAL_SEEDS_BASE_60))
+            self.assertEqual(doc["count"], 60)
+        finally:
+            shutil.rmtree(out, ignore_errors=True)
 
     def test_student_collect_command(self):
         cmd = dg.collect_cmd("/out/round_1/collect", [5101, 5103], self.SETTINGS, instances=2,
@@ -181,6 +183,9 @@ class ResumeAndReuseTests(unittest.TestCase):
         self.assertFalse(dg.eval_done(edir))
         self._write("eval/eval.json", {"failed_count": 0, "episodes_done": 2})
         self.assertTrue(dg.eval_done(edir))
+        # 中断写出的半成品（eval_closed_loop 收到 SIGTERM 写 partial=true）：续跑要挪开重评，不能当评完跳过
+        self._write("eval/eval.json", {"failed_count": 0, "episodes_done": 7, "partial": True})
+        self.assertFalse(dg.eval_done(edir))
 
     def test_collect_done_is_manifest(self):
         col = os.path.join(self.tmp, "col")

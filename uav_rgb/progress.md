@@ -49,6 +49,8 @@
 - 22:36 eval4 DONE rc=1（截断臂 seed 122 `arm_takeoff→READY超时 90s`，0 步；其余 7 组完整）→ 同条件补跑 seed 122（PGID 581057）22:44 成功 39 步。结论进 scoreboard §0：训练种子 0 / 1 / 2 = 12 / 20 / 10（seed 1 vs 2 p=0.002），单种子方案臂两两 p ≥ 0.73；PLAN「22:50 之后」。
 - 22:36 DAgger 正式 3 轮由等待脚本自动起（等待脚本只看 DONE 存在，不看 rc；截断基线不复用、流水线自己重评）。
 - 22:55 文档提交 23c6212，`check.sh --python-only` rc=0，推 GitHub（ALVLN b76c37e）。
+- 23:10 REFACTOR-TOOLS 交付并合并（002b7bc）：gsplat 缓存目录三份实现收进 `pipeline_common.torch_extensions_dir`，`dagger_gz_pipeline` 的 log/read_json/write_json 改用 pc（run/sh/mark/need 同名不同义保留）；主会话复跑 6 组测试通过。
+- 23:15 合并后续（主会话，各带红测）：`dagger_gz_pipeline.eval_done` 改为 `pc.eval_finished`（半成品 partial eval.json 不再当评完，修前红 `True is not false`）；`seeds60` 直接取 `EVAL_SEEDS_BASE_60`，删 `pick_up_to` 与 CFG `eval60_exclude`（修前红：返回严格规则的 24 个）；`scene_import_wanderland` 的第四份缓存目录函数收进 pc（修前红 `has no attribute 'pc'`）。main 上 DAgger `--dry-run` rc=0。
 - 22:55 用户定三件事（见关键决策）→ `tools/eval_seeds.py` 加 `EVAL_SEEDS_BASE_60` / `EVAL_SEEDS_BASE_X3_40` + `test_base_60_and_x3_40`（修前红 `AttributeError: … no attribute 'EVAL_SEEDS_BASE_60'`）；71 个 test 几何、X3 train/val 碰过 31 个、剩 40 个，与 19:38 的核实一致。给正在跑的 DAgger 预写 `full-1109/eval_seeds60.json`（60 个、几何两两不同）。
 
 ### 关键决策
@@ -62,7 +64,7 @@
 - GitHub：23:10 已推到本地 fcd4d18（ALVLN `b76c37e..915788a`；推之前 `check.sh --python-only` rc=0，日志 `tmp/analysis-20261109/check-py-fcd4d18.log`）。之后的提交随第九阶段合并一起推（`bash tools/git_mirror_alvln.sh`）。
 - 第九阶段 3 个 agent 交付 → 审 diff → 合并 → `check.sh` → 推 GitHub。TEACHER-3DGS 过线后：`demo_3dgs_routes` 加 CFG 透传 `--teacher-planner`，数据集 B 的 hold 按结果给用户建议。
 - DAgger 正式 3 轮（见头部）：盯 `status.json`；若因评测失败集停下，同 `--out` 重起。eval60 读预写的 `eval_seeds60.json`（E1 口径 60 个），只评 DAgger 臂；M3 表里的基线（BC / 截断 / sgvis）在 `EVAL_SEEDS_BASE_60` 上另起评测，旧 X3 在 `EVAL_SEEDS_BASE_X3_40` 上评。
-- REFACTOR-TOOLS 合并后：main 的 `dagger_gz_pipeline.seeds60` 改为直接用 `eval_seeds.EVAL_SEEDS_BASE_60`（现在 main 里还是严格排除规则，文件在该 agent 的域里，先不动）。
+- 正在跑的 DAgger 用的是 `wt-eval4` 里的旧 `eval_done`（不看 partial）：**若手动停 DAgger 再续跑，先把各 `eval20-*` / `eval60-*` 目录里 `eval.json` 带 `partial: true` 的挪开**，否则半成品会被当成评完跳过。自然跑完或因失败集停下不受影响。
 - eval4 的教师与截断新录像（`eval-teacher/videos/`、`eval-student-e1-trunc/videos/`）给短片 v3；短片 v3 等用户验收 v2 后再做。
 - **3DGS 数据集 B**：pilot 过审（99/100）；划分已定（bicycle 只作 test，val 按路线留出）；TEACHER-3DGS 合并后实现 split_policy（`collect_3dgs` + `preprocess`），再按定下的 hold 放量 ≥300 集 → 打包 → 训 S_B → 两域评测。
 - D4（E1 护罩方框四角离中心约 0.122 m，3DGS 碰撞圆柱半径 0.102 m）需要真机尺寸（118 mm 轴距 + 桨）才能定，未动。
