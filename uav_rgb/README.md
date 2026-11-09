@@ -24,8 +24,8 @@ bash tools/check.sh                  # 构建 + CTest + Python 自检 + cf_sitl�
 解包即是（与 e7f507f 只差 CRLF），或 `git clone https://github.com/songge8/CF-Drone`
 后 `git checkout e7f507f`。
 
-本次实际设备：Ubuntu 24.04、RTX 4080 SUPER（sm_89，见 `CLAUDE.md`；CMake 仍编 sm_75，靠 PTX JIT 运行）、
-CUDA 12.8、Gazebo 8.15.0。早期记录的 RTX 2080 Ti / sm_75 是 2026-11-05 前的历史环境。
+本次实际设备：Ubuntu 24.04、RTX 2080 Ti（sm_75，2026-11-09 实测；2026-11-06 至 11-07 曾是 RTX 4080 SUPER，
+CMake 编的 sm_75 产物在它上面靠 PTX JIT 运行，见 `CLAUDE.md`；每次会话先 `nvidia-smi -L`）、CUDA 12.8、Gazebo 8.15.0。
 保留已有驱动、CUDA 与 Gazebo；不使用 PyTorch、TensorRT、cuDNN、cuBLAS、ROS 2。
 `doctor` 检查命令与导入，`check` 才执行数值/训练测试；两者都不代替闭环验收。
 无卡时可显式执行 `bash tools/check.sh --python-only`，它会打印跳过 C++/CUDA 的说明。

@@ -13,6 +13,7 @@
 | 教师（真值 A*，E1 余量） | — | **20/20 = 1.00** | [0.84, 1.00] | 0.00 | 0 | 0.97 | — |
 | 新 E1 学生 · 成功线截断重训（`ckpt_trunc_distill`） | 0417 的 300 集按首次 x > 最远柱+1.0 截断 → 9845 帧，同配置重训 | **13/20 = 0.65** | [0.43, 0.82] | 0.25 | 2 | 0.59 | 0.65 ms |
 | 新 E1 学生 · 硬标签 BC（流水线 ckpt_best） | 0417 的 300 集 / 12000 帧 | 10/20 = 0.50 | [0.30, 0.70] | 0.10 | 6（另 2 集超时停在 x≈5–6） | 0.39 | 0.66 ms |
+| 新 E1 学生 · 采集端 stop-at-goal + visible 重采重训（sgvis，19:31 出数，2026-11-09 补记） | lib v3 重采 300 集 / 10659 帧（`--stop-at-goal --tiebreak visible`） | 10/20 = 0.50 | [0.30, 0.70] | 0.15 | 4（另 3 集超时停在 x≈5.4–6.0） | 0.42 | 0.65 ms |
 | 旧 X3 学生（T6 best，X3 机体 599 集） | X3 真值速度闭环 | 4/20 = 0.20 | [0.08, 0.42] | 0.55 | 5 | 0.17 | 0.66 ms |
 | 盲前进 | — | 2/20 = 0.10 | [0.03, 0.30] | 0.90 | 0 | 0.10 | — |
 
@@ -26,8 +27,12 @@
 | 硬标签 BC vs 旧 X3 | 8 | 2 | 0.109 | 0.328 |
 | 硬标签 BC vs 盲前进 | 9 | 1 | 0.021 | 0.107 |
 | 教师 vs 截断重训 | 7 | 0 | 0.016 | 0.094 |
+| sgvis vs 截断重训（2026-11-09 补） | 3 | 6 | 0.508 | — |
+| sgvis vs 硬标签 BC（2026-11-09 补） | 4 | 4 | 1.000 | — |
 
-来源：`$DATA_ROOT/uav_rgb/e1-pipeline-20261107-0417-eval3/{summary.md,eval-*/eval.json,stats/eval3.md}`。
+来源：`$DATA_ROOT/uav_rgb/e1-pipeline-20261107-0417-eval3/{summary.md,eval-*/eval.json,stats/eval3.md}`；sgvis 行来自 `$DATA_ROOT/uav_rgb/e1-pipeline-20261107-1620-sgvis/{summary.md,eval-student-e1-new/eval.json}`，配对表在 `$DATA_ROOT/uav_rgb/tmp/analysis-20261109/stats/`。sgvis 的预注册判据「SR ≥ 13/20 且碰撞 ≤ 2」不通过；且它的训练数据同时换了 SITL 库（v1 → v3）、世界模板、教师碰撞步（182 → 0），不是对截断臂的单变量对照，详见 `2026-11-07-e1-demo-plan.md` §3.4。
+
+硬件前提（2026-11-09）：本表全部学生臂与三个 ckpt 的训练都在 RTX 4080 SUPER（PTX JIT）上产生；本机已换回 RTX 2080 Ti（原生 sm_75）。新臂与本表比之前先同 seed 重跑一臂对拍（demo-plan §3.3 补记）。
 
 怎么读：
 
@@ -60,14 +65,14 @@
 
 ## 4. 森林跨场景（柱阵训的学生 → forest_e1 sparse 20 独立几何）
 
-| 组 | lib v2（13:11–14:00，部分） | lib v3（16:00 起重跑，PGID 1195540） |
-| --- | --- | --- |
-| 教师 | 13/20，碰撞 0.35 | 跑中 |
-| 新 E1 学生（硬标签 BC） | 未跑（gz EGL 后端段错误，20/20 失败） | 跑中 |
-| 新 E1 学生（截断重训） | — | 跑中 |
-| 盲前进 | 1/20，碰撞 0.95 | 跑中 |
+| 组 | lib v2（13:11–14:00，部分，作废） | lib v3（16:00–17:47，DONE rc=1；2026-11-09 补记） | Wilson 95%（lib v3） | 碰撞（lib v3） | SPL（lib v3） |
+| --- | --- | --- | --- | --- | --- |
+| 教师 | 13/20，碰撞 0.35 | **20/20 = 1.00** | [0.84, 1.00] | 0.00 | 0.93 |
+| 新 E1 学生（硬标签 BC） | 未跑（gz EGL 后端段错误，20/20 失败） | 0/20 = 0.00 | [0.00, 0.16] | 0.75 | 0.00 |
+| 新 E1 学生（截断重训） | — | 4/20 = 0.20 | [0.08, 0.42] | 0.65 | 0.17 |
+| 盲前进 | 1/20，碰撞 0.95 | 0/19 = 0.00（seed 39 一集 gz-transport 段错误，基础设施，分母按 done；rc=1 来自它） | [0.00, 0.17] | 1.00 | 0.00 |
 
-lib v2 的教师 13/20 说明 sparse 档（最窄缝 0.45 m）对 E1 余量 0.20/0.15 的教师也只有 0.65；这一格是论文「训练域 A → 保留域 B 泛化缺口」的下界参考。结束落 `$DATA_ROOT/uav_rgb/xeval-forest-sparse-20261107-1600/{DONE,summary.md}`。
+读法（2026-11-09）：lib v3 教师 20/20、SPL 0.93，sparse 档对有真值的规划器是「几乎直走」的任务；此前按 lib v2 教师 13/20 写的「sparse 档对教师也只有 0.65」是 YAW 漂移的产物，作废。柱阵训的学生到森林的泛化缺口（PLAN W4 列）：BC 0.50 → 0.00、截断 0.65 → 0.20，区间都不相交，学生在森林里主要是撞树。来源：`$DATA_ROOT/uav_rgb/xeval-forest-sparse-20261107-1600/{summary.md,eval-*/eval.json}`。
 
 ## 5. 各条路线的状态一览
 
@@ -75,8 +80,8 @@ lib v2 的教师 13/20 说明 sparse 档（最窄缝 0.45 m）对 E1 余量 0.20
 | --- | --- | --- | --- |
 | A* 硬标签 BC（基线） | 已出数 | §1 10/20 | 乱飞 6 集是主要失败模式（空画面里转向），碰撞只 2 |
 | 成功线截断（标签定义改）| 已出数（离线截断重训） | §1 13/20，乱飞 2，碰撞 5 | 方向成立；碰撞上升要靠 L/R 可见化 + DAgger 补 |
-| 采集端 `--stop-at-goal` + `--tiebreak visible` | **跑中**（16:17 起，PGID 1216165，`e1-pipeline-20261107-1620-sgvis`：300 集重采 → 训 → 20 seed 评） | DEV-DATA 开关 Gazebo 各 1 集验证；0417 数据上 visible 会改 0.7% 帧 | 预计 19:00 前后出数；与 §1 截断臂同 seed 比，看碰撞是否回到 ≤2 |
-| DAgger（影子教师，专家唯一） | 代码就绪（Gazebo `collect --policy student --beta`，3DGS `collect_3dgs --policy student`，`dagger_pipeline.py`），**未跑 Gazebo 闭环** | 3DGS 一轮 hard 13/17→13/17（样本太少） | 等 sgvis 出数后以它的 ckpt 起第 0 轮：3 轮 × 100 集，β 0.5→0，带「再采 300 集」对照臂（DISTILL §3.2） |
+| 采集端 `--stop-at-goal` + `--tiebreak visible` | **已出数，判据不通过**（`e1-pipeline-20261107-1620-sgvis`，19:31 DONE） | §1 sgvis 行：10/20、碰撞 3、乱飞 4、SPL 0.42；vs 截断 p=0.508、vs BC p=1.000 | 采集端截断把「空画面回正」帧全删后学生把空画面映射成 FORWARD，一次错转就直飞离场（7 个超时里 5 个）；且训练数据同时换了 lib v1→v3 / 模板，不是单变量对照。结论：这一层单独不够，进 DAgger 层；下一步最便宜的靶子是「离场判据」（x 回退或 y 出界即停） |
+| DAgger（影子教师，专家唯一） | 代码就绪（Gazebo `collect --policy student --beta`，3DGS `collect_3dgs --policy student`，`dagger_pipeline.py`），**未跑 Gazebo 闭环**；Gazebo 流水线 `tools/dagger_gz_pipeline.py` 未写 | 3DGS 一轮 hard 13/17→13/17（样本太少） | 第 0 轮起点改为**截断臂 ckpt**（13/20，森林唯一非零），不用 sgvis：3 轮 × 100 集，β 0.5→0，带「再采 300 集」对照臂（DISTILL §3.2） |
 | P1 信念边际化软标签（`teacher_kino`） | **负结果，停** | §3 4/18；消融定位到代价模型 | 叙事保留，实施改为「统一代价模型」（PLAN 13:40 W2 改向）：给 `astar_occ` / `teacher.py` A* 实现逐动作 cost-to-go，先 Gazebo 后 3DGS；R2-3DGS 的 A* 教师 `PLAN_HARD_M` 死锁修法并入这次教师改版 |
 | P2 双帧 + prev-action + 深度分带头 | 代码已合并（opt-in，CTest 30/30），**不进流水线** | DISTILL 反事实：prev L↔R 翻转使 YAW_L 帧预测 34:5→18:19（复读机）；无深度数据 | 等 DAgger 数据（prev = 学生真实执行）再开 `--prev-action`；`--depth-aux` 等 Wanderland/garden 有深度真值的集 |
 | `teacher_kino` kinodynamic A* | 保留为 Gazebo 教师线变体，不做 3DGS 标注 | §3 | 不再投入 |

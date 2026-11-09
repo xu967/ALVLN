@@ -218,7 +218,7 @@ P2 代码在 main 但不进流水线（DISTILL 反事实探针：prev-action 在
 
 ### W1 场景 / W4 评测
 
-- 森林跨场景矩阵一格在跑（lib v3：教师 / 两个学生 / 盲前进 → forest sparse 20 几何）；lib v2 部分结果教师 13/20 已说明 sparse 档对教师也只有 0.65。
+- 森林跨场景矩阵一格在跑（lib v3：教师 / 两个学生 / 盲前进 → forest sparse 20 几何）；lib v2 部分结果教师 13/20 已说明 sparse 档对教师也只有 0.65。（**2026-11-09 更正**：lib v3 教师 20/20、SPL 0.93，这句推论作废，见「更新 2026-11-09」。）
 - 评测口径待改（FIXLIST 批次 A #1）：评测器在成功线停、`metric_version` 升版，让 SR 不随 `--steps` 变；SPL 参考路径净空改机体半径。改完 eval3 五组要在新口径下重算一次（同 seed，直接重跑）。
 
 ### 里程碑
@@ -238,3 +238,30 @@ P2 代码在 main 但不进流水线（DISTILL 反事实探针：prev-action 在
 ### 第七阶段 agent（17:10 起；简报 `tmp/phase3-20261107/BRIEF_ALGO.md`）
 
 按 W2 的 1→2→3 顺序，把第 2、3 层的实现同时开工（第 1 层 sgvis 在跑）：TEACHER-COST（统一代价模型教师：`plan_costs` / `plan_action_costmap`，costmap 教师先过 20 seed 闭环 ≥19/20 才算示范者；trunc 重标学生对照 13/20 作为代价模型的「消融式验证」；软标签只从这一个 Q 来，α 三档离线，闭环一档）、DAGGER-GZ（Gazebo DAgger 流水线 + more_demos 对照臂 + 60 seed 清单 + 专家不一致率；正式跑在 sgvis DONE 后）。排队：STUDENT-SELECT（模型选择判据 + 训练噪声 + 双帧反事实探针）、FIX-A（评测器成功线停 + metric_version）。规则：每个改动先预注册预测与证伪条件；闭环是裁判；禁止权重网格 / smoothing / 增强 / 门控 / 滞回。
+
+## 更新 2026-11-09 17:20（会话中断两天后接手；只读分析 6 份报告在 `$DATA_ROOT/uav_rgb/tmp/analysis-20261109/`）
+
+### 事实变化
+
+- 11-07 17:18 之后两天零进展。两个守护进程都已 DONE，结果至今才入文档：
+  - **W2 第 1 层（sgvis）不通过预注册判据**：SR 10/20 [0.30, 0.70]（要求 ≥13）、碰撞 3（要求 ≤2）、乱飞 4、SPL 0.42；vs 截断臂 b=6 c=3 p=0.508，vs 硬标签 BC p=1.000。失败主型是「一次错转 → 空画面 → 直飞离场」（7 个超时里 5 个）。它还不是单变量对照（训练数据同时换了 lib v1→v3、世界模板、教师碰撞步 182→0）。详见 `experiments/2026-11-07-e1-demo-plan.md` §3.4。
+  - **森林跨场景（lib v3）**：教师 20/20 SPL 0.93，BC 0/20，截断 4/20，盲前进 0/19。W4「泛化缺口」列有数：BC 0.50→0.00、截断 0.65→0.20，区间不交。16:40 更新里「sparse 档对教师也只有 0.65」的推论作废（那是 lib v2 的 YAW 漂移）。详见 demo-plan §3.5。
+- 第七阶段 TEACHER-COST / DAGGER-GZ 的 worktree 干净、agent 目录为空：**层 2、层 3 一行代码没写**。FIX-SITL（v3.1，ctest 10/10、selftest 33/33、40 种子 40/40 本机复核）、FIX-3DGS（D1/D5/D6）、R2-UIDOCS、VIZ-LAYOUT 二轮四个 worktree 的未提交改动本日合并进 main。
+- **硬件漂移**：本机 2026-11-09 实测 RTX 2080 Ti 22 GB、驱动 580.119.02（11-06/07 是 4080 SUPER）。eval3 / sgvis / 森林的学生臂与三个 ckpt 都是 4080 上 PTX JIT 产生的，sha 一致不等于机器码一致。
+- M2（11-12）：短片 v2 守护进程 17:11 起跑（`demo-e1-20261107/reel/v2-run/`）；一页数字（eval3 五组 + sgvis + 森林）齐；用户验收未做。
+
+### 决策
+
+1. **W2 层 1 关闭**：采集端 `--stop-at-goal` / `--tiebreak visible` 作为开关保留（默认关），不再单独作为贡献点；下一步最便宜的标签定义改动是「离场判据」（x 回退或 y 出界即停并记失败），随 FIX-A 的评测器改版一起考虑。
+2. **DAgger 第 0 轮起点 = 截断臂 ckpt**（`e1-pipeline-20261107-0417-eval3/ckpt_trunc_distill.bin` + `tmp/agent6-distill/trunc/col`），不用 sgvis。
+3. **基准换代为 eval4**：SITL 库升 **v3.1**（`vel_ki` 0.30，FORWARD 稳态侧偏减半）作为 M3 全部对照的冻结库；评测口径同时升版（FIX-A：评测器在成功线停、`metric_version` 升、SPL 参考净空改机体半径 0.102）；在 **2080 Ti** 上把 eval3 的六臂（教师 / 盲前进 / 旧 X3 / BC / 截断 / sgvis）同 20 seed 重评一次，得到 eval4 表。eval3 表保留为 lib v3 + 4080 的历史基准，不再往里加臂。三个变量（卡、库、口径）一次换完，避免每换一个就重评一轮。
+4. 第七阶段五个 agent 重派（TEACHER-COST、DAGGER-GZ、STUDENT-SELECT、FIX-A、FIX-B），在新 main 上开 worktree；gz 闸门：eval4 守护进程占 ≤3 个 gz，其余 agent 合计 ≤3。
+5. M1 补项（第二个 Wanderland、stump 路线、每场景 20 集 pilot）不挡 M2/M3，排到 M3 之后。
+
+### 里程碑
+
+| 里程碑 | 日期 | 现状（11-09） |
+| --- | --- | --- |
+| M2 Demo | 11-12 | 短片 v2 生成中；一页数字齐；待用户验收并打 tag `demo-2026-11-12` |
+| M3 算法 v1 | 11-20 | 层 1 关闭（负结果）；层 2 / 层 3 本日开工；过线判据改为「相对 **eval4** 硬标签 BC，n≥60 下区间不重叠」 |
+| M4 论文材料 | 12-05 | 不变；W4 矩阵已有柱阵 6 臂 + 森林 sparse 4 臂 |

@@ -16,7 +16,7 @@
 
 ## 0. 当前渲染路径（2026-11-03 更新；2026-11-07 补：本容器只能软件 GL）
 
-- **2026-11-07 实测（RTX 4080 SUPER 容器）**：默认 `gpu` 后端起不来，`gz sim` 在
+- **2026-11-07 实测（当时是 RTX 4080 SUPER 容器；2026-11-09 换回 RTX 2080 Ti，EGL 桩库问题不变）**：默认 `gpu` 后端起不来，`gz sim` 在
   `Ogre2RenderEngine::CreateRenderSystem` 段错误（`Unable to load Ogre Plugin
   RenderSystem_GL3Plus`，rc=-11，`collect_parallel` 重试 1 次后 0/1 集）。本机所有采集/评测
   命令都要带 `UAVRGB_RENDER_BACKEND=software DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg`

@@ -1,8 +1,34 @@
 # progress.md（新开会话先读这个）
 
-- 更新：2026-11-07 17:15（第七阶段算法优化 agent 派出；最新条目见「第三阶段」列表末尾 15:30–17:10）
-- **现在在跑（16:50）**：守护进程 ① 森林跨场景 lib v3 `xeval-forest-sparse-20261107-1600`（PGID 1195540）② 成功线截断 + L/R 可见化重采流水线 `e1-pipeline-20261107-1620-sgvis`（PGID 1216165，pilot→collect 300→训→20 seed 评，约 19:00 出）。子 agent 6 个：VIZ-LAYOUT 二轮、R2-UIDOCS、FIX-SITL（批次 C）、FIX-3DGS（批次 D）、TEACHER-COST、DAGGER-GZ（算法，简报 `tmp/phase3-20261107/BRIEF_ALGO.md`）；排队 STUDENT-SELECT、FIX-A。**两个守护进程 DONE 之前不许改写 `tmp/build-cf-sitl`**（v3.1 就地重建等它们）。
-- 方案效果盘点：`docs/experiments/2026-11-07-approach-scoreboard.md`；方向计划最新一节：`docs/PLAN_2026-11-07_demo_and_paper.md` 「更新 16:40」；修复清单：`tmp/phase3-20261107/FIXLIST_R2.md`。
+- 更新：2026-11-09 17:30（Cursor 会话接手；上一会话 11-07 17:18 中断后两天零进展）
+- **现在在跑**：短片 v2 守护进程 `$DATA_ROOT/uav_rgb/demo-e1-20261107/reel/v2-run/`（PGID 163808，`run.log`，结束落 `DONE`；停 `kill -- -163808`）。11-07 的两个守护进程都已 DONE（森林 17:47 rc=1、sgvis 19:31 rc=0），结果 11-09 才入文档：`docs/experiments/2026-11-07-e1-demo-plan.md` §3.4 / §3.5。
+- 本机 **GPU 换回 RTX 2080 Ti**（驱动 580.119.02）；每次会话先 `nvidia-smi -L`。eval3 / sgvis / 森林基准都在 4080 SUPER 上产生，新臂比之前先对拍一臂（demo-plan §3.3 补记）。
+- 方案效果盘点：`docs/experiments/2026-11-07-approach-scoreboard.md`；方向计划最新一节：`docs/PLAN_2026-11-07_demo_and_paper.md` 「更新 2026-11-09」；修复清单：`tmp/phase3-20261107/FIXLIST_R2.md`；本轮 6 份只读分析报告：`$DATA_ROOT/uav_rgb/tmp/analysis-20261109/{PLAN_STATUS,WORKTREES,EXPERIMENTS,AUDIT_SRC,AUDIT_SIMTOOLS,AUDIT_SIM}.md`。
+
+## 2026-11-09（Cursor 会话接手）
+
+### 已完成的事项
+
+- 16:40 盘点现场：main @ 1552899、207 提交、GitHub 同步；两个守护进程 DONE 未记录；四个 worktree 未提交；第七阶段 agent 未开工。派 6 个只读 agent（PLAN-STATUS / WORKTREE-AUDIT / EXPERIMENTS / AUDIT-SRC / AUDIT-SIMTOOLS / AUDIT-SIM），报告在 `tmp/analysis-20261109/`。
+- 17:05 合并 `wt-r2-uidocs` 的 5 个无冲突文档 + worklog（045f759）；README / CLAUDE / HANDOFF / sim/README 取 main（worktree 侧更旧且把 GPU 写成 4080）。
+- 17:10 合并 VIZ-LAYOUT 二轮（271e657：`e1_body.py` 两域 E1 机体、chase_cam 录像补丁、VIDEO_QUALITY 三档、ffmpeg libx264 VideoSink、reel v2 配置）；删 eval_closed_loop 重复键、requirements 两行都留、不带 demo_3dgs_callinstrasse 改动；四组测试 + 3DGS video 自检 + reel self-check 全 PASS。
+- 17:11 短片 v2 守护进程起跑（见头部）。
+- 17:15 修 REVIEW2_UIDOCS M1：`train_student_with_video` 对 cf_sitl 加 `--vehicle e1_mini`（85eb7ef，修前红 ValueError）。
+- 17:30 文档落地：sgvis（不通过判据）与森林 lib v3 进 demo-plan §3.4/§3.5、scoreboard §1/§4/§5；demo-plan §3.1 的 dev F1 0.38→0.396（抄了 epoch 20）、外径 0.18→0.20；PLAN「更新 2026-11-09」（决策：层 1 关闭、DAgger 起点 = 截断臂、基准换代 eval4 = 2080 Ti + lib v3.1 + 新口径、第七阶段重派）；CLAUDE/README/sim-README 的 GPU 改回 2080 Ti。
+
+### 关键决策
+
+- 见 PLAN「更新 2026-11-09」决策 1–5。
+- 合并顺序：先文档与可视化（不碰 `sim/cf_sitl`、`sim/3dgs`），等 AUDIT-SIM 收尾再合并 fix-sitl / fix-3dgs，避免审计读到半合并状态。
+
+### 未完成的待办
+
+- 合并 `wt-fix-sitl`（C1/C2；补 worklog、`sweep_seeds.sh` 默认路径）→ 重建 `tmp/build-cf-sitl` 为 v3.1（旧 v3 改名 `build-cf-sitl-v3-20261107`）；合并 `wt-fix-3dgs`（D1/D5/D6；补 worklog）；丢弃 `wt-fix-b`；删冻结快照 `wt-e1-sgvis` / `wt-xeval-forest`。
+- `check.sh --python-only` + 全量 `check.sh` → 推 GitHub（`bash tools/git_mirror_alvln.sh`）。
+- 派 FIX-A（评测器成功线停 + metric_version + 流水线续跑判定 Must 1–3 + SIGTERM + seed 单源 + SPL 净空）、TEACHER-COST、DAGGER-GZ（round0 = 截断臂）、STUDENT-SELECT、FIX-B（含 AUDIT_SRC 新发现）。
+- FIX-A 合并后起 **eval4** 守护进程（2080 Ti + lib v3.1 + 新口径，六臂同 20 seed，≤3 gz）；出数后 scoreboard 新开 eval4 表。
+- 短片 v2 DONE 后：核对 `reel/demo_reel_v2.mp4` / `_short.mp4` / `stills_v2/`，scoreboard §5 可视化行改 done，demo 汇总页，用户验收，tag `demo-2026-11-12`。
+- 本会话 worklog：`docs/worklog/2026-11-09-1640-resume-analysis-and-merge.md`。
 
 ## 第三阶段（2026-11-07 05:10 起）
 
@@ -67,12 +93,12 @@
 - 数据盘：`$DATA_ROOT/uav_rgb`（`/root/rivermind-data/uav_rgb`）；构建产物、数据集、实验输出都在这里，不进仓库
 - 任务边界：`$DATA_ROOT/uav_rgb/grill-me/boundary-v4.txt` + `boundary-v5-addendum.txt`；任务板 `docs/TASKS.md`（SIM-E1）；实验计划 `docs/experiments/2026-11-07-e1-demo-plan.md`；长期规划 `docs/ROADMAP.md`、`docs/TEACHER_LINE_PLAN.md`
 
-## 正在跑的守护进程（先看这里）
+## 11-07 的守护进程（全部已结束；现役见头部）
 
 | 实验 | 启动 | 进程 | 看进度 | 停 |
 | --- | --- | --- | --- | --- |
-| **sgvis 流水线** `e1-pipeline-20261107-1620-sgvis`（`--stop-at-goal --tiebreak visible` 重采 300 集 → 审计 → 打包 → 训 30 轮 → 20 seed 评本轮学生 + 录像；其余四组软链 eval3） | 2026-11-07 16:17 | PGID 1216165，`…-sgvis/run.pid` | `tail -f …-sgvis/run.log`、`status.json`；结束落 `DONE` + `summary.md` | `kill -- -1216165` |
-| **森林跨场景 lib v3** `xeval-forest-sparse-20261107-1600/run_xeval.sh`（两车道：teacher→forward、e1-new→e1-trunc；forest_e1 sparse 20 独立几何） | 2026-11-07 16:00 | PGID 1195540，`…-1600/run.pid` | `tail -f …/run.log`、`…/eval-<组>.log`；结束落 `DONE` + `summary.md` | `kill -- -1195540` |
+| （已完成 19:31，rc=0；结果见 demo-plan §3.4）sgvis 流水线 `e1-pipeline-20261107-1620-sgvis`（`--stop-at-goal --tiebreak visible` 重采 300 集 → 审计 → 打包 → 训 30 轮 → 20 seed 评本轮学生 + 录像；其余四组软链 eval3） | 2026-11-07 16:17 | PGID 1216165，`…-sgvis/run.pid` | `tail -f …-sgvis/run.log`、`status.json`；结束落 `DONE` + `summary.md` | `kill -- -1216165` |
+| （已完成 17:47，rc=1 = 盲前进 seed 39 一集 gz 段错误；结果见 demo-plan §3.5）森林跨场景 lib v3 `xeval-forest-sparse-20261107-1600/run_xeval.sh`（两车道：teacher→forward、e1-new→e1-trunc；forest_e1 sparse 20 独立几何） | 2026-11-07 16:00 | PGID 1195540，`…-1600/run.pid` | `tail -f …/run.log`、`…/eval-<组>.log`；结束落 `DONE` + `summary.md` | `kill -- -1195540` |
 | （已完成 15:40）eval3 `e1-pipeline-20261107-0417-eval3`（lib v3、20 零重叠几何、五组） | 14:11 | PGID 1032381 | `…-eval3/summary.md`、`stats/eval3.md` | — |
 | （已停，lib v2 部分）森林跨场景 `xeval-forest-sparse-20261107-1310-libv2-partial`（教师 13/20、盲前进 1/20；学生组因 EGL 后端 20/20 失败） | 13:11 | — | `summary.md` | — |
 | （已完成 08:46）第二轮四组重评 `e1-pipeline-20261107-0417-eval2`（20 独立几何，lib v2） | 2026-11-07 07:11 | PGID 694826 | `…-eval2/run.log` 末尾 summary；视频 `eval-teacher/videos/`、`eval-student-e1-new/videos/` | — |
