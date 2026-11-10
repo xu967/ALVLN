@@ -769,6 +769,8 @@ def run_episode(seed, args, workdir, seen_gids):
                 cmd += ["--heading-guard", str(args.heading_guard)]   # 0 不传：旧命令行逐字不变
         elif args.policy == "rule-oracle":
             cmd += ["--rule-hfov-deg", str(args.rule_hfov_deg)]       # 只给 rule-oracle 传：其它策略的命令行逐字不变
+            if args.rule_version != "v0":
+                cmd += ["--rule-version", args.rule_version]          # v0 不传：v0 的命令行与 v0 实验逐字相同
         elif args.policy == "teacher-nn":
             cmd += ["--teacher-ckpt", args.teacher_ckpt]
         elif args.policy == "teacher-rl":
@@ -1057,6 +1059,9 @@ def main():
     p.add_argument("--heading-guard", type=int, default=0,
                    help="透传给 collect.py（仅 --policy student）：已执行的左转数减右转数的绝对值达到 N 就朝回转一步；"
                         "0=关闭。它改的是策略不是判据，eval.json 顶层记 heading_guard，不动 metric_version")
+    p.add_argument("--rule-version", choices=("v0", "v1"), default="v0",
+                   help="透传给 collect.py（仅 --policy rule-oracle）：v0=固定规则（默认，命令行与输出逐位不变）；"
+                        "v1=短期障碍记忆 + 候选航向选择（计划 D6）。v1 时 eval.json 顶层另记 rule_version")
     p.add_argument("--rule-hfov-deg", type=float, default=60.0,
                    help="透传给 collect.py（仅 --policy rule-oracle）：列距离视场（度），60=学生相机（20 列），"
                         "81=真机 GC4653 的水平视场（27 列）；范围 [6, 180]。eval.json 顶层记 rule_hfov_deg 与 rule_params")
@@ -1119,6 +1124,8 @@ def main():
         p.error("--heading-guard 必须是非负整数，且只能和 --policy student 一起用")
     if args.policy != "rule-oracle" and args.rule_hfov_deg != 60.0:
         p.error("--rule-hfov-deg 只能和 --policy rule-oracle 一起用")
+    if args.policy != "rule-oracle" and args.rule_version != "v0":
+        p.error("--rule-version 只能和 --policy rule-oracle 一起用")
     if args.policy == "rule-oracle" and not (math.isfinite(args.rule_hfov_deg)
                                              and 2 * rule_policy.COL_DEG <= args.rule_hfov_deg <= 180.0):
         p.error(f"--rule-hfov-deg 必须在 [{2 * rule_policy.COL_DEG:g}, 180] 度内")
@@ -1318,7 +1325,9 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
               "corridor_half_width": args.corridor_half_width,
               **({"heading_guard": args.heading_guard} if args.heading_guard else {}),
               # rule-oracle 的视场与规则参数：预注册的参数随结果留证（其它策略不写这两个键）
-              **({"rule_hfov_deg": args.rule_hfov_deg, "rule_params": rule_policy.RULE_V0}
+              **({"rule_hfov_deg": args.rule_hfov_deg,
+                  "rule_params": rule_policy.RULE_V0 if args.rule_version == "v0" else rule_policy.RULE_V1,
+                  **({"rule_version": args.rule_version} if args.rule_version != "v0" else {})}
                  if args.policy == "rule-oracle" else {}),
               **({"blocks": args.blocks} if args.blocks is not None else {}),   # course_base 的块数；其它任务不写键，旧输出逐位不变
               "waypoint_radius": WAYPOINT_RADIUS,

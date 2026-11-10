@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""规则层上限（计划 D3）：特权「完美列距离」+ 固定规则 v0 出动作。纯 stdlib，不依赖 Gazebo。
+"""规则层上限（计划 D3）：特权「完美列距离」+ 固定规则 v0 出动作；v1（计划 D6）在其上加短期障碍记忆。纯 stdlib，不依赖 Gazebo。
 
 可判定性分解：图像决定得了的量（各列到最近障碍的距离）由 column_distances 用仿真真值解析算出，
 图像决定不了的量（航向）由机体自己数（net_yaw），两者之间只有 rule_v0 这一层固定规则。
@@ -24,6 +24,18 @@ RULE_V0 = {
     "tie_frac": 0.10,    # 左右两半 Σmin(d, sum_clip) 相差不到较大者的 10% 算平局，沿用上次转向，免得左右摆
     "sum_clip": 4.0,     # = column_distances 的 max_range：远处全空的列不再加分
 }
+
+# 规则 v1 参数（主会话 2026-11-10 20:40 设计，起跑前冻结）：v0 在 test 上 26/40（rep0、rep1）判负后加短期障碍记忆，参数不在 test seed 上调
+RULE_V1 = {
+    "r_safe": 0.35,        # 候选航向通道半宽：同 v0
+    "d_look": 1.2,         # 候选航向通道长度：同 v0
+    "yaw_step_deg": 26.0,  # 一步 YAW 的转角：308 个转向步实测 26.12° ± 1.09°（heading-guard 数据，两个方向合并）
+    "mem_steps": 8,        # 记忆保留步数：绕过一根 0.4 m 的柱约 6–7 步，再留 1–2 步余量
+    "n_cap": 3,            # |净转向步数| 的上限（主会话设计值）：3 步约 78°，到顶不再朝同一方向转，改转回
+    "tie_frac": 0.10,      # 左右两半 Σmin(d, sum_clip) 相差不到较大者的 10% 算平局：同 v0
+    "sum_clip": 4.0,       # 同 v0
+}
+V1_ENTRIES = ("V1-back", "V1-fwd", "V1-more", "V1-side", "V1-last", "V1-left", "V1-cap")   # rule_v1_entry 的全部条目
 
 
 def _hit(ox, oy, ux, uy, p):
@@ -110,3 +122,97 @@ def rule_v0_entry(d, n, last_turn, params=RULE_V0, col_deg=COL_DEG):
 def rule_v0(d, n, last_turn, params=RULE_V0, col_deg=COL_DEG):
     """规则 v0 的动作（四个枚举之一）；要知道触发了哪一条用 rule_v0_entry。"""
     return rule_v0_entry(d, n, last_turn, params, col_deg)[0]
+
+
+# ---------------------------------------------------------------- 规则 v1：短期障碍记忆 + 候选航向选择
+def obstacle_points(d, hfov_deg=60.0, col_deg=COL_DEG, max_range=4.0, cam_forward=0.045):
+    """列距离 → 机体系障碍点 [(x, y)]（x 前、y 左，原点 = 机体中心）。
+
+    每个 d_j < max_range 的列出一个点：取该列最近距离、列中心方位 φ_j = (k/2 − 0.5 − j)·col_deg（正 = 左），
+    点 = (d_j·cos φ_j + cam_forward, d_j·sin φ_j)。点的起算位置是相机，换到机体中心要加 cam_forward。
+    列数必须等于 hfov_deg / col_deg（60° → 20、81° → 27），对不上说明视场与列距离不是一对，抛 ValueError。
+    """
+    k = len(d)
+    if k != round(hfov_deg / col_deg):
+        raise ValueError(f"列数 {k} 与视场 {hfov_deg}° / 列宽 {col_deg}° 对不上（应为 {round(hfov_deg / col_deg)}）")
+    pts = []
+    for j, dj in enumerate(d):
+        if dj < max_range:
+            phi = math.radians((k / 2 - 0.5 - j) * col_deg)
+            pts.append((dj * math.cos(phi) + cam_forward, dj * math.sin(phi)))
+    return pts
+
+
+def points_to_world(points, x, y, yaw_deg):
+    """机体系点 → 世界系点：机体位姿 (x, y, yaw_deg)（yaw 0 = +x，正 = 左转）。"""
+    c, s = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
+    return [(x + px * c - py * s, y + px * s + py * c) for px, py in points]
+
+
+def points_to_body(points_world, x, y, yaw_deg):
+    """世界系点 → 机体系点（points_to_world 的逆）。"""
+    c, s = math.cos(math.radians(yaw_deg)), math.sin(math.radians(yaw_deg))
+    return [((X - x) * c + (Y - y) * s, -(X - x) * s + (Y - y) * c) for X, Y in points_world]
+
+
+def update_memory(memory, step, new_world_points, mem_steps):
+    """记忆更新（纯函数）：memory = [(X, Y, 产生步号)]（世界系）。丢弃年龄 step − 产生步号 > mem_steps 的点，并入本步新点（年龄 0）。"""
+    kept = [m for m in memory if step - m[2] <= mem_steps]
+    return kept + [(X, Y, step) for X, Y in new_world_points]
+
+
+def corridor_clear(points_body, theta_deg, params=RULE_V1):
+    """朝相对当前航向 θ（正 = 左）的通道是否畅通：没有点满足 0 < u < d_look 且 |v| < r_safe，u = x·cosθ + y·sinθ，v = −x·sinθ + y·cosθ。"""
+    c, s = math.cos(math.radians(theta_deg)), math.sin(math.radians(theta_deg))
+    for x, y in points_body:
+        if 0.0 < x * c + y * s < params["d_look"] and abs(-x * s + y * c) < params["r_safe"]:
+            return False
+    return True
+
+
+def rule_v1_entry(points_body, d, n, last_turn, params=RULE_V1):
+    """规则 v1：(动作, 触发的条目)。points_body = 记忆里全部点（含本步新点）换到当前机体系；d = 本步各列距离（只在 V1-side 里用）；
+    n = 已执行 YAW_LEFT 数减 YAW_RIGHT 数；last_turn 上次转向方向或 None。
+
+    决策顺序（α = yaw_step_deg）：
+      1. n ≠ 0 且「转回一步」的通道畅通（n > 0 朝右 θ = −α，n < 0 朝左 θ = +α）→ 转回，V1-back；
+      2. 当前航向通道畅通 → FORWARD_SLOW，V1-fwd；
+      3. 否则转开：n ≠ 0 且 |n| < n_cap → 沿 n 的符号再转一步 V1-more；n = 0 → 左右两半 Σmin(d, sum_clip) 取较大一侧 V1-side，
+         相差不到 tie_frac 沿用 last_turn（V1-last），没有则向左（V1-left）；|n| ≥ n_cap → 转回 V1-cap。
+    永不输出 SAFE_NEUTRAL；FORWARD_SLOW 只在 clear(0) 时输出，所以它同时是护盾。
+    shortcut: 奇数列时正中间一列不计入左右两半（只影响 81° 视场）；记忆里的点只有水平截面，没有「已转过的角度」之外的航向信息。
+    """
+    alpha = params["yaw_step_deg"]
+    if n != 0:
+        back_turn, back_theta = (YAW_RIGHT, -alpha) if n > 0 else (YAW_LEFT, alpha)
+        if corridor_clear(points_body, back_theta, params):
+            return back_turn, "V1-back"
+    if corridor_clear(points_body, 0.0, params):
+        return FORWARD_SLOW, "V1-fwd"
+    if n != 0:
+        if abs(n) < params["n_cap"]:
+            return (YAW_LEFT if n > 0 else YAW_RIGHT), "V1-more"
+        return (YAW_RIGHT if n > 0 else YAW_LEFT), "V1-cap"
+    k = len(d)
+    h = k // 2
+    left, right = (sum(min(v, params["sum_clip"]) for v in half) for half in (d[:h], d[k - h:]))
+    if abs(left - right) >= params["tie_frac"] * max(left, right):
+        return (YAW_LEFT if left > right else YAW_RIGHT), "V1-side"
+    if last_turn in (YAW_LEFT, YAW_RIGHT):
+        return last_turn, "V1-last"
+    return YAW_LEFT, "V1-left"
+
+
+def rule_v1_step(memory, step, x, y, yaw_deg, d, n, last_turn, hfov_deg=60.0, params=RULE_V1):
+    """v1 的一步（collect.py 与离线模拟共用，纯函数）：本步列距离 → 世界系点并入记忆 → 全部记忆点换回当前机体系 → 规则。
+
+    返回 (动作, 条目, 新记忆, info)；info = {"mem_n": 记忆点数, "clear": [clear(+α), clear(0), clear(−α)]}（左转一步 / 保持 / 右转一步，供事后分析）。
+    x, y, yaw_deg 是真值位姿（perfect odometry）：记忆在世界系，不依赖 n。
+    """
+    new_world = points_to_world(obstacle_points(d, hfov_deg), x, y, yaw_deg)
+    memory = update_memory(memory, step, new_world, params["mem_steps"])
+    body = points_to_body([(X, Y) for X, Y, _t in memory], x, y, yaw_deg)
+    action, entry = rule_v1_entry(body, d, n, last_turn, params)
+    a = params["yaw_step_deg"]
+    clear = [corridor_clear(body, th, params) for th in (a, 0.0, -a)]
+    return action, entry, memory, {"mem_n": len(body), "clear": clear}

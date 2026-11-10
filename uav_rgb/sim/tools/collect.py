@@ -68,7 +68,7 @@ from teacher import (expert_action, plan_action, plan_action_global_tiebreak, pl
                      TIEBREAKS, TEACHER_COST_VERSION,
                      SAFE_NEUTRAL, FORWARD_SLOW, YAW_LEFT, YAW_RIGHT, ACTIONS,
                      teacher_version, task_of_scene)
-from rule_policy import column_distances, rule_v0_entry, RULE_V0, COL_DEG
+from rule_policy import column_distances, rule_v0_entry, rule_v1_step, RULE_V0, RULE_V1, COL_DEG
 import gz_io
 import save_frame
 import split_manifest as sm
@@ -821,7 +821,8 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 teacher_nn=None, text_ids=None, contact_seq0=None, dyn=None,
                 predictive_teacher=None, rl_teacher=None, sil=None,
                 tiebreak="legacy", beta=0.0, rng=None, prev_executed=None,
-                costmap_opts=None, heading_guard=0, net_yaw=0, rule_hfov_deg=60.0, last_turn=None):
+                costmap_opts=None, heading_guard=0, net_yaw=0, rule_hfov_deg=60.0, last_turn=None,
+                rule_version="v0", rule_mem=None):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。
 
     dyn=None 为 x3_velocity 旧行为（定速 + 窗口末刹停）；给 CfStab 时按摇杆模型
@@ -835,6 +836,8 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     教师改为测地场代价 argmin，每行多记 q_costs（4 个浮点，步）；None = 不启用。
     rule_hfov_deg / last_turn / net_yaw 只在 policy == "rule-oracle" 时起作用：真值位姿与柱子算列距离（视场 rule_hfov_deg），
     再过 rule_policy.rule_v0；net_yaw、last_turn 由主循环按已执行动作维护。
+    rule_version="v1"（计划 D6）：改走 rule_policy.rule_v1_step，rule_mem 是主循环按集清零、逐步传入的记忆点列表
+    [(世界 X, 世界 Y, 产生步号)]，本函数原地更新它；该步多记 rule_mem_n 与 rule_clear。v0 路径与落盘逐位不变。
     """
     if window_from not in ("dispatch", "observation"):
         raise ValueError(f"window_from 无效: {window_from!r}")
@@ -842,6 +845,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     q_costs = None             # 只有 costmap 教师会填：Q[SAFE, FWD, L, R]（步）
     executed_by = None         # 只有 DAgger 影子教师模式会填 "student"/"expert"，rule-oracle 填 "rule_oracle"
     rule_cols = rule_entry = None   # 只有 rule-oracle 会填：该步的 20 列（或 27 列）距离与触发的规则条目
+    rule_mem_n = rule_clear = None  # 只有 rule-oracle v1 会填：记忆点数、[clear(+α), clear(0), clear(−α)]
     label = None               # 标签（action_expert）；None = 与执行的动作相同（除影子教师外都如此）
     t_step = time.perf_counter()
     if contact_seq0 is None:
@@ -961,7 +965,15 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         if pillars is None or not pose_before or yaw_before is None:
             return None, "rule-oracle 需要柱子真值（--scene-meta）与该步位姿、航向"
         cols = column_distances(pose_before["x"], pose_before["y"], yaw_before, pillars, hfov_deg=rule_hfov_deg)
-        action, rule_entry = rule_v0_entry(cols, net_yaw, last_turn)
+        if rule_version == "v1":
+            if rule_mem is None:
+                return None, "rule-oracle v1 需要主循环传入 rule_mem（记忆点列表，按集清零）"
+            action, rule_entry, new_mem, info = rule_v1_step(rule_mem, step_idx, pose_before["x"], pose_before["y"],
+                                                             yaw_before, cols, net_yaw, last_turn, rule_hfov_deg)
+            rule_mem[:] = new_mem
+            rule_mem_n, rule_clear = info["mem_n"], info["clear"]
+        else:
+            action, rule_entry = rule_v0_entry(cols, net_yaw, last_turn)
         rule_cols, executed_by = [round(v, 2) for v in cols], "rule_oracle"
     elif policy == "teacher-nn":
         if teacher_nn is None:
@@ -1173,6 +1185,8 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         "q_costs": q_costs,
         "rule_cols": rule_cols,
         "rule_entry": rule_entry,
+        "rule_mem_n": rule_mem_n,
+        "rule_clear": rule_clear,
         "pose_gt": pose_after,
         "pose_ts": pose_ts,
         # 动作前位姿：audit 用它 + scene 柱子真值复算标签，验证「标签=该帧该做的动作」。
@@ -1255,8 +1269,9 @@ def action_row(r, save_depth=False):
     # 可选字段只在开了对应开关时出现：tie_margin_steps 来自 --tiebreak visible（|Q_L−Q_R|，步），
     # executed_by 来自 --policy student 的影子教师（本步执行者 student/expert），
     # q_costs 来自 --teacher-planner costmap（Q[SAFE, FWD, L, R]，步），
-    # rule_cols / rule_entry 来自 --policy rule-oracle（该步各列距离与触发的规则条目，供事后分析失败）。
-    for k in ("tie_margin_steps", "executed_by", "q_costs", "rule_cols", "rule_entry"):
+    # rule_cols / rule_entry 来自 --policy rule-oracle（该步各列距离与触发的规则条目，供事后分析失败）；
+    # rule_mem_n / rule_clear 只有 --rule-version v1 才有（记忆点数与三个候选航向的通道是否畅通）。
+    for k in ("tie_margin_steps", "executed_by", "q_costs", "rule_cols", "rule_entry", "rule_mem_n", "rule_clear"):
         if r.get(k) is not None:
             row[k] = r[k]
     return row
@@ -1381,6 +1396,9 @@ def main():
     p.add_argument("--rule-hfov-deg", type=float, default=60.0,
                    help="--policy rule-oracle 的列距离视场（度）：60=学生相机（20 列），81=真机 GC4653 的水平视场（27 列）；"
                         "列宽固定 3°，范围 [6, 180]")
+    p.add_argument("--rule-version", choices=("v0", "v1"), default="v0",
+                   help="--policy rule-oracle 的规则版本：v0=固定规则（无记忆，默认，行为逐位不变）；"
+                        "v1=短期障碍记忆 + 候选航向选择（计划 D6，参数见 rule_policy.RULE_V1）")
     p.add_argument("--scene-id", type=int, default=0, help="EpisodeMeta.scene_id（场景隔离关键字段）")
     p.add_argument("--seed", type=int, default=0, help="EpisodeMeta.seed")
     p.add_argument("--episode-id", type=int, default=None, help="EpisodeMeta.episode_id（默认=seed）")
@@ -1418,6 +1436,8 @@ def main():
         p.error("--heading-guard 必须是非负整数，且只能和 --policy student 一起用")
     if args.policy != "rule-oracle" and args.rule_hfov_deg != 60.0:
         p.error("--rule-hfov-deg 只能和 --policy rule-oracle 一起用")
+    if args.policy != "rule-oracle" and args.rule_version != "v0":
+        p.error("--rule-version 只能和 --policy rule-oracle 一起用")
     if args.policy == "rule-oracle":
         if not args.scene_meta:
             p.error("--policy rule-oracle 需要 --scene-meta（用柱子真值算列距离）")
@@ -1555,7 +1575,7 @@ def main():
         teacher_kind, planner_kind = "forward", None
     elif args.policy == "rule-oracle":
         # 动作由柱子真值列距离 + 规则 v0 给出，不是教师标签；audit 的 label_recompute 不认这个 teacher，也不该认。
-        teacher_kind, planner_kind = "rule_oracle", "rule_v0"
+        teacher_kind, planner_kind = "rule_oracle", f"rule_{args.rule_version}"
     elif args.policy == "student":
         # 有柱子真值时是 DAgger 影子教师：标签口径与 --policy teacher 完全一样（plan_action/astar），
         # 只是 executed_by=student（与 sim/3dgs/collect_3dgs.py 同义）。没真值时标签只能是学生自己的输出。
@@ -1604,6 +1624,7 @@ def main():
     prev_executed = None
     net_yaw = 0                # 已执行的 YAW_LEFT 数减 YAW_RIGHT 数（--heading-guard 与 rule-oracle 用）
     last_turn = None           # 最近一次执行的转向方向 YAW_LEFT / YAW_RIGHT（rule-oracle 平局时沿用）
+    rule_mem = []              # rule-oracle v1 的短期障碍记忆 [(世界 X, 世界 Y, 产生步号)]；每集（每次进程）从空开始
     prev_rgb_ts = 0
     timings = []
     # DAgger（--policy student）：β 混合的随机源按 seed 固定，同 seed 可复现哪些步换成了教师执行。
@@ -1712,7 +1733,8 @@ def main():
                                     tiebreak=args.tiebreak, beta=args.beta, rng=rng,
                                     prev_executed=prev_executed, costmap_opts=costmap_opts,
                                     heading_guard=args.heading_guard, net_yaw=net_yaw,
-                                    rule_hfov_deg=args.rule_hfov_deg, last_turn=last_turn)
+                                    rule_hfov_deg=args.rule_hfov_deg, last_turn=last_turn,
+                                    rule_version=args.rule_version, rule_mem=rule_mem)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -1755,6 +1777,8 @@ def main():
                         else f" exec={ACTIONS[r['action_executed']]}({r['executed_by']})")
             if r.get("rule_entry") is not None:
                 executed += f" rule={r['rule_entry']} dmin={min(r['rule_cols']):.2f} n={net_yaw}"
+                if r.get("rule_mem_n") is not None:
+                    executed += f" mem={r['rule_mem_n']} clear={''.join('1' if c else '0' for c in r['rule_clear'])}"
             print(f"step {i}: {ACTIONS[r['action_expert']]}{executed} pos={r['pose_gt']} "
                   f"dx={dx} dyaw={dyaw} action_wall={r['action_wall_s']:.2f}s "
                   f"sim_dt={r['sim_dt']:.2f}s "
@@ -1895,7 +1919,8 @@ def main():
             # 航向护栏只在开了的时候写键：默认 manifest 逐位不变。
             **({"heading_guard": args.heading_guard} if args.heading_guard else {}),
             # rule-oracle 的视场与规则参数同样只在用到时写键（预注册的参数随每集 manifest 留证）。
-            **({"rule_oracle": {"hfov_deg": args.rule_hfov_deg, "params": RULE_V0}}
+            **({"rule_oracle": ({"hfov_deg": args.rule_hfov_deg, "params": RULE_V0} if args.rule_version == "v0"
+                                else {"version": args.rule_version, "hfov_deg": args.rule_hfov_deg, "params": RULE_V1})}
                if args.policy == "rule-oracle" else {}),
             "rl_checkpoint": (os.path.abspath(args.rl_checkpoint) if args.policy == "teacher-rl" else None),
             "experimental_policy": args.policy == "teacher-rl" or planner_kind == "predictive",
