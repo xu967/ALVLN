@@ -185,7 +185,7 @@ def resolve_vehicle(args, error):
 
 
 def scene_gen_extra(args):
-    """透传给 scene_gen 的可选参数：相机、forest_e1 密度（没给就不传，旧命令行逐字不变）。"""
+    """透传给 scene_gen 的可选参数：相机、forest_e1 密度、course_base 块数（没给就不传，旧命令行逐字不变）。"""
     extra = []
     rate = getattr(args, "camera_rate", None)
     if rate is not None:
@@ -194,6 +194,8 @@ def scene_gen_extra(args):
         extra.append("--no-aux-cameras")
     if getattr(args, "density", None):
         extra += ["--density", args.density]
+    if getattr(args, "blocks", None) is not None:
+        extra += ["--blocks", str(args.blocks)]
     return extra
 
 
@@ -206,6 +208,9 @@ def task_geometry_version(task):
     if task == "forest_e1":
         import scene_forest
         return scene_forest.GEOMETRY_VERSION_FOREST
+    if task == "course_base":
+        import scene_course
+        return scene_course.GEOMETRY_VERSION
     return sm.SPLIT_SALT
 
 

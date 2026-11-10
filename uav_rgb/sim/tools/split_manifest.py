@@ -23,9 +23,14 @@ import scene_gen as sg  # noqa: E402
 
 SPLITS = ("train", "val", "test")
 # 数据里可审计的划分策略。scene_id = 旧版只按场景隔离；其余见 split_for_scene。
-SPLIT_POLICIES = ("scene_id", "geometry_gid", "campus_map_v1", "campus_assets_map_v1")
+SPLIT_POLICIES = ("scene_id", "geometry_gid", "campus_map_v1", "campus_assets_map_v1", "course_block0")
 # 已冻结、但重打包仍要能按记录复算的校园版本；新增版本时只加当前版本，不删旧值。
 FROZEN_CAMPUS_VERSIONS = ("campus.v1",)
+# 长课程（scene_course，course_block0）只按第 0 块的 base 几何划分：课程版本 -> 它建在的 base 几何版本（= 划分 salt）。
+# 冻结表：新增课程版本时加一行，不删旧值（base 版本升级后旧课程仍要按旧 salt 复算）。
+# shortcut: 课程只用于评测，训练打包没接：preprocess 按 KNOWN_GEOMETRY_VERSIONS 拒收课程版本，
+#   --allow-frozen-geometry 放开版本门后 split_for_scene 对不带 course 的 episode manifest 抛 ValueError，仍拒收；要用课程数据训练时再接。
+COURSE_BASE_SALT = {"uavrgb.course_base.v1": "uavrgb.geom.v5"}
 # asset_campus.split_key 写死的 salt（split_key 内部不接受参数）。
 ASSET_SPLIT_SALT = "asset-campus-split-v1"
 # v3：T1 把车道缝从 0.902 m 放宽到 1.2 m（LANE_SEP 1.302→1.6），几何语义变了，
@@ -112,6 +117,8 @@ def split_salt_for(meta):
     gver = meta.get("geometry_version")
     if not gver:
         return SPLIT_SALT
+    if gver in COURSE_BASE_SALT:
+        return COURSE_BASE_SALT[gver]
     # forest_e1 同旧柱阵约定「版本串 = salt」（scene_forest.GEOMETRY_VERSION_FOREST）；
     # scene.json 显式带 split_salt，episode manifest 不带，靠这里复算。
     if gver.startswith("uavrgb.geom.") or gver.startswith("uavrgb.forest_e1."):
@@ -156,6 +163,17 @@ def split_for_scene(meta):
                 raise ValueError("campus map_id 与 seed 不符")
         # 三族→split 本身是冻结合同；campus.split_map 只认当前版本前缀，借用它的表。
         return campus.split_map("%s/%s" % (campus.VERSION, family))
+    if gver in COURSE_BASE_SALT and policy != "course_block0":
+        raise ValueError("课程几何版本 %r 必须配 split_policy=course_block0（得到 %r）" % (gver, policy))
+    if policy == "course_block0":
+        # 课程的 split = 第 0 块 base 几何的 split；复算只认 scene.json 里的 course（episode manifest 不带，抛错而不是猜）。
+        course = meta.get("course") or {}
+        gids, base_version = course.get("block_gids"), course.get("base_geometry_version")
+        if not gids or not base_version:
+            raise ValueError("course_block0 复算 split 需要 meta.course.block_gids / base_geometry_version（读 scene.json）")
+        if COURSE_BASE_SALT.get(gver) != base_version:
+            raise ValueError("course_block0 的 geometry_version %r 与 base_geometry_version %r 不符" % (gver, base_version))
+        return split_for_gid(gids[0], base_version)
     gid = meta.get("geometry_gid") or geometry_gid(meta["pillars"])
     return split_for_gid(gid, split_salt_for(meta))
 

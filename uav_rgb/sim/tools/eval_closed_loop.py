@@ -69,7 +69,8 @@ STABLE_SPEED_MPS = 0.05
 # （0.2 m：30 个候选 0.85 s/集；0.1 m 只少算 <1 cm）。只在整张障碍图就是 pillars 的任务上算，
 # campus 的建筑不在 pillars 里，算出来会错，留 None。
 SPL_GOAL_Y_STEP = 0.2
-SPL_TASKS = ("base", "l1", "forest_e1")
+# course_base（长课程）的障碍图也就是 pillars，成功线 / SPL 最短路由 meta 推出，与 base 同一条路径。
+SPL_TASKS = ("base", "l1", "forest_e1", "course_base")
 # scene_gen/campus/asset_campus 目前都写死这个相机档；协议比对只用它做本次运行的实际值。
 CAMERA_PROFILE = "rgb320x240_fov60_v1"
 PROTOCOL_KEYS = ("window_from", "hold_s", "steps", "task",
@@ -844,6 +845,8 @@ def run_episode(seed, args, workdir, seen_gids):
         # dedup_key 还含颜色/左右，不能拿来数地图覆盖。
         "geometry_gid": sm.geometry_gid(meta["pillars"]),
     })
+    if meta.get("course"):   # course_base：块边界线（每块最远柱 x + 1.0）随集记下，逐块存活统计直接读它
+        summary["block_goal_x"] = meta["course"]["block_goal_x"]
     for a in actions:
         k = int(a.get("action_executed", -1))
         summary["actions"][k] = summary["actions"].get(k, 0) + 1
@@ -1023,11 +1026,14 @@ def main():
                    help="协议与本次参数不一致时直接失败（默认只警告，保证旧 run 可复现）")
     p.add_argument("--text-mode", choices=TEXT_MODES, default="keep",
                    help="L2 消融：keep=原指令；blank=空文本；shuffle=把 left/right 反过来")
-    p.add_argument("--task", choices=("base", "l1", "campus", "campus_assets", "forest_e1"), default="base",
+    p.add_argument("--task", choices=("base", "l1", "campus", "campus_assets", "forest_e1", "course_base"), default="base",
                    help="base=原柱阵；l1=彩色 landmark + instruction/waypoint；"
-                        "forest_e1=E1 随机圆柱森林（需 --density 与 --vehicle e1_mini）")
+                        "forest_e1=E1 随机圆柱森林（需 --density 与 --vehicle e1_mini）；"
+                        "course_base=K 个 base 柱阵块首尾相接的长课程（需 --blocks；成功线 = 6.0+5.0·(K−1)）")
     p.add_argument("--density", choices=("sparse", "medium", "dense"), default=None,
                    help="透传给 scene_gen：forest_e1 密度档（最窄缝 0.45/0.35/0.28 m）；forest_e1 必填")
+    p.add_argument("--blocks", type=int, default=None,
+                   help="透传给 scene_gen：course_base 块数 K（2–6）；course_base 必填，其它任务不接受")
     p.add_argument("--appearance", choices=("legacy", "v1"), default="v1",
                    help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）；旧数据复现请显式 legacy")
     p.add_argument("--split", choices=("train", "val", "test"), default="test")
@@ -1124,6 +1130,10 @@ def main():
         p.error("--density 与 --task forest_e1 必须同时给")
     if args.task == "forest_e1" and args.vehicle != "e1_mini":
         p.error("--task forest_e1 需要 --vehicle e1_mini（--dynamics cf_sitl）")
+    if (args.task == "course_base") != (args.blocks is not None):
+        p.error("--blocks 与 --task course_base 必须同时给")
+    if args.blocks is not None and not 2 <= args.blocks <= 6:   # 同 scene_course.BLOCKS_RANGE（这里不为一个常量导入它）
+        p.error("--blocks 必须在 2–6")
     if args.record_video and args.no_aux_cameras:
         p.error("--record-video 需要 chase/top 相机，不能同时 --no-aux-cameras")
     for name in ("goal_margin", "sim_timeout", "episode_timeout"):
@@ -1310,6 +1320,7 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
               # rule-oracle 的视场与规则参数：预注册的参数随结果留证（其它策略不写这两个键）
               **({"rule_hfov_deg": args.rule_hfov_deg, "rule_params": rule_policy.RULE_V0}
                  if args.policy == "rule-oracle" else {}),
+              **({"blocks": args.blocks} if args.blocks is not None else {}),   # course_base 的块数；其它任务不写键，旧输出逐位不变
               "waypoint_radius": WAYPOINT_RADIUS,
               "stop_radius": stop_radius_used,
               "geometry_version": cp.task_geometry_version(args.task),

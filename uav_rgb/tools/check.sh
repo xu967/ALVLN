@@ -150,6 +150,7 @@ PY
 echo "PASS: preprocess 教师标签/几何隔离/重复目录/split 门禁 负例"
 "$UAV_RGB_PYTHON" "$uav_check_root/sim/tools/teacher.py"
 "$UAV_RGB_PYTHON" "$uav_check_root/sim/tools/scene_gen.py" --self-check
+"$UAV_RGB_PYTHON" "$uav_check_root/sim/tools/scene_course.py" --self-check
 "$UAV_RGB_PYTHON" "$uav_check_root/sim/tools/gz_io.py" --self-check
 "$UAV_RGB_PYTHON" "$uav_check_root/tools/airsim_to_uavr.py" --self-check
 "$UAV_RGB_PYTHON" "$uav_check_root/tools/baseline_priors.py" --self-check
