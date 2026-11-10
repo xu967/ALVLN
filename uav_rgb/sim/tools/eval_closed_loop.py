@@ -50,6 +50,11 @@ REACH_RADIUS = 1.5
 # （collect.py --stop-at-goal），过线后不再有碰撞/超时，SR 不随 --steps 变；每集多记
 # stopped_on_goal / steps_to_goal。v1 的数字过线后继续飞，碰撞可能发生在过线之后，不可与 v2 混报。
 METRIC_VERSION = "sim09.v2"
+# 柱阵任务的横向边界（2026-11-10）：route_choice 原先只判 max_x >= goal_x，世界里没有墙，
+# 学生从柱阵旁边绕到 y=-17 m 再横穿成功线也会被记成成功（eval4 截断 seed1 的 20/20 里 8 集）。
+# --corridor-half-width 给值后要求 oracle pose_gt 全程 |y| <= 该值，否则 success=False；
+# 默认 None 逐位保持旧口径，metric_version 加 .corridor<N>m 后缀，新旧数字不可混报。
+CORRIDOR_HALF_WIDTH_DEFAULT = None
 # cf_sitl（固件在环）下 FORWARD 到期后机体还会滑行，碰撞步的 action 多半已是 SAFE/YAW；
 # false_forward 改成「碰撞前 1 s 仿真内下过 FORWARD」。metric_version 带后缀，数字不与旧档混报。
 COAST_WINDOW_S = {"cf_sitl": 1.0}
@@ -422,7 +427,8 @@ def spl_of(success, path_m, shortest_m):
 
 def summarize_episode(actions, oracle, goal_x, waypoint=None,
                       waypoint_radius=WAYPOINT_RADIUS, stop_radius=None, goal_radius=None,
-                      timed_out=False, coast_window_s=None, shortest_path_m=None):
+                      timed_out=False, coast_window_s=None, shortest_path_m=None,
+                      corridor_half_width=None):
     """单集指标；纯函数，便于单测。actions/oracle 是 jsonl 行。
 
     EVAL_STANDARD §5.1：stuck（FORWARD 位移 < 阈值）不是碰撞，碰撞率只看 contact。
@@ -458,6 +464,8 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
     goal_radius_stop = float(stop_radius) if stop_radius is not None else None
     metric_version = (METRIC_VERSION if coast_window_s is None
                       else f"{METRIC_VERSION}.coast{coast_window_s:g}s")
+    if corridor_half_width is not None:
+        metric_version += f".corridor{corridor_half_width:g}m"
     if not actions:
         return {"steps": 0, "collision": False, "stuck": False, "false_forward": False,
                 "success": False, "stop_success": False, "max_x": None,
@@ -468,6 +476,7 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
                 "stuck_free": True, "task_success": False,
                 "stable_termination": None, "timed_out": bool(timed_out),
                 "metric_version": metric_version,
+                "y_max_m": None, "corridor_violation": False,
                 "goal_radius_reach": REACH_RADIUS,
                 "goal_radius_stop": goal_radius_stop,
                 "path_length_m": None, "shortest_path_m": shortest_path_m, "spl": None,
@@ -485,6 +494,13 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
     xs = [float(o["pose_gt"]["x"]) for o in oracle
           if isinstance(o.get("pose_gt"), dict) and "x" in o["pose_gt"]]
     max_x = max(xs) if xs else None
+    # 横向越界只看有真值 pose_gt 的集；waypoint 任务（l1/campus）的 waypoint 本身就在柱阵外侧
+    # （|y| 可达 2.4 m），只对 route_choice 这种「穿越验收线」的判据生效。
+    ys = [abs(float(o["pose_gt"]["y"])) for o in oracle
+          if isinstance(o.get("pose_gt"), dict) and "y" in o["pose_gt"]]
+    y_max = max(ys) if ys else None
+    corridor_violation = bool(corridor_half_width is not None and y_max is not None
+                              and y_max > float(corridor_half_width))
     wp_min = wp_final = None
     nearest_i = None
     if isinstance(waypoint, dict):
@@ -519,7 +535,8 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
                             and wp_final <= radius)
     else:
         reached = wp_min is None or wp_min <= waypoint_radius
-        success = bool(not collision and max_x is not None and max_x >= goal_x and reached)
+        success = bool(not collision and max_x is not None and max_x >= goal_x and reached
+                       and not corridor_violation)
         stop_success = success
     collision_free = not collision
     reach_ever = bool(collision_free and wp_min is not None
@@ -549,6 +566,7 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
             # 只有 oracle 带真值速度（cf_sitl）才能判；其余档 None，不等于通过。
             "stable_termination": stable_termination, "timed_out": bool(timed_out),
             "metric_version": metric_version,
+            "y_max_m": y_max, "corridor_violation": corridor_violation,
             "goal_radius_reach": REACH_RADIUS,
             "goal_radius_stop": goal_radius_stop,
             # SPL 三件：p_i（oracle xy 折线，截到首次到达）、l_i（调用方给的教师参考路长）、S_i·l_i/max(p_i,l_i)。
@@ -581,12 +599,15 @@ def aggregate(episodes, requested=None, attempted=None, failed_count=0, skipped_
         return (sum(1 for e in done if e.get(key)) / n) if n else None
 
     successes = sum(1 for e in done if e.get("success"))
+    corridor_violations = sum(1 for e in done if e.get("corridor_violation"))
     # SPL 只在算出 l_i 的集上平均（A* 无路 / 旧 eval.json 没有该字段的集不进分母，spl_n 单列）；
     # requested_spl 与 requested_success_rate 同口径：失败/跳过集记 0，只有全部完成集都有 spl 时才给。
     spls = [float(e["spl"]) for e in done if e.get("spl") is not None]
     return {
         "episodes_done": n,
         "success_rate": rate("success"),
+        # 越界集数：开了 --corridor-half-width 才有意义，没开时应为 0。
+        "corridor_violations": corridor_violations,
         "spl": (sum(spls) / len(spls)) if spls else None,
         "spl_n": len(spls),
         "requested_spl": (sum(spls) / requested) if requested and spls and len(spls) == n else None,
@@ -783,7 +804,8 @@ def run_episode(seed, args, workdir, seen_gids):
                                 WAYPOINT_RADIUS, meta.get("stop_radius"), meta.get("goal_radius"),
                                 timed_out=(rc == "timeout"),
                                 coast_window_s=COAST_WINDOW_S.get(args.dynamics),
-                                shortest_path_m=episode_shortest_path_m(args, meta, oracle, goal_x))
+                                shortest_path_m=episode_shortest_path_m(args, meta, oracle, goal_x),
+                                corridor_half_width=args.corridor_half_width)
     summary.update({
         "seed": seed, "geometry_gid": gid, "split": split, "policy": args.policy,
         "task": args.task, "window_from": args.window_from,
@@ -1012,6 +1034,10 @@ def main():
                    help="成功 = 无碰撞且 max_x >= 最远柱 x + 该余量。sim09.v2 起 collect.py --stop-at-goal "
                         f"在同一条线上结束本集，余量只接受 collect.GOAL_MARGIN_M={GOAL_MARGIN_M:g}（改它会让"
                         "停线与评测线不一致）")
+    p.add_argument("--corridor-half-width", type=float, default=CORRIDOR_HALF_WIDTH_DEFAULT,
+                   help="route_choice 任务的横向边界（m）：oracle pose_gt 全程 |y| 超过它就判本集不成功。"
+                        "默认关（旧口径逐位不变）；建议 3.0（scene_gen.Y_RANGE 的走廊边界）。"
+                        "开了以后 metric_version 带 .corridor<N>m，新旧 SR 不可混报")
     p.add_argument("--sim-timeout", type=float, default=120.0)
     p.add_argument("--episode-timeout", type=float, default=600.0)
     p.add_argument("--keep-work", action="store_true", help="保留 world/每集原始文件")
@@ -1186,6 +1212,15 @@ def main():
     return rc
 
 
+def report_metric_version(args):
+    """eval.json 顶层的 metric_version：与 summarize_episode 同一套后缀规则（coast / corridor）。"""
+    v = (METRIC_VERSION if args.dynamics not in COAST_WINDOW_S
+         else f"{METRIC_VERSION}.coast{COAST_WINDOW_S[args.dynamics]:g}s")
+    if args.corridor_half_width is not None:
+        v += f".corridor{args.corridor_half_width:g}m"
+    return v
+
+
 def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_dim, infer_bin, started):
     """汇总 + 写 <out>/eval.json + 打印；返回进程退出码（中断时是 143/130/1）。"""
     results, failures, skips = state["results"], state["failures"], state["skips"]
@@ -1206,8 +1241,7 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
               "text_mode": args.text_mode, "text_dim": text_dim,
               # 新指标合同（SIM-09）；旧 success/stop_success 定义不变。
               # cf_sitl 带 .coast 后缀：false_forward 按滑行窗口判，数字不与旧档混报。
-              "metric_version": (METRIC_VERSION if args.dynamics not in COAST_WINDOW_S else
-                                 f"{METRIC_VERSION}.coast{COAST_WINDOW_S[args.dynamics]:g}s"),
+              "metric_version": report_metric_version(args),
               "coast_window_s": COAST_WINDOW_S.get(args.dynamics),
               # 成功语义跟着数据走：L1 是 goal_reach_ever「轨迹上曾进入 waypoint
               # 1.5 m 且无碰撞」，旧数据是 route_choice「越过终点」。不写死会让新旧
@@ -1248,6 +1282,7 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
               "ood": ood,
               "strict_protocol": args.strict_protocol,
               "goal_margin": args.goal_margin,
+              "corridor_half_width": args.corridor_half_width,
               "waypoint_radius": WAYPOINT_RADIUS,
               "stop_radius": stop_radius_used,
               "geometry_version": cp.task_geometry_version(args.task),
@@ -1300,6 +1335,9 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
     im = agg["inference_ms"]
     print(f"inference p50={im['p50']}ms p95={im['p95']}ms "
           f"(warm n={im['n_warm']}; cold first={im['cold_first_ms']})")
+    if args.corridor_half_width is not None:
+        print(f"corridor: half_width={args.corridor_half_width:g}m "
+              f"violations={agg['corridor_violations']}/{agg['episodes_done']}")
     print(f"action distribution: {agg['action_distribution']}")
     print(f"-> {path}" + ("  （partial=true：中断写出的部分结果）" if interrupted else ""))
     if interrupted:

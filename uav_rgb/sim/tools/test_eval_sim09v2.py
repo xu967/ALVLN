@@ -67,8 +67,11 @@ class Sim09V2Tests(unittest.TestCase):
                 on_collect(seed)
             rows = [json.dumps({"action_executed": 1, "collision": False, "infer_ms": 2.0}) for _ in oracle_x]
             (episode / "actions.jsonl").write_text("\n".join(rows) + "\n")
+            # oracle_x 的元素可以是 x（y=0）或 (x, y)：横向边界测试要构造绕开柱阵的轨迹。
             (episode / "oracle.jsonl").write_text(
-                "\n".join(json.dumps({"pose_gt": {"x": x, "y": 0.0}}) for x in oracle_x) + "\n")
+                "\n".join(json.dumps({"pose_gt": {"x": p[0], "y": p[1]}} if isinstance(p, tuple)
+                                      else {"pose_gt": {"x": p, "y": 0.0}})
+                           for p in oracle_x) + "\n")
             (episode / "rgb_00000.png").write_bytes(b"\x89PNG fake frame")
             (episode / "episode_manifest.json").write_text(json.dumps(
                 {"num_steps": len(oracle_x), "stopped_on_goal": stopped_on_goal,
@@ -132,6 +135,44 @@ class Sim09V2Tests(unittest.TestCase):
         self.assertEqual(report["success_criterion"], "goal_reach_ever")
         self.assertEqual(report["metric_version"], "sim09.v2")
         self.assertFalse(report["per_episode"][0]["stopped_on_goal"])
+
+    # ---- 2026-11-10：route_choice 的横向边界（opt-in） ----
+    def test_corridor_off_by_default_keeps_legacy_numbers(self):
+        """默认不开：轨迹绕到 y=-8 m 也按旧口径判成功，metric_version 逐字 sim09.v2。"""
+        seed = test_seeds(1)[0]
+        rc, report, _c, _w, _out = self.run_eval([seed], oracle_x=((0.0, 0.0), (2.0, -4.0), (4.6, -8.0)))
+        self.assertEqual(rc, 0)
+        self.assertEqual(report["metric_version"], "sim09.v2")
+        self.assertIsNone(report["corridor_half_width"])
+        ep = report["per_episode"][0]
+        self.assertTrue(ep["success"])
+        self.assertAlmostEqual(ep["y_max_m"], 8.0)
+        self.assertFalse(ep["corridor_violation"])
+
+    def test_corridor_rejects_detour_around_pillar_field(self):
+        """开 3 m：同一集判失败、y_max/corridor_violation 落盘、metric_version 带后缀。"""
+        seed = test_seeds(1)[0]
+        rc, report, _c, _w, _out = self.run_eval([seed], extra_argv=("--corridor-half-width", "3.0"),
+                                                 oracle_x=((0.0, 0.0), (2.0, -4.0), (4.6, -8.0)))
+        self.assertEqual(rc, 0)
+        self.assertEqual(report["metric_version"], "sim09.v2.corridor3m")
+        self.assertEqual(report["corridor_half_width"], 3.0)
+        ep = report["per_episode"][0]
+        self.assertFalse(ep["success"], "轨迹 |y| 到 8 m，超过 3 m 边界不能算成功")
+        self.assertTrue(ep["corridor_violation"])
+        self.assertAlmostEqual(ep["y_max_m"], 8.0)
+        self.assertEqual(report["corridor_violations"], 1)
+
+    def test_corridor_passes_straight_through(self):
+        """开 3 m：直线穿过（|y|<=0.5）仍然成功。"""
+        seed = test_seeds(1)[0]
+        rc, report, _c, _w, _out = self.run_eval([seed], extra_argv=("--corridor-half-width", "3.0"),
+                                                 oracle_x=((0.0, 0.0), (2.0, 0.4), (4.6, -0.5)))
+        self.assertEqual(rc, 0)
+        ep = report["per_episode"][0]
+        self.assertTrue(ep["success"])
+        self.assertFalse(ep["corridor_violation"])
+        self.assertAlmostEqual(ep["y_max_m"], 0.5)
 
     # ---- A7：l_i 净空 = 机体半径（物理可行下界），不是教师规划余量 ----
     def test_spl_reference_uses_body_radius(self):
