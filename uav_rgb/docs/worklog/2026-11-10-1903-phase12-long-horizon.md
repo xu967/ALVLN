@@ -1,0 +1,128 @@
+# 第十二阶段：查进度、任务难度与数据集、长程任务的方案、开源对比、计划与任务卡
+
+- 时间：2026-11-10 19:03 起（Cursor 会话，主会话负责思考、设计、审 diff、合并；代码改动全部由 Sonnet 5.5 Max 的 subagent 做）
+- 范围：`uav_rgb` 全仓。计划 `docs/PLAN_2026-11-10_phase12.md`；任务卡 `docs/briefs/2026-11-10-phase12-task-cards.md`；
+  公共规则 `docs/briefs/2026-11-10-phase12-common.md`；subagent 报告 `docs/reviews/2026-11-10-phase12/`；11 个零训练闭环实验。
+- 结论：部分完成。计划、任务卡、当晚的零训练实验与代码合并完成；训练类工作没有开始，等协议拍板（计划 §8）；本文末尾列出仍在跑的守护进程。
+
+用户 19:03 的七条要求与落点：
+
+| 要求 | 落点 |
+| --- | --- |
+| 1 查进度与结果 | 计划 §1；下午三个守护进程全部结束，终表在 §1.1、§1.2 |
+| 2 任务是否太简单，要不要换数据集 | 计划 §2、§3；报告 `complexity.md`、`bench.md`、`sage3d.md` |
+| 3 代码上传 GitHub | `bash tools/git_mirror_alvln.sh`，19:12 第一次推送，收尾时第二次（见「验证到哪一步」） |
+| 4 数据与实验结果放 `/root/rivermind-data`，代码放根目录 | 代码、测试、实验入口脚本在仓库；数据、权重、实验输出、第三方基线在 `/root/rivermind-data/uav_rgb`；仓库位置没有动（待确认第 9 条） |
+| 5 算法优化、长任务、复杂场景 | 计划 §4；四组上限实验（路线护栏、规则层 v0 与 v1、长课程、室内试点） |
+| 6 与开源算法对比 | 计划 §5；包装器 `sim/tools/baselines/`；零样本闭环实验 |
+| 7 做计划并推进；改代码只用 Sonnet 5.5 Max 或写成 md 给 deepseek | 计划 §6 批次；任务卡 19 张；当晚 13 个 Sonnet 5.5 Max 的 subagent（19:03 之后起的） |
+
+## 做了什么
+
+### 结果核对与只读调研
+
+- 核对下午的三个守护进程（权重平均校准、航向护栏、DAgger 流水线），全部 `DONE rc=0`。柱阵 60 集终表：`ckpt_best` 27、只平均 20、只校准 36、
+  平均加校准 39、`ckpt_best` 加护栏 47、平均校准加护栏 50。DAgger 聚合臂 1/20。
+- 三个只读调研 subagent：任务难度量化（`complexity.md`）、数据集与基准选型（`bench.md`）、开源基线选型（`baselines.md`）。
+
+### 代码（subagent 在各自工作树里改，主会话审 diff 后合并进 main）
+
+| 分支 | 合并提交 | 内容 |
+| --- | --- | --- |
+| `p12-c1` | 155e377 | `--heading-guard` 入库（默认 0 行为逐位不变）；下午两个实验的入口脚本归档 |
+| `p12-bearing3dgs` | bd3a034 | `sim/3dgs/guard.py`：oracle 路线 / 终点方位护栏，24 项测试；实验入口 |
+| `p12-ruleoracle` | 564f883 | `sim/tools/rule_policy.py` 规则 v0；`--policy rule-oracle`；实验入口 |
+| `p12-longcourse` | ef68141、97658ee | `--task course_base --blocks K`（`scene_course.py`）；A* 栅格可走性缓存（路径逐位不变）；`run_v2.sh`；汇总脚本的时序健康表 |
+| `p12-avgckpt` | 35be6d0 | `tools/average_ckpt.py`（末 k 轮平均加 FORWARD 先验校准），17 项测试，复现下午 6 个权重逐位相同 |
+| `p12-sage3d` | 938cae9、032760b | `tools/nurec_to_ply.py`、`tools/scene_import_sage3d.py`（InteriorGS 场景与 SAGE-3D 路线导入）；室内试点入口 |
+| `p12-baselines` | e87a6ad | `sim/tools/baselines/`：PULP-Dronet v3、Tiny-PULP、DroNet 的行协议包装器；零样本实验入口 |
+| `p12-rulev1` | 999f014 | 规则 v1（短期障碍记忆加候选航向选择）、`--rule-version`、离线运动学模拟；实验入口 |
+
+合并 `p12-longcourse` 时 `eval_closed_loop.py` 的 `write_report` 有一处冲突（两个分支在同一位置各加一个字典键），两个键都保留。
+每次合并后跑了相关的 `test_*.py`；收尾时在 main 上跑 `check.sh --python-only`。
+
+### 实验（全部零训练；入口在 `experiments/2026-11-10-*/`，输出在 `$D=/root/rivermind-data/uav_rgb`）
+
+| 实验 | 输出目录 | 结果 |
+| --- | --- | --- |
+| 3DGS 室外路线方位护栏 2×2 | `$D/exp-bearing-guard-3dgs-20261110/` | 盲飞 0.31；盲飞加路线护栏 0.89；学生加护栏 0.88；教师 0.83 |
+| 规则层 v0 | `$D/exp-rule-oracle-20261110/` | 38/60，低于证伪线 48 |
+| 规则层 v1 | `$D/exp-rule-oracle-v1-20261110/` | 60° 视场 57/60、撞柱 0；3 块课程 11/20；81° 视场见计划 §1.3 |
+| 长课程第一轮 | `$D/exp-long-course-20261110/` | 20:46 由主会话按 PGID 中止（时序混杂） |
+| 长课程第二轮 | `$D/exp-long-course-v2-20261110/` | 教师 19/20；学生加护栏逐块 0.65 / 0.45 / 0.32；无护栏 0.45 / 0.23 / 0.17 |
+| 单块柱阵对照 | `$D/exp-k1-control-20261110/` | 17/20，与下午相同 |
+| SAGE-3D 室内试点 | `$D/exp-sage3d-pilot-20261110/` | 教师 0.63；盲飞加路线护栏 0.60；学生加护栏 0.57 |
+| 室内教师容差诊断 | `$D/exp-sage3d-pilot-20261110-diag-teachertol18/` | 0.84 |
+| 公开小模型零样本 | `$D/exp-baselines-zeroshot-20261110/` | 见计划 §1.3 |
+
+主会话自己做的实验决定：
+
+- 20:46 停掉长课程第一轮（`kill -TERM -- -1372765`）。原因是 `--window-from observation` 下每步动作生效时长随 A* 耗时变，3 块课程是 0.77 s，单块柱阵 0.871 s。
+- 20:59 放行室内试点的其余臂（预注册的教师闸门没过；其余三个臂不走教师的转向逻辑；原判决保留在 `gate_prereg.json`）。
+- 规则 v0 判负后，按预注册的后续步骤设计规则 v1（设计写在计划 §1.3 与 `experiments/2026-11-10-rule-oracle-v1/run.sh` 文件头），取消 `rule81` 的 v0 臂。
+- 基线实验去掉 `dronet-guard2` 臂，排到长课程之后起跑；22:25 长课程第二轮结束后写 `$D/exp-long-course-20261110/DONE` 放行。
+- 21:25 起单块柱阵对照（入口 `experiments/2026-11-10-k1-control/run.sh`，主会话写的 30 行启动脚本，不改任何库代码）。
+
+### 文档
+
+- `docs/PLAN_2026-11-10_phase12.md`：结论、结果表、任务难度与任务阶梯、数据集结论、方案、开源对比、批次、待拍板、没做什么。
+- `docs/briefs/2026-11-10-phase12-task-cards.md`：19 张任务卡（W1-0 至 W1-11、W2-1 至 W2-6、K1）加第三波规格，给 deepseek 或 Sonnet 5.5 Max 执行。
+- `docs/briefs/2026-11-10-phase12-common.md`：执行任务卡的公共规则。
+- `docs/reviews/2026-11-10-phase12/`：12 份 subagent 报告归档。
+- `progress.md` 头部新增本阶段一节。
+
+## 没做什么
+
+- 没有训练任何模型。
+  - 原因：协议要先定（动作派发时延、满电起飞、巡航高度、视场、hold）。这五项任何一项改了，新数据都不能与旧数据混包；先训再改要重采多次。
+- 没有把仓库搬到 `/root/uav_rgb`。
+  - 原因：「代码放根目录」有两种读法。当时有 5 个以上守护进程用着仓库的绝对路径，`.venv-tools` 与 36 个 worktree 的登记也带绝对路径。列在待确认。
+- 没有根治时序混杂，只加了 A* 栅格缓存。
+  - 原因：根治要改 `collect.py` 的派发逻辑（任务卡 W1-0），当晚已派给 subagent，结果见文末更新。
+- 没有分清长课程第 1 块下降的两个候选原因（远处柱子进画面；每集第一步因冷缓存只生效一半时长）。
+  - 原因：分开它们要在固定派发时延的协议下重跑 120 集，写进了 W1-0 的验收第 4 项。
+- 规则 v1 的长课程臂只跑了 1 次 20 集，81° 视场跑了 3 次。没有在满电档上重跑长课程。
+  - 原因：满电档要参数副本并换动力学指纹（任务卡 W1-10），没有做。
+- 没有修 3DGS 教师的极限环（只做了容差 18° 的诊断），没有跑 3DGS 上的规则层上限。
+  - 原因：两项当晚已派给 subagent（W1-11、K1），结果见文末更新。
+- 没有跑基线的重训臂、Depth-Anything-V2、任何 7B 级模型。
+  - 原因：重训要先有基线 v2 的数据与配方；大模型权重 15–17 GB，数据盘只剩 14 GB。
+- 没有做 T3（带指令的多步任务）的任何实验；没有做多航点路线、程序化障碍、航位推算路书实验。
+  - 原因：排在 T1、T2 的结论之后（计划 §6 批次 J–N）。
+- 没有改 `ui/`；没有改 C++ 与 CUDA；没有往任何 venv 里装包。
+- 没有清理数据盘、分支、worktree。没有删除任何文件。
+  - 原因：等用户确认清单（计划 §8 第 7 条）。当晚新增 worktree 11 个（`/root/claude-code-backup-20261028/code/wt/p12-*`）。
+- 没有逐像素对拍新旧 E1 模板的机载画面。
+  - 原因：单块柱阵对照的闭环结果相同（17/20 对 17/20），对当晚的结论够用；放量采数据之前仍建议做一次。
+- 没有真机数据。
+
+## 待确认
+
+见计划 §8，共 9 条。影响面最大的三条：
+
+1. 协议一次性升级：动作派发固定时延、满电起飞、巡航 1.2–1.5 m、视场是否改 81°、3DGS 与室内任务的 hold 取 0.5。
+2. InteriorGS 与 SAGE-3D 是非商业许可，只能做研究，场景与渲染图不能再分发。是否接受。
+3. 仓库是否搬到 `/root/uav_rgb`。
+
+## 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| 每次合并后的相关测试（`test_rule_policy`、`test_rule_oracle_wiring`、`test_rule_v1`、`test_rule_v1_wiring`、`test_scene_course`、`test_astar_cache`、`test_course_summary`、`test_teacher_policy`、`teacher.py --self-check`） | 全部通过 |
+| main 上 `UAV_RGB_PYTHON=$R/.venv-tools/bin/python bash tools/check.sh --python-only`（21:40，合并 `p12-rulev1` 与 `p12-sage3d` 之后） | rc=0，「PASS（有 SKIP）」；日志 `$D/tmp/phase12-20261110/main/check_python_only_2140.log` |
+| 全量 `check.sh`（C++ / CUDA 构建、CTest、GPU 测试） | 未跑。当晚没有改 C++ 与 CUDA |
+| `sim/3dgs/test_*.py` | 各 subagent 在自己的分支上跑过（`bearing3dgs.md`、`sage3d.md` 的验证表）；主会话合并后没有重跑全部 |
+| GitHub 推送 | 19:12 推到 ALVLN `e82c865..41a2b7b`（对应 main e125b3c）；收尾推送见文末更新 |
+| 各实验的 `DONE` | 见「做了什么」的实验表与文末更新 |
+| 单块柱阵对照的预测 | 「仍在 17/20 上下且逐集一致率不低于 70%」：17/20，一致 16/20，成立 |
+
+## 风险与遗留
+
+- 当晚所有 Gazebo 数字都在旧时序协议下（每步生效 0.85–0.89 s，随策略耗时变）。跨场景、跨策略的比较要看各实验汇总里的时序健康表；
+  长课程无护栏臂的三个种子偏离参照 3.2–5.9%，它的预注册判定作废。
+- 半电量配置下一集约 100 步。长课程里拖过 130 步的集全部因电量失败，绕行多的策略被电量判负。
+- 3DGS 线的教师在 hold 1.0 下有极限环，室内教师只有 0.63。修好之前不要用它放量采数据。
+- 规则 v1 与 3DGS 护栏用的是真值位姿与真值几何，带 `oracle` 的臂不是学生的能力。
+- 读数用的临时脚本没有进仓库：`$D/tmp/phase12-20261110/main/{status,coll_x,first_steps,diverge}.py`。计划里引用它们的数字有三处
+  （第 0 步动作分布、撞柱位置分布、前几步位移）。
+- 数据盘剩 14 GB，根分区剩 2.3 GB。
