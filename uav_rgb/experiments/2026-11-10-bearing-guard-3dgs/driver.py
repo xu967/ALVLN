@@ -13,6 +13,10 @@ stop_on_collision=True、split="test"、split_policy="diag-eval-fixed-test"（�
      （actions / oracle / trace / manifest 都在，轨迹可复原）。
 每个 (臂, 场景, 路线) 结束写 <OUT>/<臂>/<场景>/r<N>/done.json，再起时据此跳过；半成品改名 *.incomplete-<时刻> 后重跑。
 用法：cd <WT> && <3dgs-venv python> driver.py <OUT> <场景> [臂名 ...]     不给臂名 = config.json 里全部（顺序即优先级）
+可选的 config.json 键（缺省时行为与原版逐位一致，2026-11-10-sage3d-pilot 共用本驱动）：
+  routes    列表 = 所有场景用同一批路线（原写法）；字典 {场景: [路线下标 ...]} = 每个场景各自的路线（场景没有路线则直接退出，不加载）
+  step_cap  每路线步数封顶：steps = min(step_cap, ceil(max_steps × step_frac) + step_pad)；缺省不封顶
+  teacher_tol_deg  教师航向容差（度），传给 OccAstarTeacher(tol_deg=…)；缺省不传，用 planner.YAW_TOL_DEG（12°）
 """
 import importlib
 import json
@@ -88,6 +92,10 @@ def drop_frames(ep_dir):
             os.remove(os.path.join(ep_dir, f))
 
 
+ROUTES = CFG["routes"][SCENE] if isinstance(CFG["routes"], dict) else CFG["routes"]   # KeyError = 字典里漏了这个场景，直接报
+if not ROUTES:
+    log("该场景没有要跑的路线，退出（不加载场景）")
+    sys.exit(0)
 path = os.path.join(CFG["scenes_dir"], SCENE, "scene.json")
 raw_routes = json.load(open(path, encoding="utf-8"))["routes"]
 t0 = time.time()
@@ -104,7 +112,7 @@ for arm in ARMS:
     g = arm["name"]
     student = StudentPolicy(arm["ckpt"], CFG["infer_bin"]) if arm["base"] == "student" else None
     try:
-        for r in CFG["routes"]:
+        for r in ROUTES:
             d = os.path.join(OUT, g, SCENE, f"r{r}")
             if finished(d):
                 log(f"[{g}] r{r} 跳过（done.json 已完成）")
@@ -116,6 +124,8 @@ for arm in ARMS:
             scene_mod.apply_route(sc, r)
             wp = (float(sc["waypoint"]["x"]), float(sc["waypoint"]["y"]))
             steps = math.ceil(raw_routes[r]["max_steps"] * CFG["step_frac"]) + CFG["step_pad"]
+            if CFG.get("step_cap") is not None:
+                steps = min(CFG["step_cap"], steps)
             identity = c3.scene_identity(sc, ply_sha256=ply_sha)
             eps, fails, tr = [], [], time.time()
             teacher = None
@@ -123,7 +133,8 @@ for arm in ARMS:
                 check = planner_mod.route_check(occ_planner, sc["spawn"], sc["waypoint"])
                 if not check["feasible"]:
                     fails.append({"episode": None, "error": f"route_check 不可达 {check}"})
-                teacher = planner_mod.OccAstarTeacher(occ_planner, sc["waypoint"])
+                teacher = planner_mod.OccAstarTeacher(
+                    occ_planner, sc["waypoint"], **({"tol_deg": CFG["teacher_tol_deg"]} if "teacher_tol_deg" in CFG else {}))
             for k in range(CFG["k"] if not fails else 0):
                 seed = CFG["seed0"] + 100 * r + k
                 ep_dir = os.path.join(d, "ep_%05d" % k)
