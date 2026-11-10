@@ -759,6 +759,8 @@ def run_episode(seed, args, workdir, seen_gids):
             cmd += ["--student-ckpt", args.ckpt]
             if args.infer_bin:
                 cmd += ["--infer-bin", args.infer_bin]
+            if args.heading_guard:
+                cmd += ["--heading-guard", str(args.heading_guard)]   # 0 不传：旧命令行逐字不变
         elif args.policy == "teacher-nn":
             cmd += ["--teacher-ckpt", args.teacher_ckpt]
         elif args.policy == "teacher-rl":
@@ -1038,6 +1040,9 @@ def main():
                    help="route_choice 任务的横向边界（m）：oracle pose_gt 全程 |y| 超过它就判本集不成功。"
                         "默认关（旧口径逐位不变）；建议 3.0（scene_gen.Y_RANGE 的走廊边界）。"
                         "开了以后 metric_version 带 .corridor<N>m，新旧 SR 不可混报")
+    p.add_argument("--heading-guard", type=int, default=0,
+                   help="透传给 collect.py（仅 --policy student）：已执行的左转数减右转数的绝对值达到 N 就朝回转一步；"
+                        "0=关闭。它改的是策略不是判据，eval.json 顶层记 heading_guard，不动 metric_version")
     p.add_argument("--sim-timeout", type=float, default=120.0)
     p.add_argument("--episode-timeout", type=float, default=600.0)
     p.add_argument("--keep-work", action="store_true", help="保留 world/每集原始文件")
@@ -1093,6 +1098,8 @@ def main():
         p.error("max-seeds >= episodes")
     if not (math.isfinite(args.hold) and args.hold > 0):
         p.error("--hold 必须是有限正数")
+    if args.heading_guard < 0 or (args.heading_guard and args.policy != "student"):
+        p.error("--heading-guard 必须是非负整数，且只能和 --policy student 一起用")
     if args.dynamics == "cf_blackbox":
         p.error("cf_blackbox 是纯 Python 模型档，Gazebo 闭环未接入；"
                 "请让 3DGS collector 直接调用 cf_blackbox，或改用 cf_stab/x3_velocity")
@@ -1283,6 +1290,7 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
               "strict_protocol": args.strict_protocol,
               "goal_margin": args.goal_margin,
               "corridor_half_width": args.corridor_half_width,
+              **({"heading_guard": args.heading_guard} if args.heading_guard else {}),
               "waypoint_radius": WAYPOINT_RADIUS,
               "stop_radius": stop_radius_used,
               "geometry_version": cp.task_geometry_version(args.task),

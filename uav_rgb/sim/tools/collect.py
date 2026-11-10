@@ -799,6 +799,18 @@ def take_off_cf_sitl(pose_sub, ex, contact_sub=None):
 
 # ---------------------------------------------------------------- 单步
 
+def heading_guard_action(net_yaw, threshold):
+    """航向护栏（R1 判别实验，2026-11-10）：净转向步数 |n| 达到阈值就朝回转一步，否则 None（不干预）。
+
+    net_yaw = 已执行的 YAW_LEFT 数减 YAW_RIGHT 数，机体自己数得出来，不是特权信息；threshold <= 0 关闭。
+    用途：学生闭环一半的步视锥内没有柱子，正确动作只由「已经偏了多少」决定而图像相同；
+    这条规则不重训就能判别「缺航向」是不是出阵的主因。
+    """
+    if threshold > 0 and abs(net_yaw) >= threshold:
+        return YAW_RIGHT if net_yaw > 0 else YAW_LEFT
+    return None
+
+
 def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 prev_action=None, prev_rgb_ts=0, pillars=None, student=None,
                 global_plan=True, window_from="dispatch", waypoint=None,
@@ -806,7 +818,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 teacher_nn=None, text_ids=None, contact_seq0=None, dyn=None,
                 predictive_teacher=None, rl_teacher=None, sil=None,
                 tiebreak="legacy", beta=0.0, rng=None, prev_executed=None,
-                costmap_opts=None):
+                costmap_opts=None, heading_guard=0, net_yaw=0):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。
 
     dyn=None 为 x3_velocity 旧行为（定速 + 窗口末刹停）；给 CfStab 时按摇杆模型
@@ -934,6 +946,9 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 action, executed_by = label, "expert"
             else:
                 executed_by = "student"
+        guard = heading_guard_action(net_yaw, heading_guard)
+        if guard is not None:
+            action, executed_by = guard, "heading_guard"
     elif policy == "teacher-nn":
         if teacher_nn is None:
             return None, "teacher-nn 策略未初始化"
@@ -1342,6 +1357,9 @@ def main():
                         " 同义；0=全由学生执行（现状）。标签始终是教师动作")
     p.add_argument("--dagger-round", type=int, default=0,
                    help="--policy student 写进 manifest 的 DAgger 轮次（溯源用，0=首轮）")
+    p.add_argument("--heading-guard", type=int, default=0,
+                   help="--policy student 的航向护栏（R1 判别实验）：已执行的左转数减右转数的绝对值达到 N 就朝回转一步；"
+                        "0=关闭（默认，行为逐位不变）。被护栏改写的步 executed_by=heading_guard")
     p.add_argument("--scene-id", type=int, default=0, help="EpisodeMeta.scene_id（场景隔离关键字段）")
     p.add_argument("--seed", type=int, default=0, help="EpisodeMeta.seed")
     p.add_argument("--episode-id", type=int, default=None, help="EpisodeMeta.episode_id（默认=seed）")
@@ -1375,6 +1393,8 @@ def main():
         p.error("--beta 必须在 [0, 1]")
     if args.dagger_round < 0:
         p.error("--dagger-round 必须是非负整数")
+    if args.heading_guard < 0 or (args.heading_guard and args.policy != "student"):
+        p.error("--heading-guard 必须是非负整数，且只能和 --policy student 一起用")
     if args.stop_at_goal and not args.scene_meta:
         p.error("--stop-at-goal 需要 --scene-meta（成功线由柱子真值定）")
     if args.tiebreak != "legacy" and not (args.scene_meta and (
@@ -1551,6 +1571,7 @@ def main():
     stopped_on_goal = False
     prev_action = None
     prev_executed = None
+    net_yaw = 0                # 已执行的 YAW_LEFT 数减 YAW_RIGHT 数（--heading-guard 用）
     prev_rgb_ts = 0
     timings = []
     # DAgger（--policy student）：β 混合的随机源按 seed 固定，同 seed 可复现哪些步换成了教师执行。
@@ -1657,13 +1678,15 @@ def main():
                                     predictive_teacher=predictive_teacher,
                                     rl_teacher=rl_teacher, sil=sil,
                                     tiebreak=args.tiebreak, beta=args.beta, rng=rng,
-                                    prev_executed=prev_executed, costmap_opts=costmap_opts)
+                                    prev_executed=prev_executed, costmap_opts=costmap_opts,
+                                    heading_guard=args.heading_guard, net_yaw=net_yaw)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
                 break
             prev_action = r["action_expert"]   # 下一步的滞回基准
             prev_executed = r["action_executed"]
+            net_yaw += (prev_executed == YAW_LEFT) - (prev_executed == YAW_RIGHT)
             if dagger is not None and r.get("executed_by") == "expert":
                 dagger["n_expert_executed"] += 1
             # 只推进到本步已检查的序号，步间漂移产生的事件归下一步。
@@ -1832,6 +1855,8 @@ def main():
             # DAgger 影子教师（--policy student + scene-meta）：谁执行了动作、β、轮次、学生 ckpt。
             # 字段名与 sim/3dgs/collect_3dgs.py 一致；教师自采不写这些键，preprocess 按 teacher/0/1.0 补。
             **(dagger or {}),
+            # 航向护栏只在开了的时候写键：默认 manifest 逐位不变。
+            **({"heading_guard": args.heading_guard} if args.heading_guard else {}),
             "rl_checkpoint": (os.path.abspath(args.rl_checkpoint) if args.policy == "teacher-rl" else None),
             "experimental_policy": args.policy == "teacher-rl" or planner_kind == "predictive",
             # hold 是**仿真时间**秒（D1 起）：窗口按位姿戳走满这个数才发零速，

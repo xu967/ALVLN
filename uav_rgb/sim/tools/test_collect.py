@@ -669,8 +669,11 @@ class FixedRng:
         return self.v
 
 
-def shadow_teacher_step(beta, rng_value=0.0, tiebreak="legacy", prev_executed=None):
-    """真 collect_one + 假学生（恒 FORWARD）+ 正前方一根柱：标签来自 A* 影子教师，执行按 β。"""
+def shadow_teacher_step(beta, rng_value=0.0, tiebreak="legacy", prev_executed=None, **guard):
+    """真 collect_one + 假学生（恒 FORWARD）+ 正前方一根柱：标签来自 A* 影子教师，执行按 β。
+
+    guard：透传 heading_guard / net_yaw（航向护栏）。
+    """
     w, h = 4, 6
     rgb = image_msg(w, h, 10)
     pose = ClockPoseSub(pose_msg(10.2))
@@ -692,7 +695,7 @@ def shadow_teacher_step(beta, rng_value=0.0, tiebreak="legacy", prev_executed=No
             patch.object(collect.time, "sleep", side_effect=advance):
         row, err = collect.collect_one(d, 0, 1.0, "student", subs, FakePub(), student=Student(),
                                        pillars=pillars, tiebreak=tiebreak, beta=beta,
-                                       rng=FixedRng(rng_value), prev_executed=prev_executed)
+                                       rng=FixedRng(rng_value), prev_executed=prev_executed, **guard)
     return row, err, seen
 
 
@@ -974,6 +977,20 @@ def main():
           not collect.stopped_at_waypoint({"pose_before": {"x": 4.0, "y": 1.5}}, None, 0.5))
     for k, v in switch_checks().items():
         check(f"开关: {k}", v)
+
+    # 航向护栏（--heading-guard）：|已执行左转数 − 右转数| 达到阈值就朝回转一步；0 = 关闭。
+    check("护栏关闭时不干预", collect.heading_guard_action(5, 0) is None)
+    check("护栏未到阈值不干预",
+          collect.heading_guard_action(1, 2) is None and collect.heading_guard_action(-1, 2) is None)
+    check("护栏：左偏 2 步朝右回", collect.heading_guard_action(2, 2) == collect.YAW_RIGHT)
+    check("护栏：右偏 3 步朝左回", collect.heading_guard_action(-3, 2) == collect.YAW_LEFT)
+    row_g, err_g, _ = shadow_teacher_step(beta=0.0, heading_guard=2, net_yaw=2)
+    check("护栏触发：覆盖学生的 FORWARD 并留痕",
+          err_g is None and row_g["action_executed"] == collect.YAW_RIGHT
+          and row_g["executed_by"] == "heading_guard")
+    row_n, err_n, _ = shadow_teacher_step(beta=0.0, heading_guard=2, net_yaw=1)
+    check("护栏未触发：执行学生动作",
+          err_n is None and row_n["action_executed"] == 1 and row_n["executed_by"] == "student")
 
     print(f"test_collect: {passed} 项通过")
     return 0
