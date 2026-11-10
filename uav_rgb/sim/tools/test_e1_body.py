@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""e1_body 自检：部件表与 sim/worlds/uav_rgb_e1.sdf 的 19 个 visual 逐项一致；着色投影的尺寸 / 朝向 / 遮挡顺序；
+"""e1_body 自检：部件表与 sim/worlds/uav_rgb_e1.sdf 的 23 个 visual 逐项一致；着色投影的尺寸 / 朝向 / 遮挡顺序；
 顶视图标的最小尺寸与朝向。需要 numpy；绘制检查需要 cv2（.venv-tools / 3dgs-venv）。
 用法：python3 sim/tools/test_e1_body.py
 """
@@ -24,7 +24,7 @@ def check_parts_match_sdf():
     visuals = {v.get("name"): v for v in link.findall("visual")}
     names = {name + "_visual" for name, *_ in eb.PARTS}
     assert names == set(visuals), ("部件表与 SDF visual 名不一致", names ^ set(visuals))
-    assert len(eb.PARTS) == 19
+    assert len(eb.PARTS) == 23   # 4 臂 + 4 电机 + 4 桨 + 8 保护罩件 + 电池 + 相机 + PCB + 4 臂 = 23
     for name, shape, pose, size, rgb, alpha in eb.PARTS:
         v = visuals[name + "_visual"]
         got_pose = tuple(float(t) for t in v.findtext("pose").split())
@@ -41,9 +41,16 @@ def check_parts_match_sdf():
         assert abs((1.0 - transparency) - alpha) < 1e-12, (name, transparency, alpha)
     # 几个派生常量也来自表：保护罩半宽、桨盘高度、整机宽
     guard = dict((n, p) for n, _s, p, *_ in eb.PARTS if n.startswith("guard_"))
-    assert abs(guard["guard_front"][0] - eb.GUARD_HALF_M) < 1e-12 and abs(guard["guard_front"][2] - eb.ROTOR_Z_M) < 1e-12
-    assert abs(eb.WIDTH_M - (2 * 0.084 + 0.004)) < 1e-12
-    print("  ok  部件表 19 项与 uav_rgb_e1.sdf 的 visual 逐项一致（pose / 几何 / diffuse / transparency）")
+    assert len(guard) == 8, "保护罩是 4 外弧 + 4 凹口圆角，不是 4 根方条"
+    assert abs(guard["guard_fl"][2] - eb.GUARD_Z_M) < 1e-12
+    assert abs(eb.WIDTH_M - 0.168) < 1e-12
+    # 外沿与官方 STL 的实测半径一致：外弧圆心 ±42 mm、半径 42 mm -> 最远 101.4 mm；凹口 58 mm
+    import math as _m
+    rmax = max(_m.hypot(x, y) for x, y in eb.GUARD_OUTLINE)
+    rmin = min(_m.hypot(x, y) for x, y in eb.GUARD_OUTLINE)
+    assert abs(rmax - 0.1014) < 0.0015, rmax
+    assert abs(rmin - 0.058) < 0.0015, rmin
+    print("  ok  部件表 23 项与 uav_rgb_e1.sdf 的 visual 逐项一致（pose / 几何 / diffuse / transparency）")
 
 
 def check_faces():
@@ -52,7 +59,8 @@ def check_faces():
     n_cyl = len(eb.PARTS) - n_box
     assert len(fs) == n_box * 6 + n_cyl * (2 + 12), len(fs)
     allpts = np.concatenate([p for p, _c, _a in fs])
-    assert abs(allpts[:, 0].max() - 0.086) < 1e-9 and abs(allpts[:, 1].min() + 0.086) < 1e-9, "外沿应是保护罩 ±0.086"
+    # 外沿 = 电机座 0.042 + 外弧半径 0.042 = 0.084（四叶草最外点），不再有 0.086 的方角
+    assert abs(allpts[:, 0].max() - 0.084) < 1e-6 and abs(allpts[:, 1].min() + 0.084) < 1e-6, "外沿应是保护罩 ±0.084"
     # 桨盘半透明、其余不透明；颜色已是 BGR 整数（相机块 rgb (0.9,0.2,0.1) -> bgr (26,51,230)）
     alphas = {a for _p, _c, a in fs}
     assert alphas == {0.5, 1.0}, alphas
@@ -87,7 +95,7 @@ def check_draw_shaded():
     assert box is not None
     width = box[2] - box[0]
     # 最宽处是离相机最近的后保护罩（斜距 hypot(1.1-0.084, 0.3-0.015)），不是机体中心
-    expect = (w / 2) / math.tan(math.radians(30)) * eb.WIDTH_M / math.hypot(1.1 - eb.GUARD_HALF_M, 0.3 - eb.ROTOR_Z_M)
+    expect = (w / 2) / math.tan(math.radians(30)) * eb.WIDTH_M / math.hypot(1.1 - eb.GUARD_ARC_R*math.sqrt(2), 0.3 - eb.GUARD_Z_M)
     assert abs(width - expect) <= 4 and width >= 80, ("机体像素宽应 ≈ f·0.172/后罩斜距", width, expect)
     assert abs((box[0] + box[2]) / 2 - w / 2) <= 6, "机体应在画面水平中央"
     # 从正后方看：机头红线在上方（远端），机体中心 -> 前保护罩在图像上方向

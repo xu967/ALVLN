@@ -185,7 +185,10 @@
             <izz>0.000149</izz>
           </inertia>
         </inertial>
-        <!-- collision_envelope: radius_from_center 0.102, z -0.020..+0.028 -> cylinder centered at z=0.004 -->
+        <!-- collision_envelope: radius_from_center 0.102, z -0.020..+0.028 -> cylinder centered at z=0.004.
+             对照官方 STL（2026-11-10）：r=0.102 在四个外弧方向正确（101.4 mm），在四个凹口方向
+             偏保守（真件 58 mm）；Gazebo 用单圆柱，最多提前 44 mm 判撞。改它要换
+             dynamics_profile（data 不能混包），所以本轮只记录、不改。 -->
         <collision name="base_link_collision">
           <pose>0 0 0.004 0 0 0</pose>
           <geometry><cylinder><radius>0.102</radius><length>0.048</length></cylinder></geometry>
@@ -268,24 +271,48 @@
           <material><ambient>0.75 0.75 0.75 1</ambient><diffuse>0.75 0.75 0.75 1</diffuse></material>
           <transparency>0.5</transparency>
         </visual>
-        <visual name="guard_front_visual">
-          <pose>0.084 0 0.015 0 0 0</pose>
-          <geometry><box><size>0.004 0.168 0.004</size></box></geometry>
+        <!-- 保护罩：官方 STL 的四叶草外形（包围盒 168x168x4 mm，外弧圆心 = 电机座 ±42,±42 mm、
+             半径 42 mm，轴向中点凹口到中心 58 mm）。4 段外弧 + 4 个凹口圆角，8 个圆柱近似；
+             由 sim/tools/e1_body.py 的 PARTS 逐项对照（test_e1_body.py 锁住）。
+             安装在 collision_envelope.z_max 之下 4 mm（24-28 mm），相机 near clip 之外。 -->
+        <visual name="guard_fl_visual">
+          <pose>0.042 0.042 0.026 0 0 0</pose>
+          <geometry><cylinder><radius>0.042</radius><length>0.004</length></cylinder></geometry>
           <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
         </visual>
-        <visual name="guard_rear_visual">
-          <pose>-0.084 0 0.015 0 0 0</pose>
-          <geometry><box><size>0.004 0.168 0.004</size></box></geometry>
+        <visual name="guard_fr_visual">
+          <pose>0.042 -0.042 0.026 0 0 0</pose>
+          <geometry><cylinder><radius>0.042</radius><length>0.004</length></cylinder></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
+        </visual>
+        <visual name="guard_rl_visual">
+          <pose>-0.042 0.042 0.026 0 0 0</pose>
+          <geometry><cylinder><radius>0.042</radius><length>0.004</length></cylinder></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
+        </visual>
+        <visual name="guard_rr_visual">
+          <pose>-0.042 -0.042 0.026 0 0 0</pose>
+          <geometry><cylinder><radius>0.042</radius><length>0.004</length></cylinder></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
+        </visual>
+        <visual name="guard_nose_visual">
+          <pose>0.042 0 0.026 0 0 0</pose>
+          <geometry><cylinder><radius>0.016</radius><length>0.004</length></cylinder></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
+        </visual>
+        <visual name="guard_tail_visual">
+          <pose>-0.042 0 0.026 0 0 0</pose>
+          <geometry><cylinder><radius>0.016</radius><length>0.004</length></cylinder></geometry>
           <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
         </visual>
         <visual name="guard_left_visual">
-          <pose>0 0.084 0.015 0 0 0</pose>
-          <geometry><box><size>0.168 0.004 0.004</size></box></geometry>
+          <pose>0 0.042 0.026 0 0 0</pose>
+          <geometry><cylinder><radius>0.016</radius><length>0.004</length></cylinder></geometry>
           <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
         </visual>
         <visual name="guard_right_visual">
-          <pose>0 -0.084 0.015 0 0 0</pose>
-          <geometry><box><size>0.168 0.004 0.004</size></box></geometry>
+          <pose>0 -0.042 0.026 0 0 0</pose>
+          <geometry><cylinder><radius>0.016</radius><length>0.004</length></cylinder></geometry>
           <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
         </visual>
         <visual name="battery_visual">
