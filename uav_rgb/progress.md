@@ -62,7 +62,7 @@
 
 ### 未完成的待办
 
-- GitHub：23:10 已推到本地 fcd4d18（ALVLN `b76c37e..915788a`；推之前 `check.sh --python-only` rc=0，日志 `tmp/analysis-20261109/check-py-fcd4d18.log`）。之后的提交随第九阶段合并一起推（`bash tools/git_mirror_alvln.sh`）。
+- GitHub：23:40 已推到本地 d060ac0（ALVLN `915788a..e82c865`；推之前 `check.sh --python-only` rc=0，日志 `tmp/analysis-20261109/check-py-d060ac0.log`）。TEACHER-3DGS 合并后再推（`bash tools/git_mirror_alvln.sh`）。
 - 第九阶段 3 个 agent 交付 → 审 diff → 合并 → `check.sh` → 推 GitHub。TEACHER-3DGS 过线后：`demo_3dgs_routes` 加 CFG 透传 `--teacher-planner`，数据集 B 的 hold 按结果给用户建议。
 - DAgger 正式 3 轮（见头部）：盯 `status.json`；若因评测失败集停下，同 `--out` 重起。eval60 读预写的 `eval_seeds60.json`（E1 口径 60 个），只评 DAgger 臂；M3 表里的基线（BC / 截断 / sgvis）在 `EVAL_SEEDS_BASE_60` 上另起评测，旧 X3 在 `EVAL_SEEDS_BASE_X3_40` 上评。
 - 正在跑的 DAgger 用的是 `wt-eval4` 里的旧 `eval_done`（不看 partial）：**若手动停 DAgger 再续跑，先把各 `eval20-*` / `eval60-*` 目录里 `eval.json` 带 `partial: true` 的挪开**，否则半成品会被当成评完跳过。自然跑完或因失败集停下不受影响。
