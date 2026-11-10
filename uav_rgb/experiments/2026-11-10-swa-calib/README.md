@@ -11,3 +11,4 @@
 `run.sh` 与 `summarize.py` 是冻结的实验记录，不是维护中的入口：里面的路径指向当时的冻结工作树（`tmp/cursor-1110/wt`）与数据盘。
 `tools/{swa,ck,calib}.py` 是生成这些权重的脚本，原样复制自 `tmp/cursor-1110/agents/src/`；`calib.py` 还 import 未入库的 `analyze.py`、`analyze2.py`，不能单独运行。
 权重平均与校准工具计划整理成 `tools/average_ckpt.py`（计划 B4）。
+正式工具：`tools/average_ckpt.py`（用法见文件头，测试 `tools/test_average_ckpt.py`）。用它重新生成上述 6 个权重（`swa_s{0,1,2}_k10`、`cal_swa_s{0,1,2}_k10`），sha256 与 `inputs.txt` 逐位一致（`UAVRGB_REPRO_AVGCKPT=1` 跑 `TestReproduction`）。
