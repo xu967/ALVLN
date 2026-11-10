@@ -33,7 +33,8 @@ tail -f $OUT/run.log; grep -v '^step ' $OUT/driver-sage3d_841150.log | tail; cat
 kill -- -$(cat $OUT/run.pid)
 ```
 
-续跑：同一条命令重起，已完成的路线（`done.json` 集数够且无失败）跳过，半成品改名为 `*.incomplete-<时刻>`。`routes_selected.json` 与上次不同（scene.json 变了）时拒绝续跑，新的写在 `routes_selected.json.new`。
+续跑：同一条命令重起，已完成的路线（`done.json` 集数够且无失败）跳过，半成品改名为 `*.incomplete-<时刻>`。
+放行闸门没过的场景继续跑阶段 2：`GATE_SR=0 setsid nohup bash run.sh > /dev/null 2>&1 < /dev/null &`（同一个 `OUT`；教师臂已完成的路线不重跑；`config.json` 与 `gate.json` 会被重写成阈值 0，原判决要先另存）。`routes_selected.json` 与上次不同（scene.json 变了）时拒绝续跑，新的写在 `routes_selected.json.new`。
 
 ## 产物（`$OUT` = `$D/exp-sage3d-pilot-20261110`）
 

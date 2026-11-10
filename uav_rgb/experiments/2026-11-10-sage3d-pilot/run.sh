@@ -57,7 +57,7 @@ HOLD=1.0                                                 # 学生是 hold 1.0 �
 STEP_FRAC=0.5; STEP_PAD=15; STEP_CAP=100                 # 步数 = ceil(max_steps×0.5)+15（max_steps 按 hold 0.5 算，与室外同口径），封顶 100：SITL 起始 50% 电量约 100 步电量限
 GUARD_DEG=45.0                                           # 护栏阈值：单步转角约 31.6°，容许偏 1 步，偏 2 步（>= 45°）就纠正；起跑前定死，与室外同
 LOOKAHEAD_M=1.5                                          # 路线前视距离：室外 3.0 m 会越过门框与拐角；起跑前定死
-GATE_ARM=teacher; GATE_SR=0.8                            # 闸门：该臂按场景的 SR(stop) >= 0.8 才跑阶段 2（预注册 P1）；冒烟设 GATE_SR=0 放行
+GATE_ARM=${GATE_ARM:-teacher}; GATE_SR=${GATE_SR:-0.8}      # 闸门：该臂按场景的 SR(stop) >= 0.8 才跑阶段 2（预注册 P1）；环境变量可覆盖，GATE_SR=0 放行所有场景（冒烟、放行续跑用）
 P2_SUPPORT_LT=0.7; P2_FALSIFY_GE=0.89                    # 预注册 P2：forward+route 合计 SR(stop) < 0.7 支持；>= 0.89（室外值）证伪
 INFER=$D/bin-snapshots/main-97ae04b/uavrgb_infer         # 今天所有闭环实验用的同一个推理二进制
 CF_SITL_PROC=$D/tmp/build-cf-sitl-lib31/cf_sitl_proc     # profile cf_sitl_v1:1bc8fedf:lib31，不要动这个目录
