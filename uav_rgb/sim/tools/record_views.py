@@ -250,9 +250,51 @@ def _track(actions, oracle):
     return [(t, *pts[t]) for t in sorted(pts)]
 
 
+def _pos_at(track, t):
+    """t 时刻的位姿估计：在相邻两个轨迹点之间线性插值。
+
+    track 只有动作前位姿（动作起点）与动作后真值（动作终点），10 Hz 采样、窗口 1 s；
+    直接取 ts<=t 的最后一点最多落后一步（实测中位 0.39 s、学生最大 2.08 s），
+    图标/pos 行会和 CHASE 里渲染的真机体错开。两端之外取端点。
+    """
+    if not track:
+        return None
+    if t <= track[0][0]:
+        return track[0][1:]
+    if t >= track[-1][0]:
+        return track[-1][1:]
+    for a, b in zip(track, track[1:]):
+        if a[0] <= t <= b[0]:
+            span = b[0] - a[0]
+            f = 0.0 if span <= 0 else (t - a[0]) / span
+            return tuple(a[i] + f * (b[i] - a[i]) for i in (1, 2, 3))
+    return track[-1][1:]
+
+
+def _speed_at(track, t):
+    """t 所在轨迹段的水平速度（m/s）：取包住 t 的那两个点做差分；越界时用最近的一段。
+
+    不再按「t-0.5 s 的最后一点」取点：track 点间隔 0.1–0.9 s，那样常取到与当前点相同的点，
+    分子为 0。cf_sitl 有 oracle speed_mps 时优先用 _oracle_speed。
+    """
+    if len(track) < 2:
+        return None
+    for a, b in zip(track, track[1:]):
+        if a[0] <= t <= b[0] or (t < track[0][0] and a is track[0]):
+            dt = (b[0] - a[0]) / 1e9
+            return math.dist(a[1:3], b[1:3]) / dt if dt > 0 else None
+    a, b = track[-2], track[-1]
+    dt = (b[0] - a[0]) / 1e9
+    return math.dist(a[1:3], b[1:3]) / dt if dt > 0 else None
+
+
 def _yaws(actions):
-    """机头朝向 [(ts, yaw_rad)]：只有 actions 的 yaw_before 带航向（oracle 没有），按时间排序。"""
-    pts = {r["pose_ts"]: r["yaw_before"] for r in actions
+    """机头朝向 [(ts, yaw_rad)]：只有 actions 的 yaw_before 带航向（oracle 没有），按时间排序。
+
+    yaw_before 是度（collect._pose_parts -> yaw_deg，原样落盘）；draw_top_icon 的 cos/sin 吃弧度。
+    2026-11-10 前这里直接存度再当弧度传给图标，实测朝向偏 7°–139°（TOP 格左右转看反）。
+    """
+    pts = {r["pose_ts"]: math.radians(r["yaw_before"]) for r in actions
            if r.get("pose_ts") and isinstance(r.get("yaw_before"), (int, float))}
     return [(t, pts[t]) for t in sorted(pts)]
 
@@ -331,7 +373,7 @@ def compose(frames_dir, ep_dir, world_path, out_path, title="", result="",
             vl.paste(cv2, canvas, images["uav"], *bl, CW, CH,
                      onboard_label(images["uav"], hfov_deg, display=s), *notes["uav"], s=s)
             _panel(cv2, canvas, *br, t, t0, t_end, actions, track, hit, stuck, title,
-                   result if k >= len(times) else "", s=s)
+                   result if k >= len(times) else "", oracle=oracle, s=s)
             writer.write(canvas)
             frames += 1
     finally:
@@ -367,7 +409,11 @@ def _draw_top(cv2, img, cam, track, t, hit_mark, stuck_mark, goal_x, waypoint,
     # 判据线和 waypoint 投到无人机当前高度，不投地面：顶视相机只有 6 m 高，是透视投影，
     # 同一 (x,y) 在地面和 2.3 m 机体高度差 25–30 px、半径圈小 38%（基线 demo 实测），
     # 机体到了圈里画面上却在圈外。按机体高度投，高度变 0.2 m 圈心只移约 3 px。没有轨迹时按地面。
+    # 视口内取「离 t 最近」的点：track 只有动作前位姿与动作后真值，按 ts<=t 取会最多落后一步
+    # （实测中位 0.39 s、学生最大 2.08 s），图标、pos 行与真机体错开。
     past = [p for p in track if p[0] <= t]
+    # 投影高度沿用「t 前最后一点」的 z（高度变化慢、且判据圈半径按它算，保持旧行为）；
+    # x/y 用插值（见 _pos_at）。
     z = past[-1][3] if past else 0.0
     draw_goal = (goal_x is not None and
                  success_criterion in (None, "", "route_choice"))
@@ -390,10 +436,13 @@ def _draw_top(cv2, img, cam, track, t, hit_mark, stuck_mark, goal_x, waypoint,
         cv2.line(img, a, b, (0, 255, 255), 2)
     if pts:
         # 机体图标按真实比例（6 m 高顶视相机下 0.172 m 只有约 12 px，不够看，图标最小 18 px）；
-        # 顶视相机 yaw=90°，图像右 = 世界 +X，和 e1_body.draw_top_icon 的约定一致，yaw 直接用。
+        # 顶视相机 yaw=90°，图像右 = 世界 +X，与 e1_body.draw_top_icon 的约定一致（yaw 弧度）。
+        # 位置按 t 在轨迹点间插值（见 _pos_at）：past[-1] 最多落后一步（实测中位 0.39 s、
+        # 学生最大 2.08 s），画在那里图标会和 CHASE 里的真机体错开。
         cx, cy, cz, hfov, w, _h = cam
         px_per_m = (w / 2) / math.tan(hfov / 2) / max(cz - z, 1e-6)
-        e1_body.draw_top_icon(cv2, img, pts[-1], yaw, px_per_m)
+        px_, py_, _ = _pos_at(track, t)
+        e1_body.draw_top_icon(cv2, img, project_top(cam, px_, py_, z), yaw, px_per_m)
     if pts and not in_image(cam, pts[-1]):
         # 机体飞出顶视相机视野（旧模板 6 m 高 80° 只盖到 x≈5.9 m，森林任务终点在 6–7 m）：
         # 轨迹被裁在图边、机体点画不出来，不说明的话像是停在边上。把点夹到图边并标注。
@@ -446,7 +495,21 @@ def _active(actions, t):
     return cur
 
 
-def _panel(cv2, canvas, x, y, t, t0, t_end, actions, track, hit, stuck, title, result, s=1):
+def _oracle_speed(oracle, t):
+    """t 时刻之前最近一条带 speed_mps 的 oracle 行（cf_sitl 才有）；没有返回 None。"""
+    cur = None
+    for o in oracle:
+        ts = o.get("timestamp_ns")
+        if ts is None or ts > t:
+            continue
+        v = o.get("speed_mps")
+        if isinstance(v, (int, float)):
+            cur = float(v)
+    return cur
+
+
+def _panel(cv2, canvas, x, y, t, t0, t_end, actions, track, hit, stuck, title, result,
+           oracle=(), s=1):
     """把本集数据整理成公共面板的几行字 / 动作段；版式本身在 view_layout.panel（s 是画布放大倍率）。"""
     # 与各视角角标同一口径：绝对仿真时间；括号里才是从视频第一帧起算的时长。
     # 以前面板只写相对时长，角标写绝对时间，同一画面两个数差 t0（基线 demo 差 5.6 s）。
@@ -454,14 +517,18 @@ def _panel(cv2, canvas, x, y, t, t0, t_end, actions, track, hit, stuck, title, r
     cur = _active(actions, t)
     if cur is not None:
         lines.append(f"step {cur['step'] + 1}/{len(actions)}")
-    past = [p for p in track if p[0] <= t]
-    if past:
-        _, px, py, pz = past[-1]
+    pos_now = _pos_at(track, t)
+    if pos_now is not None:
+        px, py, pz = pos_now
         lines.append(f"pos x={px:5.2f} y={py:5.2f} z={pz:4.2f} m")
-        prev = [p for p in track if p[0] <= t - int(0.5e9)]
-        if prev:
-            d = math.dist(past[-1][1:3], prev[-1][1:3])
-            lines.append(f"speed {d / max((past[-1][0] - prev[-1][0]) / 1e9, 1e-3):4.2f} m/s")
+        # 速度优先用 oracle 的 speed_mps（cf_sitl 每步都写，真值）；没有才用所在轨迹段差分。
+        # 2026-11-10 前按「t-0.5 s 的最后一点」取点，常取到与当前点相同的点，分子为 0，
+        # 28–30% 的帧显示 speed 0.00（同一帧还是 FORWARD_SLOW）。
+        spd = _oracle_speed(oracle, t)
+        if spd is None:
+            spd = _speed_at(track, t)
+        if spd is not None:
+            lines.append(f"speed {spd:4.2f} m/s")
     flags = []
     if hit is not None and (hit.get("action_start_ns") or 0) <= t:
         flags.append((f"COLLISION contact @ step {hit['step'] + 1}", (0, 0, 255)))

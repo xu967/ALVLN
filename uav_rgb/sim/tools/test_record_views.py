@@ -287,7 +287,8 @@ def check_top_icon_and_yaw(cam):
     cv2, img = _FakeCv2(), _FakeImage()
     track = [(10 * S, 1.0, 0.0, 2.2)]
     rv._draw_top(cv2, img, cam, track, 10 * S, None, None, None, None, yaw=0.3)
-    assert len(cv2.polys) == 2 and all(len(p[0]) == 4 for p, _c in cv2.polys), "保护罩方框（黑描边 + 白线）"
+    # 保护罩是四叶草外沿（2026-11-10 起），不再是 4 点方框；黑描边 + 白线两遍
+    assert len(cv2.polys) == 2 and all(len(p[0]) >= 24 for p, _c in cv2.polys), "保护罩外沿（黑描边 + 白线）"
     assert len([c for c in cv2.circles if c[2] == (200, 200, 200)]) == 4, "4 个桨盘"
     nose = [l for l in cv2.lines if l[2] == (0, 0, 255)]
     assert len(nose) == 1 and nose[0][0] == rv.project_top(cam, 1.0, 0.0, 2.2), nose
@@ -295,12 +296,50 @@ def check_top_icon_and_yaw(cam):
     cv2 = _FakeCv2()
     rv._draw_top(cv2, img, cam, track, 10 * S, None, None, None, None)
     assert not [l for l in cv2.lines if l[2] == (0, 0, 255)], "yaw=None 不画机头线"
-    acts = [{"pose_ts": 10 * S, "yaw_before": 0.1}, {"pose_ts": 12 * S, "yaw_before": 0.2},
+    # yaw_before 是度，_yaws 统一转弧度（2026-11-10 前直接存度，图标朝向偏 7°–139°）
+    acts = [{"pose_ts": 10 * S, "yaw_before": 90.0}, {"pose_ts": 12 * S, "yaw_before": 180.0},
             {"pose_ts": 11 * S}, {"pose_before": {}}]
     yaws = rv._yaws(acts)
-    assert yaws == [(10 * S, 0.1), (12 * S, 0.2)], yaws
-    assert rv._yaw_at(yaws, 9 * S) is None and rv._yaw_at(yaws, 11 * S) == 0.1 and rv._yaw_at(yaws, 13 * S) == 0.2
-    print("  ok  顶视当前位置画四旋翼图标；航向取 actions 的 yaw_before")
+    assert yaws == [(10 * S, math.pi / 2), (12 * S, math.pi)], yaws
+    assert rv._yaw_at(yaws, 9 * S) is None and abs(rv._yaw_at(yaws, 11 * S) - math.pi / 2) < 1e-12
+    assert abs(rv._yaw_at(yaws, 13 * S) - math.pi) < 1e-12
+    print("  ok  顶视当前位置画四旋翼图标；航向取 actions 的 yaw_before（度->弧度）")
+
+
+def check_panel_speed():
+    """面板速度：优先 oracle speed_mps；没有时用间隔 >= 0.3 s 的两点差分，不能因取到同一点而恒 0。"""
+    cv2 = _FakeCv2()
+    t0, t_end = 0, 20 * S
+    actions = [{"step": 0, "action_start_ns": 0, "action_executed": 1},
+               {"step": 1, "action_start_ns": 10 * S, "action_executed": 1}]
+    track = [(0, 0.0, 0.0, 2.0), (10 * S, 3.0, 0.0, 2.0)]
+    # 有 speed_mps：原样显示
+    rv._panel(cv2, _FakeImage(), 0, 0, 12 * S, t0, t_end, actions, track, None, None, "t", "",
+              oracle=[{"timestamp_ns": 10 * S, "speed_mps": 0.3}])
+    texts = [t for t in cv2.texts if t.startswith("speed ")]
+    assert texts and texts[-1].strip() == "speed 0.30 m/s", texts
+    # 没有 speed_mps：差分取 0 与 10 s 两点 = 0.3 m/s，不能是 0
+    cv2 = _FakeCv2()
+    rv._panel(cv2, _FakeImage(), 0, 0, 12 * S, t0, t_end, actions, track, None, None, "t", "")
+    texts = [t for t in cv2.texts if t.startswith("speed ")]
+    assert texts and texts[-1].strip() == "speed 0.30 m/s", texts
+    print("  ok  面板速度：oracle 优先，差分不会取到同一点")
+
+
+def check_top_icon_nearest():
+    """TOP 图标取离 t 最近的点，不是 past[-1]（后者最多落后一步）。"""
+    cv2 = _FakeCv2()
+    cam = (3.25, 0.0, 7.0, math.radians(80), 640, 360)
+    track = [(0, 0.0, 0.0, 2.0), (10 * S, 5.0, 0.0, 2.0)]
+    # t=9 s：最近点应是 t=10 s 的那个（差 1 s），而不是 past[-1]（t=0，差 9 s）
+    rv._draw_top(cv2, _FakeImage(), cam, track, 9 * S, None, None, None, None, yaw=0.0)
+    nose = [l for l in cv2.lines if l[2] == (0, 0, 255)]
+    assert nose, "应该画机头线"
+    # t=9 s 在 0 与 10 s 两点之间，插值后 x=4.5 m；图标在 4.5 m 附近，不在 past[-1] 的 0 m。
+    c45 = rv.project_top(cam, 4.5, 0.0, 2.0)
+    got = nose[0][1]
+    assert abs(got[0] - c45[0]) < 30, (got, c45)
+    print("  ok  TOP 图标取离 t 最近的点")
 
 
 def check_chase_patch():
@@ -374,6 +413,8 @@ def main():
     check_e1_top_coverage()
     check_ascii_overlay(cam)
     check_top_icon_and_yaw(cam)
+    check_panel_speed()
+    check_top_icon_nearest()
     check_chase_patch()
     check_record_buckets_and_overwrite()
 
