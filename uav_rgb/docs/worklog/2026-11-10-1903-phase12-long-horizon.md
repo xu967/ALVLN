@@ -126,3 +126,23 @@
 - 读数用的临时脚本没有进仓库：`$D/tmp/phase12-20261110/main/{status,coll_x,first_steps,diverge}.py`。计划里引用它们的数字有三处
   （第 0 步动作分布、撞柱位置分布、前几步位移）。
 - 数据盘剩 14 GB，根分区剩 2.3 GB。
+
+## 更新 2026-11-10 22:40（仍在跑的守护进程与 subagent）
+
+收尾推送：22:30 镜像推到 ALVLN `41a2b7b..0928c47`（对应 main a09e787）。推送前 main 上 `check.sh --python-only` rc=0（21:40，代码状态与推送时相同，之后只动了文档与实验入口）。
+
+| 名称 | 类型 | PGID 或分支 | 输出 | 状态（22:40） | 怎么看、怎么停 |
+| --- | --- | --- | --- | --- | --- |
+| 公开小模型零样本闭环 | 守护进程，5 条车道 | PGID 1490902 | `$D/exp-baselines-zeroshot-20261110/` | 22:25 起跑，6 个臂，预计 0 点前后结束 | `tail -f run.log`；结束落 `DONE` 与 `summary.md`；停 `kill -- -1490902` |
+| W1-0 动作派发固定时延 | Sonnet 5.5 Max subagent | 分支 `p12-w1-0`（未合并） | 报告 `$D/tmp/phase12-cards/reports/w1-0.md`；实验 `$D/exp-action-latency-20261110/` | 代码与测试已绿，在做冒烟与标定 | 实验的 PGID 以报告与该目录的 `run.pid` 为准 |
+| W1-11 3DGS 教师航向容差 | Sonnet 5.5 Max subagent | 分支 `p12-w1-11`（未合并） | 报告 `$D/tmp/phase12-cards/reports/w1-11.md`；实验 `$D/exp-teacher-tol-3dgs-20261110/` | 进行中 | 同上 |
+| K1 3DGS 上的规则层上限 | Sonnet 5.5 Max subagent | 分支 `p12-k1`（未合并） | 报告 `$D/tmp/phase12-cards/reports/k1.md`；实验 `$D/exp-rule-oracle-3dgs-20261110/` | 策略与测试已写完，在选参 | 同上 |
+
+已结束：规则 v1（22:29 `DONE rc=0`）、长课程第二轮（22:22 `DONE rc=0`）、单块柱阵对照（21:43 `DONE rc=0`）。
+`$D/exp-long-course-20261110/DONE` 是主会话 22:25 手写的放行文件（内容写明第一轮被中止、第二轮的位置），不是第一轮正常结束的标记；第一轮的中止说明在同目录 `DONE.v1`。
+
+接手的人要做的事：
+
+1. 三个 subagent 交回后审 diff、跑相关测试、合并进 main（顺序建议 W1-11、K1、W1-0；K1 会改 `experiments/2026-11-10-bearing-guard-3dgs/driver.py`，W1-11 不改它）。
+2. 基线实验结束后把 `summary.md` 的终表补进计划 §1.3「公开小模型零样本闭环」与 §5 的状态栏。
+3. 合并后在 main 上跑 `check.sh --python-only`，再 `bash tools/git_mirror_alvln.sh`。
