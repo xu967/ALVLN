@@ -200,3 +200,22 @@
 | NICE-FIXES 补丁在 main 上 | `git apply --check` 通过 |
 | `sim/tools/test_cf_sitl_exec.py` | `Ran 13 tests in 0.096s` / `OK`（假时钟，无真实等待） |
 | `test_audit_dataset` / `test_pick_test_seeds` / `test_e1_pipeline` | `PASS` / `PASS (20 seeds, 20 gids)` / `PASS` |
+| `check.sh --python-only`（d060ac0） | `check rc=0`；推 GitHub ALVLN `915788a..e82c865` |
+
+## 更新 2026-11-09 23:50（DAgger 第 2 轮训练 OOM → 等显存自动续跑）
+
+### 做了什么
+
+- 23:44 查到 DAgger `round_2.train` 23:36 失败：`round_2/run.log` 原文 `训练失败: CUDA 显存分配失败 …/src/model_dev.cu:36：申请 9830400 字节，现可用 1638400 / 共 23069917184 字节`。`nvidia-smi` 显示 PID 662650 `/opt/conda/bin/python train.py` 占 20792 MiB，cwd `/root/rivermind-data/YOLOVOmodal_3871538535`，23:16 由 `tools/run_exp.sh`（实验 `p50k_dinov3frz_e4`，4 轮，第 1 轮 22 min 到 49%）起。
+- 把没训成的 `round_2/run`（只有 config.json 和 .run.lock）挪到 `round_2/run.failed-oom-2336`，日志挪到 `run.failed-oom-2336.log`：训练器拒绝复用非空目录。
+- 用户选「等 YOLOVO 跑完自动续跑」：写 `full-1109/resume_when_gpu_free.sh`（只读 `nvidia-smi`，空闲显存连续 3 次 ≥ 4096 MiB 才 `exec run_after_eval4.sh`），守护进程 PGID 716565，日志追加进 `run.log`。
+
+### 没做什么
+
+- 没停、没限制 YOLOVOmodal 的进程。原因：用户另一个项目，用户选了等它跑完。
+- 没给 TEACHER-3DGS 发消息。原因：后台 agent 只有用户要求时才打断；它的任务书要求起 3DGS 进程前看 `nvidia-smi`，会自己碰到显存不足。
+
+### 风险与遗留
+
+- YOLOVO 结束后若同一会话马上起下一个实验，续跑的 DAgger（约 2–3 GB）和它会抢显存，可能有一方 OOM。
+- 续跑后 round_2 从训练开始，round_3、more_demos、eval20、基线重评、eval60 还要约 4–5 h。
