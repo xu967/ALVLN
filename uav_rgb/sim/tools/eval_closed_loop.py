@@ -10,6 +10,10 @@ GZ_PARTITION 的 gz sim -> collect.py --policy student --stop-on-collision ->
       --episodes 3 --out /tmp/eval1 --split test
   python3 sim/tools/eval_closed_loop.py --policy forward --episodes 3 \
       --out /tmp/eval-blind --split test
+  # rule-oracle：柱子真值算完美列距离 + 固定规则 v0（零训练的规则层上限，不要 --ckpt）；
+  # --rule-hfov-deg 60 = 学生相机，81 = 真机 GC4653 的水平视场
+  python3 sim/tools/eval_closed_loop.py --policy rule-oracle --rule-hfov-deg 60 --episodes 3 \
+      --out /tmp/eval-rule --split test
   # teacher-nn 用训练好的特权教师闭环（必须用带 torch 的解释器跑，见 --teacher-ckpt）
   $DATA_ROOT/uav_rgb/teacher-venv/bin/python sim/tools/eval_closed_loop.py \
       --policy teacher-nn --teacher-ckpt $DATA_ROOT/uav_rgb/teacher-run-pilot/ckpt_best.pth \
@@ -79,6 +83,7 @@ import campus  # noqa: E402
 import asset_campus  # noqa: E402
 import teacher  # noqa: E402
 import collect  # noqa: E402  - 只为 GOAL_MARGIN_M：成功线与 collect --stop-at-goal 的停线必须是同一条
+import rule_policy  # noqa: E402  - 只为 RULE_V0 / COL_DEG：参数随 eval.json 留证、视场范围校验
 
 # 与 collect_parallel 共用同一份默认矩阵（cf_sil 已退出；cf_blackbox 只留名字）。
 DYNAMICS_PROFILES = cp.DYNAMICS_CHOICES
@@ -761,6 +766,8 @@ def run_episode(seed, args, workdir, seen_gids):
                 cmd += ["--infer-bin", args.infer_bin]
             if args.heading_guard:
                 cmd += ["--heading-guard", str(args.heading_guard)]   # 0 不传：旧命令行逐字不变
+        elif args.policy == "rule-oracle":
+            cmd += ["--rule-hfov-deg", str(args.rule_hfov_deg)]       # 只给 rule-oracle 传：其它策略的命令行逐字不变
         elif args.policy == "teacher-nn":
             cmd += ["--teacher-ckpt", args.teacher_ckpt]
         elif args.policy == "teacher-rl":
@@ -971,11 +978,12 @@ def main():
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--ckpt", default=None, help="学生 checkpoint（--policy student 必填）")
-    p.add_argument("--policy", choices=("student", "forward", "teacher-nn", "teacher", "teacher-rl"),
+    p.add_argument("--policy", choices=("student", "forward", "teacher-nn", "teacher", "teacher-rl", "rule-oracle"),
                    default="student",
                    help="student=模型闭环；forward=盲前进基线（T7）；"
                         "teacher-nn=特权教师网络闭环（可解性闸门）；"
-                        "teacher=柱子真值 A* 专家闭环（新动力学下的可解性上界）")
+                        "teacher=柱子真值 A* 专家闭环（新动力学下的可解性上界）；"
+                        "rule-oracle=柱子真值列距离 + 固定规则 v0（零训练的规则层上限，不需要 --ckpt）")
     p.add_argument("--teacher-planner", choices=("astar", "predictive", "costmap"), default="astar",
                    help="--policy teacher 的规划器：costmap=测地场代价 argmin（teacher.plan_action_costmap）")
     p.add_argument("--costmap-tol", type=float, default=25.0,
@@ -1043,6 +1051,9 @@ def main():
     p.add_argument("--heading-guard", type=int, default=0,
                    help="透传给 collect.py（仅 --policy student）：已执行的左转数减右转数的绝对值达到 N 就朝回转一步；"
                         "0=关闭。它改的是策略不是判据，eval.json 顶层记 heading_guard，不动 metric_version")
+    p.add_argument("--rule-hfov-deg", type=float, default=60.0,
+                   help="透传给 collect.py（仅 --policy rule-oracle）：列距离视场（度），60=学生相机（20 列），"
+                        "81=真机 GC4653 的水平视场（27 列）；范围 [6, 180]。eval.json 顶层记 rule_hfov_deg 与 rule_params")
     p.add_argument("--sim-timeout", type=float, default=120.0)
     p.add_argument("--episode-timeout", type=float, default=600.0)
     p.add_argument("--keep-work", action="store_true", help="保留 world/每集原始文件")
@@ -1100,6 +1111,11 @@ def main():
         p.error("--hold 必须是有限正数")
     if args.heading_guard < 0 or (args.heading_guard and args.policy != "student"):
         p.error("--heading-guard 必须是非负整数，且只能和 --policy student 一起用")
+    if args.policy != "rule-oracle" and args.rule_hfov_deg != 60.0:
+        p.error("--rule-hfov-deg 只能和 --policy rule-oracle 一起用")
+    if args.policy == "rule-oracle" and not (math.isfinite(args.rule_hfov_deg)
+                                             and 2 * rule_policy.COL_DEG <= args.rule_hfov_deg <= 180.0):
+        p.error(f"--rule-hfov-deg 必须在 [{2 * rule_policy.COL_DEG:g}, 180] 度内")
     if args.dynamics == "cf_blackbox":
         p.error("cf_blackbox 是纯 Python 模型档，Gazebo 闭环未接入；"
                 "请让 3DGS collector 直接调用 cf_blackbox，或改用 cf_stab/x3_velocity")
@@ -1291,6 +1307,9 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
               "goal_margin": args.goal_margin,
               "corridor_half_width": args.corridor_half_width,
               **({"heading_guard": args.heading_guard} if args.heading_guard else {}),
+              # rule-oracle 的视场与规则参数：预注册的参数随结果留证（其它策略不写这两个键）
+              **({"rule_hfov_deg": args.rule_hfov_deg, "rule_params": rule_policy.RULE_V0}
+                 if args.policy == "rule-oracle" else {}),
               "waypoint_radius": WAYPOINT_RADIUS,
               "stop_radius": stop_radius_used,
               "geometry_version": cp.task_geometry_version(args.task),
