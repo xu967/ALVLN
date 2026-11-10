@@ -351,6 +351,24 @@ def _grid_spec(pillars, step):
     return x0, y0, nx, ny
 
 
+# 栅格格子的「可走」只由 柱子几何 / 余量 / 栅格步长 决定。评测一集内每步都从当前位姿重跑 A*（教师臂是动作本身，
+# 学生臂是影子教师标签），柱子不变；K=3 长课程里 85% 的 A* 耗时在逐格逐柱的 _point_blocked，每步 50–250 ms，
+# 把动作生效时长压短约 11%（experiments/2026-11-10-long-course 第二轮）。按场景缓存格子，之后每步只剩堆操作；路径逐位不变。
+_FREE_CACHE_MAX_SCENES = 4   # 一个采集 / 评测进程一次只飞一集；多留几个给离线批量重标（relabel 逐集换场景）
+_FREE_CACHE = {}
+
+
+def _free_cells(pillars, clearance, step):
+    """(余量, 步长, 柱子几何) 对应的 {(i, j): 可走} 字典；键含 _pillar_blocked 用到的全部字段（x、y、radius、size）。"""
+    key = (clearance, step, tuple((p["x"], p["y"], p.get("radius"), tuple(p["size"]) if "size" in p else None) for p in pillars))
+    cells = _FREE_CACHE.get(key)
+    if cells is None:
+        if len(_FREE_CACHE) >= _FREE_CACHE_MAX_SCENES:
+            _FREE_CACHE.pop(next(iter(_FREE_CACHE)))   # 字典保持插入序：丢最早的
+        cells = _FREE_CACHE[key] = {}
+    return cells
+
+
 def astar_path(pillars, start, goal, clearance=0.5, step=0.1):
     """柱区 2D 栅格 A*，返回 [(x,y), ...] 或 None。
 
@@ -367,10 +385,13 @@ def astar_path(pillars, start, goal, clearance=0.5, step=0.1):
     gx, gy = idx(*goal)
     if not (0 <= sx < nx and 0 <= sy < ny and 0 <= gx < nx and 0 <= gy < ny):
         return None
-    free = {}
+    free = _free_cells(pillars, clearance, step)
+    forced = [None]   # 起点格强制可走只对本次调用有效，不能写进跨调用共享的 free
 
     def is_free(i, j):
         k = (i, j)
+        if k == forced[0]:
+            return True
         if k not in free:
             free[k] = not _point_blocked(x0 + i * step, y0 + j * step, pillars, clearance)
         return free[k]
@@ -379,7 +400,7 @@ def astar_path(pillars, start, goal, clearance=0.5, step=0.1):
         return None
     # 起点已经在 0.5 m 规划余量内时不能让 A* 直接失败退回 0.36 m 的局部规划：
     # 强制把起点当自由格，路径先离开余量；纯追踪的前向 0.36 m 检查兜底。
-    free[(sx, sy)] = True
+    forced[0] = (sx, sy)
     open_heap = [(0.0, 0, sx, sy)]
     gscore = {(sx, sy): 0.0}
     parent = {}
