@@ -15,7 +15,9 @@ Design boundaries that must not be violated:
 
 **2026-11-09 实测**：显卡又换回 **NVIDIA GeForce RTX 2080 Ti（sm_75，22 GB，驱动 580.119.02）**，与仓库 CMake 写死的 sm_75 一致（原生 cubin，不再走 PTX JIT）。**显卡型号以每次会话开头 `nvidia-smi -L` 为准，不要信文档**：2026-11-06 至 11-07 曾是 RTX 4080 SUPER（sm_89，32 GB，驱动 595.99.02，产物经 PTX JIT 运行），eval3 / sgvis / 森林评测与 0417、截断、sgvis 三个 ckpt 都在那块卡上产生；新臂与它们比之前先同 seed 重跑一臂对拍（`docs/experiments/2026-11-07-e1-demo-plan.md` §3.3 补记）。cgroup 实际 **12 核**（`nproc` 显示 88 不可信，构建 `--parallel 4–8`）。根分区只剩约 4 GB：构建目录、worktree、临时文件一律放 `/root/rivermind-data/uav_rgb/tmp/`。本容器 Gazebo 的 gpu 渲染后端会段错误（EGL 库是 0 字节占位），**只能 `UAVRGB_RENDER_BACKEND=software`**（约 3 s/步）。
 
-The machine is a single **NVIDIA GeForce RTX 2080 Ti (sm_75, 22 GiB / 21.49 GiB usable, 68 SM)**, not the RTX 5090 described in the spec. (Earlier records said "Tesla T4"; the current device node is `/dev/nvidia0`.)
+**2026-11-10 00:11 起本机两张 RTX 2080 Ti，uav_rgb 只能用一张（用户要求）**：所有用 CUDA 的进程（`uavrgb_train` / `uavrgb_infer` / 3DGS gsplat / torch）都带 `CUDA_VISIBLE_DEVICES=GPU-dbc6435f-4db3-f704-bd1d-3b40bff73a70`（PCI 82:00.0，`nvidia-smi` 1 号，加卡前的 0 号）；按 UUID 钉，不用编号。0 号卡 `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`（02:00.0）留给其它项目（YOLOVOmodal 的 `run_exp.sh` 写死 `CUDA_VISIBLE_DEVICES=0`）。看显存用 `nvidia-smi --id=<UUID>`。Gazebo 走软件渲染，不占 GPU。
+
+The machine has **two NVIDIA GeForce RTX 2080 Ti (sm_75, 22 GiB / 21.49 GiB usable, 68 SM each)** since 2026-11-10; uav_rgb may use only `GPU-dbc6435f-4db3-f704-bd1d-3b40bff73a70` (see above). Not the RTX 5090 described in the spec. (Earlier records said "Tesla T4"; the current device node is `/dev/nvidia0`.)
 
 - CUDA Toolkit **12.8** at `/usr/local/cuda-12.8`; driver 580.119.02（2026-11-06 至 11-07 曾为 595.99.02）. Do not install CUDA 13.x (driver caps at CUDA 13.0, and Turing/sm_75 gains nothing) and never compile for sm_120.
 - Installed and usable: OpenCV 4.6 (C++), Eigen 3.4, Gazebo Harmonic 8.15 (`gz sim`), CMake 3.28 + Ninja, GCC 13.3, ncu/nsys/cuobjdump/nvdisasm.
