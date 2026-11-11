@@ -80,6 +80,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import split_manifest as sm  # noqa: E402  （路径插在常量之后，所以放这里）
 import campus  # noqa: E402
 import asset_campus  # noqa: E402
+import nav_cond  # noqa: E402
 
 
 def sha256_file(path):
@@ -426,6 +427,8 @@ def collect_command(task, args):
             cmd += ["--beta", str(args.beta)]
         if getattr(args, "dagger_round", 0):
             cmd += ["--dagger-round", str(args.dagger_round)]
+        if getattr(args, "student_cond", nav_cond.COND_PREV_ACTION) != nav_cond.COND_PREV_ACTION:
+            cmd += ["--student-cond", args.student_cond]   # W1-9：默认 prev-action 不传，旧命令行逐字不变
     if getattr(args, "stop_at_goal", False):
         cmd.append("--stop-at-goal")             # DISTILL §3.1：过线即止
     if getattr(args, "tiebreak", "legacy") != "legacy":
@@ -648,6 +651,8 @@ def main():
                    help="透传给 collect.py：--policy student 每步执行教师动作的概率（0=全学生执行）")
     p.add_argument("--dagger-round", type=int, default=0,
                    help="透传给 collect.py：--policy student 的 DAgger 轮次（溯源）")
+    p.add_argument("--student-cond", choices=nav_cond.COND_CHOICES, default=nav_cond.COND_PREV_ACTION,
+                   help="透传给 collect.py：--policy student 喂给条件输入的是上一步动作（prev-action，默认）还是航向码（heading-code，W1-9）")
     p.add_argument("--stop-at-goal", action="store_true",
                    help="透传给 collect.py：真值 x 过成功线（最远柱 x + 1.0 m）即结束本集；"
                         "只用于验收线任务（base/forest_e1）。DISTILL §3.1：过线后的帧占 18%%，"
@@ -696,6 +701,8 @@ def main():
         p.error("--student-ckpt/--infer-bin/--beta/--dagger-round 只能和 --policy student 一起用")
     if not (math.isfinite(args.beta) and 0.0 <= args.beta <= 1.0) or args.dagger_round < 0:
         p.error("--beta 必须在 [0, 1]，--dagger-round 必须是非负整数")
+    if args.student_cond != nav_cond.COND_PREV_ACTION and args.policy != "student":
+        p.error("--student-cond 只能和 --policy student 一起用")
     # waypoint 任务（l1/campus）的成功是停在半径内，不是过线；collect.py 对这类 scene 也会拒绝。
     if args.stop_at_goal and args.task not in ("base", "forest_e1"):
         p.error("--stop-at-goal 只用于验收线任务（--task base/forest_e1）")
@@ -889,6 +896,7 @@ def main():
             "teacher_tiebreak": args.tiebreak,
             **({"student_ckpt": os.path.abspath(args.student_ckpt), "beta": args.beta,
                 "dagger_round": args.dagger_round} if args.policy == "student" else {}),
+            **({"student_cond": args.student_cond} if args.student_cond != nav_cond.COND_PREV_ACTION else {}),
             "split": args.split,
             "seeds": args.seeds,
             "spawn_mode": args.spawn_mode,

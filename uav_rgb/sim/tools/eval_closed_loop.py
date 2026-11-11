@@ -90,6 +90,7 @@ import split_manifest as sm  # noqa: E402
 import campus  # noqa: E402
 import asset_campus  # noqa: E402
 import teacher  # noqa: E402
+import nav_cond  # noqa: E402  - 航向码条件输入（--student-cond）与起跑前的一致性闸门
 import collect  # noqa: E402  - 只为 GOAL_MARGIN_M：成功线与 collect --stop-at-goal 的停线必须是同一条
 import rule_policy  # noqa: E402  - 只为 RULE_V0 / COL_DEG：参数随 eval.json 留证、视场范围校验
 
@@ -895,6 +896,8 @@ def run_episode(seed, args, workdir, seen_gids):
                 cmd += ["--infer-bin", args.infer_bin]
             if args.heading_guard:
                 cmd += ["--heading-guard", str(args.heading_guard)]   # 0 不传：旧命令行逐字不变
+            if args.student_cond != nav_cond.COND_PREV_ACTION:
+                cmd += ["--student-cond", args.student_cond]          # 默认 prev-action 不传：旧命令行逐字不变
         elif args.policy == "rule-oracle":
             cmd += ["--rule-hfov-deg", str(args.rule_hfov_deg)]       # 只给 rule-oracle 传：其它策略的命令行逐字不变
             if args.rule_version != "v0":
@@ -1227,6 +1230,11 @@ def main():
     p.add_argument("--heading-guard", type=int, default=0,
                    help="透传给 collect.py（仅 --policy student）：已执行的左转数减右转数的绝对值达到 N 就朝回转一步；"
                         "0=关闭。它改的是策略不是判据，eval.json 顶层记 heading_guard，不动 metric_version")
+    p.add_argument("--student-cond", choices=nav_cond.COND_CHOICES, default=nav_cond.COND_PREV_ACTION,
+                   help="透传给 collect.py（仅 --policy student）：喂给条件输入的是上一步动作（prev-action，默认，现状）还是航向码"
+                        "（heading-code，sim/tools/nav_cond.py，W1-9）。起跑前有一致性闸门：读 ckpt 的训练配置与数据集 meta，"
+                        "条件类型与本开关不一致就报错退出；读不到则警告并记进 eval.json。非默认时 eval.json 顶层记 student_cond / student_cond_check，"
+                        "不动 metric_version")
     p.add_argument("--action-latency", type=float, default=None, metavar="L",
                    help="透传给 collect.py：把动作派发时刻固定到仿真时间（观测戳 + L 秒），动作生效时长固定为 hold - L，"
                         "迟到步（就绪时已超过 L + 0.02 s）记账。含迟到步的集算基础设施失败（eval.json failed[] 与 "
@@ -1307,6 +1315,8 @@ def main():
         p.error("--rtf 必须是有限正数")
     if args.heading_guard < 0 or (args.heading_guard and args.policy != "student"):
         p.error("--heading-guard 必须是非负整数，且只能和 --policy student 一起用")
+    if args.student_cond != nav_cond.COND_PREV_ACTION and args.policy != "student":
+        p.error("--student-cond 只能和 --policy student 一起用")
     if args.policy != "rule-oracle" and args.rule_hfov_deg != 60.0:
         p.error("--rule-hfov-deg 只能和 --policy rule-oracle 一起用")
     if args.policy != "rule-oracle" and args.rule_version != "v0":
@@ -1382,10 +1392,19 @@ def main():
             p.error(str(e))
         try:
             text_dim = probe.text_dim
+            prev_dim = probe.prev_dim
         finally:
             probe.close()
         if args.text_mode != "keep" and text_dim <= 0:
             p.error(f"ckpt text_dim={text_dim}，--text-mode {args.text_mode} 不会改变推理")
+        # 条件输入一致性闸门（W1-9）：模型训练时的条件类型（prev_dim + 训练数据 meta 的 cond）必须等于 --student-cond。
+        # 不一致 = 喂了分布外输入，结果不能当这个学生的成绩；拿不到训练时的条件类型只警告并写进 eval.json，不猜。
+        args.student_cond_check = nav_cond.check_student_cond(args.student_cond, args.ckpt, prev_dim)
+        if args.student_cond_check["status"] == "mismatch":
+            p.error(args.student_cond_check["message"])
+        if args.student_cond_check["status"] == "unverified":
+            print(f"警告: 条件输入一致性未核实（--student-cond {args.student_cond}）：{args.student_cond_check['message']}；"
+                  "已记进 eval.json 的 student_cond_check", file=sys.stderr, flush=True)
         if args.text_mode != "keep" and args.task not in ("l1", "campus", "campus_assets"):
             p.error("--text-mode 只对 --task l1/campus 有意义")
         args.infer_bin = infer_bin  # 让 run_episode 与 report 用同一个路径
@@ -1509,6 +1528,12 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
               "goal_margin": args.goal_margin,
               "corridor_half_width": args.corridor_half_width,
               **({"heading_guard": args.heading_guard} if args.heading_guard else {}),
+              # W1-9：条件输入。只在非默认（heading-code）或闸门没核实出来时写键（默认 eval.json 逐位不变）；
+              # student_cond_check 记模型训练时的条件类型与来源，事后能查「喂的是不是训练时那一种」。
+              **({"student_cond": args.student_cond, "student_cond_check": args.student_cond_check}
+                 if getattr(args, "student_cond_check", None) is not None
+                 and (args.student_cond != nav_cond.COND_PREV_ACTION
+                      or args.student_cond_check["status"] == "unverified") else {}),
               # W1-0：动作派发固定到仿真时间。只在给了开关时写键（默认 eval.json 逐位不变）：action_latency_s 是口径
               # （新旧 SR 不可混报）；含迟到步的集不在 per_episode，单列在 late_dispatch_episodes，明细同在 failed[]。
               **({"action_latency_s": args.action_latency,

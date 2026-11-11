@@ -43,6 +43,7 @@ import campus  # noqa: E402
 import asset_campus  # noqa: E402
 import instruction as instr  # noqa: E402
 import scene_forest  # noqa: E402
+import nav_cond  # noqa: E402  航向码（--cond heading-code）：与闭环同一个函数
 
 # 当前允许打包的几何族版本（不加 --allow-frozen-geometry 时）。3dgs.* 按前缀放行（collect_3dgs 写）。
 # 旧柱阵版本（v3/v4）、campus.v1 要显式 --allow-frozen-geometry。
@@ -289,6 +290,19 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
                         "collision": collision, "prev_action": prev_action,
                         "depth": depth, "depth_format": depth_format})
 
+    # 航向码（--cond heading-code，任务卡 W1-9）：按集从头累计**已执行**动作的净转向数（含被 --drop-collision 丢掉的步：
+    # 机体照样转过了），每步取执行前的 n。末行的动作不影响任何码；非末行的坏值上面的主循环已经 die 过，所以转换失败按「非转向」处理。
+    ordered = sorted(rows, key=lambda r: int(r["step"]))
+
+    def executed_or_none(r):
+        try:
+            return int(r.get("action_executed", r["action_expert"]))
+        except (TypeError, ValueError):
+            return None
+    code_at = dict(zip((int(r["step"]) for r in ordered), nav_cond.heading_codes([executed_or_none(r) for r in ordered])))
+    for s in samples:
+        s["heading_code"] = code_at[s["step"]]
+
     return {
         "dir": os.path.abspath(ep_dir),
         "camera_fx": camera.get("fx"),
@@ -502,7 +516,7 @@ def _split_facts_one_family(episodes):
 
 
 def build_meta(episodes, total, size, dropped=0, split_scheme=None,
-               collision_filter=None, allow_mixed=False, aux_info=None):
+               collision_filter=None, allow_mixed=False, aux_info=None, cond=None):
     src_w, src_h = episodes[0]["src_w"], episodes[0]["src_h"]
     families = family_facts(episodes)
     if allow_mixed and len(families) > 1:
@@ -581,6 +595,9 @@ def build_meta(episodes, total, size, dropped=0, split_scheme=None,
         # UAVRAUX1 侧车摘要（新增 meta 字段不升版本，DATASET_FORMAT.md §5）；权威信息在侧车头里。
         # 键名不能含 "episodes"/split_* 子串（C++ 读端按子串定位）。
         "aux_sidecar": aux_info,
+        # --cond heading-code（W1-9）：侧车里 prev_action 那一列是航向码而不是上一步动作；评测端闸门读这个键判断模型训练时的条件类型。
+        # 只在 heading-code 时写键（默认 meta 逐位不变；没有这个键 = prev-action 语义）。
+        **({"cond": nav_cond.DATASET_COND_TAG} if cond == nav_cond.COND_HEADING_CODE else {}),
         "splits": counts,
         # 每 split 的每类样本数：T3 的「四类 recall >0」需要先确认 val/test 有 support。
         "class_counts": class_counts,
@@ -653,13 +670,13 @@ def load_frame(path, src_w, src_h, size, crop=None, src_expected=None):
 
 def write_dataset(out_dir, episodes, total, size, dropped=0, crop=None,
                   src_expected=None, split_scheme=None, collision_filter=None,
-                  allow_mixed=False, aux_info=None):
+                  allow_mixed=False, aux_info=None, cond=None):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "dataset.uavr")
     out_w, out_h = size
 
     meta_bytes = json.dumps(build_meta(episodes, total, size, dropped, split_scheme,
-                                       collision_filter, allow_mixed, aux_info),
+                                       collision_filter, allow_mixed, aux_info, cond),
                             ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     # C++ 读端（dataset.cpp）按子串定位 "episodes" 数组与 split_* 标量，不是完整 JSON 解析：
     # "episodes" 只能出现一次，split_*/collision_flags 的第一次出现必须是顶层（在 episodes 数组之前），
@@ -844,8 +861,10 @@ def depth_bands(cells):
     return bands
 
 
-def aux_payload(episodes, size, envelope_radius_m):
-    """算 prev_index / prev_action / 深度分带；返回 (prev_index, prev_action, depth 或 None, grid)。"""
+def aux_payload(episodes, size, envelope_radius_m, cond=nav_cond.COND_PREV_ACTION):
+    """算 prev_index / prev_action / 深度分带；返回 (prev_index, prev_action, depth 或 None, grid)。
+
+    cond="heading-code"（W1-9）：prev_action 那一列写航向码（load_episode 按已执行动作累计的 s["heading_code"]），其余不变。"""
     out_w, out_h = size
     grid = (out_h // DEPTH_GRID_DOWN, out_w // DEPTH_GRID_DOWN)
     flat = [(ep, s) for ep in episodes for s in ep["samples"]]
@@ -858,7 +877,7 @@ def aux_payload(episodes, size, envelope_radius_m):
             g = ep["sample_start"] + i
             # 上一步被 --drop-collision 丢掉时 step-1 不在 by_step：同首帧处理（指向自身）。
             prev_index[g] = by_step.get(s["step"] - 1, g)
-            prev_action[g] = s["prev_action"]
+            prev_action[g] = s["heading_code"] if cond == nav_cond.COND_HEADING_CODE else s["prev_action"]
     have = [s["depth"] is not None for _, s in flat]
     if not any(have):
         return prev_index, prev_action, None, grid
@@ -965,6 +984,10 @@ def main():
                         "stdout 告警一行，meta.dynamics_profiles 记全部值；部分集缺字段仍拒绝")
     p.add_argument("--envelope-radius", type=float, default=DEFAULT_ENVELOPE_RADIUS_M,
                    metavar="M", help="深度分带目标的包络膨胀半径（m），E1 机体 0.102；0 = 不膨胀")
+    p.add_argument("--cond", choices=nav_cond.COND_CHOICES, default=nav_cond.COND_PREV_ACTION,
+                   help="侧车 dataset.aux 里 prev_action 那一列写什么：prev-action=上一步执行的动作（默认，现状）；"
+                        "heading-code=航向码（按集从头累计已执行的 YAW_LEFT−YAW_RIGHT，sim/tools/nav_cond.py，W1-9），"
+                        "meta 顶层记 cond=heading_code.v1。训练时都用 --prev-action 读这一列；只用于柱阵/长课程任务（航向设定值 H=0）")
     p.add_argument("episodes", nargs="+", help="一个或多个 collect.py episode 目录")
     args = p.parse_args()
     if args.split_by_map and not args.allow_diagnostic_split:
@@ -976,6 +999,11 @@ def main():
         args.episodes, args.drop_collision, args.exclude_collision_episodes,
         args.split_by_map, args.allow_frozen_geometry, args.allow_diagnostic_split,
         args.allow_mixed_geometry, args.allow_mixed_dynamics)
+    if args.cond == nav_cond.COND_HEADING_CODE:
+        with_waypoint = [ep["dir"] for ep in episodes if ep.get("waypoint") is not None]
+        if with_waypoint:
+            die("--cond heading-code 只用于柱阵/长课程任务（航向设定值 H 恒为 0）；%d 集带 waypoint（H 未定义），例：%s"
+                % (len(with_waypoint), with_waypoint[0]))
     split_scheme = "map-hash:%s" % args.split_by_map if args.split_by_map else None
     collision_filter = {
         "drop_collision_steps": bool(args.drop_collision),
@@ -993,7 +1021,7 @@ def main():
         os.remove(stale)
     # 侧车先算后写：深度文件坏了要在替换 dataset.uavr 之前报错。旧 dataset.aux 先删——
     # 它绑定的是旧 uavr 的 SHA，留着只会让读端报「SHA 不匹配」。
-    prev_index, prev_action, depth, grid = aux_payload(episodes, args.size, args.envelope_radius)
+    prev_index, prev_action, depth, grid = aux_payload(episodes, args.size, args.envelope_radius, args.cond)
     stale_aux = os.path.join(args.out, "dataset.aux")
     if os.path.exists(stale_aux):
         os.remove(stale_aux)
@@ -1005,7 +1033,7 @@ def main():
                                          split_scheme=split_scheme,
                                          collision_filter=collision_filter,
                                          allow_mixed=args.allow_mixed_geometry,
-                                         aux_info=aux_info)
+                                         aux_info=aux_info, cond=args.cond)
     apath = write_aux_sidecar(args.out, out_path, prev_index, prev_action, depth, grid,
                               args.envelope_radius)
     first = int((prev_index == np.arange(len(prev_index), dtype=np.uint32)).sum())

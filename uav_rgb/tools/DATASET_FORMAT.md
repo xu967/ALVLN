@@ -98,6 +98,8 @@
 - `aux_sidecar`（新版 preprocess 追加）：`{"file":"dataset.aux","format":"UAVRAUX1",
   "depth":true|false,"depth_grid":[15,20]|null,"band_edges_m":[...],"envelope_radius_m":0.102}`，
   记录同目录侧车的存在与口径（见 §6）。旧数据集没有该字段也没有侧车，读端照常。
+- `cond`（`preprocess.py --cond heading-code` 追加，W1-9）：`"heading_code.v1"`。只有这种包才有该键；没有 = 侧车 `prev_action`
+  列是上一步动作（原语义）。有它时那一列是航向码（§6.2），评测端的条件一致性闸门（`sim/tools/nav_cond.py`）读它。
 
 ### 1.5 episode_manifest.json 的「有效」与「完整」是两个字段
 
@@ -201,7 +203,7 @@ P1 软标签（UAVSOFT1）要对新包重新 `join_soft_targets`，旧 `.bin` �
 | 段 | 类型 | 说明 |
 |---|---|---|
 | prev_index | `u32[N]` | 全局样本下标：同 episode 内 step−1 的样本；首帧、或上一步被打包侧 `--drop-collision` 丢掉时 = 自身下标。读端由此派生 `first_frame[i] = (prev_index[i] == i)` 供工具/分析用；训练器目前直接按 prev_index 取上一帧，不读 first_frame |
-| prev_action | `u8[N]` | 上一步**执行**的动作（`actions.jsonl` 的 `action_executed`，旧数据退回 `action_expert`）；首帧 = 0（SAFE_NEUTRAL）。注意：上一步被丢掉时它仍取该步真实执行的动作 |
+| prev_action | `u8[N]` | 上一步**执行**的动作（`actions.jsonl` 的 `action_executed`，旧数据退回 `action_expert`）；首帧 = 0（SAFE_NEUTRAL）。注意：上一步被丢掉时它仍取该步真实执行的动作。`--cond heading-code` 的包（meta `cond="heading_code.v1"`）这一列改写航向码：按集从头累计**已执行**的 YAW_LEFT−YAW_RIGHT 得 n（含被丢掉的步），取该步执行前的 n，\|n\|≤1→0、n≥2→2、n≤−2→3，码 1 不用，首帧 0（`sim/tools/nav_cond.py`）；训练器同样用 `--prev-action` 读它 |
 | depth（flags bit0） | `u8[N·depth_h·depth_w]` | 行优先 `[n][r][c]`，0..K−1 为分带（K−1 含「没打到东西」），255 = 未知（损失屏蔽） |
 
 深度目标的生成（`preprocess.aux_payload`）：源分辨率深度图 → 每格（源图按 H/8×W/8 均分）

@@ -77,6 +77,9 @@ CFG = dict(
                                           # best = ckpt_best.bin（改前行为）。--epochs < avg_last_k 时 preflight 报错；smoke（--epochs 2）要带 E1_DELIVER=best
     avg_last_k=e1_pipeline.CFG["avg_last_k"],
     gpu=e1_pipeline.CFG["gpu"],           # 校准推理钉的那张卡（CUDA_VISIBLE_DEVICES）
+    # 条件输入（W1-9）：prev-action=现状；heading-code=采集喂航向码（--student-cond）、打包写航向码（preprocess --cond）、训练加 --prev-action、
+    # 流水线自训的臂评测带 --student-cond（基线不带）。非默认时 round0_ckpt 也必须是同类条件训的模型（本流水线不校验；评测端闸门兜底）。
+    student_cond="prev-action",
     # 评测：20 seed 从 e1_pipeline.CFG 读（单源，不复制字面量）；80 步；每臂 1 gz
     eval_seeds=e1_pipeline.CFG["eval_seeds"],
     eval_steps=e1_pipeline.CFG["eval_steps"],
@@ -273,6 +276,8 @@ def collect_cmd(col, seeds, settings, instances, steps, policy="teacher", ckpt=N
         if beta:
             cmd += ["--beta", str(beta)]   # 0 是 collect.py 默认值，不传
         cmd += ["--dagger-round", str(dagger_round), "--infer-bin", f"{BUILD}/uavrgb_infer"]
+        if CFG["student_cond"] != "prev-action":
+            cmd += ["--student-cond", CFG["student_cond"]]   # 默认不传：旧命令行逐字不变
     return cmd
 
 
@@ -468,6 +473,8 @@ def preprocess_into(ds, eps):
         cmd.append("--drop-collision")
     if CFG["allow_mixed_dynamics"]:
         cmd.append("--allow-mixed-dynamics")
+    if CFG["student_cond"] == "heading-code":
+        cmd += ["--cond", "heading-code"]
     sh(cmd + eps, log_path=None if DRY else ds + ".log")
 
 
@@ -514,6 +521,8 @@ def train_into(ds, run_dir):
            "--seed", str(CFG["seed"]), "--class-weights", CFG["class_weights"]]
     if CFG["drop_collision"]:
         cmd.append("--drop-collision")
+    if CFG["student_cond"] == "heading-code":
+        cmd.append("--prev-action")   # 读侧车里的航向码列；不加就训出忽略条件输入的模型
     if CFG["deliver"] == "calswa":
         cmd.append("--save-every-epoch")   # 平均要用末 avg_last_k 轮的 ckpt_epNN.bin（每个约 1.2 MB）
     sh(cmd, log_path=None if DRY else run_dir + ".log")
@@ -566,7 +575,7 @@ def run_more_demos(out, settings, exclude_gids, rounds):
     return deliver_ckpt(os.path.join(md, "run"))
 
 
-def eval_cmd(policy, ckpt, seeds_csv, edir, settings):
+def eval_cmd(policy, ckpt, seeds_csv, edir, settings, student_cond=None):
     cmd = [PY, f"{REPO}/sim/tools/eval_closed_loop.py", "--policy", policy, "--task", "base", "--split", "test",
            "--seeds", seeds_csv, "--episodes", str(len(seeds_csv.split(","))), "--steps", str(CFG["eval_steps"]),
            "--out", edir, "--sim-timeout", str(CFG["sim_timeout"]), "--episode-timeout", str(CFG["episode_timeout"]),
@@ -576,11 +585,14 @@ def eval_cmd(policy, ckpt, seeds_csv, edir, settings):
         cmd += ["--corridor-half-width", f"{CFG['corridor_half_width']:g}"]
     if ckpt:
         cmd += ["--ckpt", ckpt, "--infer-bin", f"{BUILD}/uavrgb_infer"]
+        if student_cond and student_cond != "prev-action":
+            cmd += ["--student-cond", student_cond]   # 只给流水线自训的臂（基线没有条件输入）；默认不传
     return cmd
 
 
-def evaluate(out, arms, seeds_csv, prefix, settings):
-    """arms = [(名, policy, ckpt)]；同时 ≤ eval_parallel 个（各 1 gz）；等齐所有组再查产物（e1_pipeline 4e44e70 的教训）。"""
+def evaluate(out, arms, seeds_csv, prefix, settings, student_cond=None):
+    """arms = [(名, policy, ckpt)]；同时 ≤ eval_parallel 个（各 1 gz）；等齐所有组再查产物（e1_pipeline 4e44e70 的教训）。
+    student_cond：流水线自训的臂（dagger / more_demos）传 CFG.student_cond；基线臂（baselines()）不传。"""
     running, launched, logs = {}, [], []
     for name, policy, ckpt in arms:
         edir = os.path.join(out, f"{prefix}-{name}")
@@ -600,7 +612,7 @@ def evaluate(out, arms, seeds_csv, prefix, settings):
                     running.pop(n)
             time.sleep(5)
         wait_gz_gate()
-        cmd, log_path = eval_cmd(policy, ckpt, seeds_csv, edir, settings), f"{edir}.log"
+        cmd, log_path = eval_cmd(policy, ckpt, seeds_csv, edir, settings, student_cond), f"{edir}.log"
         log("$ " + " ".join(cmd) + f"  > {log_path}")
         launched.append(name)
         if not DRY:
@@ -816,14 +828,14 @@ def main(argv=None):
         md_ckpt = run_more_demos(out, settings, exclude, CFG["rounds"])
         arms = [("dagger", "student", ckpt), ("more_demos", "student", md_ckpt)]
         last = "eval20"
-        step(out, "eval20", evaluate, out, arms, CFG["eval_seeds"], "eval20", settings)
+        step(out, "eval20", evaluate, out, arms, CFG["eval_seeds"], "eval20", settings, CFG["student_cond"])
         last = "baselines"
         decisions = step(out, "baselines", baselines, out, names, CFG["eval_seeds"], settings)
         last = "eval60"
         csv60 = step(out, "eval60.seeds", seeds60, out)
         arm60 = [(n, "student", ckpt if n == "dagger" else md_ckpt) for n in CFG["eval60_arms"]]
         if arm60:
-            step(out, "eval60", evaluate, out, arm60, csv60, "eval60", settings)
+            step(out, "eval60", evaluate, out, arm60, csv60, "eval60", settings, CFG["student_cond"])
         last = "summary"
         if not DRY:
             step(out, "summary", summary, out, CFG["rounds"], arms, decisions, csv60)

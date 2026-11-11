@@ -76,6 +76,7 @@ import split_manifest as sm
 import cf_sil
 import cf_blackbox
 import cf_sitl_exec
+import nav_cond
 
 TWIST_TOPIC = "/X3/gazebo/command/twist"
 CAMERA_TOPIC = "/uav/camera"
@@ -826,7 +827,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 predictive_teacher=None, rl_teacher=None, sil=None,
                 tiebreak="legacy", beta=0.0, rng=None, prev_executed=None,
                 costmap_opts=None, heading_guard=0, net_yaw=0, rule_hfov_deg=60.0, last_turn=None,
-                rule_version="v0", rule_mem=None, action_latency_s=None):
+                rule_version="v0", rule_mem=None, action_latency_s=None, student_cond="prev-action"):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。
 
     dyn=None 为 x3_velocity 旧行为（定速 + 窗口末刹停）；给 CfStab 时按摇杆模型
@@ -849,14 +850,19 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     学生 + β=0 + 给了它时，影子教师标签挪到派发之后算（A* 的耗时落进 hold 窗口，不计进观测到派发的延迟；
     β=0 时执行的动作与标签无关）；β>0（标签可能就是执行的动作）与教师策略（A* 就是动作）不动。
     None = 旧行为：派发在最新位姿戳，不等、不记迟到、标签位置不变；row["dispatch_lag_s"]（派发戳减观测戳，秒）两种情况都记。
+    student_cond（--student-cond，W1-9）：只在 policy == "student" 时起作用。"prev-action"=现状，传给学生的是 prev_executed；
+    "heading-code"=传 nav_cond.heading_code(net_yaw)（net_yaw 由主循环按已执行动作维护，首帧 0 → 码 0），该步多记 cond_code。
     """
     if window_from not in ("dispatch", "observation"):
         raise ValueError(f"window_from 无效: {window_from!r}")
+    if student_cond not in nav_cond.COND_CHOICES:
+        raise ValueError(f"student_cond 无效: {student_cond!r}（{'/'.join(nav_cond.COND_CHOICES)}）")
     if action_latency_s is not None and window_from != "observation":
         raise ValueError("action_latency_s 只能配 window_from='observation'（截止时刻 = 观测戳 + hold）")
     tie_margin = None          # 只有 tiebreak=visible 的 A* 教师会填；legacy 不多算也不落盘
     q_costs = None             # 只有 costmap 教师会填：Q[SAFE, FWD, L, R]（步）
     executed_by = None         # 只有 DAgger 影子教师模式会填 "student"/"expert"，rule-oracle 填 "rule_oracle"
+    cond_code = None           # 只有 --student-cond heading-code 的学生步会填：本步传给学生的航向码
     rule_cols = rule_entry = None   # 只有 rule-oracle 会填：该步的 20 列（或 27 列）距离与触发的规则条目
     rule_mem_n = rule_clear = None  # 只有 rule-oracle v1 会填：记忆点数、[clear(+α), clear(0), clear(−α)]
     label = None               # 标签（action_expert）；None = 与执行的动作相同（除影子教师外都如此）
@@ -956,7 +962,11 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         try:
             # prev_executed：β>0 时上一步可能执行的是教师动作，prev-action 模型要看真正执行的那个；
             # β=0 时它就是学生自己上一步的输出，与不传完全等价（student.act 的缓存语义）。
-            action, infer_ms, probs = student.act(rgb_msg, prev_action=prev_executed)
+            # heading-code（W1-9）：传航向码，与 preprocess --cond heading-code 写进训练侧车的是同一个函数。
+            cond_in = prev_executed
+            if student_cond == nav_cond.COND_HEADING_CODE:
+                cond_code = cond_in = nav_cond.heading_code(net_yaw)
+            action, infer_ms, probs = student.act(rgb_msg, prev_action=cond_in)
             if probs is not None:
                 # W1-3：保留学生的四类概率落进行里，4 位小数。放在 try 里：概率不是数字列表就在派发前判本步失败，
                 # 不留到动作发出之后才在组装行时抛异常。是学生自己的输出，与本步谁执行无关（β 混合换成教师动作、
@@ -1250,6 +1260,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         # 派发时的仿真戳减观测戳（秒）：每步都记，不依赖 --action-latency；late_dispatch 只有给了它才非 None。
         "dispatch_lag_s": (exec_ts - pose_before_ts) / 1e9,
         "late_dispatch": late_dispatch,
+        "cond_code": cond_code,      # None 时 action_row 不落盘（默认的字段集与旧版完全一致）
         "action_end_ns": pose_ts,
         "displacement_m": dist,
         "dyaw_deg": dyaw,
@@ -1338,6 +1349,9 @@ def action_row(r, save_depth=False):
     for k in ("dispatch_lag_s", "late_dispatch"):
         if r.get(k) is not None:
             row[k] = r[k]
+    # W1-9：cond_code（传给学生的航向码，0/2/3）只有 --student-cond heading-code 才有；0 是合法值，所以按 is not None 判断。排在最后。
+    if r.get("cond_code") is not None:
+        row["cond_code"] = r["cond_code"]
     return row
 
 
@@ -1457,6 +1471,10 @@ def main():
     p.add_argument("--heading-guard", type=int, default=0,
                    help="--policy student 的航向护栏（R1 判别实验）：已执行的左转数减右转数的绝对值达到 N 就朝回转一步；"
                         "0=关闭（默认，行为逐位不变）。被护栏改写的步 executed_by=heading_guard")
+    p.add_argument("--student-cond", choices=nav_cond.COND_CHOICES, default=nav_cond.COND_PREV_ACTION,
+                   help="--policy student 喂给条件输入（模型 prev_dim=4）的是什么：prev-action=上一步执行的动作（默认，现状）；"
+                        "heading-code=航向码 nav_cond.heading_code(已执行 YAW_LEFT−YAW_RIGHT)（W1-9，与 preprocess --cond heading-code 同一个函数）。"
+                        "heading-code 时 manifest 记 student_cond，每行记 cond_code；模型必须是 --prev-action 在 heading-code 数据上训的")
     p.add_argument("--action-latency", type=float, default=None, metavar="L",
                    help="把动作派发时刻固定到仿真时间（W1-0）：策略出动作后，等位姿话题的仿真戳 >= 观测戳 + L 秒再派发；"
                         "执行器截止仍是观测戳 + hold，动作生效时长固定为 hold - L，与策略这一步算了多久无关。"
@@ -1511,6 +1529,8 @@ def main():
         p.error("--dagger-round 必须是非负整数")
     if args.heading_guard < 0 or (args.heading_guard and args.policy != "student"):
         p.error("--heading-guard 必须是非负整数，且只能和 --policy student 一起用")
+    if args.student_cond != nav_cond.COND_PREV_ACTION and args.policy != "student":
+        p.error("--student-cond 只能和 --policy student 一起用")
     if args.policy != "rule-oracle" and args.rule_hfov_deg != 60.0:
         p.error("--rule-hfov-deg 只能和 --policy rule-oracle 一起用")
     if args.policy != "rule-oracle" and args.rule_version != "v0":
@@ -1821,7 +1841,8 @@ def main():
                                     heading_guard=args.heading_guard, net_yaw=net_yaw,
                                     rule_hfov_deg=args.rule_hfov_deg, last_turn=last_turn,
                                     rule_version=args.rule_version, rule_mem=rule_mem,
-                                    action_latency_s=args.action_latency)
+                                    action_latency_s=args.action_latency,
+                                    student_cond=args.student_cond)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -2006,6 +2027,8 @@ def main():
             **(dagger or {}),
             # 航向护栏只在开了的时候写键：默认 manifest 逐位不变。
             **({"heading_guard": args.heading_guard} if args.heading_guard else {}),
+            # 航向码（W1-9）：学生喂的是 heading-code 时才写键（默认 prev-action 不写，manifest 逐位不变）。
+            **({"student_cond": args.student_cond} if args.student_cond != nav_cond.COND_PREV_ACTION else {}),
             # rule-oracle 的视场与规则参数同样只在用到时写键（预注册的参数随每集 manifest 留证）。
             **({"rule_oracle": ({"hfov_deg": args.rule_hfov_deg, "params": RULE_V0} if args.rule_version == "v0"
                                 else {"version": args.rule_version, "hfov_deg": args.rule_hfov_deg, "params": RULE_V1})}

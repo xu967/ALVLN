@@ -20,6 +20,7 @@ from unittest.mock import patch
 TOOLS = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, TOOLS)
 import collect
+import nav_cond
 import split_manifest as sm
 
 passed = 0
@@ -1074,6 +1075,18 @@ def main():
     row_n, err_n, _ = shadow_teacher_step(beta=0.0, heading_guard=2, net_yaw=1)
     check("护栏未触发：执行学生动作",
           err_n is None and row_n["action_executed"] == 1 and row_n["executed_by"] == "student")
+
+    # 航向码（--student-cond heading-code，W1-9）：传给学生的值 = nav_cond.heading_code(net_yaw)；默认与改动前逐位相同。
+    # 主循环 / 行字段 / manifest / eval 透传的接线在 test_nav_cond_wiring.py，这里锁 collect_one 这一层。
+    for n in (-3, -2, -1, 0, 1, 2, 3):
+        row_c, err_c, seen_c = shadow_teacher_step(beta=0.0, prev_executed=collect.YAW_LEFT, net_yaw=n,
+                                                   student_cond="heading-code")
+        check(f"航向码：net_yaw={n} → 传给学生 {nav_cond.heading_code(n)}（与 prev_executed 无关）",
+              err_c is None and seen_c == [nav_cond.heading_code(n)] and row_c["cond_code"] == nav_cond.heading_code(n))
+    row_p, err_p, seen_p = shadow_teacher_step(beta=0.0, prev_executed=collect.YAW_RIGHT, net_yaw=5)
+    check("默认：传给学生的仍是 prev_executed（net_yaw 不起作用），行里没有 cond_code",
+          err_p is None and seen_p == [collect.YAW_RIGHT] and row_p.get("cond_code") is None
+          and "cond_code" not in collect.action_row(row_p | {"depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0}))
 
     print(f"test_collect: {passed} 项通过")
     return 0

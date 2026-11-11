@@ -396,6 +396,48 @@ class MainTests(unittest.TestCase):
         rc, out = self._run("--rounds", "1", "--baselines", "", "--epochs", "9", "--stop-after-preflight")
         self.assertEqual(rc, 0, out)
 
+    def _dry_lines(self, **cfg):
+        """dry-run 打印的命令行（每行一条）；cfg 改 CFG（tearDown 会恢复）。"""
+        dg.CFG.update(round0_collection=self.col, round0_ckpt=self.ckpt, **cfg)
+        rc, out = self._run("--dry-run", "--rounds", "2", "--eps-per-round", "2", "--instances", "2",
+                            "--steps", "12", "--eval-seeds", "1,113", "--epochs", "2", "--baselines", "trunc")
+        self.assertEqual(rc, 0, out)
+        return out.splitlines()
+
+    def test_default_student_cond_adds_no_flag_anywhere(self):
+        self.assertEqual(dg.CFG["student_cond"], "prev-action")
+        lines = self._dry_lines()
+        for flag in ("--student-cond", "--cond", "--prev-action"):
+            self.assertEqual([ln for ln in lines if flag in ln], [], flag)
+
+    def test_heading_code_is_passed_to_collect_preprocess_train_and_eval(self):
+        lines = self._dry_lines(student_cond="heading-code")
+        o = os.path.join(self.tmp, "out")
+        collects = [ln for ln in lines if "collect_parallel.py" in ln]
+        self.assertTrue(collects)
+        for ln in collects:
+            if "--policy student" in ln:
+                self.assertIn("--student-cond heading-code", ln)
+            else:
+                self.assertNotIn("--student-cond", ln, "more_demos 是教师采集：没有学生，也就没有条件输入")
+        self.assertTrue([ln for ln in collects if "--policy student" in ln])
+        packs = [ln for ln in lines if "preprocess.py" in ln]
+        self.assertTrue(packs)
+        for ln in packs:
+            self.assertIn("--cond heading-code", ln)
+        trains = [ln for ln in lines if "uavrgb_train" in ln]
+        self.assertTrue(trains)
+        for ln in trains:
+            self.assertIn("--prev-action", ln)   # 不加就训出忽略条件输入的模型，评测端闸门会拒绝
+
+        def eval_line(name):
+            hit = [ln for ln in lines if "eval_closed_loop.py" in ln and f"--out {o}/{name}" in ln]
+            self.assertEqual(len(hit), 1, name)
+            return hit[0]
+        for name in ("eval20-dagger", "eval20-more_demos", "eval60-dagger"):
+            self.assertIn("--student-cond heading-code", eval_line(name), name)
+        self.assertNotIn("--student-cond", eval_line("eval20-trunc"), "基线 trunc 没有条件输入，评测不带这个开关")
+
     def test_preflight_failure_writes_status_and_done(self):
         dg.CFG.update(round0_collection=self.col, round0_ckpt=os.path.join(self.tmp, "missing.bin"))
         rc, out = self._run("--rounds", "1", "--baselines", "")
