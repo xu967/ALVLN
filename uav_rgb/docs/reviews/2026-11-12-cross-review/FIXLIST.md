@@ -30,6 +30,7 @@
 | K3 | `df15994` | `f5f1596` | 32 个文件，+6125 −30 | `rule_policy.py` 规则 v2；`sim/3dgs/rule_oracle.py` 的 `rule_version` |
 | W1-12 | `dfb98c4` | `0401dee` | 15 个文件，+3776 −18 | `sim/3dgs/planner.py` 的 `clearance=swept`；`collect_3dgs.py` 出生两层判空（缺省关） |
 | E2E-0 | `f39ba81` | `2c95ea0` | 12 个文件，+2561 | 只有实验入口与分析脚本 |
+| T1（第二批，11-12 06:55） | `b706b2f` | `fe6ca32` | 5 个文件，+544 | 只加测试（审核 F4、F5 的两个 C++ 测试与公共夹具） |
 
 - 合计（`git diff --shortstat base-20261112 f39ba81`）：`src`、`sim`、`tools` 下 50 个文件 +8555 −169，其中不是测试的 24 个文件 +2004 −148；`experiments` 下 62 个文件 +13610 −37。
 - 合并时的冲突四次，解决办法写在各自合并提交的说明里：W1-9（`collect.py` 与 `dagger_gz_pipeline.py`，同时保留 W1-3 的 `probs` 与 W1-5 的交付权重项）、
@@ -181,10 +182,10 @@
 | F1 | 同 C2、G1：3DGS 学生的上一步动作在护栏或 DAgger 改写后取错；之前没有任何测试 | `sim/3dgs/collect_3dgs.py:169-176`、`:211-216`；`sim/3dgs/guard.py:98-116` | 已复现（提议的用例在 HEAD 上 2/2 红） | 同 C2 | 卡 S1；用例 `$D/tmp/phase12-cards/review-f/proposed/test_3dgs_student_prev_action.py` 随修复入库 |
 | F2 | 部署推理路径的 HWC→CHW、双帧顺序、条件字节没有带参考值的测试：下标写成转置、两帧写反都不会红 | `src/infer.cpp:63-80`；`src/tests/test_infer_io.cpp:29-137`；`tools/check_input_parity.py:63` | 读代码判定，没跑 | 板端移植时出错不会被发现 | 卡 T1 |
 | F3 | 打包的标签来源与图像对齐在 `--python-only` 门禁里没人守：把标签改成取执行动作、让帧号错一位，相关测试全部照过 | `tools/preprocess.py:251`、`:285`；`tools/make_synthetic_episode.py:68-69` | 已复现（变异没被抓到；审核者写的用例能抓到） | 训练数据可能悄悄变坏 | 卡 T1 |
-| F4 | 水平翻转增强的标签与条件列互换没有测试 | `src/trainer_dev.cpp:48-65`、`:75-97` | 读代码确认 | 开增强时出错不会被发现 | 卡 T1 |
-| F5 | 双帧训练读的是不是上一帧，没有测试 | `src/trainer_dev.cpp:43`；`src/tests/test_overfit.cpp:98-111` | 读代码确认 | 同上 | 卡 T1 |
+| F4 | 水平翻转增强的标签与条件列互换没有测试 | `src/trainer_dev.cpp:48-65`、`:75-97` | 读代码确认 | 开增强时出错不会被发现 | 卡 T1 第二批（`32d0892`，合并 `b706b2f`）：`src/tests/test_flip_augment.cpp`，10 个变异全部抓到 |
+| F5 | 双帧训练读的是不是上一帧，没有测试 | `src/trainer_dev.cpp:43`；`src/tests/test_overfit.cpp:98-111` | 读代码确认 | 同上 | 卡 T1 第二批（同上）：`src/tests/test_two_frame_prev_index.cpp`，5 个变异全部抓到 |
 | F6 | `check.sh` 不跑的测试（`sim/3dgs` 的 160 项等） | `tools/check.sh` | 读代码与运行确认 | 门禁有洞 | 卡 W1-6 在做 3DGS 的部分；其余在 T1 的报告里列清单 |
-| F7 | `check.sh` 的「几何 split 门禁」负例被另一道门先挡下，没有走到它要测的那一行 | `tools/check.sh:106-121`；`tools/preprocess.py:188-190`、`:388-390` | 已复现 | 那道门坏了不会被发现 | 卡 T1 |
+| F7 | `check.sh` 的「几何 split 门禁」负例被另一道门先挡下，没有走到它要测的那一行。更正（卡 T1 的执行者查明）：几何 split 有三层防线，`load_episode` 的 split 复算、`scan()` 的同几何跨 split、`build_meta` 的「几何组跨 split」；只关中间一层时打包仍被第三层拒绝 | `tools/check.sh:106-121`；`tools/preprocess.py:188-190`、`:388-390`、`:532` 附近 | 已复现 | 那道门坏了不会被发现 | 卡 T1（`54ae6bb`）：负例改成两条，各用只有那一层才有的报错文字断言 |
 | F8 | 闭环判据的边界（走廊半宽、过线）没有锁 | `sim/tools/eval_closed_loop.py:509-510`、`:545` | 已复现 | 小 | 卡 T1 |
 
 ## H：端到端学生的模型与训练配方（`review-h.md`，11-12 01:02 交回）
