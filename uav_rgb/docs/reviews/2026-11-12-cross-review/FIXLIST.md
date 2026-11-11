@@ -4,6 +4,54 @@
 - 用法：每条发现一行。「状态」照抄审核者的说法（已复现 / 读代码确认 / 推断），主会话自己核对过的另注。「处理」写清并入哪张卡、什么时候做；不做的写原因。
 - 八份 11-12 01:02 到齐，共 70 条发现（A 6、B 7、C 9、D 7、E 13、F 8、G 10、H 10）。下面先是按严重程度的总览，再是各角度的逐条表。
 
+## 怎么看 diff（2026-11-12 02:20 起；用户要求改动要方便逐条 diff）
+
+- 基线：标签 `base-20261112`（主仓库）与 `uav_rgb-base-20261112`（GitHub 镜像 ALVLN），都指 11-12 凌晨合并之前的 main。
+- 这一轮的全部代码改动：`git diff base-20261112..main -- src sim tools proto`。GitHub 上是 <https://github.com/xu967/ALVLN/compare/uav_rgb-base-20261112...main>。
+- 一张卡一个合并提交（`--no-ff`）。看一张卡的全部改动：`git diff <合并提交>^1 <合并提交>`。镜像里一张卡是一个提交，点开就是这张卡的 diff。
+- 卡里逐条的提交：`git log --oneline <合并提交>^1..<合并提交>^2`，逐条 `git show <提交号>`。11-12 02:15 之后开工的修复卡守「一条发现一个提交」（公共规则 §5），说明第一行带发现编号。
+- 只看生产代码、不看测试与文档：在上面的命令后面加 `-- . ':!*test_*' ':!*/tests/*' ':!docs' ':!experiments'`。
+
+### 已合并（11-12 01:45–01:56，按合并顺序；主会话逐个审过 diff）
+
+| 卡 | 合并提交 | 镜像提交 | 规模 | 生产代码改了什么 |
+| --- | --- | --- | --- | --- |
+| W1-6 | `499bec9` | `6ca7e41` | 3 个文件，+87 | `tools/check.sh` 加 `sim/3dgs/test_*.py` 一段 |
+| W1-1 | `25e4b28` | `61f32e4` | 5 个文件，+144 | 两条流水线的评测命令默认带 `--corridor-half-width 3` |
+| W1-5 | `8fadc83` | `0b8853a` | 5 个文件，+748 −13 | 两条流水线训练后做末 10 轮平均加校准，评测与后续步骤用这份权重 |
+| W1-2 | `670c4b4` | `5e45249` | 4 个文件，+196 −29 | `tools/stats_report.py` 成功类指标的分母改请求集 |
+| W1-4 | `dd98f89` | `04eed79` | 4 个文件，+606 −29 | `eval_closed_loop.py` 加 `blocks_passed`、`block_survival`、`collisions_per_100m` |
+| W1-3 | `bbc6132` | `d532a9e` | 8 个文件，+406 −12 | `collect.py` 落学生的 `probs`；`eval_closed_loop.py` 加 `max_frame_gap_s` |
+| T1（第一批） | `ceac416` | `c134ffd` | 5 个文件，+405 −3 | 只加测试（审核 F3、F8、F2 的一部分）；`tools/check.sh` 的几何划分负例（F7） |
+| W1-9 | `d816d2c` | `1b21325` | 13 个文件，+1056 −18 | 新文件 `sim/tools/nav_cond.py`；采集与评测的 `--student-cond`，打包的 `--cond heading-code`，评测前的一致性闸门 |
+| W1-7 | `f383584` | `e473ad7` | 20 个文件，+2378 −52 | `teacher.py` 教师 v7；`preprocess.py --exclude-failed-teacher`；审计按教师版本分派 |
+| W1-8 | `e41703e` | `5f51f2c` | 9 个文件，+1397 −6 | `preprocess.py --depth-source analytic` |
+| W1-10 | `41c474d` | `0a56254` | 16 个文件，+3825 −2 | `scene_gen.py`、`eval_closed_loop.py` 的 `--cf-sitl-params`；新工具 `tools/make_params_variant.py` |
+| K3 | `df15994` | `f5f1596` | 32 个文件，+6125 −30 | `rule_policy.py` 规则 v2；`sim/3dgs/rule_oracle.py` 的 `rule_version` |
+| W1-12 | `dfb98c4` | `0401dee` | 15 个文件，+3776 −18 | `sim/3dgs/planner.py` 的 `clearance=swept`；`collect_3dgs.py` 出生两层判空（缺省关） |
+| E2E-0 | `f39ba81` | `2c95ea0` | 12 个文件，+2561 | 只有实验入口与分析脚本 |
+
+- 合计（`git diff --shortstat base-20261112 f39ba81`）：`src`、`sim`、`tools` 下 50 个文件 +8555 −169，其中不是测试的 24 个文件 +2004 −148；`experiments` 下 62 个文件 +13610 −37。
+- 合并时的冲突四次，解决办法写在各自合并提交的说明里：W1-9（`collect.py` 与 `dagger_gz_pipeline.py`，同时保留 W1-3 的 `probs` 与 W1-5 的交付权重项）、
+  W1-7（`preprocess.py` 的 `main`）、W1-8（`preprocess.py` 的 `aux_payload` 同时带 `cond` 与 `depth_source`）、
+  W1-12（`driver.py` 与 K3 的四处；教师构造的 `hold_s` 由 K3 统一传，`test_driver_clearance.py` 的两条断言随之对齐）。
+- 验证：每次合并后跑受影响的测试；全部合并后 `tools/check.sh --python-only` 在 main `f39ba81` 上 rc=0（02:04:14，含 11 个 3DGS 测试文件）。
+  `--cond heading-code`、`--depth-source analytic`、`--exclude-failed-teacher` 三个新开关同时开，在 0417 的 6 集真实数据上打包通过（主会话实跑）。
+  全量 `check.sh`（C++ 构建、CTest、GPU 测试）没有跑：这一批只有 T1 加了一个 C++ 测试文件，等 T1 剩下的两个 C++ 测试交回后一起跑。
+
+### 在做的修复卡（11-12 02:15 开工；合并后在下面各表的「处理」一栏补提交号）
+
+| 卡 | 对应的发现 | 分支 |
+| --- | --- | --- |
+| S1a | C2、G1、F1（3DGS 学生的上一步动作）、D1（评测场景的 split） | `p12-s1a` |
+| S1b | B1–B7（3DGS 碰撞口径）、E-12；新旧口径下重定基线 | `p12-s1b` |
+| W1-13 | A1、A3、A5、G5（步间刹停与记账）、A2 的采集并行器部分；动作持续到下一次派发并重标定 | `p12-w1-13` |
+| W1-14 | D2、D4、D5、D7、A4 与卡 W1-2 的遗留 | `p12-w1-14` |
+| W1-15a | E-2、E-4、E-5、E-6、E-9、E-10、E-11、E-13（实验入口的公共脚本） | `p12-w1-15a` |
+| W1-15b | E-3、E-7、E-8、E-9、A2 的流水线部分 | `p12-w1-15b` |
+| T1（在做） | F2、F4、F5（C++ 测试） | `p12-t1` |
+| C1a（等 T1） | H8、H9、C6 与上一轮 `src.md` 的 D2、D3、D6、D9 | 未建 |
+
 ## 总览：按严重程度（主会话 11-12 01:30 排）
 
 第一类，已经报出去的数或结论要更正（都已写进计划 §10.7 与 §1.3）：
