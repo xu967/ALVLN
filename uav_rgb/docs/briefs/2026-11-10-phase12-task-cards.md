@@ -50,6 +50,7 @@ mkdir -p $D/tmp/phase12-cards/$NAME            # 草稿、日志；报告写 $D/
 | 2 | K1 | 3DGS 上的规则层上限：占据或渲染深度的列距离 + 规则 v1 + 路线方位，室内外各 120 集（零训练）。11-11 已完成并合入 | 规则 v1 已入库 | 否 | 是（3DGS） | 难，建议 Sonnet 5.5 Max |
 | 2 | K3 | 规则 v2：两侧候选、分级通道、禁忌航向；先在 3DGS 室内的开发路线上选变体，再在留出路线上与 v1 逐集配对（零训练；11-11 晚立） | K1 已合入 | 否 | 是（3DGS） | 难，建议 Sonnet 5.5 Max |
 | 2 | W1-12 | 3DGS 教师的前向净空检查改形状、出生判空可选两层检查、导引指针核查（11-11 23:30 细化） | W1-11 已合入；与 K3 只在 driver 的一处相邻改动 | 否 | 是（3DGS） | 中 |
+| 2 | W1-13 | 新协议的记账与口径闭环；动作持续到下一次派发的协议修订与重标定（审核 A 的发现，11-12 立） | W1-2、W1-3、W1-4、W1-9、W1-10 合并之后 | 2 个（标定独占） | 是 | 难，建议 Sonnet 5.5 Max |
 | 端到端 | E2E-0 | 可判定性审计：真值列距离与动作历史能决定多少教师标签（离线，11-12 立） | 无 | 否 | 可选 | 中 |
 | 端到端 | E2E-1 | 航向码端到端学生：W1-9 的实现，加「示范 / DAgger 聚合 × 有无航向码」2×2 试点，不带护栏（11-12 立） | W1-0 第二轮的 L | 2 个 | 是（训练） | 难，建议 Sonnet 5.5 Max |
 | 端到端 | E2E-P0 | PyTorch 原型线的地基：模型复刻、checkpoint 读写、行协议包装器、训练配方复刻，逐项与 C++ 对拍（11-12 立） | 无 | 2 个 | 是（训练） | 中 |
@@ -565,6 +566,38 @@ gz 的上限随核数定（24 核 7 个，12 核 3 个，公共规则 §4），�
 - 不做：不改 A* 的规划余量，不改 hold，不改航向容差，不动 `rule_oracle.py`、`rule_policy.py` 与 driver 里的规则臂（卡 K3 在改）。
 - 提交：`feat(3dgs): 教师前向净空按预测位移做扫掠检查（clearance=swept，缺省不变）`、`feat(3dgs): 出生判空可选两层检查`、
   `fix(3dgs): 导引指针在前视范围内取最近顶点`（复现了才有）、实验入口与结果文档。
+
+### 卡 W1-13：新协议的记账、口径闭环与步间刹停（审核 A 的发现 1–5；11-12 立，等第一波合并后开工）
+
+- 依据：`docs/reviews/2026-11-12-cross-review/review-a.md` 与同目录 `FIXLIST.md` 的 A1–A5。要点：
+  `--action-latency L` 固定了「观测到派发」，没有管「上一动作截止到下一动作派发」。执行器截止 = 观测戳 + hold，下一次派发 = 下一观测戳 + L，
+  相邻观测相隔 frame_dt（现在恒为 0.9 s：相机 10 Hz，动作窗口结束时到手的最新一帧是 0.1 s 前拍的）。于是每两步之间有 L − (hold − frame_dt) 的空档，执行器回 SAFE 刹停：
+  L=0.20 时恒为 0.100 s，旧协议中位 0.015–0.025 s。新协议每步前飞位移比旧协议小 17% 的原因在这里。这段空档不落盘，迟到判据也看不到步间停顿。
+- 前置：W1-3、W1-4、W1-9、W1-10、W1-2 合并之后（都改 `sim/tools/collect.py`、`sim/tools/eval_closed_loop.py` 或 `tools/stats_report.py`）。
+- 先读：审核报告的发现 1–5 与它的两个统计脚本（`$D/tmp/phase12-cards/review-a/gap_stats.py`、`stalls.py`）；`sim/tools/collect.py` 的 `collect_one`（取帧、等派发、`sil.dispatch`）；
+  `sim/tools/cf_sitl_exec.py` 的 `dispatch` 与插件侧对 `until` 的处理（`sim/cf_sitl/gz/`：到期后回 SAFE 是位置保持还是滑行，新动作到来时旧动作是否立刻被取代）；
+  `experiments/2026-11-10-action-latency/` 的 `run_r2.sh` 与 `summarize_r2.py`（标定门的写法，这张卡的标定沿用）；`docs/EVAL_STANDARD.md` §5.5。
+- 第一部分，记账（不改飞行行为；默认输出只多键，用测试锁住其余逐位不变）：
+  1. 每步行加 `safe_gap_s`（本步派发戳减上一步动作截止，首步为 null）与 `obs_gap_s`（本观测戳减上一观测戳）。
+  2. `summarize_episode` 报 `safe_gap_s` 的中位数与最大值、`obs_gap_s` 的最大值；`obs_gap_s` 超过名义步周期 0.2 s 以上的步记进 `stall_steps`。
+     带 `--action-latency` 时，含停顿步的集与含迟到步的集同等处理（进 `failed[]`，占请求名额，不计成功）；不带开关时只记不判。
+  3. 插件侧的实际生效时刻：订阅 state 话题，记每步动作字段第一次等于本步动作时的仿真时刻 `plugin_ack_sim_t`。先量后定：在空闲与满载（另起 8 个占核进程）两种条件下各跑教师 5 集，
+     报 `plugin_ack_sim_t` 减（观测戳 + L）的分布。分布的 p99 小于 10 ms 就只记录；否则迟到判据改用它，阈值按量到的分布定并写明依据。
+- 第二部分，口径闭环：
+  4. `tools/stats_report.py` 的协议一致性键加 `action_latency_s`、`heading_guard`、`rtf`。缺键等于旧口径，与带键的不能进同一张表。加测试（两份只差这一个键的 eval.json 应当报错）。
+  5. `eval_closed_loop.py`：训练数据的协议快照没有 `action_latency_s` 而本次给了 L 时，在 eval.json 里记 `protocol_notes`，不判 OOD，报表能看到。
+  6. `collect_parallel.py`、`tools/e1_pipeline.py`、`tools/dagger_gz_pipeline.py` 透传 `--action-latency` 与 `--rtf`（默认不给，命令行逐字不变）；`preprocess` 加开关丢掉迟到步与停顿步的行（默认关）。
+- 第三部分，协议修订：动作持续到下一次派发（新开关，默认关，关的时候逐位不变）：
+  7. `collect.py` 与 `eval_closed_loop.py` 加 `--action-until {deadline,next-dispatch}`，缺省 `deadline`（现状）。`next-dispatch` 只能与 `--action-latency` 同用：
+     执行器截止取「派发戳 + 名义步周期」，名义步周期先量后定（现在 frame_dt 恒为 0.9 s），相邻两步首尾相接，步间不回 SAFE。
+     SAFE_NEUTRAL 动作、每集最后一步、goal-stop、迟到步、停顿步各自怎么处理，逐条写进 `docs/EVAL_STANDARD.md` 并各有测试。manifest 与 eval.json 记这个键，进协议一致性检查。
+  8. 标定（Gazebo，守护进程，排 Gazebo 池的锁；这一步独占机器，起跑条件照 `run_r2.sh` 的条款 R7）：教师 K=1 与 K=3（K=3 带 `--rtf 0.5`）各 10 个 train 分区 seed，L=0.20，`next-dispatch`。
+     预注册的门：迟到步 0，停顿步 0；K=3 对 K=1 的逐步生效时长、转角、巡航步位移相对差都不超过 2%；`safe_gap_s` 中位数为 0、最大不超过 0.02 s。
+     另报（不进门）：每步前飞位移与转角。预期回到旧协议附近（前飞 0.25–0.27 m，转角 26° 上下）；偏离旧协议 5% 以上要写明原因。
+  9. 学生参照（门过了才跑）：calswa 三个训练种子带护栏，K=1 与 K=3 各 60 集，与第二轮的六个臂逐集配对，只报告。
+- 不做：改 hold、改相机频率、改 L 的取值；改 3DGS 线（它的步进由动力学对象同步推进，没有这段空档；这一句开工时先核实，核实不了就写「未核实」）。
+- 提交：`feat(collect): 每步记 safe_gap_s / obs_gap_s 与插件侧生效时刻，停顿步进失败集`、`fix(stats): 协议一致性键补全`、`feat(pipeline): 透传 --action-latency`、
+  `feat(collect): --action-until next-dispatch（动作持续到下一次派发，默认关）`、标定入口与结果文档。
 
 ## 4b. 端到端线的任务卡（11-12 立；背景与路线见计划 §10）
 

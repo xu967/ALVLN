@@ -62,6 +62,7 @@
     5. 守护脚本阻塞式拿自己那个池的锁（`exec 8>> <锁>; flock 8`，持有到脚本退出），起止各记一次 cgroup 的 `usage_usec` 与 `nr_throttled`。
     6. CPU 账（配额 12 核）：Gazebo 2 条车道实测约 3.5 核；3DGS 3 条车道约 3–4 核（估计，未核实）；一组训练不超过 3 核；`check.sh` 1 核。
        带 `--action-latency` 的 Gazebo 实验被抢核时会出迟到步，迟到的集按入口脚本的规则重跑；不带这个开关的 Gazebo 实验（旧协议）每步生效时长会变短，报告里必须给时序健康。
+       迟到判据目前看不到步间停顿与插件侧的实际派发时刻（交叉审核 A，卡 W1-13 在补），所以「没有迟到步」不等于没有被抢核影响：Gazebo 池保持一次一个实验，不加车位。
   - 卡的配置再变时，以 `nvidia-smi -L` 为准并向用户确认用哪一张，不要自己挑。
 - Python：数据工具 `$R/.venv-tools/bin/python`（无 torch）；3DGS `$D/3dgs-venv/bin/python`（torch + gsplat）；`$D/teacher-venv` 也有 torch，
   只给对照基线与教师工具用。主线训练推理禁用 PyTorch。不往现有 venv 里装包。
