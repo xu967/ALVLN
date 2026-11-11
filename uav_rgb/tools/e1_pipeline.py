@@ -8,6 +8,9 @@
 看进度：tail -f $OUT/run.log；每步状态 $OUT/status.json；结束落 $OUT/DONE（rc + 时间 + 最后一步）。
 续跑：--from train（跳过前面的步骤，要求它们的产物已在 OUT 里）。--dry-run 只打印命令不执行。
 改参数只改 CFG，不改函数。
+交付权重（CFG deliver，环境变量 E1_DELIVER）：默认 calswa = 训练后再做末 10 轮权重平均 + FORWARD 先验校准（tools/average_ckpt.py，
+产物 run/ckpt_calswa.bin，校准推理占 GPU，卡由 CFG gpu / E1_GPU 指定），评测评它；E1_DELIVER=best 回到 trainer 存的 ckpt_best.bin。
+calswa 要求 epochs 不小于 avg_last_k（10），否则 preflight 报错。
 预计耗时（RTF 锁 1.0、软件渲染、4 实例，gz agent 11-07 实测 ≈ 50 s/集）：pilot 5 min；采集 300 集 ≈ 65 min；
 训练 30 轮 ≈ 5 min（设备常驻 2669 样本/秒）；评测 4 组并行 ≈ 40 min。
 """
@@ -81,6 +84,17 @@ CFG = dict(
     seed=0,                  # 与 src-algo 基准 bench-after 同 seed，便于对照
     class_weights="auto",    # 训练集逆频率。FORWARD 占 ~75%，不加权 SAFE/YAW 召回归零（EVAL_STANDARD §0）
     text_dim=0,              # base 任务无指令。l1 用 16
+    # 交付权重（训练步之后；评测与后续步骤用它）
+    deliver=os.environ.get("E1_DELIVER", "calswa"),
+                             # calswa = 末 avg_last_k 轮权重平均 + FORWARD 先验校准（tools/average_ckpt.py → run/ckpt_calswa.bin），训练命令加 --save-every-epoch；
+                             # best = trainer 按 dev 宏 F1 存的 run/ckpt_best.bin（改前的行为，训练命令不加 --save-every-epoch）。
+                             # 11-10 闭环 60 集（走廊内）：ckpt_best 27 → calswa 39；只平均不校准 20（tools/average_ckpt.py 文件头）。
+                             # epochs < avg_last_k 时 calswa 取不到窗口，preflight 与 train 都报错并提示改 best。环境变量 E1_DELIVER 切换。
+                             # average_ckpt 只支持单帧纯视觉 ckpt（text_dim=0）：l1 那种 text_dim>0 的配置校准会报错停下，要设 best
+    avg_last_k=10,           # calswa 平均末几轮；11-10 闭环只测过 10（average_ckpt.LAST_K），改它之前先在闭环上测
+    gpu=os.environ.get("E1_GPU", "GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740"),
+                             # 校准推理（average_ckpt 起 uavrgb_infer）钉的那张卡，写进 CUDA_VISIBLE_DEVICES。11-11 19:23 起 nvidia-smi -L 只列这一张
+                             # （RTX 2080 Ti），用户指示 uav_rgb 放在它上。换机器或换卡用 E1_GPU 覆盖
     # 评测（四组同一批 test 场景；E1 机体、observation 语义、hold 1.0）
     eval_seeds=eval_seeds.csv(eval_seeds.EVAL_SEEDS_BASE_20),
                              # 20 个独立几何的冻结 test seed；数字与来源（pick_test_seeds 排除清单、淘汰的旧清单）只写在
@@ -222,12 +236,42 @@ def preprocess(out):
     sh(cmd + (eps or [f"{col}/{{train,val,test}}/*/" for col in cols]))   # 集目录在 Python 里枚举，不依赖 shell 展开
 
 
+def deliver_check():
+    """交付权重配置查错：值不认识、calswa 的轮数不够（取不到末 avg_last_k 轮）都在起任何命令之前报错。preflight 与 train 都调。"""
+    if CFG["deliver"] not in ("calswa", "best"):
+        raise RuntimeError(f"CFG deliver={CFG['deliver']!r}（环境变量 E1_DELIVER）只能是 calswa 或 best")
+    if CFG["deliver"] == "calswa" and CFG["epochs"] < CFG["avg_last_k"]:
+        raise RuntimeError(f"deliver=calswa 要末 {CFG['avg_last_k']} 轮的权重平均，但 epochs={CFG['epochs']} 取不到；"
+                           "改 E1_DELIVER=best（用 ckpt_best.bin），或把 CFG epochs 加到不小于 avg_last_k")
+
+
+def deliver_ckpt(run_dir):
+    """评测与后续步骤用的权重文件。"""
+    return os.path.join(run_dir, "ckpt_calswa.bin" if CFG["deliver"] == "calswa" else "ckpt_best.bin")
+
+
+def calibrate_swa(ds, run_dir):
+    """deliver=calswa：末 avg_last_k 轮平均 + 校准 → run/ckpt_calswa.bin（要 GPU 跑真实 uavrgb_infer）。
+    失败（工具非零退出）直接抛出，流水线停下，不退回 ckpt_best。average_ckpt 拒绝覆盖已有产物，
+    续跑时 .bin 与旁边的 .json 都在才算做完；只剩 .bin 时再起一次，由工具拒绝并停下，人来处理。"""
+    if CFG["deliver"] != "calswa":
+        return
+    swa = deliver_ckpt(run_dir)
+    if os.path.isfile(swa) and os.path.isfile(swa + ".json"):
+        return log(f"跳过校准平均：{swa} 已有")
+    sh([PY, f"{REPO}/tools/average_ckpt.py", "--run", run_dir, "--data", f"{ds}/dataset.uavr", "--out", swa,
+        "--last-k", str(CFG["avg_last_k"]), "--infer-bin", f"{BUILD}/uavrgb_infer"],
+       env_extra={"CUDA_VISIBLE_DEVICES": CFG["gpu"]})
+    need(swa, "average_ckpt 退出码 0 但没写出产物")
+
+
 def train(out):
     ds, run_dir = os.path.join(out, "ds"), os.path.join(out, "run")
     need(os.path.join(ds, "dataset.uavr"), "先跑 preprocess")
+    deliver_check()
     if pc.train_finished(run_dir):   # 续跑：完成 = metrics.jsonl 末行 done:（ckpt 文件每轮都写，不算）
         log(f"跳过 train：{run_dir}/metrics.jsonl 已记 done")
-        return
+        return calibrate_swa(ds, run_dir)   # 训练做完、校准平均没做完（被打断）时在这里补
     if os.path.isdir(run_dir) and os.listdir(run_dir):
         raise RuntimeError(f"{run_dir} 非空且训练没跑完（metrics.jsonl 末行不是 done:）："
                            "uavrgb_train 的 RunOwner 拒绝复用；删掉或换 --out")
@@ -240,13 +284,16 @@ def train(out):
         cmd += ["--text-dim", str(CFG["text_dim"])]
     elif os.path.isfile(f"{ds}/instructions.jsonl"):
         cmd.append("--vision-only")   # 数据带指令却要纯视觉基线时 trainer 要求显式声明
+    if CFG["deliver"] == "calswa":
+        cmd.append("--save-every-epoch")   # 平均要用末 avg_last_k 轮的 ckpt_epNN.bin（每个约 1.2 MB）
     sh(cmd)
     need(f"{run_dir}/ckpt_best.bin", "训练结束但没有 best ckpt，看 run/metrics.jsonl")
+    calibrate_swa(ds, run_dir)
 
 
 def evaluate(out):
     """四组并行，各自 1 个 gz；eval_closed_loop 有失败集时 rc=1 但 eval.json 已写，四组全跑完再一起看。"""
-    ckpts = dict(old_x3_ckpt=CFG["old_x3_ckpt"], new_ckpt=os.path.join(out, "run", "ckpt_best.bin"))
+    ckpts = dict(old_x3_ckpt=CFG["old_x3_ckpt"], new_ckpt=deliver_ckpt(os.path.join(out, "run")))
     for name, _policy, ckpt_key in eval_groups():
         if ckpt_key and ckpt_key not in ckpts:
             ckpts[ckpt_key] = ckpt_key      # 探索臂：键就是 ckpt 路径
@@ -333,6 +380,7 @@ RUN = dict(pilot=pilot, collect=collect, audit=audit, preprocess=preprocess,
 
 def preflight():
     """开跑前把会在几小时后才炸的缺件一次查完。"""
+    deliver_check()
     need(f"{BUILD}/uavrgb_train", "先 bash tools/check.sh 构建，或设 UAV_RGB_BUILD_DIR")
     need(f"{BUILD}/uavrgb_infer", "同上")
     need(CFG["old_x3_ckpt"], "旧 X3 学生 ckpt")

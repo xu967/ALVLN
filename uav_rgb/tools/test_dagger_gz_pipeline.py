@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """dagger_gz_pipeline 的纯 CPU 回归：round-0 开关读取与缺字段退出、seed 按 gid 排除、dry-run 命令行逐字、
-more_demos 集数、基线复用四条件、续跑判定、专家不一致率、失败时 status/DONE。不起 gz、不读真实数据。
+more_demos 集数、基线复用四条件、续跑判定、专家不一致率、失败时 status/DONE、交付权重（calswa / best）。不起 gz、不读真实数据。
 
 运行（仓库根）：.venv-tools/bin/python tools/test_dagger_gz_pipeline.py
 """
@@ -8,6 +8,7 @@ import contextlib
 import io
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -271,7 +272,8 @@ class MainTests(unittest.TestCase):
         os.makedirs(os.path.join(self.tmp, "gz"))
         for rel in ("bin/uavrgb_train", "bin/uavrgb_infer", "gz/libCfSitlSystem.so"):
             open(os.path.join(self.tmp, rel), "wb").close()
-        dg.CFG.update(plugin_dir=os.path.join(self.tmp, "gz"))
+        dg.CFG.update(plugin_dir=os.path.join(self.tmp, "gz"),
+                      deliver="best")   # 既有用例按 smoke（--epochs 2）写，走 deliver=best；calswa 的用例各自显式设
 
     def tearDown(self):
         dg.CFG.clear()
@@ -308,6 +310,8 @@ class MainTests(unittest.TestCase):
         self.assertIn(f"--out {o}/eval20-trunc", out)
         self.assertNotIn("eval20-teacher", out)
         self.assertIn(f"--out {o}/eval60-dagger", out)
+        self.assertNotIn("average_ckpt.py", out)                # deliver=best：没有校准平均步，训练命令不带 --save-every-epoch
+        self.assertNotIn("--save-every-epoch", out)
 
     def _dry_eval_cmds(self):
         """dry-run 打印出的每条评测命令（token 列表）：dagger / more_demos / 两条基线 / 60 seed 的 dagger 共 5 条。"""
@@ -344,6 +348,54 @@ class MainTests(unittest.TestCase):
             self.assertEqual(r.returncode, 0, r.stderr)
             self.assertEqual(r.stdout.strip(), want, (env_value, r.stdout, r.stderr))
 
+    def test_dry_run_calswa_chain(self):
+        """W1-5：deliver=calswa 的 dry-run 链。每次训练（第 1、2 轮与 more_demos）命令带 --save-every-epoch，紧跟一条 average_ckpt.py
+        （同一 run / dataset，产物 run/ckpt_calswa.bin，末 10 轮，推理二进制取 BUILD）；下一轮学生自采、20/60 seed 评测的 --ckpt 都是 ckpt_calswa.bin；
+        基线行的 ckpt 不变；全程没有 ckpt_best.bin。"""
+        dg.CFG.update(round0_collection=self.col, round0_ckpt=self.ckpt, deliver="calswa")
+        rc, out = self._run("--dry-run", "--rounds", "2", "--eps-per-round", "2", "--instances", "2", "--steps", "12",
+                            "--eval-seeds", "1,113", "--epochs", "10", "--baselines", "trunc", "--eval60-arms", "dagger")
+        self.assertEqual(rc, 0, out)
+        o = os.path.join(self.tmp, "out")
+        cmds = _dry_cmds(out)
+        trains = [i for i, c in enumerate(cmds) if os.path.basename(c[0]) == "uavrgb_train"]
+        self.assertEqual([_flag(cmds[i], "--out") for i in trains], [f"{o}/round_1/run", f"{o}/round_2/run", f"{o}/more_demos/run"])
+        for i in trains:
+            train, avg = cmds[i], cmds[i + 1]
+            run_dir = _flag(train, "--out")
+            self.assertIn("--save-every-epoch", train)
+            self.assertEqual(avg[:2], [dg.PY, os.path.join(REPO, "tools", "average_ckpt.py")], avg)
+            self.assertEqual(_flag(avg, "--run"), run_dir)
+            self.assertEqual(_flag(avg, "--data"), _flag(train, "--data"))
+            self.assertEqual(_flag(avg, "--out"), f"{run_dir}/ckpt_calswa.bin")
+            self.assertEqual(_flag(avg, "--last-k"), "10")
+            self.assertEqual(_flag(avg, "--infer-bin"), f"{dg.BUILD}/uavrgb_infer")
+        self.assertEqual(sum(1 for c in cmds if os.path.basename(c[1]) == "average_ckpt.py"), 3, "三次训练各一次校准平均")
+        self.assertIn(f"--student-ckpt {self.ckpt} --beta 0.5 --dagger-round 1", out)             # round0 学生不变
+        self.assertIn(f"--student-ckpt {o}/round_1/run/ckpt_calswa.bin --dagger-round 2", out)   # 下一轮自采用交付权重
+        evals = {os.path.basename(_flag(c, "--out")): c for c in cmds if os.path.basename(c[1]) == "eval_closed_loop.py"}
+        self.assertEqual(sorted(evals), ["eval20-dagger", "eval20-more_demos", "eval20-trunc", "eval60-dagger"])
+        self.assertEqual(_flag(evals["eval20-dagger"], "--ckpt"), f"{o}/round_2/run/ckpt_calswa.bin")
+        self.assertEqual(_flag(evals["eval60-dagger"], "--ckpt"), f"{o}/round_2/run/ckpt_calswa.bin")
+        self.assertEqual(_flag(evals["eval20-more_demos"], "--ckpt"), f"{o}/more_demos/run/ckpt_calswa.bin")
+        self.assertEqual(_flag(evals["eval20-trunc"], "--ckpt"), dg.TRUNC_CKPT)
+        self.assertNotIn("ckpt_best.bin", out)
+
+    def test_calswa_needs_enough_epochs_at_preflight(self):
+        """calswa 要末 avg_last_k 轮：--epochs 小于它时 preflight 就失败（status/DONE 记原因，提示 E1_DELIVER），不等采集几小时后训练步才炸；
+        deliver=best 不受限。"""
+        dg.CFG.update(round0_collection=self.col, round0_ckpt=self.ckpt, deliver="calswa")
+        rc, out = self._run("--rounds", "1", "--baselines", "", "--epochs", "9", "--stop-after-preflight")
+        self.assertEqual(rc, 1, out)
+        with open(os.path.join(self.tmp, "out", "status.json"), encoding="utf-8") as f:
+            st = json.load(f)
+        self.assertEqual(st["preflight"]["state"], "failed")
+        self.assertIn("E1_DELIVER", st["preflight"]["error"])
+        self.assertIn("epochs=9", st["preflight"]["error"])
+        dg.CFG["deliver"] = "best"
+        rc, out = self._run("--rounds", "1", "--baselines", "", "--epochs", "9", "--stop-after-preflight")
+        self.assertEqual(rc, 0, out)
+
     def test_preflight_failure_writes_status_and_done(self):
         dg.CFG.update(round0_collection=self.col, round0_ckpt=os.path.join(self.tmp, "missing.bin"))
         rc, out = self._run("--rounds", "1", "--baselines", "")
@@ -370,6 +422,162 @@ class MainTests(unittest.TestCase):
             inputs = json.load(f)
         for key in ("libCfSitlSystem.so", "e1_mini.json", "uavrgb_train", "uavrgb_infer", "round0_ckpt"):
             self.assertIn(key, inputs)
+
+
+def _dry_cmds(out):
+    """dry-run 输出里每条 `$ ` 命令的 token 列表（去掉时间戳与 `  > 日志` 后缀）。"""
+    return [line.split(" $ ", 1)[1].split("  > ", 1)[0].split() for line in out.splitlines() if " $ " in line]
+
+
+def _flag(cmd, name):
+    return cmd[cmd.index(name) + 1]
+
+
+class DeliverTests(unittest.TestCase):
+    """W1-5：训练后的交付权重。calswa = 末 10 轮平均 + 校准（run/ckpt_calswa.bin），best = ckpt_best.bin（改前行为）。
+    dg.run 换成替身（按真实工具的产物落文件），不起任何子进程。"""
+    DONE = '{"event":"status","message":"done: 100 samples in 1 s, ckpt=run/ckpt.bin"}\n'
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="test_dagger_gz_")
+        self.ds, self.run_dir = os.path.join(self.tmp, "ds"), os.path.join(self.tmp, "run")
+        self.swa = os.path.join(self.run_dir, "ckpt_calswa.bin")
+        self.calls, self.fail_on = [], ()
+        self.saved, self.real_run, self.real_dry = dict(dg.CFG), dg.run, dg.DRY
+        dg.run, dg.DRY = self._fake_run, False
+        dg.CFG.update(deliver="calswa", epochs=30, avg_last_k=10, drop_collision=True)
+        self._touch(os.path.join(self.ds, "dataset.uavr"))
+
+    def tearDown(self):
+        dg.run, dg.DRY = self.real_run, self.real_dry
+        dg.CFG.clear()
+        dg.CFG.update(self.saved)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    @staticmethod
+    def _touch(path, text=""):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    @staticmethod
+    def _tool(cmd):
+        first = os.path.basename(cmd[0])
+        return first if first == "uavrgb_train" else os.path.basename(cmd[1])
+
+    def _fake_run(self, cmd, env_extra=None, log_path=None):
+        self.calls.append((list(cmd), env_extra, log_path))
+        tool = self._tool(cmd)
+        if tool in self.fail_on:
+            return 1
+        if tool == "uavrgb_train":
+            out = _flag(cmd, "--out")
+            self._touch(os.path.join(out, "ckpt_best.bin"))
+            self._touch(os.path.join(out, "metrics.jsonl"), self.DONE)
+        elif tool == "average_ckpt.py":
+            self._touch(_flag(cmd, "--out"))
+            self._touch(_flag(cmd, "--out") + ".json", "{}")
+        return 0
+
+    def _tools(self):
+        return [self._tool(c) for c, _, _ in self.calls]
+
+    def test_calswa_train_then_average(self):
+        dg.train_into(self.ds, self.run_dir)
+        self.assertEqual(self._tools(), ["uavrgb_train", "average_ckpt.py"])
+        (train, _, train_log), (avg, avg_env, avg_log) = self.calls
+        self.assertEqual(train.count("--save-every-epoch"), 1, train)
+        self.assertEqual(train_log, self.run_dir + ".log")
+        self.assertEqual(avg[:2], [dg.PY, os.path.join(REPO, "tools", "average_ckpt.py")])
+        self.assertEqual(_flag(avg, "--run"), self.run_dir)
+        self.assertEqual(_flag(avg, "--data"), f"{self.ds}/dataset.uavr")
+        self.assertEqual(_flag(avg, "--out"), self.swa)
+        self.assertEqual(_flag(avg, "--last-k"), "10")
+        self.assertEqual(_flag(avg, "--infer-bin"), f"{dg.BUILD}/uavrgb_infer")
+        self.assertNotIn("--no-calibrate", avg)
+        self.assertEqual(avg_env, {"CUDA_VISIBLE_DEVICES": dg.CFG["gpu"]})
+        self.assertEqual(avg_log, self.run_dir + ".average.log")
+
+    def test_calswa_flags_exist_in_tools(self):
+        """流水线拼出的开关在被调工具里真实存在。替身 run 只看命令内容，开关笔误抓不到；
+        这里静态读 average_ckpt.py 的 add_argument 与 train_main.cpp 的开关分支，对照训练命令与校准平均命令里的每个 `--开关`。"""
+        dg.train_into(self.ds, self.run_dir)
+        train, avg = self.calls[0][0], self.calls[1][0]
+
+        def known(path, pattern):
+            with open(os.path.join(REPO, *path), encoding="utf-8") as f:
+                return set(re.findall(pattern, f.read()))
+        avg_known = known(("tools", "average_ckpt.py"), r'add_argument\("(--[\w-]+)"')
+        train_known = known(("src", "train_main.cpp"), r'a == "(--[\w-]+)"')
+        avg_used = {a for a in avg if a.startswith("--")}
+        train_used = {a for a in train if a.startswith("--")}
+        self.assertIn("--save-every-epoch", train_used)
+        self.assertTrue(avg_used)
+        self.assertLessEqual(avg_used, avg_known, f"average_ckpt.py 不认的开关：{sorted(avg_used - avg_known)}")
+        self.assertLessEqual(train_used, train_known, f"uavrgb_train 不认的开关：{sorted(train_used - train_known)}")
+
+    def test_best_keeps_old_command(self):
+        dg.CFG["deliver"] = "best"
+        dg.train_into(self.ds, self.run_dir)
+        want = [f"{dg.BUILD}/uavrgb_train", "--data", f"{self.ds}/dataset.uavr", "--out", self.run_dir,
+                "--epochs", str(dg.CFG["epochs"]), "--batch", str(dg.CFG["batch"]), "--lr", repr(float(dg.CFG["lr"])),
+                "--seed", str(dg.CFG["seed"]), "--class-weights", dg.CFG["class_weights"], "--drop-collision"]
+        self.assertEqual([c for c, _, _ in self.calls], [want])
+
+    def test_resume_trained_run_only_averages(self):
+        """训练做完但没有 ckpt_calswa.bin：只补平均，不重训；产物（.bin 与 .json）齐了什么都不跑；只剩 .bin 不当完成。"""
+        self._touch(os.path.join(self.run_dir, "ckpt_best.bin"))
+        self._touch(os.path.join(self.run_dir, "metrics.jsonl"), self.DONE)
+        dg.train_into(self.ds, self.run_dir)
+        self.assertEqual(self._tools(), ["average_ckpt.py"])
+        self.calls.clear()
+        dg.train_into(self.ds, self.run_dir)
+        self.assertEqual(self.calls, [], "产物齐了不该再跑")
+        os.remove(self.swa + ".json")
+        dg.train_into(self.ds, self.run_dir)
+        self.assertEqual(self._tools(), ["average_ckpt.py"])
+
+    def test_average_failure_stops_without_fallback(self):
+        self.fail_on = ("average_ckpt.py",)
+        with self.assertRaises(RuntimeError) as cm:
+            dg.train_into(self.ds, self.run_dir)
+        self.assertIn("average_ckpt.py", str(cm.exception))
+        self.assertFalse(os.path.exists(self.swa), "失败时不能留下交付权重")
+
+    def test_calswa_needs_enough_epochs_and_known_value(self):
+        dg.CFG["epochs"] = 9
+        with self.assertRaises(RuntimeError) as cm:
+            dg.train_into(self.ds, self.run_dir)
+        self.assertIn("E1_DELIVER", str(cm.exception))
+        self.assertEqual(self.calls, [], "报错前不该起命令")
+        dg.CFG.update(epochs=30, deliver="swa")
+        with self.assertRaises(RuntimeError) as cm:
+            dg.train_into(self.ds, self.run_dir)
+        self.assertTrue("calswa" in str(cm.exception) and "best" in str(cm.exception), cm.exception)
+
+    def test_deliver_env_overrides(self):
+        """CFG 在 import 时读 e1_pipeline.CFG（单源）：deliver 缺省 calswa、E1_DELIVER=best 切回；gpu 缺省 11-11 起机器上唯一那张卡的 UUID，
+        E1_GPU 覆盖；avg_last_k 缺省 10（新进程里验证）。"""
+        import subprocess
+        code = ("import sys; sys.path[:0] = [%r, %r]; import dagger_gz_pipeline as dg; "
+                "print(dg.CFG['deliver'], dg.CFG['gpu'], dg.CFG['avg_last_k'])"
+                % (os.path.join(REPO, "sim", "tools"), os.path.join(REPO, "tools")))
+
+        def read(**env_extra):
+            env = {k: v for k, v in os.environ.items() if k not in ("E1_DELIVER", "E1_GPU")}
+            env.update(env_extra)
+            r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return r.stdout.split()
+
+        self.assertEqual(read(), ["calswa", "GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740", "10"])
+        self.assertEqual(read(E1_DELIVER="best")[0], "best")
+        self.assertEqual(read(E1_GPU="GPU-test")[1], "GPU-test")
+
+    def test_delivered_ckpt_path(self):
+        self.assertEqual(dg.deliver_ckpt(self.run_dir), self.swa)
+        dg.CFG["deliver"] = "best"
+        self.assertEqual(dg.deliver_ckpt(self.run_dir), os.path.join(self.run_dir, "ckpt_best.bin"))
 
 
 if __name__ == "__main__":

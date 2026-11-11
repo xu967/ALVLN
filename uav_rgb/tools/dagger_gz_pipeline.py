@@ -14,7 +14,9 @@
 评测 = eval.json 且 failed_count==0 且 episodes_done>0 且不是 partial）。半成品的采集/训练目录要手动删（脚本会指出是哪个），
 半成品评测目录自动挪到 <目录>.failed-<时间> 再重评。
 --dry-run 只打印命令、不建目录；--stop-after-preflight 只查缺件、写 inputs.json 与两份 dynamics_profile。
-smoke：--rounds 1 --eps-per-round 4 --steps 12 --instances 2 --eval-seeds 1,113 --epochs 2 --baselines trunc --eval60-arms ""
+交付权重默认 calswa（每次训练后加一步 average_ckpt：末 10 轮平均 + 校准，要 GPU，见 e1_pipeline.CFG["deliver"]）；E1_DELIVER=best 回到 ckpt_best。
+smoke（--epochs 2 不满 10 轮，calswa 取不到窗口，要带 E1_DELIVER=best）：
+  E1_DELIVER=best … tools/dagger_gz_pipeline.py --rounds 1 --eps-per-round 4 --steps 12 --instances 2 --eval-seeds 1,113 --epochs 2 --baselines trunc --eval60-arms ""
 改参数只改 CFG，不改函数。
 预计用时（4 实例、RTF 锁 1.0、软件渲染，2080 Ti）：每轮采 100 集 × ≤40 步约 35 min + 训练 30 轮约 8 min；
 more_demos 同量级；20 seed × 80 步每臂约 40 min（eval3 实测 36 min），两臂并行；60 seed 最终臂约 2 h；
@@ -70,6 +72,11 @@ CFG = dict(
     audit_ignore=("class_share", "safe_collision"),   # 同 e1_pipeline（X3 口径项）；DAgger 集的 class_share 按 action_executed 统计
     # 训练 = e1_pipeline.CFG 的冻结配置（BRIEF_ALGO §0.2）：30 轮 / batch 128 / lr 1e-3 / seed 0 / class-weights auto / --drop-collision
     drop_collision=True, epochs=30, batch=128, lr=1e-3, seed=0, class_weights="auto",
+    # 交付权重（W1-5）：三项都读 e1_pipeline.CFG（单源，环境变量 E1_DELIVER / E1_GPU 两条流水线共用；取值含义与 UUID 来历写在那里）
+    deliver=e1_pipeline.CFG["deliver"],   # calswa = 每轮与 more_demos 训练后末 avg_last_k 轮平均 + 校准（run/ckpt_calswa.bin），下一轮学生自采、20/60 seed 评测都用它；
+                                          # best = ckpt_best.bin（改前行为）。--epochs < avg_last_k 时 preflight 报错；smoke（--epochs 2）要带 E1_DELIVER=best
+    avg_last_k=e1_pipeline.CFG["avg_last_k"],
+    gpu=e1_pipeline.CFG["gpu"],           # 校准推理钉的那张卡（CUDA_VISIBLE_DEVICES）
     # 评测：20 seed 从 e1_pipeline.CFG 读（单源，不复制字面量）；80 步；每臂 1 gz
     eval_seeds=e1_pipeline.CFG["eval_seeds"],
     eval_steps=e1_pipeline.CFG["eval_steps"],
@@ -372,6 +379,7 @@ def step(out, name, fn, *args, **kw):
 
 def preflight(out, settings, baseline_names):
     """开跑前把会在几小时后才炸的缺件一次查完；记 inputs.json（各臂同一套二进制/库/参数）与两份 dynamics_profile。"""
+    deliver_check()
     need(f"{BUILD}/uavrgb_train", "先 bash tools/check.sh 构建并复制到快照目录，设 UAV_RGB_BUILD_DIR")
     need(f"{BUILD}/uavrgb_infer", "同上")
     plugin = os.path.join(CFG["plugin_dir"], "libCfSitlSystem.so")
@@ -463,9 +471,41 @@ def preprocess_into(ds, eps):
     sh(cmd + eps, log_path=None if DRY else ds + ".log")
 
 
+def deliver_check():
+    """交付权重配置查错（同 e1_pipeline.deliver_check）：值不认识、calswa 的轮数不够（取不到末 avg_last_k 轮）都在起任何命令之前报错。
+    preflight 与 train_into 都调：前者让它在开跑时就失败，不等采集几小时后训练步才炸。"""
+    if CFG["deliver"] not in ("calswa", "best"):
+        raise RuntimeError(f"CFG deliver={CFG['deliver']!r}（环境变量 E1_DELIVER）只能是 calswa 或 best")
+    if CFG["deliver"] == "calswa" and CFG["epochs"] < CFG["avg_last_k"]:
+        raise RuntimeError(f"deliver=calswa 要末 {CFG['avg_last_k']} 轮的权重平均，但 epochs={CFG['epochs']} 取不到；"
+                           "改 E1_DELIVER=best（用 ckpt_best.bin），或把 --epochs 加到不小于 avg_last_k")
+
+
+def deliver_ckpt(run_dir):
+    """下一轮学生自采与评测用的权重文件。"""
+    return os.path.join(run_dir, "ckpt_calswa.bin" if CFG["deliver"] == "calswa" else "ckpt_best.bin")
+
+
+def calibrate_into(ds, run_dir):
+    """deliver=calswa：末 avg_last_k 轮平均 + 校准 → run/ckpt_calswa.bin（真实 uavrgb_infer 跑 GPU）。
+    失败（工具非零退出）直接抛出，流水线停下，不退回 ckpt_best。average_ckpt 拒绝覆盖已有产物，
+    续跑时 .bin 与旁边的 .json 都在才算做完；只剩 .bin 时再起一次，由工具拒绝并停下，人来处理。"""
+    if CFG["deliver"] != "calswa":
+        return
+    swa = deliver_ckpt(run_dir)
+    if os.path.isfile(swa) and os.path.isfile(swa + ".json"):
+        return log(f"跳过校准平均：{swa} 已有")
+    sh([PY, f"{REPO}/tools/average_ckpt.py", "--run", run_dir, "--data", f"{ds}/dataset.uavr", "--out", swa,
+        "--last-k", str(CFG["avg_last_k"]), "--infer-bin", f"{BUILD}/uavrgb_infer"],
+       env_extra={"CUDA_VISIBLE_DEVICES": CFG["gpu"]}, log_path=None if DRY else run_dir + ".average.log")
+    need(swa, "average_ckpt 退出码 0 但没写出产物")
+
+
 def train_into(ds, run_dir):
+    deliver_check()
     if train_done(run_dir):
-        return log(f"跳过训练（{run_dir}/metrics.jsonl 已 done）")
+        log(f"跳过训练（{run_dir}/metrics.jsonl 已 done）")
+        return calibrate_into(ds, run_dir)   # 训练做完、校准平均没做完（被打断）时在这里补
     if os.path.isdir(run_dir) and os.listdir(run_dir):
         raise RuntimeError(f"{run_dir} 非空且没训完：uavrgb_train 的 RunOwner 拒绝复用，删掉再跑")
     need(os.path.join(ds, "dataset.uavr"), "先打包")
@@ -474,14 +514,17 @@ def train_into(ds, run_dir):
            "--seed", str(CFG["seed"]), "--class-weights", CFG["class_weights"]]
     if CFG["drop_collision"]:
         cmd.append("--drop-collision")
+    if CFG["deliver"] == "calswa":
+        cmd.append("--save-every-epoch")   # 平均要用末 avg_last_k 轮的 ckpt_epNN.bin（每个约 1.2 MB）
     sh(cmd, log_path=None if DRY else run_dir + ".log")
     need(f"{run_dir}/ckpt_best.bin", "训练结束但没有 best ckpt，看 run/metrics.jsonl")
     if not DRY and not train_done(run_dir):
         raise RuntimeError(f"{run_dir}/metrics.jsonl 末行不是 done:，训练没正常结束")
+    calibrate_into(ds, run_dir)
 
 
 def run_round(out, k, settings, exclude_gids, prev_ckpt):
-    """第 k 轮：学生自采 → 审计 → 不一致率 → 并集打包 → 从零重训；返回本轮 ckpt。"""
+    """第 k 轮：学生自采 → 审计 → 不一致率 → 并集打包 → 从零重训（→ calswa 时再做校准平均）；返回本轮的交付权重。"""
     rd = os.path.join(out, f"round_{k}")
     beta = CFG["betas"][min(k - 1, len(CFG["betas"]) - 1)]
     base = CFG["round_seeds"][k - 1] if k <= len(CFG["round_seeds"]) else CFG["round_seeds"][-1] + 1000 * (k - len(CFG["round_seeds"]))
@@ -495,11 +538,11 @@ def run_round(out, k, settings, exclude_gids, prev_ckpt):
         raise RuntimeError(f"第 {k} 轮没有可用的自采集（{col}/train|val|test 为空）")
     step(out, f"round_{k}.preprocess", preprocess_into, os.path.join(rd, "ds"), settings["dirs"] + new)
     step(out, f"round_{k}.train", train_into, os.path.join(rd, "ds"), os.path.join(rd, "run"))
-    return os.path.join(rd, "run", "ckpt_best.bin")
+    return deliver_ckpt(os.path.join(rd, "run"))
 
 
 def run_more_demos(out, settings, exclude_gids, rounds):
-    """对照臂：教师再采 N 集（N 按 DAgger 新增帧数对齐）→ 审计 → round0 + 新示范打包 → 训练；返回 ckpt。"""
+    """对照臂：教师再采 N 集（N 按 DAgger 新增帧数对齐）→ 审计 → round0 + 新示范打包 → 训练（同样的交付权重配方）；返回交付权重。"""
     md = os.path.join(out, "more_demos")
     if DRY:
         n = CFG["eps_per_round"] * rounds   # 真跑按各轮 collection_manifest 的 steps_completed_total 算
@@ -520,7 +563,7 @@ def run_more_demos(out, settings, exclude_gids, rounds):
     step(out, "more_demos.stats", write_stats, col, os.path.join(md, "stats.json"))
     step(out, "more_demos.preprocess", preprocess_into, os.path.join(md, "ds"), settings["dirs"] + episode_dirs(col))
     step(out, "more_demos.train", train_into, os.path.join(md, "ds"), os.path.join(md, "run"))
-    return os.path.join(md, "run", "ckpt_best.bin")
+    return deliver_ckpt(os.path.join(md, "run"))
 
 
 def eval_cmd(policy, ckpt, seeds_csv, edir, settings):
