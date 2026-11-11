@@ -31,6 +31,7 @@
 | W1-12 | `dfb98c4` | `0401dee` | 15 个文件，+3776 −18 | `sim/3dgs/planner.py` 的 `clearance=swept`；`collect_3dgs.py` 出生两层判空（缺省关） |
 | E2E-0 | `f39ba81` | `2c95ea0` | 12 个文件，+2561 | 只有实验入口与分析脚本 |
 | T1（第二批，11-12 06:55） | `b706b2f` | `fe6ca32` | 5 个文件，+544 | 只加测试（审核 F4、F5 的两个 C++ 测试与公共夹具） |
+| S1a（11-12 07:45） | `5387747` | 推镜像后补 | 9 个文件，+869 −23 | `sim/3dgs/collect_3dgs.py` 的 `StudentAdapter` / `DaggerPolicy` 与 `guard.py`（C2）；`sim/3dgs/eval_3dgs.py` 的 `eval_split` 与 `--allow-train-scene`、共用驱动的 `split_from_identity`（D1） |
 
 - 合计（`git diff --shortstat base-20261112 f39ba81`）：`src`、`sim`、`tools` 下 50 个文件 +8555 −169，其中不是测试的 24 个文件 +2004 −148；`experiments` 下 62 个文件 +13610 −37。
 - 合并时的冲突四次，解决办法写在各自合并提交的说明里：W1-9（`collect.py` 与 `dagger_gz_pipeline.py`，同时保留 W1-3 的 `probs` 与 W1-5 的交付权重项）、
@@ -44,7 +45,7 @@
 
 | 卡 | 对应的发现 | 分支 |
 | --- | --- | --- |
-| S1a | C2、G1、F1（3DGS 学生的上一步动作）、D1（评测场景的 split） | `p12-s1a` |
+| S1a（11-12 07:45 已合并，`5387747`） | C2、G1、F1（3DGS 学生的上一步动作）、D1（评测场景的 split） | `p12-s1a` |
 | S1b | B1–B7（3DGS 碰撞口径）、E-12；新旧口径下重定基线 | `p12-s1b` |
 | W1-13 | A1、A3、A5、G5（步间刹停与记账）、A2 的采集并行器部分；动作持续到下一次派发并重标定 | `p12-w1-13` |
 | W1-14 | D2、D4、D5、D7、A4 与卡 W1-2 的遗留 | `p12-w1-14` |
@@ -121,7 +122,7 @@
 | 编号 | 问题 | 位置 | 状态 | 影响 | 处理 |
 | --- | --- | --- | --- | --- | --- |
 | C1 | 交付配方（末 10 轮平均加校准）对带条件输入、双帧、文本的模型都用不上；带条件的模型只用一个全局校准量，可能把各条件值下的先验校歪 | `tools/average_ckpt.py:207-212`、`:128-132` | 读代码确认；「校歪」是推断 | E1、E2、E5 的模型拿不到与基线相同的交付配方 | 卡 E2E-1 第二步只补了 `prev_dim > 0`。双帧与文本并入 E2、E5 开工前的卡；E2E-1 的报告里另报「不校准」的离线指标作参照（主会话审报告时要求） |
-| C2 | 3DGS 线喂给 prev-action 模型的是学生自己的上一步输出，不是实际执行的动作；DAgger 的教师替换与护栏改写都不更新它 | `sim/3dgs/collect_3dgs.py:169-176`、`:211-217`；`sim/3dgs/guard.py:104-115`；`sim/tools/student.py:122` | 读代码确认，未运行 | 现在 3DGS 线的学生都是纯图像模型，没有数字受影响。E4 把条件码放进这个字节时会悄悄喂错 | 卡 S1（E4 的前置）：学生适配器显式传条件值，加测试 |
+| C2 | 3DGS 线喂给 prev-action 模型的是学生自己的上一步输出，不是实际执行的动作；DAgger 的教师替换与护栏改写都不更新它 | `sim/3dgs/collect_3dgs.py:169-176`、`:211-217`；`sim/3dgs/guard.py:104-115`；`sim/tools/student.py:122` | 读代码确认，未运行 | 现在 3DGS 线的学生都是纯图像模型，没有数字受影响。E4 把条件码放进这个字节时会悄悄喂错 | 已修：卡 S1a 的 `32caa35`（合并 `5387747`）。学生适配器记上一步实际执行的动作，DAgger 与护栏改写后通知它；14 条用例，主会话另做的 2 个变异都被抓到。`sim/tools/student.py` 在带条件的模型没收到条件值时报错（G1 的后半）归卡 E2E-C1 |
 | C3 | checkpoint 与推理进程的握手行都不记录条件字节的语义（上一步动作还是航向码）；客户端不传时默认喂模型自己的上一步输出 | `src/checkpoint.cpp:174-175`；`src/infer_main.cpp:69-72`；`sim/tools/student.py:106-125` | 读代码确认 | 条件喂错不报错。W1-9 的一致性闸门靠训练配置与数据集路径去推，3DGS 线与板端没有 | 卡 E2E-C1（C++：checkpoint 升版加 `cond_kind`，握手行带出来，客户端核对）。E2E-1 出结果后开工 |
 | C4 | 条件码的维度写死成 4，翻转增强里的镜像规则写死成左转与右转互换 | `src/trainer_dev.cpp:47-59`、`:150-151`；`src/aux_sidecar.cpp:104`；`sim/tools/student.py:76-78` | 读代码确认 | 加宽历史码（E2）要先改这里 | 卡 E2E-C1 |
 | C5 | 深度辅助头接在 FiLM 之后，辅助损失的梯度会把条件调制往「与条件无关」的方向拉 | `src/include/uavrgb/model.hpp:37-39`；`src/model_dev_aux.cu:53`、`:79-82` | 读代码确认；影响是推断 | 条件输入与几何辅助头一起用（E2）时互相抵消 | 卡 E2E-C1：辅助头可选接在 FiLM 之前。先在 PyTorch 原型线上比两种接法 |
@@ -134,7 +135,7 @@
 
 | 编号 | 问题 | 位置 | 状态 | 影响 | 处理 |
 | --- | --- | --- | --- | --- | --- |
-| D1 | 3DGS 的 9 个评测场景按几何哈希 8 个在 train、1 个在 val，没有一个在 test；`eval_3dgs` 把 split 写死成 test，不核对 | `sim/3dgs/eval_3dgs.py:219-223`、`:248`、`:328`；`sim/3dgs/collect_3dgs.py:96-98` | 划分已复现；泄漏后果是推断（E4 没开工） | E4 在这些场景采数、又在同一批场景评，就是场景级泄漏，结果还会标成 test | 卡 S1 加核对；E4 的卡里把划分写死：留出场景与留出路线分开报，名字不叫 test 的不标 test |
+| D1 | 3DGS 的 9 个评测场景按几何哈希 8 个在 train、1 个在 val，没有一个在 test；`eval_3dgs` 把 split 写死成 test，不核对 | `sim/3dgs/eval_3dgs.py:219-223`、`:248`、`:328`；`sim/3dgs/collect_3dgs.py:96-98` | 划分已复现；泄漏后果是推断（E4 没开工） | E4 在这些场景采数、又在同一批场景评，就是场景级泄漏，结果还会标成 test | 已修：卡 S1a 的 `8e2a383`（合并 `5387747`）。`eval_3dgs` 在哈希为 train / val 的场景上默认 rc=2，`--allow-train-scene` 才放行并写真实 split 与 `diag-train-scene`；共用驱动加 `split_from_identity`（缺省不变）。9 个场景复算仍是 8 个 train、1 个 val、0 个 test。遗留：直接调 `eval_3dgs` 的三个工具（`tools/dagger_pipeline.py:210`、`tools/train_student_with_video.py:171`、`tools/compare_datasets.py:264`，后者 `:300` 的教师组还自己写 `"split": "test"`）要显式传开关，归卡 W1-15b 的下一轮。E4 的卡里把划分写死这一条仍然要做 |
 | D2 | 60 集主比较把 60 对当独立样本，没有按几何聚类（20 个几何 × 3 个训练种子） | `docs/briefs/2026-11-10-phase12-common.md:24`；`docs/EVAL_STANDARD.md:319`；各实验的 `summarize.py` | 已复现（重算） | 按几何的符号翻转精确检验：平均加校准对 `ckpt_best`（20 对 8）p 从 0.036 变成 0.089；只校准对 `ckpt_best` 从 0.078 变成 0.139；平均加校准对只校准是 12 对 9，p = 0.664，闭环里看不出权重平均在校准之外的作用。护栏对 `ckpt_best` 仍然显著（p = 0.0034） | 公共规则 §2 加一条（11-12）：主比较按几何聚类报检验，逐集 McNemar 只作参考。卡 W1-14（统计口径）改工具。E2E-1 的分析在数据出来之前追加这一项（见该卡的 11-12 补充） |
 | D3 | 航向护栏的阈值与规则 v1 都是看过 20 个冻结 seed 上的轨迹之后设计的，结果又报在同一组 seed 上 | `experiments/2026-11-10-heading-guard/run.sh:3-5`、`:30`；`experiments/2026-11-10-rule-oracle-v1/run.sh:18` | 读代码与文档确认；偏乐观多少未核实 | 47/60、50/60、57/60 是样本内的数。航向码的阈值沿用护栏的 2，E2E-1 在同一组 seed 上评也带这一层 | E2E-1 之后在另外 40 个 test 分区几何（`EVAL_SEEDS_BASE_60` 去掉冻结 20 个）上给胜出的臂与参照臂各补一遍。公共规则 §2 加一条 |
 | D4 | `stats_report` 的多 run 格区间偏窄，多 run 组不做配对 | `tools/stats_report.py:174-198`、`:286-290`、`:361-367` | 读代码确认 | 报表里的区间偏乐观 | 卡 W1-14 |
@@ -179,7 +180,7 @@
 
 | 编号 | 问题 | 位置 | 状态 | 影响 | 处理 |
 | --- | --- | --- | --- | --- | --- |
-| F1 | 同 C2、G1：3DGS 学生的上一步动作在护栏或 DAgger 改写后取错；之前没有任何测试 | `sim/3dgs/collect_3dgs.py:169-176`、`:211-216`；`sim/3dgs/guard.py:98-116` | 已复现（提议的用例在 HEAD 上 2/2 红） | 同 C2 | 卡 S1；用例 `$D/tmp/phase12-cards/review-f/proposed/test_3dgs_student_prev_action.py` 随修复入库 |
+| F1 | 同 C2、G1：3DGS 学生的上一步动作在护栏或 DAgger 改写后取错；之前没有任何测试 | `sim/3dgs/collect_3dgs.py:169-176`、`:211-216`；`sim/3dgs/guard.py:98-116` | 已复现（提议的用例在 HEAD 上 2/2 红） | 同 C2 | 已修并入库：卡 S1a 的 `32caa35`（`sim/3dgs/test_3dgs_student_prev_action.py`，审核者的 2 条在 `ba54628` 上红，修后与新增的 12 条一起绿） |
 | F2 | 部署推理路径的 HWC→CHW、双帧顺序、条件字节没有带参考值的测试：下标写成转置、两帧写反都不会红 | `src/infer.cpp:63-80`；`src/tests/test_infer_io.cpp:29-137`；`tools/check_input_parity.py:63` | 读代码判定，没跑 | 板端移植时出错不会被发现 | 卡 T1 |
 | F3 | 打包的标签来源与图像对齐在 `--python-only` 门禁里没人守：把标签改成取执行动作、让帧号错一位，相关测试全部照过 | `tools/preprocess.py:251`、`:285`；`tools/make_synthetic_episode.py:68-69` | 已复现（变异没被抓到；审核者写的用例能抓到） | 训练数据可能悄悄变坏 | 卡 T1 |
 | F4 | 水平翻转增强的标签与条件列互换没有测试 | `src/trainer_dev.cpp:48-65`、`:75-97` | 读代码确认 | 开增强时出错不会被发现 | 卡 T1 第二批（`32d0892`，合并 `b706b2f`）：`src/tests/test_flip_augment.cpp`，10 个变异全部抓到 |
