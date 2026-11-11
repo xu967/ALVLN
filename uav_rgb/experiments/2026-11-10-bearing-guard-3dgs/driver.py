@@ -17,6 +17,14 @@ stop_on_collision=True、split="test"、split_policy="diag-eval-fixed-test"（�
   routes    列表 = 所有场景用同一批路线（原写法）；字典 {场景: [路线下标 ...]} = 每个场景各自的路线（场景没有路线则直接退出，不加载）
   step_cap  每路线步数封顶：steps = min(step_cap, ceil(max_steps × step_frac) + step_pad)；缺省不封顶
   teacher_tol_deg  教师航向容差（度），传给 OccAstarTeacher(tol_deg=…)；缺省不传，用 planner.YAW_TOL_DEG（12°）
+2026-11-10-rule-oracle-3dgs 再加的可选键（同样缺省时行为与原版逐位一致，test_driver_rule.py 锁定）：
+  臂 base = rule-occ / rule-depth   规则层臂（sim/3dgs/rule_oracle.py，用到时才导入）：列距离分别取占据真值 / 渲染深度；
+                                    臂的 guard 在这里是航向参照：route = 路线前视点方位，goal = waypoint 方位（其它值启动时就报错，早于加载场景）
+  臂 rule_params / 全局 rule_params  覆盖 rule_policy.RULE_V1 的数值（r_safe / d_look / yaw_step_deg …），臂的盖过全局的
+  臂 hold         这个臂的动作保持时长（秒），缺省用全局 hold；done.json 里的 hold 记生效值
+  臂 step_mult    步数预算乘数（整数），在 step_cap 封顶之后再乘：hold 0.5 的臂同样的仿真时长要 2 倍的步数
+  drop_trace      true = 每集跑完删 trace.jsonl（只有视频渲染要它，每集 0.1–0.2 MB）；actions / oracle 里的位姿足够复原轨迹
+  规则臂每集多落 rule.jsonl（逐步方位误差 / n / 条目 / 两路列距离），metrics.json 里 guard = None、另有 rule 汇总
 """
 import importlib
 import json
@@ -41,6 +49,11 @@ ev = importlib.import_module("sim.3dgs.eval_3dgs")
 guard_mod = importlib.import_module("sim.3dgs.guard")
 dyn = importlib.import_module("sim.3dgs.dynamics")
 from student import StudentPolicy  # noqa: E402  sim/tools；常驻 uavrgb_infer 子进程
+
+RULE_BASES = {"rule-occ": "occ", "rule-depth": "depth"}     # 规则层臂的 base -> 决策用的列距离来源（rule_oracle.SOURCES）
+for _a in ARMS:         # 配置错在加载场景（约 200 s）之前就报，不要跑完前几个臂才发现
+    if _a["base"] in RULE_BASES and _a["guard"] not in ("route", "goal"):
+        raise ValueError(f"臂 {_a['name']}：规则层臂的 guard 必须是 route 或 goal（航向参照），得到 {_a['guard']!r}")
 
 
 def log(msg):
@@ -92,6 +105,25 @@ def drop_frames(ep_dir):
             os.remove(os.path.join(ep_dir, f))
 
 
+def drop_trace(ep_dir):
+    """drop_trace = true 时删 trace.jsonl（run_episode 写的逐物理步轨迹，只有视频渲染读它）；缺省不动。"""
+    p = os.path.join(ep_dir, "trace.jsonl")
+    if CFG.get("drop_trace") and os.path.exists(p):
+        os.remove(p)
+
+
+def nav_end(m):
+    """导航阶段的末步：首次到点或首次碰撞之前（没有则整集）。护栏与规则臂的「_pre」统计共用这一个定义。"""
+    return min([x for x in (m["reach_step"], m["collision_step"]) if x is not None] or [m["steps"] - 1])
+
+
+def count_entries(rows):
+    out = {}
+    for t in rows:
+        out[t["entry"]] = out.get(t["entry"], 0) + 1
+    return out
+
+
 ROUTES = CFG["routes"][SCENE] if isinstance(CFG["routes"], dict) else CFG["routes"]   # KeyError = 字典里漏了这个场景，直接报
 if not ROUTES:
     log("该场景没有要跑的路线，退出（不加载场景）")
@@ -110,6 +142,10 @@ log(f"场景加载 {time.time() - t0:.0f}s；dynamics_profile={params.profile()}
 rc = 0
 for arm in ARMS:
     g = arm["name"]
+    hold = arm.get("hold", CFG["hold"])
+    step_mult = int(arm.get("step_mult", 1))
+    rule_src = RULE_BASES.get(arm["base"])
+    rule_params = {**CFG.get("rule_params", {}), **arm.get("rule_params", {})} if rule_src else None
     student = StudentPolicy(arm["ckpt"], CFG["infer_bin"]) if arm["base"] == "student" else None
     try:
         for r in ROUTES:
@@ -126,6 +162,7 @@ for arm in ARMS:
             steps = math.ceil(raw_routes[r]["max_steps"] * CFG["step_frac"]) + CFG["step_pad"]
             if CFG.get("step_cap") is not None:
                 steps = min(CFG["step_cap"], steps)
+            steps *= step_mult      # 封顶之后再乘：hold 0.5 的臂要同样的仿真时长，封顶 100 步变 200 步
             identity = c3.scene_identity(sc, ply_sha256=ply_sha)
             eps, fails, tr = [], [], time.time()
             teacher = None
@@ -141,6 +178,14 @@ for arm in ARMS:
                 route = None
                 if arm["base"] == "teacher":
                     policy = teacher
+                elif rule_src:
+                    ro = importlib.import_module("sim.3dgs.rule_oracle")      # 用到规则臂才导入，其它配置不依赖这个文件
+                    if arm["guard"] == "route":      # 每集新建：路线在该集第一次调用时从起飞后的实际位姿规划一次
+                        route = guard_mod.OracleRouteGuide(occ_planner.plan, wp, CFG["route_lookahead_m"])
+                        target = route.target
+                    else:
+                        target = lambda x, y, wp=wp: wp      # noqa: E731  goal：恒指向 waypoint，不规划
+                    policy = ro.RuleOraclePolicy(occ, target, source=rule_src, params=rule_params)
                 else:
                     inner = c3.ForwardPolicy() if arm["base"] == "forward" else c3.StudentAdapter(student)
                     if arm["guard"] == "route":     # 每集新建：路线在该集第一次调用时从起飞后的实际位姿规划一次
@@ -151,7 +196,7 @@ for arm in ARMS:
                     else:
                         policy = inner
                 try:
-                    man, err = c3.run_episode(sc, ep_dir, renderer, occ, params, policy, steps, CFG["hold"],
+                    man, err = c3.run_episode(sc, ep_dir, renderer, occ, params, policy, steps, hold,
                                               split="test", seed=seed, episode_id=seed, save_depth=False,
                                               stop_on_collision=True, dynamics_path=None,
                                               spawn_jitter=CFG["jitter"], identity=identity,
@@ -161,8 +206,10 @@ for arm in ARMS:
                     log(f"[{g}] r{r} ep{k} 失败: {e}")
                     if os.path.isdir(ep_dir):
                         drop_frames(ep_dir)
+                        drop_trace(ep_dir)
                     continue
                 drop_frames(ep_dir)
+                drop_trace(ep_dir)
                 if err or not (man.get("validity") or {}).get("physics_verified", False):
                     fails.append({"episode": k, "seed": seed, "error": err or "physics_verified=false",
                                   "dynamics_anomaly": man.get("dynamics_anomaly")})
@@ -174,7 +221,7 @@ for arm in ARMS:
                 if hasattr(policy, "trace"):
                     # 学生 / 盲前进到点后不停，会在 waypoint 附近绕圈，护栏在那里几乎每步都在改写：
                     # 另记到点（或撞）之前的统计（_pre），那才是「导航阶段」护栏的介入强度
-                    end = min([x for x in (m["reach_step"], m["collision_step"]) if x is not None] or [m["steps"] - 1])
+                    end = nav_end(m)
                     pre = [t for t in policy.trace if t["step"] <= end]
                     m["guard"] = {"n_steps": policy.n_steps, "n_triggered": policy.n_triggered,
                                   "n_rewritten": policy.n_rewritten, "n_steps_pre": len(pre),
@@ -185,15 +232,29 @@ for arm in ARMS:
                     with open(os.path.join(ep_dir, "guard.jsonl"), "w", encoding="utf-8") as f:
                         for row in policy.trace:
                             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                if rule_src:
+                    # 规则臂不是护栏（没有 trace 属性，guard 仍是 None）；到点 / 撞之后的步另列（_pre），那才是导航阶段规则各条目的占比。
+                    # 绕圈、悬停的尾巴会把「整集」的占比拉向 V1-fwd 以外的条目。
+                    pre = [t for t in policy.rows if t["step"] <= nav_end(m)]
+                    m["rule"] = {"source": rule_src, "n_steps": len(policy.rows), "entries": count_entries(policy.rows),
+                                 "n_steps_pre": len(pre), "entries_pre": count_entries(pre),
+                                 "plan_failed": None if route is None else route.plan_failed, "params": policy.params}
+                    with open(os.path.join(ep_dir, "rule.jsonl"), "w", encoding="utf-8") as f:
+                        for row in policy.rows:
+                            f.write(json.dumps(row, ensure_ascii=False) + "\n")
                 with open(os.path.join(ep_dir, "metrics.json"), "w", encoding="utf-8") as f:
                     json.dump(m, f, ensure_ascii=False, indent=1)
                 eps.append({"episode": k, "seed": seed, "steps": m["steps"], "success_stop": m["success_stop"],
                             "collision": m["collision"], "timeout": m["timeout"], "wall_s": m["wall_s"]})
+            done = {"arm": g, "scene": SCENE, "route": r, "steps": steps, "hold": hold,
+                    "ckpt": arm["ckpt"], "guard": arm["guard"], "dynamics_profile": params.profile(),
+                    "episodes": eps, "failures": fails, "wall_s": round(time.time() - tr, 1)}
+            if rule_src:      # 新键只追加在后面，旧臂的 done.json 键与顺序不变；生效的完整参数每集记在 metrics.json 的 rule.params
+                done["rule"] = {"source": rule_src, "overrides": rule_params}
+            if step_mult != 1:
+                done["step_mult"] = step_mult
             with open(os.path.join(d, "done.json"), "w", encoding="utf-8") as f:
-                json.dump({"arm": g, "scene": SCENE, "route": r, "steps": steps, "hold": CFG["hold"],
-                           "ckpt": arm["ckpt"], "guard": arm["guard"], "dynamics_profile": params.profile(),
-                           "episodes": eps, "failures": fails, "wall_s": round(time.time() - tr, 1)},
-                          f, ensure_ascii=False, indent=1)
+                json.dump(done, f, ensure_ascii=False, indent=1)
             log(f"[{g}] r{r} {len(eps)}/{CFG['k']} 集 失败 {len(fails)} 到点 {sum(e['success_stop'] for e in eps)} "
                 f"撞 {sum(e['collision'] for e in eps)} 超时 {sum(e['timeout'] for e in eps)} {time.time() - tr:.0f}s")
             rc = 1 if fails else rc
