@@ -47,7 +47,7 @@
   进展与接手步骤见过程文档 `docs/worklog/2026-11-10-1903-phase12-long-horizon.md` 末尾最新的「更新」一节。
 - 回到 GPU 模式（24 核、有卡）之后先做两件事：K1 的 3DGS 正式实验（启动命令在 `$D/tmp/phase12-cards/reports/k1.md`）；
   W1-0 的第二轮标定（`experiments/2026-11-10-action-latency/run_r2.sh`，要求全机没有别的 gz）。
-- 按任务卡派工：第 1 波 W1-1 至 W1-10 互不依赖，可以直接交给 deepseek（其中纯代码的 W1-1、W1-2、W1-3、W1-4、W1-6、W1-9 在无卡模式下也能做）。
+- 按任务卡派工：第 1 波 W1-1 至 W1-10 互不依赖，可以直接交给 deepseek（其中不占 gz 与 GPU 的 W1-1、W1-2、W1-3、W1-4、W1-9 在无卡模式下也能做）。
 - 训练类工作（W2-1 至 W2-6）等协议拍板之后再开始。
 - 清理等确认：`/root/claude-code-backup-20261028/code/wt/p12-*` 11 个工作树与分支；`$D/tmp/cursor-1110`（2.6 GB）；计划 §8 第 7 条的 23 GB 清单。
 
