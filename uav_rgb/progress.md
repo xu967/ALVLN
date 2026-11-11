@@ -62,16 +62,15 @@
   只有一张卡 `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`，由 uav_rgb 独占。用 CUDA 的进程带 `CUDA_VISIBLE_DEVICES=GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`。
   容器重启时主会话没有任何提示，守护进程与 subagent 都会被打断：接手时先 `ps -o lstart= -p 1` 看重启时刻，再对照各输出目录的 `run.pid`。
   当晚的排队规矩在公共规则 §4「2026-11-11 23:15 起」与「23:55 起」两条：Gazebo 实验排 `machine.lock`，3DGS 批量实验排 `gs3d.lock`，训练排 `train.lock`，`check.sh --python-only` 排 `check.lock`。
-- 在跑的守护进程：
-  - W1-0 第二轮：输出 `$D/exp-action-latency-r2-20261111/`。21:42 起跑，23:13 被重启打断，23:31 用原命令续跑（PGID 以 `run.pid` 为准，续跑时是 16307），占着机器锁。
-    启动与续跑是同一条命令：`cd $D/exp-action-latency-r2-20261111 && DISP_CLAUSE=cruise setsid nohup bash run_r2.sh > /dev/null 2>&1 < /dev/null &`。
-    进度 `tail -f run.log`；结束看 `DONE`（rc 与原因）与 `summary.md`；停 `kill -- -$(cat run.pid)`。预计 11-12 0:30 前后结束。
-    已有结果：标定 A 组只因 K=3 的 2 个迟到步没过；B 组（教师 K=3 带 `--rtf 0.5`）过门，新协议 L=0.20。学生臂（带护栏）K=1 三个种子 16、18、19/20（合计 53/60）；K=3 种子 1 为 4/20、种子 0 为 10/20，种子 2 在跑。
-    结束后要做：读 `summary.md`，把标定门、验收 2、验收 4 的结果填进计划 §1.3 的【待填】，给用户一个协议升级的具体建议。
-  - 全量 `tools/check.sh`（main）：草稿脚本 `$D/tmp/phase12-20261110/main/full_check_1111.sh`，11-12 00:03 起跑（排 `check.lock`，构建 2 个并行任务）；日志 `full-check.log`，结束标记 `full-check.DONE`。
+- 守护进程（11-12 00:40 时两个都已结束；新的由各卡的 subagent 起，PGID 见各自输出目录的 `run.pid`）：
+  - W1-0 第二轮：**11-12 00:31 结束，DONE rc=0**（输出 `$D/exp-action-latency-r2-20261111/`，结果读 `summary.md`，数字已进计划 §1.3）。
+    标定在 L=0.20 过门（教师跑 3 块课程带 `--rtf 0.5`）；带护栏的学生单块柱阵 53/60，3 块课程逐块 36 / 23 / 20；第 1 块比单块低 0.283，判定为画面分布造成；
+    372 集学生与森林臂没有迟到步，其中森林臂是在容器 11.8 核满载下跑的。11-12 起新开的 Gazebo 实验都用 L=0.20。
+  - 全量 `tools/check.sh`（main `af5292f`）：11-12 00:08 结束 rc=0（CTest 34/34，cf_sitl CTest 9/9，Python 测试全过，没有 SKIP 段）；日志 `$D/tmp/phase12-20261110/main/full-check.log`。
 - 在跑的 subagent（都是 Sonnet 5.5 Max；一张卡一个分支，报告在 `$D/tmp/phase12-cards/reports/<卡号小写>.md`；交回后主会话审、合并、推送）：
   - K3 规则 v2：`97f46267-e86f-41b2-ae73-43ca7de737d9`，分支 `p12-k3`（已有 10 个提交），输出 `$D/exp-rule-v2-3dgs-20261111/`。22:05 开工，23:14 被重启打断，23:33 恢复；
-    11-12 00:10 通知它把锁换成 `gs3d.lock` 并重起守护进程，不再排在第二轮后面。
+    11-12 00:10 通知它把锁换成 `gs3d.lock`；实验 00:13–00:36 跑完，DONE rc=0：选中变体 v2f，留出路线 v1 0.67 → v2 0.90（22 对 0），K1 的 40 条 0.875，室外 119/120，
+    预注册三项都达到（数字已进计划 §1.3）。subagent 还在写结果文档与报告，交回后审、合并。
   - E2E-0 可判定性审计：`4c9eeed3-0d9f-4c03-8de7-37ac0124ad10`，分支 `p12-e2e-0`，输出 `$D/exp-decidability-audit-20261112/`。
   - E2E-1 航向码端到端学生（先做 W1-9，再做 2×2 试点）：`88869206-9a7b-4554-ae0b-aa3d43705084`，分支 `p12-w1-9`、`p12-e2e-1`（后者从前者的 HEAD 起），输出 `$D/exp-e2e-heading-code-20261112/`。
   - E2E-P0 PyTorch 原型线的地基（模型复刻、checkpoint 读写、包装器、训练配方复刻，逐项与 C++ 对拍）：`f1185a5d-ba4a-486c-ab9d-a351e78e4ee3`，分支 `p12-e2e-p0`，输出 `$D/exp-proto-parity-20261112/`。
