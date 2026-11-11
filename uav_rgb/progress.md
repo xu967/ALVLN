@@ -53,23 +53,28 @@
 ### 未完成的待办
 
 - 用户拍板 9 条（计划 §8）。排在最前：协议一次性升级（派发固定时延、满电、巡航高度、视场、hold）；InteriorGS / SAGE-3D 的非商业许可；仓库是否搬到 `/root/uav_rgb`。
-- 机器状态（11-11 19:30 核实）：容器 19:14 又重启过一次（17:20 时是无卡、1 核）。现在 12 核、内存上限 62 GB、有显示服务，
-  只有一张卡 `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`（原先留给别的项目的那张；`GPU-dbc6435f` 不在机器上）。
-  用户 11-11 19:23 指示：uav_rgb 就放在这一张卡上跑。用 CUDA 的进程带 `CUDA_VISIBLE_DEVICES=GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`。
-  昨晚的实验在第一次重启前都已自己结束，结果见上。
-- 三个 subagent（W1-0、W1-11、K1）11-11 21:00 前全部交回，分支已合入 main（见上）。接手步骤见过程文档
-  `docs/worklog/2026-11-10-1903-phase12-long-horizon.md` 末尾最新的「更新」一节。
-- 在跑的守护进程（11-11 21:42 起）：W1-0 第二轮，输出 `$D/exp-action-latency-r2-20261111/`，PGID 237956，占着机器锁 `$D/tmp/phase12-cards/machine.lock`。
-  启动命令：`cd $D/exp-action-latency-r2-20261111 && DISP_CLAUSE=cruise setsid nohup bash run_r2.sh > /dev/null 2>&1 < /dev/null &`（同一条命令可续跑）。
-  进度 `tail -f run.log`；结束看 `DONE`（rc 与原因）与 `summary.md`；停 `kill -- -$(cat run.pid)`。标定 A 组过门的话约 2.2 小时跑完，走到 C 组约 3.2 小时（估计）。
-  结束后要做：读 `summary.md`，把标定门、验收 2、验收 4 的结果填进计划 §1.3 的【待填】，定新协议的 L。
-  22:02 标定 A 组没过，原因只有 K=3 的 2 个迟到步（2/830）；生效时长、转角、巡航步位移的差都在 1% 以内。已按阶梯进 B 组。
-- 规则 v2（任务卡 K3）：subagent 11-11 22:05 开工（agent id `97f46267-e86f-41b2-ae73-43ca7de737d9`，Sonnet 5.5 Max），分支 `p12-k3`，
-  报告 `$D/tmp/phase12-cards/reports/k3.md`，输出 `$D/exp-rule-v2-3dgs-20261111/`。
-  它的开发与正式阶段排在机器锁后面，W1-0 第二轮结束后自动起跑。交回后主会话审、合并、推送。
-- 待开工的卡：W1-12（3DGS 教师的前向净空检查、出生判空、导引指针；规格初稿在任务卡里，K3 合并后细化）。
-- 按任务卡派工：第 1 波 W1-1 至 W1-10 互不依赖，可以交给 deepseek，也可以由 Sonnet 5.5 Max 的 subagent 做（谁来做等用户定）；从 main `d3fb68d` 之后的提交起分支。
-- 训练类工作（W2-1 至 W2-6）等协议拍板之后再开始。
+- 机器状态（11-11 23:30 核实）：容器 23:13:58 第三次重启（用户为了清掉别的会话的任务）。现在 12 核、内存上限 62 GB、有显示服务，
+  只有一张卡 `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`，由 uav_rgb 独占。用 CUDA 的进程带 `CUDA_VISIBLE_DEVICES=GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`。
+  容器重启时主会话没有任何提示，守护进程与 subagent 都会被打断：接手时先 `ps -o lstart= -p 1` 看重启时刻，再对照各输出目录的 `run.pid`。
+  当晚的排队规矩在公共规则 §4「2026-11-11 23:15 起」那一条：重实验排机器锁 `$D/tmp/phase12-cards/machine.lock`，`check.sh --python-only` 排 `check.lock`。
+- 在跑的守护进程：
+  - W1-0 第二轮：输出 `$D/exp-action-latency-r2-20261111/`。21:42 起跑，23:13 被重启打断，23:31 用原命令续跑（PGID 以 `run.pid` 为准，续跑时是 16307），占着机器锁。
+    启动与续跑是同一条命令：`cd $D/exp-action-latency-r2-20261111 && DISP_CLAUSE=cruise setsid nohup bash run_r2.sh > /dev/null 2>&1 < /dev/null &`。
+    进度 `tail -f run.log`；结束看 `DONE`（rc 与原因）与 `summary.md`；停 `kill -- -$(cat run.pid)`。预计 11-12 0:30 前后结束。
+    已有结果：标定 A 组只因 K=3 的 2 个迟到步没过；B 组（教师 K=3 带 `--rtf 0.5`）过门，新协议 L=0.20。学生臂 K=1 种子 1 为 16/20、种子 0 为 18/20；K=3 种子 1 为 4/20。
+    结束后要做：读 `summary.md`，把标定门、验收 2、验收 4 的结果填进计划 §1.3 的【待填】，给用户一个协议升级的具体建议。
+  - 全量 `tools/check.sh`（main）：草稿脚本 `$D/tmp/phase12-20261110/main/full_check_1111.sh`，排在机器锁后面；日志 `full-check.log`，结束标记 `full-check.DONE`。
+- 在跑的 subagent（都是 Sonnet 5.5 Max；一张卡一个分支，报告在 `$D/tmp/phase12-cards/reports/<卡号小写>.md`；交回后主会话审、合并、推送）：
+  - K3 规则 v2：`97f46267-e86f-41b2-ae73-43ca7de737d9`，分支 `p12-k3`，输出 `$D/exp-rule-v2-3dgs-20261111/`。22:05 开工，23:14 被重启打断，23:33 恢复。
+  - W1-10 满电档：`64315a47-cb31-409e-826f-03aee135fc10`，分支 `p12-w1-10`。
+  - W1-12 3DGS 教师前向净空：`cbdb76c6-d26e-4897-9b3a-3cae4013f9d0`，分支 `p12-w1-12`。
+  - W1-4 再 W1-3：`bf667c96-e5c1-455d-ae98-bd4a35d6266c`，分支 `p12-w1-4`、`p12-w1-3`（后者从前者的 HEAD 起，先合前者）。
+  - W1-1 再 W1-5、W1-2、W1-6：`206f5b00-838f-43b4-8877-5ee7c116c7e9`，分支 `p12-w1-1`、`p12-w1-5`（从 `p12-w1-1` 起）、`p12-w1-2`、`p12-w1-6`。
+  - W1-7 再 W1-8：`5a758bb3-fd0c-4ca5-87bb-aefcde5767d0`，分支 `p12-w1-7`、`p12-w1-8`（后者从前者的 HEAD 起）。
+- 交叉审核：任务书 `docs/briefs/2026-11-11-cross-review-brief.md`（七个角度，只读）已备好，审核 agent 没有起。
+  用户点名的 Gemini 4 Carbon Max 与 High 不在可用的 subagent 模型列表里（Gemini 4 Carbon 只有 low 档），等用户定用哪个模型。
+- 还没开工的卡：W1-9（航向码输入；与今晚几组卡都有文件重叠，等它们合并之后）。第二波（W2-1 起）等第一波交回与第二轮的结果。
+- 训练类工作（W2-1 至 W2-6）等协议拍板与第一波的前置卡（W1-1、W1-4、W1-5、W1-7）合并之后开始。
 - 清理等确认：`/root/claude-code-backup-20261028/code/wt/p12-*` 11 个工作树与分支；`$D/tmp/cursor-1110`（2.6 GB）；计划 §8 第 7 条的 23 GB 清单。
 
 ## 2026-11-10 14:41–18:15 全仓审查与第十一阶段计划（另一个 Cursor 会话；下面「未提交」「没有合进 main」两处已过时，以上一节为准）
