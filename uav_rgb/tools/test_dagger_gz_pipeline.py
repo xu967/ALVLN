@@ -309,6 +309,41 @@ class MainTests(unittest.TestCase):
         self.assertNotIn("eval20-teacher", out)
         self.assertIn(f"--out {o}/eval60-dagger", out)
 
+    def _dry_eval_cmds(self):
+        """dry-run 打印出的每条评测命令（token 列表）：dagger / more_demos / 两条基线 / 60 seed 的 dagger 共 5 条。"""
+        dg.CFG.update(round0_collection=self.col, round0_ckpt=self.ckpt)
+        rc, out = self._run("--dry-run", "--rounds", "1", "--eps-per-round", "2", "--instances", "2", "--steps", "12",
+                            "--eval-seeds", "1,113", "--epochs", "2", "--baselines", "teacher,trunc", "--eval60-arms", "dagger")
+        self.assertEqual(rc, 0, out)
+        cmds = [line.split(" $ ", 1)[1].split("  > ", 1)[0].split() for line in out.splitlines() if "eval_closed_loop.py" in line]
+        self.assertEqual(len(cmds), 5, out)
+        return cmds
+
+    def test_eval_commands_carry_corridor_half_width(self):
+        """W1-1：评测命令默认带 --corridor-half-width 3（与 e1_pipeline 同口径）；CFG 设 0 回到旧口径，命令只少这两项。"""
+        on = self._dry_eval_cmds()
+        for cmd in on:
+            self.assertIn("--corridor-half-width", cmd, " ".join(cmd))
+            self.assertEqual(cmd[cmd.index("--corridor-half-width") + 1], "3", cmd)
+        dg.CFG["corridor_half_width"] = 0.0
+        off = self._dry_eval_cmds()
+        self.assertTrue(all("--corridor-half-width" not in cmd for cmd in off), off)
+        strip = lambda c: [t for i, t in enumerate(c) if t != "--corridor-half-width" and (i == 0 or c[i - 1] != "--corridor-half-width")]  # noqa: E731
+        self.assertEqual(off, [strip(c) for c in on], "设 0 只应少这两项，其余逐字不变")
+
+    def test_corridor_half_width_env_override(self):
+        """CFG 在 import 时读 E1_CORRIDOR_HALF_WIDTH：默认 3.0，设 0 关闭，其它值照读（新进程里验证）。"""
+        import subprocess
+        code = ("import sys; sys.path[:0] = [%r, %r]; import dagger_gz_pipeline as dg; print(dg.CFG['corridor_half_width'])"
+                % (os.path.join(REPO, "sim", "tools"), os.path.join(REPO, "tools")))
+        for env_value, want in ((None, "3.0"), ("0", "0.0"), ("2.5", "2.5")):
+            env = {k: v for k, v in os.environ.items() if k != "E1_CORRIDOR_HALF_WIDTH"}
+            if env_value is not None:
+                env["E1_CORRIDOR_HALF_WIDTH"] = env_value
+            r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertEqual(r.stdout.strip(), want, (env_value, r.stdout, r.stderr))
+
     def test_preflight_failure_writes_status_and_done(self):
         dg.CFG.update(round0_collection=self.col, round0_ckpt=os.path.join(self.tmp, "missing.bin"))
         rc, out = self._run("--rounds", "1", "--baselines", "")

@@ -86,6 +86,9 @@ CFG = dict(
                              # 20 个独立几何的冻结 test seed；数字与来源（pick_test_seeds 排除清单、淘汰的旧清单）只写在
                              # tools/eval_seeds.py。这里保持逗号串：其它 agent/脚本从 CFG["eval_seeds"] 读。
     eval_steps=80,           # 给足全程余量（T7 起 80）；碰撞/到达会提前结束
+    corridor_half_width=float(os.environ.get("E1_CORRIDOR_HALF_WIDTH", "3.0")),
+                             # 柱阵评测的横向边界（m），等于 scene_gen.Y_RANGE；11-10 发现不加它时 20/20 里有 8 集是绕出柱阵；
+                             # 设 0 回到旧口径（命令不带该开关，metric_version 也不带 .corridor3m，新旧 SR 不可混报）
     old_x3_ckpt=f"{DATA_ROOT}/uav_rgb/t6-full-1640/run/ckpt_best.bin",   # T6 best（epoch 8）：X3 / x3_velocity / hold 1.0 训的
     record_groups=("teacher", "student-e1-new"),   # 这两组录三视角视频（≈10 MB/仿真秒暂存，合成后删）
     VIDEO_QUALITY="medium",  # 录像画质档（sim/tools/view_layout.VIDEO_QUALITY）：low=1280×720/CRF 28（预览）；medium=1280×720/CRF 22；
@@ -265,6 +268,8 @@ def evaluate(out):
                "--steps", str(CFG["eval_steps"]), "--out", edir,
                "--sim-timeout", str(CFG["sim_timeout"]), "--episode-timeout", str(CFG["episode_timeout"]),
                *vehicle_flags()]
+        if CFG["corridor_half_width"] > 0:
+            cmd += ["--corridor-half-width", f"{CFG['corridor_half_width']:g}"]
         if ckpt_key:
             cmd += ["--ckpt", ckpts[ckpt_key], "--infer-bin", f"{BUILD}/uavrgb_infer"]
         if policy == "teacher" and CFG["teacher_planner"] != "astar":

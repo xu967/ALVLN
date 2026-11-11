@@ -284,7 +284,45 @@ def test_teacher_planner_passthrough():
     print("ok teacher_planner：astar 命令行不变，costmap 只给采集与 teacher 组加 --teacher-planner")
 
 
+def _dry_run_eval_cmds(out, **env_extra):
+    """子进程跑 `e1_pipeline.py --from eval --dry-run`，返回打印出的每条评测命令（token 列表）。
+    CFG 在 import 时读环境变量，默认值与环境变量覆盖只能在新进程里验证。--out 由调用方给，几次调用同一个路径才能逐字比较。"""
+    env = {k: v for k, v in os.environ.items() if k != "E1_CORRIDOR_HALF_WIDTH"}
+    env.update(env_extra)
+    r = subprocess.run([sys.executable, os.path.join(REPO, "tools", "e1_pipeline.py"),
+                        "--out", out, "--from", "eval", "--dry-run"],
+                       env=env, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0, r.stdout + r.stderr
+    return [line.split(" $ ", 1)[1].split("  > ", 1)[0].split()
+            for line in r.stdout.splitlines() if "eval_closed_loop.py" in line]
+
+
+def _without_pair(cmd, flag):
+    """去掉命令里的 `flag 值` 两项。"""
+    return [t for i, t in enumerate(cmd) if t != flag and (i == 0 or cmd[i - 1] != flag)]
+
+
+def test_corridor_half_width_in_eval_commands():
+    """W1-1：四组评测命令默认带 --corridor-half-width 3（柱阵评测的横向边界 = scene_gen.Y_RANGE）；
+    E1_CORRIDOR_HALF_WIDTH=0 回到旧口径，命令与默认相比只少这两项；其它取值按 :g 格式透传。"""
+    groups = len(ep.eval_groups())
+    out = os.path.join(tempfile.gettempdir(), "test_e1_pipeline_corridor_never")   # dry-run 不建目录，只当路径用
+    on = _dry_run_eval_cmds(out)
+    assert len(on) == groups, f"dry-run 应打印 {groups} 条评测命令，实际 {len(on)}"
+    for cmd in on:
+        assert "--corridor-half-width" in cmd, f"评测命令缺 --corridor-half-width：{' '.join(cmd)}"
+        assert cmd[cmd.index("--corridor-half-width") + 1] == "3", cmd
+    off = _dry_run_eval_cmds(out, E1_CORRIDOR_HALF_WIDTH="0")
+    assert len(off) == groups, off
+    assert all("--corridor-half-width" not in cmd for cmd in off), off
+    assert off == [_without_pair(cmd, "--corridor-half-width") for cmd in on], "设 0 只应少这两项，其余逐字不变"
+    custom = _dry_run_eval_cmds(out, E1_CORRIDOR_HALF_WIDTH="2.5")
+    assert all(cmd[cmd.index("--corridor-half-width") + 1] == "2.5" for cmd in custom), custom
+    print(f"ok corridor：{groups} 组评测命令默认带 --corridor-half-width 3，设 0 时没有，设 2.5 透传")
+
+
 def main():
+    test_corridor_half_width_in_eval_commands()
     test_teacher_planner_passthrough()
     test_evaluate_waits_all_groups()
     test_summary_marks_mixed_metric_version()

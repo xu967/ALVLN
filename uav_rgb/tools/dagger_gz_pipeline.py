@@ -73,6 +73,10 @@ CFG = dict(
     # 评测：20 seed 从 e1_pipeline.CFG 读（单源，不复制字面量）；80 步；每臂 1 gz
     eval_seeds=e1_pipeline.CFG["eval_seeds"],
     eval_steps=e1_pipeline.CFG["eval_steps"],
+    corridor_half_width=float(os.environ.get("E1_CORRIDOR_HALF_WIDTH", "3.0")),
+                               # 柱阵评测的横向边界（m），等于 scene_gen.Y_RANGE；11-10 发现不加它时 20/20 里有 8 集是绕出柱阵；
+                               # 设 0 回到旧口径。与 e1_pipeline.CFG 同名同环境变量，两条流水线的评测口径一致。
+                               # 基线行复用要求 metric_version 相同：带走廊后 EVAL4（无走廊）的基线不再复用，会重评
     eval_parallel=2,           # 同时起的评测数：BRIEF §0 每个 agent ≤2 个 gz；正式跑 eval4 结束后可改 3
     gz_total_max=6,            # 起 gz 前全机 `gz sim` 总数超过它就等（BRIEF §0 闸门）；0 = 不等
     eval60_count=60,           # 60 seed 清单 = eval_seeds.EVAL_SEEDS_BASE_60 的前 eval60_count 个（用户 2026-11-09 定的 E1 口径）
@@ -525,6 +529,8 @@ def eval_cmd(policy, ckpt, seeds_csv, edir, settings):
            "--out", edir, "--sim-timeout", str(CFG["sim_timeout"]), "--episode-timeout", str(CFG["episode_timeout"]),
            "--dynamics", settings["dynamics"], "--vehicle", settings["vehicle"],
            "--hold", str(settings["hold"]), "--window-from", settings["window_from"]]
+    if CFG["corridor_half_width"] > 0:
+        cmd += ["--corridor-half-width", f"{CFG['corridor_half_width']:g}"]
     if ckpt:
         cmd += ["--ckpt", ckpt, "--infer-bin", f"{BUILD}/uavrgb_infer"]
     return cmd
