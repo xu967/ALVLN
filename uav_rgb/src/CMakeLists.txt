@@ -127,6 +127,16 @@ add_executable(test_overfit tests/test_overfit.cpp)
 target_link_libraries(test_overfit PRIVATE uavrgb_core)
 add_test(NAME test_overfit COMMAND test_overfit)
 
+# 翻转增强：标签左右互换、prev-action 同步互换、深度目标按列镜像（交叉审核 F4）。
+add_executable(test_flip_augment tests/test_flip_augment.cpp)
+target_link_libraries(test_flip_augment PRIVATE uavrgb_core)
+add_test(NAME test_flip_augment COMMAND test_flip_augment)
+
+# 双帧训练读 prev_index 那一帧、平面顺序与部署一致（交叉审核 F5）。
+add_executable(test_two_frame_prev_index tests/test_two_frame_prev_index.cpp)
+target_link_libraries(test_two_frame_prev_index PRIVATE uavrgb_core)
+add_test(NAME test_two_frame_prev_index COMMAND test_two_frame_prev_index)
+
 # T4：--eval-only 与训练期同权重/同数据的 validation 事件必须逐字节对账。
 add_executable(test_eval_only tests/test_eval_only.cpp)
 target_link_libraries(test_eval_only PRIVATE uavrgb_core)
