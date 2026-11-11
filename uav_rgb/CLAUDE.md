@@ -17,6 +17,8 @@ Design boundaries that must not be violated:
 
 **2026-11-10 00:11 起本机两张 RTX 2080 Ti，uav_rgb 只能用一张（用户要求）**：所有用 CUDA 的进程（`uavrgb_train` / `uavrgb_infer` / 3DGS gsplat / torch）都带 `CUDA_VISIBLE_DEVICES=GPU-dbc6435f-4db3-f704-bd1d-3b40bff73a70`（PCI 82:00.0，`nvidia-smi` 1 号，加卡前的 0 号）；按 UUID 钉，不用编号。0 号卡 `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`（02:00.0）留给其它项目（YOLOVOmodal 的 `run_exp.sh` 写死 `CUDA_VISIBLE_DEVICES=0`）。看显存用 `nvidia-smi --id=<UUID>`。Gazebo 走软件渲染，不占 GPU。
 
+**2026-11-11 19:23 起本机只有一张卡（用户指示：uav_rgb 就放在这一张卡上跑）**：`nvidia-smi -L` 只列出 `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`（上一段写的留给其它项目的那张），`GPU-dbc6435f-…` 不在机器上，按它钉卡时 CUDA 看不到任何设备。这段时间所有用 CUDA 的进程带 `CUDA_VISIBLE_DEVICES=GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`。YOLOVOmodal 的训练（`CUDA_VISIBLE_DEVICES=0`）也落在这张卡上：起实验前看 `nvidia-smi` 的显存占用，3DGS 实验每个驱动进程占 1–4 GB，显存不够时减并行度。`experiments/2026-11-10-*` 里写死的旧 UUID 是冻结的实验记录，不改；新写的入口脚本用当前 UUID。卡的配置再变时以 `nvidia-smi -L` 为准，并向用户确认用哪一张。同一时刻 cgroup 是 12 核、内存上限 62 GB（11-10 晚是 24 核）；`/proc/loadavg` 反映的是宿主机，容器自己的占用看 `/sys/fs/cgroup/cpu.stat`。
+
 The machine has **two NVIDIA GeForce RTX 2080 Ti (sm_75, 22 GiB / 21.49 GiB usable, 68 SM each)** since 2026-11-10; uav_rgb may use only `GPU-dbc6435f-4db3-f704-bd1d-3b40bff73a70` (see above). Not the RTX 5090 described in the spec. (Earlier records said "Tesla T4"; the current device node is `/dev/nvidia0`.)
 
 - CUDA Toolkit **12.8** at `/usr/local/cuda-12.8`; driver 580.119.02（2026-11-06 至 11-07 曾为 595.99.02）. Do not install CUDA 13.x (driver caps at CUDA 13.0, and Turing/sm_75 gains nothing) and never compile for sm_120.

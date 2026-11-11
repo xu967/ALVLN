@@ -11,7 +11,7 @@
 ```bash
 R=/root/claude-code-backup-20261028/code/uav_rgb; D=/root/rivermind-data/uav_rgb
 cd $R && git status --short && git log --oneline -3          # 主工作树必须干净
-nvidia-smi -L                                                # 两张 2080 Ti；uav_rgb 只用 GPU-dbc6435f-…（按 UUID 钉）
+nvidia-smi -L                                                # 以它列出的为准。11-11 起只有 GPU-b544b42e-… 一张，uav_rgb 就用它（公共规则 §4）；按 UUID 钉
 df -h / $D | tail -2                                         # 根分区与数据盘余量，小于 1.5 GB / 5 GB 时先停下报告
 ps -eo pid,pgid,etimes,cmd | grep -E "gz sim|eval_closed_loop|driver.py|uavrgb_train" | grep -v grep   # 谁在占 gz 与 GPU
 source $R/env.sh && UAV_RGB_PYTHON=$R/.venv-tools/bin/python bash tools/check.sh --python-only     # 必须 rc=0
@@ -51,7 +51,7 @@ mkdir -p $D/tmp/phase12-cards/$NAME            # 草稿、日志；报告写 $D/
 | 3 | W3-x | 3DGS 程序化障碍、多航点路线、执行器与路书、SAGE-3D 完整试点、数据集 B 放量 | 第 1、2 波的结论 | | | 难；规格见 §5，细化后再开工 |
 
 第 1 波的卡互不依赖，可以并行；W1-3、W1-4、W1-9 都改 `sim/tools/collect.py` 或 `sim/tools/eval_closed_loop.py`，并行时各自只动卡里写的函数，合并由主会话处理。
-gz 全机同时不超过 7 个，起实验前先看当前占用。
+gz 的上限随核数定（24 核 7 个，12 核 3 个，公共规则 §4），起实验前先看当前占用；下表「占 gz」一栏是按 24 核写的，12 核时按比例减并把实验排队。
 
 ## 3. 第一波任务卡
 
