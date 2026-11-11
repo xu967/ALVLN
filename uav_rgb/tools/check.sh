@@ -163,6 +163,23 @@ for uav_check_test in "$uav_check_root"/tools/test_*.py; do
   [[ "$uav_check_test" == */test_join_soft_targets.py || "$uav_check_test" == */test_train_student_with_video.py ]] && continue
   "$UAV_RGB_PYTHON" "$uav_check_test"
 done
+# sim/3dgs/test_*.py（mock 渲染器、纯 CPU，不起 Gazebo）要 3dgs-venv 的解释器，.venv-tools 不是同一套依赖。
+# 文件个数不写死（新增的 test_*.py 自动进来）；解释器不在就 SKIP 并让末行 PASS 列出，免得「没检查」被读成「检查过了」。
+# --python-only 也跑这一段。UAV_RGB_3DGS_PYTHON 可换解释器路径（也用来演示 SKIP 路径）；建 3dgs-venv 见 docs/HANDOFF_3DGS_20261105.md。
+uav_check_3dgs_py="${UAV_RGB_3DGS_PYTHON:-$DATA_ROOT/uav_rgb/3dgs-venv/bin/python}"
+if [[ -x "$uav_check_3dgs_py" ]]; then
+  uav_check_3dgs_n=0
+  for uav_check_test in "$uav_check_root"/sim/3dgs/test_*.py; do
+    echo "3DGS 测试: ${uav_check_test#"$uav_check_root"/}"
+    "$uav_check_3dgs_py" "$uav_check_test"
+    uav_check_3dgs_n=$((uav_check_3dgs_n + 1))
+  done
+  echo "PASS: sim/3dgs 测试 ${uav_check_3dgs_n} 个文件（$uav_check_3dgs_py）"
+else
+  echo "SKIP: 3DGS 测试未检查（$uav_check_3dgs_py 不存在或不可执行；sim/3dgs/test_*.py 要 3dgs-venv，" \
+       "建法见 docs/HANDOFF_3DGS_20261105.md）" >&2
+  uav_check_skipped+=("3DGS 测试")
+fi
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_monitor.py"
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_trainer_demo.py"
 "$UAV_RGB_PYTHON" "$uav_check_root/ui/test_studio.py"

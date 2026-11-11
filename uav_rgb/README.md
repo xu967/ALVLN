@@ -15,6 +15,7 @@
 source env.sh
 bash tools/setup_env.sh              # 新建 .venv-tools（numpy + Pillow + opencv-python-headless，tools/requirements.txt），并跑一次 doctor
 # cf_sitl 段需要固件源码；不设 CF_DRONE_DIR 时 check.sh 把 SKIP 写到 stderr，末行 PASS 会列出未检查的段（见下）
+# sim/3dgs/test_*.py 段（--python-only 也跑）用 $DATA_ROOT/uav_rgb/3dgs-venv/bin/python，没有就 SKIP 并同样列在末行；UAV_RGB_3DGS_PYTHON 可换解释器
 export CF_DRONE_DIR=<CF-Drone 目录>
 "$UAV_RGB_PYTHON" tools/doctor.py --require-gpu --require-sim
 bash tools/check.sh                  # 构建 + CTest + Python 自检 + cf_sitl（CTest/自检）
