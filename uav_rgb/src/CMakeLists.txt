@@ -113,6 +113,12 @@ add_executable(test_infer_io tests/test_infer_io.cpp)
 target_link_libraries(test_infer_io PRIVATE uavrgb_core)
 add_test(NAME test_infer_io COMMAND test_infer_io)
 
+# 部署推理路径的输入布局（交叉审核 F2）：非方形输入、双帧顺序、prev-action 字节，
+# 与自己摆成 NCHW 的 host 参考前向逐值对拍；转置下标、两帧对调、R/B 互换都会红。
+add_executable(test_infer_layout tests/test_infer_layout.cpp)
+target_link_libraries(test_infer_layout PRIVATE uavrgb_core)
+add_test(NAME test_infer_layout COMMAND test_infer_layout)
+
 add_executable(test_trainer tests/test_trainer.cpp)
 target_link_libraries(test_trainer PRIVATE uavrgb_core)
 add_test(NAME test_trainer COMMAND test_trainer)

@@ -104,6 +104,9 @@ PY
   fi
 
   # 同几何（同 geometry_gid）跨 split 必须在打包关口被拒绝；只查 scene_id 挡不住。
+  # 这道防线有两层，各配一个负例，并断言报错来自它要测的那一层（只看退出码，另一层的报错会顶替它）：
+  #   a) load_episode 的 split 复算门：默认策略下 split 必须等于 gid 按记录策略应属的 split；
+  #   b) scan 的 gid 唯一性：诊断策略（自带 split）跳过复算门，同一个几何出现在两个 split 仍要被拒。
   "$UAV_RGB_PYTHON" - "$uav_check_fmt/ep" <<'PY'
 import json, sys
 root = sys.argv[1]
@@ -113,12 +116,34 @@ for name in ("ep1", "ep3"):
     man["geometry_gid"] = "check.shared_geometry"
     json.dump(man, open(path, "w", encoding="utf-8"))
 PY
-  if "$UAV_RGB_PYTHON" "$uav_check_root/tools/preprocess.py" \
-       --out "$uav_check_fmt/ds_leak" "$uav_check_fmt/ep/ep1" "$uav_check_fmt/ep/ep3" \
-       >/dev/null 2>&1; then
+  if uav_check_err="$("$UAV_RGB_PYTHON" "$uav_check_root/tools/preprocess.py" \
+       --out "$uav_check_fmt/ds_leak" "$uav_check_fmt/ep/ep1" "$uav_check_fmt/ep/ep3" 2>&1 >/dev/null)"; then
     echo "几何 split 门禁未生效：同 geometry_gid 跨 train/val 被接受" >&2
     exit 1
   fi
+  [[ "$uav_check_err" == *"按记录策略应属的 split"* ]] || {
+    echo "几何 split 负例 a) 没有被 split 复算门挡下，报错是：$uav_check_err" >&2
+    exit 1
+  }
+  "$UAV_RGB_PYTHON" - "$uav_check_fmt/ep" <<'PY'
+import json, sys
+root = sys.argv[1]
+for name in ("ep1", "ep3"):
+    path = f"{root}/{name}/episode_manifest.json"
+    man = json.load(open(path, encoding="utf-8"))
+    man["split_policy"] = "diag-manual-split"
+    json.dump(man, open(path, "w", encoding="utf-8"))
+PY
+  if uav_check_err="$("$UAV_RGB_PYTHON" "$uav_check_root/tools/preprocess.py" --allow-diagnostic-split \
+       --out "$uav_check_fmt/ds_leak_diag" "$uav_check_fmt/ep/ep1" "$uav_check_fmt/ep/ep3" 2>&1 >/dev/null)"; then
+    echo "几何 split 门禁未生效：诊断策略下同 geometry_gid 跨 train/val 被接受" >&2
+    exit 1
+  fi
+  # 「同几何必须同 split」是 scan() 这一句独有的；build_meta 里还有一句「几何组 … 跨 split」，也含「几何组」，不能当判据。
+  [[ "$uav_check_err" == *"同几何必须同 split"* ]] || {
+    echo "几何 split 负例 b) 没有走到 scan() 的「同一个几何出现在两个 split」那一道，报错是：$uav_check_err" >&2
+    exit 1
+  }
 
   # 单集包内没有对照集可查「同 gid 跨 split」；必须直接校验 split == split_for_gid(gid)。
   # 同一 episode 目录被传两次也不能静默双打包（同一批样本会被算两遍）。
