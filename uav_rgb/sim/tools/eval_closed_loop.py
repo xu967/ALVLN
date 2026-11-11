@@ -60,6 +60,12 @@ METRIC_VERSION = "sim09.v2"
 # --corridor-half-width 给值后要求 oracle pose_gt 全程 |y| <= 该值，否则 success=False；
 # 默认 None 逐位保持旧口径，metric_version 加 .corridor<N>m 后缀，新旧数字不可混报。
 CORRIDOR_HALF_WIDTH_DEFAULT = None
+# 逐块存活判据 block_outcomes 缺省的走廊半宽（m），等于 scene_gen.Y_RANGE 的边界（summarize.py 沿用多年的缺省值）。
+# 评测命令行的 --corridor-half-width 默认仍是 None（关），与这个缺省无关；blocks_passed 一律显式传评测自己的值。
+BLOCK_CORRIDOR_HALF_WIDTH_M = 3.0
+# collisions_per_100m 的分母：run_episode 把每集量到首次碰撞 / 越界 / 过线的路程放进这个键，只给 write_report 汇总用，
+# 不写进 per_episode（任务卡 W1-4 没列这个键；infer_ms 也是这样只供汇总、不落盘）。原始轨迹在 <out>/episodes/seed_N。
+FLIGHT_PATH_KEY = "_flight_path_m"
 # cf_sitl（固件在环）下 FORWARD 到期后机体还会滑行，碰撞步的 action 多半已是 SAFE/YAW；
 # false_forward 改成「碰撞前 1 s 仿真内下过 FORWARD」。metric_version 带后缀，数字不与旧档混报。
 COAST_WINDOW_S = {"cf_sitl": 1.0}
@@ -432,6 +438,70 @@ def spl_of(success, path_m, shortest_m):
     return float(bool(success)) * float(shortest_m) / denom
 
 
+def block_outcomes(actions, oracle, goals, half_width=BLOCK_CORRIDOR_HALF_WIDTH_M, aborted=False):
+    """一集的逐块结果（纯函数）。goals = 每块的过线 x（block_goal_x）。
+
+    返回 {"pass": [bool]*K, "fail": None 或 (块序号从 0 起, "collision"|"corridor"|"not_reached"), "cross_step": [首次过线的步号或 None]*K,
+          "cross_y": [过线那一步的 |y|（m）或 None]*K}。
+    同一步既碰撞又越界按撞柱记；过线那一步本身有碰撞 / 越界，这一块不算过（与 K=1 判据：停线前任何碰撞都算失败 同口径）。
+    aborted=True 是采集中途失败的集（多为固件 FAILSAFE：电池掉压后推力不够）：没有坏事件时记「采集中止」而不是「未到线」。
+    half_width=None：不查横向（评测没开 --corridor-half-width 时 success 也不查，逐块判据与它同口径）。
+    原在 experiments/2026-11-10-long-course/summarize.py；W1-4 起移到这里，eval.json 的 blocks_passed 与汇总脚本共用这一份。
+    """
+    k_total = len(goals)
+    passed, cross, cross_y = [False] * k_total, [None] * k_total, [None] * k_total
+    cur, fail = 0, None   # cur = 已通过的块数 = 正在穿越的块
+    for i in range(max(len(actions), len(oracle))):
+        a = actions[i] if i < len(actions) else {}
+        o = oracle[i] if i < len(oracle) else {}
+        pg = o.get("pose_gt") if isinstance(o, dict) else None
+        has_pose = isinstance(pg, dict) and "x" in pg and "y" in pg
+        collided = bool(a.get("collision")) and a.get("src") != "stuck"   # stuck（前飞位移不足）不是碰撞
+        outside = has_pose and half_width is not None and abs(float(pg["y"])) > half_width
+        if fail is None and (collided or outside):
+            fail = (cur, "collision" if collided else "corridor")
+        if fail is None and has_pose:
+            while cur < k_total and float(pg["x"]) >= goals[cur]:
+                passed[cur], cross[cur], cross_y[cur] = True, i, abs(float(pg["y"]))
+                cur += 1
+    if fail is None and cur < k_total:
+        fail = (cur, "aborted" if aborted else "not_reached")
+    return {"pass": passed, "fail": fail, "cross_step": cross, "cross_y": cross_y}
+
+
+def blocks_passed(oracle, actions, block_goal_x, corridor_half_width):
+    """这一集通过的块数（0..K）：第 k 块通过 = 首次到达 x >= block_goal_x[k] 之前（含那一步）无接触碰撞，且 |y| 不超过走廊半宽。
+
+    参数顺序是 (oracle, actions)，与本文件 summarize_episode / block_outcomes 的 (actions, oracle) 相反（任务卡 W1-4 定的签名）。
+    corridor_half_width=None（评测没开走廊）时不查横向，与该次评测的 success 同口径。
+    """
+    return sum(block_outcomes(actions, oracle, block_goal_x, corridor_half_width)["pass"])
+
+
+def flight_path_m(oracle, actions, goal_x, waypoint=None, stop_radius=None, goal_radius=None,
+                  corridor_half_width=None):
+    """collisions_per_100m 的分母（一集）：oracle xy 折线，从首点量到首次接触碰撞、越界（|y| > 走廊半宽）或进入目标区为止，单位 m。
+
+    碰撞 / 越界发生的那一步算在内；stuck 不是碰撞。目标区与 summarize_episode 的 p_i 同一个（验收线任务 = x >= goal_x 半平面，
+    量到边界的插值点；waypoint 任务 = 到达圆）。越界只对验收线任务生效：waypoint 任务的 waypoint 本身可以在走廊外
+    （见 summarize_episode 的 success 判据）。没有任何 pose_gt 时 None。
+    """
+    waypoint_task = stop_radius is not None
+    half = None if waypoint_task else corridor_half_width
+    end = len(oracle)
+    for i, o in enumerate(oracle):
+        a = actions[i] if i < len(actions) else {}
+        pg = o.get("pose_gt") if isinstance(o, dict) else None
+        has_pose = isinstance(pg, dict) and "x" in pg and "y" in pg
+        outside = has_pose and half is not None and abs(float(pg["y"])) > half
+        if (bool(a.get("collision")) and _src(a) != "stuck") or outside:
+            end = i + 1   # 事件那一步的位姿也算进路程
+            break
+    return goal_path_length_m(trajectory_xy(oracle[:end]), goal_x=goal_x,
+                              waypoint=waypoint if waypoint_task else None,
+                              radius=(REACH_RADIUS if goal_radius is None else goal_radius) if waypoint_task else None)
+
+
 def summarize_episode(actions, oracle, goal_x, waypoint=None,
                       waypoint_radius=WAYPOINT_RADIUS, stop_radius=None, goal_radius=None,
                       timed_out=False, coast_window_s=None, shortest_path_m=None,
@@ -660,6 +730,27 @@ def aggregate(episodes, requested=None, attempted=None, failed_count=0, skipped_
     }
 
 
+def collisions_per_100m(episodes):
+    """每百米接触碰撞数 = 100 × 有接触碰撞的集数 ÷ 各集 FLIGHT_PATH_KEY（m）之和；集数口径同 collision_rate 的分子。
+
+    episodes 是完成集（run_episode 的返回，failed[] / skipped[] 的集不在内，没有路程可量）。总路程为 0（含没有完成集）时 None，
+    不是 0：没飞过不能说每百米 0 次碰撞。零碰撞但飞过时是 0.0。
+    """
+    total = sum(e.get(FLIGHT_PATH_KEY) or 0.0 for e in episodes)
+    if total <= 0.0:
+        return None
+    return 100.0 * sum(1 for e in episodes if e.get("collision")) / total
+
+
+def block_survival(episodes, requested, blocks):
+    """逐块存活率：长度 blocks 的列表，第 k 项（k 从 1 起）= blocks_passed >= k 的集数 ÷ requested（请求集数）。
+
+    分母同 requested_success_rate：采集失败 / 跳过的集不在 episodes 里，等于没通过，但占请求名额。非增；最后一项 = 全程通过率。
+    """
+    return [sum(1 for e in episodes if (e.get("blocks_passed") or 0) >= k) / requested
+            for k in range(1, blocks + 1)]
+
+
 def spl_clearance(vehicle, task):
     """l_i 用的 A* 膨胀余量 = 机体半径 teacher.BODY_HALF_BY_VEHICLE[vehicle]（e1_mini 0.102 / x3 0.235）：
     机心离柱表面 ≥ 这个值就是碰撞模型下可行的路，所以 l_i 是物理可行最短路的下界（栅格 0.1 m 离散误差内），
@@ -852,6 +943,15 @@ def run_episode(seed, args, workdir, seen_gids):
     })
     if meta.get("course"):   # course_base：块边界线（每块最远柱 x + 1.0）随集记下，逐块存活统计直接读它
         summary["block_goal_x"] = meta["course"]["block_goal_x"]
+        # W1-4：本集通过的块数与总块数；走廊半宽用评测自己的（--corridor-half-width，没开为 None 即不查横向），
+        # 与这一集 success 的横向判据同口径。base 等没有 course 的任务不写这两个键。
+        summary["blocks_total"] = len(meta["course"]["block_goal_x"])
+        summary["blocks_passed"] = blocks_passed(oracle, actions, meta["course"]["block_goal_x"],
+                                                 args.corridor_half_width)
+    # W1-4：collisions_per_100m 的分母（所有任务）。私有键，write_report 汇总后从 per_episode 里去掉。
+    summary[FLIGHT_PATH_KEY] = flight_path_m(oracle, actions, goal_x, meta.get("waypoint"),
+                                             meta.get("stop_radius"), meta.get("goal_radius"),
+                                             args.corridor_half_width)
     # W1-0：观测戳到派发的仿真秒（collect 每步都记 dispatch_lag_s；旧 collect 的集没有，不写键）。
     lags = [a["dispatch_lag_s"] for a in actions if a.get("dispatch_lag_s") is not None]
     if lags:
@@ -1407,8 +1507,14 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
               "partial": interrupted is not None,
               "interrupted": (None if interrupted is None else
                               {"seed": interrupted["seed"], "reason": interrupted["reason"]}),
-              **agg, "failed": failures, "skipped": skips,
-              "per_episode": [{k: v for k, v in e.items() if k != "infer_ms"}
+              **agg,
+              # W1-4：每百米接触碰撞数（所有任务；路程只量到首次碰撞 / 越界 / 过线，见 flight_path_m）。
+              # block_survival 只在 course_base 写（args.blocks 非空），分母 = 请求集数，与 requested_success_rate 同口径。
+              "collisions_per_100m": collisions_per_100m(results),
+              **({"block_survival": block_survival(results, args.episodes, args.blocks)}
+                 if args.blocks is not None else {}),
+              "failed": failures, "skipped": skips,
+              "per_episode": [{k: v for k, v in e.items() if k not in ("infer_ms", FLIGHT_PATH_KEY)}
                               for e in results]}
     path = os.path.join(out, "eval.json")
     with open(path, "w", encoding="utf-8") as f:

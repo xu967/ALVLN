@@ -90,33 +90,14 @@ def read_json(path):
         return json.load(f)
 
 
-def block_outcomes(actions, oracle, goals, half_width=DEFAULT_HALF_WIDTH_M, aborted=False):
-    """一集的逐块结果（纯函数）。goals = 每块的过线 x（block_goal_x）。
-
-    返回 {"pass": [bool]*K, "fail": None 或 (块序号从 0 起, "collision"|"corridor"|"not_reached"), "cross_step": [首次过线的步号或 None]*K,
-          "cross_y": [过线那一步的 |y|（m）或 None]*K}。
-    同一步既碰撞又越界按撞柱记；过线那一步本身有碰撞 / 越界，这一块不算过（与 K=1 判据：停线前任何碰撞都算失败 同口径）。
-    aborted=True 是采集中途失败的集（多为固件 FAILSAFE：电池掉压后推力不够）：没有坏事件时记「采集中止」而不是「未到线」。
-    """
-    k_total = len(goals)
-    passed, cross, cross_y = [False] * k_total, [None] * k_total, [None] * k_total
-    cur, fail = 0, None   # cur = 已通过的块数 = 正在穿越的块
-    for i in range(max(len(actions), len(oracle))):
-        a = actions[i] if i < len(actions) else {}
-        o = oracle[i] if i < len(oracle) else {}
-        pg = o.get("pose_gt") if isinstance(o, dict) else None
-        has_pose = isinstance(pg, dict) and "x" in pg and "y" in pg
-        collided = bool(a.get("collision")) and a.get("src") != "stuck"   # stuck（前飞位移不足）不是碰撞
-        outside = has_pose and abs(float(pg["y"])) > half_width
-        if fail is None and (collided or outside):
-            fail = (cur, "collision" if collided else "corridor")
-        if fail is None and has_pose:
-            while cur < k_total and float(pg["x"]) >= goals[cur]:
-                passed[cur], cross[cur], cross_y[cur] = True, i, abs(float(pg["y"]))
-                cur += 1
-    if fail is None and cur < k_total:
-        fail = (cur, "aborted" if aborted else "not_reached")
-    return {"pass": passed, "fail": fail, "cross_step": cross, "cross_y": cross_y}
+# 逐块判据 block_outcomes 在 sim/tools/eval_closed_loop.py：W1-4 起 eval.json 的 blocks_passed 与本脚本共用这一份。
+# 脚本被拷进实验目录时用目录里冻结的 code/sim/tools（W1-4 之前冻结的快照没有这个函数，会 ImportError），在仓库里跑时用仓库的。
+for _tools in (os.path.join(OUT, "code", "sim", "tools"),
+               os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "sim", "tools")):
+    if os.path.isfile(os.path.join(_tools, "eval_closed_loop.py")):
+        sys.path.insert(0, _tools)
+        break
+from eval_closed_loop import block_outcomes  # noqa: E402,F401  - 下面的 load_arm / 汇总用；test_course_summary 也经 sm.block_outcomes 取
 
 
 def episode_stats(actions, oracle):
