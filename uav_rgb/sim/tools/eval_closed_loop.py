@@ -917,6 +917,8 @@ def run_episode(seed, args, workdir, seen_gids):
             cmd += ["--vehicle", args.vehicle]   # x3 不传：旧命令行逐字不变
         if args.action_latency is not None:
             cmd += ["--action-latency", f"{args.action_latency:g}"]   # 没给不传：旧命令行逐字不变
+        if getattr(args, "cf_sitl_params", None):
+            cmd += ["--cf-sitl-params", args.cf_sitl_params]          # 没给不传；scene_gen 一侧由 cp.scene_gen_extra 透传
         env = cp.gz_env(partition)
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -1242,6 +1244,11 @@ def main():
                         "action_latency_s，新旧 SR 不可混报。只能配 --window-from observation，且 0 < L < --hold")
     p.add_argument("--rtf", type=float, default=None,
                    help="透传给 scene_gen：世界物理的目标实时因子（只能压低，缺省用模板值 1.0）。eval.json 顶层记 rtf")
+    p.add_argument("--cf-sitl-params", default=None, metavar="JSON",
+                   help="cf_sitl 参数副本（W1-10：满电档等，tools/make_params_variant.py 生成）。同一个绝对路径同时透传给 "
+                        "scene_gen（改写世界里 CfSitlSystem 插件读的 <params>）与 collect.py（manifest 指纹）：只给 collect.py "
+                        "时 gz 里的物理仍是原参数。只能配 --dynamics cf_sitl。默认关（旧口径逐位不变）；开了以后 eval.json "
+                        "顶层记 cf_sitl_params（路径、文件 sha256、values_sha256）与 dynamics_profile")
     p.add_argument("--rule-version", choices=("v0", "v1"), default="v0",
                    help="透传给 collect.py（仅 --policy rule-oracle）：v0=固定规则（默认，命令行与输出逐位不变）；"
                         "v1=短期障碍记忆 + 候选航向选择（计划 D6）。v1 时 eval.json 顶层另记 rule_version")
@@ -1328,6 +1335,12 @@ def main():
         p.error("cf_blackbox 是纯 Python 模型档，Gazebo 闭环未接入；"
                 "请让 3DGS collector 直接调用 cf_blackbox，或改用 cf_stab/x3_velocity")
     cp.resolve_vehicle(args, p.error)
+    if args.cf_sitl_params is not None:
+        if args.dynamics != "cf_sitl":
+            p.error("--cf-sitl-params 只能和 --dynamics cf_sitl 一起用")
+        if not os.path.isfile(args.cf_sitl_params):
+            p.error(f"--cf-sitl-params 文件不存在: {args.cf_sitl_params}")
+        args.cf_sitl_params = os.path.abspath(args.cf_sitl_params)   # scene_gen 与 collect 在别的 cwd 下起，只传绝对路径
     if (args.task == "forest_e1") != (args.density is not None):
         p.error("--density 与 --task forest_e1 必须同时给")
     if args.task == "forest_e1" and args.vehicle != "e1_mini":
@@ -1465,6 +1478,22 @@ def report_metric_version(args):
     return v
 
 
+def dynamics_profile_of(results):
+    """eval.json 顶层的 dynamics_profile（W1-10）：各集 manifest 的 dynamics_profile 一致时是那个字符串；没有任何一集记了它
+    时是 None；不一致说明动力学在集间换了（数据错误），返回排序后的列表，不挑一个。"""
+    profiles = sorted({e["dynamics_profile"] for e in results if e.get("dynamics_profile")})
+    if not profiles:
+        return None
+    return profiles[0] if len(profiles) == 1 else profiles
+
+
+def cf_sitl_params_record(path):
+    """参数副本的追溯记录：路径、文件字节 sha256、各项 value 的规范化 sha256（dynamics_profile 里的 sha8 取自它）。"""
+    import cf_sitl_exec   # 只有给了 --cf-sitl-params 才需要
+    p = cf_sitl_exec.CfSitlParams.from_json(path)
+    return {"path": path, "sha256": p.sha256, "values_sha256": p.values_sha256}
+
+
 def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_dim, infer_bin, started):
     """汇总 + 写 <out>/eval.json + 打印；返回进程退出码（中断时是 143/130/1）。"""
     results, failures, skips = state["results"], state["failures"], state["skips"]
@@ -1543,6 +1572,11 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
                       for f in failures if f.get("late_dispatch_steps")]}
                  if args.action_latency is not None else {}),
               **({"rtf": args.rtf} if args.rtf is not None else {}),
+              # W1-10：参数副本。只在给了 --cf-sitl-params 时写键（默认 eval.json 逐位不变）：路径与两个 sha 随结果留证；
+              # dynamics_profile 取各集 manifest 的值（collect 读同一份副本算出），与 per_episode 里的逐集记录互相印证。
+              **({"cf_sitl_params": cf_sitl_params_record(args.cf_sitl_params),
+                  "dynamics_profile": dynamics_profile_of(results)}
+                 if getattr(args, "cf_sitl_params", None) else {}),
               # rule-oracle 的视场与规则参数：预注册的参数随结果留证（其它策略不写这两个键）
               **({"rule_hfov_deg": args.rule_hfov_deg,
                   "rule_params": rule_policy.RULE_V0 if args.rule_version == "v0" else rule_policy.RULE_V1,

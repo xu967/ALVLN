@@ -101,6 +101,11 @@ CAMERA_RATE_RE = re.compile(
     r'\s*<always_on>1</always_on>\s*<update_rate>)([0-9.]+)(</update_rate>)')
 # 世界物理里的目标实时因子（两种载具的模板各 1 处）。--rtf 只改这一个数。
 RTF_RE = re.compile(r"(<real_time_factor>)[^<]*(</real_time_factor>)")
+# E1 模板里 CfSitlSystem 插件块的 <params>（仓库相对路径 sim/dynamics/e1_mini.json）。--cf-sitl-params 只改这一个值。
+# 锚在 <plugin filename="CfSitlSystem" ...> 到 </plugin> 之间：模板的注释里也有 "<params>" 字样，不能全文替换。
+CF_SITL_PARAMS_RE = re.compile(
+    r'(<plugin filename="CfSitlSystem"[^>]*>(?:(?!</plugin>).)*?<params>)[^<]*(</params>)', re.S)
+CF_SITL_PARAMS_BAD_CHARS = re.compile(r"[\s<>&]")   # 路径里的空白与 XML 特殊字符：不转义，直接拒绝
 # 外观版本：只改材质/光照/固定地标，不动 pillars 几何 → geometry_gid 与旧数据都保留。
 # legacy 显式复现改动前逐字节输出（含 3 个固定纯色方块）；v1 删掉它们并随机化光照/天空。
 # 2026-11-04 起新场景默认 v1：固定地标是每集重复的捷径，且不在教师真值里。
@@ -290,6 +295,22 @@ def set_real_time_factor(world, rtf):
     world, n = RTF_RE.subn(lambda m: f"{m.group(1)}{rtf:g}{m.group(2)}", world)
     if n != 1:
         raise ValueError(f"template 里 real_time_factor 匹配到 {n} 处，应为 1")
+    return world
+
+
+def set_cf_sitl_params(world, path):
+    """把 E1 世界里 CfSitlSystem 插件的 <params> 改写成 path（--cf-sitl-params，W1-10：满电档）。
+
+    模板里 <params> 写死 sim/dynamics/e1_mini.json，插件在 gz 进程里自己读它（Configure 时 cf_sitl_init）。
+    collect.py --cf-sitl-params 只让 Python 一侧读副本（manifest 的 dynamics_profile、params_sha256），不改世界时
+    gz 里的物理仍是模板指的那份：manifest 写副本的指纹、动力学却是原参数。path 必须是绝对路径：插件对绝对路径原样使用，
+    相对路径按 $UAVRGB_REPO_ROOT 解析。几何、gid、split 不受影响。
+    """
+    if not os.path.isabs(path) or CF_SITL_PARAMS_BAD_CHARS.search(path):
+        raise ValueError(f"cf_sitl params 路径要绝对路径且不含空白与 < > &: {path!r}")
+    world, n = CF_SITL_PARAMS_RE.subn(lambda m: f"{m.group(1)}{path}{m.group(2)}", world)
+    if n != 1:
+        raise ValueError(f"template 里 CfSitlSystem 插件的 <params> 匹配到 {n} 处，应为 1（X3 模板没有这个插件）")
     return world
 
 
@@ -648,6 +669,9 @@ def main():
     p.add_argument("--rtf", type=float, default=None,
                    help="世界物理的目标实时因子 <real_time_factor>（W1-0）；缺省用模板值（1.0）。只能压低、不能抬高："
                         "仿真跑不到它时无效。给了才写进 meta.real_time_factor，默认输出逐位不变")
+    p.add_argument("--cf-sitl-params", default=None, metavar="JSON",
+                   help="E1 世界里 CfSitlSystem 插件读的参数文件（W1-10：满电档等参数副本）；缺省用模板的 "
+                        "sim/dynamics/e1_mini.json。写成绝对路径进世界，给了才写进 meta.cf_sitl_params，默认输出逐位不变。仅 E1 模板")
     p.add_argument("--no-aux-cameras", action="store_true",
                    help="不生成 chase/top 两路辅助相机（采集提速；录 demo 视频时不要加）。仅 E1 模板")
     p.add_argument("--no-velocity-control", action="store_true",
@@ -688,6 +712,14 @@ def main():
     template_vehicle = vehicle_of_template(template)
     if args.vehicle and args.vehicle != template_vehicle:
         p.error(f"--vehicle {args.vehicle} 与模板里的载具 {template_vehicle} 不一致")
+    if args.cf_sitl_params is not None:
+        if template_vehicle != "e1_mini":
+            p.error("--cf-sitl-params 只能配 E1 模板（x3 模板没有 CfSitlSystem 插件）")
+        if not os.path.isfile(args.cf_sitl_params):
+            p.error(f"--cf-sitl-params 文件不存在: {args.cf_sitl_params}")
+        args.cf_sitl_params = os.path.abspath(args.cf_sitl_params)
+        if CF_SITL_PARAMS_BAD_CHARS.search(args.cf_sitl_params):
+            p.error(f"--cf-sitl-params 路径含空白或 XML 特殊字符（< > &），不写进世界: {args.cf_sitl_params!r}")
     world, meta = build_scene(template, args.seed, scene_id, args.spawn_mode, args.task,
                               args.appearance, density=args.density, blocks=args.blocks)
     if args.no_velocity_control:
@@ -702,7 +734,11 @@ def main():
     if args.rtf is not None:
         world = set_real_time_factor(world, args.rtf)
         meta["real_time_factor"] = args.rtf   # 只在给了 --rtf 时写键：默认 meta 逐位不变
-    if args.camera_rate is not None or args.no_aux_cameras or args.rtf is not None:
+    if args.cf_sitl_params is not None:
+        world = set_cf_sitl_params(world, args.cf_sitl_params)
+        meta["cf_sitl_params"] = args.cf_sitl_params   # 只在给了 --cf-sitl-params 时写键：默认 meta 逐位不变
+    if (args.camera_rate is not None or args.no_aux_cameras or args.rtf is not None
+            or args.cf_sitl_params is not None):
         meta["world_sha256"] = sha256(world.encode("utf-8"))
     # campus/asset_campus 自己写 meta，这里统一补载具与相机采样信息。
     meta.setdefault("vehicle", template_vehicle)

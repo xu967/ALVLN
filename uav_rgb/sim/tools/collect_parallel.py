@@ -186,7 +186,8 @@ def resolve_vehicle(args, error):
 
 
 def scene_gen_extra(args):
-    """透传给 scene_gen 的可选参数：相机、实时因子、forest_e1 密度、course_base 块数（没给就不传，旧命令行逐字不变）。"""
+    """透传给 scene_gen 的可选参数：相机、实时因子、forest_e1 密度、course_base 块数、cf_sitl 参数副本
+    （没给就不传，旧命令行逐字不变）。"""
     extra = []
     rate = getattr(args, "camera_rate", None)
     if rate is not None:
@@ -200,6 +201,8 @@ def scene_gen_extra(args):
         extra += ["--density", args.density]
     if getattr(args, "blocks", None) is not None:
         extra += ["--blocks", str(args.blocks)]
+    if getattr(args, "cf_sitl_params", None):
+        extra += ["--cf-sitl-params", args.cf_sitl_params]   # W1-10：插件读的参数副本；没给不传
     return extra
 
 

@@ -55,6 +55,11 @@ CMake 选项：`CF_SITL_GZ_STUB`（OFF）、`CF_SITL_TARGET`（父工程里的�
 
 物理步长必须是 `0.001`：其他步长插件只报一次 `gzerr` 并拒绝施力（固件按 1 kHz 写死）。
 
+`<params>` 是插件读参数的唯一来源（`Configure` 里 `cf_sitl_init` 读一次）。要用参数副本（如满电档，`tools/make_params_variant.py` 生成），
+世界里的 `<params>` 必须指向副本：`scene_gen.py --cf-sitl-params <文件>`（存成绝对路径，只改插件块里这一行，meta 多 `cf_sitl_params`，
+`world_sha256` 随世界更新），`eval_closed_loop.py --cf-sitl-params` 把同一个路径同时交给 scene_gen 与 `collect.py`。
+只给 `collect.py --cf-sitl-params` 时只有 Python 一侧读副本（manifest 的 `dynamics_profile`、`params_sha256`），gz 里的物理仍是模板指的那份。
+
 ## 话题约定
 
 | 话题 | 类型 | 方向 | 内容 |
