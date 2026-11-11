@@ -372,6 +372,23 @@ longcourse 分段打点）+ 策略段的墙钟耗时折成的仿真时间；后�
 - **`--rtf R`**：`scene_gen.py --rtf R`（`eval_closed_loop.py` 透传）把世界的目标实时因子压到 R，让仿真跑慢、墙钟耗时折成的仿真秒变少。
   只能压低，不能超过本机软渲染实际达到的实时因子（各集 `action_rtf` 均值约 0.8）。需要 `--rtf` 的 L 与 R 由标定定，见 `docs/experiments/2026-11-10-action-latency.md`。
 
+### 5.6 主比较协议与统计表分母（2026-11-11）
+
+**成功类指标的分母是请求集，失败集单列；主比较的规模与预注册在起跑前定。**
+
+- **统计表分母**（`tools/stats_report.py`）。下面三处旧表述按本条执行，原文不改：§5 开头列表里「SR 分母 = `episodes_done`」那一条，§5.3 指标表里 task_success 一行的分母，§5.3「统计方法」第一条。`eval.json` 里 `success_rate` 等旧率字段本身不变，仍是完成集分母：
+  - 越高越好的二值指标（SR、task_success、reach_ever、stop_success）：分母 = `episodes_requested`。基础设施失败的集
+    （`failed[]`，含 §5.5 的 `late_dispatch:` 集）与跳过的集都记 0，与 `eval.json` 的 `requested_success_rate`、`wilson_ci.requested` 同口径。
+  - 越低越好的二值指标（CR、stuck、false_forward）：分母仍是完成集 `episodes_done`。失败集没有碰撞或乱飞的观测，记 0 会压低这几项。
+  - SPL 是完成集上的均值，不变。
+  - 表里单列「失败集数」（该方法全部 run、全部场景的 `failed_count` 之和）。失败集数不为 0 时，同一行里 SR 与 CR 的 n 不同；
+    没有失败集时新旧数字逐位相同（`tools/test_stats_report.py` 锁定）。
+- **主比较的规模**：20 个冻结几何（`tools/eval_seeds.py` 的 `EVAL_SEEDS_BASE_20`）× 每方法 3 个训练种子 = 60 集；配对精确 McNemar 加 Wilson 区间。
+  T1（`--task course_base --blocks 3` 的长课程）起再报逐块存活。
+- **预注册**：起跑前在入口脚本头部写下预测、证伪条件和主比较；主比较的配对不超过 3 个；参数在起跑前定死，不在评测 seed 上调。
+- **单次 n=20 的比较不下结论**：同权重、同 seed 重评的逐集不一致率约 24%（出处：`docs/reviews/2026-11-10-phase12/longcourse.md`，自重跑一致率约 76%），
+  一次 20 集的差别落在这个波动里。结论看 60 集的配对结果，单次 20 集只作描述。
+
 ## 6. 下一步（按优先级）
 
 1. 补 `d_min`（A\* 最短自由路径）→ 才能算 PO / MP / AGV（SR 已实现）。

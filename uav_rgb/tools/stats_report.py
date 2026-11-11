@@ -4,9 +4,10 @@
 读若干 eval.json（sim/tools/eval_closed_loop.py 或 sim/3dgs/eval_3dgs.py 的产物）+ 分组名，输出论文主表
 （行 = 方法，列 = 场景 × 指标，每格 `x.xx [lo, hi] (n)`）与配对检验表，Markdown + JSON 各一份。
 
-统计口径（docs/EVAL_STANDARD.md §5.3）：
-  二值指标（SR/CR/false_forward/task_success/stuck）: 比例 + Wilson 95%，分母 = 完成集 episodes_done；
-  连续指标（SPL）: 均值 + 百分位 bootstrap 95%；
+统计口径（docs/EVAL_STANDARD.md §5.3，分母见 §5.6）：
+  二值指标: 比例 + Wilson 95%。越高越好的（SR/task_success/reach_ever/stop_success）分母 = 请求集 episodes_requested，
+    失败/跳过集记 0；越低越好的（CR/false_forward/stuck）分母 = 完成集 episodes_done。表里单列「失败集数」；
+  连续指标（SPL）: 完成集上的均值 + 百分位 bootstrap 95%；
   同一 (方法, 场景) 多个 run（训练种子）: IQM + 分层 bootstrap 95%（Agarwal et al. NeurIPS 2021）；
   两方法配对（同 seed 集）: McNemar（b+c<25 精确二项，否则带连续性校正的卡方）；
   ≥3 方法: 另给 Cochran's Q（全体共同 seed）作总体检验；两两 McNemar 照做、不以 Q 显著为前提；
@@ -264,40 +265,62 @@ def metric_values(per_episode, field):
     return out
 
 
-def _run_value(vals, kind):
-    return (sum(1 for v in vals if v) / len(vals)) if kind == "binary" else (sum(vals) / len(vals))
+def uses_requested(metric):
+    """越高越好的二值指标（SR/task_success/reach_ever/stop_success）分母取请求集：基础设施失败的集不能从分母里拿掉，否则成功率虚高。
+    越低越好的二值指标（CR/stuck/false_forward）失败集没有碰撞/乱飞的观测，记 0 会把它们压低，分母仍是完成集；连续指标（SPL）同。"""
+    _field, kind, direction = METRICS[metric]
+    return kind == "binary" and direction == "↑"
 
 
-def summarize_cell(runs, field, kind, n_boot, seed):
-    """一个 (方法, 场景) 格：1 个 run 给 Wilson / bootstrap 均值；多个 run 给 IQM + 分层 bootstrap。"""
-    per_run = [list(metric_values(r["per_episode"], field).values()) for r in runs]
-    per_run = [v for v in per_run if v]
+def run_denominator(ev, n_done, requested):
+    """一个 run 的比例分母：requested 时取 episodes_requested（失败/跳过集记 0），否则取完成集。
+    旧 eval.json 没有 episodes_requested 就退回完成集；请求数小于完成数（不应出现）时取完成数，比例不超过 1。"""
+    req = ev.get("episodes_requested")
+    return max(int(req), n_done) if requested and req else n_done
+
+
+def _run_value(vals, kind, n=None):
+    return (sum(1 for v in vals if v) / (n or len(vals))) if kind == "binary" else (sum(vals) / len(vals))
+
+
+def summarize_cell(runs, field, kind, n_boot, seed, requested=False):
+    """一个 (方法, 场景) 格：1 个 run 给 Wilson / bootstrap 均值；多个 run 给 IQM + 分层 bootstrap。
+    requested=True（越高越好的二值指标）时比例的分母是请求集；格里的 n 就是分母，分母与完成数不同时另记 n_done。"""
+    per_run = [(list(metric_values(r["per_episode"], field).values()), r) for r in runs]
+    per_run = [(v, r) for v, r in per_run if v]
     if not per_run:
         return None
+    denoms = [run_denominator(r, len(v), requested and kind == "binary") for v, r in per_run]
     if len(per_run) == 1:
-        vals = per_run[0]
-        n = len(vals)
+        vals, n_done = per_run[0][0], len(per_run[0][0])
         if kind == "binary":
-            k = sum(1 for v in vals if v)
+            n, k = denoms[0], sum(1 for v in vals if v)
             lo, hi = wilson_ci(k, n)
-            return {"point": k / n, "lo": lo, "hi": hi, "n": n, "k": k, "runs": 1, "kind": "wilson"}
+            cell = {"point": k / n, "lo": lo, "hi": hi, "n": n, "k": k, "runs": 1, "kind": "wilson"}
+            if n != n_done:
+                cell["n_done"] = n_done
+            return cell
         point, lo, hi = bootstrap_mean_ci(vals, n_boot=n_boot, seed=seed)
-        return {"point": point, "lo": lo, "hi": hi, "n": n, "runs": 1, "kind": "bootstrap_mean"}
-    scores = [[_run_value(v, kind)] for v in per_run]          # runs × 1 task
+        return {"point": point, "lo": lo, "hi": hi, "n": n_done, "runs": 1, "kind": "bootstrap_mean"}
+    scores = [[_run_value(v, kind, d)] for (v, _r), d in zip(per_run, denoms)]          # runs × 1 task
     point, lo, hi = stratified_bootstrap_ci(scores, n_boot=n_boot, seed=seed)
-    ns = sorted({len(v) for v in per_run})
-    return {"point": point, "lo": lo, "hi": hi, "n": ns[0] if len(ns) == 1 else ns, "runs": len(per_run),
+    ns, dones = sorted(set(denoms)), sorted({len(v) for v, _r in per_run})
+    cell = {"point": point, "lo": lo, "hi": hi, "n": ns[0] if len(ns) == 1 else ns, "runs": len(per_run),
             "kind": "iqm_stratified"}
+    if ns != dones:
+        cell["n_done"] = dones[0] if len(dones) == 1 else dones
+    return cell
 
 
-def summarize_all_scenes(runs_by_scene, field, kind, n_boot, seed):
-    """一个方法跨场景的 IQM：矩阵 runs × scenes，元素 = 该 run 在该场景的指标值（场景间 run 数须相同）。"""
+def summarize_all_scenes(runs_by_scene, field, kind, n_boot, seed, requested=False):
+    """一个方法跨场景的 IQM：矩阵 runs × scenes，元素 = 该 run 在该场景的指标值（场景间 run 数须相同）。
+    分母规则与 summarize_cell 一致（requested 见 uses_requested），同一张表里不留两套分母。"""
     cols = []
     for scene_runs in runs_by_scene.values():
         col = []
         for r in scene_runs:
             vals = list(metric_values(r["per_episode"], field).values())
-            col.append(_run_value(vals, kind) if vals else None)
+            col.append(_run_value(vals, kind, run_denominator(r, len(vals), requested and kind == "binary")) if vals else None)
         cols.append(col)
     runs = {len(c) for c in cols}
     if len(runs) != 1 or any(v is None for c in cols for v in c):
@@ -353,10 +376,11 @@ def build_report(entries, metrics=DEFAULT_METRICS, pair_metrics=("SR",), n_boot=
         cells[method] = {}
         for scene in scenes:
             runs = groups[method].get(scene, [])
-            cells[method][scene] = {m: (summarize_cell(runs, METRICS[m][0], METRICS[m][1], n_boot, seed)
+            cells[method][scene] = {m: (summarize_cell(runs, METRICS[m][0], METRICS[m][1], n_boot, seed, uses_requested(m))
                                         if runs else None) for m in metrics}
         if len(scenes) >= 2 and len(groups[method]) == len(scenes):
-            all_scenes[method] = {m: summarize_all_scenes(groups[method], METRICS[m][0], METRICS[m][1], n_boot, seed)
+            all_scenes[method] = {m: summarize_all_scenes(groups[method], METRICS[m][0], METRICS[m][1], n_boot, seed,
+                                                          uses_requested(m))
                                   for m in metrics}
     paired = {}
     for scene in scenes:
@@ -374,6 +398,9 @@ def build_report(entries, metrics=DEFAULT_METRICS, pair_metrics=("SR",), n_boot=
         "schema": "uavrgb.stats_report.v1", "title": title, "generated": time.strftime("%F %T"),
         "metrics": list(metrics), "pair_metrics": list(pair_metrics), "methods": methods, "scenes": scenes,
         "n_boot": n_boot, "seed": seed,
+        # 比例的分母：requested = episodes_requested（失败/跳过集记 0），done = episodes_done；failed_total = 方法的全部 run、全部场景的失败集数之和
+        "denominators": {m: "requested" if uses_requested(m) else "done" for m in metrics},
+        "failed_total": {m: sum(ev["failed"] for runs in groups[m].values() for ev in runs) for m in methods},
         # 全表出现过的 metric_version；>1 个就是混合（sim09.v1 过线后继续飞 vs v2 成功线即停），表头要标。
         "metric_versions": sorted({str(ev["metric_version"]) for _, _, ev in loaded}),
         "cells": cells, "all_scenes": all_scenes, "paired": paired, "protocol": protocol,
@@ -408,14 +435,19 @@ def to_markdown(rep):
     header = ["方法" + mixed] + [f"{s} {m}{METRICS[m][2]}" for s in rep["scenes"] for m in rep["metrics"]]
     if rep["all_scenes"]:
         header += [f"全场景 IQM {m}{METRICS[m][2]}" for m in rep["metrics"]]
+    header.append("失败集数")
     lines += ["| " + " | ".join(header) + " |", "|" + " --- |" * len(header)]
     for method in rep["methods"]:
         row = [method] + [fmt_cell(rep["cells"][method][s][m]) for s in rep["scenes"] for m in rep["metrics"]]
         if rep["all_scenes"]:
             row += [fmt_cell((rep["all_scenes"].get(method) or {}).get(m)) for m in rep["metrics"]]
+        row.append(str((rep.get("failed_total") or {}).get(method, 0)))
         lines.append("| " + " | ".join(row) + " |")
-    lines += ["", f"每格 `点估计 [95% 区间] (n)`：二值指标 Wilson（分母 = 完成集 episodes_done），SPL 为百分位 bootstrap 均值区间"
-                  f"（B={rep['n_boot']}），多 run 的格为 IQM + 分层 bootstrap（Agarwal 2021）。n<{PILOT_N} 的格只算 pilot。"
+    lines += ["", "每格 `点估计 [95% 区间] (n)`：二值指标 Wilson，分母按方向分两种。越高越好的指标（SR、task_success、reach_ever、stop_success）"
+                  "n = 请求集 episodes_requested，失败集与跳过集记 0；越低越好的指标（CR、stuck、false_forward）n = 完成集 episodes_done。"
+                  f"SPL 为完成集上的百分位 bootstrap 均值区间（B={rep['n_boot']}）；多 run 的格为 IQM + 分层 bootstrap（Agarwal 2021），"
+                  f"每个 run 按各自的分母算比例。n<{PILOT_N} 的格只算 pilot。"
+                  " 「失败集数」= 该方法全部 run、全部场景的 failed_count 之和，分场景明细见下表「失败」列。"
                   " CR = contact 碰撞比例（stuck/超时不算）。SPL 的 l_i 口径见各 eval.json 的 spl_reference。"]
     for scene in rep["scenes"]:
         pr = rep["protocol"][scene]

@@ -105,16 +105,17 @@ def test_power():
             pass
 
 
-def _fake_eval(path, seeds, success, collision=None, spl=None, **top):
+def _fake_eval(path, seeds, success, collision=None, spl=None, extra=None, **top):
+    """假 eval.json。默认请求数 = 完成数、没有失败集（既有用例的数字按完成集读）；失败集用 episodes_requested / failed_count 覆盖。"""
     per = []
     for i, s in enumerate(seeds):
         ep = {"seed": s, "success": bool(success[i]), "collision": bool(collision[i]) if collision else False,
-              "false_forward": False, "task_success": False, "stuck": False}
+              "false_forward": False, "task_success": False, "stuck": False, **(extra or {})}
         if spl is not None:
             ep["spl"] = spl[i]
         per.append(ep)
-    doc = {"per_episode": per, "episodes_done": len(per), "episodes_requested": len(per) + 1,
-           "failed_count": 1, "skipped_count": 0, "hold_s": 1.0, "metric_version": "sim09.v1.coast1s",
+    doc = {"per_episode": per, "episodes_done": len(per), "episodes_requested": len(per),
+           "failed_count": 0, "skipped_count": 0, "hold_s": 1.0, "metric_version": "sim09.v1.coast1s",
            "success_criterion": "route_choice", "dynamics": "cf_sitl", "vehicle": "e1_mini",
            "window_from": "observation", "task": "base", **top}
     with open(path, "w", encoding="utf-8") as f:
@@ -221,10 +222,60 @@ def test_default_metrics_and_test_procedure_doc():
         assert len(rep["paired"]["gz"]["SR"]["pairwise"]) == 3
 
 
+def test_success_metrics_use_requested_denominator():
+    """W1-2：越高越好的二值指标（SR、task_success、reach_ever、stop_success）分母 = episodes_requested，失败集记 0；
+    越低越好的（CR、stuck、false_forward）与连续指标 SPL 仍按完成集。一个 eval 请求 20 集、完成 19 集、失败 1 集：
+    SR 的分母是 20，CR 的分母是 19；表里有「失败集数」列和写明分母的表注。"""
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+        metrics = ("SR", "CR", "false_forward", "stuck", "task_success", "reach_ever", "stop_success", "SPL")
+        e19 = _fake_eval(os.path.join(tmp, "e19.json"), list(range(1, 20)), [1] * 15 + [0] * 4, collision=[0] * 15 + [1] * 4,
+                         spl=[0.8] * 19, extra={"reach_ever": True, "stop_success": True},
+                         episodes_requested=20, failed_count=1)
+        rep = sr.build_report([("m", "gazebo", e19)], metrics=metrics, n_boot=50, seed=0)
+        cell = rep["cells"]["m"]["gazebo"]
+        c = cell["SR"]
+        assert (c["k"], c["n"], c.get("n_done")) == (15, 20, 19) and close(c["point"], 15 / 20), c
+        assert (c["lo"], c["hi"]) == sr.wilson_ci(15, 20), c        # 区间也按 20 算
+        c = cell["CR"]
+        assert (c["k"], c["n"]) == (4, 19) and close(c["point"], 4 / 19) and "n_done" not in c, c
+        for m in ("task_success", "reach_ever", "stop_success"):   # 越高越好：请求集
+            assert cell[m]["n"] == 20 and cell[m].get("n_done") == 19, (m, cell[m])
+        for m in ("false_forward", "stuck"):                       # 越低越好：完成集
+            assert cell[m]["n"] == 19, (m, cell[m])
+        assert cell["SPL"]["n"] == 19 and cell["SPL"]["kind"] == "bootstrap_mean", cell["SPL"]
+        assert rep["failed_total"] == {"m": 1}, rep.get("failed_total")
+        assert rep["denominators"]["SR"] == "requested" and rep["denominators"]["CR"] == "done", rep.get("denominators")
+        # 没有失败集：数字与改前逐位相同（分母同为完成集，不带 n_done）。
+        e20 = _fake_eval(os.path.join(tmp, "e20.json"), list(range(1, 21)), [1] * 18 + [0] * 2)
+        c = sr.build_report([("m", "gazebo", e20)], n_boot=50, seed=0)["cells"]["m"]["gazebo"]["SR"]
+        assert (c["k"], c["n"]) == (18, 20) and "n_done" not in c, c
+        # 旧 eval.json 没有 episodes_requested：退回完成集，不报错。
+        old = _fake_eval(os.path.join(tmp, "old.json"), list(range(1, 20)), [1] * 15 + [0] * 4, episodes_requested=None)
+        c = sr.build_report([("m", "gazebo", old)], n_boot=50, seed=0)["cells"]["m"]["gazebo"]["SR"]
+        assert c["n"] == 19, c
+        # 多 run：每个 run 按各自的请求集算比例再取 IQM；CR 两个 run 的分母不同（19 与 20），n 记成列表。
+        rep2 = sr.build_report([("m", "gazebo", e19), ("m", "gazebo", e20)], metrics=("SR", "CR"), n_boot=50, seed=0)
+        c2 = rep2["cells"]["m"]["gazebo"]
+        assert c2["SR"]["runs"] == 2 and c2["SR"]["n"] == 20 and close(c2["SR"]["point"], (15 / 20 + 18 / 20) / 2), c2["SR"]
+        assert c2["CR"]["n"] == [19, 20], c2["CR"]
+        assert rep2["failed_total"] == {"m": 1}
+        # 跨场景 IQM 与单场景格同一套分母：gazebo 的 15/20 与 3dgs 的 5/6。
+        g6 = _fake_eval(os.path.join(tmp, "g6.json"), list(range(1, 7)), [1, 1, 1, 1, 1, 0])
+        rep3 = sr.build_report([("m", "gazebo", e19), ("m", "3dgs", g6)], metrics=("SR",), n_boot=50, seed=0)
+        assert close(rep3["all_scenes"]["m"]["SR"]["point"], (15 / 20 + 5 / 6) / 2), rep3["all_scenes"]
+        # Markdown：末列「失败集数」，表注写明两种分母。
+        md = sr.to_markdown(rep)
+        header = next(line for line in md.splitlines() if line.startswith("| 方法"))
+        row = next(line for line in md.splitlines() if line.startswith("| m |"))
+        assert header.rstrip().endswith("| 失败集数 |"), header
+        assert row.rstrip().endswith("| 1 |") and "0.75 [" in row and "(20)" in row and "(19)" in row, row
+        assert "请求集" in md and "episodes_requested" in md and "完成集" in md, md
+
+
 def main():
     for fn in (test_distributions, test_wilson, test_mcnemar, test_cochran_holm, test_iqm_bootstrap,
                test_power, test_report_end_to_end, test_mixed_metric_version_header,
-               test_default_metrics_and_test_procedure_doc):
+               test_default_metrics_and_test_procedure_doc, test_success_metrics_use_requested_denominator):
         fn()
         print("ok", fn.__name__)
     print("test_stats_report: PASS")
