@@ -63,7 +63,9 @@
   启动命令：`cd $D/exp-action-latency-r2-20261111 && DISP_CLAUSE=cruise setsid nohup bash run_r2.sh > /dev/null 2>&1 < /dev/null &`（同一条命令可续跑）。
   进度 `tail -f run.log`；结束看 `DONE`（rc 与原因）与 `summary.md`；停 `kill -- -$(cat run.pid)`。标定 A 组过门的话约 2.2 小时跑完，走到 C 组约 3.2 小时（估计）。
   结束后要做：读 `summary.md`，把标定门、验收 2、验收 4 的结果填进计划 §1.3 的【待填】，定新协议的 L。
-- 规则 v2（任务卡 K3）：subagent 11-11 晚开工，分支 `p12-k3`，报告 `$D/tmp/phase12-cards/reports/k3.md`，输出 `$D/exp-rule-v2-3dgs-20261111/`。
+  22:02 标定 A 组没过，原因只有 K=3 的 2 个迟到步（2/830）；生效时长、转角、巡航步位移的差都在 1% 以内。已按阶梯进 B 组。
+- 规则 v2（任务卡 K3）：subagent 11-11 22:05 开工（agent id `97f46267-e86f-41b2-ae73-43ca7de737d9`，Sonnet 5.5 Max），分支 `p12-k3`，
+  报告 `$D/tmp/phase12-cards/reports/k3.md`，输出 `$D/exp-rule-v2-3dgs-20261111/`。
   它的开发与正式阶段排在机器锁后面，W1-0 第二轮结束后自动起跑。交回后主会话审、合并、推送。
 - 待开工的卡：W1-12（3DGS 教师的前向净空检查、出生判空、导引指针；规格初稿在任务卡里，K3 合并后细化）。
 - 按任务卡派工：第 1 波 W1-1 至 W1-10 互不依赖，可以交给 deepseek，也可以由 Sonnet 5.5 Max 的 subagent 做（谁来做等用户定）；从 main `d3fb68d` 之后的提交起分支。
