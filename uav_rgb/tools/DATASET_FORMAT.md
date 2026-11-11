@@ -221,6 +221,15 @@ f 取**该样本所属 episode** 的 manifest `camera.fx`，没有则按 60° HF
 包络膨胀只由近处有限深度的格向外扩散（未知/没东西的格半径为 0），但两者都会被邻近近处格覆盖。
 一个包要么全部样本有深度，要么全无。
 
+**深度来源 `preprocess.py --depth-source`**（W1-8）：缺省 `file` = 读 episode 的深度文件，即上面的全部流程，输出与加这个开关之前逐字节相同。
+`analytic` = 不读深度文件，由几何真值解析算：`actions.jsonl` 的 `pose_before{x,y,z}` 与 `yaw_before`（动作前的机体位姿，度，逆时针为正）、
+manifest 的 `vehicle`（只认 `e1_mini`：相机在机体中心前 0.045 m、上 0.015 m，朝向 = 机头，水平安装）、同目录 `scene.json` 的 `pillars`
+（轴对齐方柱，或带 `radius` 的 forest 竖直圆柱）。每格取 3×3 条子射线（落在源图子块中心），与每根柱子和地面（z = 0）求交，
+深度 = 沿光轴的深度（= 水平射线距离 · cosφ），命中点高度超过柱顶的射线不算打到（+inf，第 8 带），格内取最小；之后与文件路径同一套：
+按该集 `camera.fx` 做包络膨胀 → `searchsorted(band_edges)`。解析深度没有「未知」，不产生 255。**忽略机体 roll/pitch**（慢速前进倾角 < 10°，
+未量化）。waypoint 任务、3DGS episode、非 `e1_mini`、缺 `scene.json` / `pillars` / 位姿的集在写任何输出之前报错。
+meta 的 `aux_sidecar.depth_source` 记 `"analytic"`；缺省 `file` 不加这个键，旧包的 meta 不变。侧车头、payload 布局与读端不变。
+
 ### 6.3 训练器约定
 
 `--two-frame` / `--prev-action` 需要侧车存在，`--depth-aux` 需要 flags bit0；缺了直接报错，

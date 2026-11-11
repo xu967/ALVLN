@@ -25,6 +25,10 @@ collision_flags（N 个 '0'/'1'，C++ 读端用 LoadOptions.drop_collision 过�
 oracle.jsonl 里 pose_gt.x 的最大值小于「最远柱 x + 1.0 m」就整集跳过，并打印跳过几集。这些集的后半段标签是撞柱前后的挣扎，
 不是示范。带 waypoint 的任务、DAgger 学生自采集、缺 scene.json 柱子或 oracle 的集不适用，不跳。
 
+深度分带目标默认读 episode 的深度文件（collect.py --save-depth）。--depth-source analytic 不读深度文件，由 actions.jsonl 的
+pose_before / yaw_before、manifest.vehicle 对应的相机安装位姿与同目录 scene.json 的柱子真值解析算（现有数据不用重采）；
+只支持 e1_mini 的柱阵 / forest episode，waypoint 任务与 3DGS episode 报错；忽略机体 roll/pitch。
+
 用法：
   .venv-tools/bin/python tools/preprocess.py --out /tmp/ds /tmp/ep0 /tmp/ep1
   python3 tools/preprocess.py --drop-collision --out /tmp/ds /tmp/ep0  # 丢碰撞步
@@ -34,6 +38,7 @@ oracle.jsonl 里 pose_gt.x 的最大值小于「最远柱 x + 1.0 m」就整集�
 import argparse
 import hashlib
 import json
+import math
 import os
 import struct
 import sys
@@ -82,6 +87,14 @@ DEFAULT_ENVELOPE_RADIUS_M = 0.102
 DEFAULT_HFOV_DEG = 60.0  # manifest 没写 fx 时按 Gazebo 相机 60° 水平视场推焦距
 # 网格 = 模型第三层特征图（H/8 × W/8），与 1x1 辅助头逐格对齐。
 DEPTH_GRID_DOWN = 8
+# --depth-source（W1-8）：file = 读 episode 的深度文件（缺省，行为与以前逐字节相同）；
+# analytic = 由 pose_before / yaw_before、相机安装位姿与 scene.json 的柱子真值解析算（analytic_depth_bands）。
+DEPTH_SOURCES = ("file", "analytic")
+DEFAULT_DEPTH_SOURCE = "file"
+ANALYTIC_RAYS = 3  # 每格每个方向 3 条子射线，3×3 = 9 条取最小
+# 相机相对机体中心的安装位置（前向 m，上方 m）= sim/dynamics/e1_mini.json camera_mount.xyz 的 x 与 z；
+# y = 0、pitch = 0 也由 test_preprocess_analytic_depth 锁住。只列已知相机安装的机型，其余机型 analytic 报错。
+CAMERA_MOUNT_BY_VEHICLE = {"e1_mini": (0.045, 0.015)}
 
 try:
     import numpy as np
@@ -342,7 +355,9 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
             die("缺帧：%s（actions.jsonl 与 rgb_*.png 不同步）" % png)
         samples.append({"png": png, "label": action, "step": step,
                         "collision": collision, "prev_action": prev_action,
-                        "depth": depth, "depth_format": depth_format})
+                        "depth": depth, "depth_format": depth_format,
+                        # 位姿只给 --depth-source analytic 用（缺也不在这里报错：file 路径不需要）
+                        "pose_before": row.get("pose_before"), "yaw_before": row.get("yaw_before")})
 
     # 航向码（--cond heading-code，任务卡 W1-9）：按集从头累计**已执行**动作的净转向数（含被 --drop-collision 丢掉的步：
     # 机体照样转过了），每步取执行前的 n。末行的动作不影响任何码；非末行的坏值上面的主循环已经 die 过，所以转换失败按「非转向」处理。
@@ -386,6 +401,7 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
         "target_color": target_color,
         "waypoint": man.get("waypoint"),
         "stop_radius": man.get("stop_radius"),
+        "vehicle": man.get("vehicle"),  # 只给 --depth-source analytic 查相机安装位姿用，不进 meta
         "window_from": man.get("window_from"),
         "hold_s": man.get("hold_s"),
         "action_latency_s": man.get("action_latency_s"),
@@ -931,10 +947,13 @@ def depth_bands(cells):
     return bands
 
 
-def aux_payload(episodes, size, envelope_radius_m, cond=nav_cond.COND_PREV_ACTION):
+def aux_payload(episodes, size, envelope_radius_m, cond=nav_cond.COND_PREV_ACTION, depth_source=DEFAULT_DEPTH_SOURCE):
     """算 prev_index / prev_action / 深度分带；返回 (prev_index, prev_action, depth 或 None, grid)。
 
-    cond="heading-code"（W1-9）：prev_action 那一列写航向码（load_episode 按已执行动作累计的 s["heading_code"]），其余不变。"""
+    cond="heading-code"（W1-9）：prev_action 那一列写航向码（load_episode 按已执行动作累计的 s["heading_code"]），其余不变。
+    depth_source = "analytic"（W1-8）时深度分带由位姿与柱子真值解析算（analytic_depth_bands），不读深度文件，所有样本都有。"""
+    if depth_source not in DEPTH_SOURCES:
+        die("未知的 depth_source=%r（支持 %s）" % (depth_source, "/".join(DEPTH_SOURCES)))
     out_w, out_h = size
     grid = (out_h // DEPTH_GRID_DOWN, out_w // DEPTH_GRID_DOWN)
     flat = [(ep, s) for ep in episodes for s in ep["samples"]]
@@ -948,6 +967,8 @@ def aux_payload(episodes, size, envelope_radius_m, cond=nav_cond.COND_PREV_ACTIO
             # 上一步被 --drop-collision 丢掉时 step-1 不在 by_step：同首帧处理（指向自身）。
             prev_index[g] = by_step.get(s["step"] - 1, g)
             prev_action[g] = s["heading_code"] if cond == nav_cond.COND_HEADING_CODE else s["prev_action"]
+    if depth_source == "analytic":
+        return prev_index, prev_action, analytic_depth_bands(episodes, grid, envelope_radius_m), grid
     have = [s["depth"] is not None for _, s in flat]
     if not any(have):
         return prev_index, prev_action, None, grid
@@ -980,6 +1001,158 @@ def episode_focal_px(ep):
     """episode 的水平焦距（px）：manifest camera.fx，缺省按 DEFAULT_HFOV_DEG 由 src_w 反推。"""
     fx = ep.get("camera_fx")
     return float(fx) if fx else (ep["src_w"] / 2.0) / np.tan(np.radians(DEFAULT_HFOV_DEG / 2))
+
+
+# ---- --depth-source analytic：由位姿与柱子真值解析算深度分带（W1-8） ----
+#
+# 相机在机体中心前方、上方 CAMERA_MOUNT_BY_VEHICLE 处，朝向 = 机头（yaw_before，度，逆时针为正，0 = +x），水平安装。
+# 每格（H/8 × W/8，源图按格均分）取 rays×rays 条子射线（落在子块中心），与每根柱子（scene.json 的轴对齐方盒，或 forest 的竖直圆柱）
+# 和地面（z = 0）求交；深度 = 沿光轴的深度（Gazebo 深度相机的 z-深度，等于水平射线距离 r·cosφ），格内取最小。
+# 命中点高度超过柱顶的射线不算打到柱子（相机低于柱顶，看不到顶面）；整格没打到任何东西 = +inf（最远带，与文件路径里
+# 「深度 0 = 天空/超远」同义）。解析深度没有「未知」，不产生 255。
+# shortcut: 忽略机体 roll/pitch。慢速前进时倾角 < 10°（e1_mini.json camera_mount 备注），没有量化它对分带的影响；
+# 对拍里若地面格或柱边缘格显示系统偏差，再把 roll/pitch 带进相机朝向。
+def _pillar_hit_t(ox, oy, oz, dx, dy, dz, p):
+    """一根柱子的最近命中参数 t（射线 o + t·d，d 的前向分量为 1，所以 t 就是沿光轴的深度）；没命中 +inf，起点在柱内记 0。
+    方盒（scene.json 的 x/y/z 是中心，size 是边长）：三维 slab；圆柱（有 radius，forest 树干）：xy 圆 + 高度区间。
+    高度区间取 z ± size[2]/2：越过柱顶的射线命中不了。"""
+    zc, zh = float(p["z"]), float(p["size"][2]) / 2.0
+    with np.errstate(divide="ignore", invalid="ignore"):
+        if p.get("radius") is not None:
+            rx, ry = ox - float(p["x"]), oy - float(p["y"])
+            a = dx * dx + dy * dy
+            b = rx * dx + ry * dy
+            disc = b * b - a * (rx * rx + ry * ry - float(p["radius"]) ** 2)
+            ok = disc >= 0.0
+            root = np.sqrt(np.where(ok, disc, 0.0))
+            ok &= (-b + root) / a >= 0.0
+            t = np.maximum((-b - root) / a, 0.0)
+            z_hit = oz + dz * t
+            ok &= (z_hit >= zc - zh) & (z_hit <= zc + zh)
+        else:
+            lo = np.full(dx.shape, -np.inf)
+            hi = np.full(dx.shape, np.inf)
+            hx, hy = float(p["size"][0]) / 2.0, float(p["size"][1]) / 2.0
+            for o, d, c, h in ((ox, dx, float(p["x"]), hx), (oy, dy, float(p["y"]), hy), (oz, dz, zc, zh)):
+                t1, t2 = (c - h - o) / d, (c + h - o) / d
+                near, far = np.minimum(t1, t2), np.maximum(t1, t2)
+                parallel = d == 0.0   # 与这对面平行：起点在板内不限制，在板外永远不相交
+                inside = abs(o - c) <= h
+                near = np.where(parallel, -np.inf if inside else np.inf, near)
+                far = np.where(parallel, np.inf if inside else -np.inf, far)
+                lo, hi = np.maximum(lo, near), np.minimum(hi, far)
+            ok = (lo <= hi) & (hi >= 0.0)
+            t = np.maximum(lo, 0.0)
+    return np.where(ok, t, np.inf)
+
+
+def analytic_ray_depth(pose, pillars, focal_px, src_wh, grid, mount, rays=ANALYTIC_RAYS, want_pid=False):
+    """一张图的子射线深度。pose = (x, y, z, yaw_deg)：机体中心，world 系（x 前、y 左），yaw 逆时针为正；
+    pillars = scene.json 的 pillars；src_wh = 源图 (宽, 高)；grid = (dh, dw)；mount = (相机前向 m, 相机上方 m)。
+    返回 (depth, pid)：depth 为 (dh·rays, dw·rays) float64，沿光轴的深度（m），+inf = 没打到任何东西；
+    pid 只在 want_pid 时给（否则 None），int32：≥ 0 = 第几根柱子，−1 = 地面，−2 = 没打到。
+    网格 15×20、rays = 16 时就是 320×240 源图的逐像素中心稠密渲染（对拍脚本用它给不一致格归类）。"""
+    src_w, src_h = src_wh
+    dh, dw = grid
+    nv, nu = dh * rays, dw * rays
+    xr = ((np.arange(nu) + 0.5) * (src_w / nu) - src_w / 2.0) / focal_px   # 归一化图像坐标，右为正
+    yd = ((np.arange(nv) + 0.5) * (src_h / nv) - src_h / 2.0) / focal_px   # 下为正
+    x, y, z, yaw = pose
+    c, s = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+    ox, oy, oz = x + mount[0] * c, y + mount[0] * s, z + mount[1]
+    # 射线方向 = 前 − xr·左 + 上·(−yd)，前 = (c, s)、左 = (−s, c)，前向分量为 1
+    shape = (nv, nu)
+    dx = np.broadcast_to(c + xr * s, shape)
+    dy = np.broadcast_to(s - xr * c, shape)
+    dz = np.broadcast_to((-yd)[:, None], shape)
+    best = np.full(shape, np.inf)
+    pid = np.full(shape, -2, dtype=np.int32)
+    if oz > 0.0:
+        down = dz < 0.0   # 负仰角（地平线以下）才会落地
+        with np.errstate(divide="ignore", invalid="ignore"):
+            best = np.where(down, -oz / dz, np.inf)
+        pid[down] = -1
+    for k, p in enumerate(pillars):
+        t = _pillar_hit_t(ox, oy, oz, dx, dy, dz, p)
+        nearer = t < best
+        best = np.where(nearer, t, best)
+        if want_pid:
+            pid = np.where(nearer, k, pid).astype(np.int32)
+    return best, (pid if want_pid else None)
+
+
+def analytic_cell_depth(pose, pillars, focal_px, src_wh, grid, mount, rays=ANALYTIC_RAYS):
+    """(dh, dw) float32：每格 rays×rays 条子射线的最小深度，+inf = 整格没打到任何东西。形状与语义同 cell_min_depth
+    （只是没有 nan：解析深度没有「未知」）。参数同 analytic_ray_depth。"""
+    depth, _ = analytic_ray_depth(pose, pillars, focal_px, src_wh, grid, mount, rays)
+    dh, dw = grid
+    return depth.reshape(dh, rays, dw, rays).min(axis=(1, 3)).astype(np.float32)
+
+
+def analytic_episode_inputs(ep):
+    """--depth-source analytic 的逐集前置检查：不支持的集、缺输入的集都在写任何输出之前报错。返回 (mount, pillars)。"""
+    where = ep["dir"]
+    if ep.get("waypoint") is not None:
+        die("%s: --depth-source analytic 不支持 waypoint 任务（场景里有柱子之外的目标物，scene.json 的柱子不是完整几何）；"
+            "请用 --depth-source file" % where)
+    gver = ep.get("geometry_version")
+    if ep.get("renderer_backend") is not None or (isinstance(gver, str) and gver.startswith("3dgs.")):
+        die("%s: --depth-source analytic 不支持 3DGS episode（深度来自高斯渲染，没有柱子真值）；请用 --depth-source file" % where)
+    vehicle = ep.get("vehicle")
+    if vehicle not in CAMERA_MOUNT_BY_VEHICLE:
+        die("%s: manifest.vehicle=%r，--depth-source analytic 只认 %s（相机安装位姿只对这些机型已知）"
+            % (where, vehicle, "/".join(CAMERA_MOUNT_BY_VEHICLE)))
+    path = os.path.join(where, "scene.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            pillars = json.load(f).get("pillars")
+    except (OSError, ValueError, AttributeError) as exc:
+        die("%s: --depth-source analytic 需要同目录的 scene.json（柱子真值），读取失败：%s" % (where, exc))
+    if not isinstance(pillars, list) or not pillars:
+        die("%s: scene.json 没有 pillars（解析深度只算柱子与地面，空场景没有核对依据）" % path)
+    for k, p in enumerate(pillars):
+        try:
+            for key in ("x", "y", "z"):
+                float(p[key])
+            if len([float(v) for v in p["size"]]) < 3:
+                raise ValueError("size 不足 3 个数")
+            if p.get("radius") is not None:
+                float(p["radius"])
+        except (KeyError, TypeError, ValueError, AttributeError) as exc:
+            die("%s: scene.json pillars[%d] 缺 x/y/z/size 或格式不对（%s）：%r" % (path, k, exc, p))
+    return CAMERA_MOUNT_BY_VEHICLE[vehicle], pillars
+
+
+def _analytic_pose(ep, s):
+    """样本的 (x, y, z, yaw_deg)：actions.jsonl 的 pose_before{x,y,z}（动作前、与该帧同一时刻的机体位姿）与 yaw_before。"""
+    pose, yaw = s.get("pose_before"), s.get("yaw_before")
+    try:
+        out = (float(pose["x"]), float(pose["y"]), float(pose["z"]), float(yaw))
+        if all(math.isfinite(v) for v in out):
+            return out
+    except (KeyError, TypeError, ValueError):
+        pass
+    die("%s step %d: --depth-source analytic 需要 actions.jsonl 的 pose_before{x,y,z} 与 yaw_before（有限数值），"
+        "实际 pose_before=%r yaw_before=%r" % (ep["dir"], s["step"], pose, yaw))
+
+
+def analytic_depth_bands(episodes, grid, envelope_radius_m):
+    """--depth-source analytic：每个样本的位姿 + 该集 scene.json 的柱子真值 → 深度分带 (n, dh, dw) uint8，
+    样本顺序同 aux_payload 的 flat。算出每格最小深度之后与文件路径同一套：按该集 camera.fx 的焦距做包络膨胀 → depth_bands。"""
+    checked = [(ep,) + analytic_episode_inputs(ep) for ep in episodes]   # 先全部检查，再开始算
+    parts = []
+    for ep, mount, pillars in checked:
+        if not ep["samples"]:
+            continue
+        focal = float(episode_focal_px(ep))
+        src_wh = (ep["src_w"], ep["src_h"])
+        cells = np.empty((len(ep["samples"]), grid[0], grid[1]), dtype=np.float32)
+        for k, s in enumerate(ep["samples"]):
+            cells[k] = analytic_cell_depth(_analytic_pose(ep, s), pillars, focal, src_wh, grid, mount)
+        parts.append(depth_bands(dilate_by_envelope(cells, focal, ep["src_w"] / grid[1], envelope_radius_m)))
+    if not parts:
+        return np.empty((0, grid[0], grid[1]), dtype=np.uint8)
+    return np.concatenate(parts)
 
 
 def write_aux_sidecar(out_dir, uavr_path, prev_index, prev_action, depth, grid,
@@ -1063,6 +1236,11 @@ def main():
                    help="侧车 dataset.aux 里 prev_action 那一列写什么：prev-action=上一步执行的动作（默认，现状）；"
                         "heading-code=航向码（按集从头累计已执行的 YAW_LEFT−YAW_RIGHT，sim/tools/nav_cond.py，W1-9），"
                         "meta 顶层记 cond=heading_code.v1。训练时都用 --prev-action 读这一列；只用于柱阵/长课程任务（航向设定值 H=0）")
+    p.add_argument("--depth-source", choices=DEPTH_SOURCES, default=DEFAULT_DEPTH_SOURCE,
+                   help="深度分带目标的来源。file = 读 episode 的深度文件（collect.py --save-depth；缺省，输出与以前逐字节相同）；"
+                        "analytic = 不读深度文件，由 actions.jsonl 的 pose_before/yaw_before、manifest.vehicle 对应的相机安装位姿"
+                        "（只认 e1_mini）与同目录 scene.json 的柱子真值解析算，现有数据不用重采；waypoint 任务与 3DGS episode 报错；"
+                        "忽略机体 roll/pitch。打开时 meta.aux_sidecar 多记 depth_source（默认 file 不加键）")
     p.add_argument("episodes", nargs="+", help="一个或多个 collect.py episode 目录")
     args = p.parse_args()
     if args.split_by_map and not args.allow_diagnostic_split:
@@ -1105,7 +1283,8 @@ def main():
         os.remove(stale)
     # 侧车先算后写：深度文件坏了要在替换 dataset.uavr 之前报错。旧 dataset.aux 先删——
     # 它绑定的是旧 uavr 的 SHA，留着只会让读端报「SHA 不匹配」。
-    prev_index, prev_action, depth, grid = aux_payload(episodes, args.size, args.envelope_radius, args.cond)
+    prev_index, prev_action, depth, grid = aux_payload(episodes, args.size, args.envelope_radius,
+                                                       cond=args.cond, depth_source=args.depth_source)
     stale_aux = os.path.join(args.out, "dataset.aux")
     if os.path.exists(stale_aux):
         os.remove(stale_aux)
@@ -1113,6 +1292,9 @@ def main():
                 "depth_grid": list(grid) if depth is not None else None,
                 "band_edges_m": list(DEPTH_BAND_EDGES_M),
                 "envelope_radius_m": args.envelope_radius}
+    if args.depth_source != DEFAULT_DEPTH_SOURCE:
+        # 只在非缺省来源时加键：默认 file 的数据集 meta 逐字节不变。
+        aux_info["depth_source"] = args.depth_source
     out_path, meta_bytes = write_dataset(args.out, episodes, total, args.size, dropped,
                                          split_scheme=split_scheme,
                                          collision_filter=collision_filter,
@@ -1122,8 +1304,9 @@ def main():
                               args.envelope_radius)
     first = int((prev_index == np.arange(len(prev_index), dtype=np.uint32)).sum())
     print("wrote %s (prev chain: %d first/self frames; depth bands: %s)"
-          % (apath, first, ("%dx%d grid, unknown %.1f%%" % (
-              grid[0], grid[1], 100.0 * float((depth == AUX_UNKNOWN).mean())))
+          % (apath, first, ("%dx%d grid, unknown %.1f%%%s" % (
+              grid[0], grid[1], 100.0 * float((depth == AUX_UNKNOWN).mean()),
+              ", source analytic" if args.depth_source == "analytic" else ""))
               if depth is not None else "none"))
     # 3DGS 数据集把 scene.json 放到 <out>/scene.json，自动评测/换机复现不必回找 episode。
     scene_paths = [os.path.join(ep["dir"], "scene.json") for ep in episodes
