@@ -44,6 +44,16 @@
   - 2026-11-11 19:23 起：12 核，内存上限 62 GB，只有一张卡 `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`。用户指示 uav_rgb 就放在这一张卡上跑：
     用 CUDA 的进程带 `CUDA_VISIBLE_DEVICES=GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`（按旧 UUID 钉卡时看不到设备）。别的项目的训练也可能落在这张卡上，
     起实验前看显存占用。11-10 的入口脚本里写死的旧 UUID 是冻结记录，不改；新入口脚本的 GPU 写在配置区，一行，注明日期与来历。
+  - 2026-11-11 23:15 起：用户停掉了别的会话的任务，机器与这张卡由 uav_rgb 独占（仍是 12 核、`GPU-b544b42e-…` 一张卡）。数据盘可用 25 GB，根分区 3.1 GB。
+    当晚有多张卡并行开工，重活按下面的规矩排队（主会话定；与 §5、§6 的说法不一致时以这里为准）：
+    1. 单个测试文件（单进程、两分钟以内）随时可以跑，前面加 `nice -n 10`；同一时刻只跑一个。
+    2. `tools/check.sh --python-only`：W1-0 第二轮结束（`$D/exp-action-latency-r2-20261111/DONE` 出现）之后才跑。所有卡共用 `$D/tmp/phase12-cards/check.lock` 串行：
+       写成守护脚本（`flock <check.lock> bash tools/check.sh --python-only > <日志> 2>&1; echo "rc=$? $(date '+%F %T')" > <完成标记>`），
+       轮询完成标记，不要让工具调用卡在等锁上。
+    3. 起 Gazebo（哪怕 1 个）、3DGS 批量渲染（多于 2 条路线或超过 3 分钟）、训练、全量 `check.sh`：一律守护脚本，脚本里阻塞式拿机器锁
+       （`exec 8>> $D/tmp/phase12-cards/machine.lock; flock 8`，持有到脚本退出）。排队期间每 10 分钟看一次，不空转刷日志。
+    4. 第二轮结束之后，单车道、不超过 3 分钟的 3DGS 冒烟可以不拿机器锁。Gazebo 的冒烟也要拿机器锁（gz 的时序受别的 gz 影响）。
+    5. 别的卡的工作树、草稿目录、实验输出只读。自己的草稿放 `$D/tmp/phase12-cards/<卡号小写>/`。
   - 卡的配置再变时，以 `nvidia-smi -L` 为准并向用户确认用哪一张，不要自己挑。
 - Python：数据工具 `$R/.venv-tools/bin/python`（无 torch）；3DGS `$D/3dgs-venv/bin/python`（torch + gsplat）；`$D/teacher-venv` 也有 torch，
   只给对照基线与教师工具用。主线训练推理禁用 PyTorch。不往现有 venv 里装包。
