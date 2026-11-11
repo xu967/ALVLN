@@ -64,6 +64,11 @@ kill -- -$(cat $OUT/run.pid)
 - `summarize.py`：表格与配对检验，按预注册规则机械给出 P1–P3 的判决，结论以人工判读为准。
 - 输出：`/root/rivermind-data/uav_rgb/exp-bearing-guard-3dgs-20261110/<臂>/<场景>/r<N>/ep_*`。
 
+## 2026-11-11 起的教师容差
+
+driver 构造教师时传 `hold_s`（臂的生效 hold，没有臂级 hold 时就是 `CFG["hold"]`），教师的航向容差按它推导；显式的 `teacher_tol_deg` 仍然优先。
+不带 `teacher_tol_deg` 的旧配置在 hold 1.0 下重跑会得到 18.9° 的教师，复现旧结果要显式写 `"teacher_tol_deg": 12.0`。
+
 ## 已知限制
 
 - 前视点按顶点找最近点，适用于 0.1 m 一格的 A* 栅格路径；稀疏折线要改线段投影（`shortcut:` 注释在 `guard.py`）。

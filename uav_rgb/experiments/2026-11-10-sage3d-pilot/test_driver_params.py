@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""bearing-guard-3dgs/driver.py 新增的三个可选 config 键（routes 字典、step_cap、teacher_tol_deg）的单测。
+"""bearing-guard-3dgs/driver.py 新增的三个可选 config 键（routes 字典、step_cap、teacher_tol_deg）与教师构造时传 hold_s 的单测。
 
 不碰 GPU、不起 sitl、不读 PLY：把 driver 依赖的 sim.3dgs.* 与 student 换成桩模块，在进程内用 runpy 跑真实的 driver.py，
 桩版 run_episode 只记下收到的 steps 并写出 episode_metrics 需要的最小 actions / oracle。只用标准库。
@@ -70,14 +70,14 @@ def install_stubs(routes_in_scene_json):
     return list(mods)
 
 
-def run_driver(cfg, scene, scene_routes, arm="forward"):
+def run_driver(cfg, scene, scene_routes, arm="forward", arm_extra=None):
     CALLS.clear()
     LOADED.clear()
     TEACHER_KW.clear()
     with tempfile.TemporaryDirectory() as out:
         full = {"repo": HERE, "scenes_dir": out, "scenes": [scene], "k": 1, "seed0": 8000, "jitter": 0.2, "hold": 1.0,
                 "step_frac": 0.5, "step_pad": 15, "guard_threshold_deg": 45.0, "route_lookahead_m": 1.5,
-                "arms": [{"name": arm, "base": arm, "ckpt": None, "guard": None}],
+                "arms": [{"name": arm, "base": arm, "ckpt": None, "guard": None, **(arm_extra or {})}],
                 "infer_bin": "x", "cf_sitl_proc": "y", **cfg}
         os.makedirs(os.path.join(out, scene))
         with open(os.path.join(out, "config.json"), "w", encoding="utf-8") as f:
@@ -146,13 +146,31 @@ class TestDriverParams(unittest.TestCase):
     def test_teacher_tol_deg_reaches_the_teacher(self):
         rc, calls, _, _ = run_driver({"routes": [0, 1], "teacher_tol_deg": 18.0}, "sA", ROUTES, arm="teacher")
         self.assertEqual(rc, 0)
-        self.assertEqual(TEACHER_KW, [{"tol_deg": 18.0}, {"tol_deg": 18.0}])      # 每条路线构造一次教师，都带上容差
+        # 每条路线构造一次教师，都带上容差，也都带上 hold_s；显式的 tol_deg 在 OccAstarTeacher 里优先于 hold_s 的推导
+        self.assertEqual(TEACHER_KW, [{"hold_s": 1.0, "tol_deg": 18.0}, {"hold_s": 1.0, "tol_deg": 18.0}])
         self.assertEqual(len(calls), 2)
 
     def test_teacher_default_tolerance_not_passed(self):
         rc, _, _, _ = run_driver({"routes": [0]}, "sA", ROUTES, arm="teacher")
         self.assertEqual(rc, 0)
-        self.assertEqual(TEACHER_KW, [{}])       # 不给键 = 不传 tol_deg，教师用 planner.YAW_TOL_DEG（与原版一致）
+        # 不给 teacher_tol_deg = 不传 tol_deg，只传 hold_s：教师按 hold 推导容差（hold 1.0 → 18.9°）。
+        # 2026-11-11 之前这里是 [{}]（教师退回 12°），旧配置要复现旧结果须显式写 teacher_tol_deg: 12.0
+        self.assertEqual(TEACHER_KW, [{"hold_s": 1.0}])
+
+    def test_teacher_receives_the_global_hold(self):
+        rc, _, _, _ = run_driver({"routes": [0, 1], "hold": 0.5}, "sA", ROUTES, arm="teacher")
+        self.assertEqual(rc, 0)
+        self.assertEqual(TEACHER_KW, [{"hold_s": 0.5}, {"hold_s": 0.5}])
+
+    def test_teacher_receives_the_arms_effective_hold(self):
+        rc, _, _, done = run_driver({"routes": [0]}, "sA", ROUTES, arm="teacher", arm_extra={"hold": 0.5})
+        self.assertEqual(rc, 0)
+        self.assertEqual(TEACHER_KW, [{"hold_s": 0.5}], "臂级 hold 盖过全局 hold，教师容差按实际执行的窗口推导")
+        self.assertEqual(done[0]["hold"], 0.5)
+
+    def test_hold_is_not_passed_to_other_bases(self):
+        rc, calls, _, _ = run_driver({"routes": [0]}, "sA", ROUTES, arm="forward")
+        self.assertEqual((rc, TEACHER_KW), (0, []))
 
 
 if __name__ == "__main__":

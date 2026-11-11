@@ -1,0 +1,47 @@
+[holdout] 各臂
+ forward+route: n=96 到点=65 碰撞=39 撞在前=29 超时=2
+  OK   holdout/forward+route n: 复算 96  summary.json 96
+  OK   holdout/forward+route 到点数: 复算 65  summary.json 65
+ rule-occ+route: n=96 到点=64 碰撞=3 撞在前=3 超时=29
+  OK   holdout/rule-occ+route n: 复算 96  summary.json 96
+  OK   holdout/rule-occ+route 到点数: 复算 64  summary.json 64
+ rule2-occ+route: n=96 到点=86 碰撞=2 撞在前=2 超时=8
+  OK   holdout/rule2-occ+route n: 复算 96  summary.json 96
+  OK   holdout/rule2-occ+route 到点数: 复算 86  summary.json 86
+ rule2-depth+route: n=96 到点=87 碰撞=2 撞在前=2 超时=7
+  OK   holdout/rule2-depth+route n: 复算 96  summary.json 96
+  OK   holdout/rule2-depth+route 到点数: 复算 87  summary.json 87
+[formal40] 各臂
+ rule-occ+route: n=120 到点=80 碰撞=4 撞在前=4 超时=36
+  OK   formal40/rule-occ+route n: 复算 120  summary.json 120
+  OK   formal40/rule-occ+route 到点数: 复算 80  summary.json 80
+ rule2-occ+route: n=120 到点=105 碰撞=3 撞在前=3 超时=12
+  OK   formal40/rule2-occ+route n: 复算 120  summary.json 120
+  OK   formal40/rule2-occ+route 到点数: 复算 105  summary.json 105
+ rule2-depth+route: n=120 到点=106 碰撞=4 撞在前=3 超时=11
+  OK   formal40/rule2-depth+route n: 复算 120  summary.json 120
+  OK   formal40/rule2-depth+route 到点数: 复算 106  summary.json 106
+[outdoor] 各臂
+ rule2-occ+route: n=120 到点=119 碰撞=1 撞在前=1 超时=0
+  OK   outdoor/rule2-occ+route n: 复算 120  summary.json 120
+  OK   outdoor/rule2-occ+route 到点数: 复算 119  summary.json 119
+ rule2-depth+route: n=120 到点=108 碰撞=4 撞在前=4 超时=8
+  OK   outdoor/rule2-depth+route n: 复算 120  summary.json 120
+  OK   outdoor/rule2-depth+route 到点数: 复算 108  summary.json 108
+[holdout] rule2-occ+route vs rule-occ+route: 配对 96，A 成 B 败 22，A 败 B 成 0，Δ=+0.2292，p=4.77e-07
+  OK   holdout A成B败 b: 复算 22  summary.json 22
+  OK   holdout A败B成 c: 复算 0  summary.json 0
+  OK   holdout p: 复算 4.76837158203125e-07  summary.json 4.76837158203125e-07
+[formal40] rule2-occ+route vs rule-occ+route: 配对 120，A 成 B 败 27，A 败 B 成 2，Δ=+0.2083，p=1.62e-06
+  OK   formal40 A成B败 b: 复算 27  summary.json 27
+  OK   formal40 A败B成 c: 复算 2  summary.json 2
+  OK   formal40 p: 复算 1.6242265701293945e-06  summary.json 1.6242265701293945e-06
+[outdoor] rule2-occ+route vs K1:rule-occ+route: 配对 120，A 成 B 败 2，A 败 B 成 0，Δ=+0.0167，p=0.5
+  OK   outdoor A成B败 b: 复算 2  summary.json 2
+  OK   outdoor A败B成 c: 复算 0  summary.json 0
+  OK   outdoor p: 复算 0.5  summary.json 0.5
+  OK   室外 verdict.b_v1_only: 复算 0  summary.json 0
+  OK   室外 verdict.c_v2_only: 复算 2  summary.json 2
+[主终点] Δ=+0.2292 p=4.77e-07 碰撞=0.0208 撞在前=0.0208 -> 达到预测
+[室外] SR=0.9917 (v1成v2败)0-(v2成v1败)2=-2 碰撞=0.0083 -> 不劣
+全部一致

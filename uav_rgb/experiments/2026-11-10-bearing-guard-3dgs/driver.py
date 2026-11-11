@@ -16,7 +16,9 @@ stop_on_collision=True、split="test"、split_policy="diag-eval-fixed-test"（�
 可选的 config.json 键（缺省时行为与原版逐位一致，2026-11-10-sage3d-pilot 共用本驱动）：
   routes    列表 = 所有场景用同一批路线（原写法）；字典 {场景: [路线下标 ...]} = 每个场景各自的路线（场景没有路线则直接退出，不加载）
   step_cap  每路线步数封顶：steps = min(step_cap, ceil(max_steps × step_frac) + step_pad)；缺省不封顶
-  teacher_tol_deg  教师航向容差（度），传给 OccAstarTeacher(tol_deg=…)；缺省不传，用 planner.YAW_TOL_DEG（12°）
+  teacher_tol_deg  教师航向容差（度），传给 OccAstarTeacher(tol_deg=…)，显式给了就优先于 hold 推导；缺省不传 tol_deg，教师按臂的生效 hold
+                   推导（OccAstarTeacher(hold_s=hold)，planner.yaw_tol_deg：hold 1.0 → 18.9°）。2026-11-11 之前缺省是 12°（planner.YAW_TOL_DEG），
+                   hold 1.0 下复现旧教师结果要在 config 里显式写 "teacher_tol_deg": 12.0
 2026-11-10-rule-oracle-3dgs 再加的可选键（同样缺省时行为与原版逐位一致，test_driver_rule.py 锁定）：
   臂 base = rule-occ / rule-depth   规则层臂（sim/3dgs/rule_oracle.py，用到时才导入）：列距离分别取占据真值 / 渲染深度；
                                     臂的 guard 在这里是航向参照：route = 路线前视点方位，goal = waypoint 方位（其它值启动时就报错，早于加载场景）
@@ -25,6 +27,10 @@ stop_on_collision=True、split="test"、split_policy="diag-eval-fixed-test"（�
   臂 step_mult    步数预算乘数（整数），在 step_cap 封顶之后再乘：hold 0.5 的臂同样的仿真时长要 2 倍的步数
   drop_trace      true = 每集跑完删 trace.jsonl（只有视频渲染要它，每集 0.1–0.2 MB）；actions / oracle 里的位姿足够复原轨迹
   规则臂每集多落 rule.jsonl（逐步方位误差 / n / 条目 / 两路列距离），metrics.json 里 guard = None、另有 rule 汇总
+2026-11-11-rule-v2-3dgs（任务卡 K3）再加的可选键（缺省时同样与原版逐位一致，test_driver_v2.py 与 K1 的 test_driver_rule.py 锁定）：
+  臂 rule_version  "v1" | "v2"，只给规则层臂：传给 RuleOraclePolicy(rule_version=…)；不给 = 不传这个参数（等于 v1，旧臂字节不变）。
+                   v2 的 rule_params 键是 rule_policy.RULE_V2 的（levels / order / mem_steps / tabu_* / m_max …），由策略构造时按版本校验；
+                   给了这个键，metrics.json 的 rule 与 done.json 的 rule 里多记一个 rule_version（没给就没有，旧产物键不变）
 """
 import importlib
 import json
@@ -54,6 +60,9 @@ RULE_BASES = {"rule-occ": "occ", "rule-depth": "depth"}     # 规则层臂的 ba
 for _a in ARMS:         # 配置错在加载场景（约 200 s）之前就报，不要跑完前几个臂才发现
     if _a["base"] in RULE_BASES and _a["guard"] not in ("route", "goal"):
         raise ValueError(f"臂 {_a['name']}：规则层臂的 guard 必须是 route 或 goal（航向参照），得到 {_a['guard']!r}")
+    if "rule_version" in _a and (_a["base"] not in RULE_BASES or _a["rule_version"] not in ("v1", "v2")):    # 与 rule_oracle.RULE_VERSIONS 同
+        raise ValueError(f"臂 {_a['name']}：rule_version 只给规则层臂（{sorted(RULE_BASES)}），值只能是 v1 或 v2，得到 base={_a['base']!r} "
+                         f"rule_version={_a['rule_version']!r}")
 
 
 def log(msg):
@@ -146,6 +155,7 @@ for arm in ARMS:
     step_mult = int(arm.get("step_mult", 1))
     rule_src = RULE_BASES.get(arm["base"])
     rule_params = {**CFG.get("rule_params", {}), **arm.get("rule_params", {})} if rule_src else None
+    rule_kw = {"rule_version": arm["rule_version"]} if "rule_version" in arm else {}     # 没给键就不传：旧臂调用与原版逐位相同
     student = StudentPolicy(arm["ckpt"], CFG["infer_bin"]) if arm["base"] == "student" else None
     try:
         for r in ROUTES:
@@ -171,7 +181,8 @@ for arm in ARMS:
                 if not check["feasible"]:
                     fails.append({"episode": None, "error": f"route_check 不可达 {check}"})
                 teacher = planner_mod.OccAstarTeacher(
-                    occ_planner, sc["waypoint"], **({"tol_deg": CFG["teacher_tol_deg"]} if "teacher_tol_deg" in CFG else {}))
+                    occ_planner, sc["waypoint"], hold_s=hold,
+                    **({"tol_deg": CFG["teacher_tol_deg"]} if "teacher_tol_deg" in CFG else {}))
             for k in range(CFG["k"] if not fails else 0):
                 seed = CFG["seed0"] + 100 * r + k
                 ep_dir = os.path.join(d, "ep_%05d" % k)
@@ -185,7 +196,7 @@ for arm in ARMS:
                         target = route.target
                     else:
                         target = lambda x, y, wp=wp: wp      # noqa: E731  goal：恒指向 waypoint，不规划
-                    policy = ro.RuleOraclePolicy(occ, target, source=rule_src, params=rule_params)
+                    policy = ro.RuleOraclePolicy(occ, target, source=rule_src, params=rule_params, **rule_kw)
                 else:
                     inner = c3.ForwardPolicy() if arm["base"] == "forward" else c3.StudentAdapter(student)
                     if arm["guard"] == "route":     # 每集新建：路线在该集第一次调用时从起飞后的实际位姿规划一次
@@ -239,6 +250,8 @@ for arm in ARMS:
                     m["rule"] = {"source": rule_src, "n_steps": len(policy.rows), "entries": count_entries(policy.rows),
                                  "n_steps_pre": len(pre), "entries_pre": count_entries(pre),
                                  "plan_failed": None if route is None else route.plan_failed, "params": policy.params}
+                    if rule_kw:
+                        m["rule"].update(rule_kw)      # 新键只在给了 rule_version 的臂上追加，旧臂的 rule 汇总键不变
                     with open(os.path.join(ep_dir, "rule.jsonl"), "w", encoding="utf-8") as f:
                         for row in policy.rows:
                             f.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -250,7 +263,7 @@ for arm in ARMS:
                     "ckpt": arm["ckpt"], "guard": arm["guard"], "dynamics_profile": params.profile(),
                     "episodes": eps, "failures": fails, "wall_s": round(time.time() - tr, 1)}
             if rule_src:      # 新键只追加在后面，旧臂的 done.json 键与顺序不变；生效的完整参数每集记在 metrics.json 的 rule.params
-                done["rule"] = {"source": rule_src, "overrides": rule_params}
+                done["rule"] = {"source": rule_src, "overrides": rule_params, **rule_kw}
             if step_mult != 1:
                 done["step_mult"] = step_mult
             with open(os.path.join(d, "done.json"), "w", encoding="utf-8") as f:

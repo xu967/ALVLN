@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """规则层的极简运动学模拟（不起 Gazebo）：前进一步 0.25 m、转向一步 26°、SAFE_NEUTRAL 原地不动。
 
-用途：规则 v1 的离线检查（单柱绕行、train 分区几何过线数）。每步调用的规则代码与 collect.py 是同一份
-（column_distances → rule_v0_entry / rule_v1_step），所以这里的行为差异只来自运动学简化，不来自规则实现。
+用途：规则 v1 / v2 的离线检查（单柱绕行、train 分区几何过线数）。每步调用的规则代码与 collect.py 是同一份
+（column_distances → rule_v0_entry / rule_v1_step / rule_v2_step），所以这里的行为差异只来自运动学简化，不来自规则实现。
 简化：转向步不位移、前进步无侧漂、位姿无延迟；Gazebo 里每步 1.0 s 的实际位移 0.2–0.3 m、转角 26.1° ± 1.1°。
 不计入判据的只有 |y| ≤ 3 m 的走廊（success 按 eval 口径包含走廊，另给 out_of_corridor）。
 
-用法（仓库根）：.venv-tools/bin/python sim/tools/rule_sim.py [--rule v0|v1] [--count 20] [--steps 80]   # train 分区几何的离线检查
+用法（仓库根）：.venv-tools/bin/python sim/tools/rule_sim.py [--rule v0|v1|v2] [--count 20] [--steps 80]   # train 分区几何的离线检查
 纯 stdlib。
 """
 import argparse
@@ -54,16 +54,17 @@ def max_reversal_run(actions):
 
 
 def simulate(pillars, rule="v1", hfov_deg=60.0, steps=80, stop_at_goal=True, start=(START_X, 0.0, 0.0),
-             v1_params=rp.RULE_V1, v0_params=rp.RULE_V0):
-    """跑一集。rule: "v0" | "v1" | "forward"（一直前进）| "left"（一直左转），后两个只给模拟自身的测试用。
+             v1_params=rp.RULE_V1, v0_params=rp.RULE_V0, v2_params=rp.RULE_V2):
+    """跑一集。rule: "v0" | "v1" | "v2" | "forward"（一直前进）| "left"（一直左转），后两个只给模拟自身的测试用。
 
     返回 dict：success（过线且不撞且不出走廊）、collided、out_of_corridor、steps（执行的步数）、goal_x、n_final、min_gap、
-    traj（起点 + 每步之后的 (x, y, yaw_deg)）、actions、entries、mem_n（仅 v1）、clear（仅 v1，每步 [左, 保持, 右]）、cols（每步 d）。
+    traj（起点 + 每步之后的 (x, y, yaw_deg)）、actions、entries、mem_n（仅 v1 / v2）、clear（仅 v1 / v2，每步 [左, 保持, 右]）、cols（每步 d）。
     stop_at_goal=False 时过线后继续跑满 steps（检查绕过后航向是否回正）。
     """
     goal_x = max(float(p["x"]) for p in pillars) + GOAL_MARGIN_M
     x, y, yaw = start
     n, last_turn, memory = 0, None, []
+    tabu, prev_action = [], None                      # 仅 v2：禁忌表与上一步执行的动作
     traj, actions, entries, mem_n, clears, cols = [(x, y, yaw)], [], [], [], [], []
     gap_min = min_gap(pillars, x, y)
     collided = outside = reached = False
@@ -71,6 +72,11 @@ def simulate(pillars, rule="v1", hfov_deg=60.0, steps=80, stop_at_goal=True, sta
         d = rp.column_distances(x, y, yaw, pillars, hfov_deg=hfov_deg)
         if rule == "v1":
             action, entry, memory, info = rp.rule_v1_step(memory, step, x, y, yaw, d, n, last_turn, hfov_deg, v1_params)
+            mem_n.append(info["mem_n"])
+            clears.append(info["clear"])
+        elif rule == "v2":
+            action, entry, memory, tabu, info = rp.rule_v2_step(memory, tabu, step, x, y, yaw, d, n, last_turn, prev_action=prev_action,
+                                                                hfov_deg=hfov_deg, params=v2_params)
             mem_n.append(info["mem_n"])
             clears.append(info["clear"])
         elif rule == "v0":
@@ -98,6 +104,7 @@ def simulate(pillars, rule="v1", hfov_deg=60.0, steps=80, stop_at_goal=True, sta
             last_turn = YAW_RIGHT
         elif action != SAFE_NEUTRAL:
             raise ValueError(action)
+        prev_action = action
         actions.append(action)
         entries.append(entry)
         traj.append((x, y, yaw))
@@ -129,7 +136,7 @@ def train_geometries(count=20, task="base", first_seed=1):
 
 def main():
     ap = argparse.ArgumentParser(description="train 分区几何上的离线（运动学）检查；只用 train 几何，不碰 val / test")
-    ap.add_argument("--rule", choices=("v0", "v1"), default="v1")
+    ap.add_argument("--rule", choices=("v0", "v1", "v2"), default="v1")
     ap.add_argument("--count", type=int, default=20)
     ap.add_argument("--steps", type=int, default=80)
     ap.add_argument("--hfov-deg", type=float, default=60.0)

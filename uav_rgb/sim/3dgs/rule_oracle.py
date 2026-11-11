@@ -43,6 +43,8 @@ BAND_MARGIN_M = 0.10        # depth 来源的高度带：包络半高之外再�
 REFINE_ITERS = 7            # 二分次数：半体素 0.05 m / 2^7 ≈ 0.4 mm
 SOURCES = ("occ", "depth")
 POLICY_VERSION = "uavrgb.rule_oracle.v1"
+POLICY_VERSION_V2 = "uavrgb.rule_oracle.v2"      # 任务卡 K3：rule_version = "v2" 时的版本串；v1 的 POLICY_VERSION 不变
+RULE_VERSIONS = ("v1", "v2")
 
 
 def _hit(occ, px, py, pz):
@@ -132,29 +134,41 @@ class RuleOraclePolicy:
     occ        碰撞判定同一个 Occupancy（occ 来源的列距离、depth 来源的包络半高都从它来）；
     target_fn  (x, y) -> (tx, ty)：路线臂传 guard.OracleRouteGuide.target，终点臂传返回 waypoint 的函数；
     source     "occ" | "depth"：决策用哪一路列距离；
-    params     覆盖 rule_policy.RULE_V1 的数值（r_safe / d_look / yaw_step_deg …），未知键抛 ValueError；
+    params     覆盖 rule_policy.RULE_V1（rule_version="v2" 时是 RULE_V2）的数值，未知键抛 ValueError；v2 的 levels / order 等在构造时校验；
     shadow     True = 另一路列距离也算并落日志（同位姿一致性分析用）；depth 为 None 时跳过 depth。
-    rows       逐步日志：step / err_deg / n / target / action / entry / mem_n / clear / src / d_occ / d_depth。
+    rule_version  "v1"（缺省，与 K1 逐位相同）| "v2"（任务卡 K3：rule_policy.rule_v2_step，两侧候选 + 分级通道 + 禁忌航向）。
+               v2 的 n 仍是 round(−err / yaw_step_deg)，另把浮点值 e = −err / yaw_step_deg 交给规则做候选排序；
+               上一步返回的动作（prev_action）由本类记，供「只许静止起步」的级判断。
+    rows       逐步日志：step / err_deg / n / target / action / entry / mem_n / clear / src / d_occ / d_depth；
+               v2 在 n 之后多 e，在 clear 之后多 level / m / tabu_n / ok（各级 × m = −n_cap … n_cap 的位图），其余键与次序同 v1。
     """
     name = "rule_oracle"            # manifest 的 teacher 字段；executed_by 会按「非 forward / student」记成 teacher，来源看 planner 字段
     planner_name = "rule_v1"
     version = POLICY_VERSION
 
-    def __init__(self, occ, target_fn, source="occ", params=None, hfov_deg=60.0, shadow=True):
+    def __init__(self, occ, target_fn, source="occ", params=None, hfov_deg=60.0, shadow=True, rule_version="v1"):
         if source not in SOURCES:
             raise ValueError(f"source 必须是 {SOURCES}，得到 {source!r}")
-        unknown = sorted(set(params or {}) - set(rp.RULE_V1))
+        if rule_version not in RULE_VERSIONS:
+            raise ValueError(f"rule_version 必须是 {RULE_VERSIONS}，得到 {rule_version!r}")
+        table = rp.RULE_V1 if rule_version == "v1" else rp.RULE_V2
+        unknown = sorted(set(params or {}) - set(table))
         if unknown:
-            raise ValueError(f"未知规则参数 {unknown}；可用 {sorted(rp.RULE_V1)}")
+            raise ValueError(f"未知规则参数 {unknown}；{rule_version} 可用 {sorted(table)}")
         self.occ, self.target_fn, self.source = occ, target_fn, source
-        self.params = {**rp.RULE_V1, **(params or {})}
+        self.params = {**table, **(params or {})}
+        self.rule_version = rule_version
+        if rule_version == "v2":
+            rp.check_v2_params(self.params)                              # 构造时就报错：levels 不逐级收紧、order 不认识等
+            self.planner_name, self.version = "rule_v2", POLICY_VERSION_V2   # 实例属性盖掉类属性；v1 实例不设，保持 K1 的值
         self.hfov_deg, self.shadow = float(hfov_deg), bool(shadow)
         self.reset()
 
     def reset(self):
         """集边界：记忆、步号、上次转向、日志、条目计数全部清零（规则的记忆按集清零）。"""
         self.memory, self.step_idx, self.last_turn, self.rows = [], 0, None, []
-        self.entry_counts = {e: 0 for e in rp.V1_ENTRIES}
+        self.tabu, self.last_action = [], None                           # 仅 v2：禁忌表、上一步返回的动作
+        self.entry_counts = {e: 0 for e in (rp.V1_ENTRIES if self.rule_version == "v1" else rp.V2_ENTRIES)}
 
     def __call__(self, rgb, depth, state):
         x, y, z = float(state.x), float(state.y), float(getattr(state, "z", 2.0))
@@ -170,15 +184,29 @@ class RuleOraclePolicy:
         tx, ty = self.target_fn(x, y)
         err = bearing_error_deg(x, y, yaw_deg, (tx, ty))
         n = int(round(-err / self.params["yaw_step_deg"]))          # 目标在左 err > 0 -> n < 0 -> 规则朝左转回（YAW_LEFT）
-        action, entry, self.memory, info = rp.rule_v1_step(self.memory, self.step_idx, x, y, yaw_deg, [float(v) for v in d], n,
-                                                           self.last_turn, self.hfov_deg, self.params)
+        if self.rule_version == "v1":
+            action, entry, self.memory, info = rp.rule_v1_step(self.memory, self.step_idx, x, y, yaw_deg, [float(v) for v in d], n,
+                                                               self.last_turn, self.hfov_deg, self.params)
+            extra = {}
+        else:
+            e = -err / self.params["yaw_step_deg"]                  # n 的浮点值（同一个符号约定）：规则用它给两侧候选排序
+            action, entry, self.memory, self.tabu, info = rp.rule_v2_step(
+                self.memory, self.tabu, self.step_idx, x, y, yaw_deg, [float(v) for v in d], n, self.last_turn, e=e,
+                prev_action=self.last_action, hfov_deg=self.hfov_deg, params=self.params)
+            extra = {"level": info["level"], "m": info["m"], "tabu_n": info["tabu_n"], "ok": info["ok"]}
         if action in (YAW_LEFT, YAW_RIGHT):
             self.last_turn = action
+        self.last_action = int(action)
         self.entry_counts[entry] += 1
-        self.rows.append({"step": self.step_idx, "err_deg": round(err, 2), "n": n, "target": [round(tx, 3), round(ty, 3)],
-                          "action": int(action), "entry": entry, "mem_n": info["mem_n"], "clear": [int(c) for c in info["clear"]],
-                          "src": self.source,
-                          "d_occ": None if d_occ is None else [round(float(v), 3) for v in d_occ],
-                          "d_depth": None if d_depth is None else [round(float(v), 3) for v in d_depth]})
+        row = {"step": self.step_idx, "err_deg": round(err, 2), "n": n}
+        if self.rule_version == "v2":                                # v2 多出来的键：e 在 n 之后，level / m / tabu_n / ok 在 clear 之后
+            row["e"] = round(e, 4)
+        row.update({"target": [round(tx, 3), round(ty, 3)], "action": int(action), "entry": entry, "mem_n": info["mem_n"],
+                    "clear": [int(c) for c in info["clear"]]})
+        row.update(extra)
+        row.update({"src": self.source,
+                    "d_occ": None if d_occ is None else [round(float(v), 3) for v in d_occ],
+                    "d_depth": None if d_depth is None else [round(float(v), 3) for v in d_depth]})
+        self.rows.append(row)
         self.step_idx += 1
         return int(action), None
