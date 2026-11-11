@@ -185,13 +185,16 @@ def resolve_vehicle(args, error):
 
 
 def scene_gen_extra(args):
-    """透传给 scene_gen 的可选参数：相机、forest_e1 密度、course_base 块数（没给就不传，旧命令行逐字不变）。"""
+    """透传给 scene_gen 的可选参数：相机、实时因子、forest_e1 密度、course_base 块数（没给就不传，旧命令行逐字不变）。"""
     extra = []
     rate = getattr(args, "camera_rate", None)
     if rate is not None:
         extra += ["--camera-rate", f"{rate:g}"]
     if getattr(args, "no_aux_cameras", False):
         extra.append("--no-aux-cameras")
+    rtf = getattr(args, "rtf", None)
+    if rtf is not None:
+        extra += ["--rtf", f"{rtf:g}"]   # W1-0：世界目标实时因子；没给不传
     if getattr(args, "density", None):
         extra += ["--density", args.density]
     if getattr(args, "blocks", None) is not None:

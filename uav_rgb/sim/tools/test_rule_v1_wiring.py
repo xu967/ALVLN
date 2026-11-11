@@ -108,13 +108,13 @@ class CollectOneV1Tests(unittest.TestCase):
         self.assertIsNone(row["rule_mem_n"])
         self.assertIsNone(row["rule_clear"])
         ar = collect.action_row(row | {"depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0})
-        self.assertEqual(set(ar), tc.ROW_KEYS_LEGACY | {"executed_by", "rule_cols", "rule_entry"}, "v0 落盘字段集与 v0 实验一致")
+        self.assertEqual(set(ar), tc.ROW_KEYS_DEFAULT | {"executed_by", "rule_cols", "rule_entry"}, "v0 落盘字段集与 v0 实验一致")
         self.assertEqual(row["rule_entry"], "R2-left")
 
     def test_v1_action_row_has_the_two_new_fields(self):
         row, _ = v1_step()
         ar = collect.action_row(row | {"depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0})
-        self.assertEqual(set(ar), tc.ROW_KEYS_LEGACY | {"executed_by", "rule_cols", "rule_entry", "rule_mem_n", "rule_clear"})
+        self.assertEqual(set(ar), tc.ROW_KEYS_DEFAULT | {"executed_by", "rule_cols", "rule_entry", "rule_mem_n", "rule_clear"})
         self.assertEqual(ar["rule_clear"], [False, False, False])
 
 
@@ -191,7 +191,7 @@ class CollectLoopV1Tests(unittest.TestCase):
     def test_other_policies_leave_no_trace(self):
         _seen, man, _err, rows = run_loop_v1([], [FORWARD, LEFT])
         self.assertNotIn("rule_oracle", man)
-        self.assertTrue(all(set(r) == tc.ROW_KEYS_LEGACY for r in rows))
+        self.assertTrue(all(set(r) == tc.ROW_KEYS_DEFAULT for r in rows))
 
     def test_version_validation(self):
         _seen, man, err, _rows = run_loop_v1(["--rule-version", "v1"], [FORWARD])          # 默认策略是教师

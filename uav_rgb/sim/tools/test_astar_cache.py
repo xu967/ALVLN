@@ -164,5 +164,61 @@ class AstarCache(unittest.TestCase):
         self.assertLessEqual(len(cache), T._FREE_CACHE_MAX_SCENES)
 
 
+class AstarWarmUp(unittest.TestCase):
+    """teacher.warm_free_cells：--action-latency 的每集预热。把整张 A* 栅格的「可走」一次填满，
+    第一步的 A* 不再比后续步慢约 0.45 s（K=3）；缓存里的值与按需算出来的逐格相同，所以路径逐位不变。"""
+
+    def setUp(self):
+        clear_cache()
+
+    def test_fills_the_whole_grid_under_the_key_astar_uses(self):
+        pillars, _ = sc.sample_course(1, 3)
+        x0, y0, nx, ny = T._grid_spec(pillars, 0.1)
+        n = T.warm_free_cells(pillars, clearance=0.4)
+        self.assertEqual(n, nx * ny, "整张栅格，不是 A* 碰到的那一带")
+        self.assertEqual(len(T._free_cells(pillars, 0.4, 0.1)), nx * ny)
+        with mock.patch.object(T, "_point_blocked", wraps=T._point_blocked) as spy:
+            T.astar_path(pillars, (-0.5, 0.0), goal_of(pillars), clearance=0.4)
+            T.astar_path(pillars, (2.0, 0.3), goal_of(pillars), clearance=0.4)
+        self.assertEqual(spy.call_count, 0, "预热之后 A* 不再算任何格子")
+
+    def test_paths_identical_to_reference_after_warm_up(self):
+        rng = random.Random(20261110)
+        n = 0
+        for seed in SEEDS[:4]:
+            for pillars in (sg.sample_pillars(seed)[0], sc.sample_course(seed, 3)[0]):
+                goal = goal_of(pillars)
+                T.warm_free_cells(pillars, clearance=0.4)
+                for _ in range(5):
+                    start = (rng.uniform(-1.0, goal[0] - 1.0), rng.uniform(-2.0, 2.0))
+                    self.assertEqual(T.astar_path(pillars, start, goal, clearance=0.4),
+                                     astar_reference(pillars, start, goal, clearance=0.4),
+                                     f"seed={seed} start={start}")
+                    n += 1
+        self.assertGreater(n, 30)
+
+    def test_default_clearance_follows_the_vehicle_profile(self):
+        pillars, _ = sc.sample_course(113, 2)
+        T.set_vehicle("e1_mini", "base")
+        try:
+            T.warm_free_cells(pillars)
+            with mock.patch.object(T, "_point_blocked", wraps=T._point_blocked) as spy:
+                T.astar_path(pillars, (-0.5, 0.0), goal_of(pillars), clearance=T.ASTAR_CLEARANCE_M)
+            self.assertEqual(spy.call_count, 0, "默认余量取当前载具档（set_vehicle 之后）")
+        finally:
+            T.set_vehicle("x3", "base")
+
+    def test_warm_up_respects_the_cache_bound_and_round_pillars(self):
+        trees = [{"name": f"t{i}", "x": 1.0 + 0.8 * i, "y": 0.2 * (i % 5) - 0.4, "radius": 0.15, "size": [0.3, 0.3]}
+                 for i in range(8)]
+        T.warm_free_cells(trees, clearance=0.2)
+        goal = goal_of(trees)
+        self.assertEqual(T.astar_path(trees, (-0.5, 0.2), goal, clearance=0.2),
+                         astar_reference(trees, (-0.5, 0.2), goal, clearance=0.2))
+        for seed in range(1, 12):
+            T.warm_free_cells(sg.sample_pillars(seed)[0], clearance=0.4)
+        self.assertLessEqual(len(T._FREE_CACHE), T._FREE_CACHE_MAX_SCENES)
+
+
 if __name__ == "__main__":
     unittest.main()

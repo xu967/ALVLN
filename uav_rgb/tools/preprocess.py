@@ -50,7 +50,9 @@ KNOWN_GEOMETRY_VERSIONS = (sm.SPLIT_SALT, campus.VERSION, asset_campus.VERSION,
                            scene_forest.GEOMETRY_VERSION_FOREST)
 # 口径键：任何模式下一个包只能有一种值（含「部分缺」也不行）。hold/窗口语义/动力学不同意味着
 # 同一个动作标签对应的位移不同（Gazebo hold 1.0 前飞 0.25 m/步，3DGS hold 0.5 约 0.12 m），混了无法归因。
-STRICT_KEYS = ("window_from", "hold_s", "dynamics_profile")
+# action_latency_s（collect.py --action-latency，W1-0）：派发时刻固定到观测戳 + L 的数据，动作生效时长是 hold − L，
+# 与不固定的旧数据、与不同 L 的数据每步位移都不同；旧集没有这个键（None），部分缺也拒绝，所以新旧不能混包。
+STRICT_KEYS = ("window_from", "hold_s", "dynamics_profile", "action_latency_s")
 # 族身份键：默认同样必须一致；--allow-mixed-geometry（跨族合并实验，如柱阵+森林、Gazebo+3DGS）才放开，
 # meta 按族记录计数/salt/口径，各族仍按各自的 split_salt 复算 split（同几何同 split 的泄漏门照常）。
 FAMILY_KEYS = ("geometry_version", "appearance_version", "split_policy", "split_salt",
@@ -318,6 +320,7 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
         "stop_radius": man.get("stop_radius"),
         "window_from": man.get("window_from"),
         "hold_s": man.get("hold_s"),
+        "action_latency_s": man.get("action_latency_s"),
         "src_w": src_w,
         "src_h": src_h,
         "samples": samples,
@@ -560,6 +563,9 @@ def build_meta(episodes, total, size, dropped=0, split_scheme=None,
         "goal_radius": pick(episodes, "goal_radius"),
         "window_from": _uniform(episodes, "window_from"),
         "hold_s": _uniform(episodes, "hold_s"),
+        # --action-latency 的 L：只在这批数据带它时写键（旧数据集 meta 逐位不变）；scan 已保证全包同值或全无。
+        **({"action_latency_s": _uniform(episodes, "action_latency_s")}
+           if _uniform(episodes, "action_latency_s") is not None else {}),
         # 包里出现过的全部动力学档（通常 1 个；--allow-mixed-dynamics 的 DAgger 并集会有 2 个）。
         "dynamics_profiles": sorted({ep.get("dynamics_profile") for ep in episodes} - {None}),
         # 3DGS 数据：记录渲染后端与每集 scene.json，自动评测据此走 eval_3dgs。
@@ -606,6 +612,7 @@ def build_meta(episodes, total, size, dropped=0, split_scheme=None,
             "stop_radius": ep.get("stop_radius"),
             "window_from": ep.get("window_from"),
             "hold_s": ep.get("hold_s"),
+            **({"action_latency_s": ep["action_latency_s"]} if ep.get("action_latency_s") is not None else {}),
             "num_steps": ep["num_samples"],
             "sample_start": ep["sample_start"],
             "sample_count": ep["num_samples"],

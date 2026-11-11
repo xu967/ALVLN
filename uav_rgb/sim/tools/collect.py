@@ -119,6 +119,9 @@ READY_TIMEOUT = 10.0  # 启动时等 camera/depth/pose 首帧的上限
 DEPTH_STALE_NS = 100_000_000  # depth 与 RGB 的 sim-time 差上限；超过视为停更/不同步
 CONTACT_POLL = 0.02   # 动作窗口内轮询接触锁存序号的间隔
 MIN_WINDOW_RTF = 0.05 # 动作窗口的墙钟兜底：仿真时间走不动时按此 RTF 折算等待上限
+# --action-latency L：动作就绪时仿真戳已超过「观测戳 + L」这么多纳秒（0.02 s）就记迟到。
+# 迟到步的派发时刻不再是观测戳 + L，该集的动作生效时长不可比，评测把含迟到步的集当基础设施失败。
+LATE_DISPATCH_TOL_NS = 20_000_000
 
 # 动作 -> 速度指令。forward=+X，left=+Y，up=+Z；yaw 正 z = 左转（右手定则）。
 # vz 是**高度保持**分量（见 altitude_vz）：速度控制器只吃速度指令，z:0 是「零垂直速度」
@@ -822,7 +825,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 predictive_teacher=None, rl_teacher=None, sil=None,
                 tiebreak="legacy", beta=0.0, rng=None, prev_executed=None,
                 costmap_opts=None, heading_guard=0, net_yaw=0, rule_hfov_deg=60.0, last_turn=None,
-                rule_version="v0", rule_mem=None):
+                rule_version="v0", rule_mem=None, action_latency_s=None):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。
 
     dyn=None 为 x3_velocity 旧行为（定速 + 窗口末刹停）；给 CfStab 时按摇杆模型
@@ -838,15 +841,27 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     再过 rule_policy.rule_v0；net_yaw、last_turn 由主循环按已执行动作维护。
     rule_version="v1"（计划 D6）：改走 rule_policy.rule_v1_step，rule_mem 是主循环按集清零、逐步传入的记忆点列表
     [(世界 X, 世界 Y, 产生步号)]，本函数原地更新它；该步多记 rule_mem_n 与 rule_clear。v0 路径与落盘逐位不变。
+    action_latency_s（--action-latency L，W1-0）：把派发时刻固定到仿真时间。观测戳 = 与 RGB 配对的位姿帧戳
+    （pose_before_ts，observation 窗口的起点，执行器截止 = 观测戳 + hold 的基准）。策略出动作后等位姿话题的
+    仿真戳 ≥ 观测戳 + L 再派发，动作生效时长固定为 hold − L，与策略这一步算了多久无关；动作就绪时仿真戳已超过
+    观测戳 + L + LATE_DISPATCH_TOL_NS 的步记 late_dispatch=True（立即派发，不再等）。只配 window_from="observation"。
+    学生 + β=0 + 给了它时，影子教师标签挪到派发之后算（A* 的耗时落进 hold 窗口，不计进观测到派发的延迟；
+    β=0 时执行的动作与标签无关）；β>0（标签可能就是执行的动作）与教师策略（A* 就是动作）不动。
+    None = 旧行为：派发在最新位姿戳，不等、不记迟到、标签位置不变；row["dispatch_lag_s"]（派发戳减观测戳，秒）两种情况都记。
     """
     if window_from not in ("dispatch", "observation"):
         raise ValueError(f"window_from 无效: {window_from!r}")
+    if action_latency_s is not None and window_from != "observation":
+        raise ValueError("action_latency_s 只能配 window_from='observation'（截止时刻 = 观测戳 + hold）")
     tie_margin = None          # 只有 tiebreak=visible 的 A* 教师会填；legacy 不多算也不落盘
     q_costs = None             # 只有 costmap 教师会填：Q[SAFE, FWD, L, R]（步）
     executed_by = None         # 只有 DAgger 影子教师模式会填 "student"/"expert"，rule-oracle 填 "rule_oracle"
     rule_cols = rule_entry = None   # 只有 rule-oracle 会填：该步的 20 列（或 27 列）距离与触发的规则条目
     rule_mem_n = rule_clear = None  # 只有 rule-oracle v1 会填：记忆点数、[clear(+α), clear(0), clear(−α)]
     label = None               # 标签（action_expert）；None = 与执行的动作相同（除影子教师外都如此）
+    # --action-latency + 学生 + β=0 + 有柱子真值：影子教师标签在派发之后算（见 docstring）；其余情况标签位置不变。
+    defer_label = bool(action_latency_s is not None and policy == "student" and beta == 0.0 and pillars)
+    late_dispatch = None       # 只有给了 action_latency_s 才非 None
     t_step = time.perf_counter()
     if contact_seq0 is None:
         contact_seq0 = _contact_seq(subs["contact"])
@@ -948,9 +963,10 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             # 位姿缺失时宁可本步失败，不能让学生动作冒充教师标签（manifest 已记成 plan_action）。
             if not pose_before:
                 return None, "影子教师需要位姿真值，但该步 pose 缺 position"
-            label, tie_margin = plan_action_global_tiebreak(
-                pose_before["x"], pose_before["y"], yaw_before, pillars, tiebreak,
-                waypoint=waypoint, stop_at_waypoint=stop_at_waypoint, stop_radius=stop_radius)
+            if not defer_label:   # defer_label（--action-latency，β=0）：标签在派发之后算，见下面 sil.dispatch 之后
+                label, tie_margin = plan_action_global_tiebreak(
+                    pose_before["x"], pose_before["y"], yaw_before, pillars, tiebreak,
+                    waypoint=waypoint, stop_at_waypoint=stop_at_waypoint, stop_radius=stop_radius)
             # β 混合与 sim/3dgs/collect_3dgs.py DaggerPolicy 同义：以概率 β 改执行教师动作。
             if beta > 0.0 and rng is not None and rng.random() < beta:
                 action, executed_by = label, "expert"
@@ -996,9 +1012,24 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             return None, f"teacher-nn 推理失败: {type(e).__name__}: {e}"
     else:  # policy == "forward": 盲策略（恒定前进），用于撞柱/基线对照
         action = FORWARD_SLOW
-    if label is None:
+    if label is None and not defer_label:
         label = action
     t_io = time.perf_counter()
+
+    if action_latency_s is not None:
+        # 派发时刻固定到 观测戳 + L（仿真时间）。就绪时仿真戳超过 观测戳 + L + 0.02 s 记迟到并立即派发；
+        # 否则等位姿话题的仿真戳走到 观测戳 + L（200 Hz 位姿，等待精度 5 ms）。这段等待不计进 timing["io"]。
+        latency_ns = int(round(action_latency_s * 1e9))
+        target_ns = pose_before_ts + latency_ns
+        ready_msg = subs["pose"].latest()
+        ready_ts = _pose_stamp(ready_msg) if ready_msg is not None else 0
+        late_dispatch = ready_ts > target_ns + LATE_DISPATCH_TOL_NS
+        if ready_ts < target_ns:
+            wait_s = action_latency_s / MIN_WINDOW_RTF   # 仿真时间走不动时的墙钟兜底，同动作窗口
+            if subs["pose"].latest_after(target_ns - 1, timeout=wait_s) is None:
+                return None, ("pose 订阅进程已退出" if not subs["pose"].healthy() else
+                              f"等派发时刻超时：{wait_s:.1f}s 墙钟内位姿戳没到 观测戳 + {action_latency_s:g} s"
+                              "（位姿停更或 RTF 过低）")
 
     # 动作窗口的起点是**派发时刻**的最新位姿，不是观测帧位姿：策略推理/解码
     # 期间仿真仍在走，用观测戳会让实际执行窗口短于 hold（学生与基线不公平）。
@@ -1046,6 +1077,17 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
             # 动作没发出去也要确认没有旧指令在飞；失败原因继续上抛。
             stop_executor(publisher, sil)
             raise
+
+        if defer_label:
+            # 影子教师标签（--action-latency，学生 β=0）：动作已派发，A* 的耗时落在 hold 窗口里（与下面 PNG 落盘同位置），
+            # 不再计进观测到派发的延迟。同一个函数、同一组位姿与参数，标签只写进 row，不影响已派发的动作。
+            try:
+                label, tie_margin = plan_action_global_tiebreak(
+                    pose_before["x"], pose_before["y"], yaw_before, pillars, tiebreak,
+                    waypoint=waypoint, stop_at_waypoint=stop_at_waypoint, stop_radius=stop_radius)
+            except Exception:
+                stop_executor(publisher, sil)   # 动作已经在飞：标签失败也要刹住再上抛
+                raise
 
         # PNG 落盘落在 hold 窗口内（RGB 已在发指令前抓到，M1 不受影响）。
         rgb_ok, _ = write_rgb_png(
@@ -1198,6 +1240,9 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         "depth_ts": depth_ts,
         "pose_before_ts": pose_before_ts,
         "action_start_ns": action_start_ns,
+        # 派发时的仿真戳减观测戳（秒）：每步都记，不依赖 --action-latency；late_dispatch 只有给了它才非 None。
+        "dispatch_lag_s": (exec_ts - pose_before_ts) / 1e9,
+        "late_dispatch": late_dispatch,
         "action_end_ns": pose_ts,
         "displacement_m": dist,
         "dyaw_deg": dyaw,
@@ -1272,6 +1317,11 @@ def action_row(r, save_depth=False):
     # rule_cols / rule_entry 来自 --policy rule-oracle（该步各列距离与触发的规则条目，供事后分析失败）；
     # rule_mem_n / rule_clear 只有 --rule-version v1 才有（记忆点数与三个候选航向的通道是否畅通）。
     for k in ("tie_margin_steps", "executed_by", "q_costs", "rule_cols", "rule_entry", "rule_mem_n", "rule_clear"):
+        if r.get(k) is not None:
+            row[k] = r[k]
+    # W1-0：dispatch_lag_s（派发的仿真戳减观测戳，秒）每步都记，排在最后（旧键的行内顺序不变）；
+    # late_dispatch（bool）只有给了 --action-latency 才有。
+    for k in ("dispatch_lag_s", "late_dispatch"):
         if r.get(k) is not None:
             row[k] = r[k]
     return row
@@ -1393,6 +1443,12 @@ def main():
     p.add_argument("--heading-guard", type=int, default=0,
                    help="--policy student 的航向护栏（R1 判别实验）：已执行的左转数减右转数的绝对值达到 N 就朝回转一步；"
                         "0=关闭（默认，行为逐位不变）。被护栏改写的步 executed_by=heading_guard")
+    p.add_argument("--action-latency", type=float, default=None, metavar="L",
+                   help="把动作派发时刻固定到仿真时间（W1-0）：策略出动作后，等位姿话题的仿真戳 >= 观测戳 + L 秒再派发；"
+                        "执行器截止仍是观测戳 + hold，动作生效时长固定为 hold - L，与策略这一步算了多久无关。"
+                        "动作就绪时仿真戳已超过 观测戳 + L + 0.02 s 的步记迟到（行 late_dispatch、manifest late_dispatch_steps）。"
+                        "开了以后每集起跑前预热 A* 栅格，学生 + beta=0 的影子教师标签挪到派发之后算，manifest 记 action_latency_s"
+                        "（preprocess 不许与旧口径混包）。默认关（旧行为逐位不变）。只能配 --window-from observation，且 0 < L < --hold")
     p.add_argument("--rule-hfov-deg", type=float, default=60.0,
                    help="--policy rule-oracle 的列距离视场（度）：60=学生相机（20 列），81=真机 GC4653 的水平视场（27 列）；"
                         "列宽固定 3°，范围 [6, 180]")
@@ -1413,6 +1469,13 @@ def main():
     # NaN <= 0 是 False，只判 <=0 会让 --hold nan 一路跑进 sleep 里挂死。
     if not (math.isfinite(args.hold) and args.hold > 0):
         p.error("--hold must be finite and > 0")
+    if args.action_latency is not None:
+        if not (math.isfinite(args.action_latency) and args.action_latency > 0):
+            p.error("--action-latency 必须是有限正数")
+        if args.action_latency >= args.hold:
+            p.error(f"--action-latency 必须小于 --hold（动作生效时长 = hold - L；L={args.action_latency:g} hold={args.hold:g}）")
+        if args.window_from != "observation":
+            p.error("--action-latency 只能配 --window-from observation（执行器截止 = 观测戳 + hold）")
     if args.steps < 1:
         p.error("--steps must be >= 1")
     if args.policy == "student" and not args.student_ckpt:
@@ -1627,6 +1690,7 @@ def main():
     rule_mem = []              # rule-oracle v1 的短期障碍记忆 [(世界 X, 世界 Y, 产生步号)]；每集（每次进程）从空开始
     prev_rgb_ts = 0
     timings = []
+    late_dispatch_steps = 0    # --action-latency：动作就绪时已超过 观测戳 + L + 0.02 s 的步数
     # DAgger（--policy student）：β 混合的随机源按 seed 固定，同 seed 可复现哪些步换成了教师执行。
     dagger = None
     if args.policy == "student" and pillars:
@@ -1690,6 +1754,14 @@ def main():
             text_ids = tokenize(instruction_text) if instruction_text else None
             teacher_nn = TeacherPolicy(args.teacher_ckpt)
 
+        if args.action_latency is not None and pillars and planner_kind == "astar":
+            # 每集（每个 collect 进程）起跑前把整张 A* 栅格的「可走」填满：否则第一步的 A* 比后续步慢约 0.45 s（K=3），
+            # 第一步必迟到。教师的 A* 是动作本身，学生的 A* 是影子标签。学生推理的首帧开销由 StudentPolicy 构造时的
+            # _warmup 吃掉（每集一次，已在上面），这里不再重复。放在起飞之前：不多悬停一秒。
+            t_warm = time.perf_counter()
+            n_cells = _teacher.warm_free_cells(pillars)
+            print(f"预热 A* 栅格：{n_cells} 格，{time.perf_counter() - t_warm:.2f} s", file=sys.stderr)
+
         contact_seq0 = _contact_seq(subs["contact"])
         if cf_sitl_params is not None:
             print("cf_sitl: reset + arm_takeoff，等固件 READY…", file=sys.stderr)
@@ -1734,7 +1806,8 @@ def main():
                                     prev_executed=prev_executed, costmap_opts=costmap_opts,
                                     heading_guard=args.heading_guard, net_yaw=net_yaw,
                                     rule_hfov_deg=args.rule_hfov_deg, last_turn=last_turn,
-                                    rule_version=args.rule_version, rule_mem=rule_mem)
+                                    rule_version=args.rule_version, rule_mem=rule_mem,
+                                    action_latency_s=args.action_latency)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -1766,6 +1839,7 @@ def main():
                                        "speed_mps": r["speed_after_mps"]}) + "\n")
             oracle_f.flush()
             rows_written += 1
+            late_dispatch_steps += bool(r.get("late_dispatch"))
             timings.append(r["timing"] | {"depth_gap_ns": gap_ns,
                                           "pose_gap_ns": pose_gap_ns,
                                           "rgb_before_start": r["rgb_ts"] < r["action_start_ns"]})
@@ -1928,6 +2002,10 @@ def main():
             # 与 RTF 无关。同 scene 的 0.5 与 1.0 两批数据仍靠它区分。
             "hold_s": args.hold,
             "window_from": args.window_from,
+            # W1-0：只在给了 --action-latency 时写键（默认 manifest 逐位不变）。preprocess 把 action_latency_s 当口径键，
+            # 与旧数据、与不同 L 的数据都不能混包；late_dispatch_steps > 0 的集在评测里算基础设施失败。
+            **({"action_latency_s": args.action_latency, "late_dispatch_steps": late_dispatch_steps}
+               if args.action_latency is not None else {}),
             "task_version": task_version,
             "instruction": instruction_text,
             "target_color": target_color,

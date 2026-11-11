@@ -89,10 +89,10 @@ class CollectOneTests(unittest.TestCase):
     def test_action_row_writes_rule_fields_only_for_this_policy(self):
         row, _ = rule_step()
         ar = collect.action_row(row | {"depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0})
-        self.assertEqual(set(ar), tc.ROW_KEYS_LEGACY | {"executed_by", "rule_cols", "rule_entry"})
+        self.assertEqual(set(ar), tc.ROW_KEYS_DEFAULT | {"executed_by", "rule_cols", "rule_entry"})
         self.assertEqual(ar["rule_cols"], row["rule_cols"])
         plain = collect.action_row(tc.fake_row(0, 1.0) | {"depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0})
-        self.assertEqual(set(plain), tc.ROW_KEYS_LEGACY, "其它策略的行字段集不变")
+        self.assertEqual(set(plain), tc.ROW_KEYS_DEFAULT, "其它策略的行字段集不变")
 
     def test_missing_pose_or_pillars_fail_the_step(self):
         row, err = rule_step(pillars=None)
@@ -167,7 +167,7 @@ class CollectLoopWiringTests(unittest.TestCase):
         seen, man, _err, rows = run_loop([], [FORWARD, LEFT])
         self.assertNotIn("rule_oracle", man)
         self.assertEqual((man["teacher"], man["planner"]), ("plan_action", "astar"))
-        self.assertTrue(all(set(r) == tc.ROW_KEYS_LEGACY for r in rows))
+        self.assertTrue(all(set(r) == tc.ROW_KEYS_DEFAULT for r in rows))
         seen, man, _err, _rows = run_loop(["--policy", "forward"], [FORWARD, FORWARD])
         self.assertNotIn("rule_oracle", man)
 

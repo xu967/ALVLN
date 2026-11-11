@@ -542,6 +542,43 @@ class PreprocessSplitTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("dynamics_profile", r.stderr)
 
+    def test_action_latency_is_a_strict_protocol_key(self):
+        """W1-0：--action-latency 采的集（manifest.action_latency_s）与旧集、与不同 L 的集都不能混包（STRICT_KEYS，
+        与 hold_s / window_from 同级）；同一 L 才打包，meta 顶层记它；旧数据 meta 不多这个键。"""
+        for ep in self.eps:
+            man = self.man(ep)
+            man.update(action_latency_s=0.16, geometry_gid=gid_for(man["split"], ep.name))
+            self.save(ep, man)
+        r = self.run_pre(self.tmp / "ds_same", self.eps)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        meta = read_meta(self.tmp / "ds_same" / "dataset.uavr")
+        self.assertEqual(meta["action_latency_s"], 0.16)
+        self.assertEqual({e["action_latency_s"] for e in meta["episodes"]}, {0.16})
+        man = self.man(self.eps[2])
+        man["action_latency_s"] = 0.20
+        self.save(self.eps[2], man)
+        r = self.run_pre(self.tmp / "ds_two_values", self.eps)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("action_latency_s", r.stderr)
+        man = self.man(self.eps[2])
+        del man["action_latency_s"]
+        self.save(self.eps[2], man)
+        r = self.run_pre(self.tmp / "ds_partial", self.eps)       # 一集是旧口径：部分缺也拒绝
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("action_latency_s", r.stderr)
+        r = self.run_pre(self.tmp / "ds_partial_mixed", self.eps, "--allow-mixed-geometry")   # 族开关不放开口径键
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("action_latency_s", r.stderr)
+        for ep in self.eps:                                        # 全是旧口径：照常打包，meta 没有这个键
+            man = self.man(ep)
+            man.pop("action_latency_s", None)
+            self.save(ep, man)
+        r = self.run_pre(self.tmp / "ds_legacy_only", self.eps)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        meta = read_meta(self.tmp / "ds_legacy_only" / "dataset.uavr")
+        self.assertNotIn("action_latency_s", meta)
+        self.assertTrue(all("action_latency_s" not in e for e in meta["episodes"]))
+
     def test_legacy_episodes_record_scene_id_scheme(self):
         r = self.run_pre(self.tmp / "ds_legacy", self.eps)
         self.assertEqual(r.returncode, 0, r.stderr)

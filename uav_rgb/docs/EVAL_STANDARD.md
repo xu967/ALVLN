@@ -345,6 +345,33 @@ SPL 的 p_i 本来就截到第一次进入目标区，v2 下与整条轨迹一�
 正常结束时每集的 `actions.jsonl` / `oracle.jsonl` / `episode_manifest.json` 保留在 `<out>/episodes/seed_<seed>/`（帧仍删），
 所以 v2 起的 eval.json 可以复算 SPL。
 
+### 5.5 动作派发时刻固定到仿真时间（`--action-latency`，2026-11-10）
+
+**新实验一律带 `--action-latency L`，报数时同时报 `dispatch_lag_s` 的中位数与最大值、迟到步数。**
+`--window-from observation` 下动作窗口从观测戳起算，执行器截止 = 观测戳 + hold（1.0 s），所以每步动作实际生效的时长
+= hold −（观测戳到派发的仿真秒）。这段延迟 = 帧龄（相机 10 Hz，固定约 0.114 s，出处 `docs/PLAN_2026-11-10_phase12.md`
+longcourse 分段打点）+ 策略段的墙钟耗时折成的仿真时间；后一项随场景变（K=3 长课程里 Python A\* 每步重跑，冷缓存时
+最慢），不带开关时 K=1 与 K=3 的生效时长因此不同（旧协议实测 K=1 0.871 s，K=3 第一轮 0.77–0.79 s，
+`docs/worklog/2026-11-10-2011-long-course.md`），拿它比成功率会把时序差当成场景差。
+
+- **口径**：`collect.py --action-latency L`（`eval_closed_loop.py` 透传同名参数）。策略出结果后等位姿话题的仿真戳 ≥ 观测戳 + L 再派发，
+  执行器截止仍是观测戳 + hold，所以每步生效时长固定为 hold − L（再加 5–10 ms 的位姿网格过冲），与场景无关。
+  只配 `--window-from observation`，L 必须是 (0, hold) 内的有限数。
+- **迟到**：策略结果出来时仿真戳已超过观测戳 + L + 0.02 s（`LATE_DISPATCH_TOL_NS`）记一个迟到步，立即派发。
+  `actions.jsonl` 每行有 `dispatch_lag_s`（观测戳到派发的仿真秒；不带开关时也写，只多这一个键），manifest 有
+  `action_latency_s` 与 `late_dispatch_steps`。**含迟到步的集不计成功**：`eval_closed_loop.py` 把它记成基础设施失败
+  （`failed[]` 里 `error` 以 `late_dispatch:` 开头，eval.json 另有 `late_dispatch_episodes`）：不进 `success_rate` 的完成集，在 `requested_success_rate` 里算非成功；
+  `per_episode` 有 `late_dispatch_steps`、`dispatch_lag_s_median`、`dispatch_lag_s_max`。迟到集的轨迹仍留在 `<out>/episodes/`。
+- **影子标签**：学生 + β=0 + 带开关时，影子教师的 A\* 标签挪到派发之后算（β>0、教师、规则 oracle 不动；`action_expert` 的值不变），
+  A\* 耗时不再进延迟。**预热**：带开关时每集起飞前把教师的整张 A\* 自由栅格填满（`teacher.warm_free_cells`），
+  第 0 步不再吃冷缓存；外部基线与学生本来就在构造时空推理一次（`StudentPolicy._warmup`）。不带开关时两者都不动，
+  默认路径逐位不变（`sim/tools/test_action_latency.py` 的默认锁）。
+- **协议键**：`action_latency_s` 在 eval 的 `PROTOCOL_KEYS` 和 `tools/preprocess.py` 的 `STRICT_KEYS` 里。
+  协议文件（训练数据快照）里写了 `action_latency_s` 而评测不带或 L 不同，判协议不一致；旧协议文件没有这个键，不触发。打包时不同 L 的集、或新旧混合会被拒收。
+  带开关与不带开关的 SR / CR **不可直接比**（生效时长 hold − L 与旧协议不同），报表头标 L。
+- **`--rtf R`**：`scene_gen.py --rtf R`（`eval_closed_loop.py` 透传）把世界的目标实时因子压到 R，让仿真跑慢、墙钟耗时折成的仿真秒变少。
+  只能压低，不能超过本机软渲染实际达到的实时因子（各集 `action_rtf` 均值约 0.8）。需要 `--rtf` 的 L 与 R 由标定定，见 `docs/experiments/2026-11-10-action-latency.md`。
+
 ## 6. 下一步（按优先级）
 
 1. 补 `d_min`（A\* 最短自由路径）→ 才能算 PO / MP / AGV（SR 已实现）。

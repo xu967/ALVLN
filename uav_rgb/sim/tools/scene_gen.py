@@ -99,6 +99,8 @@ AUX_CAMERA_RE = re.compile(r"\n    <!-- aux-camera:.*?<!-- /aux-camera -->", re.
 CAMERA_RATE_RE = re.compile(
     r'(<sensor name="(?:camera|depth)" type="(?:camera|depth_camera)">\s*<pose>[^<]*</pose>'
     r'\s*<always_on>1</always_on>\s*<update_rate>)([0-9.]+)(</update_rate>)')
+# 世界物理里的目标实时因子（两种载具的模板各 1 处）。--rtf 只改这一个数。
+RTF_RE = re.compile(r"(<real_time_factor>)[^<]*(</real_time_factor>)")
 # 外观版本：只改材质/光照/固定地标，不动 pillars 几何 → geometry_gid 与旧数据都保留。
 # legacy 显式复现改动前逐字节输出（含 3 个固定纯色方块）；v1 删掉它们并随机化光照/天空。
 # 2026-11-04 起新场景默认 v1：固定地标是每集重复的捷径，且不在教师真值里。
@@ -274,6 +276,20 @@ def set_camera_rate(world, hz):
     world, n = CAMERA_RATE_RE.subn(lambda m: f"{m.group(1)}{hz:g}{m.group(3)}", world)
     if n != 2:
         raise ValueError(f"template 里学生相机/深度相机 update_rate 匹配到 {n} 处，应为 2")
+    return world
+
+
+def set_real_time_factor(world, rtf):
+    """改世界物理里的目标实时因子 <real_time_factor>（--rtf，W1-0）。
+
+    目标 RTF 只能压低、不能抬高：仿真本来就跑不到它（软件渲染实测约 0.8）时无效。用途是让慢策略（A* 有缓存的 K=3、
+    大模型）在仿真时间里少承担一段延迟：墙钟耗时 × RTF = 仿真延迟。几何与 gid 不受影响。
+    """
+    if not (rtf > 0 and math.isfinite(rtf)):
+        raise ValueError(f"rtf 无效: {rtf}")
+    world, n = RTF_RE.subn(lambda m: f"{m.group(1)}{rtf:g}{m.group(2)}", world)
+    if n != 1:
+        raise ValueError(f"template 里 real_time_factor 匹配到 {n} 处，应为 1")
     return world
 
 
@@ -629,6 +645,9 @@ def main():
     p.add_argument("--camera-rate", type=float, default=None,
                    help="学生 RGB 与深度相机的 update_rate（Hz）；缺省用模板值"
                         "（E1 模板 10 Hz：每个 hold 窗口只消费 1 帧，两路同频配对误差≈0）")
+    p.add_argument("--rtf", type=float, default=None,
+                   help="世界物理的目标实时因子 <real_time_factor>（W1-0）；缺省用模板值（1.0）。只能压低、不能抬高："
+                        "仿真跑不到它时无效。给了才写进 meta.real_time_factor，默认输出逐位不变")
     p.add_argument("--no-aux-cameras", action="store_true",
                    help="不生成 chase/top 两路辅助相机（采集提速；录 demo 视频时不要加）。仅 E1 模板")
     p.add_argument("--no-velocity-control", action="store_true",
@@ -642,6 +661,8 @@ def main():
         args.template = VEHICLES[args.vehicle or DEFAULT_VEHICLE]["template"]
     if args.camera_rate is not None and not (math.isfinite(args.camera_rate) and args.camera_rate > 0):
         p.error("--camera-rate 必须是有限正数")
+    if args.rtf is not None and not (math.isfinite(args.rtf) and args.rtf > 0):
+        p.error("--rtf 必须是有限正数")
     if (args.task == "forest_e1") != (args.density is not None):
         p.error("--density 与 --task forest_e1 必须同时给")
     if args.task == "forest_e1" and args.spawn_mode != "default":
@@ -678,7 +699,10 @@ def main():
         world = set_camera_rate(world, args.camera_rate)
     if args.no_aux_cameras:
         world = strip_aux_cameras(world)
-    if args.camera_rate is not None or args.no_aux_cameras:
+    if args.rtf is not None:
+        world = set_real_time_factor(world, args.rtf)
+        meta["real_time_factor"] = args.rtf   # 只在给了 --rtf 时写键：默认 meta 逐位不变
+    if args.camera_rate is not None or args.no_aux_cameras or args.rtf is not None:
         meta["world_sha256"] = sha256(world.encode("utf-8"))
     # campus/asset_campus 自己写 meta，这里统一补载具与相机采样信息。
     meta.setdefault("vehicle", template_vehicle)

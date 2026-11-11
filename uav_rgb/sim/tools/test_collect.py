@@ -638,6 +638,8 @@ def cf_stab_window(cruise=False):
 ROW_KEYS_LEGACY = {"step", "timestamp_ns", "action_expert", "action_executed", "collision", "rgb_ok",
                    "frame", "src", "rgb_ts", "depth_ts", "depth_rgb_gap_ns", "pose_ts", "pose_rgb_gap_ns",
                    "dyaw_deg", "displacement_m", "infer_ms", "action_start_ns", "pose_before", "yaw_before"}
+# W1-0：每步行多记 dispatch_lag_s（派发时的仿真戳减观测戳；不给 --action-latency 也记，只加键、排在最后）。
+ROW_KEYS_DEFAULT = ROW_KEYS_LEGACY | {"dispatch_lag_s"}
 # 成功线 = 最远柱 4.97 + 1.0 = 5.97
 SCENE = {"pillars": [{"x": 1.0, "y": 0.3, "z": 1.5, "size": [0.4, 0.4, 3.0]},
                      {"x": 4.97, "y": -0.5, "z": 1.5, "size": [0.4, 0.4, 3.0]}]}
@@ -655,6 +657,7 @@ def fake_row(step, x, **over):
          "action_end_ns": s * 10**9 + 10**9, "displacement_m": 0.25, "dyaw_deg": 0.0, "sim_dt": 1.0,
          "speed_after_mps": None, "infer_ms": None, "action_wall_s": 1.0, "src": None,
          "tie_margin_steps": None, "executed_by": None,
+         "dispatch_lag_s": 0.129, "late_dispatch": None,   # 与真 collect_one 的返回一致：late_dispatch 只有 --action-latency 才非 None
          "timing": {"io": 0.01, "window": 1.0, "block": 1.0, "tail": 0.01, "total": 1.02,
                     "dispatch_sim_dt": 1.0}}
     r.update(over)
@@ -781,7 +784,7 @@ def switch_checks():
                                                   and man["teacher_tiebreak"] == "legacy"
                                                   and man["teacher"] == "plan_action" and man["planner"] == "astar"
                                                   and "executed_by" not in man and "beta" not in man
-                                                  and all(set(a) == ROW_KEYS_LEGACY for a in acts))
+                                                  and all(set(a) == ROW_KEYS_DEFAULT for a in acts))
     with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()), \
             patch.object(sys, "argv", ["collect.py", "--out", os.path.join(d, "x"), "--stop-at-goal"]):
         try:
@@ -805,9 +808,9 @@ def switch_checks():
     out["--tiebreak visible 每步记 tie_margin_steps"] = (err_v is None
                                                         and isinstance(row_v["tie_margin_steps"], float))
     ar = collect.action_row(row | {"depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0})
-    out["action_row 只在开关开着时多字段"] = (set(ar) == ROW_KEYS_LEGACY | {"executed_by"}
+    out["action_row 只在开关开着时多字段"] = (set(ar) == ROW_KEYS_DEFAULT | {"executed_by"}
                                            and set(collect.action_row(fake_row(0, 1.0) | {
-                                               "depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0})) == ROW_KEYS_LEGACY)
+                                               "depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0})) == ROW_KEYS_DEFAULT)
     # 4) student 模式 manifest：字段名与 sim/3dgs/collect_3dgs.py 一致
     rows_s = [fake_row(i, 1.0 + 0.25 * i, action_expert=2, action_executed=1 if i != 1 else 2,
                        executed_by="expert" if i == 1 else "student") for i in range(3)]
@@ -831,7 +834,7 @@ def switch_checks():
         and man_c["teacher_version"] == collect.TEACHER_COST_VERSION
         and man_c["costmap_tol_deg"] == 25.0 and man_c["costmap_lookahead_steps"] == 1
         and man_c["experimental_policy"] is False and man_c["teacher_tiebreak"] == "legacy")
-    out["costmap 行多 q_costs（4 浮点）"] = all(set(a) == ROW_KEYS_LEGACY | {"q_costs"} and len(a["q_costs"]) == 4
+    out["costmap 行多 q_costs（4 浮点）"] = all(set(a) == ROW_KEYS_DEFAULT | {"q_costs"} and len(a["q_costs"]) == 4
                                               for a in acts_c)
     man_c2, _, code_c2, _ = run_main(["--teacher-planner", "costmap", "--costmap-tol", "0", "--costmap-lookahead-steps", "2"], rows_c)
     out["costmap 变体参数进 manifest"] = (code_c2 is None and man_c2["costmap_tol_deg"] == 0.0

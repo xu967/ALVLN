@@ -29,6 +29,7 @@ import math
 import os
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -74,7 +75,7 @@ SPL_TASKS = ("base", "l1", "forest_e1", "course_base")
 # scene_gen/campus/asset_campus 目前都写死这个相机档；协议比对只用它做本次运行的实际值。
 CAMERA_PROFILE = "rgb320x240_fov60_v1"
 PROTOCOL_KEYS = ("window_from", "hold_s", "steps", "task",
-                 "appearance_version", "dynamics", "camera_profile")
+                 "appearance_version", "dynamics", "camera_profile", "action_latency_s")
 
 sys.path.insert(0, TOOLS)
 import collect_parallel as cp  # noqa: E402
@@ -784,6 +785,8 @@ def run_episode(seed, args, workdir, seen_gids):
                 cmd += ["--costmap-lookahead-steps", str(args.costmap_lookahead_steps)]
         if getattr(args, "vehicle", None) and args.vehicle != "x3":
             cmd += ["--vehicle", args.vehicle]   # x3 不传：旧命令行逐字不变
+        if args.action_latency is not None:
+            cmd += ["--action-latency", f"{args.action_latency:g}"]   # 没给不传：旧命令行逐字不变
         env = cp.gz_env(partition)
         proc = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE,
                                 stderr=subprocess.PIPE, text=True, start_new_session=True)
@@ -849,6 +852,18 @@ def run_episode(seed, args, workdir, seen_gids):
     })
     if meta.get("course"):   # course_base：块边界线（每块最远柱 x + 1.0）随集记下，逐块存活统计直接读它
         summary["block_goal_x"] = meta["course"]["block_goal_x"]
+    # W1-0：观测戳到派发的仿真秒（collect 每步都记 dispatch_lag_s；旧 collect 的集没有，不写键）。
+    lags = [a["dispatch_lag_s"] for a in actions if a.get("dispatch_lag_s") is not None]
+    if lags:
+        summary["dispatch_lag_s_median"] = statistics.median(lags)
+        summary["dispatch_lag_s_max"] = max(lags)
+    if args.action_latency is not None:
+        # 迟到步 = 动作就绪时仿真戳已超过 观测戳 + L + 0.02 s（collect 逐步记 late_dispatch）。数行而不是读 manifest：
+        # 采集中途失败的集没有 manifest 的计数，行是权威。有迟到步的集在 scan_episodes 里算基础设施失败。
+        late_ids = [a.get("step", i) for i, a in enumerate(actions) if a.get("late_dispatch")]
+        summary["late_dispatch_steps"] = len(late_ids)
+        if late_ids:
+            summary["late_step_ids"] = late_ids
     for a in actions:
         k = int(a.get("action_executed", -1))
         summary["actions"][k] = summary["actions"].get(k, 0) + 1
@@ -895,6 +910,7 @@ def scan_episodes(seed_list, episodes, run_fn, log=print, state=None):
             skips.append({"seed": seed, "reason": skip})
             continue
         attempted.append(seed)
+        late = summary.get("late_dispatch_steps") or 0   # 只有给了 --action-latency 才有这个键
         if summary["collect_rc"] != 0 or summary["steps"] == 0:
             # 采集中途失败不是「学生飞得差」，不计进 SR 分子，但占请求名额。
             failures.append({"seed": seed, "rc": summary["collect_rc"],
@@ -903,6 +919,21 @@ def scan_episodes(seed_list, episodes, run_fn, log=print, state=None):
                              "render_backend_requested": summary.get("render_backend_requested")})
             log(f"[seed {seed}] 采集失败 rc={summary['collect_rc']}，占请求名额、不计入成功",
                 flush=True)
+            continue
+        if late > 0:
+            # 迟到步 = 派发时刻偏离了固定的 观测戳 + L：这一集的动作生效时长不可比。与采集失败同样处理：
+            # 基础设施失败，占请求名额、不计入成功，原因与迟到明细随 failed[] 留证。
+            failures.append({"seed": seed, "rc": summary["collect_rc"],
+                             "error": f"late_dispatch: {late} 步迟到（动作就绪时已超过 观测戳 + L + 0.02 s），"
+                                      "派发时刻不再固定，本集不计成功",
+                             "late_dispatch_steps": late, "late_step_ids": summary.get("late_step_ids", []),
+                             "dispatch_lag_s_median": summary.get("dispatch_lag_s_median"),
+                             "dispatch_lag_s_max": summary.get("dispatch_lag_s_max"),
+                             "stderr_tail": summary.get("stderr_tail"),
+                             "performance": summary.get("performance"),
+                             "render_backend_requested": summary.get("render_backend_requested")})
+            log(f"[seed {seed}] 迟到派发 {late} 步（步号 {summary.get('late_step_ids')}），基础设施失败，"
+                "占请求名额、不计入成功", flush=True)
             continue
         seen.add(summary["dedup_key"])
         results.append(summary)
@@ -1059,6 +1090,13 @@ def main():
     p.add_argument("--heading-guard", type=int, default=0,
                    help="透传给 collect.py（仅 --policy student）：已执行的左转数减右转数的绝对值达到 N 就朝回转一步；"
                         "0=关闭。它改的是策略不是判据，eval.json 顶层记 heading_guard，不动 metric_version")
+    p.add_argument("--action-latency", type=float, default=None, metavar="L",
+                   help="透传给 collect.py：把动作派发时刻固定到仿真时间（观测戳 + L 秒），动作生效时长固定为 hold - L，"
+                        "迟到步（就绪时已超过 L + 0.02 s）记账。含迟到步的集算基础设施失败（eval.json failed[] 与 "
+                        "late_dispatch_episodes 单列），不计入成功。默认关（旧口径逐位不变）；开了以后 eval.json 顶层记 "
+                        "action_latency_s，新旧 SR 不可混报。只能配 --window-from observation，且 0 < L < --hold")
+    p.add_argument("--rtf", type=float, default=None,
+                   help="透传给 scene_gen：世界物理的目标实时因子（只能压低，缺省用模板值 1.0）。eval.json 顶层记 rtf")
     p.add_argument("--rule-version", choices=("v0", "v1"), default="v0",
                    help="透传给 collect.py（仅 --policy rule-oracle）：v0=固定规则（默认，命令行与输出逐位不变）；"
                         "v1=短期障碍记忆 + 候选航向选择（计划 D6）。v1 时 eval.json 顶层另记 rule_version")
@@ -1090,6 +1128,7 @@ def main():
         "task": args.task,
         "appearance_version": appearance_version_for(args.task, args.appearance),
         "dynamics": args.dynamics, "camera_profile": CAMERA_PROFILE,
+        "action_latency_s": args.action_latency,   # None = 旧口径；协议快照写了它而本次没给（或值不同）= OOD
     }
     protocol, mismatches = None, []
     if args.protocol:
@@ -1120,6 +1159,15 @@ def main():
         p.error("max-seeds >= episodes")
     if not (math.isfinite(args.hold) and args.hold > 0):
         p.error("--hold 必须是有限正数")
+    if args.action_latency is not None:
+        if not (math.isfinite(args.action_latency) and args.action_latency > 0):
+            p.error("--action-latency 必须是有限正数")
+        if args.action_latency >= args.hold:
+            p.error(f"--action-latency 必须小于 --hold（动作生效时长 = hold - L；L={args.action_latency:g} hold={args.hold:g}）")
+        if args.window_from != "observation":
+            p.error("--action-latency 只能配 --window-from observation（执行器截止 = 观测戳 + hold）")
+    if args.rtf is not None and not (math.isfinite(args.rtf) and args.rtf > 0):
+        p.error("--rtf 必须是有限正数")
     if args.heading_guard < 0 or (args.heading_guard and args.policy != "student"):
         p.error("--heading-guard 必须是非负整数，且只能和 --policy student 一起用")
     if args.policy != "rule-oracle" and args.rule_hfov_deg != 60.0:
@@ -1324,6 +1372,15 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
               "goal_margin": args.goal_margin,
               "corridor_half_width": args.corridor_half_width,
               **({"heading_guard": args.heading_guard} if args.heading_guard else {}),
+              # W1-0：动作派发固定到仿真时间。只在给了开关时写键（默认 eval.json 逐位不变）：action_latency_s 是口径
+              # （新旧 SR 不可混报）；含迟到步的集不在 per_episode，单列在 late_dispatch_episodes，明细同在 failed[]。
+              **({"action_latency_s": args.action_latency,
+                  "late_dispatch_episodes": [
+                      {k: f.get(k) for k in ("seed", "late_dispatch_steps", "late_step_ids",
+                                             "dispatch_lag_s_median", "dispatch_lag_s_max")}
+                      for f in failures if f.get("late_dispatch_steps")]}
+                 if args.action_latency is not None else {}),
+              **({"rtf": args.rtf} if args.rtf is not None else {}),
               # rule-oracle 的视场与规则参数：预注册的参数随结果留证（其它策略不写这两个键）
               **({"rule_hfov_deg": args.rule_hfov_deg,
                   "rule_params": rule_policy.RULE_V0 if args.rule_version == "v0" else rule_policy.RULE_V1,

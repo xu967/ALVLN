@@ -369,6 +369,25 @@ def _free_cells(pillars, clearance, step):
     return cells
 
 
+def warm_free_cells(pillars, clearance=None, step=0.1):
+    """把整张 A* 栅格的「可走」一次填进缓存（--action-latency 的每集预热），返回格子数。
+
+    astar_path 按需填格子：一集的第一步还没有缓存，A* 比后续步慢约 0.45 s（K=3 长课程），那一步的动作就晚了。
+    预热按 astar_path 同一把钥匙（余量、步长、柱子几何）、同一个栅格范围（_grid_spec）、同一个判定（_point_blocked）
+    逐格填满；格子的值只由钥匙决定，所以之后 astar_path 的路径与按需填的逐位相同。clearance 缺省取当前载具档
+    （set_vehicle 之后的 ASTAR_CLEARANCE_M，与 plan_action_global 的缺省一致）。
+    """
+    if clearance is None:
+        clearance = ASTAR_CLEARANCE_M
+    x0, y0, nx, ny = _grid_spec(pillars, step)
+    free = _free_cells(pillars, clearance, step)
+    for i in range(nx):
+        for j in range(ny):
+            if (i, j) not in free:
+                free[(i, j)] = not _point_blocked(x0 + i * step, y0 + j * step, pillars, clearance)
+    return nx * ny
+
+
 def astar_path(pillars, start, goal, clearance=0.5, step=0.1):
     """柱区 2D 栅格 A*，返回 [(x,y), ...] 或 None。
 
