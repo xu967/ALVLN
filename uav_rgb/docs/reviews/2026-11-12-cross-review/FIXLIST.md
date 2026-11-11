@@ -30,8 +30,8 @@
 | K3 | `df15994` | `f5f1596` | 32 个文件，+6125 −30 | `rule_policy.py` 规则 v2；`sim/3dgs/rule_oracle.py` 的 `rule_version` |
 | W1-12 | `dfb98c4` | `0401dee` | 15 个文件，+3776 −18 | `sim/3dgs/planner.py` 的 `clearance=swept`；`collect_3dgs.py` 出生两层判空（缺省关） |
 | E2E-0 | `f39ba81` | `2c95ea0` | 12 个文件，+2561 | 只有实验入口与分析脚本 |
-| T1（第二批，11-12 06:55） | `b706b2f` | `fe6ca32` | 5 个文件，+544 | 只加测试（审核 F4、F5 的两个 C++ 测试与公共夹具） |
-| S1a（11-12 07:45） | `5387747` | 推镜像后补 | 9 个文件，+869 −23 | `sim/3dgs/collect_3dgs.py` 的 `StudentAdapter` / `DaggerPolicy` 与 `guard.py`（C2）；`sim/3dgs/eval_3dgs.py` 的 `eval_split` 与 `--allow-train-scene`、共用驱动的 `split_from_identity`（D1） |
+| T1（第二批，11-12 06:54） | `b706b2f` | `fe6ca32` | 5 个文件，+544 | 只加测试（审核 F4、F5 的两个 C++ 测试与公共夹具） |
+| S1a（11-12 07:38） | `5387747` | `d7937c8` | 9 个文件，+869 −23 | `sim/3dgs/collect_3dgs.py` 的 `StudentAdapter` / `DaggerPolicy` 与 `guard.py`（C2）；`sim/3dgs/eval_3dgs.py` 的 `eval_split` 与 `--allow-train-scene`、共用驱动的 `split_from_identity`（D1） |
 
 - 合计（`git diff --shortstat base-20261112 f39ba81`）：`src`、`sim`、`tools` 下 50 个文件 +8555 −169，其中不是测试的 24 个文件 +2004 −148；`experiments` 下 62 个文件 +13610 −37。
 - 合并时的冲突四次，解决办法写在各自合并提交的说明里：W1-9（`collect.py` 与 `dagger_gz_pipeline.py`，同时保留 W1-3 的 `probs` 与 W1-5 的交付权重项）、
@@ -45,7 +45,7 @@
 
 | 卡 | 对应的发现 | 分支 |
 | --- | --- | --- |
-| S1a（11-12 07:45 已合并，`5387747`） | C2、G1、F1（3DGS 学生的上一步动作）、D1（评测场景的 split） | `p12-s1a` |
+| S1a（11-12 07:38 已合并，`5387747`） | C2、G1、F1（3DGS 学生的上一步动作）、D1（评测场景的 split） | `p12-s1a` |
 | S1b | B1–B7（3DGS 碰撞口径）、E-12；新旧口径下重定基线 | `p12-s1b` |
 | W1-13 | A1、A3、A5、G5（步间刹停与记账）、A2 的采集并行器部分；动作持续到下一次派发并重标定 | `p12-w1-13` |
 | W1-14 | D2、D4、D5、D7、A4 与卡 W1-2 的遗留 | `p12-w1-14` |
