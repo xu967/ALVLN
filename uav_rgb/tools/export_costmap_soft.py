@@ -20,7 +20,7 @@ import numpy as np
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "sim", "tools"))
-from teacher import TEACHER_COST_VERSION  # noqa: E402
+from teacher import recomputable_versions  # noqa: E402
 
 NUM_CLASSES = 4
 
@@ -45,6 +45,8 @@ def main():
         p.error("--fallback-peak 在 (0.5, 1)")
 
     out, n_q, n_fb, n_mismatch = {}, 0, 0, 0
+    accepted = recomputable_versions(costmap=True)
+    version = None       # 各集 costmap 教师版本必须一致：v1 点目标、v2 过柱阵后线目标，出口区标签口径不同，不混导
     for split in args.splits.split(","):
         for ep in sorted(glob.glob(os.path.join(args.src, split, "*"))):
             man_path = os.path.join(ep, "episode_manifest.json")
@@ -52,9 +54,14 @@ def main():
             if not (os.path.isfile(man_path) and os.path.isfile(act_path)):
                 continue
             man = json.load(open(man_path, encoding="utf-8"))
-            if man.get("planner") != "costmap" or man.get("teacher_version") != TEACHER_COST_VERSION:
+            if man.get("planner") != "costmap" or man.get("teacher_version") not in accepted:
                 sys.exit(f"错误: {ep} 不是 costmap 集（planner={man.get('planner')}, "
-                         f"teacher_version={man.get('teacher_version')}）")
+                         f"teacher_version={man.get('teacher_version')}，可接受 {list(accepted)}）")
+            if version is None:
+                version = man["teacher_version"]
+            elif man["teacher_version"] != version:
+                sys.exit(f"错误: {ep} 的 teacher_version={man['teacher_version']} 与此前的 {version} 不一致，"
+                         f"不同版本的软标签口径不同，不能混导")
             eid = str(man.get("episode_id", os.path.basename(ep)))
             for line in open(act_path, encoding="utf-8"):
                 if not line.strip():
@@ -80,7 +87,7 @@ def main():
                 out[key] = logits.astype(np.float32)
     if not out:
         sys.exit("错误: 没有读到任何帧")
-    meta = {"teacher_version": np.array(TEACHER_COST_VERSION), "alpha_steps": np.array(str(args.alpha)),
+    meta = {"teacher_version": np.array(version), "alpha_steps": np.array(str(args.alpha)),
             "aggregate": np.array("costmap_softmax_negQ_over_alpha"),
             "n_frames": np.array(len(out)), "n_from_q": np.array(n_q), "n_fallback": np.array(n_fb),
             "n_argmin_ne_label": np.array(n_mismatch), "src": np.array(os.path.abspath(args.src))}

@@ -193,12 +193,26 @@ class CountingAndClasses(unittest.TestCase):
         self.assertEqual((action, tie), teacher.plan_action_global_tiebreak(-0.5, 0.0, 0.0, pillars, "legacy"))
 
     def test_count_call_detects_astar_failure_fallback(self):
-        """起点在柱子正中：邻格全在膨胀区里，A* 第一次出堆就没有路 → 退回局部 plan_action。"""
+        """起点在柱子正中：邻格全在膨胀区里，A* 第一次出堆就没有路 → 退回局部 plan_action。
+
+        v5 规则（B3 关）只调一次 A*；v7 规则（B3 开）标准余量无路后再按 0.30、0.20 m 各重试一次，共 3 次 A*，
+        每次都在第一次出堆就失败（起点在柱方框里，余量再小邻格也在膨胀区内），最后仍退回局部 plan_action 一次。
+        """
         pillars = tiny_scene()
+        teacher.set_vehicle("e1_mini", "base", version="uavrgb.teacher.v5")
+        try:
+            _res, counts = pf.count_call(teacher, teacher.plan_action_global_tiebreak, 2.0, 0.5, 0.0, pillars, "legacy")
+            self.assertEqual(counts["astar_calls"], 1)
+            self.assertEqual(counts["fallback_calls"], 1)
+            self.assertEqual(counts["pops"], 1)
+            self.assertIsNone(counts["path_cells"])
+        finally:
+            teacher.set_vehicle("e1_mini", "base")
         _res, counts = pf.count_call(teacher, teacher.plan_action_global_tiebreak, 2.0, 0.5, 0.0, pillars, "legacy")
-        self.assertEqual(counts["astar_calls"], 1)
+        self.assertEqual(counts["astar_calls"], 1 + len(teacher.ASTAR_RETRY_CLEARANCES))
+        self.assertEqual(counts["astar_calls"], 3)
         self.assertEqual(counts["fallback_calls"], 1)
-        self.assertEqual(counts["pops"], 1)
+        self.assertEqual(counts["pops"], 3)
         self.assertIsNone(counts["path_cells"])
 
     def test_count_call_restores_module_when_fn_raises(self):

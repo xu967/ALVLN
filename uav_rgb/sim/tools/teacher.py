@@ -20,14 +20,20 @@ import math
 SAFE_NEUTRAL, FORWARD_SLOW, YAW_LEFT, YAW_RIGHT = 0, 1, 2, 3
 ACTIONS = ("SAFE_NEUTRAL", "FORWARD_SLOW", "YAW_LEFT", "YAW_RIGHT")
 
-# 教师实现版本：改动作选择（A* 参数/前向安全门/局部容差）必须 bump。
-# collect 写进 manifest，audit 只对同版本数据做 label_recompute，避免用新算法
-# 复算旧标签造成假 FAIL。
-TEACHER_VERSION = "uavrgb.teacher.v5"  # v5：goal-stop（waypoint 作为最终目标）
-# 版本按任务档位分开：forest_e1 档的动作选择（余量 0.20/0.15 + 圆柱按圆判定）与 v5 不同，
-# 旧森林集（manifest 仍写 v5、按 0.40/0.30 方框算的标签）不能被新算法复算。base 档
-# （柱阵 base/l1/safe/campus…）的动作选择一字未改、标签逐字节同 v5，所以不 bump——
-# bump 会让 audit 对 E1 流水线正在产出的 v5 集全部跳过 label_recompute。
+# 教师实现版本：改动作选择（A* 参数/前向安全门/局部容差/目标定义）必须 bump，并在 TEACHER_RULES_BY_VERSION 加一行。
+# collect 写进 manifest；audit 的 label_recompute 按 manifest 里的版本分派规则（set_vehicle(..., version=)），
+# 旧版本的集按旧规则复算：不跳过，也不会用新算法复算旧标签造成假 FAIL。
+TEACHER_VERSION = "uavrgb.teacher.v7"
+# v7（第十二阶段 W1-7）：
+#   B2 机体越过最远柱后表面（最远柱 x + 柱半宽）后，base 目标 (最远柱 x + 2.0, 0) 的 y 取当前 y（点 → 线）。
+#      点目标让出口区的教师为回到 y=0 继续转向，这些 YAW 标签占出口区 17.7%，而学生看不到目标点（data-algo §A2）。
+#   B3 A* 在标准余量下无路（起点落在余量内、八邻全堵）时，按 0.30、0.20 m 各重试一次，只试严格小于标准余量的档位，
+#      仍无路才返回 None、由调用方退回局部规划（无路步原先退回局部规则左右摆，data-algo §A4）。
+#   costmap 教师的 B2 同步生效，版本是 TEACHER_COST_VERSION（v2）。
+# v6：forest_e1 档（余量 0.20/0.15 + 圆柱按圆判定），版本按任务档位分开：旧森林集（写 v5、按 0.40/0.30 方框算）
+#   不能被它复算。forest_e1 档仍是旧规则（v6 = 不开 B2、B3）：B2、B3 只在 base 档的 20 个冻结 seed 上做过闭环验证，
+#   森林档的标签逐位不变。
+# v5：goal-stop（waypoint 作为最终目标）。
 # 已知口径问题：5af664a 把 e1_mini 的 base 余量从 0.5/0.36 改到 0.40/0.30 并加脱困 v2 却没 bump，
 # 0357 与 0417 两次 pilot 都写 v5；此前的 e1 集只能靠采集时间区分。
 TEACHER_VERSION_BY_TASK = {"base": TEACHER_VERSION, "forest_e1": "uavrgb.teacher.v6"}
@@ -171,25 +177,34 @@ ESCAPE_STAGES = ESCAPE_STAGES_BY_VEHICLE["x3"]
 # 按 err 原地左右换向；② 局部脱困选出射线后，前向 0.4 m 检查用同样的 skip，否则 t=0 永远被判堵、
 # 脱困射线永远走不出去（只会 YAW）。E1 pilot 两种卡法都实测到了。
 ESCAPE_V2 = False
+# 教师规则档（按 TEACHER_RULES_BY_VERSION 取，set_vehicle 设置）。导入时的缺省 = 当前 TEACHER_VERSION 的规则：
+# GOAL_LINE_AFTER_PILLARS = B2（过柱阵后目标取线）；ASTAR_RETRY_CLEARANCES = B3（A* 无路时依次重试的余量，空 = 不重试）。
+GOAL_LINE_AFTER_PILLARS = True
+ASTAR_RETRY_CLEARANCES = (0.30, 0.20)
 
 
-def set_vehicle(name, task="base"):
-    """按 (载具, 任务档位) 切换机身半宽、规划余量与脱困策略；未知载具报错。
+def set_vehicle(name, task="base", version=None):
+    """按 (载具, 任务档位) 切换机身半宽、规划余量与脱困策略，并按教师版本切换规则档（B2、B3）；未知载具/版本报错。
 
     collect.py 在解析 --vehicle 与 scene.json 后调用一次；audit 复算每集前按 manifest.vehicle +
-    task_of_scene(scene.json) 调。任务没有单列余量时用该载具的 base 档（l1/safe/campus 都是柱阵）。
+    task_of_scene(scene.json) + manifest.teacher_version 调。任务没有单列余量时用该载具的 base 档（l1/safe/campus 都是柱阵）。
+    version=None：取该任务档位当前的教师版本（teacher_version(task)）；给定时取该版本的规则，用来按旧规则复算旧数据。
+    规则在改任何全局状态之前先校验：未知版本报错时不会留下改了一半的状态。
     """
     global BODY_HALF_M, ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M, ESCAPE_STAGES, ESCAPE_V2, TEACHER_TASK
+    global GOAL_LINE_AFTER_PILLARS, ASTAR_RETRY_CLEARANCES
     if name not in BODY_HALF_BY_VEHICLE:
         raise ValueError(f"未知载具 {name!r}，可选 {sorted(BODY_HALF_BY_VEHICLE)}")
     if not isinstance(task, str) or not task:
         raise ValueError(f"任务档位必须是非空字符串，得到 {task!r}")
+    rules = rules_for_version(version if version is not None else teacher_version(task))
     BODY_HALF_M = BODY_HALF_BY_VEHICLE[name]
     ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M = CLEARANCE_BY_VEHICLE.get(
         (name, task), CLEARANCE_BY_VEHICLE[(name, "base")])
     ESCAPE_STAGES = ESCAPE_STAGES_BY_VEHICLE[name]
     ESCAPE_V2 = name != "x3"
     TEACHER_TASK = task
+    GOAL_LINE_AFTER_PILLARS, ASTAR_RETRY_CLEARANCES = rules["goal_line"], rules["retry"]
     return BODY_HALF_M
 
 
@@ -470,25 +485,59 @@ def _pursuit_err_deg(path, x, y, yaw_deg, lookahead):
     return (math.degrees(math.atan2(ty - y, tx - x)) - yaw_deg + 180.0) % 360.0 - 180.0
 
 
+def _pillar_back_x(p):
+    """柱的后表面 x：圆柱 x + radius；方柱 x + size[0]/2（缺 size 按 0.4 m 方柱的半宽 0.2）。"""
+    r = p.get("radius")
+    if r is not None:
+        return float(p["x"]) + float(r)
+    return float(p["x"]) + p.get("size", [0.4, 0.4])[0] / 2
+
+
+def _pillars_back_x(pillars):
+    """所有柱的后表面里最靠后的 x：机体 x 大于它，才算越过整个柱阵（B2 的触发线）。"""
+    return max(_pillar_back_x(p) for p in pillars)
+
+
+def _astar_retry(pillars, start, goal, clearance, step):
+    """B3：标准余量下 A* 无路时，按 ASTAR_RETRY_CLEARANCES 里严格小于标准余量的档位依次重试，第一个有路的就用。
+
+    无路的典型成因是起点已漂进余量、八邻全堵（起点格强制可走也出不去）。重试放宽的是「离柱面多远算可走」，
+    路径仍是 A* 最短路；每个余量用自己的可走性缓存钥匙（_free_cells 的钥匙含余量），不会串档。
+    标准余量下有路时只调一次 astar_path，与改动前逐位相同。ASTAR_RETRY_CLEARANCES 为空（旧版本规则、forest 档）时不重试。
+    """
+    path = astar_path(pillars, start, goal, clearance=clearance, step=step)
+    if path is None:
+        for c in ASTAR_RETRY_CLEARANCES:
+            if c < clearance:
+                path = astar_path(pillars, start, goal, clearance=c, step=step)
+                if path is not None:
+                    break
+    return path
+
+
 def _global_path(x, y, pillars, clearance, step, waypoint=None, stop_at_waypoint=False):
     """plan_action_global 跟踪的那条 A* 路径；None = 无路或 waypoint 字段坏（调用方退回局部 plan_action）。
 
     base 任务目标 (最远柱 x + 2.0, 0)：比验收线（最远柱 x + 1.0）再远 1 m，目标正好落在验收线上时
-    飞控会在终点前转头/减速，max_x 常停在 5.97 而判失败。waypoint 任务：stop_at_waypoint 时 waypoint 就是
-    终点；旧 route-choice 口径是「先到 waypoint 再到走廊终点」两段拼接。tie-break 的滚出位姿也走这里，
-    保证 Q_L/Q_R 与教师看的是同一张图、同一个目标。
+    飞控会在终点前转头/减速，max_x 常停在 5.97 而判失败。B2（v7）：机体 x 越过所有柱的后表面后，目标 y 取当前 y
+    （点 → 线）：过了柱阵不再为回到 y=0 转向，学生也看不到那个点。waypoint 任务：stop_at_waypoint 时 waypoint 就是
+    终点；旧 route-choice 口径是「先到 waypoint 再到走廊终点」两段拼接（B2 只作用于 base 目标，waypoint 任务不受影响）。
+    tie-break 的滚出位姿也走这里，保证 Q_L/Q_R 与教师看的是同一张图、同一个目标。
+    B3（v7）：每次 A* 无路时按 ASTAR_RETRY_CLEARANCES 降余量重试（见 _astar_retry）。
     """
     goal = (max(float(p["x"]) for p in pillars) + 2.0, 0.0)
     if waypoint is None:
-        return astar_path(pillars, (x, y), goal, clearance=clearance, step=step)
+        if GOAL_LINE_AFTER_PILLARS and x > _pillars_back_x(pillars):
+            goal = (goal[0], float(y))
+        return _astar_retry(pillars, (x, y), goal, clearance, step)
     try:
         wp = (float(waypoint["x"]), float(waypoint["y"]))
     except (KeyError, TypeError, ValueError):
         return None
     if stop_at_waypoint:
-        return astar_path(pillars, (x, y), wp, clearance=clearance, step=step)
-    first = astar_path(pillars, (x, y), wp, clearance=clearance, step=step)
-    rest = (astar_path(pillars, wp, goal, clearance=clearance, step=step)
+        return _astar_retry(pillars, (x, y), wp, clearance, step)
+    first = _astar_retry(pillars, (x, y), wp, clearance, step)
+    rest = (_astar_retry(pillars, wp, goal, clearance, step)
             if first is not None else None)
     return (first + rest[1:]) if first is not None and rest is not None else None
 
@@ -501,6 +550,7 @@ def plan_action_global(x, y, yaw_deg, pillars, clearance=None, step=0.1,
     tol=25°：偏航一步约 34°，容差小于半步会左右过冲（T1 门柱振荡的根因）。
     路径目标比 T1 验收终点（最右柱 x+1.0）再远 1 m：目标正好落在验收线上时，
     飞控会在终点前转头/减速，max_x 常停在 5.97 而判失败；多飞 1 m 才真正越过。
+    v7：越过柱阵后目标取线（B2），A* 无路时降余量重试（B3），细节见 _global_path / _astar_retry。
 
     stop_at_waypoint=True（L1 v2 goal-stop）：waypoint 就是最终目标，距其
     ≤ stop_radius 时输出 SAFE_NEUTRAL；不再去走廊终点。旧 route-choice 的
@@ -657,7 +707,41 @@ def plan_action_global_tiebreak(x, y, yaw_deg, pillars, tiebreak="legacy", clear
 # cost-to-go 的 argmin 与 legacy 标签只有 72.2% 一致，P1 的失败根因是「示范专家 ≠ 标注专家」。这里让示范教师本身
 # 就是 argmin_a Q(s,a)：Q 建在同一张测地场上（栅格 / 膨胀 / 移动集与 astar_path 同一套 helper），软标签只从这一个 Q 来。
 # 版本独立于 TEACHER_VERSION：costmap 集的 manifest 写这个，audit 按 planner 字段选复算函数。
-TEACHER_COST_VERSION = "uavrgb.teacher_cost.v1"
+# v2（第十二阶段 W1-7 的 B2）：越过柱阵后目标取线（见 _costmap_goal）；v1 = 目标永远是点 (最远柱 x + 2.0, 0)。
+TEACHER_COST_VERSION = "uavrgb.teacher_cost.v2"
+
+
+# 版本 → 规则档。audit 的 label_recompute 按 manifest.teacher_version 取这张表（set_vehicle(..., version=)），
+# 旧版本的集按旧规则复算；collect 与评测不传版本，取当前版本的规则。
+#   goal_line：B2，越过柱阵后 base 目标的 y 取当前 y（A* 教师的 _global_path 与 costmap 教师的 _costmap_goal 共用这一个开关）。
+#   retry：B3，A* 无路时依次重试的余量（只试严格小于标准余量的档位；costmap 教师不走 A*，用不到）。
+# 加新版本必须加一行：set_vehicle 缺省取当前版本，表里没有会直接报错，不会悄悄沿用旧规则。
+TEACHER_RULES_BY_VERSION = {
+    "uavrgb.teacher.v5": {"goal_line": False, "retry": ()},
+    "uavrgb.teacher.v6": {"goal_line": False, "retry": ()},      # forest_e1 档：旧规则
+    TEACHER_VERSION: {"goal_line": True, "retry": (0.30, 0.20)},
+    "uavrgb.teacher_cost.v1": {"goal_line": False, "retry": ()},
+    TEACHER_COST_VERSION: {"goal_line": True, "retry": ()},
+}
+# audit 能按旧规则逐位复算的版本（按任务档位；最新的在最后）。写进这张表 = 承诺上面的规则档能复现该版本的标签。
+RECOMPUTABLE_VERSIONS = {"base": ("uavrgb.teacher.v5", TEACHER_VERSION),
+                         "forest_e1": (TEACHER_VERSION_BY_TASK["forest_e1"],)}
+RECOMPUTABLE_COST_VERSIONS = ("uavrgb.teacher_cost.v1", TEACHER_COST_VERSION)
+
+
+def rules_for_version(version):
+    """教师版本对应的规则档 {"goal_line": bool, "retry": 余量元组}；版本不认识报错（不回落到当前规则）。"""
+    rules = TEACHER_RULES_BY_VERSION.get(version) if isinstance(version, str) else None
+    if rules is None:
+        raise ValueError(f"未知教师版本 {version!r}，可选 {sorted(TEACHER_RULES_BY_VERSION)}")
+    return dict(rules)
+
+
+def recomputable_versions(task=None, costmap=False):
+    """audit 能复算的教师版本：costmap 集看 RECOMPUTABLE_COST_VERSIONS，其余按任务档位（未单列的任务走 base 档）。"""
+    if costmap:
+        return RECOMPUTABLE_COST_VERSIONS
+    return RECOMPUTABLE_VERSIONS.get(task if task is not None else TEACHER_TASK, RECOMPUTABLE_VERSIONS["base"])
 COST_TIE_EPS = 1e-6          # |ΔQ| 小于它算平局（先按可见柱侧，再按动作枚举顺序）
 _FIELD_CACHE_MAX = 16        # 每个场景一张场（柱子静态）；relabel 逐集扫 300 个场景时只保留最近的几张
 _FIELD_CACHE = {}
@@ -759,10 +843,17 @@ def geodesic_field(pillars, goal, clearance, step=0.1):
     return field
 
 
-def _costmap_goal(pillars, waypoint, stop_at_waypoint):
-    """costmap 的目标点：base 任务 (最远柱 x + 2.0, 0)（与 _global_path 同）；goal-stop 任务就是 waypoint。"""
+def _costmap_goal(pillars, waypoint, stop_at_waypoint, x=None, y=None):
+    """costmap 的目标点：base 任务 (最远柱 x + 2.0, 0)（与 _global_path 同）；goal-stop 任务就是 waypoint。
+
+    B2（cost v2）：给了机体位置 (x, y) 且 x 已越过所有柱的后表面时，base 目标的 y 取当前 y（点 → 线，与 _global_path 同）。
+    测地场按目标缓存，出口区每个不同的 y 一张场（E1 柱阵约 5000 格、10 ms）。不给 (x, y) 时仍是点目标。
+    """
     if waypoint is None:
-        return (max(float(p["x"]) for p in pillars) + 2.0, 0.0)
+        goal_x = max(float(p["x"]) for p in pillars) + 2.0
+        if GOAL_LINE_AFTER_PILLARS and x is not None and y is not None and x > _pillars_back_x(pillars):
+            return (goal_x, float(y))
+        return (goal_x, 0.0)
     if not stop_at_waypoint:
         raise ValueError("costmap 教师只支持 goal-stop 的 waypoint 任务，不支持旧 route-choice 两段目标")
     return (float(waypoint["x"]), float(waypoint["y"]))
@@ -799,7 +890,7 @@ def plan_costs(x, y, yaw_deg, pillars, clearance=None, step=0.1, lookahead=0.7, 
         raise ValueError("lookahead_steps 必须 ≥ 1")
     if clearance is None:
         clearance = ASTAR_CLEARANCE_M
-    goal = _costmap_goal(pillars, waypoint, stop_at_waypoint)
+    goal = _costmap_goal(pillars, waypoint, stop_at_waypoint, x, y)
     field = geodesic_field(pillars, goal, clearance, step)
     q = [_q_value(field, pillars, *_rollout(x, y, yaw_deg, a), lookahead, tol, lookahead_steps)
          for a in range(4)]
@@ -1031,10 +1122,10 @@ if __name__ == "__main__":
     print(f"  {'ok' if got_stop == SAFE_NEUTRAL and got_go != SAFE_NEUTRAL else 'FAIL'}  "
           f"goal-stop: 半径内={ACTIONS[got_stop]}, 半径外={ACTIONS[got_go]}")
 
-    # forest_e1 档：(载具, 任务) 余量与版本。base 档一字不改（x3 / e1_mini 标签逐字节同 v5）。
+    # forest_e1 档：(载具, 任务) 余量与版本。base 档的余量与脱困策略一字不改（v7 只改目标与无路重试，见下面的 v7 自检）。
     try:
         ok_prof = set_vehicle("x3") == 0.235 and (ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M) == (0.5, 0.36)
-        ok_prof = ok_prof and teacher_version() == TEACHER_VERSION == "uavrgb.teacher.v5"
+        ok_prof = ok_prof and teacher_version() == TEACHER_VERSION == "uavrgb.teacher.v7"
         set_vehicle("e1_mini")
         ok_prof = ok_prof and (ASTAR_CLEARANCE_M, LOCAL_CLEARANCE_M) == (0.40, 0.30)
         ok_prof = ok_prof and teacher_version() == TEACHER_VERSION
@@ -1111,6 +1202,31 @@ if __name__ == "__main__":
             ok_t = False
         ok = ok and ok_t
         print(f"  {'ok' if ok_t else 'FAIL'}  tiebreak=visible 近平局（{m_vis:.2f} 步）改向可见柱反侧，legacy 不变、非平局不改")
+
+        # v7（W1-7）：B2 越过柱阵后目标取线——机体在 (最远柱 x + 0.5, 1.2)、机头 +x：v7 前进，v5 规则还在转向回 y=0；
+        # B3 标准余量下无路（起点离柱前表面 0.25 m，0.40 m 余量八邻全堵）、0.30 m 余量有路：v7 给出路径，v5 规则无路 → 局部规划 SAFE。
+        # 完整用例在 test_teacher_v7.py；这里只留一条最短的，让 check.sh 跑 teacher 自检时也覆盖规则开关。
+        wall = [{"x": 1.55, "y": 0.0, "z": 1.5, "size": [0.4, 0.4, 3.0]}]
+        set_vehicle("e1_mini")
+        ok_v7 = plan_action_global(2.0, 1.2, 0.0, gate) == FORWARD_SLOW
+        ok_v7 = ok_v7 and _global_path(1.1, 0.0, wall, ASTAR_CLEARANCE_M, 0.1) is not None
+        set_vehicle("e1_mini", "base", version="uavrgb.teacher.v5")
+        ok_v7 = ok_v7 and plan_action_global(2.0, 1.2, 0.0, gate) == YAW_RIGHT
+        ok_v7 = ok_v7 and _global_path(1.1, 0.0, wall, ASTAR_CLEARANCE_M, 0.1) is None
+        ok_v7 = ok_v7 and plan_action_global(1.1, 0.0, 0.0, wall) == SAFE_NEUTRAL
+        set_vehicle("e1_mini", "forest_e1")          # forest 档缺省 v6：B2、B3 都关
+        ok_v7 = ok_v7 and not GOAL_LINE_AFTER_PILLARS and ASTAR_RETRY_CLEARANCES == ()
+        ok_v7 = ok_v7 and all(rules_for_version(v) for v in TEACHER_RULES_BY_VERSION)
+        ok_v7 = ok_v7 and TEACHER_VERSION in TEACHER_RULES_BY_VERSION and TEACHER_COST_VERSION in TEACHER_RULES_BY_VERSION
+        ok_v7 = ok_v7 and recomputable_versions("base") == ("uavrgb.teacher.v5", TEACHER_VERSION)
+        try:
+            set_vehicle("e1_mini", "base", version="uavrgb.teacher.v99")
+        except ValueError:
+            pass
+        else:
+            ok_v7 = False
+        ok = ok and ok_v7
+        print(f"  {'ok' if ok_v7 else 'FAIL'}  v7：过柱阵后目标取线（FORWARD，v5 规则 YAW_RIGHT）、无路降余量重试（v5 规则 SAFE）、forest 档不开、版本表")
     finally:
         set_vehicle("x3")
 

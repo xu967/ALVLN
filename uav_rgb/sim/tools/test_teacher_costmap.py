@@ -10,6 +10,8 @@
 
 legacy 锁定值（硬编码）取自 main 2899428 未改动前的 teacher.py（仓库解释器 .venv-tools Python 3.12、E1 base 档）：
 抽 astar_path 的栅格 helper、把 TIE_* 收进 _rollout/_q_from 之后，这些数必须逐位不变。
+W1-7 升版（TEACHER_VERSION v5 → v7，B2 过柱阵后目标取线、B3 A* 无路降余量重试）之后，legacy 锁与数据回归按 v5 规则复算
+（set_vehicle(..., version=v5)，数据回归按 manifest.teacher_version）；V7_LOCK 单独锁 B3 改变了的状态。
 换解释器（如 conda 3.11）时 libm 的 hypot/atan2 可能差 1 ulp（相对 1e-16），_same 对浮点放 1e-14 相对 + 1e-13 绝对容差（margin 是两个 Q 之差，抵消后相对误差放大）——
 任何模型改动都在 1e-6 以上，不会漏；整数（动作）仍精确比。
 """
@@ -49,6 +51,18 @@ ASTAR_LOCK = [  # (载具, 场景, start, goal, clearance) → (路径点数, �
     ("e1_mini", TIE, (0.0, 0.0), (4.4, 0.0), 0.40, 45, "fef1621e5e5a9a13"),
 ]
 
+# legacy 锁值取自升版前的 teacher.py：按 v5 规则（B2、B3 关）复算。
+LEGACY_RULES = "uavrgb.teacher.v5"
+# v7 规则下与 LEGACY_LOCK 不同的两个状态：滚出位姿落在 0.40 m 余量内，旧规则下 A* 无路（该侧 Q = 40），B3 按 0.30 m 余量重试后有路：
+#   ONE 柱 (0.5, 0, 20°)：Q_L、Q_R 都从 40 变成有限值（margin 0 → 2.95）；
+#   GATE 柱 (1.1, 0.48, 0°)：Q_R 从 40 变成 11.75（margin 28.4 → 0.15，变成近平局）。
+# LEGACY_LOCK 的其余 6 个状态在 v7 规则下与 v5 逐位相同。数值由本次改动后的 teacher.py 算出，只锁回归，不是独立真值
+# （独立对照见 test_teacher_v7.py）。
+V7_LOCK = [
+    (ONE, (0.5, 0.0, 20.0), 2.948931371378004, 16.27762542924883, 13.328694057870825, 3),
+    (GATE, (1.1, 0.48, 0.0), 0.15382935225432703, 11.594112549695428, 11.747941901949755, 2),
+]
+
 passed = 0
 
 
@@ -74,9 +88,9 @@ def _same(got, want):
 
 
 def synthetic():
-    t.set_vehicle("e1_mini", "base")
+    t.set_vehicle("e1_mini", "base", version=LEGACY_RULES)
     try:
-        # ---- legacy 锁 ----
+        # ---- legacy 锁（v5 规则）----
         for pil, (x, y, yaw), m_ref, ql_ref, qr_ref, act_ref in LEGACY_LOCK:
             m = t.lr_tie_margin_steps(x, y, yaw, pil)
             ql = t._q_after_yaw(x, y, yaw, t.YAW_LEFT, pil, t.ASTAR_CLEARANCE_M, 0.1, 0.7, 25.0)
@@ -88,11 +102,25 @@ def synthetic():
         vis, m_vis = t.plan_action_global_tiebreak(0.0, 0.0, -10.0, TIE, "visible")
         check("tiebreak legacy/visible 不变", _same((leg, m_leg, vis, m_vis), (2, None, 3, 0.21792723167688166)))
         for veh, pil, s, g, cl, n_ref, sha_ref in ASTAR_LOCK:
-            t.set_vehicle(veh)
+            t.set_vehicle(veh, "base", version=LEGACY_RULES)
             path = t.astar_path(pil, s, g, clearance=cl)
             sha = hashlib.sha256(json.dumps(path).encode()).hexdigest()[:16]
             check(f"astar_path 锁 {veh}", (len(path), sha) == (n_ref, sha_ref), f"got {(len(path), sha)}")
+        # ---- v7 规则：B3 之后 LEGACY_LOCK 里 A* 无路的 2 个状态变成有路，其余 6 条状态与 v5 逐位相同 ----
         t.set_vehicle("e1_mini", "base")
+        for pil, (x, y, yaw), m_ref, ql_ref, qr_ref, act_ref in V7_LOCK:
+            m = t.lr_tie_margin_steps(x, y, yaw, pil)
+            ql = t._q_after_yaw(x, y, yaw, t.YAW_LEFT, pil, t.ASTAR_CLEARANCE_M, 0.1, 0.7, 25.0)
+            qr = t._q_after_yaw(x, y, yaw, t.YAW_RIGHT, pil, t.ASTAR_CLEARANCE_M, 0.1, 0.7, 25.0)
+            act = t.plan_action_global(x, y, yaw, pil)
+            check(f"v7 锁 {len(pil)} 柱 {(x, y, yaw)}", _same((m, ql, qr, act), (m_ref, ql_ref, qr_ref, act_ref)),
+                  f"got {(m, ql, qr, act)!r} want {(m_ref, ql_ref, qr_ref, act_ref)!r}")
+        same_in_v7 = [row for row in LEGACY_LOCK if all(row[:2] != v[:2] for v in V7_LOCK)]
+        check("LEGACY_LOCK 里 v7 规则下不变的状态数", len(same_in_v7) == len(LEGACY_LOCK) - len(V7_LOCK) == 6)
+        for pil, (x, y, yaw), m_ref, ql_ref, qr_ref, act_ref in same_in_v7:
+            m = t.lr_tie_margin_steps(x, y, yaw, pil)
+            check(f"v7 规则下未触发 B2/B3 的状态与 v5 逐位相同 {len(pil)} 柱 {(x, y, yaw)}",
+                  _same((m, t.plan_action_global(x, y, yaw, pil)), (m_ref, act_ref)))
         x0, y0, nx, ny = t._grid_spec(GATE, 0.1)
         check("_grid_spec 与 astar_path 原公式一致", (x0, y0, nx, ny) == (-1.5, -2.8, 86, 57), f"{(x0, y0, nx, ny)}")
 
@@ -200,7 +228,7 @@ def synthetic():
         a_go, _ = t.plan_action_costmap(0.0, 0.0, 0.0, GATE, waypoint=wp, stop_at_waypoint=True)
         check("goal-stop：半径内 SAFE，半径外非 SAFE", a_stop == t.SAFE_NEUTRAL and inf_stop["fallback"] == "goal_stop"
               and a_go != t.SAFE_NEUTRAL)
-        check("版本常量独立于 TEACHER_VERSION", t.TEACHER_COST_VERSION == "uavrgb.teacher_cost.v1"
+        check("版本常量独立于 TEACHER_VERSION", t.TEACHER_COST_VERSION == "uavrgb.teacher_cost.v2"
               and t.TEACHER_COST_VERSION != t.TEACHER_VERSION)
         # L/R 死锁场景（R2-3DGS）：航向已对准、前向 0.4 m 被堵 → legacy 按 err 符号换向；costmap 直接选代价低的一侧
         a_dl, inf_dl = t.plan_action_costmap(0.8, 0.0, 0.0, GATE)   # 距柱面 0.5 m 正对：FWD 撞、两个 YAW 有限
@@ -217,9 +245,10 @@ def _ep_dirs(root):
 
 def _recompute(args):
     ep_dir, mode = args
-    t.set_vehicle("e1_mini", "base")
     scene = json.load(open(os.path.join(ep_dir, "scene.json")))
     man = json.load(open(os.path.join(ep_dir, "episode_manifest.json")))
+    # 按 manifest 记录的教师版本复算（0417 / sgvis 写 v5：B2、B3 关），与 audit 的版本分派一致
+    t.set_vehicle("e1_mini", "base", version=man.get("teacher_version"))
     pillars = scene["pillars"]
     n = bad_label = bad_margin = 0
     for line in open(os.path.join(ep_dir, "actions.jsonl")):

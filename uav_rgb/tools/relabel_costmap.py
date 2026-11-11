@@ -58,7 +58,9 @@ def relabel_episode(job):
     man = json.load(open(os.path.join(ep, "episode_manifest.json"), encoding="utf-8"))
     pillars = scene["pillars"]
     max_px = max(float(p["x"]) for p in pillars)
-    T.set_vehicle(man.get("vehicle") or "x3", T.task_of_scene(scene))
+    # 规则档按写进副本 manifest 的 TEACHER_COST_VERSION 切（B2 开）：重标出的标签与 audit 按该版本复算的一致。
+    # err 诊断列（_global_path）同走这一档：A* 不重试（旧版本的 no_path 口径），只有出口区目标取线。
+    T.set_vehicle(man.get("vehicle") or "x3", T.task_of_scene(scene), version=T.TEACHER_COST_VERSION)
     waypoint, stop_radius = man.get("waypoint"), man.get("stop_radius")
     rows = [json.loads(line) for line in open(os.path.join(ep, "actions.jsonl"), encoding="utf-8") if line.strip()]
     recs, new_rows = [], []

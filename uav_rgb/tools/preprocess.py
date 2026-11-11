@@ -21,6 +21,10 @@ map-hash:* / diag* 诊断性划分默认拒绝，必须显式 --allow-diagnostic
 collision_flags（N 个 '0'/'1'，C++ 读端用 LoadOptions.drop_collision 过滤）。
 --drop-collision 在打包时直接跳过这些步，并在 report 里打印丢弃步数与占比。
 
+教师自己没过线的集（--exclude-failed-teacher，默认关）：策略是教师（executed_by=teacher）、没有 waypoint 的集，
+oracle.jsonl 里 pose_gt.x 的最大值小于「最远柱 x + 1.0 m」就整集跳过，并打印跳过几集。这些集的后半段标签是撞柱前后的挣扎，
+不是示范。带 waypoint 的任务、DAgger 学生自采集、缺 scene.json 柱子或 oracle 的集不适用，不跳。
+
 用法：
   .venv-tools/bin/python tools/preprocess.py --out /tmp/ds /tmp/ep0 /tmp/ep1
   python3 tools/preprocess.py --drop-collision --out /tmp/ds /tmp/ep0  # 丢碰撞步
@@ -116,12 +120,55 @@ def diag_split(gid, salt):
     return "train" if bucket < 70 else ("val" if bucket < 85 else "test")
 
 
+# --exclude-failed-teacher 的成功线 = 最远柱 x + 1.0 m，与 collect.GOAL_MARGIN_M / eval_closed_loop 的 goal_x 同一口径
+# （max_x 取 oracle pose_gt.x）。这里不 import collect：它带着 gz/cf_sil 等一串依赖；test_preprocess_failed_teacher 锁两处相等。
+FAILED_TEACHER_GOAL_MARGIN_M = 1.0
+# load_episode 的返回哨兵：教师没过线而整集跳过。与碰撞整集丢弃的 None 区分，scan 分开计数、meta 分开记。
+SKIP_FAILED_TEACHER = "failed_teacher"
+
+
+def teacher_crossed_goal(ep_dir, man, executed_by):
+    """B1：教师自采集是否越过成功线。True = 越过；False = 没越过（oracle 最大 x < 最远柱 x + 1.0）；None = 不适用。
+
+    不适用（不跳，原样打包）：executed_by 不是 teacher（DAgger 学生自采，轨迹是学生的，不是教师示范）；带 waypoint 的任务
+    （成功判据是到点，不是过线）；缺 scene.json / pillars，或 oracle.jsonl 里没有有效的 pose_gt.x（没有依据，
+    不能按「没过线」丢整集）。成功线与 max_x 都取真值：最远柱 x（scene.json）与 oracle pose_gt.x（每步动作后的位姿）。
+    """
+    if executed_by != "teacher" or man.get("waypoint") is not None:
+        return None
+    try:
+        with open(os.path.join(ep_dir, "scene.json"), encoding="utf-8") as f:
+            pillar_xs = [float(p["x"]) for p in json.load(f).get("pillars")]
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return None
+    if not pillar_xs:
+        return None
+    max_x = None
+    try:
+        with open(os.path.join(ep_dir, man.get("oracle_ref") or "oracle.jsonl"), encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                x = (json.loads(line).get("pose_gt") or {}).get("x")
+                if x is not None and (max_x is None or float(x) > max_x):
+                    max_x = float(x)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return None
+    if max_x is None:
+        return None
+    return max_x >= max(pillar_xs) + FAILED_TEACHER_GOAL_MARGIN_M
+
+
 def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
-                 split_salt=None, allow_frozen=False, allow_diagnostic=False):
+                 split_salt=None, allow_frozen=False, allow_diagnostic=False,
+                 exclude_failed_teacher=False, stats=None):
     """读 manifest + actions.jsonl，只建立样本索引，不碰像素（内存友好）。
 
     exclude_collision_episodes=True 时，只要该集有 collision=true 就返回 None
     （整集丢弃）。碰撞后的专家标签不可信，T2 的 SAFE 硬约束也不允许 SAFE+碰撞。
+    exclude_failed_teacher=True 时，教师自采集没过成功线（teacher_crossed_goal 为 False）返回 SKIP_FAILED_TEACHER；
+    不适用的集（None）照常打包，数量记进 stats["failed_teacher_na"]（stats 是调用方给的 dict，可不给）。
+    碰撞开关先判：既有碰撞又没过线的集记在碰撞计数里，不重复记。
     split_salt 非空 = --split-by-map 诊断构建；allow_diagnostic 才允许 map-hash/diag*。
     """
     man_path = os.path.join(ep_dir, "episode_manifest.json")
@@ -230,6 +277,13 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
         die("%s: actions.jsonl 为空" % ep_dir)
     if exclude_collision_episodes and any(r.get("collision") is True for r in rows):
         return None
+    if exclude_failed_teacher:
+        crossed = teacher_crossed_goal(ep_dir, man, executed_by)
+        if crossed is None:
+            if stats is not None:
+                stats["failed_teacher_na"] = stats.get("failed_teacher_na", 0) + 1
+        elif not crossed:
+            return SKIP_FAILED_TEACHER
     expected = man.get("num_steps")
     if isinstance(expected, int) and len(rows) != expected:
         die("%s: actions.jsonl %d 行 != manifest num_steps %d（文件被截断？）"
@@ -376,10 +430,16 @@ def _check_uniform_keys(episodes, allow_mixed=False, allow_mixed_dynamics=False)
 
 def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
          split_salt=None, allow_frozen=False, allow_diagnostic=False, allow_mixed=False,
-         allow_mixed_dynamics=False):
-    """加载全部 episode 索引，并检查 scene_id 的 split 唯一性。"""
+         allow_mixed_dynamics=False, exclude_failed_teacher=False, skip_stats=None):
+    """加载全部 episode 索引，并检查 scene_id 的 split 唯一性。
+
+    返回值的 skipped 只数碰撞整集丢弃（--exclude-collision-episodes，含义不变）；--exclude-failed-teacher 的跳过数
+    放进调用方给的 skip_stats["failed_teacher"]，不适用的集数放进 skip_stats["failed_teacher_na"]。
+    """
     episodes, scene_split, gid_split, total, dropped = [], {}, {}, 0, 0
-    skipped = 0
+    skipped = failed_teacher = 0
+    if skip_stats is None:
+        skip_stats = {}
     seen_dirs = set()
     for d in ep_dirs:
         # 同一目录经两个 glob/软链传两次会静默双打包，同一批样本被算两遍。
@@ -388,7 +448,10 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
             die("重复的 episode 目录：%s（同一集只能打包一次）" % real)
         seen_dirs.add(real)
         ep = load_episode(d, drop_collision, exclude_collision_episodes, split_salt,
-                          allow_frozen, allow_diagnostic)
+                          allow_frozen, allow_diagnostic, exclude_failed_teacher, skip_stats)
+        if ep == SKIP_FAILED_TEACHER:
+            failed_teacher += 1
+            continue
         if ep is None:
             skipped += 1
             continue
@@ -413,6 +476,13 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
         episodes.append(ep)
     if skipped:
         print("preprocess: 跳过整集 %d 个（--exclude-collision-episodes）" % skipped)
+    if exclude_failed_teacher:
+        # 开关打开时跳过 0 集也打印：日志里没有这一行不能和「跳过 0 集」混为一谈。
+        na = skip_stats.get("failed_teacher_na", 0)
+        print("preprocess: 跳过整集 %d 个（--exclude-failed-teacher：oracle 最大 x < 最远柱 x + %.1f m）%s"
+              % (failed_teacher, FAILED_TEACHER_GOAL_MARGIN_M,
+                 "；%d 集不适用（带 waypoint / 非教师执行 / 缺 scene.json 柱子或 oracle），未跳" % na if na else ""))
+        skip_stats["failed_teacher"] = failed_teacher
     if total == 0:
         die("没有可写样本")
     _check_uniform_keys(episodes, allow_mixed, allow_mixed_dynamics)
@@ -967,6 +1037,11 @@ def main():
                    help="跳过 collision=true 的步（专家撞墙后的标签本身是错的）")
     p.add_argument("--exclude-collision-episodes", action="store_true",
                    help="整集丢弃含 collision 步的 episode（T2 硬约束）")
+    p.add_argument("--exclude-failed-teacher", action="store_true",
+                   help="整集丢弃教师自己没过成功线的 episode：executed_by=teacher、无 waypoint，且 oracle pose_gt.x 的最大值 "
+                        "< 最远柱 x + 1.0 m；带 waypoint / DAgger 学生自采 / 缺 scene.json 柱子或 oracle 的集不适用、不跳。"
+                        "打开时 meta.collision_filter 多记 exclude_failed_teacher / failed_teacher_skipped / "
+                        "failed_teacher_goal_margin_m（默认关，不加键）")
     p.add_argument("--allow-frozen-geometry", action="store_true",
                    help="【诊断专用】允许冻结版本（如 campus.v1）打包；仍强制全包版本一致")
     p.add_argument("--split-by-map", metavar="SALT", default=None,
@@ -995,10 +1070,12 @@ def main():
     if not (0 <= args.envelope_radius < 10):
         p.error("--envelope-radius 须在 [0,10) m")
 
+    skip_stats = {}
     episodes, total, dropped, skipped = scan(
         args.episodes, args.drop_collision, args.exclude_collision_episodes,
         args.split_by_map, args.allow_frozen_geometry, args.allow_diagnostic_split,
-        args.allow_mixed_geometry, args.allow_mixed_dynamics)
+        args.allow_mixed_geometry, args.allow_mixed_dynamics,
+        args.exclude_failed_teacher, skip_stats)
     if args.cond == nav_cond.COND_HEADING_CODE:
         with_waypoint = [ep["dir"] for ep in episodes if ep.get("waypoint") is not None]
         if with_waypoint:
@@ -1010,6 +1087,13 @@ def main():
         "exclude_collision_episodes": bool(args.exclude_collision_episodes),
         "excluded_episodes": skipped,
     }
+    if args.exclude_failed_teacher:
+        # 只在开关打开时加键：默认关的数据集 meta 逐字节不变。键名不含 "episodes"/split_（C++ 读端按子串定位）。
+        collision_filter.update({
+            "exclude_failed_teacher": True,
+            "failed_teacher_skipped": skip_stats.get("failed_teacher", 0),
+            "failed_teacher_goal_margin_m": FAILED_TEACHER_GOAL_MARGIN_M,
+        })
     # 先校验侧车内容，再替换 dataset.uavr；有指令时先删旧侧车。
     # 这样侧车写失败时结果是「新数据集、没有侧车」（文本模型会显式报错），
     # 而不是「新数据集 + 旧侧车」被 C++ 按同集区间静默绑定。

@@ -59,7 +59,7 @@ from instruction import parse_target_color  # noqa: E402
 from split_manifest import SPLIT_SALT, geometry_gid  # noqa: E402
 from teacher import (TEACHER_VERSION, TEACHER_COST_VERSION, plan_action, plan_action_global_tiebreak,
                      plan_action_costmap, astar_path, _point_blocked, set_vehicle,
-                     teacher_version, task_of_scene)  # noqa: E402
+                     teacher_version, task_of_scene, recomputable_versions)  # noqa: E402,F401  版本常量供 test_audit_dataset 经 ad.* 取用
 
 # scene.json 里落盘的全局几何常量；与当前 scene_gen 不一致说明改了几何但没
 # bump GEOMETRY_VERSION，gid 会全变、别的闸门查不出新旧混包（A2）。
@@ -320,8 +320,9 @@ def campus_checks(facts, quarantined=()):
                 scene_digest = hashlib.sha256(sf.read()).hexdigest()
             if man.get("scene_meta_sha256") != scene_digest:
                 wrong.append("scene_meta_sha256")
+            # 版本认「能按旧规则复算的版本」（teacher.recomputable_versions）：v5 的 campus 集仍有效，label_recompute 按 v5 规则复算。
             if (man.get("teacher") != "plan_action" or man.get("planner") != "astar"
-                    or man.get("teacher_version") != TEACHER_VERSION):
+                    or man.get("teacher_version") not in recomputable_versions("base")):
                 wrong.append("teacher/planner/version")
             if any(not isinstance(s.get("pose_before"), dict)
                    or any(k not in s["pose_before"] for k in ("x", "y"))
@@ -918,20 +919,21 @@ def audit(facts, pre_excluded=(), quarantined=()):
         if f.get("planner") == "predictive":
             not_recomputable += len(f["steps"])
             continue
-        # 旧几何/旧教师版本数据没有版本字段；用当前算法复算会假 FAIL。版本按任务档位比：
-        # forest_e1 集要求 forest 档版本（v6），旧森林集（写 v5、按 0.40/0.30 方框算）自动跳过。
+        # 旧几何数据、版本不认识的数据没有可用的复算规则，用当前算法复算会假 FAIL，跳过。版本按任务档位比，
+        # 并且按 manifest.teacher_version 分派规则（teacher.set_vehicle(..., version=)）：v5 的集按 v5 规则（B2、B3 关）、
+        # v7 的集按 v7 规则复算，不再因为升版整集跳过。forest_e1 集只认 forest 档版本（v6），旧森林集（写 v5、按 0.40/0.30
+        # 方框算）仍跳过。
         teacher_task = task_of_scene(f.get("scene_metadata"))
-        # costmap 集（--teacher-planner costmap / relabel_costmap.py）的版本是独立常量：
+        # costmap 集（--teacher-planner costmap / relabel_costmap.py）的版本是独立常量（cost v1 / v2）：
         # 它的标签是测地场 Q 的 argmin，不随 legacy 教师版本走，也不能用 legacy 复算。
         is_costmap = f.get("planner") == "costmap"
-        want_version = TEACHER_COST_VERSION if is_costmap else teacher_version(teacher_task)
         if (f.get("geometry_version") not in RECOMPUTE_GEOMETRY_VERSIONS or
-                f.get("teacher_version") != want_version):
+                f.get("teacher_version") not in recomputable_versions(teacher_task, costmap=is_costmap)):
             old_version += len(f["steps"])
             continue
         # 脱困段的机身方框与规划余量按采集时的 (载具, 任务) 算：E1 数据用 X3 半宽复算会在 0.36 m
         # 余量内判出不同标签（pilot 20 集实测 47/800 假不一致，按 e1_mini 复算为 0）
-        set_vehicle(f["vehicle"], teacher_task)
+        set_vehicle(f["vehicle"], teacher_task, version=f["teacher_version"])
         for s in f["steps"]:
             pb, yb = s["pose_before"], s["yaw_before"]
             if (not isinstance(pb, dict) or yb is None or

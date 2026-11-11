@@ -1708,6 +1708,10 @@ def main():
     # costmap 教师：只在 planner_kind == "costmap" 时给 collect_one 传选项（其余档位 None，行为不变）。
     costmap_opts = ({"tol": args.costmap_tol, "lookahead_steps": args.costmap_lookahead_steps}
                     if planner_kind == "costmap" else None)
+    if planner_kind == "costmap":
+        # manifest.teacher_version 写的是 TEACHER_COST_VERSION：规则档（B2 过柱阵后目标取线开，A* 重试 costmap 不用）
+        # 按它切，采集时生效的规则与 audit 按 manifest 版本复算的规则一致（forest_e1 档的 costmap 集也一样）。
+        _teacher.set_vehicle(vehicle, teacher_task, version=TEACHER_COST_VERSION)
     text_ids = None
     cam_info = None
     rows_written = 0

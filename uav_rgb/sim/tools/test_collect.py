@@ -22,6 +22,7 @@ sys.path.insert(0, TOOLS)
 import collect
 import nav_cond
 import split_manifest as sm
+import teacher
 
 passed = 0
 
@@ -839,6 +840,12 @@ class FakeStudentPolicy:
         pass
 
 
+def active_rules_match(man):
+    """collect.main 跑完后 teacher 模块里生效的规则档（B2/B3）== manifest.teacher_version 对应的规则档。"""
+    return teacher.rules_for_version(man["teacher_version"]) == {
+        "goal_line": teacher.GOAL_LINE_AFTER_PILLARS, "retry": teacher.ASTAR_RETRY_CLEARANCES}
+
+
 def switch_checks():
     """--stop-at-goal / --policy student 影子教师 / --tiebreak 三个开关，以及关着时与旧版一致。"""
     out = {}
@@ -863,6 +870,9 @@ def switch_checks():
                                                   and man["teacher"] == "plan_action" and man["planner"] == "astar"
                                                   and "executed_by" not in man and "beta" not in man
                                                   and all(set(a) == ROW_KEYS_DEFAULT for a in acts))
+    out["A* 采集：生效规则 = manifest.teacher_version 的规则（v7：B2 开、A* 重试开）"] = (
+        man["teacher_version"] == teacher.TEACHER_VERSION and active_rules_match(man)
+        and teacher.GOAL_LINE_AFTER_PILLARS and teacher.ASTAR_RETRY_CLEARANCES == (0.30, 0.20))
     with tempfile.TemporaryDirectory() as d, contextlib.redirect_stderr(io.StringIO()), \
             patch.object(sys, "argv", ["collect.py", "--out", os.path.join(d, "x"), "--stop-at-goal"]):
         try:
@@ -913,6 +923,8 @@ def switch_checks():
         and man_c["teacher_version"] == collect.TEACHER_COST_VERSION
         and man_c["costmap_tol_deg"] == 25.0 and man_c["costmap_lookahead_steps"] == 1
         and man_c["experimental_policy"] is False and man_c["teacher_tiebreak"] == "legacy")
+    out["costmap 采集：生效规则 = cost 版本的规则（B2 开、A* 不重试）"] = (
+        active_rules_match(man_c) and teacher.GOAL_LINE_AFTER_PILLARS and teacher.ASTAR_RETRY_CLEARANCES == ())
     out["costmap 行多 q_costs（4 浮点）"] = all(set(a) == ROW_KEYS_DEFAULT | {"q_costs"} and len(a["q_costs"]) == 4
                                               for a in acts_c)
     man_c2, _, code_c2, _ = run_main(["--teacher-planner", "costmap", "--costmap-tol", "0", "--costmap-lookahead-steps", "2"], rows_c)
