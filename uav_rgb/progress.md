@@ -74,13 +74,16 @@
     11-12 00:10 通知它把锁换成 `gs3d.lock` 并重起守护进程，不再排在第二轮后面。
   - E2E-0 可判定性审计：`4c9eeed3-0d9f-4c03-8de7-37ac0124ad10`，分支 `p12-e2e-0`，输出 `$D/exp-decidability-audit-20261112/`。
   - E2E-1 航向码端到端学生（先做 W1-9，再做 2×2 试点）：`88869206-9a7b-4554-ae0b-aa3d43705084`，分支 `p12-w1-9`、`p12-e2e-1`（后者从前者的 HEAD 起），输出 `$D/exp-e2e-heading-code-20261112/`。
+  - E2E-P0 PyTorch 原型线的地基（模型复刻、checkpoint 读写、包装器、训练配方复刻，逐项与 C++ 对拍）：`f1185a5d-ba4a-486c-ab9d-a351e78e4ee3`，分支 `p12-e2e-p0`，输出 `$D/exp-proto-parity-20261112/`。
   - W1-10 满电档：`64315a47-cb31-409e-826f-03aee135fc10`，分支 `p12-w1-10`。
   - W1-12 3DGS 教师前向净空：`cbdb76c6-d26e-4897-9b3a-3cae4013f9d0`，分支 `p12-w1-12`。
   - W1-4 再 W1-3：`bf667c96-e5c1-455d-ae98-bd4a35d6266c`，分支 `p12-w1-4`、`p12-w1-3`（后者从前者的 HEAD 起，先合前者）。
   - W1-1 再 W1-5、W1-2、W1-6：`206f5b00-838f-43b4-8877-5ee7c116c7e9`，分支 `p12-w1-1`、`p12-w1-5`（从 `p12-w1-1` 起）、`p12-w1-2`、`p12-w1-6`。
   - W1-7 再 W1-8：`5a758bb3-fd0c-4ca5-87bb-aefcde5767d0`，分支 `p12-w1-7`、`p12-w1-8`（后者从前者的 HEAD 起）。
 - 交叉审核：任务书 `docs/briefs/2026-11-11-cross-review-brief.md`（八个角度 A–H，只读），11-12 00:35 起了 8 个 Claude Opus 5.5 的审核 agent。
-  报告在 `$D/tmp/phase12-cards/reports/review-<a…h>.md`；交回后主会话汇总成修复清单，按严重程度派卡。
+  报告在 `$D/tmp/phase12-cards/reports/review-<a…h>.md`；交回后主会话汇总成修复清单，按严重程度派卡。agent id：
+  A `a2c5693d-da44-4f1b-a54e-1a96cdd6a9f3`、B `c193fd46-59a1-491b-9f01-28adff66e14e`、C `4d22f6f7-ee1c-444e-a35a-5cf27cd42159`、D `4fb5bd8b-7fb7-4476-a8e2-f13cafd10d06`、
+  E `2885acfb-7f58-4573-8c9d-92a272c1f86c`、F `9813d6ea-061d-44df-a78a-9a61fcebce28`、G `b2823c34-c9ed-47d1-b062-ef359e3e66cf`、H `089a16e9-5224-4cb7-8c4e-a6b9e9d0a914`。
 - 还没开工的：端到端线的 E4（3DGS 室内的条件模仿，等 K3 与 W1-12 合并后写卡，这一步的采集、训练、闭环都在 GPU 上）；第二波（W2-1 起）等第一波交回与第二轮的结果。
 - 训练类工作（W2-1 至 W2-6）等协议拍板与第一波的前置卡（W1-1、W1-4、W1-5、W1-7）合并之后开始。
 - 清理等确认：`/root/claude-code-backup-20261028/code/wt/p12-*` 11 个工作树与分支；`$D/tmp/cursor-1110`（2.6 GB）；计划 §8 第 7 条的 23 GB 清单。
