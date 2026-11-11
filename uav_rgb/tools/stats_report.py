@@ -8,11 +8,20 @@
   二值指标: 比例 + Wilson 95%。越高越好的（SR/task_success/reach_ever/stop_success）分母 = 请求集 episodes_requested，
     失败/跳过集记 0；越低越好的（CR/false_forward/stuck）分母 = 完成集 episodes_done。表里单列「失败集数」；
   连续指标（SPL）: 完成集上的均值 + 百分位 bootstrap 95%；
-  同一 (方法, 场景) 多个 run（训练种子）: IQM + 分层 bootstrap 95%（Agarwal et al. NeurIPS 2021）；
+  同一 (方法, 场景) 多个 run（训练种子）: 各 run 比例的 IQM（Agarwal et al. NeurIPS 2021），区间 = 整个几何有放回重采样的
+    百分位 95%（同一几何上各 run 的集一起抽，簇键同下；run 级分层 bootstrap 把同一几何上的集当独立样本，区间比整簇区间窄）；
+    跨场景的 IQM（全场景列）区间仍是 run 级分层 bootstrap；
   两方法配对（同 seed 集）: McNemar（b+c<25 精确二项，否则带连续性校正的卡方）；
-  ≥3 方法: 另给 Cochran's Q（全体共同 seed）作总体检验；两两 McNemar 照做、不以 Q 显著为前提；
-    Holm 族 = 同一场景、同一指标的全部两两行（k 方法 → k(k-1)/2 个 p）；
+    多 run 的方法也配对：第 i 个 run 对第 i 个 run，按 (run, seed) 对齐（run 数不同只配前 min 个）；这样的行另加两列：
+    几何聚类符号翻转 p（每个几何上各 run 的成功差相加，对几何做双侧符号翻转；≤20 个非零几何精确，否则固定种子蒙特卡洛并写明
+    抽样次数）与整簇 bootstrap 的 A−B 率差区间（tools/paired_stats.py，只用标准库）；逐集 McNemar 把同一几何上的各 run 当
+    独立样本，只作参考。聚类键 = per_episode 的 geometry_gid，没有就回退为 seed（表里写明）；
+  ≥3 个单 run 方法: 另给 Cochran's Q（全体共同 seed）作总体检验；两两 McNemar 照做、不以 Q 显著为前提；
+    Holm 族 = 同一场景、同一指标的全部两两行（k 方法 → k(k-1)/2 个 p；只校正逐集 McNemar 的 p）；
   样本量: 两比例功效估算（正态近似 + Fleiss 连续性校正）。
+协议一致性（A4）：同一场景（同一列组）内，action_latency_s / heading_guard / rtf / student_cond / dynamics_profile 五个键
+  必须一致，缺键 = 旧协议；不一致就报错并列出哪些键、各取什么值；确实要混表（例如有护栏对无护栏）加 --allow-mixed-protocol，
+  表头标「混合协议」。原有七个键（metric_version、success_criterion、hold_s、dynamics、vehicle、window_from、task）仍只警告。
 默认列 SR/CR/false_forward/SPL；task_success 要显式 --metrics 加（base 任务没有 waypoint，恒为 0）。
 
 用法（仓库根，.venv-tools 的 python）：
@@ -34,7 +43,17 @@ import time
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import paired_stats  # noqa: E402  - 几何聚类的配对检验与区间（标准库）
 import pipeline_common  # noqa: E402  - wilson_ci 只此一份
+
+
+class InputError(ValueError):
+    """输入不合法（run 内 seed 重复、未知指标、协议不一致）：命令行干净退出（rc 2），库调用方按 ValueError 处理。"""
+
+
+class ProtocolMismatch(InputError):
+    """同一场景内五个协议键不一致（A4）；allow_mixed_protocol=True 或 --allow-mixed-protocol 放行。"""
+
 
 # 表头名 -> (per_episode 字段, 类型, 方向)。CR 就是 collision（contact 口径，stuck/超时不算碰撞），不另起字段。
 METRICS = {
@@ -48,6 +67,10 @@ METRICS = {
     "SPL": ("spl", "mean", "↑"),
 }
 DEFAULT_METRICS = ("SR", "CR", "false_forward", "SPL")   # task_success 只在有 waypoint 的任务（l1/campus）有意义，显式 --metrics 加
+# A4：不一致就报错的协议键。eval_closed_loop.py 只在给了对应参数（或非默认值）时才写这些键，所以缺键 = 旧协议或默认值。
+# cf_sitl_params 含路径，不比较（dynamics_profile 里的哈希已经覆盖参数内容）。
+STRICT_PROTOCOL_KEYS = ("action_latency_s", "heading_guard", "rtf", "student_cond", "dynamics_profile")
+NO_VALUE = "（无）"
 PILOT_N = 20            # e1-demo-plan §3：n<20 标 pilot
 EXACT_MCNEMAR_MAX = 25  # 不一致对 b+c 小于此用精确二项，否则卡方（Agresti 的常用阈值）
 _NORMAL = statistics.NormalDist()
@@ -232,6 +255,14 @@ def power_two_proportions(p1, p2, alpha=0.05, power=0.8):
 
 
 # ───────────────────────────── 读 eval.json、汇总成表 ─────────────────────────────
+def protocol_value(key, v):
+    """严格协议键的比较形式：缺键（旧协议）与等价于缺键的默认值（heading_guard=0、student_cond=prev-action）都记 NO_VALUE，
+    其余取 str(值)。"""
+    if v is None or (key == "heading_guard" and v == 0) or (key == "student_cond" and v == "prev-action"):
+        return NO_VALUE
+    return str(v)
+
+
 def load_eval(path):
     """eval.json（或含它的目录）-> 报表需要的字段。失败/跳过集不在 per_episode 里，另记数。"""
     if os.path.isdir(path):
@@ -239,23 +270,41 @@ def load_eval(path):
     with open(path, encoding="utf-8") as f:
         e = json.load(f)
     per = e.get("per_episode") or []
+    check_unique_seeds(per, path)
     hold = e.get("hold_s")
     return {
         "path": os.path.abspath(path), "per_episode": per,
         "episodes_done": e.get("episodes_done", len(per)),
         "episodes_requested": e.get("episodes_requested"),
         "failed": e.get("failed_count", len(e.get("failed") or [])),
+        "failed_seeds": [f["seed"] for f in (e.get("failed") or []) if isinstance(f, dict) and f.get("seed") is not None],
         "skipped": e.get("skipped_count", len(e.get("skipped") or [])),
         "hold_s": hold, "metric_version": e.get("metric_version"),
         "success_criterion": e.get("success_criterion"), "dynamics": e.get("dynamics"),
         "vehicle": e.get("vehicle"), "window_from": e.get("window_from"),
         "task": e.get("task"), "route": (e.get("scene") or {}).get("route") if isinstance(e.get("scene"), dict) else None,
         "spl_reference": e.get("spl_reference"),
+        **{k: e.get(k) for k in STRICT_PROTOCOL_KEYS},
     }
 
 
+def check_unique_seeds(per_episode, where):
+    """同一个 run 内 seed 必须唯一：{seed: 值} 的写法里后一集会覆盖前一集，配对与比例会静默少算，所以重复就报错（D5）。
+    没有 seed 字段的集按序号算，不会重复。不同 run 的同一个 seed 不算重复，配对时按 (run, seed) 对齐。"""
+    seen, dups = set(), []
+    for i, ep in enumerate(per_episode):
+        sd = ep.get("seed", i)
+        if sd in seen and sd not in dups:
+            dups.append(sd)
+        seen.add(sd)
+    if dups:
+        raise InputError(f"{where}: per_episode 里 seed {sorted(dups)} 重复；同一个 run 内 seed 必须唯一"
+                         "（不同 run 的同一个 seed 按 (run, seed) 对齐，不算重复）。要重复评测同一个 seed，请拆成多个 eval.json 当多个 run 给")
+
+
 def metric_values(per_episode, field):
-    """per_episode -> {seed: 值}，None 的集丢掉（如旧 eval.json 没有 spl）。"""
+    """per_episode -> {seed: 值}，None 的集丢掉（如旧 eval.json 没有 spl）。run 内 seed 重复 → ValueError（check_unique_seeds）。"""
+    check_unique_seeds(per_episode, "per_episode")
     out = {}
     for i, ep in enumerate(per_episode):
         v = ep.get(field)
@@ -272,6 +321,24 @@ def uses_requested(metric):
     return kind == "binary" and direction == "↑"
 
 
+def all_failed(ev):
+    """请求的集全部失败：完成 0 集、有失败记录、请求数已知。没有 per_episode 的聚合文件（完成数不是 0）与缺这个指标字段的旧文件都不是全失败，
+    它们的格仍是「—」，不能被写成 0。"""
+    return ev["episodes_done"] == 0 and ev["failed"] > 0 and bool(ev.get("episodes_requested"))
+
+
+def run_outcomes(ev, field, requested):
+    """一个 run 的 {seed: 值}，配对用。requested（越高越好的二值指标）时基础设施失败的 seed 记 False，与主表的请求集分母同口径；
+    越低越好的指标失败集没有观测，不进。run 里没有这个字段（旧文件）而且不是全失败时，不给失败集补 False（没有观测可对）。
+    同一个 seed 既完成又在 failed 里（重试成功）以完成的为准。没有 seed 的空位（episodes_requested 大于完成加失败，旧文件里有）
+    配不上对，不进。"""
+    out = dict(metric_values(ev["per_episode"], field))
+    if requested and (out or all_failed(ev)):
+        for sd in ev.get("failed_seeds", []):
+            out.setdefault(sd, False)
+    return out
+
+
 def run_denominator(ev, n_done, requested):
     """一个 run 的比例分母：requested 时取 episodes_requested（失败/跳过集记 0），否则取完成集。
     旧 eval.json 没有 episodes_requested 就退回完成集；请求数小于完成数（不应出现）时取完成数，比例不超过 1。"""
@@ -284,13 +351,15 @@ def _run_value(vals, kind, n=None):
 
 
 def summarize_cell(runs, field, kind, n_boot, seed, requested=False):
-    """一个 (方法, 场景) 格：1 个 run 给 Wilson / bootstrap 均值；多个 run 给 IQM + 分层 bootstrap。
+    """一个 (方法, 场景) 格：1 个 run 给 Wilson / bootstrap 均值；多个 run 给各 run 比例的 IQM + 整簇（几何）重采样区间。
     requested=True（越高越好的二值指标）时比例的分母是请求集；格里的 n 就是分母，分母与完成数不同时另记 n_done。"""
     per_run = [(list(metric_values(r["per_episode"], field).values()), r) for r in runs]
-    per_run = [(v, r) for v, r in per_run if v]
+    with_requested = requested and kind == "binary"
+    # 没有完成集的 run 丢掉；但越高越好的指标分母是请求集，全部失败的 run（请求 > 0）记 0 留下，格显示 0.00、n = 请求集。
+    per_run = [(v, r) for v, r in per_run if v or (with_requested and all_failed(r))]
     if not per_run:
         return None
-    denoms = [run_denominator(r, len(v), requested and kind == "binary") for v, r in per_run]
+    denoms = [run_denominator(r, len(v), with_requested) for v, r in per_run]
     if len(per_run) == 1:
         vals, n_done = per_run[0][0], len(per_run[0][0])
         if kind == "binary":
@@ -302,14 +371,60 @@ def summarize_cell(runs, field, kind, n_boot, seed, requested=False):
             return cell
         point, lo, hi = bootstrap_mean_ci(vals, n_boot=n_boot, seed=seed)
         return {"point": point, "lo": lo, "hi": hi, "n": n_done, "runs": 1, "kind": "bootstrap_mean"}
-    scores = [[_run_value(v, kind, d)] for (v, _r), d in zip(per_run, denoms)]          # runs × 1 task
-    point, lo, hi = stratified_bootstrap_ci(scores, n_boot=n_boot, seed=seed)
+    point = iqm([_run_value(v, kind, d) for (v, _r), d in zip(per_run, denoms)])        # 各 run 比例的 IQM，点估计与以前相同
+    clusters, key = cell_clusters([r for _v, r in per_run], field, kind, denoms, requested and kind == "binary")
+
+    def stat(sample):    # 重采样出的簇 -> 各 run 在这些簇上的比例 -> IQM；某个 run 一个簇都没抽到（分母 0）就不算它
+        rates = [sum(c[2 * i] for c in sample) / den for i in range(len(per_run))
+                 if (den := sum(c[2 * i + 1] for c in sample))]
+        return iqm(rates) if rates else None
+
+    lo, hi, _nb = paired_stats.cluster_bootstrap(clusters, stat, n_boot=n_boot, seed=seed)
+    if lo is None:      # shortcut: 不足 2 个簇没有簇间方差可估，区间取点（与单 run 区间退化为点是同一个约定）
+        lo = hi = point
     ns, dones = sorted(set(denoms)), sorted({len(v) for v, _r in per_run})
     cell = {"point": point, "lo": lo, "hi": hi, "n": ns[0] if len(ns) == 1 else ns, "runs": len(per_run),
-            "kind": "iqm_stratified"}
+            "kind": "iqm_cluster", "cluster_key": key, "n_clusters": len(clusters)}
     if ns != dones:
         cell["n_done"] = dones[0] if len(dones) == 1 else dones
     return cell
+
+
+def cell_clusters(evs, field, kind, denoms, with_missing):
+    """多 run 格的整簇重采样数据：每个簇一个元组 (run0 分子, run0 分母, run1 分子, run1 分母, ...)，返回 (簇列表, 聚类键)。
+    簇 = geometry_gid（所有完成集都有），否则 seed（同一个 seed 在各 run 里同一簇）。分子分母与点估计同一套：
+    二值指标 = 成功数 / 集数，连续指标 = 值之和 / 集数；with_missing（越高越好的二值指标，分母取请求集）时，失败集记 0 落进它所在的几何簇
+    （几何由别的 run 里同 seed 的集给出，查不到就是以 seed 为键的单点簇），记录里没有 seed 的空位各自一个单点簇。"""
+    use_gid = all(ep.get("geometry_gid") is not None for ev in evs for ep in ev["per_episode"] if ep.get(field) is not None)
+    geom = {}
+    for ev in evs:
+        geom.update(run_geometries(ev))
+
+    def cid(sd, gid):
+        return gid if use_gid and gid is not None else ("seed", sd)
+
+    acc = []
+    for i, ev in enumerate(evs):
+        a, done = {}, set()
+        for j, ep in enumerate(ev["per_episode"]):
+            v = ep.get(field)
+            if v is None:
+                continue
+            sd = ep.get("seed", j)
+            done.add(sd)
+            e = a.setdefault(cid(sd, ep.get("geometry_gid")), [0.0, 0])
+            e[0] += (1 if v else 0) if kind == "binary" else v
+            e[1] += 1
+        missing = denoms[i] - len(done)
+        if with_missing and missing > 0:
+            fs = [sd for sd in ev.get("failed_seeds", []) if sd not in done][:missing]
+            for sd in fs:
+                a.setdefault(cid(sd, geom.get(sd)), [0.0, 0])[1] += 1
+            for j in range(missing - len(fs)):
+                a[("pad", i, j)] = [0.0, 1]
+        acc.append(a)
+    ids = list(dict.fromkeys(c for a in acc for c in a))
+    return [tuple(x for a in acc for x in a.get(c, (0.0, 0))) for c in ids], ("geometry_gid" if use_gid else "seed")
 
 
 def summarize_all_scenes(runs_by_scene, field, kind, n_boot, seed, requested=False):
@@ -320,7 +435,9 @@ def summarize_all_scenes(runs_by_scene, field, kind, n_boot, seed, requested=Fal
         col = []
         for r in scene_runs:
             vals = list(metric_values(r["per_episode"], field).values())
-            col.append(_run_value(vals, kind, run_denominator(r, len(vals), requested and kind == "binary")) if vals else None)
+            den = run_denominator(r, len(vals), requested and kind == "binary")
+            col.append(_run_value(vals, kind, den)
+                       if (vals or (requested and kind == "binary" and all_failed(r))) else None)   # 全部失败的 run 记 0，与单场景格同口径
         cols.append(col)
     runs = {len(c) for c in cols}
     if len(runs) != 1 or any(v is None for c in cols for v in c):
@@ -331,28 +448,80 @@ def summarize_all_scenes(runs_by_scene, field, kind, n_boot, seed, requested=Fal
             "kind": "iqm_stratified"}
 
 
-def paired_tests(single_runs, field):
-    """同一场景内单 run 方法两两 McNemar（共同 seed）+ Holm；≥3 方法先 Cochran's Q（全体共同 seed）。"""
-    names = list(single_runs)
-    outcomes = {n: {s: bool(v) for s, v in metric_values(single_runs[n]["per_episode"], field).items()}
-                for n in names}
+def run_geometries(ev):
+    """一个 run 的 {seed: geometry_gid}；没有 gid 的集不进。"""
+    out = {}
+    for i, ep in enumerate(ev["per_episode"]):
+        g = ep.get("geometry_gid")
+        if g is not None:
+            out[ep.get("seed", i)] = g
+    return out
+
+
+def pair_units(runs_a, runs_b, field, requested=False):
+    """两个方法的配对单元 [(簇, a, b)]（a、b 为 0/1）：第 i 个 run 对第 i 个 run（按 --eval 给出的顺序），每个 run 内按共同 seed 配对。
+    键是 (run, seed)，不同 run 的同一个 seed 各是一个单元，不会互相覆盖。requested 见 run_outcomes（失败集记 0，共同 seed =
+    两侧请求 seed 的交集）。簇 = geometry_gid（每个单元两边都有且相同；失败集没有自己的 gid，取同 seed 在别的 run 里的），
+    否则整张表回退成 seed。返回 (units, 聚类键, 配对的 run 数)。"""
+    # shortcut: 两边 run 数不同时只配前 min(nA, nB) 个 run，多出来的 run 不参与；改成按几何取均值再配对，几何差就不再是整数，
+    #   精确符号翻转不适用。
+    m = min(len(runs_a), len(runs_b))
+    geom = {}
+    for ev in list(runs_a) + list(runs_b):
+        for sd, g in run_geometries(ev).items():
+            geom.setdefault(sd, g)
+    rows, use_gid = [], True
+    for i in range(m):
+        va = run_outcomes(runs_a[i], field, requested)
+        vb = run_outcomes(runs_b[i], field, requested)
+        ga, gb = run_geometries(runs_a[i]), run_geometries(runs_b[i])
+        for s in sorted(set(va) & set(vb)):
+            g = ga.get(s, geom.get(s))
+            use_gid = use_gid and g is not None and g == gb.get(s, geom.get(s))
+            rows.append((s, g, int(bool(va[s])), int(bool(vb[s]))))
+    return [((g if use_gid else s), a, b) for s, g, a, b in rows], ("geometry_gid" if use_gid else "seed"), m
+
+
+def paired_tests(runs, field, n_boot=2000, seed=0, n_draws=paired_stats.DEFAULT_DRAWS, requested=False):
+    """同一场景内方法两两配对 + Holm；runs = {方法: [run, ...]}；≥3 个单 run 方法先 Cochran's Q（全体共同 seed）。
+    两个都是单 run：逐集 McNemar（共同 seed）。有多 run 的一方：按 pair_units 配成 (run, seed) 单元，逐集 McNemar 保留作参考，
+    行里另加 cluster：几何聚类符号翻转 p 与整簇 bootstrap 的 A−B 率差区间（paired_stats.pair_summary）。
+    requested = uses_requested(指标)：越高越好的二值指标一侧基础设施失败的 seed 记 0（run_outcomes），与主表同分母。"""
+    names = list(runs)
+    single = [n for n in names if len(runs[n]) == 1]
+    outcomes = {n: {s: bool(v) for s, v in run_outcomes(runs[n][0], field, requested).items()} for n in single}
     out = {"cochran_q": None, "pairwise": []}
-    if len(names) >= 3:
-        common = sorted(set.intersection(*(set(o) for o in outcomes.values())))
+    if len(single) >= 3:
+        common = sorted(set.intersection(*(set(outcomes[n]) for n in single)))
         if len(common) >= 2:
-            out["cochran_q"] = cochran_q([[int(outcomes[n][s]) for n in names] for s in common])
-            out["cochran_q"]["methods"] = names
+            out["cochran_q"] = cochran_q([[int(outcomes[n][s]) for n in single] for s in common])
+            out["cochran_q"]["methods"] = single
     rows = []
     for i, a in enumerate(names):
         for b in names[i + 1:]:
-            bb, cc, n = paired_outcomes(outcomes[a], outcomes[b])
-            if n == 0:
+            if len(runs[a]) == 1 and len(runs[b]) == 1:
+                bb, cc, n = paired_outcomes(outcomes[a], outcomes[b])
+                if n == 0:
+                    continue
+                common = set(outcomes[a]) & set(outcomes[b])
+                rows.append({"A": a, "B": b, "n_common": n,
+                             "rate_A": sum(1 for s in common if outcomes[a][s]) / n,
+                             "rate_B": sum(1 for s in common if outcomes[b][s]) / n,
+                             **mcnemar(bb, cc)})
                 continue
-            common = set(outcomes[a]) & set(outcomes[b])
+            units, key, m = pair_units(runs[a], runs[b], field, requested)
+            if not units:
+                continue
+            bb = sum(1 for _g, x, y in units if x and not y)
+            cc = sum(1 for _g, x, y in units if not x and y)
+            n = len(units)
+            cs = paired_stats.pair_summary(units, n_boot=n_boot, seed=seed, n_draws=n_draws)
             rows.append({"A": a, "B": b, "n_common": n,
-                         "rate_A": sum(1 for s in common if outcomes[a][s]) / n,
-                         "rate_B": sum(1 for s in common if outcomes[b][s]) / n,
-                         **mcnemar(bb, cc)})
+                         "rate_A": sum(x for _g, x, _y in units) / n, "rate_B": sum(y for _g, _x, y in units) / n,
+                         **mcnemar(bb, cc),
+                         "cluster": {"key": key, "runs": [len(runs[a]), len(runs[b]), m],
+                                     **{k: cs[k] for k in ("n_clusters", "n_nonzero", "p_value", "method", "n_draws",
+                                                           "diff", "ci_lo", "ci_hi", "n_boot", "n_boot_valid")}}})
     if rows:
         for r, p in zip(rows, holm([r["p_value"] for r in rows])):
             r["p_holm"] = p
@@ -360,11 +529,15 @@ def paired_tests(single_runs, field):
     return out
 
 
-def build_report(entries, metrics=DEFAULT_METRICS, pair_metrics=("SR",), n_boot=2000, seed=0, title=None):
-    """entries: [(method, scene, eval.json 路径)]。返回可直接 json.dump 的 dict（表 + 检验 + 口径）。"""
+def build_report(entries, metrics=DEFAULT_METRICS, pair_metrics=("SR",), n_boot=2000, seed=0, title=None,
+                 n_draws=paired_stats.DEFAULT_DRAWS, allow_mixed_protocol=False):
+    """entries: [(method, scene, eval.json 路径)]。返回可直接 json.dump 的 dict（表 + 检验 + 口径）。
+    n_draws：多 run 配对里非零几何超过 paired_stats.EXACT_MAX_CLUSTERS 时蒙特卡洛的抽样次数。
+    同一场景内 STRICT_PROTOCOL_KEYS 不一致：默认抛 ProtocolMismatch（列出键、取值与方法）；allow_mixed_protocol=True 放行，
+    结果里 mixed_protocol = {场景: [不一致的键]}，表头标「混合协议」。"""
     for m in tuple(metrics) + tuple(pair_metrics):
         if m not in METRICS:
-            raise ValueError(f"未知指标 {m}，可选 {sorted(METRICS)}")
+            raise InputError(f"未知指标 {m}，可选 {sorted(METRICS)}")
     loaded = [(method, scene, load_eval(path)) for method, scene, path in entries]
     methods = list(dict.fromkeys(m for m, _, _ in loaded))
     scenes = list(dict.fromkeys(s for _, s, _ in loaded))
@@ -384,16 +557,35 @@ def build_report(entries, metrics=DEFAULT_METRICS, pair_metrics=("SR",), n_boot=
                                   for m in metrics}
     paired = {}
     for scene in scenes:
-        single = {m: groups[m][scene][0] for m in methods if len(groups[m].get(scene, [])) == 1}
-        skipped = [m for m in methods if len(groups[m].get(scene, [])) > 1]
-        if len(single) >= 2:
-            paired[scene] = {pm: paired_tests(single, METRICS[pm][0]) for pm in pair_metrics}
-            paired[scene]["skipped_multi_run"] = skipped
-    protocol = {}
+        scene_runs = {m: groups[m][scene] for m in methods if groups[m].get(scene)}
+        if len(scene_runs) >= 2:
+            paired[scene] = {pm: paired_tests(scene_runs, METRICS[pm][0], n_boot, seed, n_draws, uses_requested(pm))
+                             for pm in pair_metrics}
+            paired[scene]["skipped_multi_run"] = []     # 键保留给旧读者：多 run 的方法现在也配对，恒为空
+    protocol, mixed_protocol, problems = {}, {}, []
     for scene in scenes:
         keys = ("metric_version", "success_criterion", "hold_s", "dynamics", "vehicle", "window_from", "task")
         vals = {k: sorted({str(ev[k]) for m in methods for ev in groups[m].get(scene, [])}) for k in keys}
+        bad = {}
+        for k in STRICT_PROTOCOL_KEYS:
+            by_value = {}
+            for m in methods:
+                for ev in groups[m].get(scene, []):
+                    by_value.setdefault(protocol_value(k, ev.get(k)), set()).add(m)
+            if set(by_value) != {NO_VALUE}:         # 整个场景都缺键 = 旧协议，不进口径行
+                vals[k] = sorted(by_value)
+            if len(by_value) > 1:
+                bad[k] = by_value
         protocol[scene] = {"values": vals, "inconsistent": [k for k, v in vals.items() if len(v) > 1]}
+        if bad:
+            mixed_protocol[scene] = list(bad)
+            problems.append(f"场景 {scene}：" + "；".join(
+                f"{k}：" + " / ".join(f"{v} [{', '.join(sorted(ms))}]" for v, ms in sorted(by_value.items()))
+                for k, by_value in bad.items()))
+    if problems and not allow_mixed_protocol:
+        raise ProtocolMismatch("协议不一致（A4）：" + "。".join(problems)
+                               + "。同一场景内这些键必须相同才能比较，缺键表示旧协议；确实要混表（例如有护栏对无护栏）"
+                                 "加 --allow-mixed-protocol，表头会标「混合协议」")
     return {
         "schema": "uavrgb.stats_report.v1", "title": title, "generated": time.strftime("%F %T"),
         "metrics": list(metrics), "pair_metrics": list(pair_metrics), "methods": methods, "scenes": scenes,
@@ -404,6 +596,7 @@ def build_report(entries, metrics=DEFAULT_METRICS, pair_metrics=("SR",), n_boot=
         # 全表出现过的 metric_version；>1 个就是混合（sim09.v1 过线后继续飞 vs v2 成功线即停），表头要标。
         "metric_versions": sorted({str(ev["metric_version"]) for _, _, ev in loaded}),
         "cells": cells, "all_scenes": all_scenes, "paired": paired, "protocol": protocol,
+        "mixed_protocol": mixed_protocol,        # {场景: [不一致的协议键]}，只有 allow_mixed_protocol 时才可能非空
         "entries": [{"method": m, "scene": s, **{k: v for k, v in ev.items() if k != "per_episode"}}
                     for m, s, ev in loaded],
     }
@@ -425,6 +618,14 @@ def _p(p):
     return "<0.001" if p < 0.001 else f"{p:.3f}"
 
 
+def _cluster_p(c):
+    return _p(c["p_value"]) + (f" (MC {c['n_draws']})" if c["method"] == "monte_carlo" else "")
+
+
+def _cluster_diff(c):
+    return f"{c['diff']:+.2f} [{c['ci_lo']:+.2f}, {c['ci_hi']:+.2f}]"
+
+
 def to_markdown(rep):
     lines = []
     if rep.get("title"):
@@ -432,6 +633,9 @@ def to_markdown(rep):
     versions = rep.get("metric_versions") or []
     mixed = (f" ⚠ metric_version 混合：{' / '.join(versions)}（v1 过线后继续飞、碰撞可能发生在过线之后；"
              "v2 成功线即停；SR/CR 不可直接比，见 EVAL_STANDARD §5）" if len(versions) > 1 else "")
+    mp = rep.get("mixed_protocol") or {}
+    mixed += (" ⚠ 混合协议（--allow-mixed-protocol）：" + "；".join(f"{sc} 的 {', '.join(ks)}" for sc, ks in mp.items())
+              + " 在各行不同，行间差异不能全归给方法") if mp else ""
     header = ["方法" + mixed] + [f"{s} {m}{METRICS[m][2]}" for s in rep["scenes"] for m in rep["metrics"]]
     if rep["all_scenes"]:
         header += [f"全场景 IQM {m}{METRICS[m][2]}" for m in rep["metrics"]]
@@ -445,8 +649,10 @@ def to_markdown(rep):
         lines.append("| " + " | ".join(row) + " |")
     lines += ["", "每格 `点估计 [95% 区间] (n)`：二值指标 Wilson，分母按方向分两种。越高越好的指标（SR、task_success、reach_ever、stop_success）"
                   "n = 请求集 episodes_requested，失败集与跳过集记 0；越低越好的指标（CR、stuck、false_forward）n = 完成集 episodes_done。"
-                  f"SPL 为完成集上的百分位 bootstrap 均值区间（B={rep['n_boot']}）；多 run 的格为 IQM + 分层 bootstrap（Agarwal 2021），"
-                  f"每个 run 按各自的分母算比例。n<{PILOT_N} 的格只算 pilot。"
+                  f"SPL 为完成集上的百分位 bootstrap 均值区间（B={rep['n_boot']}）；多 run 的格为各 run 比例的 IQM（Agarwal 2021），"
+                  "区间按几何整簇重采样（同一几何上各 run 的集一起抽，没有 geometry_gid 时按 seed 聚），每个 run 按各自的分母算比例"
+                  + ("；全场景 IQM 的区间仍是 run 级分层 bootstrap" if rep["all_scenes"] else "")
+                  + f"。n<{PILOT_N} 的格只算 pilot。"
                   " 「失败集数」= 该方法全部 run、全部场景的 failed_count 之和，分场景明细见下表「失败」列。"
                   " CR = contact 碰撞比例（stuck/超时不算）。SPL 的 l_i 口径见各 eval.json 的 spl_reference。"]
     for scene in rep["scenes"]:
@@ -469,15 +675,42 @@ def to_markdown(rep):
                              f"p={_p(q['p_value'])}")
                 lines.append("")
             # b/c 的 ✓ 指该二值指标为 1（SR 是成功，CR 是碰撞），不是"更好"。
-            lines += [f"| A | B | n 共同 | {pm}_A | {pm}_B | b (A=1,B=0) | c (A=0,B=1) | p | p Holm | 方法 |",
-                      "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+            cl = any("cluster" in r for r in t["pairwise"])     # 有多 run 的行才加聚类两列；单 run 的表与以前逐字相同
+            head = ["A", "B", "n 共同", f"{pm}_A", f"{pm}_B", "b (A=1,B=0)", "c (A=0,B=1)",
+                    "p 逐集 McNemar（参考）" if cl else "p", "p Holm（逐集）" if cl else "p Holm", "方法"]
+            if cl:
+                head += ["p 几何聚类符号翻转", "差值 [95% 整簇区间]"]
+            lines += ["| " + " | ".join(head) + " |", "|" + " --- |" * len(head)]
             for r in t["pairwise"]:
-                lines.append(f"| {r['A']} | {r['B']} | {r['n_common']} | {r['rate_A']:.2f} | {r['rate_B']:.2f} | "
-                             f"{r['b']} | {r['c']} | {_p(r['p_value'])} | {_p(r['p_holm'])} | {r['method']} |")
+                cells = [r["A"], r["B"], str(r["n_common"]), f"{r['rate_A']:.2f}", f"{r['rate_B']:.2f}",
+                         str(r["b"]), str(r["c"]), _p(r["p_value"]), _p(r["p_holm"]), r["method"]]
+                if cl:
+                    c = r.get("cluster")
+                    cells += [_cluster_p(c), _cluster_diff(c)] if c else ["—", "—"]
+                lines.append("| " + " | ".join(cells) + " |")
             lines.append(f"\n注：两两 McNemar 不以 Q 显著为前提（Q 只是总体检验）；Holm 族 = 本表全部 {len(t['pairwise'])} 行"
-                         f"（场景 `{scene}` × {pm}），跨指标/跨场景不合并校正。")
-        if tests.get("skipped_multi_run"):
-            lines.append(f"\n多 run 分组不做配对检验：{', '.join(tests['skipped_multi_run'])}")
+                         f"（场景 `{scene}` × {pm}），跨指标/跨场景不合并校正。"
+                         + (" 越高越好的指标：一侧基础设施失败的 seed 记失败（失败集记 0，与主表同分母），n 共同 = 两侧请求 seed 的交集。"
+                            if uses_requested(pm) else
+                            " 越低越好的指标：失败集没有观测，只配两侧都完成的 seed。"))
+            if cl:
+                first = next(r["cluster"] for r in t["pairwise"] if "cluster" in r)
+                lines += ["", "多 run 的行：第 i 个 run 对第 i 个 run，按 (run, seed) 对齐，一个 (run, seed) 是一个单元。"
+                              "几何聚类 p = 每个几何上各 run 的 A、B 成功数之差相加，对非零几何做双侧符号翻转检验"
+                              f"（非零几何不超过 {paired_stats.EXACT_MAX_CLUSTERS} 个时精确，否则固定种子蒙特卡洛，抽样次数写在该格）；"
+                              f"区间 = 整个几何有放回重采样（B={first['n_boot']}）的 A 率减 B 率的百分位 95% 区间。"
+                              "逐集 McNemar 把同一几何上的各 run 当独立样本，p 低于几何聚类 p，只作参考；"
+                              "Holm 只校正逐集 McNemar 的 p，几何聚类 p 不做多重比较校正。"]
+                for r in t["pairwise"]:
+                    c = r.get("cluster")
+                    if not c:
+                        continue
+                    ra, rb, m = c["runs"]
+                    note = ("" if ra == rb else f"，两边 run 数不同，只配前 {m} 个")
+                    key = ("geometry_gid" if c["key"] == "geometry_gid"
+                           else "seed（eval.json 没有 geometry_gid 或两边不一致，回退为 seed）")
+                    lines.append(f"- {r['A']}（{ra} run）对 {r['B']}（{rb} run）：配 {m} 个 run{note}，{r['n_common']} 个单元，"
+                                 f"{c['n_clusters']} 个簇，聚类键 {key}")
     if rep.get("power"):
         pw = rep["power"]
         lines += ["", f"两比例功效估算：p1={pw['p1']} vs p2={pw['p2']}，α={pw['alpha']}，功效 {pw['power']}："
@@ -505,7 +738,12 @@ def main(argv=None):
     p.add_argument("--stem", default="stats_report")
     p.add_argument("--title", default=None)
     p.add_argument("--n-boot", type=int, default=2000)
+    p.add_argument("--n-draws", type=int, default=paired_stats.DEFAULT_DRAWS,
+                   help="多 run 配对里非零几何超过 %d 个时，符号翻转蒙特卡洛的抽样次数" % paired_stats.EXACT_MAX_CLUSTERS)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--allow-mixed-protocol", action="store_true",
+                   help="同一场景内 action_latency_s / heading_guard / rtf / student_cond / dynamics_profile 不一致时不报错（默认报错），"
+                        "表头标「混合协议」")
     p.add_argument("--power", nargs=2, type=float, metavar=("P1", "P2"), default=None,
                    help="两比例功效估算：每臂集数（可与 --eval 同用，结果附在报表末尾）")
     p.add_argument("--alpha", type=float, default=0.05)
@@ -520,9 +758,13 @@ def main(argv=None):
     for _m, _s, path in a.eval:
         if not os.path.exists(path):
             p.error(f"找不到 {path}")
-    rep = build_report([tuple(e) for e in a.eval], metrics=[m.strip() for m in a.metrics.split(",") if m.strip()],
-                       pair_metrics=[m.strip() for m in a.pair_metrics.split(",") if m.strip()],
-                       n_boot=a.n_boot, seed=a.seed, title=a.title)
+    try:
+        rep = build_report([tuple(e) for e in a.eval], metrics=[m.strip() for m in a.metrics.split(",") if m.strip()],
+                           pair_metrics=[m.strip() for m in a.pair_metrics.split(",") if m.strip()],
+                           n_boot=a.n_boot, seed=a.seed, title=a.title, n_draws=a.n_draws,
+                           allow_mixed_protocol=a.allow_mixed_protocol)
+    except InputError as e:      # 重复 seed、未知指标等输入问题：干净退出（rc 2），不抛 traceback；别的 ValueError 是 bug，照常抛
+        p.error(str(e))
     rep["power"] = power
     md = write_report(rep, a.out_dir, a.stem) if a.out_dir else to_markdown(rep)
     print(md)

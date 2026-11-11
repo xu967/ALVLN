@@ -184,9 +184,11 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
 
 - **episode 终止条件 = `contact` ∨ `stuck`**（`eval_closed_loop.py --stop-on-collision`）。
   `stuck` 单独计率，不等同碰撞；被挡后不再继续转向脱困。
-- **SR 分母 = `episodes_done`**（`collect_rc==0` 且 `steps>0` 的集）。采集失败
-  （含学生推理进程崩溃）进 `failed`，不进分子分母。因此绝对 SR 对失败集是乐观的；
-  报告必须同时给 `failed` 数。盲前进基线同口径，两个基线对比仍公平。
+- **SR 分母 = `episodes_requested`**（2026-11-11 起，见 §5.6）。完成集 `episodes_done` 是 `collect_rc==0` 且 `steps>0` 的集；
+  采集失败（含学生推理进程崩溃）进 `failed`，与跳过的集一起在分母里记 0，所以失败集不会抬高绝对 SR。
+  报告必须同时给 `failed` 数。越低越好的指标（CR、stuck、false_forward）分母仍是完成集。
+  `eval.json` 里 `success_rate` 等旧率字段仍是完成集分母，`requested_success_rate` 是请求集分母。
+  盲前进基线同口径，两个基线对比仍公平。
 - **处理时间 p50/p95** 是学生策略前向 + 决策，不含物理执行；本机 GPU 数字，不是板端。
 - **L1 goal-reach-ever（2026-11-02 起，主指标，`success_criterion="goal_reach_ever"`）**：
   `stop_radius` 非空时 success = 无碰撞 + **轨迹上曾**进入 waypoint 的
@@ -277,7 +279,7 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
 | `spl` | `S_i · l_i / max(p_i, l_i)`，S_i = 该集旧 `success`（Anderson et al. 2018） | 每集；p_i 或 l_i 缺一个就是 None |
 | 汇总 `spl` / `spl_n` | 有 `spl` 的完成集平均 / 个数 | `requested_spl` 只在全部完成集都有 spl 时给（请求集分母，skipped/failed 计 0） |
 | CR | 就是已有的 `collision_rate`（contact 碰撞集比例）；**不新增字段**。stuck / 超时不算碰撞 | `episodes_done` |
-| task_success | 已在 §5.2 定义：`reach_ever` + `final_in_radius` + `stop_action_issued` + `collision_free` + 未超时；不另造 | `episodes_done` |
+| task_success | 已在 §5.2 定义：`reach_ever` + `final_in_radius` + `stop_action_issued` + `collision_free` + 未超时；不另造 | `episodes_requested`（失败与跳过的集记 0，见 §5.6） |
 
 - **目标区与 success 同口径**：waypoint 任务 = 以 waypoint 为心、`goal_radius` 为半径的圆盘
   （Gazebo L1 1.5 m，3DGS `reach_radius_m` 2.0 m）；验收线任务（base / forest_e1）= 半平面 `x ≥ goal_x`。
@@ -310,15 +312,18 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
   `speed_mps` 时才算，且 < 0.05 m/s 的门槛在滑行机体上通常不满足。写论文时 task_success 一列对 E1
   要标注这一点，或等执行器实现位置保持后复跑。
 - **统计方法**（`tools/stats_report.py`，纯 numpy/标准库；单测 `tools/test_stats_report.py`）：
-  - 二值指标（SR / CR / false_forward / task_success / stuck）：比例 + **Wilson 95%**，分母 =
-    `episodes_done`；请求集口径另报 `requested_success_rate`。
+  - 二值指标：比例 + **Wilson 95%**。越高越好的（SR / task_success / reach_ever / stop_success）分母 =
+    `episodes_requested`，失败与跳过的集记 0；越低越好的（CR / false_forward / stuck）分母 = `episodes_done`（§5.6）。
+    新实验的 summarize 脚本用 `tools/paired_stats.py` 的 `success_counts` 取成功数与请求 / 完成 / 失败三个分母，不再各写各的 n。
   - 连续指标（SPL）：均值 + 百分位 bootstrap 95%（B=2000，seed 固定）。
   - 同一 (方法, 场景) 多个训练种子 run：**IQM**（去掉两端各 25% 后的均值，Agarwal et al. 2021 定义，
-    与 `scipy.stats.trim_mean(x, 0.25)` 一致）+ **分层 bootstrap**（每个任务/run 内重采样）95%。
-    多 run 的格不做配对检验。
+    与 `scipy.stats.trim_mean(x, 0.25)` 一致）作点估计，区间 = **几何整簇有放回重采样**的百分位 95%（同一几何上各 run 的集一起抽，
+    每个 run 按各自的分母算比例）。run 级分层 bootstrap 把同一几何上的 3 集当独立样本，区间比整簇区间窄（calswa 的 60 集：
+    旧 [0.60, 0.75]，整簇 [0.50, 0.78]）。跨场景的全场景 IQM 区间仍是 run 级分层 bootstrap。多 run 的方法也做配对检验，见 §5.6。
   - 两方法同一 seed 集：**McNemar**（不一致对 b+c < 25 用精确二项，否则带连续性校正的卡方）；
-    ≥3 方法另给 **Cochran's Q**（全体共同 seed）作总体检验；两两 McNemar 照做、不以 Q 显著为前提，
-    **Holm** 族 = 同一场景、同一指标的全部两两行（`stats_report.py` 就是这么做的，表注会写）。配对只用共同 seed。
+    ≥3 个单 run 方法另给 **Cochran's Q**（全体共同 seed）作总体检验；两两 McNemar 照做、不以 Q 显著为前提，
+    **Holm** 族 = 同一场景、同一指标的全部两两行（`stats_report.py` 就是这么做的，表注会写）。配对按共同 seed 对齐
+    （成功类指标取两侧请求 seed 交集，失败集记 0；越低越好指标取两侧都完成的 seed，见 §5.6）。
     默认表列 SR/CR/false_forward/SPL；`task_success` 在没有 waypoint 的 base 任务恒为 0，要显式 `--metrics` 加。
   - 样本量：两比例功效估算（正态近似，另给 Fleiss 连续性校正）。0.80 vs 0.90、α=0.05、功效 0.8
     每臂约 199 集（校正后 219）；配对设计可更少。n < 20 的格只算 pilot。
@@ -376,18 +381,54 @@ longcourse 分段打点）+ 策略段的墙钟耗时折成的仿真时间；后�
 
 **成功类指标的分母是请求集，失败集单列；主比较的规模与预注册在起跑前定。**
 
-- **统计表分母**（`tools/stats_report.py`）。下面三处旧表述按本条执行，原文不改：§5 开头列表里「SR 分母 = `episodes_done`」那一条，§5.3 指标表里 task_success 一行的分母，§5.3「统计方法」第一条。`eval.json` 里 `success_rate` 等旧率字段本身不变，仍是完成集分母：
+- **统计表分母**（`tools/stats_report.py`）。`eval.json` 里 `success_rate` 等旧率字段本身不变，仍是完成集分母：
   - 越高越好的二值指标（SR、task_success、reach_ever、stop_success）：分母 = `episodes_requested`。基础设施失败的集
     （`failed[]`，含 §5.5 的 `late_dispatch:` 集）与跳过的集都记 0，与 `eval.json` 的 `requested_success_rate`、`wilson_ci.requested` 同口径。
   - 越低越好的二值指标（CR、stuck、false_forward）：分母仍是完成集 `episodes_done`。失败集没有碰撞或乱飞的观测，记 0 会压低这几项。
   - SPL 是完成集上的均值，不变。
   - 表里单列「失败集数」（该方法全部 run、全部场景的 `failed_count` 之和）。失败集数不为 0 时，同一行里 SR 与 CR 的 n 不同；
     没有失败集时新旧数字逐位相同（`tools/test_stats_report.py` 锁定）。
-- **主比较的规模**：20 个冻结几何（`tools/eval_seeds.py` 的 `EVAL_SEEDS_BASE_20`）× 每方法 3 个训练种子 = 60 集；配对精确 McNemar 加 Wilson 区间。
-  T1（`--task course_base --blocks 3` 的长课程）起再报逐块存活。
-- **预注册**：起跑前在入口脚本头部写下预测、证伪条件和主比较；主比较的配对不超过 3 个；参数在起跑前定死，不在评测 seed 上调。
-- **单次 n=20 的比较不下结论**：同权重、同 seed 重评的逐集不一致率约 24%（出处：`docs/reviews/2026-11-10-phase12/longcourse.md`，自重跑一致率约 76%），
-  一次 20 集的差别落在这个波动里。结论看 60 集的配对结果，单次 20 集只作描述。
+- **主比较的规模**：20 个冻结几何（`tools/eval_seeds.py` 的 `EVAL_SEEDS_BASE_20`）× 每方法 3 个训练种子 = 60 集；
+  主检验是按几何聚类的符号翻转检验与整簇 bootstrap 区间（下一条），逐集 McNemar 与 Wilson 区间照旧报，只作参考；
+  两者结论不一致时照实写。T1（`--task course_base --blocks 3` 的长课程）起再报逐块存活。
+- **配对检验与区间按几何聚类**（`tools/paired_stats.py`，只用标准库；`stats_report` 的配对表在多 run 的行里加两列）。
+  60 集里同一几何上的 3 集不独立，独立单位是几何；逐集 McNemar 把 60 集当独立样本，逐集 p 低于几何聚类 p
+  （calswa 对 best：逐集精确二项 0.036、带连续性校正的卡方 0.038，几何聚类 0.089）。
+  - 检验：每个几何内 A 的成功数减 B 的成功数，得 d_g（整数）；差为 0 的几何不改变符号和，先剔除；全部几何差均为 0 时 p = 1.0。
+    对非零的 d_g 做双侧符号翻转，统计量 |Σ d_g|，p = #{|S| ≥ |观测|} / 2^k（k = 非零几何数）。
+    k ≤ 20 精确（与枚举 2^k 种符号等价；20 个几何的主比较恒为精确），k > 20 用固定种子蒙特卡洛（p = (命中 + 1) / (抽样 + 1)），
+    表里写明抽样次数（默认 100000，`--n-draws`）。
+  - 区间：A−B 成功率差的整簇 bootstrap 百分位 95%（B=2000，seed 固定）。簇键 = `per_episode[*].geometry_gid`，
+    没有该字段时回退为 seed，表注写明。
+  - 配对方式：同一方法的多个 run 按 `--eval` 的给出顺序对齐，第 i 个 run 对第 i 个 run，单元 = (run, seed)；
+    两侧 run 数不同只配前 min 个。同一个 run 内 seed 重复直接报错，不静默覆盖。单 run 的方法配对表不加这两列。
+  - 越高越好的指标配对时，一侧基础设施失败的 seed 记 0，与主表同分母，n 共同 = 两侧请求 seed 的交集；全部失败的格显示 `0.00 (n=请求数)`。
+    越低越好的指标失败集没有观测，只配两侧都完成的 seed。
+  - Holm 校正只作用于逐集 McNemar 的 p；几何聚类 p 不做 Holm。
+- **协议一致性**（`tools/stats_report.py`）。同一场景（同一列组）内，`action_latency_s`、`heading_guard`、`rtf`、`student_cond`、
+  `dynamics_profile` 五个键必须一致，缺键 = 旧协议，`heading_guard=0` 与 `student_cond=prev-action` 等价于缺键。不一致报错（rc 2），
+  信息列出场景、键、各取值与方法；确实要混表（例如有护栏对无护栏）加 `--allow-mixed-protocol`，表头标「混合协议」。
+  `cf_sitl_params` 含路径，不比较，参数内容由 `dynamics_profile` 里的哈希覆盖。`metric_version`、`success_criterion`、`hold_s`、
+  `dynamics`、`vehicle`、`window_from`、`task` 仍只警告。
+- **预注册与样本内外划分**：起跑前在入口脚本头部写下预测、证伪条件和主比较；主比较的配对不超过 3 个；参数在起跑前定死，不在评测 seed 上调。
+  设计时看过冻结 20 个评测 seed（`EVAL_SEEDS_BASE_20`）上轨迹的方法（护栏阈值、规则、条件码阈值），在这 20 个 seed 上的数字算样本内；
+  要在另外 40 个 test 分区几何（`tools/eval_seeds.py` 的 `EVAL_SEEDS_BASE_60` 去掉冻结的 20 个）上补评一遍，才算样本外的数字（2026-11-12，交叉审核 D3）。
+- **单次 n=20 的比较不下结论**：同权重、同 seed 重评的逐集不一致率，此前写「约 24%」（出处 `docs/reviews/2026-11-10-phase12/longcourse.md`
+  的「自重跑一致率约 76%」，该文档没有注明数据来源），**未核实**。W1-14 扫描数据根 `uav_rgb/` 四层目录内（不含 `tmp/`，按 `realpath` 去重）
+  共 63 个顶层目录、220 个 `eval.json`（含 `e1-pipeline-20261107-*`、`eval3-gpucheck-20261109`、`exp-swa-calib-20261110`、
+  `exp-heading-guard-20261110`、`exp-action-latency-{20261110,r2-20261111}`、`exp-long-course-{,v2-}20261110`、`exp-dagger-gz-20261109`、
+  `exp-teacher-cost-20261109`、`exp-rule-oracle-{,v1-}20261110`、`exp-k1-control-20261110`、`exp-baselines-zeroshot-20261110`、
+  `exp-fix-a-20261109`、`exp-soc100-parity-20261111`、`exp-2026-11-12-teacher-v7-parity`、`exp-proto-parity-20261112`、`exp-viz3-20261110`，
+  以及 `l1-*`、`cfstab-*`、`campus-*`、`3dgs-*`、`xeval-*`、`teacher-eval-*`、`distill-*`、`t5b-*`、`t6-*`、`t7-*`、`demo-*`、`gpu-*` 等历史目录），
+  按 `ckpt_sha256` 相同且 28 个配置键全同、共同完成 seed ≥ 10 筛选，得 9 对，逐集不一致率 0.20 到 0.47：
+  `e1-pipeline-20261107-0417-eval3` 对 `eval3-gpucheck-20261109`（2 对，`new` 与 `trunc` 各 4/17 = 0.235，两次的差别是 GPU，
+  RTX 4080 SUPER 对 RTX 2080 Ti，见 `docs/experiments/2026-11-07-e1-demo-plan.md`）；这两个目录的 `trunc` 臂各对
+  `exp-teacher-cost-20261109/cl2/eval-trunc-legacy`（2 对，9/20 = 0.450 与 5/17 = 0.294）；`e1-pipeline-20261107-0417-eval4` 对
+  `exp-dagger-gz-20261109/full-1109/eval20-trunc`（1 对，9/19 = 0.474）；`exp-long-course-20261110` 对 `exp-long-course-v2-20261110`
+  （4 对，0.200 到 0.350）。另有 `exp-heading-guard-20261110/guard2-calswa-s1` 对 `exp-k1-control-20261110/guard2-calswa-s1`
+  （4/20 = 0.200）因 `template_sha256` 不同未计入。9 对中只有换 GPU 那 2 对是有记录的受控重评，其余 7 对隔了日期或代码改动，
+  没有一对能证明两次运行条件完全相同；「约 24%」与换 GPU 那 2 对的 4/17 数值吻合，是否同源未核实。要给出可引用的重评不一致率，
+  需要补跑同权重、同 seed、同机器的两次评测。一次 20 集的差别可能落在这个波动里，所以结论看 60 集的配对结果（几何聚类检验），单次 20 集只作描述。
 
 ## 6. 下一步（按优先级）
 
