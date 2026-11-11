@@ -39,13 +39,22 @@ class OracleRouteGuide:
     只隔 1 m 左右，全局取最近点会跳回已走过的那段，朝前一段取全局最小则会跳到后面更近的一段（前视点反指、穿墙）。
     规划失败（被围死 / waypoint 在占据里）时一直直指 waypoint，plan_failed=True 留给汇总统计。
     shortcut: 最近点按顶点算（A* 栅格路径 0.1 m 一点，误差 < 0.05 m），稀疏折线不适用，要的话改线段投影。
+
+    nearest_in_lookahead（W1-12，缺省 False = 上面的旧行为，target() 逐位不变）：
+    旧规则停在第一个「下一个顶点更远」的顶点，也就是顶点距离序列的第一个局部极小。A* 栅格路径开头常有一个侧向的小凹口
+    （例如 (0, 0) -> (0.1, -0.1) -> (0.2, 0)，对角走一步再对角走回来），飞机在凹口北侧起飞，凹口底部的顶点永远比前一个顶点远，
+    指针停在凹口之前，目标点留在原地（K1 的 841150 r13 与 r4，复现见 experiments/2026-11-11-teacher-clearance-3dgs/replay_guide.py）。
+    True：每次从当前指针往前，沿路径累计不超过 lookahead_m 的范围内取离飞机最近的顶点（并列取更靠前的），指针仍只增不减。
+    范围限在前视距离内，是为了不让指针跳到折回的后一段上；折回的另一段若落在这个范围内（墙很薄、路径绕墙端不到 lookahead_m），
+    指针仍会跳过去，调用方打开前要知道这一点。
     """
 
-    def __init__(self, plan_fn, waypoint_xy, lookahead_m):
+    def __init__(self, plan_fn, waypoint_xy, lookahead_m, nearest_in_lookahead=False):
         if not (math.isfinite(lookahead_m) and lookahead_m > 0):
             raise ValueError(f"lookahead_m 必须是有限正数，得到 {lookahead_m!r}")
         self.plan_fn, self.waypoint = plan_fn, (float(waypoint_xy[0]), float(waypoint_xy[1]))
         self.lookahead = float(lookahead_m)
+        self.nearest_in_lookahead = bool(nearest_in_lookahead)
         self.path, self.k, self.plan_failed = None, 0, False
 
     def target(self, x, y):
@@ -59,8 +68,18 @@ class OracleRouteGuide:
         def d2(i):
             return (p[i][0] - x) ** 2 + (p[i][1] - y) ** 2
 
-        while self.k + 1 < len(p) and d2(self.k + 1) <= d2(self.k):
-            self.k += 1
+        if self.nearest_in_lookahead:
+            best, best_d, run = self.k, d2(self.k), 0.0
+            for j in range(self.k + 1, len(p)):
+                run += math.dist(p[j - 1], p[j])
+                if run > self.lookahead:
+                    break
+                if d2(j) <= best_d:
+                    best, best_d = j, d2(j)
+            self.k = best
+        else:
+            while self.k + 1 < len(p) and d2(self.k + 1) <= d2(self.k):
+                self.k += 1
         acc = 0.0
         for i in range(self.k, len(p) - 1):
             seg = math.dist(p[i], p[i + 1])

@@ -31,6 +31,12 @@ stop_on_collision=True、split="test"、split_policy="diag-eval-fixed-test"（�
   臂 rule_version  "v1" | "v2"，只给规则层臂：传给 RuleOraclePolicy(rule_version=…)；不给 = 不传这个参数（等于 v1，旧臂字节不变）。
                    v2 的 rule_params 键是 rule_policy.RULE_V2 的（levels / order / mem_steps / tabu_* / m_max …），由策略构造时按版本校验；
                    给了这个键，metrics.json 的 rule 与 done.json 的 rule 里多记一个 rule_version（没给就没有，旧产物键不变）
+2026-11-11-teacher-clearance-3dgs（任务卡 W1-12）再加的两个臂上的可选键（缺省时同样与原版逐位一致，test_driver_clearance.py 锁定）：
+  臂 teacher_clearance  "ray" | "swept"，只给 base = teacher 的臂：传给 OccAstarTeacher(clearance=…)；不给 = 不传这个参数（等于 ray）。
+                        hold_s 自 K3 起对所有教师臂都传这个臂的生效 hold（见上面 teacher_tol_deg 一条）。
+                        swept 要求生效 hold 为 1.0（位移系数只在 hold 1.0 下量过），启动时就校验，早于加载场景
+  臂 spawn_two_layer    true | false，传给 run_episode(spawn_two_layer=…)（出生两层判空，要求全局 jitter > 0）；不给 = 不传。
+                        给了任一个键，done.json 末尾多记同名键（没给就没有，旧产物的键不变）
 """
 import importlib
 import json
@@ -63,6 +69,15 @@ for _a in ARMS:         # 配置错在加载场景（约 200 s）之前就报，
     if "rule_version" in _a and (_a["base"] not in RULE_BASES or _a["rule_version"] not in ("v1", "v2")):    # 与 rule_oracle.RULE_VERSIONS 同
         raise ValueError(f"臂 {_a['name']}：rule_version 只给规则层臂（{sorted(RULE_BASES)}），值只能是 v1 或 v2，得到 base={_a['base']!r} "
                          f"rule_version={_a['rule_version']!r}")
+    if "teacher_clearance" in _a:       # 值域与 planner.CLEARANCE_MODES 同；swept 的 hold 与 planner.SWEPT_HOLD_S 同
+        if _a["base"] != "teacher" or _a["teacher_clearance"] not in ("ray", "swept"):
+            raise ValueError(f"臂 {_a['name']}：teacher_clearance 只给 base = teacher 的臂，值只能是 ray 或 swept，得到 base={_a['base']!r} "
+                             f"teacher_clearance={_a['teacher_clearance']!r}")
+        if _a["teacher_clearance"] == "swept" and abs(float(_a.get("hold", CFG["hold"])) - 1.0) > 1e-9:
+            raise ValueError(f"臂 {_a['name']}：teacher_clearance=swept 的位移系数只在 hold 1.0 s 下量过，得到 hold={_a.get('hold', CFG['hold'])!r}")
+    if "spawn_two_layer" in _a and (not isinstance(_a["spawn_two_layer"], bool) or (_a["spawn_two_layer"] and not CFG["jitter"] > 0)):
+        raise ValueError(f"臂 {_a['name']}：spawn_two_layer 要是 true / false，且为 true 时全局 jitter 必须大于 0，得到 "
+                         f"spawn_two_layer={_a['spawn_two_layer']!r} jitter={CFG['jitter']!r}")
 
 
 def log(msg):
@@ -156,6 +171,8 @@ for arm in ARMS:
     rule_src = RULE_BASES.get(arm["base"])
     rule_params = {**CFG.get("rule_params", {}), **arm.get("rule_params", {})} if rule_src else None
     rule_kw = {"rule_version": arm["rule_version"]} if "rule_version" in arm else {}     # 没给键就不传：旧臂调用与原版逐位相同
+    teacher_kw = {"clearance": arm["teacher_clearance"]} if "teacher_clearance" in arm else {}   # 没给键就不传 clearance（等于 ray）；hold_s 由教师构造处对所有教师臂统一传（K3）
+    spawn_kw = {"spawn_two_layer": arm["spawn_two_layer"]} if "spawn_two_layer" in arm else {}                   # 同上：没给键就不传给 run_episode
     student = StudentPolicy(arm["ckpt"], CFG["infer_bin"]) if arm["base"] == "student" else None
     try:
         for r in ROUTES:
@@ -182,7 +199,7 @@ for arm in ARMS:
                     fails.append({"episode": None, "error": f"route_check 不可达 {check}"})
                 teacher = planner_mod.OccAstarTeacher(
                     occ_planner, sc["waypoint"], hold_s=hold,
-                    **({"tol_deg": CFG["teacher_tol_deg"]} if "teacher_tol_deg" in CFG else {}))
+                    **({"tol_deg": CFG["teacher_tol_deg"]} if "teacher_tol_deg" in CFG else {}), **teacher_kw)
             for k in range(CFG["k"] if not fails else 0):
                 seed = CFG["seed0"] + 100 * r + k
                 ep_dir = os.path.join(d, "ep_%05d" % k)
@@ -211,7 +228,7 @@ for arm in ARMS:
                                               split="test", seed=seed, episode_id=seed, save_depth=False,
                                               stop_on_collision=True, dynamics_path=None,
                                               spawn_jitter=CFG["jitter"], identity=identity,
-                                              split_policy="diag-eval-fixed-test", dynamics="cf_sitl")
+                                              split_policy="diag-eval-fixed-test", dynamics="cf_sitl", **spawn_kw)
                 except Exception as e:  # noqa: BLE001 - 单集失败进 done.json，不拖垮整轮
                     fails.append({"episode": k, "seed": seed, "error": f"{type(e).__name__}: {e}"})
                     log(f"[{g}] r{r} ep{k} 失败: {e}")
@@ -266,6 +283,10 @@ for arm in ARMS:
                 done["rule"] = {"source": rule_src, "overrides": rule_params, **rule_kw}
             if step_mult != 1:
                 done["step_mult"] = step_mult
+            if teacher_kw:      # 新键只追加在后面，给了才有
+                done["teacher_clearance"] = teacher_kw["clearance"]
+            if spawn_kw:
+                done["spawn_two_layer"] = spawn_kw["spawn_two_layer"]
             with open(os.path.join(d, "done.json"), "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=1)
             log(f"[{g}] r{r} {len(eps)}/{CFG['k']} 集 失败 {len(fails)} 到点 {sum(e['success_stop'] for e in eps)} "

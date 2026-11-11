@@ -191,13 +191,16 @@ class DaggerPolicy:
         self.planner_name = expert.planner_name
         self.version = getattr(expert, "version", None)
         self.tol = getattr(expert, "tol", None)          # 教师的航向容差，run_episode 写进 manifest 的 teacher_yaw_tol_deg
+        self.clearance = getattr(expert, "clearance", None)   # 教师前向净空检查的形状（ray / swept），写进 manifest 的 teacher_clearance
         self.stop_radius = expert.stop_radius
         self.last_expert = None
         self.n_expert_exec = 0
 
     def reset(self):
-        """集边界：清学生的帧/动作缓存（StudentAdapter 只在构造时 reset，而本对象整轮复用）。"""
+        """集边界：清学生的帧/动作缓存（StudentAdapter 只在构造时 reset，而本对象整轮复用）；教师有集内状态（连续等待计数）也清。"""
         self.student.student.reset()
+        if hasattr(self.expert, "reset"):
+            self.expert.reset()
         self.last_expert = None
 
     @property
@@ -217,7 +220,24 @@ class DaggerPolicy:
         return action, infer_ms
 
 
-def _spawn_for_episode(scene, occ, jitter_m, rng):
+# 出生两层判空（W1-12，spawn_two_layer=True 才用）。起飞后的飞行高度与 scene.spawn.z 不在同一层栅格：室内首步 z − spawn.z 为
+# +0.012..+0.070（中位 +0.045），室外 −0.003..+0.066（中位 +0.027）（W1-11 新教师臂 240 集的首步位姿），之后多数步回落到 spawn.z 附近
+# （全部步中位 −0.009）。室内 spawn.z = 1.2 在栅格层边界上，按浮点落在下一层，起飞后的 1.21–1.27 m 落在上一层（120/120 集两层不同）。
+# 「巡航高度」取 spawn.z + SPAWN_CRUISE_DZ_M，常数是选择，不是测得的唯一值（待主会话确认）。
+SPAWN_CRUISE_DZ_M = 0.05
+SPAWN_CLEARANCE_MARGIN_M = 0.05    # occ.clearance（到最近原始占据体素中心的水平距离）至少 机体半径 + 此余量
+
+
+def _spawn_two_layer_ok(occ, x, y, z):
+    """候选出生点在出生高度与巡航高度两层都不碰撞，且到最近原始占据体素中心的水平距离不低于机体半径加余量。"""
+    return (not occ.collides(x, y, z) and not occ.collides(x, y, z + SPAWN_CRUISE_DZ_M)
+            and occ.clearance(x, y, z) >= occ.body_radius + SPAWN_CLEARANCE_MARGIN_M)
+
+
+def _spawn_for_episode(scene, occ, jitter_m, rng, two_layer=False):
+    """two_layer=False（缺省）：出生位姿与 rng 的消耗顺序与加这个参数之前逐位相同（test_teacher_clearance.py 锁住）。
+    True：抖动候选还要过 _spawn_two_layer_ok；被它多拒绝的候选多消耗 rng，所以开关打开后出生位姿序列可以与关闭时不同。
+    jitter_m <= 0 时直接返回 scene.spawn，不抽样也不检查。"""
     s = scene["spawn"]
     x, y, yaw = float(s["x"]), float(s["y"]), float(s.get("yaw_deg", 0.0))
     if jitter_m <= 0:
@@ -225,7 +245,7 @@ def _spawn_for_episode(scene, occ, jitter_m, rng):
     for _ in range(100):
         nx = x + rng.uniform(-jitter_m, jitter_m)
         ny = y + rng.uniform(-jitter_m, jitter_m)
-        if not occ.collides(nx, ny, float(s["z"])):
+        if not occ.collides(nx, ny, float(s["z"])) and (not two_layer or _spawn_two_layer_ok(occ, nx, ny, float(s["z"]))):
             return nx, ny, yaw + rng.uniform(-10.0, 10.0)
     raise RuntimeError(f"spawn 抖动 {jitter_m} m 内找不到自由点")
 
@@ -235,7 +255,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                 save_depth=False, stop_on_collision=False, dynamics_path=None,
                 truncate_on_collision=False,
                 spawn_jitter=0.0, identity=None, split_policy=None,
-                dynamics="cf_blackbox", agl=None):
+                dynamics="cf_blackbox", agl=None, spawn_two_layer=False):
     """跑一集，返回 (manifest, error)。产物写 out_dir；异常也尽量落 manifest。
 
     identity：scene_identity() 的结果（gid/scene_id/task_id）；None 时现算。
@@ -250,6 +270,8 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
     stop_on_collision = 闭环评测语义（manifest stopped_on_collision=true，preprocess 整集拒收）；
     truncate_on_collision = 训练采集语义：撞的那一步写完就结束本集，只有那一行被 --drop-collision 丢，
     manifest 记 truncated_on_collision=true，stopped_on_collision 保持 false。两者互斥。
+    spawn_two_layer：出生抖动的候选点要在出生高度与巡航高度两层都不碰撞、且净空够（_spawn_two_layer_ok）；缺省 False，
+    出生位姿与随机数消耗不变。开关值写进 manifest 的 spawn_two_layer。
     """
     if stop_on_collision and truncate_on_collision:
         raise ValueError("stop_on_collision（闭环评测）与 truncate_on_collision（训练采集）互斥")
@@ -263,7 +285,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
     if save_depth:
         os.makedirs(os.path.join(out_dir, "depth"), exist_ok=True)
     rng = np.random.default_rng(seed)
-    x, y, yaw = _spawn_for_episode(scene, occ, spawn_jitter, rng)
+    x, y, yaw = _spawn_for_episode(scene, occ, spawn_jitter, rng, two_layer=spawn_two_layer)
     if dynamics == "cf_sitl":
         dyn = CfSitlDynamics(scene, params, dynamics_path, seed=seed)
         try:
@@ -477,6 +499,10 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             # 占据 A* 教师的航向容差（度）：只有带 tol 的策略才写这个键，其余策略与旧 manifest 一样没有；
             # 旧集没有这个键 = 12°（v1）。离线按记录重标时以这里为准。
             **({"teacher_yaw_tol_deg": policy.tol} if getattr(policy, "tol", None) is not None else {}),
+            # 占据 A* 教师前向净空检查的形状（ray = 机头线段，v1 / v2；swept = 再加预测位移扫掠，v3）：只有带 clearance 的策略才写这个键，
+            # 旧 manifest 没有这个键 = ray。
+            **({"teacher_clearance": policy.clearance} if getattr(policy, "clearance", None) is not None else {}),
+            "spawn_two_layer": bool(spawn_two_layer),     # 出生判空是否用两层检查（旧 manifest 没有这个键 = False）
             "hold_s": hold_s,
             "window_from": "render_observation",
             "actions_ref": "actions.jsonl",
@@ -584,6 +610,12 @@ def main():
                         "可执行文件取 $CF_SITL_PROC，缺失直接报错）；cf_blackbox = 一阶黑盒、z 固定，只用于冒烟/单测")
     p.add_argument("--dynamics-params", default=None)
     p.add_argument("--spawn-jitter", type=float, default=0.0)
+    p.add_argument("--spawn-two-layer", action="store_true",
+                   help="出生抖动的候选点要在出生高度与巡航高度两层都不碰撞、且净空够（需要 --spawn-jitter > 0；缺省关，"
+                        "关时出生位姿与随机数消耗不变）")
+    p.add_argument("--teacher-clearance", choices=planner_mod.CLEARANCE_MODES, default="ray",
+                   help="占据 A* 教师前向净空检查的形状：ray = 沿机头一条线段（缺省，与以前逐步相同）；swept = 机头线段通过后再沿预测位移"
+                        "（加 reserve）做扫掠，教师版本 v3（只用于 --policy astar / student，且 hold 必须是 1.0）")
     args = p.parse_args()
     if os.path.isdir(args.out) and os.listdir(args.out):
         p.error(f"--out {args.out} 不是空目录")
@@ -598,6 +630,13 @@ def main():
         p.error("steps 必须 >=1，hold 必须有限正数")
     if args.spawn_jitter < 0 or not math.isfinite(args.spawn_jitter):
         p.error("--spawn-jitter 必须有限且 >= 0")
+    if args.spawn_two_layer and args.spawn_jitter <= 0:
+        p.error("--spawn-two-layer 需要 --spawn-jitter > 0（抖动为 0 时不抽样，开关没有作用，manifest 却会记成开）")
+    if args.teacher_clearance != "ray":
+        if args.policy not in ("astar", "student"):
+            p.error(f"--teacher-clearance {args.teacher_clearance} 只用于 --policy astar / student（占据 A* 教师）")
+        if abs(hold - planner_mod.SWEPT_HOLD_S) > 1e-9:
+            p.error(f"--teacher-clearance {args.teacher_clearance} 的位移系数只在 hold {planner_mod.SWEPT_HOLD_S:g} s 下量过，得到 --hold {hold:g}")
     if args.policy == "student" and not (args.ckpt and os.path.isfile(args.ckpt)):
         p.error("--policy student 需要存在的 --ckpt")
     if not (0.0 <= args.beta <= 1.0):
@@ -628,7 +667,7 @@ def main():
     if args.policy in ("astar", "student"):
         occ_planner = planner_mod.OccPlanner(occ)
         # 航向容差随 hold 推导（hold 0.5 仍是 12°，hold 1.0 为 18.9°）：转角步比死区宽时教师会左右来回转
-        policy = planner_mod.OccAstarTeacher(occ_planner, scene["waypoint"], hold_s=hold)
+        policy = planner_mod.OccAstarTeacher(occ_planner, scene["waypoint"], hold_s=hold, clearance=args.teacher_clearance)
         check = planner_mod.route_check(occ_planner, scene["spawn"], scene["waypoint"],
                                         terrain_occ=terrain, route_name=route_name)
         if not check["feasible"]:
@@ -670,7 +709,7 @@ def main():
                 truncate_on_collision=args.truncate_on_collision,
                 dynamics_path=args.dynamics_params,
                 spawn_jitter=args.spawn_jitter, identity=identity,
-                split_policy=split_policy, dynamics=args.dynamics, agl=agl)
+                split_policy=split_policy, dynamics=args.dynamics, agl=agl, spawn_two_layer=args.spawn_two_layer)
             episodes.append({"episode": ep, "dir": os.path.basename(ep_dir),
                              "steps": manifest["num_steps"],
                              "collision": any(a["collision"] for a in
@@ -688,6 +727,7 @@ def main():
         "route": scene.get("route"), "spawn": scene.get("spawn"), "waypoint": scene.get("waypoint"),
         "split": split, "split_policy": split_policy,
         "policy": args.policy, "steps": steps, "hold_s": hold,
+        "teacher_clearance": args.teacher_clearance, "spawn_two_layer": args.spawn_two_layer,
         "dagger": dagger,
         "dynamics": args.dynamics,
         "dynamics_profile": params.profile(),
