@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """eval_closed_loop.summarize_episode 自检：contact/stuck 口径（EVAL_STANDARD §5.1）
 与 SIM-09 新口径（reach_ever/final_in_radius/stop_action_issued/task_success）。
+W1-3：帧间隔。actions 行的 rgb_ts（ns）相邻两步之差的最大值写 max_frame_gap_s（秒）；大于 1.2 × hold 时再写
+frame_gap_flag: true（不大于则不写这个键）。hold 由调用方给（run_episode 传 --hold）；没给时用行里的 sim_dt。
 """
 import os
 import sys
@@ -10,6 +12,17 @@ import eval_closed_loop as ec
 
 WP = {"x": 2.0, "y": 1.0}
 
+# 旧代码（W1-3 之前，75e85e2）下 summarize_episode 的真实键集合：一般调用、waypoint 调用、空集三种都是这 28 个。
+# actions 行没有 rgb_ts（旧数据）、只有 1 步、空集时，输出必须仍是这 28 个键。
+SUMMARY_KEYS_OLD = {
+    'collision', 'collision_free', 'corridor_violation', 'false_forward', 'final_in_radius',
+    'final_waypoint_dist', 'goal_radius_reach', 'goal_radius_stop', 'infer_ms', 'max_x', 'metric_version',
+    'path_length_m', 'reach_ever', 'shortest_path_m', 'spl', 'stable_termination', 'steps', 'steps_to_goal',
+    'stop_action_issued', 'stop_success', 'stopped', 'stuck', 'stuck_free', 'success', 'task_success',
+    'timed_out', 'waypoint_min_dist', 'y_max_m'
+}
+GAP_KEYS = {"max_frame_gap_s", "frame_gap_flag"}
+
 
 def run(rows, x=6.0, goal_x=5.0):
     return ec.summarize_episode(rows, [{"pose_gt": {"x": x}}], goal_x)
@@ -18,6 +31,24 @@ def run(rows, x=6.0, goal_x=5.0):
 def l1(rows, oracle, stop_radius=0.5, goal_radius=None, timed_out=False):
     return ec.summarize_episode(rows, oracle, 6.0, WP, stop_radius=stop_radius,
                                 goal_radius=goal_radius, timed_out=timed_out)
+
+
+def gap_rows(*gaps_s, **extra):
+    """rgb_ts 从 10 s 起；第 i 步与第 i-1 步相隔 gaps_s[i-1] 秒（整数 ns，避免浮点误差）。extra 加进每一行。"""
+    ts = [10 * 10**9]
+    for g in gaps_s:
+        ts.append(ts[-1] + int(round(g * 1e9)))
+    return [{"collision": False, "action_executed": 1, "rgb_ts": t, **extra} for t in ts]
+
+
+def gap_summary(rows, goal_x=5.0, **kw):
+    """rows 配一条飞过线的 oracle（逐行一一对应）；kw 原样传给 summarize_episode（如 hold）。"""
+    return ec.summarize_episode(rows, [{"pose_gt": {"x": 6.0}} for _ in rows], goal_x, **kw)
+
+
+def gap_run(gaps_s, hold=None, **row_extra):
+    """合成一条相邻帧间隔为 gaps_s 的轨迹（无碰撞、飞过线）。hold 给了才传给 summarize_episode；row_extra 进每一行（如 sim_dt）。"""
+    return gap_summary(gap_rows(*gaps_s, **row_extra), **({} if hold is None else {"hold": hold}))
 
 
 def main():
@@ -190,8 +221,74 @@ def main():
     s = ec.summarize_episode(actions, one_m, 6.0, WP, stop_radius=0.5, goal_radius=0.5, shortest_path_m=1.0)
     assert s["spl"] == 0.0 and s["reach_ever"], s
 
+    frame_gap_checks()
+    old_outputs_unchanged_checks()
+
     print("test_eval_summary: PASS")
     return 0
+
+
+def frame_gap_checks():
+    """W1-3：max_frame_gap_s / frame_gap_flag 的取值与 hold 的来源。"""
+    # 相邻帧间隔 2.4 s（hold 1.0）：写最大间隔，frame_gap_flag 为真
+    s = gap_run((1.0, 1.0, 2.4, 1.0), hold=1.0)
+    assert s["max_frame_gap_s"] == 2.4 and s["frame_gap_flag"] is True, s
+    # 相邻帧间隔 1.0 s：写最大间隔，不写 frame_gap_flag
+    s = gap_run((1.0, 1.0, 1.0), hold=1.0)
+    assert s["max_frame_gap_s"] == 1.0 and "frame_gap_flag" not in s, s
+    # 取的是相邻两步之差的最大值，不是首尾之差，也不是平均
+    assert gap_run((1.0, 1.1, 1.0), hold=1.0)["max_frame_gap_s"] == 1.1
+    # 阈值是严格大于 1.2 × hold：恰好 1.2 s 不打旗，1.201 s 打旗
+    assert "frame_gap_flag" not in gap_run((1.0, 1.2), hold=1.0)
+    assert gap_run((1.0, 1.201), hold=1.0)["frame_gap_flag"] is True
+    # 阈值跟着 hold 走：同样 1.0 s 的间隔，hold 0.5 时算断帧，hold 1.0 时不算
+    assert gap_run((1.0, 1.0), hold=0.5)["frame_gap_flag"] is True
+    assert "frame_gap_flag" not in gap_run((1.0, 1.0), hold=1.0)
+
+    # 拿不到 hold 时用行里的 sim_dt（3DGS 的行带 sim_dt = hold_s）
+    assert gap_run((1.0, 1.0), sim_dt=0.5)["frame_gap_flag"] is True
+    assert "frame_gap_flag" not in gap_run((1.0, 1.0), sim_dt=1.0)
+    # 给了 hold 就以 hold 为准，不看 sim_dt
+    assert "frame_gap_flag" not in gap_run((1.0, 1.0), hold=1.0, sim_dt=0.5)
+    # 行里的 sim_dt 取中位数：个别行的离群值不能把阈值抬高
+    rows = gap_rows(1.0, 1.5, 1.0, sim_dt=1.0)
+    rows[2]["sim_dt"] = 9.0
+    s = gap_summary(rows)
+    assert s["max_frame_gap_s"] == 1.5 and s["frame_gap_flag"] is True, s
+    # hold 与 sim_dt 都没有：只写间隔，没有判据就不打旗
+    s = gap_run((1.0, 5.0))
+    assert s["max_frame_gap_s"] == 5.0 and "frame_gap_flag" not in s, s
+
+    # 缺 rgb_ts 的行不桥接：桥接会把一个缺行算成 2 倍间隔
+    rows = gap_rows(1.0, 1.0, 1.0)
+    rows[1]["rgb_ts"] = None
+    s = gap_summary(rows, hold=1.0)
+    assert s["max_frame_gap_s"] == 1.0 and "frame_gap_flag" not in s, s
+
+    # waypoint 任务（l1 / campus）同样写帧间隔，口径与验收线任务一致
+    rows = gap_rows(1.0, 2.4)
+    s = ec.summarize_episode(rows, [{"pose_gt": {"x": 2.0, "y": 1.0}}] * len(rows), 6.0, WP,
+                             stop_radius=0.5, hold=1.0)
+    assert s["max_frame_gap_s"] == 2.4 and s["frame_gap_flag"] is True and s["success"], s
+
+    # 新键只有这两个，且只加不改：其余键与值同没有 rgb_ts 的同一条轨迹逐项相等
+    with_ts = gap_run((1.0, 1.0, 2.4, 1.0), hold=1.0)
+    without_ts = gap_summary([{k: v for k, v in r.items() if k != "rgb_ts"} for r in gap_rows(1.0, 1.0, 2.4, 1.0)])
+    assert set(with_ts) - set(without_ts) == GAP_KEYS and {k: with_ts[k] for k in without_ts} == without_ts, \
+        (with_ts, without_ts)
+
+
+def old_outputs_unchanged_checks():
+    """W1-3 不改旧输出：没有可算的相邻时间戳时，键集合与旧代码一字不差。这一组在旧代码上也应通过。"""
+    # 旧数据没有 rgb_ts
+    one = [{"collision": False, "action_executed": 1}]
+    assert set(run(one)) == SUMMARY_KEYS_OLD, set(run(one)) ^ SUMMARY_KEYS_OLD
+    assert set(l1(one, [{"pose_gt": {"x": 2.0, "y": 1.0}}])) == SUMMARY_KEYS_OLD
+    no_ts = gap_summary([{k: v for k, v in r.items() if k != "rgb_ts"} for r in gap_rows(1.0, 1.0, 2.4, 1.0)])
+    assert set(no_ts) == SUMMARY_KEYS_OLD, set(no_ts) ^ SUMMARY_KEYS_OLD
+    # 一步集没有相邻两步；空集没有步
+    assert set(gap_run(())) == SUMMARY_KEYS_OLD, "一步集"
+    assert set(ec.summarize_episode([], [], 5.0)) == SUMMARY_KEYS_OLD, "空集"
 
 
 if __name__ == "__main__":

@@ -181,12 +181,12 @@ class ActionLatencyStep(unittest.TestCase):
         self.assertAlmostEqual(row["dispatch_lag_s"], 0.06, places=9)
         self.assertIsNone(row["late_dispatch"])
         keys = set(collect.action_row(row | {"depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0}))
-        self.assertEqual(keys, tc.ROW_KEYS_DEFAULT | {"executed_by"})   # 学生行本来就带 executed_by
+        self.assertEqual(keys, tc.ROW_KEYS_DEFAULT | {"executed_by", "probs"})   # 学生行本来就带 executed_by；W1-3 起另带 probs
 
     def test_flag_row_adds_late_dispatch_after_dispatch_lag(self):
         row, _, _, _, _, _, _ = run_step(OBS_S + 0.06)
         ar = collect.action_row(row | {"depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0})
-        self.assertEqual(set(ar), tc.ROW_KEYS_DEFAULT | {"executed_by", "late_dispatch"})
+        self.assertEqual(set(ar), tc.ROW_KEYS_DEFAULT | {"executed_by", "late_dispatch", "probs"})   # probs：W1-3，学生行才有
         self.assertIs(ar["late_dispatch"], False)
         keys = list(ar)
         self.assertEqual(keys[-2:], ["dispatch_lag_s", "late_dispatch"], "新键排在最后：旧键的行内顺序不变")

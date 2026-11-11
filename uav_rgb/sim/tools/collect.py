@@ -39,6 +39,7 @@ RGB 仍然是**动作前**的观测（M1：rgb_ts < action_start_ts），动作�
                          collision/rgb_ok/frame/depth_ts/depth_rgb_gap_ns/pose_ts/
                          pose_rgb_gap_ns/rgb_ts/action_start_ns/pose_before/yaw_before
                          + depth_file（仅 --save-depth）
+                         + probs（仅 --policy student：学生四类概率，下标 = 动作编号，保留 4 位小数；零样本基线是 one-hot）
   oracle.jsonl           每步 step/timestamp_ns(动作后 pose)/pose_gt + 动作起止 sim-time
   rgb_%05d.png           320x240 原图（降采样到 160x120 由 tools/preprocess.py 负责）
   depth/depth_%05d.png   --save-depth 时：16 位灰度 PNG，单位毫米（0=无回波）
@@ -898,6 +899,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     pose_before, _, yaw_before = _pose_parts(pose_msg)
 
     infer_ms = None
+    probs = None    # W1-3：学生的四类概率；只有 --policy student 才赋值，其它策略保持 None（行里不出现 probs 键）
     if policy == "teacher":
         if pillars:
             # 有柱子真值就用 carrot planner：真值只决定标签，不进学生输入。
@@ -954,7 +956,12 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         try:
             # prev_executed：β>0 时上一步可能执行的是教师动作，prev-action 模型要看真正执行的那个；
             # β=0 时它就是学生自己上一步的输出，与不传完全等价（student.act 的缓存语义）。
-            action, infer_ms, _probs = student.act(rgb_msg, prev_action=prev_executed)
+            action, infer_ms, probs = student.act(rgb_msg, prev_action=prev_executed)
+            if probs is not None:
+                # W1-3：保留学生的四类概率落进行里，4 位小数。放在 try 里：概率不是数字列表就在派发前判本步失败，
+                # 不留到动作发出之后才在组装行时抛异常。是学生自己的输出，与本步谁执行无关（β 混合换成教师动作、
+                # 航向护栏改写动作时，probs 仍是学生看到这一帧后给的）。
+                probs = [round(float(p), 4) for p in probs]
         except Exception as e:  # noqa: BLE001 - 推理进程任何失败都算本步失败
             return None, f"学生推理失败: {type(e).__name__}: {e}"
         if pillars:
@@ -1213,7 +1220,7 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     stuck = bool(action == FORWARD_SLOW and sim_dt > 0 and dist is not None
                  and armed and dist < stuck_eps)
 
-    return {
+    row = {
         "contact_seq_end": contact_seq_end,
         "step": step_idx,
         "timestamp_ns": rgb_ts,        # 动作前 RGB 帧 sim-time（EpisodeStep）
@@ -1259,7 +1266,10 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         "timing": {"io": t_io - t_step, "window": action_wall,
                    "block": t_block - t_action_start, "tail": t_end - t_block,
                    "total": t_end - t_step, "dispatch_sim_dt": dispatch_sim_dt},
-    }, None
+    }
+    if probs is not None:     # 只有学生策略才有 probs 键；其它策略的行逐键不变
+        row["probs"] = probs
+    return row, None
 
 
 def write_manifest(path, manifest):
@@ -1315,8 +1325,12 @@ def action_row(r, save_depth=False):
     # executed_by 来自 --policy student 的影子教师（本步执行者 student/expert），
     # q_costs 来自 --teacher-planner costmap（Q[SAFE, FWD, L, R]，步），
     # rule_cols / rule_entry 来自 --policy rule-oracle（该步各列距离与触发的规则条目，供事后分析失败）；
-    # rule_mem_n / rule_clear 只有 --rule-version v1 才有（记忆点数与三个候选航向的通道是否畅通）。
-    for k in ("tie_margin_steps", "executed_by", "q_costs", "rule_cols", "rule_entry", "rule_mem_n", "rule_clear"):
+    # rule_mem_n / rule_clear 只有 --rule-version v1 才有（记忆点数与三个候选航向的通道是否畅通）；
+    # probs（W1-3）只有 --policy student 才有：学生看到那一帧后的四类概率，下标 = 动作编号 0..3（src/infer.cpp：action 是
+    # probs 的 argmax 下标），4 位小数；collect_one 只在学生策略下给这个键。零样本基线（baselines/baseline_infer.py）也经
+    # --policy student --infer-bin 走这一支，它没有四类概率，probs 是 one-hot（原始输出在基线自己的 raw）。
+    for k in ("tie_margin_steps", "executed_by", "q_costs", "rule_cols", "rule_entry", "rule_mem_n", "rule_clear",
+              "probs"):
         if r.get(k) is not None:
             row[k] = r[k]
     # W1-0：dispatch_lag_s（派发的仿真戳减观测戳，秒）每步都记，排在最后（旧键的行内顺序不变）；

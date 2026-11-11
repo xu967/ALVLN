@@ -502,10 +502,34 @@ def flight_path_m(oracle, actions, goal_x, waypoint=None, stop_radius=None, goal
                               radius=(REACH_RADIUS if goal_radius is None else goal_radius) if waypoint_task else None)
 
 
+# W1-3：相邻两帧的间隔大于 hold 的这个倍数，per_episode 记 frame_gap_flag: true。
+FRAME_GAP_FLAG_FACTOR = 1.2
+
+
+def max_frame_gap_s(actions):
+    """actions 行的 rgb_ts（ns）相邻两步之差的最大值，单位秒；没有可算的相邻对时 None。
+
+    缺 rgb_ts 的行不桥接（桥接会把一个缺行算成 2 倍间隔）：只算相邻两行都有时间戳的那些对。
+    旧数据没有 rgb_ts、一步集、空集都是 None。
+    """
+    gaps = [b["rgb_ts"] - a["rgb_ts"] for a, b in zip(actions, actions[1:])
+            if a.get("rgb_ts") is not None and b.get("rgb_ts") is not None]
+    return max(gaps) / 1e9 if gaps else None
+
+
+def frame_gap_reference_s(actions, hold=None):
+    """判断帧间隔是否偏大的参照秒数：调用方给的 hold；没给时取行里 sim_dt 的中位数（3DGS 的行带 sim_dt = hold_s），
+    都拿不到为 None。gz 采集的 actions.jsonl 行没有 sim_dt，所以 run_episode 必须传 hold。"""
+    if hold is not None:
+        return float(hold)
+    dts = [float(a["sim_dt"]) for a in actions if (a.get("sim_dt") or 0) > 0]
+    return statistics.median(dts) if dts else None
+
+
 def summarize_episode(actions, oracle, goal_x, waypoint=None,
                       waypoint_radius=WAYPOINT_RADIUS, stop_radius=None, goal_radius=None,
                       timed_out=False, coast_window_s=None, shortest_path_m=None,
-                      corridor_half_width=None):
+                      corridor_half_width=None, hold=None):
     """单集指标；纯函数，便于单测。actions/oracle 是 jsonl 行。
 
     EVAL_STANDARD §5.1：stuck（FORWARD 位移 < 阈值）不是碰撞，碰撞率只看 contact。
@@ -537,6 +561,10 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
     3DGS planner.route_check）；写 path_length_m（oracle xy 折线，截到首次到达，见 goal_path_length_m）、
     shortest_path_m、spl = success · l_i / max(p_i, l_i)。没给 l_i 时 spl 为 None，旧字段逐位不变。
     steps_to_goal（sim09.v2）：第一次进入目标区用的步数（first_goal_step），从未进入 None。
+    帧间隔（W1-3，只加不改）：actions 行有 rgb_ts（ns）且至少两步时，写 max_frame_gap_s（相邻两步 rgb_ts 之差的最大值，秒）；
+    大于 FRAME_GAP_FLAG_FACTOR(1.2) × hold 时再写 frame_gap_flag: true（不大于则不写这个键）。hold 是每动作仿真秒，
+    调用方给（run_episode 传 --hold）；没给时用行里 sim_dt 的中位数，都没有就只写间隔、不打旗。
+    没有 rgb_ts（旧数据）、一步集、空集不多任何键。
     """
     goal_radius_stop = float(stop_radius) if stop_radius is not None else None
     metric_version = (METRIC_VERSION if coast_window_s is None
@@ -631,7 +659,7 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
     p_i = goal_path_length_m(trajectory_xy(oracle), **goal_region)
     steps_to_goal = first_goal_step(oracle, **goal_region)
     infer = [float(a["infer_ms"]) for a in actions if a.get("infer_ms") is not None]
-    return {"steps": len(actions), "collision": collision, "stuck": stuck,
+    stat = {"steps": len(actions), "collision": collision, "stuck": stuck,
             "false_forward": false_forward, "success": success,
             "stop_success": stop_success,
             "max_x": max_x, "waypoint_min_dist": wp_min,
@@ -650,6 +678,14 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
             "path_length_m": p_i, "shortest_path_m": shortest_path_m,
             "spl": spl_of(success, p_i, shortest_path_m),
             "steps_to_goal": steps_to_goal}
+    # W1-3：相邻帧最大间隔与断帧旗（只加不改；缺 rgb_ts 的旧数据、一步集不写键）。
+    gap = max_frame_gap_s(actions)
+    if gap is not None:
+        stat["max_frame_gap_s"] = gap
+        ref = frame_gap_reference_s(actions, hold)
+        if ref is not None and ref > 0 and gap > FRAME_GAP_FLAG_FACTOR * ref:
+            stat["frame_gap_flag"] = True
+    return stat
 
 
 def aggregate(episodes, requested=None, attempted=None, failed_count=0, skipped_count=0):
@@ -911,7 +947,8 @@ def run_episode(seed, args, workdir, seen_gids):
                                 timed_out=(rc == "timeout"),
                                 coast_window_s=COAST_WINDOW_S.get(args.dynamics),
                                 shortest_path_m=episode_shortest_path_m(args, meta, oracle, goal_x),
-                                corridor_half_width=args.corridor_half_width)
+                                corridor_half_width=args.corridor_half_width,
+                                hold=args.hold)   # W1-3：帧间隔旗的参照；gz 的 actions 行没有 sim_dt，只能由这里传
     summary.update({
         "seed": seed, "geometry_gid": gid, "split": split, "policy": args.policy,
         "task": args.task, "window_from": args.window_from,

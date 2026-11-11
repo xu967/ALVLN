@@ -262,11 +262,12 @@ class AggregateHelpers(unittest.TestCase):
 
 # ---------------------------------------------------------------- 完整 ec.main()（假 scene_gen / 假 collect）
 
-def run_eval(task, trajectories, failing=(), corridor="3.0", real_spl=False):
+def run_eval(task, trajectories, failing=(), corridor="3.0", real_spl=False, extra_argv=()):
     """完整 ec.main()：假 scene_gen 用真生成器出 meta，假 collect 把 trajectories[seed] = (oracle, actions) 写成集目录。
 
     failing 里的 seed：collect 返回 rc=1 且不写轨迹（算采集失败）。corridor=None 不给 --corridor-half-width。返回 eval.json。
     SPL 的参考路径要跑 A*（K=3 每集约 2 s），与本卡无关，默认打桩成 None；real_spl=True 走真函数（新旧树差分用）。
+    extra_argv：追加到命令行末尾（W1-3 的 test_eval_frame_gap.py 用它给 --hold）。
     """
     seeds = list(trajectories) + [s for s in failing if s not in trajectories]
 
@@ -303,6 +304,7 @@ def run_eval(task, trajectories, failing=(), corridor="3.0", real_spl=False):
             argv += ["--corridor-half-width", corridor]
         if task == "course_base":
             argv += ["--blocks", "3"]
+        argv += list(extra_argv)
         with contextlib.ExitStack() as st:
             st.enter_context(patch.object(ec.sys, "argv", argv))
             st.enter_context(patch.object(ec.cp, "XDG_RUNTIME_DIR", str(Path(d) / "xdg")))

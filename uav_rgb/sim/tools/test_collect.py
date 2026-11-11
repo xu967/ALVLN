@@ -702,6 +702,83 @@ def shadow_teacher_step(beta, rng_value=0.0, tiebreak="legacy", prev_executed=No
     return row, err, seen
 
 
+def probs_step(policy, probs=None):
+    """真 collect_one：policy == "student" 时接一个假学生（act 返回 (动作, 毫秒, probs)），其它策略不接学生。
+
+    夹具同 shadow_teacher_step（一帧 RGB/深度，位姿推进 1 s），不给柱子：学生没有影子教师，教师走深度专家。返回 (row, err)。
+    """
+    w, h = 4, 6
+    rgb = image_msg(w, h, 10)
+    pose = ClockPoseSub(pose_msg(10.2))
+    subs = {"rgb": FakeSub(after=rgb), "depth": FakeSub(frames=[(1, _fresh_depth(w, h))]),
+            "pose": pose, "contact": FakeSub()}
+
+    class Student:
+        def act(self, msg, prev_action=None):
+            return 1, 5.0, probs
+
+    def advance(_secs):
+        pose.current = pose_msg(11.2)
+
+    with tempfile.TemporaryDirectory() as d, \
+            patch.object(collect, "write_rgb_png", return_value=(True, None)), \
+            patch.object(collect.time, "sleep", side_effect=advance):
+        return collect.collect_one(d, 0, 1.0, policy, subs, FakePub(),
+                                   student=Student() if policy == "student" else None)
+
+
+def as_actions_line(row):
+    """collect_one 的行经 action_row 写进 actions.jsonl 的样子（补上主循环加的两个间隔键）。"""
+    return collect.action_row(row | {"depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0})
+
+
+def probs_checks():
+    """W1-3：学生每步的四类概率落进 actions.jsonl 行（4 位小数）；其它策略的行逐键不变。"""
+    out = {}
+    raw = [0.1234567, 0.5000004, 0.2000009, 0.176542]            # 推理进程给的原始概率（和为 1，不止 4 位小数）
+    row, err = probs_step("student", raw)
+    out["collect_one 学生行有 probs：4 个数，保留 4 位小数"] = (
+        err is None and row.get("probs") == [0.1235, 0.5, 0.2, 0.1765]
+        and all(isinstance(p, float) and round(p, 4) == p for p in row.get("probs", ())))
+    out["学生行的 probs 之和为 1（±1e-3）"] = err is None and abs(sum(row.get("probs", ())) - 1.0) <= 1e-3
+    line = as_actions_line(row)
+    keys = list(line)
+    out["action_row 把 probs 写进 actions.jsonl 行；W1-0 的 dispatch_lag_s 仍是最后一个键"] = (
+        line.get("probs") is not None and line["probs"] == row["probs"] and keys[-1] == "dispatch_lag_s")
+    out["学生行只比默认行多 probs"] = set(line) == ROW_KEYS_DEFAULT | {"probs"}
+    # 边界：学生没给 probs（None）→ 行里没有这个键，步照常成功；给的不是数字 → 派发前判本步失败，不留到动作发出之后
+    row_none, err_none = probs_step("student", None)
+    out["学生给 None：行里没有 probs 键，步成功"] = err_none is None and "probs" not in row_none
+    row_bad, err_bad = probs_step("student", ["x", 1.0, 0.0, 0.0])
+    out["probs 不是数字：本步失败（学生推理失败）"] = row_bad is None and "学生推理失败" in (err_bad or "")
+    # 零样本基线（baselines/baseline_infer.py）经 --policy student --infer-bin 走同一条学生分支；它没有四类概率，给 one-hot，照常落盘
+    row_oh, err_oh = probs_step("student", [0.0, 1.0, 0.0, 0.0])
+    out["零样本基线的 one-hot probs 照常落盘（走同一条学生分支）"] = (
+        err_oh is None and row_oh.get("probs") == [0.0, 1.0, 0.0, 0.0]
+        and as_actions_line(row_oh).get("probs") == [0.0, 1.0, 0.0, 0.0])
+    # probs 是学生自己的输出，与谁执行无关：β=1 时执行教师动作，probs 仍是学生的
+    row_b, err_b, _ = shadow_teacher_step(beta=1.0, rng_value=0.3, prev_executed=3)
+    out["probs 不随执行者变（β=1 执行教师动作，probs 仍是学生的）"] = (
+        err_b is None and row_b["executed_by"] == "expert" and row_b.get("probs") == [0.0, 1.0, 0.0, 0.0])
+    # 其它策略：行里没有 probs 键（collect_one 的行与 action_row 的行都没有），键集合与默认行一字不差
+    for policy in ("teacher", "forward"):
+        row_o, err_o = probs_step(policy)
+        out[f"{policy} 的行没有 probs 键"] = (
+            err_o is None and "probs" not in row_o and "probs" not in as_actions_line(row_o)
+            and set(as_actions_line(row_o)) == ROW_KEYS_DEFAULT)
+    # 主循环落盘：student 的 actions.jsonl 每行带 probs，教师的每行都没有
+    rows_s = [fake_row(i, 1.0 + 0.25 * i, executed_by="student", probs=[0.1, 0.6, 0.2, 0.1]) for i in range(3)]
+    _, acts_s, code_s, _ = run_main(["--policy", "student", "--student-ckpt", "CKPT"], rows_s,
+                                    student_cls=FakeStudentPolicy)
+    out["主循环：student 的 actions.jsonl 每行带 probs"] = (
+        code_s is None and len(acts_s) == 3 and all(a.get("probs") == [0.1, 0.6, 0.2, 0.1] for a in acts_s)
+        and all(set(a) == ROW_KEYS_DEFAULT | {"executed_by", "probs"} for a in acts_s))
+    _, acts_t, code_t, _ = run_main([], [fake_row(i, 1.0 + 0.25 * i) for i in range(3)])
+    out["主循环：教师的 actions.jsonl 没有 probs"] = (
+        code_t is None and len(acts_t) == 3 and all("probs" not in a and set(a) == ROW_KEYS_DEFAULT for a in acts_t))
+    return out
+
+
 class MainPub(FakePub):
     mode = "fake"
 
@@ -808,7 +885,8 @@ def switch_checks():
     out["--tiebreak visible 每步记 tie_margin_steps"] = (err_v is None
                                                         and isinstance(row_v["tie_margin_steps"], float))
     ar = collect.action_row(row | {"depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0})
-    out["action_row 只在开关开着时多字段"] = (set(ar) == ROW_KEYS_DEFAULT | {"executed_by"}
+    # W1-3：student 的行另有 probs（学生四类概率，见 probs_checks）；教师行仍是默认字段集
+    out["action_row 只在开关开着时多字段"] = (set(ar) == ROW_KEYS_DEFAULT | {"executed_by", "probs"}
                                            and set(collect.action_row(fake_row(0, 1.0) | {
                                                "depth_rgb_gap_ns": 0, "pose_rgb_gap_ns": 0})) == ROW_KEYS_DEFAULT)
     # 4) student 模式 manifest：字段名与 sim/3dgs/collect_3dgs.py 一致
@@ -980,6 +1058,8 @@ def main():
           not collect.stopped_at_waypoint({"pose_before": {"x": 4.0, "y": 1.5}}, None, 0.5))
     for k, v in switch_checks().items():
         check(f"开关: {k}", v)
+    for k, v in probs_checks().items():
+        check(f"学生概率: {k}", v)
 
     # 航向护栏（--heading-guard）：|已执行左转数 − 右转数| 达到阈值就朝回转一步；0 = 关闭。
     check("护栏关闭时不干预", collect.heading_guard_action(5, 0) is None)
