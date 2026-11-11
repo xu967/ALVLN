@@ -52,6 +52,7 @@ mkdir -p $D/tmp/phase12-cards/$NAME            # 草稿、日志；报告写 $D/
 | 2 | W1-12 | 3DGS 教师的前向净空检查改形状、出生判空可选两层检查、导引指针核查（11-11 23:30 细化） | W1-11 已合入；与 K3 只在 driver 的一处相邻改动 | 否 | 是（3DGS） | 中 |
 | 端到端 | E2E-0 | 可判定性审计：真值列距离与动作历史能决定多少教师标签（离线，11-12 立） | 无 | 否 | 可选 | 中 |
 | 端到端 | E2E-1 | 航向码端到端学生：W1-9 的实现，加「示范 / DAgger 聚合 × 有无航向码」2×2 试点，不带护栏（11-12 立） | W1-0 第二轮的 L | 2 个 | 是（训练） | 难，建议 Sonnet 5.5 Max |
+| 端到端 | E2E-P0 | PyTorch 原型线的地基：模型复刻、checkpoint 读写、行协议包装器、训练配方复刻，逐项与 C++ 对拍（11-12 立） | 无 | 2 个 | 是（训练） | 中 |
 | 3 | W3-x | 3DGS 程序化障碍、多航点路线、执行器与路书、SAGE-3D 完整试点、数据集 B 放量。11-12 起「执行器与路书」不作为交付路线（计划 §10.3） | 第 1、2 波的结论 | | | 难；规格见 §5，细化后再开工 |
 
 第 1 波的卡互不依赖，可以并行；W1-3、W1-4、W1-9 都改 `sim/tools/collect.py` 或 `sim/tools/eval_closed_loop.py`，并行时各自只动卡里写的函数，合并由主会话处理。
@@ -636,6 +637,32 @@ gz 的上限随核数定（24 核 7 个，12 核 3 个，公共规则 §4），�
 - 并行改动的提醒：今晚别的卡也在改 `tools/preprocess.py`（W1-7、W1-8）、`sim/tools/collect.py` 的学生分支与 `sim/tools/eval_closed_loop.py`（W1-3、W1-4）、
   两条流水线（W1-1、W1-5）。只动卡里写的地方，改动尽量集中在新函数与新参数上，合并冲突由主会话处理。
 - 提交：W1-9 的提交照该卡；`feat(tools): average_ckpt 的校准支持带条件输入的模型`；实验入口与结果文档。
+
+### 卡 E2E-P0：PyTorch 原型线的地基（用户 11-12 允许结构探索用 PyTorch 做原型）
+
+- 目的：以后要试循环状态、更省参数的卷积这类结构，先在 PyTorch 里试，闭环评测走 `--infer-bin` 包装器，结构定了再移植到 C++。
+  这张卡只搭地基，并证明「原型线的数与主线的数可比」。不做任何结构探索。
+- 规矩（公共规则 §4）：原型代码只放新目录 `proto/`；`src/`、`tools/`、`sim/` 的主线代码不 import 它；原型的权重与数字都标 `proto`，不进主表。
+  解释器用 `$D/teacher-venv/bin/python`（只读借用，不往里装包；缺包就停下报告）。
+- 先读：`src/include/uavrgb/model.hpp` 与 `src/model.cpp`（前向的每一步：卷积的填充、池化、FiLM 的公式 y' = (1+γ)·y + β、展平的顺序）；`src/checkpoint.cpp`（checkpoint 的二进制格式与版本）；
+  `src/include/uavrgb/infer.hpp`、`src/infer_main.cpp`、`sim/tools/student.py`（行协议：结构头一行、每帧一行 JSON、双帧与 prev-action 字节的顺序）；
+  `sim/tools/baselines/baseline_infer.py` 与同目录 README（现成的 PyTorch 包装器与启动器写法）；`tools/DATASET_FORMAT.md`、`tools/read_dataset.cpp`、`tools/select_ckpt.py`（UAVR 与侧车的读法）；
+  `src/trainer*.cpp`、`src/class_weights.cpp`（训练配方：Adam 的超参、类权重 auto 的算法、丢碰撞帧、`ckpt_best` 按什么选、每轮存档）；`teacher/dataset.py`（已有的 PyTorch 数据读取，能复用就复用）。
+- 第一步，前向对拍：`proto/model.py` 复刻 `CnnModel`（含 FiLM 的文本段与 prev-action 段、辅助头、双帧）；`proto/ckpt_io.py` 读写 C++ 的 checkpoint。
+  验收：载入 `$D/exp-swa-calib-20261110/ckpt/cal_swa_s1_k10.bin`，在它训练数据集的 val 分区取 2,000 帧，四类概率与 `uavrgb_infer` 的输出逐帧相差不超过 1e-5；
+  写出再读回的 checkpoint 与原文件逐字节相同。带 prev-action 的模型同样对拍（卡 E2E-1 的权重出来之前，用 `uavrgb_train --prev-action` 现训一个 1 轮的小模型）。
+- 第二步，包装器：`proto/infer_wrap.py` 说 `uavrgb_infer` 的行协议，加启动器。验收：载入同一个 C++ checkpoint，离线回放一集的帧序列，动作序列与 `uavrgb_infer` 逐步相同；
+  Gazebo 里用 calswa 种子 1 跑 3 个冻结 seed（排 Gazebo 池的锁，新协议，带护栏），与 W1-0 第二轮 `acc-L0.20-k1-s1` 的同 seed 集对照动作序列，
+  有分歧就写明第一处分歧在第几步、两边的派发时延各是多少。推理时延的 p50 与 p95 写进报告（包装器比 C++ 推理慢多少，会不会造成迟到步）。
+- 第三步，训练对拍：`proto/train.py` 复刻主线配方（与 `$D/exp-student-select-20261109/e1-noise/seed0/run/config.json` 逐项相同：30 轮、batch 128、lr 0.001、Adam 的 β 与 ε、
+  类权重 auto、丢碰撞帧、无增强、每轮存档）；`proto/export.py` 把 PyTorch 权重写成 C++ checkpoint，之后的平均加校准与闭环都走主线工具。
+  验收（a，离线）：在同一份数据集（`$D/tmp/agent6-distill/trunc/ds/dataset.uavr`）上训 3 个种子，val 与 test 的 macro-F1、每类召回落在 C++ 三个参照种子的范围上下各放宽 0.03 之内。
+  验收（b，闭环，排 Gazebo 池的锁，2 条车道，新协议，带护栏，20 个冻结 seed × 3 个种子）：导出、平均加校准之后用 `uavrgb_infer` 评测。
+  预注册：与第二轮的三个 K=1 臂（53/60）相比，成功数相差不超过 6 集。超过就说明两套训练不等价，停下查原因，不往下用。
+  训练排训练池的锁。
+- 不做：任何新结构、新损失、新数据、新的评测端规则。
+- 交付：`proto/README.md`（规矩、怎么训、怎么导出、怎么接闭环）；测试（前向对拍、checkpoint 往返、包装器协议）；报告。
+- 提交：`feat(proto): PyTorch 原型线地基（模型复刻、checkpoint 读写、行协议包装器、训练配方复刻，逐项与 C++ 对拍）`。
 
 ## 5. 第三波规格（细化后再开工，不要照这一节直接写代码）
 

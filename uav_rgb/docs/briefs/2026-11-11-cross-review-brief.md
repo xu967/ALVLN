@@ -1,9 +1,10 @@
 # 交叉审核任务书（2026-11-11 晚立，给只读的审核 agent）
 
-- 来由：用户 11-11 23:18 与 23:30 要求加派多个 agent、换一个模型家族，从不同角度审我们的代码还有哪些缺陷。
-  仓库里的代码都是 Claude 系模型写的，这一轮要的是另一双眼睛的独立判断，不是复述已有结论。
+- 来由：用户 11-11 23:18 与 23:30 要求加派多个 agent，从不同角度审我们的代码还有哪些缺陷。点名的 Gemini 4 Carbon Max 与 High 不在可用列表里，
+  用户 11-12 改定用 Claude Opus 5.5。写代码的是 Sonnet 5.5 Max 的 subagent，这一轮要的是独立判断，不是复述已有结论。
+- 方向（用户 11-11 23:46）：交付路线是端到端，部署时只有一个网络（计划 §10）。所以训练推理栈、数据链路、学生的训练配方上的缺陷，分量比规则层与评测端护栏上的缺陷重。
 - 只读：不改仓库里的任何文件，不提交，不建分支，不合并，不推送。只写自己的报告与草稿。
-- 先读：`CLAUDE.md`；`docs/briefs/2026-11-10-phase12-common.md` 的 §1–§4（项目是什么、口径、路径、环境）；计划 `docs/PLAN_2026-11-10_phase12.md` 的 §0。
+- 先读：`CLAUDE.md`；`docs/briefs/2026-11-10-phase12-common.md` 的 §1–§4（项目是什么、口径、路径、环境）；计划 `docs/PLAN_2026-11-10_phase12.md` 的 §0 与 §10。
   上一轮全仓审查（11-10 下午）的六份报告在 `docs/reviews/2026-11-10/`（`sim-real`、`viz`、`data-algo`、`src`、`arch`、`lit`）：
   先读与自己角度对应的那一份，已经写在里面的问题不重复报，除非你发现它的结论有错或者问题仍然没修。
 
@@ -18,12 +19,14 @@
 | E | 实验入口与流水线的健壮性 | `experiments/*/run*.sh`、`tools/e1_pipeline.py`、`tools/dagger_gz_pipeline.py`、`tools/dagger_pipeline.py`、`tools/check.sh`、`env.sh` | 失败处理与续跑、锁与竞态、环境变量残留、静默降级、可复现性（冻结代码、seed、指纹）、容器重启后的恢复 |
 | F | 测试的质量 | `sim/tools/test_*.py`、`sim/3dgs/test_*.py`、`tools/test_*.py`、`experiments/*/test_*.py`、`src/` 下的测试 | 永远不会失败的测试、断言过弱、关键路径没有测试、门禁（`check.sh`）没跑到的测试；对你认为最要紧的 5 个函数写出缺的用例 |
 | G | 仿真与真机的一致性 | `sim/cf_sitl/`、`sim/dynamics/e1_mini.json`、动作协议、相机内外参、时延与电量模型；与 `docs/reviews/2026-11-10/sim-real.md` 对照 | 仿真里成立而真机上不成立的假设；学生输入里有没有混进仿真真值；部署链（int8、输入分辨率、推理协议）上的不一致 |
+| H | 端到端学生的模型与训练配方（从机器学习方法的角度） | `src/model.cpp`、`src/include/uavrgb/model.hpp`、`src/trainer*.cpp`、`src/class_weights.cpp`、`src/augment_dev.cu`、`tools/average_ckpt.py`、`tools/select_ckpt.py`；历史结果 `docs/experiments/2026-11-07-approach-scoreboard.md`、`docs/reviews/2026-11-10/data-algo.md` | 参数用在哪（19,200 → 4 的全连接占四分之三）、感受野、FiLM 的位置、没有归一化、损失与类权重、增强、选模与校准、条件输入的捷径风险；在十万参数预算内给出最值得试的 3 个结构或配方改动，各写依据与最小实验 |
 
 ## 2. 怎么审
 
 - 以代码为准，不以文档为准。每条发现都要落到文件与行号。
 - 能验证的就验证：可以跑单个测试文件、写十几行的小脚本喂边界输入（单进程，前面加 `nice -n 10`，两分钟以内）。
-  不起 Gazebo，不跑 3DGS 批量渲染，不训练，不跑 `tools/check.sh`，不占机器锁。草稿放 `/root/rivermind-data/uav_rgb/tmp/phase12-cards/review-<代号小写>/`。
+  不起 Gazebo，不跑 3DGS 批量渲染，不训练，不跑 `tools/check.sh`，不占任何池的锁。草稿放 `/root/rivermind-data/uav_rgb/tmp/phase12-cards/review-<代号小写>/`。
+  机器上有对抢核敏感的 Gazebo 实验在跑：同一时刻最多一个验证进程，`nice -n 15`；能靠读代码判断的就不跑。
 - 机器上有别的 agent 在各自的工作树（`/root/claude-code-backup-20261028/code/wt/p12-*`）里改代码、有守护进程在跑实验。
   审的是主仓库 `/root/claude-code-backup-20261028/code/uav_rgb` 的 main；别的工作树与实验输出只读，进程不要动。
 - 质量优先于数量：每个角度不超过 15 条。不报风格问题、命名问题、「可以更优雅」之类的意见。

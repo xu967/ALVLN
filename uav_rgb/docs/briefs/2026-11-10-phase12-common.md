@@ -65,6 +65,8 @@
   - 卡的配置再变时，以 `nvidia-smi -L` 为准并向用户确认用哪一张，不要自己挑。
 - Python：数据工具 `$R/.venv-tools/bin/python`（无 torch）；3DGS `$D/3dgs-venv/bin/python`（torch + gsplat）；`$D/teacher-venv` 也有 torch，
   只给对照基线与教师工具用。主线训练推理禁用 PyTorch。不往现有 venv 里装包。
+  2026-11-12 用户决定：结构探索可以用 PyTorch 做原型。原型代码只放 `proto/`，主线代码不 import 它；闭环评测走 `--infer-bin` 包装器；
+  原型的权重与数字都标 `proto`，不进主表，结构定了移植到 C++ 并复现之后才算。交付模型仍是自研 C++/CUDA。
 - Gazebo 只能软件渲染：`export UAVRGB_RENDER_BACKEND=software DISPLAY=:20 XDG_RUNTIME_DIR=/tmp/xdg`。gz 实例的上限随核数定：24 核时全机不超过 7 个，12 核时不超过 3 个；起之前先看占用。
   对墙钟敏感的实验（带 `--action-latency` 的标定）独占机器：用机器锁 `$D/tmp/phase12-cards/machine.lock`（入口脚本里 `exec 8>> 锁文件; flock 8`），
   别的重实验拿同一把锁排队。
