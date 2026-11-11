@@ -54,6 +54,14 @@
        （`exec 8>> $D/tmp/phase12-cards/machine.lock; flock 8`，持有到脚本退出）。排队期间每 10 分钟看一次，不空转刷日志。
     4. 第二轮结束之后，单车道、不超过 3 分钟的 3DGS 冒烟可以不拿机器锁。Gazebo 的冒烟也要拿机器锁（gz 的时序受别的 gz 影响）。
     5. 别的卡的工作树、草稿目录、实验输出只读。自己的草稿放 `$D/tmp/phase12-cards/<卡号小写>/`。
+  - 2026-11-11 23:55 起（用户 23:46 指示：实验可以并行）：按资源分池，池内串行，池间并行。上一条的第 2、3、4 款改成下面这样，第 1、5 款不变：
+    1. Gazebo 池（吃 CPU，对墙钟敏感）：锁 `$D/tmp/phase12-cards/machine.lock`（文件没换，名字沿用）。一次一个 Gazebo 实验，每个实验不超过 2 条车道。冒烟也排这把锁。
+    2. 3DGS 池（吃 GPU）：锁 `$D/tmp/phase12-cards/gs3d.lock`。一次一个 3DGS 批量实验，不超过 3 条车道。不用等 Gazebo 池。单车道、3 分钟以内的冒烟可以不拿锁。
+    3. 训练池（吃 GPU）：锁 `$D/tmp/phase12-cards/train.lock`。一次一组训练，组内最多 3 个训练进程同时跑（单个约 1 核、显存 2 GB 以内）。不用等别的池。
+    4. `tools/check.sh --python-only`：仍排 `check.lock`，随时可以跑，不用再等第二轮结束。全量 `check.sh` 由主会话跑。
+    5. 守护脚本阻塞式拿自己那个池的锁（`exec 8>> <锁>; flock 8`，持有到脚本退出），起止各记一次 cgroup 的 `usage_usec` 与 `nr_throttled`。
+    6. CPU 账（配额 12 核）：Gazebo 2 条车道实测约 3.5 核；3DGS 3 条车道约 3–4 核（估计，未核实）；一组训练不超过 3 核；`check.sh` 1 核。
+       带 `--action-latency` 的 Gazebo 实验被抢核时会出迟到步，迟到的集按入口脚本的规则重跑；不带这个开关的 Gazebo 实验（旧协议）每步生效时长会变短，报告里必须给时序健康。
   - 卡的配置再变时，以 `nvidia-smi -L` 为准并向用户确认用哪一张，不要自己挑。
 - Python：数据工具 `$R/.venv-tools/bin/python`（无 torch）；3DGS `$D/3dgs-venv/bin/python`（torch + gsplat）；`$D/teacher-venv` 也有 torch，
   只给对照基线与教师工具用。主线训练推理禁用 PyTorch。不往现有 venv 里装包。
