@@ -11,6 +11,10 @@
 hold（每步动作窗口）必须显式给：--hold，或 --data 指向采集 run 目录 / episode 目录 /
 .uavr 数据集，从它的 hold_s 读；两者都给且不一致则报错（AUDIT #12）。
 
+评测集的 split 取自场景身份里按几何组哈希得到的 split（审核 D1）：哈希 test 的场景写 split=test、split_policy=diag-eval-fixed-test；
+train / val 的场景默认拒绝（退出码 2，什么都不写），--allow-train-scene 才放行，产物里写真实 split 与 split_policy=diag-train-scene
+（两种 split_policy 都以 diag 开头，preprocess 默认拒收）。
+
 用法：
   $DATA_ROOT/uav_rgb/3dgs-venv/bin/python -m sim.3dgs.eval_3dgs \
       --scene $SCENES/synthetic/scene.json --out $DATA_ROOT/uav_rgb/3dgs-pilot-eval \
@@ -133,6 +137,24 @@ def resolve_hold(hold_arg, data_arg):
     return float(hold_arg), "cli --hold"
 
 
+def eval_split(identity, allow_train_scene):
+    """评测集的 (split, split_policy)，由场景身份里按几何组哈希得到的 split 决定（审核 D1）。
+
+    哈希 split 是 test：("test", "diag-eval-fixed-test")，与改动前逐位相同。
+    不是 test（train / val）：这个场景的几何在训练 / 验证划分里，拿它评测不是留出评测。缺省拒绝（ValueError）；
+    allow_train_scene=True 才放行，产物里写真实 split 与 split_policy = "diag-train-scene"，不再标成 test。
+    两种 split_policy 都以 diag 开头（split_manifest 的诊断约定），preprocess 默认拒收，评测产物不会混进训练数据。
+    """
+    split = identity["split"]
+    if split == "test":
+        return "test", "diag-eval-fixed-test"
+    if not allow_train_scene:
+        raise ValueError(
+            f"几何组 {identity['geometry_gid']} 按哈希属于 {split} 分区，不是留出的 test：在它上面评测得到的是训练 / 验证场景上的数字。"
+            "诊断用途确要评测就加 --allow-train-scene，产物里会写真实 split 与 split_policy=diag-train-scene")
+    return split, "diag-train-scene"
+
+
 def _sha256(path):
     if not path or not os.path.isfile(path):
         return None
@@ -180,6 +202,9 @@ def main():
                    help="每集把 rgb_*.png 合成 <out>/videos/seed_<seed>.webm（VP8，fps=1/hold）")
     p.add_argument("--route", type=int, default=None,
                    help="scene.routes[N]：覆盖 spawn/waypoint/max_steps（默认 0 = 顶层 spawn/waypoint）")
+    p.add_argument("--allow-train-scene", action="store_true",
+                   help="允许评测按几何哈希属于 train / val 分区的场景（诊断用，不是留出评测）：产物里写真实 split 与 "
+                        "split_policy=diag-train-scene；缺省拒绝。哈希属于 test 的场景不受影响")
     args = p.parse_args()
     if args.policy == "student" and not args.ckpt:
         p.error("--policy student 需要 --ckpt")
@@ -205,6 +230,17 @@ def main():
                   else CfBlackboxParams.from_json(args.dynamics_params))
     except (FileNotFoundError, RuntimeError) as e:   # cf_sitl_proc 缺失 / 库版本探测失败：不悄悄退回黑盒
         p.error(f"--dynamics {args.dynamics}: {e}")
+    # 身份（AUDIT #1）：scene_id/geometry_gid 来自 PLY 指纹，不随 seed 变。评测集的 split 取自这里按几何组哈希得到的 split（审核 D1）：
+    # 哈希 test 的场景写 test + diag-eval-fixed-test（与以前相同）；train / val 的场景默认拒绝，--allow-train-scene 才放行并写真实 split。
+    # 放在加载高斯 / 渲染器之前：大场景约 200 s，拒绝时什么都没写、什么都没加载。
+    identity = collect_3dgs.scene_identity(scene)
+    try:
+        split, split_policy = eval_split(identity, args.allow_train_scene)
+    except ValueError as e:
+        p.error(f"--scene {args.scene}: {e}")
+    if split != "test":
+        print(f"警告: 场景几何组 {identity['geometry_gid']} 按哈希属于 {split} 分区，--allow-train-scene 放行；"
+              f"产物里 split={split}、split_policy={split_policy}，这不是留出评测", file=sys.stderr)
     gaussians = (scene_mod.read_gaussian_ply(scene["ply_path"])
                  if scene.get("collision", {}).get("source", "gaussians") == "gaussians" else None)
     occ = collision_mod.from_scene(scene, gaussians=gaussians)
@@ -216,11 +252,6 @@ def main():
     del gaussians
     renderer = renderer_mod.make_renderer(scene, args.mock_renderer, args.width,
                                           args.height, args.fov, args.device)
-    # 身份（AUDIT #1）：scene_id/geometry_gid 来自 PLY 指纹，不随 seed 变。评测集固定写
-    # split="test"，这不是按几何组哈希分的，所以 split_policy 标成 diag-eval-fixed-test
-    # （split_manifest 的 diag* 约定）：preprocess 默认拒绝，评测产物不会混进训练数据。
-    identity = collect_3dgs.scene_identity(scene)
-    split_policy = "diag-eval-fixed-test"
     # SPL 的 l_i 规划器：占据栅格为空（mock 场景）时不算 SPL，不让评测因此失败。
     try:
         occ_planner = planner_mod.OccPlanner(occ)
@@ -245,7 +276,7 @@ def main():
             try:
                 manifest, err = collect_3dgs.run_episode(
                     scene, ep_dir, renderer, occ, params, policy, steps, hold,
-                    split="test", seed=args.seed + ep,
+                    split=split, seed=args.seed + ep,
                     episode_id=args.seed + ep, save_depth=args.save_depth,
                     stop_on_collision=True,
                     dynamics_path=args.dynamics_params,
@@ -325,7 +356,7 @@ def main():
                   "geometry_gid": identity["geometry_gid"],
                   "scene_id": identity["scene_id"],
                   "task_id": identity["task_id"],
-                  "split": "test", "split_policy": split_policy,
+                  "split": split, "split_policy": split_policy,
                   "route": scene.get("route"),
                   "waypoint": scene.get("waypoint"),
                   "spawn": scene.get("spawn"),

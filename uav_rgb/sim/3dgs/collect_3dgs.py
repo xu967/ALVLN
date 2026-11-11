@@ -40,6 +40,7 @@ if TOOLS not in sys.path:
     sys.path.insert(0, TOOLS)
 from teacher import ACTIONS, TEACHER_VERSION, expert_action  # noqa: E402
 import split_manifest as sm  # noqa: E402
+import nav_cond  # noqa: E402   学生条件输入的名字（prev-action）与 Gazebo 线同一套
 
 GEOMETRY_VERSION = "3dgs.v1"
 # 倒飞保护（见 run_episode 注释）：FORWARD 下窗口末**机体系**前向速度 vx_b < -ANOMALY_BACK_VX 连续 ANOMALY_BACK_WINDOWS
@@ -161,10 +162,21 @@ class StudentAdapter:
 
     def __init__(self, student):
         self.student = student
-        # 一个 adapter 对应一集；eval_3dgs 跨集复用同一个 StudentPolicy 进程。双帧 / prev-action 模型
-        # 缓存上一帧与上一步动作，不清掉的话第 k≥1 集首帧拿的是上一集末帧（REVIEW-P2 实测 max|Δp|=0.225，
-        # 第一步就可能错方向）；训练口径是首帧「上一帧=自身、prev=SAFE」。单帧模型 reset 是空操作。
-        student.reset()
+        # 学生喂的条件输入：prev-action = 上一步**实际执行**的动作（训练侧车取的就是 action_executed）；
+        # None = 纯图像模型（prev_dim = 0），没有条件输入。run_episode 把非 None 的值写进 manifest 的 student_cond。
+        self.student_cond = nav_cond.COND_PREV_ACTION if getattr(student, "prev_dim", 0) else None
+        self.reset()
+
+    def reset(self):
+        """集边界。一个 adapter 对应一集；eval_3dgs 跨集复用同一个 StudentPolicy 进程。双帧 / prev-action 模型
+        缓存上一帧与上一步动作，不清掉的话第 k≥1 集首帧拿的是上一集末帧（REVIEW-P2 实测 max|Δp|=0.225，
+        第一步就可能错方向）；训练口径是首帧「上一帧=自身、prev=SAFE」。单帧模型 reset 是空操作。"""
+        self.student.reset()
+        self.last_executed = SAFE_NEUTRAL
+
+    def note_executed(self, action):
+        """改写动作的包装层（DaggerPolicy 的 β 混合、OracleGuardedPolicy 的护栏）调用：下一步喂给学生的上一步动作是改写之后真正执行的。"""
+        self.last_executed = action
 
     def __call__(self, rgb, depth, state):
         import base64
@@ -172,7 +184,11 @@ class StudentAdapter:
         msg = {"width": w, "height": h, "step": w * 3,
                "pixelFormatType": "RGB_INT8",
                "data": base64.b64encode(np.ascontiguousarray(rgb).tobytes()).decode()}
-        action, infer_ms, _probs = self.student.act(msg)
+        # 不传 prev_action 时 student.act 用模型自己上一步的输出，改写之后就与训练口径不同（审核 C2 / G1 / F1）；
+        # 纯图像模型照旧不传，act 的调用与改动前逐位相同。
+        kw = {"prev_action": self.last_executed} if self.student_cond == nav_cond.COND_PREV_ACTION else {}
+        action, infer_ms, _probs = self.student.act(msg, **kw)
+        self.last_executed = action      # 没有人改写时，执行的就是模型自己的输出
         return action, infer_ms
 
 
@@ -188,6 +204,7 @@ class DaggerPolicy:
 
     def __init__(self, student, expert, beta, rng):
         self.student, self.expert, self.beta, self.rng = StudentAdapter(student), expert, float(beta), rng
+        self.student_cond = self.student.student_cond     # run_episode 写进 manifest 的 student_cond（纯图像学生为 None，不写）
         self.planner_name = expert.planner_name
         self.version = getattr(expert, "version", None)
         self.tol = getattr(expert, "tol", None)          # 教师的航向容差，run_episode 写进 manifest 的 teacher_yaw_tol_deg
@@ -197,11 +214,15 @@ class DaggerPolicy:
         self.n_expert_exec = 0
 
     def reset(self):
-        """集边界：清学生的帧/动作缓存（StudentAdapter 只在构造时 reset，而本对象整轮复用）；教师有集内状态（连续等待计数）也清。"""
-        self.student.student.reset()
+        """集边界：清学生的帧/动作缓存与上一步执行的动作（StudentAdapter 只在构造时 reset，而本对象整轮复用）；教师有集内状态（连续等待计数）也清。"""
+        self.student.reset()
         if hasattr(self.expert, "reset"):
             self.expert.reset()
         self.last_expert = None
+
+    def note_executed(self, action):
+        """外层护栏改写了本策略的动作：转给学生适配器，下一步的上一步动作取改写之后的。"""
+        self.student.note_executed(action)
 
     @property
     def n_plan_fail(self):
@@ -217,6 +238,7 @@ class DaggerPolicy:
         if self.beta > 0.0 and self.rng.random() < self.beta:
             action = self.last_expert
             self.n_expert_exec += 1
+            self.student.note_executed(action)     # 学生下一步看到的上一步动作是教师动作，不是它自己的输出
         return action, infer_ms
 
 
@@ -494,6 +516,9 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             "student_ckpt": (dagger or {}).get("student_ckpt"),
             "student_ckpt_sha256": (dagger or {}).get("student_ckpt_sha256"),
             "n_expert_executed": getattr(policy, "n_expert_exec", None),
+            # 学生喂的条件输入：prev-action = 上一步实际执行的动作（C2：DAgger 换教师、护栏改写之后取改写后的）。
+            # 只有带条件输入的学生才写这个键，纯图像学生、教师、forward 策略的键集与旧 manifest 逐位相同（没有这个键 = 没喂条件）。
+            **({"student_cond": policy.student_cond} if getattr(policy, "student_cond", None) is not None else {}),
             "teacher_version": (TEACHER_VERSION if policy.name == "expert_action"
                                 else getattr(policy, "version", None)),
             # 占据 A* 教师的航向容差（度）：只有带 tol 的策略才写这个键，其余策略与旧 manifest 一样没有；

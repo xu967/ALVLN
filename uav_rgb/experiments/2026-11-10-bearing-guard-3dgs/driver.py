@@ -3,7 +3,8 @@
 
 基于 11-09 的 xeval_3dgs_driver.py（原因同它：每次调 eval_3dgs / collect_3dgs 都要重读 1.2–1.5 GB 的 PLY 并重建碰撞代理，
 一次约 200 s，而一集只要 4–12 s）。逐集调用的仍是同一个 collect_3dgs.run_episode，参数照 eval_3dgs.main：
-stop_on_collision=True、split="test"、split_policy="diag-eval-fixed-test"（评测产物，preprocess 默认拒收）。
+stop_on_collision=True、split="test"、split_policy="diag-eval-fixed-test"（评测产物，preprocess 默认拒收；缺省写死，
+config 里 split_from_identity = true 才改成取场景身份里按哈希得到的 split，见下面 S1a 一条）。
 与 11-09 的差别：
   1. 臂 = 底座（forward / student / teacher）+ 可选的 oracle 护栏（route = 路线前视点方位，goal = waypoint 方位），
      护栏用 sim/3dgs/guard.py，策略对象包一层即可，run_episode 不动；
@@ -37,6 +38,11 @@ stop_on_collision=True、split="test"、split_policy="diag-eval-fixed-test"（�
                         swept 要求生效 hold 为 1.0（位移系数只在 hold 1.0 下量过），启动时就校验，早于加载场景
   臂 spawn_two_layer    true | false，传给 run_episode(spawn_two_layer=…)（出生两层判空，要求全局 jitter > 0）；不给 = 不传。
                         给了任一个键，done.json 末尾多记同名键（没给就没有，旧产物的键不变）
+2026-11-12 卡 S1a（审核 D1）再加的全局可选键（缺省时同样与原版逐位一致，test_driver_split.py 锁定）：
+  split_from_identity  true | false；不给 = 与原版相同，每集写死 split="test"、split_policy="diag-eval-fixed-test"，场景按几何哈希是 train / val 也一样。
+                       true：每条路线把身份交给 eval_3dgs.eval_split(identity, True)，用它给的 (split, split_policy) 传给 run_episode：哈希 test 的场景仍是
+                       ("test", "diag-eval-fixed-test")，train / val 的场景写真实 split 与 "diag-train-scene"（诊断评测，preprocess 默认拒收）。
+                       给了这个键（true 或 false），done.json 末尾多记 split 与 split_policy（生效值）；没给就没有，旧产物的键不变。值不是布尔时启动就报错，早于加载场景
 """
 import importlib
 import json
@@ -78,6 +84,8 @@ for _a in ARMS:         # 配置错在加载场景（约 200 s）之前就报，
     if "spawn_two_layer" in _a and (not isinstance(_a["spawn_two_layer"], bool) or (_a["spawn_two_layer"] and not CFG["jitter"] > 0)):
         raise ValueError(f"臂 {_a['name']}：spawn_two_layer 要是 true / false，且为 true 时全局 jitter 必须大于 0，得到 "
                          f"spawn_two_layer={_a['spawn_two_layer']!r} jitter={CFG['jitter']!r}")
+if "split_from_identity" in CFG and not isinstance(CFG["split_from_identity"], bool):
+    raise ValueError(f"split_from_identity 要是 true / false，得到 {CFG['split_from_identity']!r}")
 
 
 def log(msg):
@@ -191,6 +199,9 @@ for arm in ARMS:
                 steps = min(CFG["step_cap"], steps)
             steps *= step_mult      # 封顶之后再乘：hold 0.5 的臂要同样的仿真时长，封顶 100 步变 200 步
             identity = c3.scene_identity(sc, ply_sha256=ply_sha)
+            # 缺省与原版相同（写死 test）；split_from_identity = true 才取身份里按几何哈希得到的 split（D1），train / val 的场景写 diag-train-scene
+            split, split_policy = (ev.eval_split(identity, True) if CFG.get("split_from_identity")
+                                   else ("test", "diag-eval-fixed-test"))
             eps, fails, tr = [], [], time.time()
             teacher = None
             if arm["base"] == "teacher":
@@ -225,10 +236,10 @@ for arm in ARMS:
                         policy = inner
                 try:
                     man, err = c3.run_episode(sc, ep_dir, renderer, occ, params, policy, steps, hold,
-                                              split="test", seed=seed, episode_id=seed, save_depth=False,
+                                              split=split, seed=seed, episode_id=seed, save_depth=False,
                                               stop_on_collision=True, dynamics_path=None,
                                               spawn_jitter=CFG["jitter"], identity=identity,
-                                              split_policy="diag-eval-fixed-test", dynamics="cf_sitl", **spawn_kw)
+                                              split_policy=split_policy, dynamics="cf_sitl", **spawn_kw)
                 except Exception as e:  # noqa: BLE001 - 单集失败进 done.json，不拖垮整轮
                     fails.append({"episode": k, "seed": seed, "error": f"{type(e).__name__}: {e}"})
                     log(f"[{g}] r{r} ep{k} 失败: {e}")
@@ -287,6 +298,8 @@ for arm in ARMS:
                 done["teacher_clearance"] = teacher_kw["clearance"]
             if spawn_kw:
                 done["spawn_two_layer"] = spawn_kw["spawn_two_layer"]
+            if "split_from_identity" in CFG:      # 新键只追加在最后，给了才有；记生效的 split / split_policy（不记开关）
+                done["split"], done["split_policy"] = split, split_policy
             with open(os.path.join(d, "done.json"), "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=1)
             log(f"[{g}] r{r} {len(eps)}/{CFG['k']} 集 失败 {len(fails)} 到点 {sum(e['success_stop'] for e in eps)} "

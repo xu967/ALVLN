@@ -99,11 +99,14 @@ class OracleGuardedPolicy:
     故意不带 stop_radius / prev 等教师属性，否则 run_episode 会把它当 goal-stop 教师。
     统计：n_steps 总步数，n_triggered = |err| 超阈值的步数，n_rewritten = 其中内层动作与护栏动作不同、真被改写的步数；
     trace 每步一行（step / inner / action / err_deg / target / triggered / rewritten），调用方自己决定写不写旁路文件。
+    改写之后，把真正执行的动作告诉内层（内层有 note_executed 就调）：prev-action 学生下一步看到的是护栏改写后的动作，
+    不是它自己的输出（C2）。student_cond 照搬内层的，只给 run_episode 写 manifest 用。
     """
 
     def __init__(self, inner, target_fn, threshold_deg):
         self.inner, self.target_fn, self.threshold = inner, target_fn, float(threshold_deg)
         self.name = inner.name
+        self.student_cond = getattr(inner, "student_cond", None)
         self.n_steps = self.n_triggered = self.n_rewritten = 0
         self.trace = []
 
@@ -128,6 +131,8 @@ class OracleGuardedPolicy:
         self.n_triggered += turn is not None
         self.n_rewritten += rewritten
         out = turn if rewritten else action
+        if rewritten and hasattr(self.inner, "note_executed"):
+            self.inner.note_executed(out)
         self.trace.append({"step": step, "inner": int(action), "action": int(out), "err_deg": round(err, 2),
                            "target": [round(target[0], 3), round(target[1], 3)],
                            "triggered": turn is not None, "rewritten": rewritten})

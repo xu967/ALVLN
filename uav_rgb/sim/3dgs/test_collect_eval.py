@@ -48,6 +48,9 @@ def _load(path):
 
 # AUDIT_SIM #9 之后 --dynamics 默认 cf_sitl（要 cf_sitl_proc）；mock 链路显式走黑盒。
 BLACKBOX = ["--dynamics", "cf_blackbox"]
+# D1：eval_3dgs 默认拒绝按几何哈希属于 train / val 的场景。下面用的合成走廊（seed 2 / 3）哈希都是 train、用例也不关心 split，
+# 显式放行；默认路径（哈希 test）与拒绝路径在 test_eval_split.py 里锁。
+ALLOW_TRAIN = ["--allow-train-scene"]
 
 
 def _collect(scene_json, out, *extra):
@@ -58,7 +61,7 @@ def _collect(scene_json, out, *extra):
 def _eval(scene_json, out, *extra):
     return _run(["sim.3dgs.eval_3dgs", "--scene", scene_json, "--out", out,
                  "--policy", "forward", "--mock-renderer", "--episodes", "1",
-                 "--steps", "3", *BLACKBOX, *extra])
+                 "--steps", "3", *BLACKBOX, *ALLOW_TRAIN, *extra])
 
 
 class TestCollect3dgs(unittest.TestCase):
@@ -173,7 +176,7 @@ class TestCollect3dgs(unittest.TestCase):
             scene_json = os.path.join(scene_dir, "scene.json")
             env = dict(os.environ, CF_SITL_PROC=os.path.join(tmp, "no_such_cf_sitl_proc"))
             cases = (("sim.3dgs.collect_3dgs", ["--policy", "forward", "--steps", "2"]),
-                     ("sim.3dgs.eval_3dgs", ["--policy", "forward", "--steps", "2", "--hold", "0.5", "--episodes", "1"]))
+                     ("sim.3dgs.eval_3dgs", ["--policy", "forward", "--steps", "2", "--hold", "0.5", "--episodes", "1", *ALLOW_TRAIN]))
             for i, (mod, extra) in enumerate(cases):
                 base = [mod, "--scene", scene_json, "--mock-renderer", *extra]
                 r = _run(base + ["--out", os.path.join(tmp, f"default{i}")], env=env)
@@ -311,10 +314,14 @@ class TestEval3dgs(unittest.TestCase):
             self.assertEqual(len(e["per_episode"]), 1)
             self.assertEqual((e["hold_s"], e["hold_source"]), (0.5, "cli --hold"))
             self.assertEqual(e["failed"], [])
-            # 评测产物的身份：gid 来自 PLY，split 固定 test 且标成诊断策略，打包端默认拒绝
+            # 评测产物的身份：gid 来自 PLY，split 取自按几何哈希得到的 split（D1）且标成诊断策略，打包端默认拒绝。
+            # 这个走廊（seed 3）哈希是 train，_eval 显式放行：写真实 split 与 diag-train-scene，不再写 test
             m = _load(os.path.join(out, "ep_00000", "episode_manifest.json"))
+            hashed = collect.scene_identity(scene_mod.load_scene(os.path.join(scene_dir, "scene.json")))["split"]
+            self.assertNotEqual(hashed, "test")
             self.assertEqual(m["geometry_gid"], e["scene"]["geometry_gid"])
-            self.assertEqual((m["split"], m["split_policy"]), ("test", "diag-eval-fixed-test"))
+            self.assertEqual((m["split"], m["split_policy"]), (hashed, "diag-train-scene"))
+            self.assertEqual((e["scene"]["split"], e["scene"]["split_policy"]), (hashed, "diag-train-scene"))
             self.assertTrue(sm.is_diagnostic_scheme(m["split_policy"]))
 
     def test_video_fps_follows_hold_and_reports_task_identity(self):
@@ -328,7 +335,7 @@ class TestEval3dgs(unittest.TestCase):
             scene_json = os.path.join(scene_dir, "scene.json")
             out = os.path.join(tmp, "eval")
             r = _run(["sim.3dgs.eval_3dgs", "--scene", scene_json, "--out", out,
-                      "--policy", "forward", "--mock-renderer", *BLACKBOX, "--episodes", "1",
+                      "--policy", "forward", "--mock-renderer", *BLACKBOX, *ALLOW_TRAIN, "--episodes", "1",
                       "--steps", "4", "--hold", "0.2", "--record-video"])
             self.assertEqual(r.returncode, 0, r.stderr[-2000:])
             e = _load(os.path.join(out, "eval.json"))
@@ -664,7 +671,7 @@ class TestEpisodeFailureExit(unittest.TestCase):
             env = dict(os.environ, PYTHONPATH=hook + os.pathsep + ROOT)
             out = os.path.join(tmp, "eval")
             r = _run(["sim.3dgs.eval_3dgs", "--scene", scene_json, "--out", out,
-                      "--policy", "forward", "--mock-renderer", *BLACKBOX, "--episodes", "3",
+                      "--policy", "forward", "--mock-renderer", *BLACKBOX, *ALLOW_TRAIN, "--episodes", "3",
                       "--steps", "2", "--hold", "0.5"], env=env)
             self.assertEqual(r.returncode, 1, r.stderr[-2000:])
             self.assertIn("FAILED episode=1", r.stderr)
