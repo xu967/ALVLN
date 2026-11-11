@@ -190,6 +190,7 @@ class DaggerPolicy:
         self.student, self.expert, self.beta, self.rng = StudentAdapter(student), expert, float(beta), rng
         self.planner_name = expert.planner_name
         self.version = getattr(expert, "version", None)
+        self.tol = getattr(expert, "tol", None)          # 教师的航向容差，run_episode 写进 manifest 的 teacher_yaw_tol_deg
         self.stop_radius = expert.stop_radius
         self.last_expert = None
         self.n_expert_exec = 0
@@ -473,6 +474,9 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             "n_expert_executed": getattr(policy, "n_expert_exec", None),
             "teacher_version": (TEACHER_VERSION if policy.name == "expert_action"
                                 else getattr(policy, "version", None)),
+            # 占据 A* 教师的航向容差（度）：只有带 tol 的策略才写这个键，其余策略与旧 manifest 一样没有；
+            # 旧集没有这个键 = 12°（v1）。离线按记录重标时以这里为准。
+            **({"teacher_yaw_tol_deg": policy.tol} if getattr(policy, "tol", None) is not None else {}),
             "hold_s": hold_s,
             "window_from": "render_observation",
             "actions_ref": "actions.jsonl",
@@ -623,14 +627,16 @@ def main():
     student, dagger = None, None
     if args.policy in ("astar", "student"):
         occ_planner = planner_mod.OccPlanner(occ)
-        policy = planner_mod.OccAstarTeacher(occ_planner, scene["waypoint"])
+        # 航向容差随 hold 推导（hold 0.5 仍是 12°，hold 1.0 为 18.9°）：转角步比死区宽时教师会左右来回转
+        policy = planner_mod.OccAstarTeacher(occ_planner, scene["waypoint"], hold_s=hold)
         check = planner_mod.route_check(occ_planner, scene["spawn"], scene["waypoint"],
                                         terrain_occ=terrain, route_name=route_name)
         if not check["feasible"]:
             p.error(f"route {scene.get('route')}: spawn/waypoint 不可达 {check}")
         agl = {k: check[k] for k in ("tof_terrain_m", "agl_model_unverified", "agl_model_unverified_reason")}
         print(f"astar 教师: route={scene.get('route')} 航程 {check['path_m']} m 转向 {check['turn_deg']}° "
-              f"最小净空 {check['min_clearance_m']} m 步数预算 {check['steps_estimate']}（--steps {steps}）",
+              f"最小净空 {check['min_clearance_m']} m 步数预算 {check['steps_estimate']}（--steps {steps}）"
+              f" 航向容差 {policy.tol:.1f}°（hold {hold:g} s）",
               file=sys.stderr)
         if args.policy == "student":
             from student import StudentPolicy   # sim/tools（TOOLS 已在 sys.path）；常驻 uavrgb_infer 子进程

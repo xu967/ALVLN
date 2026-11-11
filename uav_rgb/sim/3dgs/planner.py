@@ -18,7 +18,10 @@ import math
 import numpy as np
 
 SAFE_NEUTRAL, FORWARD_SLOW, YAW_LEFT, YAW_RIGHT = 0, 1, 2, 3
-TEACHER_VERSION = "uavrgb.teacher_occ.v1"
+TEACHER_VERSION = "uavrgb.teacher_occ.v1"            # 航向容差 12°：旧数据全是它；hold 0.5 的新数据与旧教师逐步相同，也写它
+# 航向容差不是 12°（按 hold 推导或显式给的）。实际值记在 episode manifest 的 teacher_yaw_tol_deg；旧 manifest 没有这个键 = 12°，
+# 以后离线按记录重标时取 manifest.get("teacher_yaw_tol_deg", YAW_TOL_DEG)。
+TEACHER_VERSION_HOLD_TOL = "uavrgb.teacher_occ.v2"
 # 软余量：硬栅格 = 机体包络膨胀后的占据；再向外 MARGIN_M 这一圈可走但每米加 MARGIN_COST 倍代价，
 # 路径贴走廊中线、窄缝仍可通过。0.4 与 E1 Gazebo A* 余量同值（teacher.CLEARANCE_BY_VEHICLE）。
 MARGIN_M = 0.4
@@ -27,9 +30,18 @@ LOOKAHEAD_M = 0.7      # 纯追踪胡萝卜（Gazebo 教师同值）；cf_sitl �
 # 视线抽捷径上限：8 邻接 A* 的 0°/45° 阶梯路径会让纯追踪每 3–4 步换向（smoke_r1 实测 ±34° 来回摆），
 # 先瞄最远的、与当前位置连线不穿软余量的路径点（<= LOS_MAX_M），其次不穿硬栅格的，都没有才退回胡萝卜。
 LOS_MAX_M = 2.5
-# cf_sitl 每 0.5 s 步偏航 17°（首步 14.5°，tmp/agent-3dgs-routes/probe_yaw.py 实测）；
-# tol 取 0.7 步：小于半步会左右过冲（T1 门柱振荡的根因），大于一步会斜着飞出走廊。
+# 航向容差（度）：|err| > tol 才转向。tol 小于半个转角步时，误差落在 (tol, 步长 − tol) 里转一步就过冲到对侧容差之外，
+# 再转回来，左右来回转（极限环，T1 门柱振荡的根因）；大于一步会斜着飞出走廊。hold 0.5 一步 17°（首步 14.5°，
+# tmp/agent-3dgs-routes/probe_yaw.py 实测），12° = 0.7 步，没有环。hold 1.0 一步实测 26.3–34.7°（旧教师臂 5564 步，dyaw_deg 按上一步
+# 动作分：直飞后首转 31.6°，同向连转 34.4° = 名义值，反向 27.5°；experiments/2026-11-10-teacher-tol-3dgs/measure_turn_step.py），
+# 全部大于死区宽 24°，所以容差随 hold 推导（yaw_tol_deg），12° 只是下限，hold 0.5 仍取它。
 YAW_TOL_DEG = 12.0
+# 名义转角步 = 偏航角速度 × hold。planner 不读 json：YAW_RATE_RPS 抄自 sim/dynamics/e1_mini.json 的 executor.yaw_rate_rps，
+# test_teacher_tol.py 锁住两处相等。
+YAW_RATE_RPS = 0.6
+# 容差 / 名义转角步。最大的转角步（同向连转）等于名义值，不出环要求 2 × tol >= 步长，即系数 >= 0.5；取 0.55 留 10% 余量
+# （hold 1.0 为 18.9°；真正出环的是反向步 27.5°，只要求 13.8°）。
+TOL_STEP_FRAC = 0.55
 FORWARD_CHECK_M = 0.4  # 前向净空（硬栅格 sweep）；Gazebo 教师同值
 STOP_RADIUS_M = 0.5    # goal-stop 半径（teacher v5 同值）；到达判定仍是 scene.reach_radius_m
 # 步数预算：每步前进 0.15 m / 偏航 17°，加速与 goal-stop 约 8 步，再留 25%。
@@ -114,6 +126,16 @@ def _wrap(deg):
     return (deg + 180.0) % 360.0 - 180.0
 
 
+def yaw_tol_deg(hold_s):
+    """hold（秒）下教师的航向容差（度）= max(YAW_TOL_DEG, TOL_STEP_FRAC × 名义转角步)，名义转角步 = YAW_RATE_RPS × hold。
+
+    hold 0.5：max(12, 9.5) = 12°（与旧教师逐步相同）；hold 1.0：18.9°。线性段与下限在 hold ≈ 0.635 s 相交。
+    """
+    if isinstance(hold_s, bool) or not isinstance(hold_s, (int, float)) or not (math.isfinite(hold_s) and hold_s > 0):
+        raise ValueError(f"hold_s 必须是有限正数，得到 {hold_s!r}")
+    return max(YAW_TOL_DEG, TOL_STEP_FRAC * math.degrees(YAW_RATE_RPS * float(hold_s)))
+
+
 class OccPlanner:
     """Occupancy -> 2D 硬栅格（膨胀占据，沿 z 任一层）+ 软余量代价；plan() 在裁剪窗口上跑 A*。"""
 
@@ -196,14 +218,22 @@ class OccAstarTeacher:
     planner_name = "astar_occ"
     version = TEACHER_VERSION
 
-    def __init__(self, planner, waypoint, lookahead=LOOKAHEAD_M, tol_deg=YAW_TOL_DEG,
-                 stop_radius=STOP_RADIUS_M, forward_check_m=FORWARD_CHECK_M):
+    def __init__(self, planner, waypoint, lookahead=LOOKAHEAD_M, tol_deg=None,
+                 stop_radius=STOP_RADIUS_M, forward_check_m=FORWARD_CHECK_M, hold_s=None):
+        """航向容差：tol_deg 显式给了就照用；否则按 hold_s 推导（yaw_tol_deg）；两个都没给 = 不知道 hold，退回 YAW_TOL_DEG
+        （旧行为，不猜）。调用方知道 hold 就要传 hold_s（collect_3dgs.main 传了）：hold 1.0 下不传会留着 12° 的极限环。
+        hold_s 放在最后，位置参数的旧调用方不受影响。
+        """
         self.planner = planner
         self.wp = (float(waypoint["x"]), float(waypoint["y"]))
-        self.lookahead, self.tol = float(lookahead), float(tol_deg)
+        self.lookahead = float(lookahead)
+        self.tol = float(tol_deg) if tol_deg is not None else (YAW_TOL_DEG if hold_s is None else yaw_tol_deg(hold_s))
+        # 容差 = 12° 的教师与 v1 逐步相同，版本不变；不是 12° 才写 v2（与 manifest 的 teacher_yaw_tol_deg 一起区分新旧容差）
+        self.version = TEACHER_VERSION if self.tol == YAW_TOL_DEG else TEACHER_VERSION_HOLD_TOL
         self.stop_radius, self.forward_check = float(stop_radius), float(forward_check_m)
         self.prev = None          # collect 每集会重置（滞回接口），这里不用
         self.last_path = None
+        self.last_branch = None   # 本步动作由哪条规则给出：stop / plan_fail / turn_err / turn_blocked / forward（离线归因交替段用）
         self.n_plan_fail = 0
 
     def set_waypoint(self, waypoint):
@@ -213,24 +243,30 @@ class OccAstarTeacher:
         x, y, z = float(state.x), float(state.y), float(getattr(state, "z", 2.0))
         yaw_deg = math.degrees(float(state.yaw))
         if math.hypot(x - self.wp[0], y - self.wp[1]) <= self.stop_radius:
+            self.last_branch = "stop"
             return SAFE_NEUTRAL, None
         path = self.planner.plan((x, y), self.wp)
         self.last_path = path
         if path is None:                      # 被围死 / waypoint 不可达：fail closed
             self.n_plan_fail += 1
+            self.last_branch = "plan_fail"
             return SAFE_NEUTRAL, None
         tx, ty = self.planner.aim_point(path, x, y, self.lookahead)
         err = _wrap(math.degrees(math.atan2(ty - y, tx - x)) - yaw_deg)
         if err > self.tol:
+            self.last_branch = "turn_err"
             return YAW_LEFT, None
         if err < -self.tol:
+            self.last_branch = "turn_err"
             return YAW_RIGHT, None
         # 航向对准也不能盲进：机体有惯性，前向 FORWARD_CHECK_M 内撞硬栅格就先按 err 方向转。
         yaw = math.radians(yaw_deg)
         hit, _ = self.planner.occ.sweep(
             (x, y, z), (x + self.forward_check * math.cos(yaw), y + self.forward_check * math.sin(yaw), z))
         if hit:
+            self.last_branch = "turn_blocked"
             return YAW_LEFT if err >= 0 else YAW_RIGHT, None
+        self.last_branch = "forward"
         return FORWARD_SLOW, None
 
 
