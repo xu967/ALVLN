@@ -154,8 +154,10 @@ def yaw_tol_deg(hold_s):
 class OccPlanner:
     """Occupancy -> 2D 硬栅格 + 软余量代价；plan() 在裁剪窗口上跑 A*。
 
-    硬栅格（B4）：collision_model="v1" 是膨胀占据沿 z 各层取并（改动前的做法，z 不起作用）；
-    "v2" 是飞行高度 z 处的层带取并（与碰撞判定同一个口径，Occupancy.planning_grid），z 缺省取 occ.cruise_z（= scene.spawn.z）。
+    硬栅格（B4 / J-1 / J-9）：collision_model="v1" 是膨胀占据沿 z 各层取并（改动前的做法，z 不起作用）；
+    "v2" 是名义高度 z 处整集高度包络层的并（Occupancy.planning_grid）：包络比判定用的机体半高层带宽，规划看到的障碍层是判定
+    可能碰到的层的超集；水平方向仍是格中心的欧氏膨胀栅格（A* 只走格中心），与连续判定的精确距离不完全相同。
+    z 缺省取 occ.cruise_z（= scene.spawn.z）；各路线的出生高度不同时，驱动与命令行按路线自己的出生高度各建一个规划器（J-9）。
     z 放在最后，位置参数的旧调用方不受影响。
     """
 
@@ -464,6 +466,8 @@ def main(argv=None):
     p.add_argument("--scene", required=True)
     p.add_argument("--route", type=int, nargs="*", default=None,
                    help="routes 索引（默认全部；scene 没有 routes 时查顶层 spawn/waypoint）")
+    p.add_argument("--collision-model", choices=("v1", "v2"), default="v1",
+                   help="碰撞口径（v1 = 各层全并，缺省；v2 = 按每条路线自己的 spawn.z 取整集高度包络层）")
     p.add_argument("--json", action="store_true", help="单行 JSON 输出（给脚本解析）")
     args = p.parse_args(argv)
     scene_mod = importlib.import_module("sim.3dgs.scene")
@@ -472,12 +476,21 @@ def main(argv=None):
     # 高斯源只读一次 PLY（飞行层占据 + 飞行层以下的 ToF 地形层共用）；点云/网格源由 from_scene 自己读两遍。
     gaussians = (scene_mod.read_gaussian_ply(scene["ply_path"])
                  if scene.get("collision", {}).get("source", "gaussians") == "gaussians" else None)
-    planner = OccPlanner(collision.from_scene(scene, gaussians=gaussians))
+    occ = collision.from_scene(scene, gaussians=gaussians, collision_model=args.collision_model)
     terrain = collision.terrain_from_scene(scene, gaussians=gaussians)
+    planners = {}
+    v1_planner = OccPlanner(occ) if args.collision_model != "v2" else None
     idxs = args.route if args.route else list(range(max(1, len(scene.get("routes") or []))))
     rows = []
     for i in idxs:
         sc = scene_mod.apply_route(dict(scene), i)
+        if v1_planner is not None:
+            planner = v1_planner
+        else:
+            rz = float(sc["spawn"]["z"])
+            if rz not in planners:
+                planners[rz] = OccPlanner(occ, z=rz)
+            planner = planners[rz]
         r = route_check(planner, sc["spawn"], sc["waypoint"], terrain_occ=terrain,
                         route_name=(sc.get("route") or {}).get("name"))
         r.pop("path", None)

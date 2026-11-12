@@ -118,6 +118,73 @@ class TestClipPlanes(unittest.TestCase):
             self.assertEqual((st["near_plane_m"], st["far_plane_m"]), (0.05, 50.0))
 
 
+class TestDepthOpacityMin(unittest.TestCase):
+    """B5：GsplatRenderer 可选 depth_opacity_min（缺省 None 逐位不变；给定门限时 RGB 仍用全部高斯，深度只用 opacity >= 门限的高斯另渲一遍）。"""
+
+    def test_default_none_calls_rasterization_once_and_with_threshold_renders_depth_from_filtered_subset(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("无 torch（3dgs-venv）")
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_mod.make_corridor(tmp, seed=0, length=12.0)
+            sjson = os.path.join(tmp, "scene.json")
+            scene = scene_mod.load_scene(sjson)
+            g = scene_mod.read_gaussian_ply(scene["ply_path"])
+            # 造两批高斯：半透明雾 op=0.10（近距 z=1.0 m）、实体墙 op=0.80（远距 z=3.5 m）
+            opac = np.where(np.arange(len(g["opacities"])) % 2 == 0, 0.10, 0.80).astype(np.float32)
+            scene_mod.write_gaussian_ply(scene["ply_path"], g["means"], g["colors"], g["scales"], g["quats"], opac)
+            scene = scene_mod.load_scene(sjson)
+
+            calls = []
+
+            def fake_rast(means, quats, scales, opacities, colors, vm, ks, w, h, **kw):
+                calls.append({"n": int(len(opacities)), "min_op": float(opacities.min().item()) if len(opacities) else None,
+                              "mode": kw.get("render_mode")})
+                # 含 op<0.3 的雾时返回近深度 1.0 m、RGB=0.2；只剩 op>=0.3 的实体时返回真实深度 3.5 m、RGB=0.9
+                has_fog = len(opacities) > 0 and float(opacities.min().item()) < 0.30
+                z_val = 1.0 if has_fog else 3.5
+                c_val = 0.2 if has_fog else 0.9
+                mode = kw.get("render_mode", "RGB+ED")
+                if mode == "ED":
+                    out = torch.full((1, h, w, 1), z_val, dtype=torch.float32)
+                else:
+                    out = torch.zeros((1, h, w, 4), dtype=torch.float32)
+                    out[..., :3] = c_val * 0.8
+                    out[..., 3] = z_val
+                alp = torch.full((1, h, w, 1), 0.8, dtype=torch.float32)
+                return out, alp, {}
+
+            r_def = renderer_mod.GsplatRenderer(scene, device="cpu", supersample=1)
+            r_def.rasterization = fake_rast
+            rgb0, dep0, _ = r_def.render_pose(1.0, 0.0, 2.0, 0.0)
+            self.assertEqual(len(calls), 1, "缺省 depth_opacity_min=None 只光栅化一次")
+            self.assertNotIn("depth_opacity_min", r_def.stats())
+
+            calls.clear()
+            r_flt = renderer_mod.GsplatRenderer(scene, device="cpu", supersample=1, depth_opacity_min=0.30)
+            r_flt.rasterization = fake_rast
+            rgb1, dep1, _ = r_flt.render_pose(1.0, 0.0, 2.0, 0.0)
+            self.assertEqual(len(calls), 2, "给 depth_opacity_min=0.30 时 RGB 全量 + 深度过滤子集各一次")
+            self.assertGreaterEqual(calls[1]["min_op"], 0.30 - 1e-5)
+            self.assertLess(calls[1]["n"], calls[0]["n"])
+            np.testing.assert_array_equal(rgb0, rgb1, err_msg="RGB 画面与缺省逐像素完全相同")
+            self.assertAlmostEqual(float(dep0[0, 0]), 1.0, places=5)
+            self.assertAlmostEqual(float(dep1[0, 0]), 3.5, places=5)
+            self.assertEqual(r_flt.stats()["depth_opacity_min"], 0.30)
+
+            # set_depth_opacity_min 可在同实例上切换回 None（复用同一份 GPU 基础张量）
+            calls.clear()
+            r_flt.set_depth_opacity_min(None)
+            rgb2, dep2, _ = r_flt.render_pose(1.0, 0.0, 2.0, 0.0)
+            self.assertEqual(len(calls), 1)
+            np.testing.assert_array_equal(dep0, dep2)
+
+            for bad in (-0.1, 1.1, float("nan"), True):
+                with self.assertRaises(ValueError):
+                    renderer_mod.GsplatRenderer(scene, device="cpu", depth_opacity_min=bad)
+
+
 @unittest.skipUnless(os.environ.get("RUN_3DGS_REAL") == "1",
                      "设 RUN_3DGS_REAL=1 才跑真实 gsplat（首次会 JIT 编译）")
 class TestGsplatReal(unittest.TestCase):

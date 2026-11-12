@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""measure_z_margin.py 的单测：合成轨迹，不读真实实验输出。
+"""measure_z_margin.py（整集高度包络与起飞水平漂移测量，卡 S1b 第二轮 J-1）的单测：合成轨迹，不读真实实验输出。
 
-锁定：起飞过冲（前 STEADY_FROM_STEP 步）不进稳态分布；r<N>.incomplete-<时刻> 半成品不读；余量 = 各来源 max(|p1|, |p99|) 的最大值向上取到 5 mm；
-没有 scene.json 的集跳过。
-
-  TMPDIR=$DATA_ROOT/uav_rgb/tmp $DATA_ROOT/uav_rgb/3dgs-venv/bin/python experiments/2026-11-12-3dgs-rebaseline/test_measure_z_margin.py
+锁定：
+  1. 全部步（含第 0 步动作前位姿 pose_before、步末 pose_gt 与 trace.jsonl 全部中间点）的 z − spawn.z 最小与最大值都计入包络（不再跳过前 3 步起飞过冲）；
+  2. 起飞水平漂移 = 第 0 步动作前位姿 (pose_before.x, pose_before.y) 到候选出生点 (cx, cy) 的欧氏距离最大值；
+  3. Z_ENVELOPE_DOWN_M、Z_ENVELOPE_UP_M、SPAWN_DRIFT_MARGIN_M 均为各来源极值向外取到 5 mm 的整数倍；
+  4. r<N>.incomplete-<时刻> 半成品不读。
 """
 import importlib.util
 import json
@@ -24,54 +25,66 @@ if "TMPDIR" not in os.environ and os.path.isdir(os.path.join(_DATA, "tmp")):
     tempfile.tempdir = os.path.join(_DATA, "tmp")
 
 
-def write_episode(root, scene, route, ep, zs, spawn_z=1.2, with_scene=True):
+def write_episode(root, scene, route, ep, before_zs, gt_zs, trace_zs=(), spawn_z=1.2,
+                  cand_xy=(0.0, 0.0), start_xy=(0.0, 0.0), seed=8000, with_scene=True):
     d = os.path.join(root, scene, route, ep)
     os.makedirs(d, exist_ok=True)
-    with open(os.path.join(d, "actions.jsonl"), "w") as f:
-        for i, z in enumerate(zs):
-            f.write(json.dumps({"step": i, "pose_gt": {"x": 0.0, "y": 0.0, "z": z}}) + "\n")
+    with open(os.path.join(d, "actions.jsonl"), "w", encoding="utf-8") as f:
+        for i, (zb, zg) in enumerate(zip(before_zs, gt_zs)):
+            sx, sy = start_xy if i == 0 else (0.1 * i, 0.0)
+            f.write(json.dumps({
+                "step": i,
+                "pose_before": {"x": sx, "y": sy, "z": zb},
+                "pose_gt": {"x": sx + 0.1, "y": sy, "z": zg},
+            }) + "\n")
+    if trace_zs:
+        with open(os.path.join(d, "trace.jsonl"), "w", encoding="utf-8") as f:
+            for i, zt in enumerate(trace_zs):
+                f.write(json.dumps({"step": 0, "t": 0.1 * (i + 1), "pos": [0.0, 0.0, zt]}) + "\n")
     if with_scene:
-        with open(os.path.join(d, "scene.json"), "w") as f:
-            json.dump({"spawn": {"z": spawn_z}}, f)
+        with open(os.path.join(d, "scene.json"), "w", encoding="utf-8") as f:
+            json.dump({"spawn": {"x": cand_xy[0], "y": cand_xy[1], "z": spawn_z, "yaw_deg": 0.0}}, f)
+    with open(os.path.join(d, "metrics.json"), "w", encoding="utf-8") as f:
+        json.dump({"scene": scene, "route": 0, "seed": seed}, f)
 
 
-class TestMeasureZMargin(unittest.TestCase):
-    def test_takeoff_overshoot_excluded(self):
+class TestMeasureEnvelopeAndDrift(unittest.TestCase):
+    def test_includes_step0_pose_before_and_trace_extremes(self):
         with tempfile.TemporaryDirectory() as t:
-            # 前 3 步过冲 +0.05，之后 100 步在 spawn.z 上下 ±0.02 均匀分布
-            zs = [1.25, 1.25, 1.25] + list(1.2 + np.linspace(-0.02, 0.02, 100))
-            write_episode(t, "s", "r0", "ep_00000", zs)
-            dz, n_ep = mz.steady_dz(t, depth=1)
-            self.assertEqual(n_ep, 1)
-            self.assertEqual(len(dz), 100)
-            self.assertLess(abs(dz.max() - 0.02), 1e-9)
+            # 第 0 步 pose_before 过冲到 1.270（+0.070），trace 跌到 1.166（-0.034），稳态在 1.200
+            write_episode(t, "s", "r0", "ep_00000",
+                          before_zs=[1.270, 1.200, 1.200, 1.200],
+                          gt_zs=[1.215, 1.200, 1.200, 1.200],
+                          trace_zs=[1.260, 1.166],
+                          spawn_z=1.200, cand_xy=(1.0, 2.0), start_xy=(1.06, 2.08))
+            res = mz.scan_source(t, depth=1, jitter=0.0)
+            self.assertEqual(res["episodes"], 1)
+            self.assertAlmostEqual(res["dz_max"], 0.070, places=6)
+            self.assertAlmostEqual(res["dz_min"], -0.034, places=6)
+            self.assertAlmostEqual(res["drift_max"], 0.100, places=6)   # hypot(0.06, 0.08) = 0.10
 
     def test_incomplete_and_sceneless_episodes_skipped(self):
         with tempfile.TemporaryDirectory() as t:
-            write_episode(t, "s", "r0", "ep_00000", [1.2] * 6)
-            write_episode(t, "s", "r0.incomplete-020101", "ep_00000", [1.5] * 6)
-            write_episode(t, "s", "r1", "ep_00000", [1.5] * 6, with_scene=False)
-            dz, n_ep = mz.steady_dz(t, depth=1)
-            self.assertEqual(n_ep, 1)
-            self.assertEqual(float(np.abs(dz).max()), 0.0)
+            write_episode(t, "s", "r0", "ep_00000", [1.2], [1.2])
+            write_episode(t, "s", "r0.incomplete-020101", "ep_00000", [1.9], [0.5], start_xy=(5.0, 5.0))
+            write_episode(t, "s", "r1", "ep_00000", [1.9], [0.5], with_scene=False)
+            res = mz.scan_source(t, depth=1, jitter=0.0)
+            self.assertEqual(res["episodes"], 1)
+            self.assertEqual((res["dz_min"], res["dz_max"], res["drift_max"]), (0.0, 0.0, 0.0))
 
-    def test_margin_is_max_over_sources_rounded_up(self):
-        a = {"p1": -0.0231, "p99": 0.009}
-        b = {"p1": -0.0188, "p99": 0.0090}
-        margin, need = mz.pick_margin({"a": a, "b": b})
-        self.assertAlmostEqual(need, 0.0231)
-        self.assertEqual(margin, 0.025)
-        # 恰为 5 mm 整数倍时不再往上加一档
-        self.assertEqual(mz.pick_margin({"c": {"p1": -0.02, "p99": 0.01}})[0], 0.02)
-        # p99 在上侧更大时取上侧
-        self.assertEqual(mz.pick_margin({"d": {"p1": -0.001, "p99": 0.0301}})[0], 0.035)
-
-    def test_percentiles_use_pct_config(self):
-        dz = np.linspace(-0.05, 0.05, 10001)
-        s = mz.stats(dz)
-        self.assertAlmostEqual(s["p1"], -0.049, places=6)
-        self.assertAlmostEqual(s["p99"], 0.049, places=6)
-        self.assertEqual(s["n"], 10001)
+    def test_pick_envelope_and_drift_rounds_outward_to_5mm(self):
+        sources = {
+            "a": {"dz_min": -0.034197, "dz_max": 0.070023, "drift_max": 0.0824},
+            "b": {"dz_min": -0.028900, "dz_max": 0.065700, "drift_max": 0.102369},
+        }
+        picked = mz.pick_constants(sources)
+        self.assertEqual(picked["z_envelope_down_m"], 0.035)
+        self.assertEqual(picked["z_envelope_up_m"], 0.075)
+        self.assertEqual(picked["spawn_drift_margin_m"], 0.105)
+        # 恰为 5 mm 整数倍时不再多加一档
+        exact = mz.pick_constants({"c": {"dz_min": -0.030, "dz_max": 0.070, "drift_max": 0.080}})
+        self.assertEqual((exact["z_envelope_down_m"], exact["z_envelope_up_m"], exact["spawn_drift_margin_m"]),
+                         (0.030, 0.070, 0.080))
 
 
 if __name__ == "__main__":

@@ -108,11 +108,17 @@ def main(argv=None):
                     "collision_model": cm,
                     "metric_version": mv,
                 }
+                if "depth_opacity_min" in arm:
+                    m["depth_opacity_min"] = float(arm["depth_opacity_min"])
                 with open(os.path.join(ep_dir, "metrics.json"), "w", encoding="utf-8") as f:
                     json.dump(m, f, ensure_ascii=False, indent=1)
+                with open(os.path.join(ep_dir, "scene.json"), "w", encoding="utf-8") as f:
+                    json.dump({"spawn": {"x": 0.0, "y": 0.0, "z": 1.2},
+                               "collision": {"z_slice": [1.0, 1.4], "voxel_m": 0.1, "envelope": "e1_mini"}}, f)
                 with open(os.path.join(ep_dir, "actions.jsonl"), "w", encoding="utf-8") as f:
                     f.write(json.dumps({"step": 0, "action_executed": 1, "collision": False,
                                         "pose_before": {"x": pose["x"], "y": pose["y"], "z": 1.2},
+                                        "pose_gt": {"x": pose["x"] + 0.1, "y": pose["y"], "z": 1.2},
                                         "yaw_before": pose["yaw_deg"]}) + "\n")
                 if not cfg.get("drop_trace") and os.environ.get("STUB_DROP_TRACE") != "1":
                     with open(os.path.join(ep_dir, "trace.jsonl"), "w", encoding="utf-8") as f:
@@ -130,6 +136,8 @@ def main(argv=None):
             if "split_from_identity" in cfg:
                 done["split"] = "train"
                 done["split_policy"] = "diag-train-scene"
+            if "depth_opacity_min" in arm:
+                done["depth_opacity_min"] = float(arm["depth_opacity_min"])
             with open(os.path.join(rdir, "done.json"), "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=1)
     return 0

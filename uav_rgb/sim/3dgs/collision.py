@@ -20,8 +20,12 @@ v3（2026-11-07）：同一套 Occupancy 接口多两条**真值几何**输入�
   （相对 scene.json 目录），from_scene() 按它切换，collect_3dgs / planner / video 不用改。
 
 两套编号别混：上面的 v1 / v2 / v3 是代理的代际（PROXY_VERSION = 3dgs.occ.v2，v3 = 真值几何输入）；
-collision_model 的 v1 / v2（S1b，交叉审核 B）是碰撞口径，两者正交：口径 v1 = 本文件在 S1b 之前的判法（缺省），
-口径 v2 = 结构元素按精确欧氏距离、高度按层带取并、每步沿轨迹逐段扫。
+collision_model 的 v1 / v2（卡 S1b 第一轮立、第二轮定稿，交叉审核 B 与 J）是碰撞口径，两者正交：
+  口径 v1 = 本文件在 S1b 之前的判法（缺省，金标锁死不变）；
+  口径 v2 = 定稿几何（第一轮的未定稿 v2 没有出过任何正式数字，v2 与 +coll.v2 后缀直接沿用给定稿口径）：
+            机体视为圆柱（半径 = body_radius + inflate，半高 = body_half_height），与任一原始占据体素方块相交即碰，判定不再加高度余量；
+            规划硬栅格与出生检查按整集高度包络取层（盖住起飞过冲与飞行波动，使规划看到的障碍为判定可能碰到障碍的超集），出生检查另加起飞水平漂移余量；
+            每步碰撞沿 SITL 窗口内的 10 Hz trace 折线逐段扫。
 """
 import json
 import math
@@ -50,10 +54,12 @@ DEFAULT_MAX_SCALE_M = scene_mod.RENDER_DEFAULTS["max_scale_m"]   # 与渲染端�
 # "看得见就算实体"的 0.3 口径；1σ（0.61）会让相邻高斯之间留缝，3σ（0.01）把薄墙画成 3 倍厚。
 DEFAULT_SIGMA_K = 1.5
 PROXY_VERSION = "3dgs.occ.v2"
-# 碰撞口径（任务卡 S1b，交叉审核 B）：collision_model 选结构元素、高度口径与每步扫掠的形状。
+# 碰撞口径（任务卡 S1b 第一轮立开关，第二轮按审核 J 定稿）：collision_model 选连续查询的形状、高度口径与每步扫掠的形状。
 #   v1 = 改动前的现状（缺省，逐位不变，test_collision_model.py 的金标锁定）
-#   v2 = 审核 B 的发现 1、2、3 都生效：xy 结构元素按格中心到原始体素方块的欧氏距离取（B1）、高度按层带取并（B2/B4/B7）、
-#        每步碰撞沿 SITL 窗口内的轨迹点逐段扫（B3，在 collect_3dgs.run_episode）
+#   v2 = 定稿口径：连续查询（collides / sweep / sweep_path / 规则臂列距离）取圆柱与原始占据体素方块的精确相交，
+#        水平为点到方块的精确欧氏距离 <= 机体半径 + 余量，竖直为机体半高碰到的层，不加高度余量（J-1、J-2）；
+#        规划硬栅格与出生检查取整集高度包络的层（J-1）；每步碰撞沿 SITL 窗口内的轨迹点逐段扫（B3，在 collect_3dgs.run_episode）。
+#        第一轮的格中心欧氏结构元素（_dilate_euclid）只留给规划硬栅格用。
 # 同一份几何（原始占据 raw 与口径无关）两种口径的结果不可混报：v2 的 proxy_version / metric_version 带 +coll.v2 后缀。
 COLLISION_MODELS = ("v1", "v2")
 DEFAULT_COLLISION_MODEL = "v1"
@@ -67,16 +73,21 @@ def metric_version(base, collision_model=DEFAULT_COLLISION_MODEL):
     return base + COLLISION_VERSION_SUFFIX[collision_model]
 
 
-# v2 的高度口径（B2 / B4 / B7）：碰撞判定、教师规划硬栅格、规则臂列距离、出生检查共用一个层带，
-# 层带 = z ± (机体半高 + HEIGHT_MARGIN_M) 覆盖到的栅格层取并（Occupancy.layer_span）。
-# HEIGHT_MARGIN_M 先量后定（experiments/2026-11-12-3dgs-rebaseline/measure_z_margin.py，输出在 docs/experiments/2026-11-12-3dgs-rebaseline.md）：
-# K1 / W1-11 / W1-12 / K3 已跑完的 cf_sitl 臂（hold 1.0，室内外 120 集、holdout 96 集，共 12 个来源）稳态飞行（第 3 步起）的
-# 位姿 z 相对出生高度 spawn.z：p1 在 −0.0188 … −0.0231 m，p99 在 +0.0005 … +0.0090 m，偏离幅度 max(|p1|, |p99|) 最大 0.0231 m，
-# 向上取到 5 mm 的整数倍 = 0.025 m（层带半宽 0.053 m）。起飞过冲（前 3 步，最大 +0.046 m）不进稳态口径；
-# 过冲时带下沿仍比出生高度低 0.007 m，出生高度所在的层仍在带内。
-# 0.1 m 体素、E1 机体（半高 0.028）：稳态飞行（逐步极值 −0.0342 … +0.018 m）的层带只落在出生高度两侧的两层，
-# 出生高度压在层边界上也不跳层（test_collision_model.TestB2HeightBand.test_steady_flight_band_stays_in_layers_1_and_2）。
-HEIGHT_MARGIN_M = 0.025
+# v2 定稿的高度包络与起飞水平漂移余量（卡 S1b 第二轮，审核 J-1；先量后定，脚本 experiments/2026-11-12-3dgs-rebaseline/measure_z_margin.py）：
+# 数据来源：W1-11（teacher-tol 室内外各 120 集）、W1-12（swept 室内外各 120 集）、K1（forward+route 与 rule-occ+route 室内外各 120 集）、
+#   K3（holdout 四臂各 96 集、formal40 两臂各 120 集、outdoor 两臂各 120 集），共 16 个已完成来源、1,824 集、92,826 步（含第 0 步动作前位姿
+#   pose_before 与步末 pose_gt）及 186,850 个 10 Hz trace.jsonl 轨迹点。
+# 实测极值与取整规则（各极值向外取到 5 mm 的整数倍）：
+#   1. 整集高度相对名义出生高度 z − spawn.z：最小 −0.034197 m（teacher-tol / swept 室内 trace）→ Z_ENVELOPE_DOWN_M = 0.035 m；
+#      最大 +0.070023 m（室内第 0 步起飞过冲 pose_before.z）→ Z_ENVELOPE_UP_M = 0.075 m。
+#   2. 起飞段水平漂移 hypot(step0.pose_before.xy − candidate_spawn.xy)：室内最大 0.0824 m，室外最大 0.102369 m（r5 ep3）
+#      → SPAWN_DRIFT_MARGIN_M = 0.105 m。
+# 用途区分：连续碰撞判定（layer_span / _grid_hit）只看机体自身圆柱半高 [z − 半高, z + 半高]，不再加高度余量；
+#   按名义出生高度做的规划硬栅格（planning_grid）与出生检查（spawn_ok）取包络 [z_nom − Z_ENVELOPE_DOWN_M − 半高, z_nom + Z_ENVELOPE_UP_M + 半高]，
+#   保证规划与出生检查看到的障碍层始终是全集碰撞判定可能查到的层的超集。
+Z_ENVELOPE_DOWN_M = 0.035
+Z_ENVELOPE_UP_M = 0.075
+SPAWN_DRIFT_MARGIN_M = 0.105
 # 真值几何路径的版本串（summary().proxy_version 按 source 取；高斯路径保持 v2 串，旧 manifest 可比）。
 TRUTH_VERSION = {"points": "3dgs.occ.v3.points", "mesh": "3dgs.occ.v3.mesh"}
 # min_points=3：LiDAR 稠密云里 0.1–0.2 m 体素内真实表面有几十到上千个点，1–2 个点的体素多是
@@ -288,14 +299,9 @@ class Occupancy:
                  body_radius_m=0.102, body_half_height_m=0.028, inflate_m=0.0,
                  opacity_min=DEFAULT_OPACITY_MIN, max_scale_m=DEFAULT_MAX_SCALE_M,
                  sigma_k=DEFAULT_SIGMA_K, ground_z=0.0, pad_m=1.0,
-                 min_points=1, source="gaussians", collision_model=DEFAULT_COLLISION_MODEL, height_margin_m=None):
+                 min_points=1, source="gaussians", collision_model=DEFAULT_COLLISION_MODEL):
         if collision_model not in COLLISION_MODELS:
             raise ValueError(f"collision_model 必须是 {COLLISION_MODELS} 之一，得到 {collision_model!r}")
-        if height_margin_m is not None:
-            if collision_model != "v2":
-                raise ValueError("height_margin_m 只对 collision_model='v2' 有意义（v1 的高度口径不看余量）")
-            if not (math.isfinite(height_margin_m) and height_margin_m >= 0):
-                raise ValueError(f"height_margin_m 必须是非负有限数，得到 {height_margin_m!r}")
         pts = np.asarray(means, dtype=np.float64)
         if pts.ndim != 2 or pts.shape[1] < 3:
             raise ValueError("means 必须是 Nx3")
@@ -319,9 +325,10 @@ class Occupancy:
         self.collision_model = collision_model
         self.proxy_version = (TRUTH_VERSION.get(self.source, PROXY_VERSION)
                               + COLLISION_VERSION_SUFFIX[collision_model])
-        # v2 的层带半宽 = 机体半高 + 高度余量；cruise_z = 规划用的巡航高度（from_scene 取 scene.spawn.z），v1 不用
-        self.height_margin = HEIGHT_MARGIN_M if height_margin_m is None else float(height_margin_m)
-        self.height_band_half = self.body_half_height + self.height_margin
+        # cruise_z = 名义出生高度（from_scene 取 scene.spawn.z），供 v2 的规划硬栅格缺省取层包络；v1 不用
+        self.z_envelope_down = Z_ENVELOPE_DOWN_M
+        self.z_envelope_up = Z_ENVELOPE_UP_M
+        self.spawn_drift_margin = SPAWN_DRIFT_MARGIN_M
         self.cruise_z = None
         self.n_points = len(pts)
         self.n_kept = 0
@@ -476,16 +483,13 @@ class Occupancy:
         return out
 
     def _dilate_euclid(self, occ):
-        """v2 的结构元素（B1）：xy 偏移 (di, dj) 保留 <=> 该格中心到原始占据体素（边长 1 格的方块）的欧氏距离
-        <= 机体半径 + 余量；z 方向不膨胀（B2）：机体半高 + 高度余量由查询时的层带承担（layer_span / _grid_hit）。
+        """v2 的规划格中心膨胀栅格（B1 / J-2）：xy 偏移 (di, dj) 保留 <=> 该格中心到原始占据体素（边长 1 格的方块）的欧氏距离
+        <= 机体半径 + 余量；z 方向不膨胀。
 
-        以格为单位，r = (机体半径 + 余量) / voxel；方块边在 ±0.5 格，所以偏移 (di, dj) 的距离是
-        hypot(max(|di| - 0.5, 0), max(|dj| - 0.5, 0))，轴向最远的格 |d| <= r + 0.5。
-        0.1 m 体素、E1 的 0.102 m：r = 1.02，(1, 1) 的距离 0.707 在内，(2, 0) 的 1.5 在外，得 3×3 方核；
-        0.2 m 体素：r = 0.51，(1, 0) 的 0.5 在内，(1, 1) 的 0.707 在外，仍是十字，与 v1 相同。
-
-        shortcut: 栅格按格中心判，查询点落在格内任意位置都取该格的值，对格内点的判定与精确距离最多差半个格对角线
-        （0.1 m 体素 0.07 m）；升级条件：要更精时改成每次查询扫邻域取点到方块的距离（规则臂每步查 8100 个点，开销要先量），或缩小体素。
+        注意（审核 J-2，卡 S1b 第二轮定稿）：这张 self.grid 只供离散格中心上的 A* 规划硬栅格（planning_grid）用
+        （格中心处与精确距离恒等）；连续坐标查询（collides / sweep / sweep_path / 规则臂 occ_columns）在 _grid_hit 里
+        不查 self.grid，而是查点到原始占据体素方块的精确水平欧氏距离（_exact_xy_hit），消除 0.1 m 体素 3×3 方核斜向多判
+        3.94 cm 与 0.2 m 体素十字核斜向漏判 10.2 cm / 轴向多判 9.8 cm 的误差。
         """
         r = (self.body_radius + self.inflate) / self.voxel
         reach = int(math.floor(r + 0.5 + 1e-9))
@@ -501,7 +505,39 @@ class Occupancy:
                     continue
                 out[max(0, di):nx - max(0, -di), max(0, dj):ny - max(0, -dj), :] |= \
                     occ[max(0, -di):nx - max(0, di), max(0, -dj):ny - max(0, dj), :]
+        self._prepare_exact_xy(occ)
         return out
+
+    def _prepare_exact_xy(self, occ):
+        """预计算连续点到原始占据体素方块精确水平距离查询的粗筛表（J-2）：
+        - _exact_inner：格内任意点到某占据方块的最大可能距离 <= R（落入即必碰，O(1) 返回 True）；
+        - _exact_shell：格内至少存在一点到某占据方块的最小可能距离 <= R，但未必碰（只对这一薄壳里的候选点算精确距离）。
+        """
+        r = (self.body_radius + self.inflate) / self.voxel
+        reach = int(math.ceil(r + 1e-12))
+        nx, ny, _ = occ.shape
+        inner = occ.copy()
+        outer = occ.copy()
+        shell_offs, all_offs = [], []
+        for di in range(-reach, reach + 1):
+            for dj in range(-reach, reach + 1):
+                min_d2 = max(abs(di) - 1, 0) ** 2 + max(abs(dj) - 1, 0) ** 2
+                if min_d2 > r * r + 1e-12:
+                    continue
+                all_offs.append((di, dj))
+                max_d2 = abs(di) ** 2 + abs(dj) ** 2
+                if di != 0 or dj != 0:
+                    src = occ[max(0, -di):nx - max(0, di), max(0, -dj):ny - max(0, dj), :]
+                    outer[max(0, di):nx - max(0, -di), max(0, dj):ny - max(0, -dj), :] |= src
+                    if max_d2 <= r * r - 1e-12:
+                        inner[max(0, di):nx - max(0, -di), max(0, dj):ny - max(0, -dj), :] |= src
+                if max_d2 > r * r - 1e-12 and (di != 0 or dj != 0):
+                    shell_offs.append((di, dj))
+        self._exact_inner = inner
+        self._exact_shell = outer & ~inner
+        self._exact_shell_offsets = np.asarray(shell_offs, dtype=np.int64).reshape(-1, 2)
+        self._exact_all_offsets = np.asarray(all_offs, dtype=np.int64).reshape(-1, 2)
+        self._exact_reach = reach
 
     def _empty(self):
         self.shape = (0, 0, 0)
@@ -509,54 +545,179 @@ class Occupancy:
         self.raw = self.grid = np.zeros((0, 0, 0), dtype=bool)
         self._occ_xy = np.zeros((0, 2))
         self.dilation_cells = (0, 0)
+        self._exact_inner = self._exact_shell = np.zeros((0, 0, 0), dtype=bool)
+        self._exact_shell_offsets = self._exact_all_offsets = np.zeros((0, 2), dtype=np.int64)
+        self._exact_reach = 0
+
+    def _exact_xy_hit(self, p_xy, k0, k1, radius_m=None, strict_lt=False):
+        """p_xy:[M,2] 在各自层区间 [k0, k1] 内，到原始占据体素方块的水平欧氏距离是否 <= radius_m（strict_lt=True 时判 <）。"""
+        p_xy = np.asarray(p_xy, dtype=np.float64).reshape(-1, 2)
+        hit = np.zeros(len(p_xy), dtype=bool)
+        if self.raw.size == 0 or len(p_xy) == 0:
+            return hit
+        v = self.voxel
+        nx, ny, _ = self.raw.shape
+        finite = np.isfinite(p_xy).all(axis=1) & (k0 <= k1)
+        f_idx = np.nonzero(finite)[0]
+        if len(f_idx) == 0:
+            return hit
+        c_xy = np.floor((p_xy[f_idx] - self.origin[:2]) / v).astype(int)
+
+        def check_subset(sub_f_idx, sub_c, offs, thr2, strict):
+            if len(sub_f_idx) == 0 or len(offs) == 0:
+                return
+            ni = sub_c[:, 0:1] + offs[None, :, 0]
+            nj = sub_c[:, 1:2] + offs[None, :, 1]
+            ok = (ni >= 0) & (ni < nx) & (nj >= 0) & (nj < ny)
+            bx0 = self.origin[0] + ni * v
+            by0 = self.origin[1] + nj * v
+            px, py = p_xy[sub_f_idx, 0:1], p_xy[sub_f_idx, 1:2]
+            dx = np.maximum(np.maximum(bx0 - px, 0.0), px - (bx0 + v))
+            dy = np.maximum(np.maximum(by0 - py, 0.0), py - (by0 + v))
+            d2 = dx * dx + dy * dy
+            in_r = ok & ((d2 < thr2) if strict else (d2 <= thr2))
+            mm, kk_off = np.nonzero(in_r)
+            if len(mm):
+                nni, nnj = ni[mm, kk_off], nj[mm, kk_off]
+                sa, sb = k0[sub_f_idx][mm], k1[sub_f_idx][mm]
+                occ_z = self.raw[nni, nnj, sa].copy()
+                max_d = int((sb - sa).max())
+                for d in range(1, max_d + 1):
+                    lv = sa + d <= sb
+                    if lv.any():
+                        occ_z[lv] |= self.raw[nni[lv], nnj[lv], (sa + d)[lv]]
+                if occ_z.any():
+                    hit[sub_f_idx[mm[occ_z]]] = True
+
+        if radius_m is None and not strict_lt:
+            reach = self._exact_reach
+            r_tot = self.body_radius + self.inflate
+            r2 = r_tot * r_tot + 1e-18
+            in_b = (c_xy[:, 0] >= 0) & (c_xy[:, 0] < nx) & (c_xy[:, 1] >= 0) & (c_xy[:, 1] < ny)
+            if in_b.all():
+                ib_idx, ic = f_idx, c_xy
+                ia, ib = k0[ib_idx], k1[ib_idx]
+                c0, c1 = ic[:, 0], ic[:, 1]
+                sure = self._exact_inner[c0, c1, ia].copy()
+                maybe = self._exact_shell[c0, c1, ia].copy()
+                for d in range(1, int((ib - ia).max()) + 1):
+                    lv = ia + d <= ib
+                    kk = (ia + d)[lv]
+                    sure[lv] |= self._exact_inner[c0[lv], c1[lv], kk]
+                    maybe[lv] |= self._exact_shell[c0[lv], c1[lv], kk]
+                hit[ib_idx[sure]] = True
+                sh = maybe & ~sure
+                if sh.any():
+                    check_subset(ib_idx[sh], ic[sh], self._exact_shell_offsets, r2, False)
+                return hit
+            near = ((c_xy[:, 0] >= -reach) & (c_xy[:, 0] < nx + reach)
+                    & (c_xy[:, 1] >= -reach) & (c_xy[:, 1] < ny + reach))
+            if not near.any():
+                return hit
+            idx, c_xy = f_idx[near], c_xy[near]
+            in_b = (c_xy[:, 0] >= 0) & (c_xy[:, 0] < nx) & (c_xy[:, 1] >= 0) & (c_xy[:, 1] < ny)
+            if in_b.any():
+                ib_idx, ic = idx[in_b], c_xy[in_b]
+                ia, ib = k0[ib_idx], k1[ib_idx]
+                sure = np.zeros(len(ib_idx), dtype=bool)
+                maybe = np.zeros(len(ib_idx), dtype=bool)
+                for d in range(int((ib - ia).max()) + 1):
+                    lv = ia + d <= ib
+                    kk = (ia + d)[lv]
+                    sure[lv] |= self._exact_inner[ic[lv, 0], ic[lv, 1], kk]
+                    maybe[lv] |= self._exact_shell[ic[lv, 0], ic[lv, 1], kk]
+                hit[ib_idx[sure]] = True
+                sh = maybe & ~sure
+                if sh.any():
+                    check_subset(ib_idx[sh], ic[sh], self._exact_shell_offsets, r2, False)
+            if (~in_b).any():
+                check_subset(idx[~in_b], c_xy[~in_b], self._exact_all_offsets, r2, False)
+            return hit
+
+        r_tot = (self.body_radius + self.inflate) if radius_m is None else float(radius_m)
+        r = r_tot / v
+        reach = int(math.ceil(r + 1e-12))
+        near = ((c_xy[:, 0] >= -reach) & (c_xy[:, 0] < nx + reach)
+                & (c_xy[:, 1] >= -reach) & (c_xy[:, 1] < ny + reach))
+        if not near.any():
+            return hit
+        offs = np.asarray(
+            [(di, dj) for di in range(-reach, reach + 1) for dj in range(-reach, reach + 1)
+             if max(abs(di) - 1, 0) ** 2 + max(abs(dj) - 1, 0) ** 2 <= r * r + 1e-12],
+            dtype=np.int64,
+        ).reshape(-1, 2)
+        thr2 = (max(r_tot - 1e-12, 0.0) ** 2) if strict_lt else (r_tot * r_tot + 1e-18)
+        check_subset(f_idx[near], c_xy[near], offs, thr2, strict_lt)
+        return hit
 
     # -- 查询 ---------------------------------------------------------------
-    def layer_span(self, z):
-        """z（标量或数组）处的层带 z ± height_band_half 与栅格各层的相交范围，返回 (k0, k1)（含端点，已裁到 [0, nz-1]）；
-        带完全在栅格上方或下方、或 z 不是有限数时 k0 > k1（空）。v2 的碰撞判定、规划硬栅格、规则臂列距离、出生检查都用它。"""
-        z = np.asarray(z, dtype=np.float64)
-        h, zlo = self.height_band_half, float(self.origin[2])
-        lo = np.nan_to_num(np.floor((z - h - zlo) / self.voxel), nan=1e9, posinf=1e9, neginf=-1e9)
-        hi = np.nan_to_num(np.floor((z + h - zlo) / self.voxel), nan=1e9, posinf=1e9, neginf=-1e9)
+    def _interval_layers(self, z_lo, z_hi):
+        """区间 [z_lo, z_hi] 与栅格各层 [origin_z + k·v, origin_z + (k+1)·v] 相交的层下标范围 (k0, k1)；
+        完全在栅格上方或下方、或非有限数时 k0 > k1（空）。
+
+        边界约定：竖直方向两端各向内缩 1e-12 m，区间只贴着层面（只差浮点误差）不算碰到那一层；水平方向 _exact_xy_hit 则是
+        距离 <= 半径算碰（贴着也算）。两处的约定只在测度为零的边界上不同。"""
+        zlo_g, v = float(self.origin[2]), self.voxel
+        lo = np.nan_to_num(np.floor((np.asarray(z_lo, dtype=np.float64) - zlo_g) / v + 1e-12), nan=1e9, posinf=1e9, neginf=-1e9)
+        hi = np.nan_to_num(np.ceil((np.asarray(z_hi, dtype=np.float64) - zlo_g) / v - 1e-12) - 1.0, nan=-1e9, posinf=1e9, neginf=-1e9)
         return np.maximum(lo, 0).astype(int), np.minimum(hi, self.shape[2] - 1).astype(int)
 
+    def layer_span(self, z):
+        """连续碰撞判定的竖直层范围（J-1 定稿）：机体高度区间 [z − body_half_height, z + body_half_height]（无余量）碰到的层 (k0, k1)。"""
+        z = np.asarray(z, dtype=np.float64)
+        return self._interval_layers(z - self.body_half_height, z + self.body_half_height)
+
+    def envelope_layer_span(self, z):
+        """规划硬栅格与出生检查按名义出生高度 z 取的整集高度包络层范围（J-1 定稿）：
+        [z − z_envelope_down − body_half_height, z + z_envelope_up + body_half_height] 碰到的层 (k0, k1)。"""
+        z = np.asarray(z, dtype=np.float64)
+        return self._interval_layers(z - self.z_envelope_down - self.body_half_height,
+                                     z + self.z_envelope_up + self.body_half_height)
+
     def planning_grid(self, z=None):
-        """教师规划的 2D 硬栅格（B4）。v1：各层取并（不看 z，改动前的做法）；v2：z 处层带的并，z 缺省取 cruise_z
-        （from_scene 取 scene.spawn.z），都没有就报错，不猜高度。"""
+        """教师规划的 2D 硬栅格（B4 / J-1）。v1：各层取并（不看 z，改动前的做法）；v2：名义高度 z 处整集高度包络层的并（self.grid
+        已按 _dilate_euclid 做格中心欧氏膨胀），z 缺省取 cruise_z（from_scene 取 scene.spawn.z），都没有就报错，不猜高度。"""
         if self.collision_model != "v2":
             return self.grid.any(axis=2)
         if z is None:
             z = self.cruise_z
         if z is None:
-            raise ValueError("collision_model='v2' 的规划硬栅格要知道飞行高度：给 z，或经 from_scene 建占据（取 scene.spawn.z）")
+            raise ValueError("collision_model='v2' 的规划硬栅格要知道名义出生高度：给 z，或经 from_scene 建占据（取 scene.spawn.z）")
         if self.grid.size == 0:
             return np.zeros(self.shape[:2], dtype=bool)
-        k0, k1 = (int(k) for k in self.layer_span(float(z)))
+        k0, k1 = (int(k) for k in self.envelope_layer_span(float(z)))
         if k0 > k1:
             return np.zeros(self.shape[:2], dtype=bool)
         return self.grid[:, :, k0:k1 + 1].any(axis=2)
 
-    def _grid_hit(self, p):
-        """p:[M,3] -> [M] bool（膨胀栅格）。
+    def spawn_ok(self, x, y, z):
+        """v2 的出生候选点检查（J-1）：在名义高度 z 的整集包络层上，候选点到原始占据体素方块的精确水平距离不小于
+        body_radius + inflate + spawn_drift_margin，且 z 不低于地面包络；v1 等价于 not self.collides(x, y, z)。"""
+        if self.collision_model != "v2":
+            return not self.collides(x, y, z)
+        if bool(self._ground_hit(float(z) - self.z_envelope_down)):
+            return False
+        if self.raw.size == 0:
+            return True
+        k0, k1 = self.envelope_layer_span(np.array([float(z)]))
+        if int(k0[0]) > int(k1[0]):
+            return True
+        need = self.body_radius + self.inflate + self.spawn_drift_margin
+        return not bool(self._exact_xy_hit(np.array([[float(x), float(y)]]), k0, k1, radius_m=need, strict_lt=True)[0])
 
-        v1：点所在的那一层；栅格外 / 高度范围外为 False（z 在层边界上差 1 cm 就换一层，审核 B 发现 2）。
-        v2：z ± height_band_half 覆盖到的层取并；带只擦到栅格最上 / 最下一层也算（机体半高加余量够得到那一层）。
+    def _grid_hit(self, p):
+        """p:[M,3] -> [M] bool。
+
+        v1：点所在的那一层查膨胀栅格 self.grid；栅格外 / 高度范围外为 False（z 在层边界上差 1 cm 就换一层，审核 B 发现 2）。
+        v2：竖直方向取 layer_span(z) 覆盖到的层，水平方向取点到原始占据体素方块的精确欧氏距离 <= 机体半径 + 余量（审核 J-2）。
         """
         p = np.asarray(p, dtype=np.float64).reshape(-1, 3)
         hit = np.zeros(len(p), dtype=bool)
         if self.grid.size == 0:
             return hit
         if self.collision_model == "v2":
-            c = self._cell(p)
             k0, k1 = self.layer_span(p[:, 2])
-            idx = np.nonzero((c[:, 0] >= 0) & (c[:, 0] < self.shape[0]) & (c[:, 1] >= 0) & (c[:, 1] < self.shape[1])
-                             & (k0 <= k1))[0]
-            if len(idx):
-                ci, cj, a, b = c[idx, 0], c[idx, 1], k0[idx], k1[idx]
-                for d in range(int((b - a).max()) + 1):
-                    live = a + d <= b
-                    hit[idx[live]] |= self.grid[ci[live], cj[live], (a + d)[live]]
-            return hit
+            return self._exact_xy_hit(p[:, :2], k0, k1)
         inz = (p[:, 2] >= self.z_range[0]) & (p[:, 2] < self.z_range[1])
         c = self._cell(p)
         ok = inz & (c >= 0).all(axis=1) & (c < np.array(self.shape)).all(axis=1)
@@ -637,8 +798,9 @@ class Occupancy:
                 "sigma_k": self.sigma_k, "min_points": self.min_points, "ground_z": self.ground_z,
                 "note": note}
         if self.collision_model == "v2":
-            out["height_margin_m"] = self.height_margin
-            out["height_band_half_m"] = self.height_band_half
+            out["z_envelope_down_m"] = self.z_envelope_down
+            out["z_envelope_up_m"] = self.z_envelope_up
+            out["spawn_drift_margin_m"] = self.spawn_drift_margin
             out["cruise_z"] = self.cruise_z
         return out
 

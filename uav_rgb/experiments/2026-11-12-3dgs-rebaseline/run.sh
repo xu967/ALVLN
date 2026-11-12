@@ -23,8 +23,8 @@
 #   - DONE 的退出码反映驱动任务与汇总的失败（有驱动失败记 rc=7，v1 对拍不一致记 rc=6，不因汇总脚本成功而掩盖为 0，E-6）；
 #   - 被打断后续跑改名的 *.incomplete-<时刻> 半成品目录，由 summarize.py 单独列出（E-1），正式结果读取一律走 sim.3dgs.route_dirs（E-12）。
 #
-# 卡 S1a（审核 D1）衔接说明：
-#   主会话将卡 S1a（评测场景真实 split 与 diag-train-scene）与本卡合并进 main 后，第二轮正式起跑前把下方配置区的 SPLIT_FROM_IDENTITY 设为 "true"（当前分支未合入 S1a，缺省留空不传该键）。
+# 卡 S1a（审核 D1 / J-4）说明：
+#   卡 S1a 已合入 main，下方配置区 SPLIT_FROM_IDENTITY 缺省为 "true"，所有套件默认按几何哈希写真实 split 与 diag-train-scene。
 #
 # 运行方式：
 #   正式起跑（合并进 main 后）：
@@ -81,8 +81,8 @@ GUARD_DEG=45.0                                                      # forward+ro
 TEACHER_TOL_DEG=18.907607239317166                                  # 教师容差 = planner.yaw_tol_deg(1.0)（同 W1-11 / W1-12）
 YAW_STEP=31.7;               V1_R_SAFE=0.25;       V1_D_LOOK=1.2    # K1 / K3 冻结规则参数
 DROP_TRACE=${DROP_TRACE:-false}                                     # 任务卡硬要求：保留每集 trace.jsonl（禁止设为 true）
-# 卡 S1a（审核 D1）预留开关：S1a 与 S1b 合并进 main 后改为 "true"，让 driver 写入真实 split 与 diag-train-scene
-SPLIT_FROM_IDENTITY=${SPLIT_FROM_IDENTITY:-}                        # 空 = 不传该键（合并前兼容）；"true" = 启用 S1a 划分记录
+# 卡 S1a（审核 D1 / J-4）：S1a 已合入 main，缺省启用真实 split 与 diag-train-scene，不再把 train/val 场景标成 test
+SPLIT_FROM_IDENTITY=${SPLIT_FROM_IDENTITY:-true}                    # "true" = 按几何哈希写真实 split 与 diag-train-scene（缺省）
 # 冒烟裁剪项（仅 SMOKE=1 或 DRY_RUN=1 允许非空）
 ROUTES_LIMIT=${ROUTES_LIMIT:-}
 ONLY_ARMS=${ONLY_ARMS:-}

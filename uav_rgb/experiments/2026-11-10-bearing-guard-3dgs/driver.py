@@ -45,9 +45,13 @@ config 里 split_from_identity = true 才改成取场景身份里按哈希得到
                        给了这个键（true 或 false），done.json 末尾多记 split 与 split_policy（生效值）；没给就没有，旧产物的键不变。值不是布尔时启动就报错，早于加载场景
 2026-11-12-3dgs-rebaseline（任务卡 S1b）再加的全局可选键（缺省时同样与原版逐位一致，test_driver_collision_model.py 锁定）：
   collision_model  "v1" | "v2"：传给 collision.from_scene(base, collision_model=…)；不给 = 不传（等于 v1，改动前的判法）。
-                   v2 = 审核 B 的发现 1、2、3：结构元素按欧氏距离、高度按层带取并、每步沿 SITL trace 折线扫（出生检查随之统一成层带口径，
-                   所以 v2 下任何臂的 spawn_two_layer 为 true 都在启动时报错，早于加载场景）。给了这个键，每集 metrics.json 与 done.json
+                   v2 = 定稿口径（审核 B 立、审核 J 定稿）：圆柱与原始占据体素方块精确相交（无高度余量）、规划硬栅格与出生检查取整集高度包络、
+                   每步沿 SITL trace 折线扫（出生检查已按包络判空，所以 v2 下任何臂的 spawn_two_layer 为 true 都在启动时报错，早于加载场景）。
+                   给了这个键，每集 metrics.json 与 done.json
                    末尾多记 collision_model 与 metric_version（v2 带 +coll.v2 后缀；没给就没有，旧产物的键不变）
+  臂 / 全局 depth_opacity_min   [0, 1] 内的数（B5，卡 S1b 第二轮）：传给 renderer.set_depth_opacity_min(…)，RGB 照旧渲染全部高斯，
+                                深度只用 opacity >= 门限的高斯另渲一遍；臂级覆盖全局，不带该键的臂自动切回 None（缺省不给，逐位不变）。
+                                给了这个键，每集 metrics.json 与 done.json 末尾多记 depth_opacity_min。
 """
 import importlib
 import json
@@ -89,6 +93,15 @@ for _a in ARMS:         # 配置错在加载场景（约 200 s）之前就报，
     if "spawn_two_layer" in _a and (not isinstance(_a["spawn_two_layer"], bool) or (_a["spawn_two_layer"] and not CFG["jitter"] > 0)):
         raise ValueError(f"臂 {_a['name']}：spawn_two_layer 要是 true / false，且为 true 时全局 jitter 必须大于 0，得到 "
                          f"spawn_two_layer={_a['spawn_two_layer']!r} jitter={CFG['jitter']!r}")
+    if "depth_opacity_min" in _a:
+        _dom = _a["depth_opacity_min"]
+        if isinstance(_dom, bool) or not isinstance(_dom, (int, float)) or not (math.isfinite(_dom) and 0.0 <= float(_dom) <= 1.0):
+            raise ValueError(f"臂 {_a['name']}：depth_opacity_min 要是 [0, 1] 内的有限数，得到 {_dom!r}")
+if "depth_opacity_min" in CFG:
+    _gdom = CFG["depth_opacity_min"]
+    if isinstance(_gdom, bool) or not isinstance(_gdom, (int, float)) or not (math.isfinite(_gdom) and 0.0 <= float(_gdom) <= 1.0):
+        raise ValueError(f"全局 depth_opacity_min 要是 [0, 1] 内的有限数，得到 {_gdom!r}")
+HAS_DEPTH_OPACITY = ("depth_opacity_min" in CFG) or any("depth_opacity_min" in _a for _a in ARMS)
 if "split_from_identity" in CFG and not isinstance(CFG["split_from_identity"], bool):
     raise ValueError(f"split_from_identity 要是 true / false，得到 {CFG['split_from_identity']!r}")
 
@@ -181,7 +194,9 @@ t0 = time.time()
 base = scene_mod.load_scene(path)
 occ = coll.from_scene(base, **CM_KW)
 renderer = renderer_mod.make_renderer(base, False, None, None, None, "cuda")
-occ_planner = planner_mod.OccPlanner(occ)
+# J-9：v1 硬栅格不看高度，直接调一次 OccPlanner(occ)（与旧测试单参桩兼容）；v2 按每条路线自己的 spawn.z 缓存规划器，避免顶层高度错位或缺失
+planners_by_z = {}
+default_planner = None if CFG.get("collision_model") == "v2" else planner_mod.OccPlanner(occ)
 ply_sha = c3._sha256(base["ply_path"])
 params = dyn.CfSitlParams.from_json(None)
 log(f"场景加载 {time.time() - t0:.0f}s；dynamics_profile={params.profile()}；臂 {[a['name'] for a in ARMS]}")
@@ -196,6 +211,10 @@ for arm in ARMS:
     rule_kw = {"rule_version": arm["rule_version"]} if "rule_version" in arm else {}     # 没给键就不传：旧臂调用与原版逐位相同
     teacher_kw = {"clearance": arm["teacher_clearance"]} if "teacher_clearance" in arm else {}   # 没给键就不传 clearance（等于 ray）；hold_s 由教师构造处对所有教师臂统一传（K3）
     spawn_kw = {"spawn_two_layer": arm["spawn_two_layer"]} if "spawn_two_layer" in arm else {}                   # 同上：没给键就不传给 run_episode
+    has_dom = ("depth_opacity_min" in arm) or ("depth_opacity_min" in CFG)
+    eff_dom = float(arm["depth_opacity_min"]) if "depth_opacity_min" in arm else (float(CFG["depth_opacity_min"]) if "depth_opacity_min" in CFG else None)
+    if HAS_DEPTH_OPACITY:
+        renderer.set_depth_opacity_min(eff_dom)
     student = StudentPolicy(arm["ckpt"], CFG["infer_bin"]) if arm["base"] == "student" else None
     try:
         for r in ROUTES:
@@ -208,6 +227,13 @@ for arm in ARMS:
             os.makedirs(d)
             sc = scene_mod.load_scene(path)
             scene_mod.apply_route(sc, r)
+            if default_planner is not None:
+                occ_planner = default_planner
+            else:
+                rz = float(sc["spawn"]["z"])
+                if rz not in planners_by_z:
+                    planners_by_z[rz] = planner_mod.OccPlanner(occ, z=rz)
+                occ_planner = planners_by_z[rz]
             wp = (float(sc["waypoint"]["x"]), float(sc["waypoint"]["y"]))
             steps = math.ceil(raw_routes[r]["max_steps"] * CFG["step_frac"]) + CFG["step_pad"]
             if CFG.get("step_cap") is not None:
@@ -301,6 +327,8 @@ for arm in ARMS:
                 if CM_KW:      # 新键追加在最后，给了 collision_model 才有
                     m["collision_model"] = occ.collision_model
                     m["metric_version"] = coll.metric_version(METRIC_VERSION, occ.collision_model)
+                if has_dom:
+                    m["depth_opacity_min"] = eff_dom
                 with open(os.path.join(ep_dir, "metrics.json"), "w", encoding="utf-8") as f:
                     json.dump(m, f, ensure_ascii=False, indent=1)
                 eps.append({"episode": k, "seed": seed, "steps": m["steps"], "success_stop": m["success_stop"],
@@ -321,6 +349,8 @@ for arm in ARMS:
             if CM_KW:
                 done["collision_model"] = occ.collision_model
                 done["metric_version"] = coll.metric_version(METRIC_VERSION, occ.collision_model)
+            if has_dom:
+                done["depth_opacity_min"] = eff_dom
             with open(os.path.join(d, "done.json"), "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=1)
             log(f"[{g}] r{r} {len(eps)}/{CFG['k']} 集 失败 {len(fails)} 到点 {sum(e['success_stop'] for e in eps)} "

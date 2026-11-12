@@ -205,6 +205,9 @@ def main():
     p.add_argument("--allow-train-scene", action="store_true",
                    help="允许评测按几何哈希属于 train / val 分区的场景（诊断用，不是留出评测）：产物里写真实 split 与 "
                         "split_policy=diag-train-scene；缺省拒绝。哈希属于 test 的场景不受影响")
+    p.add_argument("--collision-model", choices=collision_mod.COLLISION_MODELS, default=collision_mod.DEFAULT_COLLISION_MODEL,
+                   help="碰撞口径（J-3）：v1 = 旧口径（缺省，逐位不变）；v2 = 圆柱与原始体素方块精确相交 + SITL trace 折线逐段扫，"
+                        "eval.json 记 collision_model 且 metric_version 加 +coll.v2")
     args = p.parse_args()
     if args.policy == "student" and not args.ckpt:
         p.error("--policy student 需要 --ckpt")
@@ -243,7 +246,8 @@ def main():
               f"产物里 split={split}、split_policy={split_policy}，这不是留出评测", file=sys.stderr)
     gaussians = (scene_mod.read_gaussian_ply(scene["ply_path"])
                  if scene.get("collision", {}).get("source", "gaussians") == "gaussians" else None)
-    occ = collision_mod.from_scene(scene, gaussians=gaussians)
+    occ = collision_mod.from_scene(scene, gaussians=gaussians, collision_model=args.collision_model)
+    eff_metric_version = collision_mod.metric_version(METRIC_VERSION, occ.collision_model)
     # ToF 平地模型打标（AUDIT_SIM #2）：评测集 manifest 也带 tof_terrain_m / agl_model_unverified（沿 spawn→waypoint 直线段）
     agl = planner_mod.agl_flags(collision_mod.terrain_from_scene(scene, gaussians=gaussians),
                                 planner_mod.segment_points((scene["spawn"]["x"], scene["spawn"]["y"]),
@@ -300,6 +304,7 @@ def main():
             oracle = _read_jsonl(os.path.join(ep_dir, "oracle.jsonl"))
             summary = summarize_3dgs_episode(actions, oracle, scene, timed_out=False,
                                              shortest_path_m=route_shortest_path_m(occ_planner, oracle, scene))
+            summary["metric_version"] = eff_metric_version
             summary.update({
                 "seed": args.seed + ep, "episode": ep,
                 "dir": os.path.basename(ep_dir),
@@ -342,7 +347,8 @@ def main():
     report = {
         "schema": "uavrgb.eval.v1",
         "policy": args.policy,
-        "metric_version": METRIC_VERSION,
+        "metric_version": eff_metric_version,
+        "collision_model": occ.collision_model,
         "success_criterion": SUCCESS_CRITERION,
         "reach_radius_m": reach_radius_of(scene),
         "spl_reference": SPL_REFERENCE if occ_planner is not None else None,

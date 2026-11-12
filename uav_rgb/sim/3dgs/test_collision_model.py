@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """collision_model（任务卡 S1b，审核 B）的单测：纯 Python + numpy，不需要 torch / GPU。
 
-collision_model 选碰撞口径：v1 = 改动前的现状（缺省，逐位不变）；v2 = 审核 B 的发现 1、2、3 都生效。
+collision_model 选碰撞口径：v1 = 改动前的现状（缺省，逐位不变）；v2 = 定稿口径（第一轮按审核 B 立开关，第二轮按审核 J 定稿）：
+机体是圆柱、原始占据的每个体素是实心方块，连续查询取两者的精确相交，没有高度余量。
 本文件随各条发现逐个追加用例（一条发现一个提交，用例与代码同一个提交）：
   v1 逐位锁定   五组合成占据（体素 0.05 / 0.1 / 0.2 m，E1 与 X3 机体包络，带余量）在改动前的代码（main ba54628）上算的栅格、
                 查询、扫掠、净空、规划硬栅格 / 软余量摘要，改动后缺省参数与显式 v1 都要逐位相同；另有内嵌的改动前 _dilate 逐字拷贝作对照
-  B1  膨胀核    v2 的 xy 结构元素 = 格中心到原始占据体素（方块）的欧氏距离不超过 机体半径 + 余量；0.1 m 体素下斜向格要膨胀（v1 是十字，斜向为 0）
-  B2  高度口径  v2 的栅格查询取 z ± (机体半高 + 高度余量) 覆盖到的层的并，同一 xy 高 1 cm 与低 1 cm 的结果相同（v1 只查点所在那一层，层边界上跳层）
-  B4  规划硬栅格 v2 的 OccPlanner.hard = 巡航高度处同一个层带的并（v1 是全部层的并）；规则臂的列距离与教师的前向检查走同一个 _grid_hit，随之统一
-  B7  出生检查  v2 的候选出生点按同一个层带判空，spawn_two_layer 不再需要（v2 下给了就报错），v1 保留
+  B1 / J-2  结构元素与连续查询  规划用的格中心栅格 self.grid：格中心到原始占据体素（方块）的欧氏距离不超过 机体半径 + 余量
+                （0.1 m 体素 3×3，0.2 m 体素十字；v1 是十字，0.1 m 体素斜向为 0）；连续坐标查询（collides / sweep / sweep_path / 规则臂列距离）
+                = 点到原始方块的精确水平欧氏距离（贴着算碰），与暴力公式逐点一致
+  B2 / J-1  高度口径  连续查询只取机体圆柱 [z − 半高, z + 半高] 碰到的层，没有高度余量（v1 只查点所在那一层，层边界上跳层）；
+                规划硬栅格与出生检查取整集高度包络的层，包络是判定层带的超集
+  B4  规划硬栅格 v2 的 OccPlanner.hard = 名义高度处整集高度包络层的并（v1 是全部层的并）；规则臂的列距离与教师的前向检查走同一个 _grid_hit，随之统一
+  B7  出生检查  v2 的候选出生点在整集包络层上要离原始方块不小于 机体半径 + 余量 + 起飞漂移余量，spawn_two_layer 不再需要（v2 下给了就报错），v1 保留
   B3  逐段扫掠  Occupancy.sweep_path 沿折线逐段扫；run_episode 在 v2 且动力学带 trace（cf_sitl）时每步沿 [起点, 窗口内 10 个 trace 点] 扫，
                 v1 与没有 trace 的 cf_blackbox 仍是起点到终点一条弦
   B6  blackbox 高度  cf_blackbox 的 z 固定 2.0；占据栅格的高度范围（z_slice）不含 2.0（室内 1.0–1.4）时 run_episode 报错（两种口径都报），
@@ -230,17 +234,110 @@ class TestB1Kernel(unittest.TestCase):
             with self.subTest(voxel=voxel, inflate=inflate, radius=radius):
                 self.assertEqual(self.offsets_of(occ, ij), expected_offsets(voxel, radius + inflate))
 
-    def test_e1_at_010_is_3x3_square(self):
-        occ, ij = single_voxel(0.1, "v2")
-        self.assertEqual(self.offsets_of(occ, ij), {(a, b) for a in (-1, 0, 1) for b in (-1, 0, 1)})
+    def test_e1_at_010_planning_grid_is_3x3_but_continuous_query_is_exact(self):
+        """J-2：0.1 m 体素下规划用的格中心膨胀栅格 occ.grid 仍是 3×3，但连续查询 collides 按点到原始体素方块的精确欧氏距离判：
+        斜向贴角（<= 0.102 m）判碰，离角 0.11 m（仍落在斜向邻格 (1,1) 内，第一轮 3×3 方核误判碰）不判碰。"""
+        occ, (i, j) = single_voxel(0.1, "v2")
+        self.assertEqual(self.offsets_of(occ, (i, j)), {(a, b) for a in (-1, 0, 1) for b in (-1, 0, 1)})
         self.assertEqual(occ.dilation_cells[0], 1)
+        corner_x = occ.origin[0] + (i + 1) * 0.1
+        corner_y = occ.origin[1] + (j + 1) * 0.1
+        s = math.sqrt(0.5)
+        self.assertTrue(occ.collides(corner_x + 0.01 * s, corner_y + 0.01 * s, 1.15), "斜向贴角 0.01 m 判碰")
+        self.assertTrue(occ.collides(corner_x + 0.101 * s, corner_y + 0.101 * s, 1.15), "斜向离角 0.101 m 判碰")
+        p_far = (corner_x + 0.11 * s, corner_y + 0.11 * s, 1.15)
+        self.assertEqual(tuple(occ._cell([p_far])[0][:2]), (i + 1, j + 1), "离角 0.11 m 仍落在斜向邻格 (1,1) 内")
+        self.assertFalse(occ.collides(*p_far), "斜向离角 0.11 m > 0.102 m 不判碰")
 
-    def test_v2_equals_v1_at_020_voxel(self):
-        """0.2 m 体素：v1 的圆盘与 v2 的欧氏核都是十字（斜向邻格中心到方块边角 0.141 m 大于 0.102 m），栅格逐位相同。"""
-        a, ij = single_voxel(0.2, "v1")
+    def test_020_voxel_planning_grid_is_cross_but_continuous_query_fixes_both_errors(self):
+        """J-2：0.2 m 体素下格中心膨胀栅格仍是十字，但连续查询修正了第一轮 v2 的两处反向错误：
+        斜向离角 0.05 m 判碰（第一轮十字核漏判），轴向离面 0.15 m 不判碰（第一轮十字核多判）。"""
+        a, (i, j) = single_voxel(0.2, "v1")
         b, _ = single_voxel(0.2, "v2")
         self.assertTrue(np.array_equal(a.grid, b.grid))
-        self.assertEqual(self.offsets_of(b, ij), {(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)})
+        self.assertEqual(self.offsets_of(b, (i, j)), {(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)})
+        bx1 = b.origin[0] + (i + 1) * 0.2
+        by1 = b.origin[1] + (j + 1) * 0.2
+        by_mid = b.origin[1] + (j + 0.5) * 0.2
+        s = math.sqrt(0.5)
+        diag_near = (bx1 + 0.05 * s, by1 + 0.05 * s, 2.0)
+        axial_far = (bx1 + 0.15, by_mid, 2.0)
+        # z_range 默认 (1.0, 1.4)，取 1.15
+        diag_near = (diag_near[0], diag_near[1], 1.15)
+        axial_far = (axial_far[0], axial_far[1], 1.15)
+        self.assertFalse(a.collides(*diag_near), "v1 十字核：0.2 m 体素斜向离角 0.05 m 漏判")
+        self.assertTrue(b.collides(*diag_near), "v2 精确距离：0.2 m 体素斜向离角 0.05 m 判碰")
+        self.assertTrue(a.collides(*axial_far), "v1 十字核：0.2 m 体素轴向离面 0.15 m 多判")
+        self.assertFalse(b.collides(*axial_far), "v2 精确距离：0.2 m 体素轴向离面 0.15 m 不判碰")
+
+    def test_continuous_queries_match_bruteforce_point_to_box_distance(self):
+        """J-2：随机连续点（含 pad_m=0 时越出栅格边界的点）在 0.05 / 0.1 / 0.2 m 体素下与暴力公式逐点完全一致。"""
+        rng = np.random.default_rng(2026)
+        for voxel, inflate, radius, pad in [(0.1, 0.0, 0.102, 1.0), (0.2, 0.0, 0.102, 1.0),
+                                            (0.05, 0.02, 0.102, 0.5), (0.1, 0.0, 0.102, 0.0)]:
+            pts = np.stack([rng.uniform(-1.5, 1.5, 60), rng.uniform(-1.5, 1.5, 60), rng.uniform(1.02, 1.38, 60)], 1)
+            occ = col.Occupancy(pts, z_range=(1.0, 1.4), voxel_m=voxel, body_radius_m=radius,
+                                body_half_height_m=0.028, inflate_m=inflate, pad_m=pad, collision_model="v2")
+            q = np.stack([
+                rng.uniform(occ.origin[0] - 0.25, occ.origin[0] + occ.shape[0] * voxel + 0.25, 500),
+                rng.uniform(occ.origin[1] - 0.25, occ.origin[1] + occ.shape[1] * voxel + 0.25, 500),
+                rng.uniform(0.90, 1.50, 500),
+            ], 1)
+            got = occ._grid_hit(q)
+            k0, k1 = occ.layer_span(q[:, 2])
+            r_tot = radius + inflate
+            want = np.zeros(len(q), dtype=bool)
+            for idx, (x, y, _) in enumerate(q):
+                if k0[idx] > k1[idx]:
+                    continue
+                ii, jj = np.nonzero(occ.raw[:, :, k0[idx]:k1[idx] + 1].any(axis=2))
+                if len(ii) == 0:
+                    continue
+                bx0, by0 = occ.origin[0] + ii * voxel, occ.origin[1] + jj * voxel
+                dx = np.maximum(np.maximum(bx0 - x, 0.0), x - (bx0 + voxel))
+                dy = np.maximum(np.maximum(by0 - y, 0.0), y - (by0 + voxel))
+                want[idx] = bool((dx * dx + dy * dy <= r_tot * r_tot + 1e-18).any())
+            with self.subTest(voxel=voxel, inflate=inflate, pad=pad):
+                self.assertTrue(np.array_equal(got, want), f"不一致点数: {int((got != want).sum())}")
+                self.assertGreaterEqual(int(want.sum()), 15)
+
+    def test_continuous_queries_all_inside_grid_match_bruteforce(self):
+        """J-2 补测（卡 S1b 第二轮接手核对）：整批查询点都落在栅格内时，_exact_xy_hit 走「不判出界、直接查粗筛表」的快路径（c31b9a9 新增）。
+        上一个用例的查询点会越出栅格 0.25 m，只走带出界判断的慢路径；这里整批点严格落在栅格内，体素 0.05 / 0.1 / 0.2 m，
+        机体半高 0.028 m（圆柱跨 1–2 层）与 0.15 m（跨 3–4 层，覆盖逐层相或的循环），与暴力公式（遍历全部原始占据体素方块的精确水平距离与竖直重叠）逐点一致；
+        再核整批、分批（1 / 2 / 7 点）、夹带栅格外点的混合批，对同一批栅格内点给出相同结果（快路径与慢路径不互相影响）。"""
+        rng = np.random.default_rng(2027)
+        for voxel, inflate, radius, half_h, pad in [(0.1, 0.0, 0.102, 0.028, 1.0), (0.2, 0.0, 0.102, 0.028, 1.0),
+                                                    (0.05, 0.02, 0.102, 0.028, 0.5), (0.1, 0.0, 0.102, 0.15, 0.3)]:
+            pts = np.stack([rng.uniform(-1.5, 1.5, 60), rng.uniform(-1.5, 1.5, 60), rng.uniform(1.02, 1.38, 60)], 1)
+            occ = col.Occupancy(pts, z_range=(1.0, 1.4), voxel_m=voxel, body_radius_m=radius,
+                                body_half_height_m=half_h, inflate_m=inflate, pad_m=pad, collision_model="v2")
+            nx, ny, _ = occ.shape
+            q = np.stack([
+                rng.uniform(occ.origin[0] + 1e-6, occ.origin[0] + nx * voxel - 1e-6, 800),
+                rng.uniform(occ.origin[1] + 1e-6, occ.origin[1] + ny * voxel - 1e-6, 800),
+                rng.uniform(0.90, 1.50, 800),
+            ], 1)
+            ii, jj, kk = np.nonzero(occ.raw)
+            bx0, by0, bz0 = occ.origin[0] + ii * voxel, occ.origin[1] + jj * voxel, occ.origin[2] + kk * voxel
+            r_tot = radius + inflate
+            want = np.zeros(len(q), dtype=bool)
+            for n, (x, y, z) in enumerate(q):
+                vert = (bz0 < z + half_h) & (bz0 + voxel > z - half_h)
+                dx = np.maximum(np.maximum(bx0[vert] - x, 0.0), x - (bx0[vert] + voxel))
+                dy = np.maximum(np.maximum(by0[vert] - y, 0.0), y - (by0[vert] + voxel))
+                want[n] = bool((dx * dx + dy * dy <= r_tot * r_tot + 1e-18).any())
+            got = occ._grid_hit(q)
+            with self.subTest(voxel=voxel, inflate=inflate, half_h=half_h):
+                self.assertTrue(np.array_equal(got, want), f"不一致点数: {int((got != want).sum())}")
+                self.assertGreaterEqual(int(want.sum()), 15)
+                self.assertGreaterEqual(int((~want).sum()), 15)
+                for size in (1, 2, 7):
+                    parts = np.concatenate([occ._grid_hit(q[s:s + size]) for s in range(0, 140, size)])
+                    self.assertTrue(np.array_equal(parts, got[:len(parts)]), f"分批 {size} 点与整批不一致")
+                outside = np.array([[occ.origin[0] - 0.3, occ.origin[1] + 0.3, 1.2]])
+                mixed = occ._grid_hit(np.concatenate([q[:140], outside]))
+                self.assertTrue(np.array_equal(mixed[:140], got[:140]), "夹带栅格外点的混合批改变了栅格内点的结果")
 
     def test_v2_is_superset_of_v1(self):
         means, scales, quats, opac = _synth(9)
@@ -273,85 +370,86 @@ class TestB1Kernel(unittest.TestCase):
         self.assertGreater(n_hit, 25)
 
 
-# ----------------------------------------------------------------------------- B2 高度口径
-def wall(layer_z, model, margin=None, voxel=0.1, z_range=(1.0, 1.4), env=None):
+# ----------------------------------------------------------------------------- B2 & J-1 高度口径与整集高度包络
+def wall(layer_z, model, voxel=0.1, z_range=(1.0, 1.4), env=None):
     """x = 1.0 处沿 y 的一堵点墙，只在高度 layer_z 这一层；返回占据。"""
     ys = np.linspace(-1.0, 1.0, 21)
     pts = np.stack([np.full(21, 1.0), ys, np.full(21, layer_z)], 1)
     kw = dict(z_range=z_range, voxel_m=voxel, **(env or E1))
-    if margin is not None:
-        kw["height_margin_m"] = margin
     return mk(pts, model=model, **kw)
 
 
-
 class TestB2HeightBand(unittest.TestCase):
+    def test_height_margin_m_removed_and_envelope_constants_defined(self):
+        """J-1 定稿：碰撞判定不再有高度余量（HEIGHT_MARGIN_M 去掉），规划与出生检查用整集高度包络 Z_ENVELOPE_DOWN_M / Z_ENVELOPE_UP_M 与起飞漂移余量 SPAWN_DRIFT_MARGIN_M。"""
+        self.assertFalse(hasattr(col, "HEIGHT_MARGIN_M"))
+        self.assertEqual(col.Z_ENVELOPE_DOWN_M, 0.035)
+        self.assertEqual(col.Z_ENVELOPE_UP_M, 0.075)
+        self.assertEqual(col.SPAWN_DRIFT_MARGIN_M, 0.105)
+
     def test_v1_flips_across_layer_boundary(self):
         """v1 的缺陷（锁定）：墙只在层 2（z 1.2–1.3），同一 xy 高 1 cm 判碰、低 1 cm 不判。"""
         occ = wall(1.25, "v1")
         self.assertFalse(occ.collides(1.0, 0.0, 1.199))
         self.assertTrue(occ.collides(1.0, 0.0, 1.201))
 
-    def test_v2_same_answer_across_layer_boundary(self):
-        """稳态飞行 z（出生高度 1.2 上下 −0.0231 … +0.009，起飞过冲到 +0.046）内，墙在层 1 或层 2 都判碰，不随跳层变化。"""
+    def test_v2_same_answer_across_layer_boundary_within_body_half_height(self):
+        """v2 判定按机体实际圆柱半高 0.028 m 相交取层：在层边界 1.2 m 上下 ±0.027 m 内（1.173 … 1.227），层 1 与层 2 的墙都判碰，不随毫米级高度变化跳层。"""
         for wall_z in (1.15, 1.25):
             occ = wall(wall_z, "v2")
-            for z in (1.1769, 1.185, 1.199, 1.2, 1.201, 1.209, 1.2457):
+            for z in (1.173, 1.185, 1.199, 1.2, 1.201, 1.215, 1.227):
                 with self.subTest(wall_z=wall_z, z=z):
                     self.assertTrue(occ.collides(1.0, 0.0, z))
 
-    def test_v2_band_edges_are_body_half_height_plus_margin(self):
-        """层带 = z ± (0.028 + 余量)：离带 1 mm 以外的层不算，带内 1 mm 的层算。"""
-        h = 0.028 + col.HEIGHT_MARGIN_M
-        top = wall(1.35, "v2")                          # 层 3：[1.3, 1.4)
+    def test_v2_band_edges_are_exact_body_half_height(self):
+        """J-1 定稿：判定层带 = [z − 半高, z + 半高]（无余量）：离层边界 0.028 m 之外 1 mm 不算，之内 1 mm 算。"""
+        h = 0.028
+        top = wall(1.35, "v2")                          # 层 3：[1.3, 1.4]
         self.assertFalse(top.collides(1.0, 0.0, 1.3 - h - 1e-3))
         self.assertTrue(top.collides(1.0, 0.0, 1.3 - h + 1e-3))
-        bottom = wall(1.05, "v2")                       # 层 0：[1.0, 1.1)
+        bottom = wall(1.05, "v2")                       # 层 0：[1.0, 1.1]
         self.assertFalse(bottom.collides(1.0, 0.0, 1.1 + h + 1e-3))
         self.assertTrue(bottom.collides(1.0, 0.0, 1.1 + h - 1e-3))
 
     def test_steady_flight_band_stays_in_layers_1_and_2(self):
-        """余量 0.025 m 的取值依据：稳态 z 相对出生高度 1.2 的 p1 / p99 为 −0.0231 / +0.009，逐步极值 −0.0342 / +0.018；
-        层带只落在层 1 与层 2，层 0、层 3 的障碍不算。"""
+        """稳态飞行（z = 1.175 … 1.225）圆柱半高 0.028 m 只与层 1 [1.1, 1.2] 和层 2 [1.2, 1.3] 相交，层 0、层 3 的障碍不判碰；
+        起飞过冲（如 z = 1.270）时 z + 0.028 = 1.298 仍在层 2，超过 1.272（如 1.273）则判碰层 3，而规划包络已包含层 3。"""
         for wall_z in (1.05, 1.35):
             occ = wall(wall_z, "v2")
-            for z in (1.1658, 1.1769, 1.19, 1.2, 1.209, 1.218):
+            for z in (1.175, 1.19, 1.2, 1.21, 1.225):
                 with self.subTest(wall_z=wall_z, z=z):
                     self.assertFalse(occ.collides(1.0, 0.0, z))
+        self.assertTrue(wall(1.35, "v2").collides(1.0, 0.0, 1.273))
 
-    def test_height_margin_parameter(self):
-        occ0 = wall(1.35, "v2", margin=0.0)             # 带 ±0.028
-        self.assertFalse(occ0.collides(1.0, 0.0, 1.27))
-        self.assertTrue(occ0.collides(1.0, 0.0, 1.273))
-        occ1 = wall(1.35, "v2", margin=0.1)             # 带 ±0.128
-        self.assertTrue(occ1.collides(1.0, 0.0, 1.2))
-
-    def test_height_margin_validated(self):
-        with self.assertRaises(ValueError):
-            wall(1.25, "v2", margin=-0.01)
-
-    def test_z_outside_range_uses_band_intersection(self):
-        """z 在栅格高度范围外：v1 只查地面；v2 看带与栅格最上 / 最下层是否相交。"""
+    def test_z_outside_range_uses_cylinder_intersection(self):
+        """z 在栅格高度范围外：v1 只查地面；v2 看圆柱 [z − 0.028, z + 0.028] 与最上 / 最下层是否相交。"""
         top_wall = wall(1.35, "v2")
-        self.assertTrue(top_wall.collides(1.0, 0.0, 1.42))       # 带 [1.367, 1.473] 与层 3 相交
-        self.assertFalse(top_wall.collides(1.0, 0.0, 1.46))      # 带 [1.407, ...] 在栅格上方
+        self.assertTrue(top_wall.collides(1.0, 0.0, 1.42))       # [1.392, 1.448] 与层 3 [1.3, 1.4] 相交
+        self.assertFalse(top_wall.collides(1.0, 0.0, 1.43))      # [1.402, ...] 在栅格上方
         self.assertFalse(wall(1.35, "v1").collides(1.0, 0.0, 1.42))
 
-    def test_layer_span_values(self):
-        occ = wall(1.25, "v2")                                       # 4 层，带半宽 0.053
-        k0, k1 = occ.layer_span(np.array([1.19, 1.15, 1.25, 3.0, -1.0, np.nan, np.inf]))
-        self.assertEqual(list(zip(k0[:3].tolist(), k1[:3].tolist())), [(1, 2), (0, 2), (1, 3)])
-        self.assertTrue((k0[3:] > k1[3:]).all(), "带在栅格上 / 下方、z 不是有限数：空")
-        k0s, k1s = occ.layer_span(1.19)                                # 标量
+    def test_layer_span_and_envelope_layer_span_values(self):
+        occ = wall(1.25, "v2")                                       # 4 层 [1.0, 1.4]，半高 0.028
+        k0, k1 = occ.layer_span(np.array([1.19, 1.15, 1.28, 3.0, -1.0, np.nan, np.inf]))
+        self.assertEqual(list(zip(k0[:3].tolist(), k1[:3].tolist())), [(1, 2), (1, 1), (2, 3)])
+        self.assertTrue((k0[3:] > k1[3:]).all(), "在栅格上 / 下方、z 不是有限数：空")
+        k0s, k1s = occ.layer_span(1.19)
         self.assertEqual((int(k0s), int(k1s)), (1, 2))
+        # 名义出生高度 1.2 m 的整集包络 [1.2 - 0.035 - 0.028, 1.2 + 0.075 + 0.028] = [1.137, 1.303] -> 覆盖层 1..3，是全程判定层带的超集
+        ek0, ek1 = occ.envelope_layer_span(1.2)
+        self.assertEqual((int(ek0), int(ek1)), (1, 3))
+        for dz in np.linspace(-col.Z_ENVELOPE_DOWN_M, col.Z_ENVELOPE_UP_M, 50):
+            sk0, sk1 = occ.layer_span(1.2 + float(dz))
+            self.assertGreaterEqual(int(sk0), int(ek0))
+            self.assertLessEqual(int(sk1), int(ek1))
 
     def test_v2_grid_has_no_z_dilation(self):
-        """v2 的 z 向膨胀由查询时的层带承担：X3 包络（半高 0.3）下栅格不再沿 z 复制，同样的障碍两种写法等价。"""
+        """v2 的 z 向相交由查询时的 layer_span 承担：X3 包络（半高 0.3）下栅格不再沿 z 复制。"""
         x3 = dict(body_radius_m=0.3, body_half_height_m=0.3)
         occ = wall(1.35, "v2", env=x3)
         self.assertEqual(occ.dilation_cells[1], 0)
         self.assertFalse(occ.grid[:, :, 0].any() or occ.grid[:, :, 1].any() or occ.grid[:, :, 2].any(), "栅格只在原始层上")
-        self.assertTrue(occ.collides(1.0, 0.0, 1.1), "带 ±0.325 够到层 3")
+        self.assertTrue(occ.collides(1.0, 0.0, 1.1), "半高 ±0.3 够到层 3")
 
     def test_vectorised_equals_scalar(self):
         means, scales, quats, opac = _synth(11)
@@ -363,11 +461,14 @@ class TestB2HeightBand(unittest.TestCase):
         self.assertTrue(np.array_equal(vec, one))
         self.assertGreater(int(vec.sum()), 20)
 
-    def test_v2_summary_has_height_fields(self):
+    def test_v2_summary_has_envelope_fields_and_no_height_margin(self):
         s = wall(1.25, "v2").summary()
-        self.assertEqual(s["height_margin_m"], col.HEIGHT_MARGIN_M)
-        self.assertAlmostEqual(s["height_band_half_m"], 0.028 + col.HEIGHT_MARGIN_M)
-        self.assertNotIn("height_margin_m", wall(1.25, "v1").summary(), "v1 的 summary 不多记高度字段")
+        self.assertNotIn("height_margin_m", s)
+        self.assertNotIn("height_band_half_m", s)
+        self.assertEqual(s["z_envelope_down_m"], col.Z_ENVELOPE_DOWN_M)
+        self.assertEqual(s["z_envelope_up_m"], col.Z_ENVELOPE_UP_M)
+        self.assertEqual(s["spawn_drift_margin_m"], col.SPAWN_DRIFT_MARGIN_M)
+        self.assertNotIn("z_envelope_down_m", wall(1.25, "v1").summary(), "v1 的 summary 不多记字段")
 
     def test_cruise_z_from_scene(self):
         import tempfile
@@ -411,8 +512,9 @@ class TestB4Consumers(unittest.TestCase):
             with self.subTest(wall_z=wall_z):
                 self.assertTrue(hard[i, j])
 
-    def test_planner_hard_v2_is_band_union_at_cruise_height(self):
-        for wall_z, want in ((1.05, False), (1.15, True), (1.25, True), (1.35, False)):
+    def test_planner_hard_v2_is_envelope_superset_at_nominal_height(self):
+        """J-1 定稿：名义高度 1.2 m 处包络 [1.137, 1.303] 覆盖层 1、2、3（盖住起飞过冲 +0.070 m），不含层 0 [1.0, 1.1]。"""
+        for wall_z, want in ((1.05, False), (1.15, True), (1.25, True), (1.35, True)):
             occ = wall(wall_z, "v2")
             hard = planner.OccPlanner(occ, z=1.2).hard
             i, j = occ._cell(np.array([[1.0, 0.0, 1.2]]))[0][:2]
@@ -436,8 +538,8 @@ class TestB4Consumers(unittest.TestCase):
         ro = importlib.import_module("sim.3dgs.rule_oracle")
         for model, expect_equal in (("v1", False), ("v2", True)):
             occ = wall(1.25, model)                                  # 墙只在层 2
-            lo = ro.occ_columns(occ, 0.0, 0.0, 1.19, 0.0)             # 动作前 z 在层 1
-            hi = ro.occ_columns(occ, 0.0, 0.0, 1.21, 0.0)             # 动作前 z 在层 2
+            lo = ro.occ_columns(occ, 0.0, 0.0, 1.19, 0.0)             # 动作前 z=1.19（半高 0.028 伸到 1.218，进入层 2）
+            hi = ro.occ_columns(occ, 0.0, 0.0, 1.21, 0.0)             # 动作前 z=1.21 在层 2
             mid = len(lo) // 2
             with self.subTest(model=model):
                 self.assertLess(hi[mid], ro.MAX_RANGE_M, "层 2 里的墙在 z=1.21 时看得见")
@@ -446,7 +548,7 @@ class TestB4Consumers(unittest.TestCase):
                     self.assertEqual(lo[mid], ro.MAX_RANGE_M, "v1：z=1.19 单层，墙在层 2 看不见")
 
     def test_teacher_forward_check_follows_unified_band(self):
-        """教师 0.4 m 前向检查（occ.sweep）：墙在层 2、机体 z=1.19（层 1）。v1 放行（FORWARD），v2 先转（turn_blocked）。"""
+        """教师 0.4 m 前向检查（occ.sweep）：墙在层 2、机体 z=1.19（层 1，上沿 1.218 入层 2）。v1 放行（FORWARD），v2 先转（turn_blocked）。"""
         out = {}
         for model in ("v1", "v2"):
             occ_w = mk(np.stack([np.full(41, 0.45), np.linspace(-2, 2, 41), np.full(41, 1.25)], 1),
@@ -458,7 +560,7 @@ class TestB4Consumers(unittest.TestCase):
         self.assertEqual(out["v2"][1], "turn_blocked")
 
 
-# ----------------------------------------------------------------------------- B7 出生检查
+# ----------------------------------------------------------------------------- B7 & J-1 出生检查（整集高度包络 + 起飞水平漂移余量）
 class TestB7Spawn(unittest.TestCase):
     def setUp(self):
         self.collect = importlib.import_module("sim.3dgs.collect_3dgs")
@@ -482,12 +584,33 @@ class TestB7Spawn(unittest.TestCase):
         x, y, _ = self.collect._spawn_for_episode(self.scene, occ, 0.3, np.random.default_rng(0))
         self.assertTrue(abs(x) <= 0.3 and abs(y) <= 0.3)
 
-    def test_v2_rejects_candidates_blocked_in_either_neighbouring_layer(self):
-        for wall_z in (1.15, 1.25):
+    def test_v2_rejects_candidates_blocked_in_envelope_layers_including_takeoff_overshoot(self):
+        """J-1：出生高度 1.2 m 的包络覆盖层 1、2、3（1.15 / 1.25 / 1.35 均拒绝），层 0（1.05）不在包络内放行。"""
+        for wall_z in (1.15, 1.25, 1.35):
             occ = self.filled_box(wall_z, "v2")
             with self.subTest(wall_z=wall_z):
                 with self.assertRaises(RuntimeError):
                     self.collect._spawn_for_episode(self.scene, occ, 0.3, np.random.default_rng(0))
+        occ0 = self.filled_box(1.05, "v2")
+        x, y, _ = self.collect._spawn_for_episode(self.scene, occ0, 0.3, np.random.default_rng(0))
+        self.assertTrue(abs(x) <= 0.3 and abs(y) <= 0.3)
+
+    def test_v2_spawn_ok_enforces_horizontal_drift_margin(self):
+        """J-1：出生候选点到包络层内原始占据方块的精确水平距离不小于 body_radius + inflate + SPAWN_DRIFT_MARGIN_M。"""
+        occ, (i, j) = single_voxel(0.1, "v2")   # 体素方块 [bx0, bx0+0.1] × [by0, by0+0.1]，z=1.15 在包络内
+        bx1 = occ.origin[0] + (i + 1) * 0.1
+        by_mid = occ.origin[1] + (j + 0.5) * 0.1
+        need = occ.body_radius + col.SPAWN_DRIFT_MARGIN_M
+        self.assertFalse(occ.spawn_ok(bx1 + need - 1e-3, by_mid, 1.2), "距方块不足半径+漂移余量：拒绝")
+        self.assertTrue(occ.spawn_ok(bx1 + need + 1e-3, by_mid, 1.2), "距方块达到半径+漂移余量：通过")
+        # 抖动抽样验证：右侧 x > 0 放墙，选出的出生点距墙方块左沿 bx0 至少 need
+        wall_occ = mk(np.stack([np.full(41, 0.25), np.linspace(-1, 1, 41), np.full(41, 1.35)], 1),
+                      model="v2", z_range=(1.0, 1.4), voxel_m=0.1, **E1)
+        wi = int(wall_occ._cell([[0.25, 0.0, 1.35]])[0][0])
+        wall_left = wall_occ.origin[0] + wi * 0.1
+        for s in range(25):
+            sx, _, _ = self.collect._spawn_for_episode(self.scene, wall_occ, 0.3, np.random.default_rng(s))
+            self.assertLessEqual(sx, wall_left - need + 1e-9)
 
     def test_v2_free_space_spawn_sequence_unchanged(self):
         """没有障碍时 v2 与 v1 的出生位姿序列逐位相同（只多拒绝被挡的候选）。"""
@@ -772,6 +895,82 @@ class TestCollisionModelCli(unittest.TestCase):
             self.assertEqual(r.returncode, 2, r.stderr[-1000:])
             r = self.cli(tmp, "v1both", "--spawn-jitter", "0.1", "--spawn-two-layer")      # v1 仍可叠用
             self.assertEqual(r.returncode, 0, r.stderr[-1000:])
+
+    def test_planner_cli_caches_by_route_spawn_height_and_supports_collision_model(self):
+        """J-9：planner.main 按每条路线自己的 spawn.z 建并缓存规划器（不锁死在顶层 spawn.z）。
+        构造 z_slice=[1.0, 2.0]：在 z=1.85 m 放堵在 x=3.0 处的墙（y ∈ [-2, 2]），两侧 y=±2.05 再放全层走廊边墙。
+        顶层 spawn.z=1.8（会被堵），route 0 spawn.z=1.2（包络 [1.137, 1.303] 不碰 1.85，直飞 5.0 m 畅通），
+        route 1 spawn.z=1.8（包络碰 1.85，被堵死不可达）。collision_model=v2 下 route 0 必须 feasible=True、route 1 必须 feasible=False。"""
+        scene_mod = importlib.import_module("sim.3dgs.scene")
+        with tempfile.TemporaryDirectory() as tmp:
+            sdir = os.path.join(tmp, "sc")
+            os.makedirs(sdir)
+            ys = np.linspace(-2.0, 2.0, 41)
+            wall_pts = np.stack([np.full(41, 3.0), ys, np.full(41, 1.85)], 1)
+            xs = np.linspace(0.0, 6.0, 61)
+            zs = np.array([1.15, 1.25, 1.75, 1.85])
+            side = np.array([(x, sy, z) for x in xs for sy in (-2.0, 2.0) for z in zs])
+            endcaps = np.array([(ex, y, z) for ex in (0.0, 6.0) for y in ys for z in zs])
+            pts = np.vstack([wall_pts, side, endcaps]).astype(np.float32)
+            ply_path = os.path.join(sdir, "w.ply")
+            scene_mod.write_gaussian_ply(ply_path, pts, np.ones_like(pts) * 0.5,
+                                         scales=np.full_like(pts, 0.02), opacities=np.full(len(pts), 0.95, np.float32))
+            sc_doc = {
+                "schema": "uavrgb.3dgs_scene.v1",
+                "name": "multi_z", "ply": "w.ply", "ground_z": 0.0,
+                "spawn": {"x": 0.5, "y": 0.0, "z": 1.8, "yaw_deg": 0.0},
+                "waypoint": {"x": 5.5, "y": 0.0, "z": 1.8},
+                "collision": {"z_slice": [1.0, 2.0], "voxel_m": 0.1, "envelope": "e1_mini"},
+                "routes": [
+                    {"name": "r0_low_clear", "spawn": {"x": 0.5, "y": 0.0, "z": 1.2, "yaw_deg": 0.0},
+                     "waypoint": {"x": 5.5, "y": 0.0, "z": 1.2}, "max_steps": 30},
+                    {"name": "r1_high_blocked", "spawn": {"x": 0.5, "y": 0.0, "z": 1.8, "yaw_deg": 0.0},
+                     "waypoint": {"x": 5.5, "y": 0.0, "z": 1.8}, "max_steps": 30},
+                ],
+            }
+            sjson = os.path.join(sdir, "scene.json")
+            scene_mod.save_scene(sc_doc, sjson)
+            r = subprocess.run([sys.executable, "-m", "sim.3dgs.planner", "--scene", sjson, "--collision-model", "v2", "--json"],
+                               cwd=ROOT, capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 1, r.stderr)   # r1 不可达故返回 1，但不能报错崩溃
+            rows = json.loads(r.stdout)
+            self.assertEqual([x["feasible"] for x in rows], [True, False], rows)
+            # 缺省 v1：全层取并，r0 与 r1 都看到 z=1.85 的墙，均为 False
+            r_v1 = subprocess.run([sys.executable, "-m", "sim.3dgs.planner", "--scene", sjson, "--json"],
+                                  cwd=ROOT, capture_output=True, text=True, timeout=60)
+            self.assertEqual([x["feasible"] for x in json.loads(r_v1.stdout)], [False, False])
+
+    def test_eval_3dgs_cli_collision_model_and_metric_version(self):
+        """J-3：eval_3dgs.py 接 --collision-model（缺省 v1 逐位不变，v2 透传给占据代理与 run_episode，eval.json 与 per_episode 的 metric_version 随口径加 +coll.v2）。"""
+        scene_mod = importlib.import_module("sim.3dgs.scene")
+        ev_mod = importlib.import_module("sim.3dgs.eval_3dgs")
+        with tempfile.TemporaryDirectory() as tmp:
+            scene_dir = os.path.join(tmp, "scene")
+            scene_mod.make_corridor(scene_dir, seed=3, length=12.0)
+            sjson = os.path.join(scene_dir, "scene.json")
+            base_cmd = [sys.executable, "-m", "sim.3dgs.eval_3dgs", "--scene", sjson, "--policy", "forward",
+                        "--mock-renderer", "--dynamics", "cf_blackbox", "--episodes", "1", "--steps", "2",
+                        "--hold", "0.5", "--allow-train-scene"]
+            r1 = subprocess.run(base_cmd + ["--out", os.path.join(tmp, "e_v1")], cwd=ROOT, capture_output=True, text=True, timeout=180)
+            self.assertEqual(r1.returncode, 0, r1.stderr[-2000:])
+            e1 = self.load(os.path.join(tmp, "e_v1", "eval.json"))
+            m1 = self.load(os.path.join(tmp, "e_v1", "ep_00000", "episode_manifest.json"))
+            self.assertEqual((e1["collision_model"], e1["metric_version"]), ("v1", ev_mod.METRIC_VERSION))
+            self.assertEqual(e1["per_episode"][0]["metric_version"], ev_mod.METRIC_VERSION)
+            self.assertEqual((m1["collision_model"], m1["collision_proxy"]["proxy_version"]), ("v1", col.PROXY_VERSION))
+
+            r2 = subprocess.run(base_cmd + ["--out", os.path.join(tmp, "e_v2"), "--collision-model", "v2"],
+                                cwd=ROOT, capture_output=True, text=True, timeout=180)
+            self.assertEqual(r2.returncode, 0, r2.stderr[-2000:])
+            e2 = self.load(os.path.join(tmp, "e_v2", "eval.json"))
+            m2 = self.load(os.path.join(tmp, "e_v2", "ep_00000", "episode_manifest.json"))
+            self.assertEqual((e2["collision_model"], e2["metric_version"]), ("v2", ev_mod.METRIC_VERSION + "+coll.v2"))
+            self.assertEqual(e2["per_episode"][0]["metric_version"], ev_mod.METRIC_VERSION + "+coll.v2")
+            self.assertEqual((m2["collision_model"], m2["collision_proxy"]["proxy_version"]), ("v2", col.PROXY_VERSION + "+coll.v2"))
+
+            r_bad = subprocess.run(base_cmd + ["--out", os.path.join(tmp, "e_bad"), "--collision-model", "v3"],
+                                   cwd=ROOT, capture_output=True, text=True, timeout=60)
+            self.assertEqual(r_bad.returncode, 2)
 
 
 if __name__ == "__main__":

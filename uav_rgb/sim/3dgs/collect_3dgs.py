@@ -257,21 +257,24 @@ def _spawn_two_layer_ok(occ, x, y, z):
 
 
 def _spawn_for_episode(scene, occ, jitter_m, rng, two_layer=False):
-    """two_layer=False（缺省）：出生位姿与 rng 的消耗顺序与加这个参数之前逐位相同（test_teacher_clearance.py 锁住）。
-    True：抖动候选还要过 _spawn_two_layer_ok；被它多拒绝的候选多消耗 rng，所以开关打开后出生位姿序列可以与关闭时不同。
-    collision_model="v2"（B7）：候选只过 occ.collides（层带口径，出生高度压在层边界上也盖到上下两层），
-    不再有两层判空与巡航高度常数 SPAWN_CRUISE_DZ_M；v2 下 two_layer=True 报错（两套办法解同一个问题，不叠用）。
+    """two_layer=False（缺省）：v1 下出生位姿与 rng 的消耗顺序与加这个参数之前逐位相同（test_teacher_clearance.py 锁住）。
+    True：v1 下抖动候选还要过 _spawn_two_layer_ok；被它多拒绝的候选多消耗 rng，所以开关打开后出生位姿序列可以与关闭时不同。
+    collision_model="v2"（B7 / J-1 定稿）：候选走 occ.spawn_ok（整集高度包络层上到原始体素方块的精确水平距离不小于
+    机体半径 + inflate + SPAWN_DRIFT_MARGIN_M），不再用两层判空与 SPAWN_CRUISE_DZ_M；v2 下 two_layer=True 报错。
     jitter_m <= 0 时直接返回 scene.spawn，不抽样也不检查。"""
-    if two_layer and getattr(occ, "collision_model", "v1") == "v2":      # getattr：旧调用方与测试的替身占据没有这个属性 = v1
-        raise ValueError("collision_model='v2' 的出生检查已是层带口径（B7），不与 spawn_two_layer（W1-12 的两层判空）叠用")
+    is_v2 = getattr(occ, "collision_model", "v1") == "v2"                 # getattr：旧调用方与测试的替身占据没有这个属性 = v1
+    if two_layer and is_v2:
+        raise ValueError("collision_model='v2' 的出生检查已是高度包络加漂移余量口径（B7/J-1），不与 spawn_two_layer（W1-12 的两层判空）叠用")
     s = scene["spawn"]
     x, y, yaw = float(s["x"]), float(s["y"]), float(s.get("yaw_deg", 0.0))
     if jitter_m <= 0:
         return x, y, yaw
+    sz = float(s["z"])
     for _ in range(100):
         nx = x + rng.uniform(-jitter_m, jitter_m)
         ny = y + rng.uniform(-jitter_m, jitter_m)
-        if not occ.collides(nx, ny, float(s["z"])) and (not two_layer or _spawn_two_layer_ok(occ, nx, ny, float(s["z"]))):
+        ok = occ.spawn_ok(nx, ny, sz) if is_v2 else (not occ.collides(nx, ny, sz) and (not two_layer or _spawn_two_layer_ok(occ, nx, ny, sz)))
+        if ok:
             return nx, ny, yaw + rng.uniform(-10.0, 10.0)
     raise RuntimeError(f"spawn 抖动 {jitter_m} m 内找不到自由点")
 
@@ -668,8 +671,9 @@ def main():
                    help="出生抖动的候选点要在出生高度与巡航高度两层都不碰撞、且净空够（需要 --spawn-jitter > 0；缺省关，"
                         "关时出生位姿与随机数消耗不变）")
     p.add_argument("--collision-model", choices=collision_mod.COLLISION_MODELS, default=collision_mod.DEFAULT_COLLISION_MODEL,
-                   help="碰撞口径（S1b，交叉审核 B）：v1 = 改动前的判法（缺省，逐位不变）；v2 = 结构元素按欧氏距离、高度按层带取并、"
-                        "每步沿 SITL trace 折线扫（v2 的出生检查已是层带口径，不能再加 --spawn-two-layer）")
+                   help="碰撞口径（S1b，交叉审核 B 与 J）：v1 = 改动前的判法（缺省，逐位不变）；v2 = 定稿口径：圆柱与原始占据体素方块"
+                        "精确相交（无高度余量）、规划硬栅格与出生检查取整集高度包络、每步沿 SITL trace 折线扫（v2 的出生检查已按包络判空，"
+                        "不能再加 --spawn-two-layer）")
     p.add_argument("--teacher-clearance", choices=planner_mod.CLEARANCE_MODES, default="ray",
                    help="占据 A* 教师前向净空检查的形状：ray = 沿机头一条线段（缺省，与以前逐步相同）；swept = 机头线段通过后再沿预测位移"
                         "（加 reserve）做扫掠，教师版本 v3（只用于 --policy astar / student，且 hold 必须是 1.0）")

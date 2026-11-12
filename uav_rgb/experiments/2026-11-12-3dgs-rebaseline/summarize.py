@@ -10,7 +10,7 @@
   v1 评测口径版本串：`3dgs.pilot.v2+stop.v1`
   v2 评测口径版本串：`3dgs.pilot.v2+stop.v1+coll.v2`（sim.3dgs.collision.metric_version）
   分母一律用请求集数 n_req = sum_{预期路线} K（完成集少于请求集时差额记入未完成/失败，不缩小分母）。
-  逐集配对（v2 对 v1）：同（路线集, 臂, 场景, 路线, seed）；由于 v2 出生检查是层带 + 欧氏膨胀核，可能比 v1 多拒绝候选出生点导致重抽，
+  逐集配对（v2 对 v1）：同（路线集, 臂, 场景, 路线, seed）；由于 v2 出生检查在整集高度包络层上要离障碍不小于 机体半径 + 起飞漂移余量，可能比 v1 多拒绝候选出生点导致重抽，
   汇总同时列出「全部配对集」「同出生位姿集（位置差 <= 1e-6 m、航向差 <= 1e-6°）」「出生位姿不同集」三组计数。
 
 预注册对照（任务卡 S1 原文，写在 run.sh 头部）：
@@ -128,6 +128,59 @@ def scan_incompletes(suite_dir):
     return records
 
 
+def _ep_layer_outside_env_steps(ep_dir):
+    """检查单集内每步（pose_before、pose_gt 及本步 trace 点）的连续判定层范围是否超出名义出生高度的规划包络层范围（J-1 / 卡第 8 条，应当为 0）。"""
+    sp = read_json(os.path.join(ep_dir, "scene.json"))
+    ap = os.path.join(ep_dir, "actions.jsonl")
+    if not sp or not os.path.isfile(ap):
+        return 0
+    spawn = sp.get("spawn") or {}
+    if "z" not in spawn:
+        return 0
+    c = sp.get("collision") or {}
+    z_lo, z_hi = (float(x) for x in c.get("z_slice", (1.65, 2.35)))
+    v = float(c.get("voxel_m", 0.1))
+    nz = max(1, int(math.ceil((z_hi - z_lo) / v - 1e-9)))
+    env = coll_mod.resolve_envelope(c.get("envelope"))
+    hh = float(env["half_height_m"])
+    sz = float(spawn["z"])
+
+    def span(zlo_q, zhi_q):
+        k0 = max(0, int(math.floor((zlo_q - z_lo) / v + 1e-12)))
+        k1 = min(nz - 1, int(math.ceil((zhi_q - z_lo) / v - 1e-12) - 1))
+        return k0, k1
+
+    pk0, pk1 = span(sz - coll_mod.Z_ENVELOPE_DOWN_M - hh, sz + coll_mod.Z_ENVELOPE_UP_M + hh)
+    tr_by_step = {}
+    tp = os.path.join(ep_dir, "trace.jsonl")
+    if os.path.isfile(tp):
+        with open(tp, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    t = json.loads(line)
+                    tr_by_step.setdefault(int(t["step"]), []).append(float(t["pos"][2]))
+
+    bad_steps = 0
+    with open(ap, encoding="utf-8") as f:
+        for line in f:
+            if not line.strip():
+                continue
+            a = json.loads(line)
+            st = int(a["step"])
+            zs = []
+            if "pose_before" in a and "z" in a["pose_before"]:
+                zs.append(float(a["pose_before"]["z"]))
+            if "pose_gt" in a and "z" in a["pose_gt"]:
+                zs.append(float(a["pose_gt"]["z"]))
+            zs.extend(tr_by_step.get(st, ()))
+            for z in zs:
+                k0, k1 = span(z - hh, z + hh)
+                if k0 <= k1 and (k0 < pk0 or k1 > pk1):
+                    bad_steps += 1
+                    break
+    return bad_steps
+
+
 def load_suite(suite_dir):
     """读取一个套件（如 indoor40_v1）。路线目录严格使用 sim.3dgs.route_dirs.route_dirs，排除 *.incomplete-*。"""
     cfg = read_json(os.path.join(suite_dir, "config.json"))
@@ -168,6 +221,7 @@ def load_suite(suite_dir):
             if mj.get("metric_version") != want_mv or mj.get("collision_model") != cm:
                 mv_mismatch += 1
             mj["_has_trace"] = has_trace
+            mj["_layer_outside_env_steps"] = _ep_layer_outside_env_steps(ep_dir) if cm == "v2" else 0
             episodes[(g, s, int(mj["route"]), int(mj["seed"]))] = mj
 
     missing_routes = [list(x) for x in expected_routes if x not in done_routes]
@@ -207,6 +261,7 @@ def arm_stats(suite_data, arm):
     k_cf = sum(bool(m["collide_first"]) for m in rows)
     k_to = sum(bool(m["timeout"]) for m in rows)
     k_spawn_coll = sum(m.get("collision_step") == 0 for m in rows)
+    layer_outside = sum(int(m.get("_layer_outside_env_steps", 0)) for m in rows)
     spls = [float(m["spl_stop"]) for m in rows if m.get("spl_stop") is not None]
     # 未完成集对 SPL 按 0 计入请求分母
     spl_mean = (sum(spls) / n_req) if (n_req > 0 and len(spls) > 0) else None
@@ -226,6 +281,7 @@ def arm_stats(suite_data, arm):
         "k_timeout": k_to,
         "timeout_rate": (k_to / n_req) if n_req else 0.0,
         "k_spawn_coll": k_spawn_coll,
+        "layer_outside_env_steps": layer_outside,
         "spl_stop": round(spl_mean, 4) if spl_mean is not None else None,
         "steps_mean": round(steps_mean, 2) if steps_mean is not None else None,
     }
@@ -246,6 +302,8 @@ def pair_v2_vs_v1(s_v1, s_v2, arm):
         cf2 = sum(bool(e2[(arm, *k)]["collide_first"]) for k in sub_keys)
         to1 = sum(bool(e1[(arm, *k)]["timeout"]) for k in sub_keys)
         to2 = sum(bool(e2[(arm, *k)]["timeout"]) for k in sub_keys)
+        coll_v2_not_v1 = sum(bool(e2[(arm, *k)]["collision"]) and not bool(e1[(arm, *k)]["collision"]) for k in sub_keys)
+        coll_v1_not_v2 = sum(bool(e1[(arm, *k)]["collision"]) and not bool(e2[(arm, *k)]["collision"]) for k in sub_keys)
         return {
             "pairs": n,
             "k_v1": k1,
@@ -258,6 +316,8 @@ def pair_v2_vs_v1(s_v1, s_v2, arm):
             "cf_v2": cf2,
             "to_v1": to1,
             "to_v2": to2,
+            "coll_v2_not_v1": coll_v2_not_v1,
+            "coll_v1_not_v2": coll_v1_not_v2,
         }
 
     same_keys = [k for k in keys if pose_same(e1[(arm, *k)].get("start_pose"), e2[(arm, *k)].get("start_pose"))]
@@ -410,7 +470,7 @@ def render_markdown(out_dir, suites, arm_tables, pairs_by_class, cross_arm, v1_c
         "# 3DGS 碰撞口径重定基线汇总（任务卡 S1b）",
         "",
         f"- 输出目录：`{out_dir}`",
-        f"- 口径版本串：v1 = `{METRIC_V1}`，v2 = `{METRIC_V2}`（B1 欧氏距离膨胀核 + B2/B4/B7 层带 `z ± 0.053 m` 统一高度口径 + B3 SITL 10 Hz `trace.jsonl` 折线逐段扫）。",
+        f"- 口径版本串：v1 = `{METRIC_V1}`，v2 = `{METRIC_V2}`（定稿：圆柱与原始体素方块精确欧氏相交 + 判定层带 `[z − 半高, z + 半高]` + 规划与出生包络层带 `[z_nom − 0.035 − 半高, z_nom + 0.075 + 半高]` + 出生漂移余量 `0.105 m` + SITL 10 Hz `trace.jsonl` 折线逐段扫）。",
         f"- 数据完整度：{'**全部完成**' if complete_all else '**部分完成 / 冒烟子集（数据不全，不作正式判决）**'}；分母一律为请求集数。",
         "",
         "## 1. 预注册预期对照",
@@ -439,7 +499,11 @@ def render_markdown(out_dir, suites, arm_tables, pairs_by_class, cross_arm, v1_c
         if s1 is None and s2 is None:
             continue
         L += [f"### 2.{BASE_CLASSES.index(bcls) + 1} {titles[bcls]}", ""]
-        arms = (s1 or s2)["arms"]
+        arms = list((s1 or s2)["arms"])
+        if s2 is not None:
+            for a_extra in s2["arms"]:
+                if a_extra not in arms:
+                    arms.append(a_extra)
         rows = []
         for arm in arms:
             a1 = arm_tables.get(f"{bcls}_v1", {}).get(arm)
@@ -447,18 +511,21 @@ def render_markdown(out_dir, suites, arm_tables, pairs_by_class, cross_arm, v1_c
             p = pairs_by_class.get(bcls, {}).get(arm)
             c1 = fmt_rate(a1["k_stop"], a1["n_req"], a1["sr_ci"]) if a1 else "—"
             c2 = fmt_rate(a2["k_stop"], a2["n_req"], a2["sr_ci"]) if a2 else "—"
-            cf_str = f"{a1['k_collide_first']} → {a2['k_collide_first']}" if (a1 and a2) else "—"
-            to_str = f"{a1['k_timeout']} → {a2['k_timeout']}" if (a1 and a2) else "—"
-            sp_str = f"{a1['k_spawn_coll']} → {a2['k_spawn_coll']}" if (a1 and a2) else "—"
+            cf_str = f"{a1['k_collide_first']} → {a2['k_collide_first']}" if (a1 and a2) else (str(a2["k_collide_first"]) if a2 else "—")
+            to_str = f"{a1['k_timeout']} → {a2['k_timeout']}" if (a1 and a2) else (str(a2["k_timeout"]) if a2 else "—")
+            sp_str = f"{a1['k_spawn_coll']} → {a2['k_spawn_coll']}" if (a1 and a2) else (str(a2["k_spawn_coll"]) if a2 else "—")
             if p:
                 pa, ps, pd = p["all"], p["same_spawn"], p["diff_spawn"]
                 pair_str = f"{pa['diff_v2_minus_v1']:+d} (b={pa['b_v2_only']}, c={pa['c_v1_only']}, p={pa['p_mcnemar']:.4f})"
                 spawn_split = f"同起点 {ps['pairs']} 对({ps['diff_v2_minus_v1']:+d}) / 异起点 {pd['pairs']} 对({pd['diff_v2_minus_v1']:+d})"
+                v2_new_coll = str(pa["coll_v2_not_v1"])
             else:
-                pair_str, spawn_split = "—", "—"
-            rows.append([f"`{arm}`", c1, c2, cf_str, to_str, sp_str, pair_str, spawn_split])
+                pair_str, spawn_split, v2_new_coll = "—", "—", "—"
+            layer_mis = str(a2["layer_outside_env_steps"]) if a2 is not None else "—"
+            rows.append([f"`{arm}`", c1, c2, cf_str, to_str, sp_str, v2_new_coll, layer_mis, pair_str, spawn_split])
         L += md_table(
-            ["臂", f"v1 到点 (`{METRIC_V1}`)", f"v2 到点 (`{METRIC_V2}`)", "撞在前 v1→v2", "超时 v1→v2", "出生即撞 v1→v2", "配对 v2−v1 (b=v2成v1败, c=v1成v2败)", "同出生位姿 / 异出生位姿拆分"],
+            ["臂", f"v1 到点 (`{METRIC_V1}`)", f"v2 到点 (`{METRIC_V2}`)", "撞在前 v1→v2", "超时 v1→v2", "出生即撞 v1→v2",
+             "v2判碰而v1未碰", "规划与判定层不一致步数", "配对 v2−v1 (b=v2成v1败, c=v1成v2败)", "同出生位姿 / 异出生位姿拆分"],
             rows,
         )
         if bcls in cross_arm:

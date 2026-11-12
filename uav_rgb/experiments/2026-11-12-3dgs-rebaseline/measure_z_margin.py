@@ -1,10 +1,18 @@
 #!/usr/bin/env python3
-"""量高度余量（任务卡 S1b 第 2 条：先量后定）：已有 3DGS 实验轨迹里，稳态飞行的 z 相对出生高度（scene.json 的 spawn.z）的分布。
+"""测量整集高度包络与起飞水平漂移（卡 S1b 第二轮 J-1：先量后定）。
 
-统一高度口径函数取 z ± (机体半高 + 高度余量) 覆盖到的层取并（sim/3dgs/collision.py 的 HEIGHT_MARGIN_M）。余量要盖住稳态飞行 z 偏离出生高度的幅度，
-所以按每个来源的稳态 z − spawn.z 的 p1 与 p99 取偏离幅度 max(|p1|, |p99|)，各来源再取最大，向上取到 ROUND_UP_TO_M 的整数倍。
+定稿碰撞口径（collision_model="v2"）：
+  - 碰撞判定不再有高度余量：圆柱 [z − 半高, z + 半高] 与体素方块相交即碰；
+  - 按名义出生高度做的两件事（规划硬栅格 planning_grid、出生检查 spawn_ok）用整集高度包络取层：
+    [名义高度 − Z_ENVELOPE_DOWN_M − 半高, 名义高度 + Z_ENVELOPE_UP_M + 半高]，
+    出生检查另要求候选点到这些层内原始体素方块的水平距离 >= 机体半径 + inflate + SPAWN_DRIFT_MARGIN_M。
 
-只读，不渲染不用 GPU：
+本脚本在已跑完的 W1-11 / W1-12 / K1 / K3 共 16 个来源上测量：
+  1. 全部步（含第 0 步动作前位姿 pose_before、步末 pose_gt，以及若有 trace.jsonl 的全部 10 Hz 轨迹点）的 z − spawn.z 最小与最大值；
+  2. 每集起飞水平漂移：第 0 步动作前位姿 (pose_before.x, pose_before.y) 相对起飞前候选出生点 (cx, cy) 的欧氏距离最大值；
+  3. 各极值向外取到 ROUND_UP_TO_M（5 mm）的整数倍，定出 Z_ENVELOPE_DOWN_M、Z_ENVELOPE_UP_M、SPAWN_DRIFT_MARGIN_M。
+
+只读，不用 GPU：
   <3dgs-venv python> experiments/2026-11-12-3dgs-rebaseline/measure_z_margin.py [输出 json 路径]
 """
 import importlib
@@ -17,88 +25,153 @@ import numpy as np
 
 # ------------------------------------------------------------------ 配置区
 DATA = os.path.join(os.environ.get("DATA_ROOT", "/root/rivermind-data"), "uav_rgb")
-STEADY_FROM_STEP = 3        # 稳态 = 第 3 步起（步号从 0 数）：起飞过冲只占前几步，第 3 步动作前位姿位于上层的集室内 6/117、室外 0/119（审核 B 发现 2，复核脚本 step_layers2.py）
-PCT = (1, 99)               # 任务卡的口径：稳态 z 的 p1 与 p99
-ROUND_UP_TO_M = 0.005       # 向上取到 5 mm 的整数倍，常数不带一长串小数
-# (标签, 根目录, 根目录与 r<N> 之间的层数)：K1 / W1-11 / W1-12 / K3 已跑完的 3DGS 臂（cf_sitl，hold 1.0），室内室外各一份
+SCENES_DIR = os.path.join(DATA, "3dgs-scenes")
+ROUND_UP_TO_M = 0.005       # 向外取到 5 mm 的整数倍
+# (标签, 根目录, 根目录与 r<N> 之间的层数, 出生抖动半径 m)：W1-11 / W1-12 / K1 / K3 全部已完成正式臂
 SOURCES = []
-for _suite in ("indoor", "outdoor"):
+for _s, _jit in (("indoor", 0.2), ("outdoor", 0.5)):
     SOURCES += [
-        (f"teacher-tol/{_suite}", f"{DATA}/exp-teacher-tol-3dgs-20261110/{_suite}/teacher-tol", 1),
-        (f"swept/{_suite}", f"{DATA}/exp-teacher-clearance-3dgs-20261111/{_suite}/swept", 1),
-        (f"k1-forward+route/{_suite}", f"{DATA}/exp-rule-oracle-3dgs-20261110/formal/{_suite}/forward+route", 1),
-        (f"k1-rule-occ+route/{_suite}", f"{DATA}/exp-rule-oracle-3dgs-20261110/formal/{_suite}/rule-occ+route", 1),
+        (f"teacher-tol/{_s}", f"{DATA}/exp-teacher-tol-3dgs-20261110/{_s}/teacher-tol", 1, _jit),
+        (f"swept/{_s}", f"{DATA}/exp-teacher-clearance-3dgs-20261111/{_s}/swept", 1, _jit),
+        (f"k1-forward+route/{_s}", f"{DATA}/exp-rule-oracle-3dgs-20261110/formal/{_s}/forward+route", 1, _jit),
+        (f"k1-rule-occ+route/{_s}", f"{DATA}/exp-rule-oracle-3dgs-20261110/formal/{_s}/rule-occ+route", 1, _jit),
     ]
 SOURCES += [
-    ("k3-rule2-occ+route/holdout", f"{DATA}/exp-rule-v2-3dgs-20261111/holdout/rule2-occ+route", 1),
-    ("k3-rule2-depth+route/holdout", f"{DATA}/exp-rule-v2-3dgs-20261111/holdout/rule2-depth+route", 1),
-    ("k3-rule2-occ+route/outdoor", f"{DATA}/exp-rule-v2-3dgs-20261111/outdoor/rule2-occ+route", 1),
-    ("k3-rule2-depth+route/outdoor", f"{DATA}/exp-rule-v2-3dgs-20261111/outdoor/rule2-depth+route", 1),
+    ("k3-forward+route/holdout", f"{DATA}/exp-rule-v2-3dgs-20261111/holdout/forward+route", 1, 0.2),
+    ("k3-rule-occ+route/holdout", f"{DATA}/exp-rule-v2-3dgs-20261111/holdout/rule-occ+route", 1, 0.2),
+    ("k3-rule2-occ+route/holdout", f"{DATA}/exp-rule-v2-3dgs-20261111/holdout/rule2-occ+route", 1, 0.2),
+    ("k3-rule2-depth+route/holdout", f"{DATA}/exp-rule-v2-3dgs-20261111/holdout/rule2-depth+route", 1, 0.2),
+    ("k3-rule2-occ+route/formal40", f"{DATA}/exp-rule-v2-3dgs-20261111/formal40/rule2-occ+route", 1, 0.2),
+    ("k3-rule2-depth+route/formal40", f"{DATA}/exp-rule-v2-3dgs-20261111/formal40/rule2-depth+route", 1, 0.2),
+    ("k3-rule2-occ+route/outdoor", f"{DATA}/exp-rule-v2-3dgs-20261111/outdoor/rule2-occ+route", 1, 0.5),
+    ("k3-rule2-depth+route/outdoor", f"{DATA}/exp-rule-v2-3dgs-20261111/outdoor/rule2-depth+route", 1, 0.5),
 ]
-# ------------------------------------------------------------------ 以下是流程
+# ------------------------------------------------------------------ 流程
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, REPO)
-route_dirs = importlib.import_module("sim.3dgs.route_dirs")     # E-12：排除 r<N>.incomplete-<时刻>
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+if os.path.join(REPO, "sim", "tools") not in sys.path:
+    sys.path.insert(0, os.path.join(REPO, "sim", "tools"))
+
+route_dirs = importlib.import_module("sim.3dgs.route_dirs")
+scene_mod = importlib.import_module("sim.3dgs.scene")
+coll_mod = importlib.import_module("sim.3dgs.collision")
+c3_mod = importlib.import_module("sim.3dgs.collect_3dgs")
 
 
-def steady_dz(root, depth, steady_from=STEADY_FROM_STEP):
-    """一个来源的稳态 z − spawn.z 序列（每步取 pose_gt.z，即该步动作窗口末的高度）；返回 (np.array, 集数)。"""
-    dz, n_ep = [], 0
+def ceil_to(x, step=ROUND_UP_TO_M):
+    return round(math.ceil(max(0.0, float(x)) / step - 1e-9) * step, 6)
+
+
+def scan_source(root, depth=1, jitter=0.0, occ_cache=None, scene_cache=None):
+    """扫描单个来源：返回集数、步数、trace 点数，以及 z − spawn.z 的分布与起飞水平漂移分布。"""
+    dz, drifts = [], []
+    n_ep = n_steps = n_trace = 0
     for ap in route_dirs.episode_files(root, "actions.jsonl", depth):
-        sp = os.path.join(os.path.dirname(ap), "scene.json")
-        if not os.path.exists(sp):
+        ed = os.path.dirname(ap)
+        sp_path = os.path.join(ed, "scene.json")
+        if not os.path.isfile(sp_path):
             continue
-        with open(sp, encoding="utf-8") as f:
-            spawn_z = float(json.load(f)["spawn"]["z"])
+        with open(sp_path, encoding="utf-8") as f:
+            ep_sc = json.load(f)
+        spawn = ep_sc.get("spawn") or {}
+        if "z" not in spawn:
+            continue
+        spawn_z = float(spawn["z"])
+        cx, cy = float(spawn.get("x", 0.0)), float(spawn.get("y", 0.0))
+        if jitter > 0 and occ_cache is not None and scene_cache is not None:
+            mp = os.path.join(ed, "metrics.json")
+            if os.path.isfile(mp):
+                with open(mp, encoding="utf-8") as f:
+                    m = json.load(f)
+                sname, r_idx, seed = m["scene"], int(m["route"]), int(m["seed"])
+                if sname not in scene_cache:
+                    sc0 = scene_mod.load_scene(os.path.join(SCENES_DIR, sname, "scene.json"))
+                    scene_cache[sname] = sc0
+                    occ_cache[sname] = coll_mod.from_scene(sc0, collision_model="v1")
+                sc_r = dict(scene_cache[sname])
+                scene_mod.apply_route(sc_r, r_idx)
+                spawn_z = float(sc_r["spawn"]["z"])
+                cx, cy, _ = c3_mod._spawn_for_episode(sc_r, occ_cache[sname], jitter, np.random.default_rng(seed), two_layer=False)
         n_ep += 1
         with open(ap, encoding="utf-8") as f:
-            for line in f:
+            for idx, line in enumerate(f):
                 a = json.loads(line)
-                if a["step"] >= steady_from:
-                    dz.append(a["pose_gt"]["z"] - spawn_z)
-    return np.asarray(dz, dtype=float), n_ep
+                n_steps += 1
+                pb, pg = a["pose_before"], a["pose_gt"]
+                if idx == 0:
+                    drifts.append(math.hypot(float(pb["x"]) - cx, float(pb["y"]) - cy))
+                dz.append(float(pb["z"]) - spawn_z)
+                dz.append(float(pg["z"]) - spawn_z)
+        tp = os.path.join(ed, "trace.jsonl")
+        if os.path.isfile(tp):
+            with open(tp, encoding="utf-8") as f:
+                for line in f:
+                    t = json.loads(line)
+                    n_trace += 1
+                    dz.append(float(t["pos"][2]) - spawn_z)
+    if not n_ep:
+        return None
+    arr = np.asarray(dz, dtype=np.float64)
+    darr = np.asarray(drifts, dtype=np.float64)
+    return {
+        "episodes": n_ep,
+        "steps": n_steps,
+        "trace_points": n_trace,
+        "dz_min": float(arr.min()),
+        "dz_p1": float(np.percentile(arr, 1)),
+        "dz_p50": float(np.percentile(arr, 50)),
+        "dz_p99": float(np.percentile(arr, 99)),
+        "dz_max": float(arr.max()),
+        "drift_p50": float(np.median(darr)),
+        "drift_p99": float(np.percentile(darr, 99)),
+        "drift_max": float(darr.max()),
+    }
 
 
-def stats(dz):
-    return {"n": int(len(dz)), "min": float(dz.min()), "p1": float(np.percentile(dz, PCT[0])), "p50": float(np.percentile(dz, 50)),
-            "p99": float(np.percentile(dz, PCT[1])), "max": float(dz.max())}
-
-
-def ceil_to(x, step):
-    return round(math.ceil(x / step - 1e-9) * step, 6)
-
-
-def pick_margin(per_source, round_up_to=ROUND_UP_TO_M):
-    """各来源 max(|p1|, |p99|) 的最大值，向上取整到 round_up_to。"""
-    need = max(max(abs(s["p1"]), abs(s["p99"])) for s in per_source.values())
-    return ceil_to(need, round_up_to), need
+def pick_constants(per_source, round_up_to=ROUND_UP_TO_M):
+    raw_down = max(max(0.0, -s["dz_min"]) for s in per_source.values())
+    raw_up = max(max(0.0, s["dz_max"]) for s in per_source.values())
+    raw_drift = max(max(0.0, s["drift_max"]) for s in per_source.values())
+    return {
+        "raw_down_m": raw_down,
+        "raw_up_m": raw_up,
+        "raw_drift_m": raw_drift,
+        "z_envelope_down_m": ceil_to(raw_down, round_up_to),
+        "z_envelope_up_m": ceil_to(raw_up, round_up_to),
+        "spawn_drift_margin_m": ceil_to(raw_drift, round_up_to),
+    }
 
 
 def main(argv):
     out_path = argv[1] if len(argv) > 1 else None
     per_source, missing = {}, []
-    for label, root, depth in SOURCES:
-        dz, n_ep = steady_dz(root, depth)
-        if not len(dz):
+    occ_cache, scene_cache = {}, {}
+    for label, root, depth, jit in SOURCES:
+        res = scan_source(root, depth=depth, jitter=jit, occ_cache=occ_cache, scene_cache=scene_cache)
+        if res is None:
             missing.append(label)
             continue
-        per_source[label] = {"episodes": n_ep, **stats(dz)}
+        per_source[label] = res
     if not per_source:
         raise SystemExit("没有读到任何来源")
-    margin, need = pick_margin(per_source)
-    print(f"稳态 = 第 {STEADY_FROM_STEP} 步起；z − spawn.z（米），分位 p{PCT[0]} / p50 / p{PCT[1]}")
-    print(f"{'来源':34s} {'集':>4s} {'步':>6s} {'min':>8s} {'p1':>8s} {'p50':>8s} {'p99':>8s} {'max':>8s}")
+    picked = pick_constants(per_source)
+    print("整集高度包络（全部步 pose_before + pose_gt + trace.jsonl）与起飞水平漂移（米）：")
+    print(f"{'来源':32s} {'集':>4s} {'步':>6s} {'trace点':>8s} {'dz_min':>9s} {'dz_p1':>8s} {'dz_p99':>8s} {'dz_max':>9s} {'drift_p50':>9s} {'drift_max':>9s}")
     for label, s in per_source.items():
-        print(f"{label:34s} {s['episodes']:4d} {s['n']:6d} {s['min']:+8.4f} {s['p1']:+8.4f} {s['p50']:+8.4f} {s['p99']:+8.4f} {s['max']:+8.4f}")
+        print(f"{label:32s} {s['episodes']:4d} {s['steps']:6d} {s['trace_points']:8d} "
+              f"{s['dz_min']:+9.4f} {s['dz_p1']:+8.4f} {s['dz_p99']:+8.4f} {s['dz_max']:+9.4f} "
+              f"{s['drift_p50']:9.4f} {s['drift_max']:9.4f}")
     if missing:
-        print("没读到（目录不存在或没有集）：", ", ".join(missing))
-    print(f"各来源 max(|p1|, |p99|) 的最大值 {need:.4f} m，向上取到 {ROUND_UP_TO_M * 1000:g} mm 的整数倍：高度余量 = {margin:g} m")
+        print("没读到：", ", ".join(missing))
+    print(f"极值：dz_min = -{picked['raw_down_m']:.6f} m, dz_max = +{picked['raw_up_m']:.6f} m, drift_max = {picked['raw_drift_m']:.6f} m")
+    print(f"向外取整到 {ROUND_UP_TO_M*1000:g} mm：Z_ENVELOPE_DOWN_M = {picked['z_envelope_down_m']:g} m, "
+          f"Z_ENVELOPE_UP_M = {picked['z_envelope_up_m']:g} m, SPAWN_DRIFT_MARGIN_M = {picked['spawn_drift_margin_m']:g} m")
     if out_path:
         with open(out_path, "w", encoding="utf-8") as f:
-            json.dump({"steady_from_step": STEADY_FROM_STEP, "percentiles": list(PCT), "round_up_to_m": ROUND_UP_TO_M,
-                       "per_source": per_source, "missing": missing, "need_m": need, "height_margin_m": margin},
-                      f, ensure_ascii=False, indent=1)
+            json.dump({"round_up_to_m": ROUND_UP_TO_M, "per_source": per_source, "missing": missing, **picked},
+                      f, ensure_ascii=False, indent=2)
     return 0
 
 

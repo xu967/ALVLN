@@ -22,6 +22,10 @@ OLD = tdr.TestDefaultsLocked
 METRIC_BASE = "3dgs.pilot.v2+stop.v1"
 
 FROM_SCENE = []                          # 桩 from_scene 每次收到的关键字参数
+PLANNER_ZS = []                          # 桩 OccPlanner 每次构造收到的 z 关键字参数
+DEPTH_OP_CALLS = []                      # 桩 renderer.set_depth_opacity_min 每次收到的门限
+ROUTE_ZS = {}                            # 可选覆盖每条路线的 spawn.z：{route_idx: z}
+IDENTITY = {}                            # 可选覆盖桩 scene_identity 的返回字典
 _orig_install = tdr.install
 
 
@@ -30,14 +34,43 @@ def _install(routes):
     coll = sys.modules["sim.3dgs.collision"]
     coll.from_scene = lambda base, **kw: FROM_SCENE.append(dict(kw)) or _ns(collision_model=kw.get("collision_model", "v1"))
     coll.metric_version = lambda base, cm="v1": base + {"v1": "", "v2": "+coll.v2"}[cm]
+    rend_mod = sys.modules["sim.3dgs.renderer"]
+    rend_mod.make_renderer = lambda *a, **kw: (tdp.LOADED.append(1)
+                                               or _ns(set_depth_opacity_min=lambda v: DEPTH_OP_CALLS.append(v)))
+    pl_mod = sys.modules["sim.3dgs.planner"]
+    pl_mod.OccPlanner = lambda occ, **kw: (PLANNER_ZS.append(kw.get("z"))
+                                           or _ns(plan=(tdr.PLAN if "z" not in kw else (tdr.PLAN, kw["z"]))))
+    if IDENTITY:
+        sys.modules["sim.3dgs.collect_3dgs"].scene_identity = lambda sc, ply_sha256=None: dict(IDENTITY)
+        sys.modules["sim.3dgs.eval_3dgs"].eval_split = (
+            lambda ident, allow: ("test", "diag-eval-fixed-test") if ident["split"] == "test" else (ident["split"], "diag-train-scene")
+        )
+    if ROUTE_ZS:
+        sc_mod = sys.modules["sim.3dgs.scene"]
+        orig_apply = sc_mod.apply_route
+
+        def _apply(sc, r):
+            orig_apply(sc, r)
+            if r in ROUTE_ZS:
+                sc["spawn"]["z"] = ROUTE_ZS[r]
+
+        sc_mod.apply_route = _apply
     return names
 
 
 tdr.install = _install
 
 
-def run(cfg, arms, **kw):
+def run(cfg, arms, route_zs=None, identity=None, **kw):
     FROM_SCENE.clear()
+    PLANNER_ZS.clear()
+    DEPTH_OP_CALLS.clear()
+    ROUTE_ZS.clear()
+    IDENTITY.clear()
+    if route_zs:
+        ROUTE_ZS.update(route_zs)
+    if identity:
+        IDENTITY.update(identity)
     return tdr.run({"routes": [0], **cfg}, arms, **kw)
 
 
@@ -123,6 +156,66 @@ class TestCollisionModelKey(unittest.TestCase):
         rc, _ = run({"collision_model": "v1"}, [arm("t", base="teacher", spawn_two_layer=True)])
         self.assertEqual(rc, 0)
         self.assertEqual(REC["runs"][0]["kw"]["spawn_two_layer"], True)
+
+    def test_v2_caches_planner_by_each_routes_own_spawn_height(self):
+        """J-9：driver 在 v2 下按每条路线自己的 sc['spawn']['z'] 构建并缓存 OccPlanner（同高度跨路线与跨臂复用，三维 occ 只建一次）；
+        v1 不给 collision_model=v2 时仍无参数调一次 OccPlanner(occ)。"""
+        rc, _ = run(
+            {"collision_model": "v2", "routes": [0, 1, 2]},
+            [arm("t", base="teacher"), arm("f", base="forward", guard="route")],
+            route_zs={0: 1.2, 1: 1.8, 2: 1.2},
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(FROM_SCENE), 1, "三维占据只建一次")
+        self.assertEqual(PLANNER_ZS, [1.2, 1.8], "两个不同路线高度各建一次规划器，r2 与第二臂复用缓存")
+        # forward+route 的 OracleRouteGuide 在 r0/r1/r2 拿到的 plan 分别对应各自高度 1.2 / 1.8 / 1.2
+        self.assertEqual([g.plan[1] for g in REC["guides"]], [1.2, 1.8, 1.2])
+
+        # 对照：v1 下仍只无关键字调一次 OccPlanner(occ)
+        rc1, _ = run({"routes": [0, 1]}, [arm("f")], route_zs={0: 1.2, 1: 1.8})
+        self.assertEqual(rc1, 0)
+        self.assertEqual(PLANNER_ZS, [None])
+
+    def test_split_from_identity_and_collision_model_combined_done_key_order(self):
+        """J-4：split_from_identity 与 collision_model 两键同开时（重定基线正式运行配置），done.json 末尾键顺序锁为：
+        split、split_policy 在前（S1a），collision_model、metric_version 在后（S1b）。"""
+        rc, snap = run(
+            {"split_from_identity": True, "collision_model": "v2"},
+            [arm("t", base="teacher", teacher_clearance="swept"), arm("r", base="rule-occ", guard="route", rule_version="v2")],
+            identity={"split": "train", "geometry_gid": "a" * 16},
+        )
+        self.assertEqual(rc, 0)
+        dt = done_of(snap, "t")
+        dr = done_of(snap, "r")
+        self.assertEqual(list(dt), OLD.OLD_DONE_KEYS + ["teacher_clearance", "split", "split_policy", "collision_model", "metric_version"])
+        self.assertEqual((dt["split"], dt["split_policy"], dt["collision_model"], dt["metric_version"]),
+                         ("train", "diag-train-scene", "v2", METRIC_BASE + "+coll.v2"))
+        self.assertEqual(list(dr), OLD.OLD_DONE_KEYS + ["rule", "split", "split_policy", "collision_model", "metric_version"])
+
+    def test_depth_opacity_min_per_arm_resets_for_other_arms_and_records_key(self):
+        """B5：driver 支持臂级 depth_opacity_min（给深度规则臂用）：切到带该键的臂时调 set_depth_opacity_min(0.30)，
+        下一个不带该键的臂自动调回 None，不留状态；没有臂用这个键时从不调用 set_depth_opacity_min（旧单参桩兼容）。"""
+        rc, snap = run({}, [arm("f")])
+        self.assertEqual((rc, DEPTH_OP_CALLS), (0, []), "没有任何臂设 depth_opacity_min 时不调用")
+
+        rc, snap = run(
+            {"collision_model": "v2"},
+            [arm("r0", base="rule-depth", guard="route", rule_version="v2"),
+             arm("r_op", base="rule-depth", guard="route", rule_version="v2", depth_opacity_min=0.30),
+             arm("f", base="forward")],
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(DEPTH_OP_CALLS, [None, 0.30, None])
+        self.assertNotIn("depth_opacity_min", done_of(snap, "r0"))
+        self.assertNotIn("depth_opacity_min", metrics_of(snap, "r0"))
+        self.assertEqual(done_of(snap, "r_op")["depth_opacity_min"], 0.30)
+        self.assertEqual(metrics_of(snap, "r_op")["depth_opacity_min"], 0.30)
+        self.assertNotIn("depth_opacity_min", done_of(snap, "f"))
+
+        for bad in (-0.01, 1.5, "0.3", True, None):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                run({}, [arm("r_bad", base="rule-depth", guard="route", depth_opacity_min=bad)])
+            self.assertEqual(tdp.LOADED, [])
 
 
 if __name__ == "__main__":

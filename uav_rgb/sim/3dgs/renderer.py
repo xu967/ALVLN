@@ -55,7 +55,7 @@ class GsplatRenderer:
 
     def __init__(self, scene, width=None, height=None, fov_deg=None,
                  device="cuda", sh_degree=None, max_scale_m=None, supersample=None,
-                 background=(0.7, 0.75, 0.8)):
+                 background=(0.7, 0.75, 0.8), depth_opacity_min=None):
         try:
             import torch
             from gsplat import rasterization
@@ -109,6 +109,33 @@ class GsplatRenderer:
         self.scene = scene
         self.samples = 0
         self.total_ms = 0.0
+        self.depth_opacity_min = None
+        self._depth_pack = None
+        if depth_opacity_min is not None:
+            self.set_depth_opacity_min(depth_opacity_min)
+
+    def set_depth_opacity_min(self, depth_opacity_min):
+        """设置或清除渲染深度专用的高斯不透明度下限（B5）：
+        None = 关闭（缺省，RGB 与深度一次 RGB+ED 光栅化完成，逐位不变）；
+        浮点数 ∈ [0, 1] = RGB 照旧用全部高斯，深度只用 opacity >= 门限的高斯另渲一遍 ED。"""
+        if depth_opacity_min is None:
+            self.depth_opacity_min = None
+            self._depth_pack = None
+            return
+        if isinstance(depth_opacity_min, bool) or not isinstance(depth_opacity_min, (int, float)) or not (0.0 <= float(depth_opacity_min) <= 1.0):
+            raise ValueError(f"depth_opacity_min 必须是 None 或 [0, 1] 内的数，得到 {depth_opacity_min!r}")
+        thr = float(depth_opacity_min)
+        self.depth_opacity_min = thr
+        mask = self.opacities >= thr
+        # ED 模式也要传 [M, 3] 占位颜色给 gsplat（不设 sh_degree，省显存）
+        d_col = (self.colors[mask, 0].contiguous() if self.sh_degree > 0 else self.colors[mask].contiguous())
+        self._depth_pack = (
+            self.means[mask].contiguous(),
+            self.quats[mask].contiguous(),
+            self.scales[mask].contiguous(),
+            self.opacities[mask].contiguous(),
+            d_col,
+        )
 
     def render_pose(self, x, y, z, yaw_deg, pitch_deg=0.0, width=None, height=None):
         """nav 位姿 -> (rgb uint8 HxWx3, depth float32 HxW[米,0=无效], 耗时 ms)。"""
@@ -141,36 +168,56 @@ class GsplatRenderer:
             alpha = alphas[0].detach().float()              # [H*s, W*s, 1]
             # 手动背景合成：accumulated RGB 已是预乘 alpha。
             rgb_t = out[..., :3] + self._bg * (1.0 - alpha)
-            depth_t = out[..., 3:4].float()
+            if self._depth_pack is not None:
+                d_means, d_quats, d_scales, d_opac, d_col = self._depth_pack
+                if len(d_opac) > 0:
+                    d_out, d_alphas, _ = self.rasterization(
+                        d_means, d_quats, d_scales, d_opac, d_col,
+                        vm, ks, width * s, height * s,
+                        sh_degree=None,
+                        near_plane=NEAR_PLANE_M, far_plane=FAR_PLANE_M,
+                        render_mode="ED", backgrounds=None, packed=True)
+                    depth_t = d_out[0, ..., 0:1].detach().float()
+                    alpha_d = d_alphas[0].detach().float()
+                else:
+                    depth_t = torch.zeros((height * s, width * s, 1), dtype=torch.float32, device=self.device)
+                    alpha_d = depth_t
+            else:
+                depth_t = out[..., 3:4].float()
+                alpha_d = alpha
             if s > 1:
                 pool = torch.nn.functional.avg_pool2d
                 nchw = lambda im: im.permute(2, 0, 1)[None]          # noqa: E731
                 hwc = lambda im: im[0].permute(1, 2, 0)              # noqa: E731
                 rgb_t = hwc(pool(nchw(rgb_t), s))
                 # 期望深度按 alpha 加权合并子像素，和 gsplat 单像素内 sum(w z)/sum(w) 同义。
-                wsum = pool(nchw(alpha), s)
-                depth_t = hwc(pool(nchw(depth_t * alpha), s) / wsum.clamp_min(1e-6))
-                alpha = hwc(wsum)
+                wsum = pool(nchw(alpha_d), s)
+                depth_t = hwc(pool(nchw(depth_t * alpha_d), s) / wsum.clamp_min(1e-6))
+                alpha_d = hwc(wsum)
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         ms = (time.perf_counter() - t0) * 1e3
         rgb = (rgb_t.clamp(0.0, 1.0).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
         depth = depth_t[..., 0].cpu().numpy()
-        alpha_np = alpha.cpu().numpy()
+        alpha_np = alpha_d.cpu().numpy()
         depth = np.where(alpha_np[..., 0] >= 0.05, depth, 0.0).astype(np.float32)
         self.samples += 1
         self.total_ms += ms
         return rgb, depth, ms
 
     def stats(self):
-        return {"backend": self.backend, "n_gaussians": self.n_gaussians,
-                "n_loaded": self.n_loaded, "n_removed_by_scale": self.n_removed_by_scale,
-                "max_scale_m": self.max_scale_m, "supersample": self.supersample,
-                "width": self.width, "height": self.height, "fov_deg": self.fov_deg,
-                "sh_degree": self.sh_degree, "device": str(self.device),
-                "near_plane_m": NEAR_PLANE_M, "far_plane_m": FAR_PLANE_M,
-                "samples": self.samples,
-                "mean_ms": self.total_ms / self.samples if self.samples else None}
+        out = {"backend": self.backend, "n_gaussians": self.n_gaussians,
+               "n_loaded": self.n_loaded, "n_removed_by_scale": self.n_removed_by_scale,
+               "max_scale_m": self.max_scale_m, "supersample": self.supersample,
+               "width": self.width, "height": self.height, "fov_deg": self.fov_deg,
+               "sh_degree": self.sh_degree, "device": str(self.device),
+               "near_plane_m": NEAR_PLANE_M, "far_plane_m": FAR_PLANE_M,
+               "samples": self.samples,
+               "mean_ms": self.total_ms / self.samples if self.samples else None}
+        if self.depth_opacity_min is not None:
+            out["depth_opacity_min"] = self.depth_opacity_min
+            out["n_depth_gaussians"] = int(len(self._depth_pack[3])) if self._depth_pack is not None else 0
+        return out
 
 
 class MockRenderer:
@@ -179,7 +226,7 @@ class MockRenderer:
     backend = "mock"
 
     def __init__(self, scene=None, width=None, height=None, fov_deg=None,
-                 depth_m=5.0):
+                 depth_m=5.0, depth_opacity_min=None):
         cam = (scene or {}).get("camera", {})
         self.width = int(width or cam.get("width", 320))
         self.height = int(height or cam.get("height", 240))
@@ -187,6 +234,17 @@ class MockRenderer:
         self.depth_m = float(depth_m)
         self.samples = 0
         self.total_ms = 0.0
+        self.depth_opacity_min = None
+        if depth_opacity_min is not None:
+            self.set_depth_opacity_min(depth_opacity_min)
+
+    def set_depth_opacity_min(self, depth_opacity_min):
+        if depth_opacity_min is None:
+            self.depth_opacity_min = None
+            return
+        if isinstance(depth_opacity_min, bool) or not isinstance(depth_opacity_min, (int, float)) or not (0.0 <= float(depth_opacity_min) <= 1.0):
+            raise ValueError(f"depth_opacity_min 必须是 None 或 [0, 1] 内的数，得到 {depth_opacity_min!r}")
+        self.depth_opacity_min = float(depth_opacity_min)
 
     def render_view(self, view, width=None, height=None):
         """从 world->camera 4x4 反推相机中心与朝向，再走 render_pose 的渐变。"""
@@ -215,19 +273,22 @@ class MockRenderer:
         return rgb, depth, ms
 
     def stats(self):
-        return {"backend": self.backend, "width": self.width, "height": self.height,
-                "fov_deg": self.fov_deg, "samples": self.samples,
-                "mean_ms": self.total_ms / self.samples if self.samples else None}
+        out = {"backend": self.backend, "width": self.width, "height": self.height,
+               "fov_deg": self.fov_deg, "samples": self.samples,
+               "mean_ms": self.total_ms / self.samples if self.samples else None}
+        if self.depth_opacity_min is not None:
+            out["depth_opacity_min"] = self.depth_opacity_min
+        return out
 
 
 def make_renderer(scene, mock=False, width=None, height=None, fov_deg=None,
                   device="cuda", **render_opts):
     """显式选择后端；真实后端不可用时直接报错，不静默回退 mock。
 
-    render_opts：sh_degree / max_scale_m / supersample，None 表示按 scene.render 段。
+    render_opts：sh_degree / max_scale_m / supersample / depth_opacity_min，None 表示按 scene.render 段（depth_opacity_min 缺省关闭）。
     """
     if mock:
-        return MockRenderer(scene, width, height, fov_deg)
+        return MockRenderer(scene, width, height, fov_deg, depth_opacity_min=render_opts.get("depth_opacity_min"))
     return GsplatRenderer(scene, width, height, fov_deg, device=device, **render_opts)
 
 

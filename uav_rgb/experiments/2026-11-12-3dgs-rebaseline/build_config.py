@@ -35,12 +35,12 @@ REQUIRED = (
 )
 
 
-def make_arms(e, selected):
+def make_arms(e, selected, collision_model):
     occ_levels = selected["levels"]
     occ_order = selected["order"]
     dep_levels = selected["depth_levels"]
     dep_order = selected["depth_order"]
-    return [
+    arms = [
         {"name": "teacher-tol", "base": "teacher", "ckpt": None, "guard": None},
         {"name": "teacher-swept", "base": "teacher", "ckpt": None, "guard": None, "teacher_clearance": "swept"},
         {"name": "forward+route", "base": "forward", "ckpt": None, "guard": "route"},
@@ -51,6 +51,14 @@ def make_arms(e, selected):
         {"name": "rule2-depth+route", "base": "rule-depth", "ckpt": None, "guard": "route",
          "rule_version": "v2", "rule_params": {"levels": dep_levels, "order": dep_order}},
     ]
+    if collision_model == "v2":
+        # B5 诊断臂（只在 v2 下跑）：规则 v2（深度）带 depth_opacity_min = 0.30（与占据门限对齐），验证 garden 虚警消除效果
+        arms.append({
+            "name": "rule2-depth-op030+route", "base": "rule-depth", "ckpt": None, "guard": "route",
+            "rule_version": "v2", "rule_params": {"levels": dep_levels, "order": dep_order},
+            "depth_opacity_min": 0.30,
+        })
+    return arms
 
 
 def build(suite, e):
@@ -82,16 +90,15 @@ def build(suite, e):
         "suite": suite,
         "class": base_cls,
     }
-    # 预留卡 S1a（审核 D1）的 driver config 键 split_from_identity：
-    # 第二轮主会话把 p12-s1a 与 p12-s1b 合进 main 后，设 SPLIT_FROM_IDENTITY=true 即写入该键，写真实 split 与 diag-train-scene；
-    # 当前分支未含 p12-s1a，缺省留空不写，保证本轮桩演练与 GPU 冒烟不报错且与原实验配置对齐。
-    split_flag = e.get("SPLIT_FROM_IDENTITY", "").strip().lower()
-    if split_flag in ("true", "1"):
+    # 卡 S1a（审核 D1 / J-4）的 driver config 键 split_from_identity：
+    # S1a 已合入 main，缺省为 true（按几何哈希写真实 split 与 diag-train-scene）；显式传 "none" 时不写该键。
+    split_flag = e.get("SPLIT_FROM_IDENTITY", "true").strip().lower()
+    if split_flag in ("", "true", "1"):
         cfg["split_from_identity"] = True
     elif split_flag in ("false", "0"):
         cfg["split_from_identity"] = False
-    elif split_flag != "":
-        raise ValueError(f"SPLIT_FROM_IDENTITY 只能为空、true 或 false，得到 {e.get('SPLIT_FROM_IDENTITY')!r}")
+    elif split_flag != "none":
+        raise ValueError(f"SPLIT_FROM_IDENTITY 只能为 true、false 或 none，得到 {e.get('SPLIT_FROM_IDENTITY')!r}")
 
     if base_cls == "outdoor":
         scenes = e["OUTDOOR_SCENES"].split()
@@ -125,7 +132,7 @@ def build(suite, e):
             "title": f"{label}重定基线（collision_model={cm}）",
         })
 
-    arms = make_arms(e, selected)
+    arms = make_arms(e, selected, cm)
     if e.get("ONLY_ARMS"):
         want = [x.strip() for x in e["ONLY_ARMS"].split(",") if x.strip()]
         bad = [x for x in want if x not in {a["name"] for a in arms}]
