@@ -34,8 +34,8 @@
 | S1b 第一轮（11-12 08:29） | `2b3eee7` | `f0d2747` | 13 个文件，+2496 −27 | `sim/3dgs/collision.py` 的 `collision_model`（缺省 v1 不变；v2 未定稿）、`planner.py`、`collect_3dgs.py`、新文件 `route_dirs.py`；重定基线的入口 |
 | W1-15b（11-12 08:11） | `035b398` | `cc48b27` | 13 个文件，+1775 −119 | `tools/pipeline_common.py`（实例锁、`run.pid`、`eval_state`、`retire_dir`）；三条流水线的续跑、分母、`action_latency` / `rtf` 透传；两个旧工具的提示 |
 | W1-15b 第二轮（11-12 08:58） | `f3b7a14` | `b7118e9` | 9 个文件，+320 −14 | `eval_3dgs` 的三个调用方（`tools/dagger_pipeline.py`、`tools/compare_datasets.py`、`tools/train_student_with_video.py`）显式传 `--allow-train-scene`，汇总标注实际划分；三条流水线文件头的起跑食谱 `>` 改 `>>` |
-| C1a（11-12 09:03） | `a9fa8b4` | 待推 | 17 个文件，+1604 −79 | `src/trainer.cpp`（增强随机数随 seed、续训继承 `max_grad_norm`、`--log-grad-norm`）；`src/trainer_eval.cpp`（eval-only 的碰撞口径取自 config 与 checkpoint 契约）；`src/checkpoint.cpp`（读契约位）；`--cuda-blocking-sync`；7 个新 CTest |
-| E2E-1 的代码部分（11-12 09:03） | `13ad44f` | 待推 | 24 个文件，+4291 −10 | `tools/average_ckpt.py`（校准支持带条件输入的模型）；`experiments/2026-11-12-e2e-heading-code/`（入口、汇总器、对拍、演练测试）。实验结果另起一次合并 |
+| C1a（11-12 09:03） | `a9fa8b4` | `44c2710` | 17 个文件，+1604 −79 | `src/trainer.cpp`（增强随机数随 seed、续训继承 `max_grad_norm`、`--log-grad-norm`）；`src/trainer_eval.cpp`（eval-only 的碰撞口径取自 config 与 checkpoint 契约）；`src/checkpoint.cpp`（读契约位）；`--cuda-blocking-sync`；7 个新 CTest |
+| E2E-1 的代码部分（11-12 09:03） | `13ad44f` | `b64d67f` | 24 个文件，+4291 −10 | `tools/average_ckpt.py`（校准支持带条件输入的模型）；`experiments/2026-11-12-e2e-heading-code/`（入口、汇总器、对拍、演练测试）。实验结果另起一次合并 |
 | W1-13 第一、二部分（11-12 08:05） | `e40c693` | `7770479` | 15 个文件，+2637 −36 | `sim/tools/collect.py`、`cf_sitl_exec.py`、`eval_closed_loop.py` 的三项记账与 `protocol_notes`；`collect_parallel.py` 的透传；`tools/preprocess.py --drop-late-and-stall` |
 | W1-15a（11-12 08:03） | `f2c1107` | `a177ab2` | 7 个文件，+1500 | 新文件 `tools/exp_lib.sh`、`tools/stop_daemon.sh`、`experiments/_template/`；`tools/check.sh` 的 E-13 三行 |
 | W1-14（11-12 07:42） | `0d7f3b5` | `c284175` | 6 个文件，+1195 −68 | 新文件 `tools/paired_stats.py`；`tools/stats_report.py` 的多 run 配对、整簇区间、协议一致性键、失败集记 0；`docs/EVAL_STANDARD.md` §5 |
