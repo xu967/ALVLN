@@ -31,9 +31,9 @@
 | W1-12 | `dfb98c4` | `0401dee` | 15 个文件，+3776 −18 | `sim/3dgs/planner.py` 的 `clearance=swept`；`collect_3dgs.py` 出生两层判空（缺省关） |
 | E2E-0 | `f39ba81` | `2c95ea0` | 12 个文件，+2561 | 只有实验入口与分析脚本 |
 | T1（第二批，11-12 06:54） | `b706b2f` | `fe6ca32` | 5 个文件，+544 | 只加测试（审核 F4、F5 的两个 C++ 测试与公共夹具） |
-| S1b 第一轮（11-12 08:29） | `2b3eee7` | 推镜像后补 | 13 个文件，+2496 −27 | `sim/3dgs/collision.py` 的 `collision_model`（缺省 v1 不变；v2 未定稿）、`planner.py`、`collect_3dgs.py`、新文件 `route_dirs.py`；重定基线的入口 |
+| S1b 第一轮（11-12 08:29） | `2b3eee7` | `f0d2747` | 13 个文件，+2496 −27 | `sim/3dgs/collision.py` 的 `collision_model`（缺省 v1 不变；v2 未定稿）、`planner.py`、`collect_3dgs.py`、新文件 `route_dirs.py`；重定基线的入口 |
 | W1-15b（11-12 08:11） | `035b398` | `cc48b27` | 13 个文件，+1775 −119 | `tools/pipeline_common.py`（实例锁、`run.pid`、`eval_state`、`retire_dir`）；三条流水线的续跑、分母、`action_latency` / `rtf` 透传；两个旧工具的提示 |
-| W1-15b 第二轮（11-12 08:58） | `f3b7a14` | 待推 | 9 个文件，+320 −14 | `eval_3dgs` 的三个调用方（`tools/dagger_pipeline.py`、`tools/compare_datasets.py`、`tools/train_student_with_video.py`）显式传 `--allow-train-scene`，汇总标注实际划分；三条流水线文件头的起跑食谱 `>` 改 `>>` |
+| W1-15b 第二轮（11-12 08:58） | `f3b7a14` | `b7118e9` | 9 个文件，+320 −14 | `eval_3dgs` 的三个调用方（`tools/dagger_pipeline.py`、`tools/compare_datasets.py`、`tools/train_student_with_video.py`）显式传 `--allow-train-scene`，汇总标注实际划分；三条流水线文件头的起跑食谱 `>` 改 `>>` |
 | W1-13 第一、二部分（11-12 08:05） | `e40c693` | `7770479` | 15 个文件，+2637 −36 | `sim/tools/collect.py`、`cf_sitl_exec.py`、`eval_closed_loop.py` 的三项记账与 `protocol_notes`；`collect_parallel.py` 的透传；`tools/preprocess.py --drop-late-and-stall` |
 | W1-15a（11-12 08:03） | `f2c1107` | `a177ab2` | 7 个文件，+1500 | 新文件 `tools/exp_lib.sh`、`tools/stop_daemon.sh`、`experiments/_template/`；`tools/check.sh` 的 E-13 三行 |
 | W1-14（11-12 07:42） | `0d7f3b5` | `c284175` | 6 个文件，+1195 −68 | 新文件 `tools/paired_stats.py`；`tools/stats_report.py` 的多 run 配对、整簇区间、协议一致性键、失败集记 0；`docs/EVAL_STANDARD.md` §5 |
