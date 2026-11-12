@@ -837,6 +837,8 @@ def run_main(extra_argv, rows, scene=SCENE, student_cls=None, steps=None):
 
 
 class FakeStudentPolicy:
+    prev_dim = 4
+
     def __init__(self, ckpt, infer_bin, text_ids=None):
         pass
 

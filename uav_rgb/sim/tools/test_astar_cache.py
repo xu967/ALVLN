@@ -219,6 +219,71 @@ class AstarWarmUp(unittest.TestCase):
             T.warm_free_cells(sg.sample_pillars(seed)[0], clearance=0.4)
         self.assertLessEqual(len(T._FREE_CACHE), T._FREE_CACHE_MAX_SCENES)
 
+    def test_default_warm_up_covers_all_retry_clearances_without_eviction(self):
+        pillars, _ = sc.sample_course(1, 3)
+        _x0, _y0, nx, ny = T._grid_spec(pillars, 0.1)
+        p0 = pillars[0]
+        sx, sy = float(p0["x"]) - 0.42, float(p0["y"])   # 距柱面 0.22 m：0.40 与 0.30 无路，触发 0.20 重试
+        T.set_vehicle("e1_mini", "base")
+        try:
+            n = T.warm_free_cells(pillars)
+            self.assertEqual(n, 3 * nx * ny, "标准余量 0.40 + 两档重试 0.30/0.20 共 3 张栅格")
+            self.assertEqual(sorted(k[0] for k in T._FREE_CACHE), [0.20, 0.30, 0.40])
+            self.assertLessEqual(len(T._FREE_CACHE), T._FREE_CACHE_MAX_SCENES)
+            with mock.patch.object(T, "_point_blocked", wraps=T._point_blocked) as spy:
+                T.plan_action_global_tiebreak(sx, sy, 0.0, pillars, "legacy")
+                T.plan_action_global_tiebreak(sx, sy, 0.0, pillars, "visible")
+            self.assertEqual(spy.call_count, 0, "预热后首次触发 B3 重试也不再现算任何格子")
+        finally:
+            T.set_vehicle("x3", "base")
+
+    def test_warm_up_preserves_exact_actions_across_all_regimes(self):
+        rng = random.Random(20261112)
+        T.set_vehicle("e1_mini", "base")
+        try:
+            checked = 0
+            for seed in (1, 113, 122):
+                pillars, _ = sc.sample_course(seed, 3)
+                p0, plast = pillars[0], max(pillars, key=lambda p: p["x"])
+                probes = [
+                    (float(p0["x"]) - 0.55, float(p0["y"]), 0.0),      # 0.35 m：命中 0.30 重试
+                    (float(p0["x"]) - 0.42, float(p0["y"]), 15.0),     # 0.22 m：命中 0.20 重试
+                    (float(p0["x"]) - 0.36, float(p0["y"]), -20.0),    # 0.16 m：三档全无路，退回局部
+                    (float(plast["x"]) + 0.4, 1.2, 10.0),              # 过柱阵后 B2 区域
+                ]
+                for _ in range(8):
+                    probes.append((rng.uniform(-0.5, float(plast["x"]) + 0.5),
+                                   rng.uniform(-2.0, 2.0), rng.uniform(-90.0, 90.0)))
+                cold = []
+                for x, y, yaw in probes:
+                    for tb in ("legacy", "visible"):
+                        clear_cache()
+                        cold.append(T.plan_action_global_tiebreak(x, y, yaw, pillars, tb))
+                clear_cache()
+                T.warm_free_cells(pillars)
+                hot = [T.plan_action_global_tiebreak(x, y, yaw, pillars, tb)
+                       for x, y, yaw in probes for tb in ("legacy", "visible")]
+                self.assertEqual(hot, cold, f"seed={seed}")
+                checked += len(hot)
+            self.assertGreaterEqual(checked, 72)
+        finally:
+            T.set_vehicle("x3", "base")
+
+    def test_forest_and_v5_warm_only_standard_clearance(self):
+        pillars, _ = sc.sample_course(1, 2)
+        _x0, _y0, nx, ny = T._grid_spec(pillars, 0.1)
+        try:
+            T.set_vehicle("e1_mini", "forest_e1")
+            clear_cache()
+            self.assertEqual(T.warm_free_cells(pillars), nx * ny)
+            self.assertEqual([k[0] for k in T._FREE_CACHE], [0.20])
+            T.set_vehicle("e1_mini", "base", version="uavrgb.teacher.v5")
+            clear_cache()
+            self.assertEqual(T.warm_free_cells(pillars), nx * ny)
+            self.assertEqual([k[0] for k in T._FREE_CACHE], [0.40])
+        finally:
+            T.set_vehicle("x3", "base")
+
 
 if __name__ == "__main__":
     unittest.main()

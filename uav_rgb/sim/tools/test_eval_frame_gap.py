@@ -61,8 +61,8 @@ class FrameGapReport(unittest.TestCase):
         self.assertEqual(set(self.eps[122]), OLD_EPISODE_KEYS_BASE)
 
     def test_only_per_episode_gains_keys(self):
-        self.assertEqual(set(self.report), OLD_TOP_KEYS_BASE | {"collisions_per_100m"},
-                         "顶层键集合与 W1-4 之后一致：aggregate 没动，也没有新的汇总键")
+        self.assertEqual(set(self.report), OLD_TOP_KEYS_BASE | {"collisions_per_100m", "collisions_per_100m_def"},
+                         "顶层键集合与 W1-4 / I1-5 之后一致：aggregate 没动，frame_gap 不加顶层汇总键")
         self.assertEqual(set(self.eps[1]), OLD_EPISODE_KEYS_BASE | GAP_KEYS)
         self.assertEqual(set(self.eps[113]), OLD_EPISODE_KEYS_BASE | {"max_frame_gap_s"})
 
@@ -82,17 +82,27 @@ class HoldComesFromTheCommandLine(unittest.TestCase):
 
     def test_flag_follows_hold(self):
         n = len(ramp(6.3)) - 1
-        spike = [1.0] * n
-        spike[10] = 2.4
-        pair = {1: stamped(traj(ramp(6.3)), spike), 113: stamped(traj(ramp(6.3)), [1.0] * n)}
-        # --hold 2.0：阈值 2.4 s，2.4 s 的间隔不算大于
-        eps = by_seed(run_eval("base", pair, extra_argv=["--hold", "2.0"]))
-        self.assertEqual(eps[1]["max_frame_gap_s"], 2.4)
-        self.assertNotIn("frame_gap_flag", eps[1])
-        # --hold 0.5：阈值 0.6 s，全程 1.0 s 的那集也算断帧
-        eps = by_seed(run_eval("base", pair, extra_argv=["--hold", "0.5"]))
-        self.assertIs(eps[113]["frame_gap_flag"], True)
-        self.assertIs(eps[1]["frame_gap_flag"], True)
+        spike_12 = [0.9] * n
+        spike_12[10] = 1.2
+        spike_21 = [1.9] * n
+        spike_21[10] = 2.1
+        pair = {1: stamped(traj(ramp(6.3)), spike_21),
+                113: stamped(traj(ramp(6.3)), spike_12),
+                122: stamped(traj(ramp(6.3)), [1.0] * n)}
+        # 默认 --hold 1.0（阈值 1.1 s）：1.0 s 不打旗，1.2 s 与 2.1 s 打旗
+        eps1 = by_seed(run_eval("base", pair))
+        self.assertNotIn("frame_gap_flag", eps1[122])
+        self.assertIs(eps1[113]["frame_gap_flag"], True)
+        self.assertIs(eps1[1]["frame_gap_flag"], True)
+        # --hold 2.0（名义 1.9 s + 0.2 s = 阈值 2.1 s）：2.1 s 与 1.2 s 都不打旗
+        eps2 = by_seed(run_eval("base", pair, extra_argv=["--hold", "2.0"]))
+        self.assertEqual(eps2[1]["max_frame_gap_s"], 2.1)
+        self.assertNotIn("frame_gap_flag", eps2[1])
+        self.assertNotIn("frame_gap_flag", eps2[113])
+        # --hold 0.5（名义 0.4 s + 0.2 s = 阈值 0.6 s）：全程 1.0 s 的那集也算断帧
+        eps05 = by_seed(run_eval("base", pair, extra_argv=["--hold", "0.5"]))
+        self.assertIs(eps05[122]["frame_gap_flag"], True)
+        self.assertIs(eps05[113]["frame_gap_flag"], True)
 
 
 if __name__ == "__main__":

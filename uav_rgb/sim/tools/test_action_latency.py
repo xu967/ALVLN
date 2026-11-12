@@ -343,6 +343,7 @@ class ActionLatencyMain(unittest.TestCase):
         self.assertEqual([e if isinstance(e, str) else e[0] for e in log], ["warm", "takeoff", "step", "step"])
         warm = log[0]
         self.assertEqual(warm[1], (tc.SCENE["pillars"],), "整张栅格按本集 scene-meta 的柱子填")
+        self.assertEqual(warm[2], {"include_retries": True}, "I1-4：带 --action-latency 预热一并覆盖重试余量")
         code, log = self.run_loop([], self.ok_row, steps=2)
         self.assertEqual(code, 0)
         self.assertEqual(log, ["takeoff", "step", "step"], "不给开关：不预热")

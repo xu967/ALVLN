@@ -238,16 +238,31 @@ def frame_gap_checks():
     assert s["max_frame_gap_s"] == 1.0 and "frame_gap_flag" not in s, s
     # 取的是相邻两步之差的最大值，不是首尾之差，也不是平均
     assert gap_run((1.0, 1.1, 1.0), hold=1.0)["max_frame_gap_s"] == 1.1
-    # 阈值是严格大于 1.2 × hold：恰好 1.2 s 不打旗，1.201 s 打旗
-    assert "frame_gap_flag" not in gap_run((1.0, 1.2), hold=1.0)
-    assert gap_run((1.0, 1.201), hold=1.0)["frame_gap_flag"] is True
-    # 阈值跟着 hold 走：同样 1.0 s 的间隔，hold 0.5 时算断帧，hold 1.0 时不算
+    # I1-9：给了 hold（Gazebo）时与 collect.is_stall_gap 共用同一判据：严格大于 max(0.1, hold - 0.1) + 0.2 s
+    # hold=1.0 时名义 0.9 s、阈值 1.1 s：恰好 1.1 s 不打旗，1.101 s 与 1.2 s 都打旗
+    assert "frame_gap_flag" not in gap_run((1.0, 1.1), hold=1.0)
+    assert gap_run((1.0, 1.101), hold=1.0)["frame_gap_flag"] is True
+    assert gap_run((1.0, 1.2), hold=1.0)["frame_gap_flag"] is True
+    # hold=0.2 时名义 max(0.1, 0.1)=0.1 s、阈值 0.3 s：0.30 s 不误标，0.35 s 打旗
+    assert "frame_gap_flag" not in gap_run((0.3, 0.3), hold=0.2)
+    assert gap_run((0.3, 0.35), hold=0.2)["frame_gap_flag"] is True
+    # 阈值跟着 hold 走：同样 1.0 s 的间隔，hold 0.5（阈值 0.6 s）算断帧，hold 1.0（阈值 1.1 s）不算
     assert gap_run((1.0, 1.0), hold=0.5)["frame_gap_flag"] is True
     assert "frame_gap_flag" not in gap_run((1.0, 1.0), hold=1.0)
+    # 同一集同时带 rgb_ts 与 obs_gap_s 时，frame_gap_flag 与 stall_steps > 0 完全同真同假
+    for h_val in (0.5, 1.0, 2.0):
+        for g_val in (0.4, 0.6, 0.8, 0.9, 1.1, 1.15, 1.2, 1.9, 2.1, 2.2):
+            ts0 = 10 * 10**9
+            r_pair = [{"step": 0, "collision": False, "action_executed": 1, "rgb_ts": ts0, "obs_gap_s": None},
+                      {"step": 1, "collision": False, "action_executed": 1,
+                       "rgb_ts": ts0 + int(round(g_val * 1e9)), "obs_gap_s": g_val}]
+            st = gap_summary(r_pair, hold=h_val)
+            assert bool(st.get("frame_gap_flag")) == (st["stall_steps"] > 0), (h_val, g_val, st)
 
-    # 拿不到 hold 时用行里的 sim_dt（3DGS 的行带 sim_dt = hold_s）
+    # 拿不到 hold 时（3DGS 的行带 sim_dt = hold_s，无 10 Hz 相机相位差）保持原 1.2 × sim_dt 判据
     assert gap_run((1.0, 1.0), sim_dt=0.5)["frame_gap_flag"] is True
-    assert "frame_gap_flag" not in gap_run((1.0, 1.0), sim_dt=1.0)
+    assert "frame_gap_flag" not in gap_run((1.0, 1.2), sim_dt=1.0)
+    assert gap_run((1.0, 1.201), sim_dt=1.0)["frame_gap_flag"] is True
     # 给了 hold 就以 hold 为准，不看 sim_dt
     assert "frame_gap_flag" not in gap_run((1.0, 1.0), hold=1.0, sim_dt=0.5)
     # 行里的 sim_dt 取中位数：个别行的离群值不能把阈值抬高

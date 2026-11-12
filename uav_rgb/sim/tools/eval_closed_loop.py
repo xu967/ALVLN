@@ -63,9 +63,13 @@ CORRIDOR_HALF_WIDTH_DEFAULT = None
 # 逐块存活判据 block_outcomes 缺省的走廊半宽（m），等于 scene_gen.Y_RANGE 的边界（summarize.py 沿用多年的缺省值）。
 # 评测命令行的 --corridor-half-width 默认仍是 None（关），与这个缺省无关；blocks_passed 一律显式传评测自己的值。
 BLOCK_CORRIDOR_HALF_WIDTH_M = 3.0
-# collisions_per_100m 的分母：run_episode 把每集量到首次碰撞 / 越界 / 过线的路程放进这个键，只给 write_report 汇总用，
-# 不写进 per_episode（任务卡 W1-4 没列这个键；infer_ms 也是这样只供汇总、不落盘）。原始轨迹在 <out>/episodes/seed_N。
+# collisions_per_100m 的事件窗口（W1-4 / W1-13b I1-5）：从起点到第一个终局事件（首次越出走廊、首次进目标区/过终点线、碰撞）。
+# run_episode 把每集窗口内的路程与窗口内是否碰撞放在下面两个私有键，只供 write_report 汇总，不写进 per_episode；
+# eval.json 顶层用 collisions_per_100m_def 标记定义版本（W1-4 旧产物缺该键 = 整集分子/截断分母，不可混报；metric_version
+# 保持 sim09.v2，不让 SR/CR/SPL 统计表分裂或让流水线误判基线失效）。
 FLIGHT_PATH_KEY = "_flight_path_m"
+WINDOW_COLLISION_KEY = "_window_collision"
+COLLISIONS_PER_100M_DEF = "v2.first_terminal_event"
 # cf_sitl（固件在环）下 FORWARD 到期后机体还会滑行，碰撞步的 action 多半已是 SAFE/YAW；
 # false_forward 改成「碰撞前 1 s 仿真内下过 FORWARD」。metric_version 带后缀，数字不与旧档混报。
 COAST_WINDOW_S = {"cf_sitl": 1.0}
@@ -512,28 +516,59 @@ def blocks_passed(oracle, actions, block_goal_x, corridor_half_width):
     return sum(block_outcomes(actions, oracle, block_goal_x, corridor_half_width)["pass"])
 
 
-def flight_path_m(oracle, actions, goal_x, waypoint=None, stop_radius=None, goal_radius=None,
-                  corridor_half_width=None):
-    """collisions_per_100m 的分母（一集）：oracle xy 折线，从首点量到首次接触碰撞、越界（|y| > 走廊半宽）或进入目标区为止，单位 m。
+def collision_window(oracle, actions, goal_x, waypoint=None, stop_radius=None, goal_radius=None,
+                     corridor_half_width=None):
+    """collisions_per_100m 的事件窗口（W1-13b I1-5）：从起点到第一个终局事件，返回 (窗口内路程 m 或 None, 窗口内是否接触碰撞)。
 
-    碰撞 / 越界发生的那一步算在内；stuck 不是碰撞。目标区与 summarize_episode 的 p_i 同一个（验收线任务 = x >= goal_x 半平面，
-    量到边界的插值点；waypoint 任务 = 到达圆）。越界只对验收线任务生效：waypoint 任务的 waypoint 本身可以在走廊外
-    （见 summarize_episode 的 success 判据）。没有任何 pose_gt 时 None。
+    终局事件 = 首次接触碰撞（stuck 不算）、首次越出走廊（|y| > corridor_half_width，只对非 waypoint 任务生效）、
+    首次进入目标区或过终点线（与 summarize_episode 的 p_i 同一目标区）。同一步既碰撞又越界（或既碰撞又过线）按碰撞记，
+    与 block_outcomes 一致；越界或进目标区之后才发生的接触不进分子。单步即终止（len(traj) == 1）时用第 0 步
+    pose_before -> pose_gt 的折线长计路程，不返回 0。没有任何 pose_gt 时路程为 None。
     """
     waypoint_task = stop_radius is not None
     half = None if waypoint_task else corridor_half_width
+    radius = (REACH_RADIUS if goal_radius is None else float(goal_radius)) if waypoint_task else None
     end = len(oracle)
+    win_collision = False
     for i, o in enumerate(oracle):
         a = actions[i] if i < len(actions) else {}
         pg = o.get("pose_gt") if isinstance(o, dict) else None
         has_pose = isinstance(pg, dict) and "x" in pg and "y" in pg
-        outside = has_pose and half is not None and abs(float(pg["y"])) > half
-        if (bool(a.get("collision")) and _src(a) != "stuck") or outside:
-            end = i + 1   # 事件那一步的位姿也算进路程
+        collided = bool(a.get("collision")) and _src(a) != "stuck"
+        outside = has_pose and half is not None and abs(float(pg["y"])) > float(half)
+        if waypoint_task:
+            in_goal = (has_pose and isinstance(waypoint, dict)
+                       and math.hypot(float(pg["x"]) - float(waypoint["x"]),
+                                      float(pg["y"]) - float(waypoint["y"])) <= radius)
+        else:
+            in_goal = has_pose and goal_x is not None and float(pg["x"]) >= float(goal_x)
+        if collided or outside or in_goal:
+            end = i + 1   # 事件那一步的位姿算进路程（过线/进圆段再由 goal_path_length_m 插值截断）
+            win_collision = collided
             break
-    return goal_path_length_m(trajectory_xy(oracle[:end]), goal_x=goal_x,
-                              waypoint=waypoint if waypoint_task else None,
-                              radius=(REACH_RADIUS if goal_radius is None else goal_radius) if waypoint_task else None)
+    else:
+        if any(bool(a.get("collision")) and _src(a) != "stuck" for a in actions[len(oracle):]):
+            win_collision = True
+    traj = trajectory_xy(oracle[:end])
+    if not traj:
+        return None, win_collision
+    if len(traj) == 1 and actions:
+        pb = actions[0].get("pose_before")
+        if isinstance(pb, dict) and "x" in pb and "y" in pb:
+            traj = [(float(pb["x"]), float(pb["y"])), traj[0]]
+        elif (actions[0].get("displacement_m") or 0.0) > 0.0:
+            return float(actions[0]["displacement_m"]), win_collision
+    path_m = goal_path_length_m(traj, goal_x=goal_x,
+                                waypoint=waypoint if waypoint_task else None,
+                                radius=radius)
+    return path_m, win_collision
+
+
+def flight_path_m(oracle, actions, goal_x, waypoint=None, stop_radius=None, goal_radius=None,
+                  corridor_half_width=None):
+    """collisions_per_100m 的分母（一集）：从起点量到第一个终局事件的路程（m），见 collision_window。"""
+    return collision_window(oracle, actions, goal_x, waypoint=waypoint, stop_radius=stop_radius,
+                            goal_radius=goal_radius, corridor_half_width=corridor_half_width)[0]
 
 
 # W1-3：相邻两帧的间隔大于 hold 的这个倍数，per_episode 记 frame_gap_flag: true。
@@ -716,12 +751,17 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
             "path_length_m": p_i, "shortest_path_m": shortest_path_m,
             "spl": spl_of(success, p_i, shortest_path_m),
             "steps_to_goal": steps_to_goal}
-    # W1-3：相邻帧最大间隔与断帧旗（只加不改；缺 rgb_ts 的旧数据、一步集不写键）。
+    # W1-3 / W1-13b I1-9：相邻帧最大间隔与断帧旗（只加不改；缺 rgb_ts 的旧数据、一步集不写键）。
+    # 给了 hold（Gazebo 线）时与停顿步共用 collect.is_stall_gap(gap, hold)；不给 hold 的 3DGS 集无 10 Hz 相机相位差，保持 1.2 × sim_dt。
     gap = max_frame_gap_s(actions)
     if gap is not None:
         stat["max_frame_gap_s"] = gap
-        ref = frame_gap_reference_s(actions, hold)
-        if ref is not None and ref > 0 and gap > FRAME_GAP_FLAG_FACTOR * ref:
+        if hold is not None:
+            flagged = float(hold) > 0 and collect.is_stall_gap(gap, hold=float(hold))
+        else:
+            ref = frame_gap_reference_s(actions, None)
+            flagged = ref is not None and ref > 0 and gap > FRAME_GAP_FLAG_FACTOR * ref
+        if flagged:
             stat["frame_gap_flag"] = True
     # W1-13 A1：步间 SAFE 空档（collect 每步记 safe_gap_s = 本步派发戳减上一步执行器截止；首步 null）。
     # 旧数据、旧 collect 的集没有这个字段，没有非空值时不写键；下一动作先到时为负，照常进分布。
@@ -821,15 +861,17 @@ def aggregate(episodes, requested=None, attempted=None, failed_count=0, skipped_
 
 
 def collisions_per_100m(episodes):
-    """每百米接触碰撞数 = 100 × 有接触碰撞的集数 ÷ 各集 FLIGHT_PATH_KEY（m）之和；集数口径同 collision_rate 的分子。
+    """每百米接触碰撞数（W1-13b I1-5：v2.first_terminal_event）= 100 × 窗口内有接触碰撞的集数 ÷ 各集窗口路程之和。
 
-    episodes 是完成集（run_episode 的返回，failed[] / skipped[] 的集不在内，没有路程可量）。总路程为 0（含没有完成集）时 None，
-    不是 0：没飞过不能说每百米 0 次碰撞。零碰撞但飞过时是 0.0。
+    分子与分母同取「从起点到第一个终局事件」窗口（WINDOW_COLLISION_KEY 与 FLIGHT_PATH_KEY）；越界或到达目标之后才发生的接触
+    不进分子（整集 collision_rate 不动）。单测直接构造无 WINDOW_COLLISION_KEY 的字典时回退读 collision。总路程为 0 时 None。
     """
     total = sum(e.get(FLIGHT_PATH_KEY) or 0.0 for e in episodes)
     if total <= 0.0:
         return None
-    return 100.0 * sum(1 for e in episodes if e.get("collision")) / total
+    hits = sum(1 for e in episodes
+               if (bool(e[WINDOW_COLLISION_KEY]) if WINDOW_COLLISION_KEY in e else bool(e.get("collision"))))
+    return 100.0 * hits / total
 
 
 def block_survival(episodes, requested, blocks):
@@ -1043,10 +1085,11 @@ def run_episode(seed, args, workdir, seen_gids):
         summary["blocks_total"] = len(meta["course"]["block_goal_x"])
         summary["blocks_passed"] = blocks_passed(oracle, actions, meta["course"]["block_goal_x"],
                                                  args.corridor_half_width)
-    # W1-4：collisions_per_100m 的分母（所有任务）。私有键，write_report 汇总后从 per_episode 里去掉。
-    summary[FLIGHT_PATH_KEY] = flight_path_m(oracle, actions, goal_x, meta.get("waypoint"),
-                                             meta.get("stop_radius"), meta.get("goal_radius"),
-                                             args.corridor_half_width)
+    # W1-4 / W1-13b I1-5：collisions_per_100m 的窗口内路程与窗口内碰撞（所有任务）。私有键，write_report 汇总后从 per_episode 去掉。
+    summary[FLIGHT_PATH_KEY], summary[WINDOW_COLLISION_KEY] = collision_window(
+        oracle, actions, goal_x, meta.get("waypoint"),
+        meta.get("stop_radius"), meta.get("goal_radius"),
+        args.corridor_half_width)
     # W1-0：观测戳到派发的仿真秒（collect 每步都记 dispatch_lag_s；旧 collect 的集没有，不写键）。
     lags = [a["dispatch_lag_s"] for a in actions if a.get("dispatch_lag_s") is not None]
     if lags:
@@ -1394,6 +1437,8 @@ def main():
         p.error("--heading-guard 必须是非负整数，且只能和 --policy student 一起用")
     if args.student_cond != nav_cond.COND_PREV_ACTION and args.policy != "student":
         p.error("--student-cond 只能和 --policy student 一起用")
+    if args.student_cond == nav_cond.COND_HEADING_CODE and args.task in ("l1", "campus", "campus_assets"):
+        p.error(f"--student-cond heading-code 只用于航向设定值 H=0 的走廊任务，不支持带 waypoint 的 --task {args.task}")
     if args.policy != "rule-oracle" and args.rule_hfov_deg != 60.0:
         p.error("--rule-hfov-deg 只能和 --policy rule-oracle 一起用")
     if args.policy != "rule-oracle" and args.rule_version != "v0":
@@ -1405,12 +1450,24 @@ def main():
         p.error("cf_blackbox 是纯 Python 模型档，Gazebo 闭环未接入；"
                 "请让 3DGS collector 直接调用 cf_blackbox，或改用 cf_stab/x3_velocity")
     cp.resolve_vehicle(args, p.error)
+    args._cf_sitl_params_obj = None
     if args.cf_sitl_params is not None:
         if args.dynamics != "cf_sitl":
             p.error("--cf-sitl-params 只能和 --dynamics cf_sitl 一起用")
         if not os.path.isfile(args.cf_sitl_params):
             p.error(f"--cf-sitl-params 文件不存在: {args.cf_sitl_params}")
         args.cf_sitl_params = os.path.abspath(args.cf_sitl_params)   # scene_gen 与 collect 在别的 cwd 下起，只传绝对路径
+        import scene_gen as _sg
+        if _sg.CF_SITL_PARAMS_BAD_CHARS.search(args.cf_sitl_params):
+            p.error(f"--cf-sitl-params 路径含空白或 XML 特殊字符（< > &），不写进世界: {args.cf_sitl_params!r}")
+        import cf_sitl_exec as _ce
+        try:
+            parsed = _ce.CfSitlParams.from_json(args.cf_sitl_params)
+        except (OSError, UnicodeDecodeError, ValueError, TypeError, KeyError) as e:
+            p.error(f"--cf-sitl-params 无法加载: {e}")
+        if not any(isinstance(v, dict) and "value" in v for v in parsed.obj.values()):
+            p.error(f"--cf-sitl-params 缺少形如 {{\"value\": ...}} 的参数项: {args.cf_sitl_params}")
+        args._cf_sitl_params_obj = parsed
     if (args.task == "forest_e1") != (args.density is not None):
         p.error("--density 与 --task forest_e1 必须同时给")
     if args.task == "forest_e1" and args.vehicle != "e1_mini":
@@ -1554,20 +1611,39 @@ def report_metric_version(args):
     return v
 
 
-def dynamics_profile_of(results):
-    """eval.json 顶层的 dynamics_profile（W1-10）：各集 manifest 的 dynamics_profile 一致时是那个字符串；没有任何一集记了它
-    时是 None；不一致说明动力学在集间换了（数据错误），返回排序后的列表，不挑一个。"""
-    profiles = sorted({e["dynamics_profile"] for e in results if e.get("dynamics_profile")})
-    if not profiles:
+def _cf_sitl_lib_version():
+    """从 sim/cf_sitl/include/cf_sitl.h 读取 CF_SITL_LIB_VERSION（同 tools/make_params_variant.py）；读不到返回 None。"""
+    import re
+    header = os.path.join(SIM_DIR, "cf_sitl", "include", "cf_sitl.h")
+    try:
+        with open(header, encoding="utf-8") as f:
+            m = re.search(r"^\s*#\s*define\s+CF_SITL_LIB_VERSION\s+(\d+)\b", f.read(), re.M)
+    except OSError:
         return None
-    return profiles[0] if len(profiles) == 1 else profiles
+    return int(m.group(1)) if m else None
 
 
-def cf_sitl_params_record(path):
+def dynamics_profile_of(results, params_path=None, params_obj=None):
+    """eval.json 顶层的 dynamics_profile（W1-10 / W1-13b I1-7）：各集 manifest 的 dynamics_profile 一致时取该字符串；
+    不一致返回排序后的列表；完成集为空（全失败）而给了参数文件时，由参数文件加 CF_SITL_LIB_VERSION 算出，不写 null。"""
+    profiles = sorted({e["dynamics_profile"] for e in results if e.get("dynamics_profile")})
+    if profiles:
+        return profiles[0] if len(profiles) == 1 else profiles
+    if params_obj is None and params_path:
+        import cf_sitl_exec
+        params_obj = cf_sitl_exec.CfSitlParams.from_json(params_path)
+    if params_obj is not None:
+        import cf_sitl_exec
+        return cf_sitl_exec.format_profile(params_obj.values_sha256, _cf_sitl_lib_version())
+    return None
+
+
+def cf_sitl_params_record(path, params_obj=None):
     """参数副本的追溯记录：路径、文件字节 sha256、各项 value 的规范化 sha256（dynamics_profile 里的 sha8 取自它）。"""
-    import cf_sitl_exec   # 只有给了 --cf-sitl-params 才需要
-    p = cf_sitl_exec.CfSitlParams.from_json(path)
-    return {"path": path, "sha256": p.sha256, "values_sha256": p.values_sha256}
+    if params_obj is None:
+        import cf_sitl_exec   # 只有给了 --cf-sitl-params 才需要
+        params_obj = cf_sitl_exec.CfSitlParams.from_json(path)
+    return {"path": path, "sha256": params_obj.sha256, "values_sha256": params_obj.values_sha256}
 
 
 def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_dim, infer_bin, started, notes=()):
@@ -1655,8 +1731,9 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
               **({"rtf": args.rtf} if args.rtf is not None else {}),
               # W1-10：参数副本。只在给了 --cf-sitl-params 时写键（默认 eval.json 逐位不变）：路径与两个 sha 随结果留证；
               # dynamics_profile 取各集 manifest 的值（collect 读同一份副本算出），与 per_episode 里的逐集记录互相印证。
-              **({"cf_sitl_params": cf_sitl_params_record(args.cf_sitl_params),
-                  "dynamics_profile": dynamics_profile_of(results)}
+              **({"cf_sitl_params": cf_sitl_params_record(args.cf_sitl_params, getattr(args, "_cf_sitl_params_obj", None)),
+                  "dynamics_profile": dynamics_profile_of(results, args.cf_sitl_params,
+                                                          getattr(args, "_cf_sitl_params_obj", None))}
                  if getattr(args, "cf_sitl_params", None) else {}),
               # rule-oracle 的视场与规则参数：预注册的参数随结果留证（其它策略不写这两个键）
               **({"rule_hfov_deg": args.rule_hfov_deg,
@@ -1685,13 +1762,15 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
               "interrupted": (None if interrupted is None else
                               {"seed": interrupted["seed"], "reason": interrupted["reason"]}),
               **agg,
-              # W1-4：每百米接触碰撞数（所有任务；路程只量到首次碰撞 / 越界 / 过线，见 flight_path_m）。
+              # W1-4 / W1-13b I1-5：每百米接触碰撞数（分子与分母同取首终局事件窗口，定义版本见 collisions_per_100m_def）。
               # block_survival 只在 course_base 写（args.blocks 非空），分母 = 请求集数，与 requested_success_rate 同口径。
               "collisions_per_100m": collisions_per_100m(results),
+              "collisions_per_100m_def": COLLISIONS_PER_100M_DEF,
               **({"block_survival": block_survival(results, args.episodes, args.blocks)}
                  if args.blocks is not None else {}),
               "failed": failures, "skipped": skips,
-              "per_episode": [{k: v for k, v in e.items() if k not in ("infer_ms", FLIGHT_PATH_KEY)}
+              "per_episode": [{k: v for k, v in e.items()
+                               if k not in ("infer_ms", FLIGHT_PATH_KEY, WINDOW_COLLISION_KEY)}
                               for e in results]}
     path = os.path.join(out, "eval.json")
     with open(path, "w", encoding="utf-8") as f:

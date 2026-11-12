@@ -292,5 +292,160 @@ class EvalPassthroughTests(unittest.TestCase):
                              "--student-cond 只能和 --policy student 一起用")
 
 
+class CollectGateAndWaypointTests(unittest.TestCase):
+    """W1-13b I1-3 & I2-2(2)：collect.py 构造学生后调 check_student_cond 闸门；
+    collect.py / collect_parallel.py / eval_closed_loop.py 三处入口在带 waypoint 任务上拒绝 --student-cond heading-code。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _make_trained_ckpt(self, tag, cond_tag=None, prev_dim=4):
+        root = Path(self._tmp.name, tag)
+        root.mkdir()
+        ds = root / "dataset.uavr"
+        write_dataset(ds, {"schema": "uavrgb.dataset.v1", **({"cond": cond_tag} if cond_tag else {})})
+        ckpt = root / "ckpt_best.bin"
+        ckpt.write_bytes(b"ckpt")
+        (root / "config.json").write_text(json.dumps({
+            "schema": "uavrgb.train_config.v1", "data": str(ds),
+            "dataset_sha256": hashlib.sha256(ds.read_bytes()).hexdigest(),
+            "prev_action": bool(prev_dim),
+        }))
+        closed = []
+
+        class _Stu:
+            def __init__(self, _c, _b, text_ids=None):
+                self.prev_dim = prev_dim
+                self.text_dim = 0
+
+            def close(self):
+                closed.append(True)
+
+        return ckpt, _Stu, closed
+
+    def _run_collect(self, ckpt, stu_cls, extra_argv, scene=None):
+        scene = tc.SCENE if scene is None else scene
+        d = Path(self._tmp.name, f"c_{len(os.listdir(self._tmp.name))}")
+        d.mkdir()
+        out, meta = d / "ep", d / "scene.json"
+        meta.write_text(json.dumps(scene))
+        argv = ["collect.py", "--out", str(out), "--scene-meta", str(meta),
+                "--split", sm.split_for_scene(scene), "--steps", "2",
+                "--policy", "student", "--student-ckpt", str(ckpt)] + list(extra_argv)
+        subs = {k: tc.FakeSub(latest=tc.pose_msg(1.0)) for k in ("rgb", "depth", "pose", "contact", "camera_info")}
+        steps_called = []
+
+        def fake_step(_out, step_idx, *_a, **_kw):
+            steps_called.append(step_idx)
+            return tc.fake_row(step_idx, 1.0 + 0.25 * step_idx, executed_by="student"), None
+
+        err = io.StringIO()
+        code = 0
+        with patch.object(sys, "argv", argv), \
+             patch.object(collect, "open_subs", return_value=subs), \
+             patch.object(collect, "wait_ready", return_value=None), \
+             patch.object(collect, "read_camera_info", return_value=None), \
+             patch.object(collect.gz_io, "open_twist_publisher", return_value=tc.MainPub()), \
+             patch.object(collect, "take_off", return_value=0), \
+             patch.object(collect, "stop_executor"), \
+             patch.object(collect, "close_subs"), \
+             patch.object(collect, "collect_one", side_effect=fake_step), \
+             patch("student.StudentPolicy", stu_cls), \
+             contextlib.redirect_stderr(err):
+            try:
+                collect.main()
+            except SystemExit as e:
+                code = e.code
+        man_p = out / "episode_manifest.json"
+        man = json.loads(man_p.read_text()) if man_p.is_file() else None
+        return code, err.getvalue(), steps_called, man
+
+    def test_collect_rejects_pure_vision_ckpt_with_heading_code_and_closes_student(self):
+        ckpt, stu_cls, closed = self._make_trained_ckpt("pv0", cond_tag=None, prev_dim=0)
+        code, stderr, steps, man = self._run_collect(ckpt, stu_cls, ["--student-cond", "heading-code"])
+        self.assertEqual(code, 2)
+        self.assertEqual(steps, [], "闸门拒绝后一步也不能采")
+        self.assertEqual(closed, [True], "已启动的学生推理进程必须收尾关闭")
+        self.assertIn("不会生效", stderr)
+        if man is not None:
+            self.assertIn("不会生效", man["error"])
+            self.assertFalse(man["validity"]["episode_executed"])
+
+    def test_collect_rejects_heading_code_ckpt_when_flag_omitted(self):
+        ckpt, stu_cls, closed = self._make_trained_ckpt("hc", cond_tag=nav_cond.DATASET_COND_TAG, prev_dim=4)
+        code, stderr, steps, _ = self._run_collect(ckpt, stu_cls, [])
+        self.assertEqual(code, 2)
+        self.assertEqual(steps, [])
+        self.assertEqual(closed, [True])
+        self.assertIn("heading-code", stderr)
+        self.assertIn("不一致", stderr)
+
+    def test_collect_rejects_prev_action_ckpt_with_heading_code_flag(self):
+        ckpt, stu_cls, closed = self._make_trained_ckpt("pa", cond_tag=None, prev_dim=4)
+        code, stderr, steps, _ = self._run_collect(ckpt, stu_cls, ["--student-cond", "heading-code"])
+        self.assertEqual(code, 2)
+        self.assertEqual(steps, [])
+        self.assertEqual(closed, [True])
+        self.assertIn("prev-action", stderr)
+        self.assertIn("不一致", stderr)
+
+    def test_collect_accepts_matching_ckpts_and_keeps_default_manifest_unchanged(self):
+        import test_action_latency as tal
+        ckpt_pa, stu_pa, _ = self._make_trained_ckpt("ok_pa", cond_tag=None, prev_dim=4)
+        code_pa, _, steps_pa, man_pa = self._run_collect(ckpt_pa, stu_pa, [])
+        self.assertEqual((code_pa, steps_pa), (0, [0, 1]))
+        self.assertEqual(set(man_pa), tal.MANIFEST_KEYS_STUDENT, "匹配默认 prev-action 时 manifest 键集逐位不变")
+
+        ckpt_hc, stu_hc, _ = self._make_trained_ckpt("ok_hc", cond_tag=nav_cond.DATASET_COND_TAG, prev_dim=4)
+        code_hc, _, steps_hc, man_hc = self._run_collect(ckpt_hc, stu_hc, ["--student-cond", "heading-code"])
+        self.assertEqual((code_hc, steps_hc, man_hc["student_cond"]), (0, [0, 1], "heading-code"))
+
+    def test_all_three_entrypoints_reject_heading_code_on_waypoint_tasks(self):
+        import eval_closed_loop as ec
+        ckpt_hc, stu_hc, _ = self._make_trained_ckpt("wp_hc", cond_tag=nav_cond.DATASET_COND_TAG, prev_dim=4)
+        infer = Path(self._tmp.name, "uavrgb_infer")
+        infer.write_bytes(b"bin")
+
+        # 1) collect.py：scene_meta 含 waypoint
+        wp_scene = dict(tc.SCENE, waypoint={"x": 3.0, "y": 1.0}, stop_radius=0.5,
+                        instruction="go left", target_color="red", relation="left")
+        code_c, err_c, steps_c, man_c = self._run_collect(ckpt_hc, stu_hc, ["--student-cond", "heading-code"],
+                                                          scene=wp_scene)
+        self.assertEqual(code_c, 2)
+        self.assertEqual(steps_c, [])
+        self.assertIsNone(man_c, "在参数/场景校验阶段直接拒绝，不进主循环")
+        self.assertIn("waypoint", err_c)
+
+        # 2) collect_parallel.py：l1 / campus / campus_assets
+        for task_argv in (["--task", "l1", "--spawn-mode", "random"],
+                          ["--task", "campus"],
+                          ["--task", "campus_assets"]):
+            err_p = io.StringIO()
+            out_p = Path(self._tmp.name, f"p_{len(os.listdir(self._tmp.name))}")
+            argv_p = ["collect_parallel.py", "--policy", "student", "--student-ckpt", str(ckpt_hc),
+                      "--student-cond", "heading-code", "--out", str(out_p)] + task_argv
+            with patch.object(sys, "argv", argv_p), contextlib.redirect_stderr(err_p):
+                with self.assertRaises(SystemExit) as cm:
+                    parallel.main()
+            self.assertEqual(cm.exception.code, 2, task_argv)
+            self.assertIn("waypoint", err_p.getvalue(), task_argv)
+
+        # 3) eval_closed_loop.py：l1 / campus / campus_assets
+        for task_name in ("l1", "campus", "campus_assets"):
+            err_e = io.StringIO()
+            out_e = Path(self._tmp.name, f"e_{task_name}")
+            argv_e = ["eval_closed_loop.py", "--policy", "student", "--ckpt", str(ckpt_hc),
+                      "--infer-bin", str(infer), "--student-cond", "heading-code",
+                      "--task", task_name, "--seeds", "16", "--steps", "1", "--out", str(out_e)]
+            with patch.object(ec.sys, "argv", argv_e), \
+                 patch("student.StudentPolicy", return_value=Mock(text_dim=0, prev_dim=4)), \
+                 contextlib.redirect_stderr(err_e):
+                with self.assertRaises(SystemExit) as cm:
+                    ec.main()
+            self.assertEqual(cm.exception.code, 2, task_name)
+            self.assertIn("waypoint", err_e.getvalue(), task_name)
+
+
 if __name__ == "__main__":
     unittest.main()

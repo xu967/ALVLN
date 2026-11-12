@@ -224,6 +224,290 @@ class EvalCfSitlParams(unittest.TestCase):
         self.assertEqual(ec.dynamics_profile_of([{"dynamics_profile": "b"}, {"dynamics_profile": "a"}]),
                          ["a", "b"], "各集不一致是数据错误：列出全部，不挑一个")
 
+    def test_bad_params_file_and_xml_chars_fail_fast_before_running_episodes(self):
+        bad_syntax = os.path.join(self._tmp.name, "corrupt.json")
+        Path(bad_syntax).write_text("{not-json", encoding="utf-8")
+        bad_list = os.path.join(self._tmp.name, "list.json")
+        Path(bad_list).write_text("[1, 2, 3]", encoding="utf-8")
+        bad_empty = os.path.join(self._tmp.name, "empty.json")
+        Path(bad_empty).write_text("{}", encoding="utf-8")
+        bad_xml = write_copy(self._tmp.name, name="bad&char.json")
+        for bad_path in (bad_syntax, bad_list, bad_empty, bad_xml):
+            code, cmds = self.run_eval(["--cf-sitl-params", bad_path], expect_exit=True)
+            self.assertEqual(code, 2, bad_path)
+            self.assertNotIn("scene_gen", cmds, f"{bad_path}: 应在起任何子进程前当场 rc=2")
+            self.assertNotIn("collect", cmds, bad_path)
+            self.assertIn("--cf-sitl-params", cmds["stderr"], bad_path)
+
+    def test_all_failed_episodes_still_record_non_null_top_level_dynamics_profile(self):
+        # 1) collect 子进程 rc=1 全失败：per_episode 为空，顶层 dynamics_profile 仍必须等于参数副本的指纹
+        report_rc1, _ = self.run_eval(["--cf-sitl-params", self.copy], {}, collect_rc=1)
+        self.assertEqual(report_rc1["per_episode"], [])
+        self.assertEqual(report_rc1["failed_count"], 1)
+        self.assertEqual(report_rc1["dynamics_profile"], PROFILE_FULL)
+        self.assertNotIn("dynamics_profile", report_rc1["failed"][0])
+
+        # 2) 迟到步导致全失败（collect_rc=0，但进 failed[]）：per_episode 为空，顶层 dynamics_profile 同样是 PROFILE_FULL
+        report_late, _ = tal.EvalHarness.run(
+            self.CF + ["--cf-sitl-params", self.copy, "--action-latency", "0.2"],
+            tal.eval_rows([0.35], late_ids=(0,)),
+            {"dynamics_profile": PROFILE_FULL, "action_latency_s": 0.2, "late_dispatch_steps": 1})
+        self.assertEqual(report_late["per_episode"], [])
+        self.assertEqual(report_late["failed_count"], 1)
+        self.assertEqual(report_late["dynamics_profile"], PROFILE_FULL)
+
+
+class CollectParallelCfSitlParams(unittest.TestCase):
+    """I1-2：collect_parallel.py 命令行 --cf-sitl-params、collect_command 透传、collection_manifest 记录与默认逐字不变。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.copy = write_copy(self._tmp.name)
+        patcher = patch.object(cp, "find_plugin_dir", return_value="/fake-plugin-dir")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    @staticmethod
+    def _ns(**over):
+        base = dict(steps=40, hold=1.0, policy="teacher", teacher_planner="astar", rl_checkpoint="",
+                    window_from="observation", dynamics="cf_sitl", save_depth=False, vehicle="e1_mini",
+                    student_ckpt=None, infer_bin=None, beta=0.0, dagger_round=0,
+                    stop_at_goal=False, tiebreak="legacy")
+        base.update(over)
+        return SimpleNamespace(**base)
+
+    def test_collect_command_default_unchanged_and_forwards_when_set(self):
+        t = cp.Task(0, 0, 2, 2, "train", "world.sdf", "scene.json")
+        cmd_def = cp.collect_command(t, self._ns())
+        self.assertNotIn("--cf-sitl-params", cmd_def)
+        self.assertEqual(cp.collect_command(t, self._ns(cf_sitl_params=None)), cmd_def)
+        cmd_with = cp.collect_command(t, self._ns(cf_sitl_params=self.copy))
+        self.assertEqual(cmd_with[:-2], cmd_def)
+        self.assertEqual(cmd_with[-2:], ["--cf-sitl-params", self.copy])
+
+    def _run_parallel(self, extra_argv, expect_exit=False):
+        from unittest.mock import Mock
+        seen = {"scene_gen": [], "collect": []}
+        pillars = [{"x": 1.5, "y": 0.0, "z": 1.5, "size": [0.4, 0.4, 3.0]}]
+
+        def fake_run(cmd, **_kw):
+            if cp.SCENE_GEN in cmd:
+                seen["scene_gen"].append(list(cmd))
+                w = Path(cmd[cmd.index("--out") + 1])
+                w.write_text("<sdf/>")
+                meta = {"pillars": pillars, "pillar_count": 1, "vehicle": "e1_mini"}
+                if "--cf-sitl-params" in cmd:
+                    meta["cf_sitl_params"] = cmd[cmd.index("--cf-sitl-params") + 1]
+                w.with_suffix(".json").write_text(json.dumps(meta))
+            return Mock(returncode=0, stdout="", stderr="")
+
+        def fake_popen(item, args_obj, _env, _log):
+            seen["collect"].append(cp.collect_command(item, args_obj))
+            os.makedirs(item.staging, exist_ok=True)
+            Path(item.staging, "episode_manifest.json").write_text(json.dumps({
+                "num_steps": args_obj.steps,
+                "validity": {"episode_executed": True, "camera_verified": True, "physics_verified": True},
+            }))
+            proc, pump = Mock(), Mock()
+            proc.wait.return_value = 0
+            return proc, pump
+
+        err = io.StringIO()
+        out = os.path.join(self._tmp.name, f"pout_{len(os.listdir(self._tmp.name))}")
+        argv = ["collect_parallel.py", "--instances", "1", "--episodes-per-instance", "1",
+                "--seeds", "2", "--steps", "3", "--dynamics", "cf_sitl", "--vehicle", "e1_mini",
+                "--out", out] + extra_argv
+        with patch.object(sys, "argv", argv), \
+             patch.object(cp.subprocess, "run", side_effect=fake_run), \
+             patch.object(cp, "_start_sim", return_value=Mock(pid=77)), \
+             patch.object(cp, "wait_ready"), \
+             patch.object(cp, "_popen_collect", side_effect=fake_popen), \
+             patch.object(cp, "stop_group"), patch.object(cp, "cleanup_all"), \
+             patch.object(cp, "_sweep_world_ruby", return_value=[]), \
+             patch.object(cp, "_ruby_pids", return_value=[]), \
+             patch.object(cp, "XDG_RUNTIME_DIR", os.path.join(self._tmp.name, "xdg")), \
+             patch.object(cp.time, "sleep"), patch.object(cp.signal, "signal"), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            if expect_exit:
+                with self.assertRaises(SystemExit) as cm:
+                    cp.main()
+                return cm.exception.code, err.getvalue(), seen, None
+            rc = cp.main()
+        man = json.loads(Path(out, "collection_manifest.json").read_text())
+        return rc, err.getvalue(), seen, man
+
+    def test_parallel_main_wires_both_sides_and_keeps_default_unchanged(self):
+        rc0, _, seen0, man0 = self._run_parallel([])
+        self.assertEqual(rc0, 0)
+        self.assertNotIn("--cf-sitl-params", seen0["scene_gen"][0])
+        self.assertNotIn("--cf-sitl-params", seen0["collect"][0])
+        self.assertNotIn("cf_sitl_params", man0)
+
+        rel = os.path.relpath(self.copy, os.getcwd())
+        rc1, _, seen1, man1 = self._run_parallel(["--cf-sitl-params", rel])
+        self.assertEqual(rc1, 0)
+        want = os.path.abspath(rel)
+        self.assertEqual(seen1["scene_gen"][0][-2:], ["--cf-sitl-params", want])
+        self.assertEqual(seen1["collect"][0][-2:], ["--cf-sitl-params", want])
+        self.assertEqual(man1["cf_sitl_params"], want)
+
+    def test_parallel_main_rejects_bad_usage(self):
+        bad_json = os.path.join(self._tmp.name, "bad.json")
+        Path(bad_json).write_text("{not valid json")
+        bad_xml = write_copy(self._tmp.name, name="a&b.json")
+        for extra, frag in (
+            (["--dynamics", "x3_velocity", "--vehicle", "x3", "--cf-sitl-params", self.copy], "只能和 --dynamics cf_sitl"),
+            (["--cf-sitl-params", os.path.join(self._tmp.name, "missing.json")], "不存在"),
+            (["--cf-sitl-params", bad_xml], "XML"),
+            (["--cf-sitl-params", bad_json], "--cf-sitl-params"),
+        ):
+            code, stderr, _, _ = self._run_parallel(extra, expect_exit=True)
+            self.assertEqual(code, 2, extra)
+            self.assertIn(frag, stderr, extra)
+
+
+class CollectSceneMetaParamsGuard(unittest.TestCase):
+    """K-2：collect.py 在 --dynamics cf_sitl + --scene-meta 下核对自身参数文件与 scene_meta['cf_sitl_params'] 的真实路径；
+    并验证 eval_closed_loop.py（默认与带 --cf-sitl-params、含 l1 指令覆写）跑真 scene_gen + 真 collect 校验不被误伤。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.soc100 = write_copy(self._tmp.name, "soc100.json", soc=1.0)
+        self.soc80 = write_copy(self._tmp.name, "soc80.json", soc=0.8)
+        patcher = patch.object(cp, "find_plugin_dir", return_value="/fake-plugin-dir")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _make_scene_meta(self, extra_scene_argv, seed=2):
+        w = os.path.join(self._tmp.name, f"w_{len(os.listdir(self._tmp.name))}.sdf")
+        argv = ["scene_gen.py", "--seed", str(seed), "--vehicle", "e1_mini", "--out", w] + extra_scene_argv
+        with patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()):
+            assert scene_gen.main() == 0
+        return os.path.splitext(w)[0] + ".json"
+
+    def _run_collect_main(self, meta_path, collect_extra):
+        import collect
+        import split_manifest as sm
+        import teacher
+        import test_collect as tc
+        from unittest.mock import Mock
+        meta_obj = json.loads(Path(meta_path).read_text())
+        out = os.path.join(self._tmp.name, f"ep_{len(os.listdir(self._tmp.name))}")
+        argv = ["collect.py", "--out", out, "--scene-meta", meta_path,
+                "--split", sm.split_for_scene(meta_obj),
+                "--dynamics", "cf_sitl", "--vehicle", "e1_mini", "--steps", "1"] + collect_extra
+        subs = {k: tc.FakeSub(latest=tc.pose_msg(1.0)) for k in ("rgb", "depth", "pose", "contact", "camera_info")}
+        fake_sil = Mock(takeoff_failsafes=0)
+        fake_sil.params = collect.cf_sitl_exec.CfSitlParams.from_json(
+            collect_extra[collect_extra.index("--cf-sitl-params") + 1]
+            if "--cf-sitl-params" in collect_extra else collect.cf_sitl_exec.DEFAULT_PARAMS)
+        err = io.StringIO()
+        code = 0
+        with patch.object(sys, "argv", argv), \
+             patch.object(collect, "open_subs", return_value=subs), \
+             patch.object(collect, "wait_ready", return_value=None), \
+             patch.object(collect, "read_camera_info", return_value=None), \
+             patch.object(collect, "take_off_cf_sitl", return_value=0), \
+             patch.object(collect, "stop_executor"), \
+             patch.object(collect, "close_subs"), \
+             patch.object(collect.cf_sitl_exec, "CfSitlExecutor", return_value=fake_sil), \
+             patch.object(collect, "collect_one", return_value=(tc.fake_row(0, 1.0), None)), \
+             patch.object(teacher, "warm_free_cells", return_value=0), \
+             contextlib.redirect_stderr(err):
+            try:
+                collect.main()
+            except SystemExit as e:
+                code = e.code
+        return code, err.getvalue(), out
+
+    def test_collect_rejects_one_sided_or_mismatched_params_and_accepts_matching_paths(self):
+        import collect
+        meta_def = self._make_scene_meta([])
+        meta_100 = self._make_scene_meta(["--cf-sitl-params", self.soc100])
+        link_100 = os.path.join(self._tmp.name, "link_soc100.json")
+        os.symlink(self.soc100, link_100)
+
+        # 匹配情形：两边都缺省、两边同一文件（含软链）、一边显式传默认 e1_mini.json 另一边缺省
+        self.assertEqual(self._run_collect_main(meta_def, [])[0], 0)
+        self.assertEqual(self._run_collect_main(meta_100, ["--cf-sitl-params", self.soc100])[0], 0)
+        self.assertEqual(self._run_collect_main(meta_100, ["--cf-sitl-params", link_100])[0], 0, "按 realpath 比，软链一致放行")
+        self.assertEqual(self._run_collect_main(meta_def, ["--cf-sitl-params", collect.cf_sitl_exec.DEFAULT_PARAMS])[0], 0)
+
+        # 不匹配情形：只给世界不给 collect、只给 collect 不给世界、两边给不同副本
+        for m, extra in (
+            (meta_100, []),
+            (meta_def, ["--cf-sitl-params", self.soc100]),
+            (meta_100, ["--cf-sitl-params", self.soc80]),
+        ):
+            code, stderr, out = self._run_collect_main(m, extra)
+            self.assertEqual(code, 2, (m, extra))
+            self.assertIn("cf_sitl_params", stderr)
+            self.assertFalse(os.path.isfile(os.path.join(out, "episode_manifest.json")))
+
+    def test_eval_closed_loop_runs_real_scene_gen_and_real_collect_guard_without_false_alarm(self):
+        import collect
+        import teacher
+        import test_collect as tc
+        from unittest.mock import Mock
+
+        def run_real_wired_eval(extra_argv):
+            def real_scene_gen(cmd, **_kw):
+                with patch.object(sys, "argv", [cmd[1]] + list(cmd[2:])), contextlib.redirect_stdout(io.StringIO()):
+                    rc = scene_gen.main()
+                return Mock(returncode=rc)
+
+            def real_collect_proc(cmd, **_kw):
+                fake_sil = Mock(takeoff_failsafes=0)
+                p_arg = cmd[cmd.index("--cf-sitl-params") + 1] if "--cf-sitl-params" in cmd else collect.cf_sitl_exec.DEFAULT_PARAMS
+                fake_sil.params = collect.cf_sitl_exec.CfSitlParams.from_json(p_arg)
+                fake_sil.params.lib_version = 31
+                subs = {k: tc.FakeSub(latest=tc.pose_msg(1.0)) for k in ("rgb", "depth", "pose", "contact", "camera_info")}
+                err_buf = io.StringIO()
+                rc = 0
+                with patch.object(sys, "argv", [cmd[1]] + list(cmd[2:])), \
+                     patch.object(collect, "open_subs", return_value=subs), \
+                     patch.object(collect, "wait_ready", return_value=None), \
+                     patch.object(collect, "read_camera_info", return_value=None), \
+                     patch.object(collect, "take_off_cf_sitl", return_value=0), \
+                     patch.object(collect, "stop_executor"), \
+                     patch.object(collect, "close_subs"), \
+                     patch.object(collect.cf_sitl_exec, "CfSitlExecutor", return_value=fake_sil), \
+                     patch.object(collect, "collect_one", return_value=(tc.fake_row(0, 6.5), None)), \
+                     patch.object(teacher, "warm_free_cells", return_value=0), \
+                     contextlib.redirect_stderr(err_buf):
+                    try:
+                        collect.main()
+                    except SystemExit as e:
+                        rc = e.code or 0
+                proc = Mock(returncode=rc)
+                proc.communicate.return_value = ("", err_buf.getvalue())
+                return proc
+
+            out = os.path.join(self._tmp.name, f"ev_{len(os.listdir(self._tmp.name))}")
+            argv = ["eval_closed_loop.py", "--policy", "teacher", "--dynamics", "cf_sitl", "--vehicle", "e1_mini",
+                    "--seeds", "1", "--steps", "1", "--out", out] + extra_argv
+            with patch.object(ec.sys, "argv", argv), \
+                 patch.object(ec.subprocess, "run", side_effect=real_scene_gen), \
+                 patch.object(ec.subprocess, "Popen", side_effect=real_collect_proc), \
+                 patch.object(ec.cp, "_start_sim", return_value=Mock()), \
+                 patch.object(ec.cp, "wait_ready"), patch.object(ec.cp, "_register"), \
+                 patch.object(ec.cp, "stop_group"), patch.object(ec.cp, "cleanup_all"), \
+                 patch.object(ec.cp, "XDG_RUNTIME_DIR", os.path.join(self._tmp.name, "xdg")), \
+                 patch.object(ec.time, "sleep"), patch.object(ec.signal, "signal"), \
+                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                rc = ec.main()
+            return rc, json.loads(Path(out, "eval.json").read_text())
+
+        # 1) 默认不传 --cf-sitl-params
+        rc_def, rep_def = run_real_wired_eval([])
+        self.assertEqual((rc_def, rep_def["failed_count"], rep_def["episodes_done"]), (0, 0, 1))
+        # 2) 传相对路径的 --cf-sitl-params
+        rel_100 = os.path.relpath(self.soc100, os.getcwd())
+        rc_100, rep_100 = run_real_wired_eval(["--cf-sitl-params", rel_100])
+        self.assertEqual((rc_100, rep_100["failed_count"], rep_100["dynamics_profile"]), (0, 0, PROFILE_FULL))
+
 
 if __name__ == "__main__":
     unittest.main()

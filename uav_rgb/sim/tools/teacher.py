@@ -384,23 +384,32 @@ def _free_cells(pillars, clearance, step):
     return cells
 
 
-def warm_free_cells(pillars, clearance=None, step=0.1):
-    """把整张 A* 栅格的「可走」一次填进缓存（--action-latency 的每集预热），返回格子数。
+def warm_free_cells(pillars, clearance=None, step=0.1, include_retries=None):
+    """把整张 A* 栅格的「可走」一次填进缓存（--action-latency 的每集预热），返回填满的总格子数。
 
-    astar_path 按需填格子：一集的第一步还没有缓存，A* 比后续步慢约 0.45 s（K=3 长课程），那一步的动作就晚了。
+    astar_path 按需填格子：一集的第一步还没有缓存，A* 比后续步慢约 0.45 s（K=3 长课程），那一步的动作就晚了；
+    v7 的 B3 在标准余量无路时还会按 ASTAR_RETRY_CLEARANCES 降余量重试，冷触发两档重试在 K=3 上再慢 0.45–0.72 s（I1-4）。
     预热按 astar_path 同一把钥匙（余量、步长、柱子几何）、同一个栅格范围（_grid_spec）、同一个判定（_point_blocked）
-    逐格填满；格子的值只由钥匙决定，所以之后 astar_path 的路径与按需填的逐位相同。clearance 缺省取当前载具档
-    （set_vehicle 之后的 ASTAR_CLEARANCE_M，与 plan_action_global 的缺省一致）。
+    逐格填满；格子的值只由钥匙决定，所以之后 astar_path / _global_path 的路径与按需填的逐位相同。
+    clearance 缺省取当前载具档 ASTAR_CLEARANCE_M；include_retries 缺省在 clearance=None（每集预热入口）时为 True，
+    一并填满严格小于标准余量的 ASTAR_RETRY_CLEARANCES 各档；显式传单档 clearance 时缺省 False，保持单档语义不变。
     """
-    if clearance is None:
-        clearance = ASTAR_CLEARANCE_M
+    if include_retries is None:
+        include_retries = clearance is None
+    base = ASTAR_CLEARANCE_M if clearance is None else clearance
+    clearances = [base]
+    if include_retries:
+        for c in ASTAR_RETRY_CLEARANCES:
+            if c < base and c not in clearances:
+                clearances.append(c)
     x0, y0, nx, ny = _grid_spec(pillars, step)
-    free = _free_cells(pillars, clearance, step)
-    for i in range(nx):
-        for j in range(ny):
-            if (i, j) not in free:
-                free[(i, j)] = not _point_blocked(x0 + i * step, y0 + j * step, pillars, clearance)
-    return nx * ny
+    for c in clearances:
+        free = _free_cells(pillars, c, step)
+        for i in range(nx):
+            for j in range(ny):
+                if (i, j) not in free:
+                    free[(i, j)] = not _point_blocked(x0 + i * step, y0 + j * step, pillars, c)
+    return len(clearances) * nx * ny
 
 
 def astar_path(pillars, start, goal, clearance=0.5, step=0.1):

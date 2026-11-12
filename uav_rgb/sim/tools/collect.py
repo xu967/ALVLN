@@ -1674,6 +1674,12 @@ def main():
             raw_meta = f.read()
         scene_meta_sha = hashlib.sha256(raw_meta).hexdigest()
         scene_meta_obj = json.loads(raw_meta.decode("utf-8"))
+        if args.dynamics == "cf_sitl":
+            own_params = os.path.realpath(args.cf_sitl_params or cf_sitl_exec.DEFAULT_PARAMS)
+            scene_params = os.path.realpath(scene_meta_obj.get("cf_sitl_params") or cf_sitl_exec.DEFAULT_PARAMS)
+            if own_params != scene_params:
+                p.error(f"--cf-sitl-params ({own_params}) 与 --scene-meta 里的 cf_sitl_params ({scene_params}) 不一致："
+                        "世界插件与 collect.py 必须读同一份参数文件")
         pillars = scene_meta_obj["pillars"]
         scene_version = scene_meta_obj.get("geometry_version")
         instruction_text = scene_meta_obj.get("instruction")
@@ -1682,6 +1688,8 @@ def main():
         waypoint = scene_meta_obj.get("waypoint")
         task_version = scene_meta_obj.get("task_version")
         stop_radius = scene_meta_obj.get("stop_radius")
+        if args.student_cond == nav_cond.COND_HEADING_CODE and (waypoint is not None or stop_radius is not None):
+            p.error("--student-cond heading-code 只用于航向设定值 H=0 的走廊任务；带 waypoint 的任务（l1/campus）不支持")
         for k, pl in enumerate(pillars):
             if "x" not in pl or "y" not in pl:
                 p.error(f"--scene-meta {args.scene_meta}: pillars[{k}] 缺 x/y")
@@ -1835,6 +1843,14 @@ def main():
             print("学生策略: 启动推理进程…", file=sys.stderr)
             text_ids = tokenize(instruction_text) if instruction_text else None
             student = StudentPolicy(args.student_ckpt, args.infer_bin, text_ids=text_ids)
+            cond_check = nav_cond.check_student_cond(args.student_cond, args.student_ckpt,
+                                                     getattr(student, "prev_dim", 0))
+            if cond_check["status"] == "mismatch":
+                error = cond_check["message"]
+                p.error(cond_check["message"])
+            if cond_check["status"] == "unverified":
+                print(f"警告: 条件输入一致性未核实（--student-cond {args.student_cond}）：{cond_check['message']}",
+                      file=sys.stderr)
         elif args.policy == "teacher-rl":
             from stable_baselines3 import PPO
             rl_teacher = PPO.load(args.rl_checkpoint, device="cpu")
@@ -1851,7 +1867,7 @@ def main():
             # 第一步必迟到。教师的 A* 是动作本身，学生的 A* 是影子标签。学生推理的首帧开销由 StudentPolicy 构造时的
             # _warmup 吃掉（每集一次，已在上面），这里不再重复。放在起飞之前：不多悬停一秒。
             t_warm = time.perf_counter()
-            n_cells = _teacher.warm_free_cells(pillars)
+            n_cells = _teacher.warm_free_cells(pillars, include_retries=True)
             print(f"预热 A* 栅格：{n_cells} 格，{time.perf_counter() - t_warm:.2f} s", file=sys.stderr)
 
         contact_seq0 = _contact_seq(subs["contact"])
@@ -2004,7 +2020,8 @@ def main():
                       f"median={_median(pgaps):.1f}ms max={max(pgaps):.1f}ms",
                       file=sys.stderr)
     except BaseException as e:
-        error = f"{type(e).__name__}: {e}"
+        if error is None:
+            error = f"{type(e).__name__}: {e}"
         raise
     finally:
         # M3: 无论正常结束、深度失败、异常还是 Ctrl-C，先发零速/停桨再收尾

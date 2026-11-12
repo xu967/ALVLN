@@ -279,6 +279,7 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
 | `spl` | `S_i · l_i / max(p_i, l_i)`，S_i = 该集旧 `success`（Anderson et al. 2018） | 每集；p_i 或 l_i 缺一个就是 None |
 | 汇总 `spl` / `spl_n` | 有 `spl` 的完成集平均 / 个数 | `requested_spl` 只在全部完成集都有 spl 时给（请求集分母，skipped/failed 计 0） |
 | CR | 就是已有的 `collision_rate`（contact 碰撞集比例）；**不新增字段**。stuck / 超时不算碰撞 | `episodes_done` |
+| `collisions_per_100m` | `100 × 窗口内有接触碰撞的完成集数 ÷ 各完成集窗口内路程之和（m）`（2026-11-12 起，`collisions_per_100m_def = "v2.first_terminal_event"`）。窗口从起点到**第一个终局事件**（首次越出走廊、首次进入目标区或过终点线、首次接触碰撞；`stuck` 不算）；同一步既碰撞又越界（或过线）计为碰撞，越界或进目标区之后才发生的接触不进分子；单步即终止的集用第 0 步 `pose_before -> pose_gt` 折线长计路程。整集 `collision_rate` 不动 | 完成集窗口总路程；W1-4 旧产物缺 `collisions_per_100m_def` 键（分子计整集碰撞），新旧数不可混报 |
 | task_success | 已在 §5.2 定义：`reach_ever` + `final_in_radius` + `stop_action_issued` + `collision_free` + 未超时；不另造 | `episodes_requested`（失败与跳过的集记 0，见 §5.6） |
 
 - **目标区与 success 同口径**：waypoint 任务 = 以 waypoint 为心、`goal_radius` 为半径的圆盘
@@ -368,9 +369,10 @@ longcourse 分段打点）+ 策略段的墙钟耗时折成的仿真时间；后�
   （`failed[]` 里 `error` 以 `late_dispatch:` 开头，eval.json 另有 `late_dispatch_episodes`）：不进 `success_rate` 的完成集，在 `requested_success_rate` 里算非成功；
   `per_episode` 有 `late_dispatch_steps`、`dispatch_lag_s_median`、`dispatch_lag_s_max`。迟到集的轨迹仍留在 `<out>/episodes/`。
 - **影子标签**：学生 + β=0 + 带开关时，影子教师的 A\* 标签挪到派发之后算（β>0、教师、规则 oracle 不动；`action_expert` 的值不变），
-  A\* 耗时不再进延迟。**预热**：带开关时每集起飞前把教师的整张 A\* 自由栅格填满（`teacher.warm_free_cells`），
-  第 0 步不再吃冷缓存；外部基线与学生本来就在构造时空推理一次（`StudentPolicy._warmup`）。不带开关时两者都不动，
+  A\* 耗时不再进延迟。**预热**：带开关时每集起飞前把教师的整张 A\* 自由栅格填满（`teacher.warm_free_cells(pillars, include_retries=True)`，
+  一并覆盖标准余量与小于标准余量的 `ASTAR_RETRY_CLEARANCES` 重试档位），第 0 步与首次降余量重试均不再吃冷缓存；外部基线与学生本来就在构造时空推理一次（`StudentPolicy._warmup`）。不带开关时两者都不动，
   默认路径逐位不变（`sim/tools/test_action_latency.py` 的默认锁）。
+- **停顿步与断帧旗统一判据**：相邻两步观测戳间隔超过 `max(0.1, hold - 0.1) + 0.2 s`（`collect.is_stall_gap`，`hold = 1.0 s` 时严格大于 `1.1 s`）记为停顿步（`stall_steps`）。带 `--action-latency` 时含停顿步的集与含迟到步的集同样计入 `failed[]`（`stall_episodes` 单列）；不带开关时只记不判。Gazebo 评测 `per_episode` 的 `frame_gap_flag` 与停顿步共用同一函数 `collect.is_stall_gap(max_frame_gap_s, hold)`；无 `hold` 参数的 3DGS 集无 10 Hz 相机相位差，保持 `max_frame_gap_s > 1.2 × sim_dt` 原判断。
 - **协议键**：`action_latency_s` 在 eval 的 `PROTOCOL_KEYS` 和 `tools/preprocess.py` 的 `STRICT_KEYS` 里。
   协议文件（训练数据快照）里写了 `action_latency_s` 而评测不带或 L 不同，判协议不一致；旧协议文件没有这个键，不触发。打包时不同 L 的集、或新旧混合会被拒收。
   带开关与不带开关的 SR / CR **不可直接比**（生效时长 hold − L 与旧协议不同），报表头标 L。

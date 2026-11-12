@@ -443,6 +443,8 @@ def collect_command(task, args):
     action_latency = getattr(args, "action_latency", None)
     if action_latency is not None:
         cmd += ["--action-latency", f"{action_latency:g}"]   # W1-13 A2：没给不传，旧命令行逐字不变
+    if getattr(args, "cf_sitl_params", None):
+        cmd += ["--cf-sitl-params", args.cf_sitl_params]     # W1-13b I1-2：与 scene_gen 同路径透传；没给不传
     return cmd
 
 
@@ -671,6 +673,9 @@ def main():
                         "只能配 --window-from observation，且 0 < L < --hold")
     p.add_argument("--rtf", type=float, default=None,
                    help="透传给 scene_gen（W1-13 A2）：世界物理的目标实时因子（只能压低，缺省用模板值 1.0，不传）")
+    p.add_argument("--cf-sitl-params", default=None, metavar="JSON",
+                   help="cf_sitl 参数副本（W1-10/I1-2：满电档等，tools/make_params_variant.py 生成）。同一个绝对路径同时透传给 "
+                        "scene_gen 与 collect.py，collection_manifest.json 记 cf_sitl_params。只能配 --dynamics cf_sitl；默认关")
     p.add_argument("--save-depth", action="store_true",
                    help="透传给 collect.py：每步另存 depth/depth_%%05d.png（16 位 PNG，毫米）")
     p.add_argument("--template", default=None,
@@ -723,6 +728,8 @@ def main():
         p.error("--beta 必须在 [0, 1]，--dagger-round 必须是非负整数")
     if args.student_cond != nav_cond.COND_PREV_ACTION and args.policy != "student":
         p.error("--student-cond 只能和 --policy student 一起用")
+    if args.student_cond == nav_cond.COND_HEADING_CODE and args.task in ("l1", "campus", "campus_assets"):
+        p.error(f"--student-cond heading-code 只用于航向设定值 H=0 的走廊任务，不支持带 waypoint 的 --task {args.task}")
     # waypoint 任务（l1/campus）的成功是停在半径内，不是过线；collect.py 对这类 scene 也会拒绝。
     if args.stop_at_goal and args.task not in ("base", "forest_e1"):
         p.error("--stop-at-goal 只用于验收线任务（--task base/forest_e1）")
@@ -737,6 +744,20 @@ def main():
         p.error("cf_blackbox 是纯 Python 模型档，Gazebo 并行采集未接入；"
                 "请让 3DGS collector 直接调用 cf_blackbox，或改用 cf_stab/x3_velocity")
     resolve_vehicle(args, p.error)
+    if args.cf_sitl_params is not None:
+        if args.dynamics != "cf_sitl":
+            p.error("--cf-sitl-params 只能和 --dynamics cf_sitl 一起用")
+        if not os.path.isfile(args.cf_sitl_params):
+            p.error(f"--cf-sitl-params 文件不存在: {args.cf_sitl_params}")
+        args.cf_sitl_params = os.path.abspath(args.cf_sitl_params)
+        import scene_gen as _sg
+        if _sg.CF_SITL_PARAMS_BAD_CHARS.search(args.cf_sitl_params):
+            p.error(f"--cf-sitl-params 路径含空白或 XML 特殊字符（< > &），不写进世界: {args.cf_sitl_params!r}")
+        import cf_sitl_exec as _ce
+        try:
+            _ce.CfSitlParams.from_json(args.cf_sitl_params)
+        except (OSError, ValueError, TypeError, KeyError) as e:
+            p.error(f"--cf-sitl-params 无法解析: {e}")
     # forest_e1 的缝 0.28–0.45 m 按 E1 外径 0.204 m 定，X3（0.711 m）过不去；density 只属于它。
     if (args.task == "forest_e1") != (args.density is not None):
         p.error("--density 与 --task forest_e1 必须同时给")
@@ -919,6 +940,7 @@ def main():
             **({"student_cond": args.student_cond} if args.student_cond != nav_cond.COND_PREV_ACTION else {}),
             **({"action_latency_s": args.action_latency} if args.action_latency is not None else {}),
             **({"rtf": args.rtf} if args.rtf is not None else {}),
+            **({"cf_sitl_params": args.cf_sitl_params} if args.cf_sitl_params is not None else {}),
             "split": args.split,
             "seeds": args.seeds,
             "spawn_mode": args.spawn_mode,

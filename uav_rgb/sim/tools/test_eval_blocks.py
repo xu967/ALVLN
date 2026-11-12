@@ -378,12 +378,15 @@ class CourseReport(unittest.TestCase):
         self.assertEqual(report["block_survival"][-1], report["requested_success_rate"])
 
     def test_key_sets(self):
-        self.assertEqual(set(self.report) - OLD_TOP_KEYS_COURSE, {"collisions_per_100m", "block_survival"})
+        self.assertEqual(set(self.report) - OLD_TOP_KEYS_COURSE,
+                         {"collisions_per_100m", "collisions_per_100m_def", "block_survival"})
+        self.assertEqual(self.report["collisions_per_100m_def"], "v2.first_terminal_event")
         self.assertEqual(OLD_TOP_KEYS_COURSE - set(self.report), set(), "旧键一个不少")
         ep = self.report["per_episode"][0]
         self.assertEqual(set(ep) - OLD_EPISODE_KEYS_COURSE, {"blocks_passed", "blocks_total"})
         self.assertEqual(OLD_EPISODE_KEYS_COURSE - set(ep), set(), "旧键一个不少")
         self.assertNotIn(ec.FLIGHT_PATH_KEY, ep, "分母的逐集路程只给汇总用，不落进 per_episode")
+        self.assertNotIn(ec.WINDOW_COLLISION_KEY, ep, "窗口内碰撞私有键不落进 per_episode")
 
 
 class BaseReport(unittest.TestCase):
@@ -406,7 +409,8 @@ class BaseReport(unittest.TestCase):
         self.assertAlmostEqual(self.report["collisions_per_100m"], 100.0 * 1 / total, places=9)
 
     def test_key_sets_are_the_old_ones_plus_collisions_per_100m(self):
-        self.assertEqual(set(self.report), OLD_TOP_KEYS_BASE | {"collisions_per_100m"})
+        self.assertEqual(set(self.report), OLD_TOP_KEYS_BASE | {"collisions_per_100m", "collisions_per_100m_def"})
+        self.assertEqual(self.report["collisions_per_100m_def"], "v2.first_terminal_event")
         self.assertEqual(set(self.report["per_episode"][0]), OLD_EPISODE_KEYS_BASE)
 
     def test_old_values_are_untouched(self):
@@ -425,6 +429,60 @@ class SharedFunctionsUnchanged(unittest.TestCase):
         s = ec.summarize_episode(actions, oracle, 16.0)
         self.assertEqual(set(ec.aggregate([s], requested=1)), OLD_AGGREGATE_KEYS)
         self.assertEqual(set(s), OLD_SUMMARY_KEYS)
+
+
+class CollisionWindowAlignment(unittest.TestCase):
+    """W1-13b I1-5：每百米碰撞数分子与分母同取「从起点到第一个终局事件」窗口；单步即撞用第 0 步折线长。"""
+
+    def test_post_corridor_collision_excluded_from_numerator_while_collision_rate_unchanged(self):
+        # 步 2 出走廊（|y|=3.5 > 3.0），步 5 才碰撞（如飞到没电落地）：collision_rate 仍计 1，collisions_per_100m 分子计 0
+        xs = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0]
+        ys = [0.0, 0.0, 3.5, 4.0, 4.5, 5.0]
+        oracle, actions = traj(xs, ys, collide={5})
+        rep = run_eval("base", {1: (oracle, actions)}, corridor="3.0")
+        self.assertEqual(rep["collision_rate"], 1.0, "整集 collision_rate 不动")
+        self.assertTrue(rep["per_episode"][0]["collision"])
+        self.assertEqual(rep["collisions_per_100m"], 0.0, "越界之后才发生的接触不进分子")
+        # 没开走廊判据时步 2 不算越界，步 5 碰撞是第一个终局事件，分子计 1
+        rep_nocor = run_eval("base", {1: (oracle, actions)}, corridor=None)
+        self.assertGreater(rep_nocor["collisions_per_100m"], 0.0)
+
+    def test_same_step_collision_and_corridor_counts_as_collision(self):
+        xs = [0.0, 1.0, 2.0]
+        ys = [0.0, 0.0, 3.5]
+        oracle, actions = traj(xs, ys, collide={2})
+        path_m, win_col = ec.collision_window(oracle, actions, 6.0, corridor_half_width=3.0)
+        self.assertTrue(win_col)
+        self.assertAlmostEqual(path_m, polyline([(0.0, 0.0), (1.0, 0.0), (2.0, 3.5)]), places=9)
+        rep = run_eval("base", {1: (oracle, actions)}, corridor="3.0")
+        self.assertAlmostEqual(rep["collisions_per_100m"], 100.0 / path_m, places=9)
+
+    def test_post_goal_collision_excluded_for_line_and_waypoint(self):
+        # 1) 过线任务：步 2 已过 x=6.0（x=6.5），步 3 才撞 -> 分子为 0；若步 2 同一步撞 -> 分子为 1
+        o_after, a_after = traj([0.0, 3.0, 6.5, 7.0], collide={3})
+        p_after, c_after = ec.collision_window(o_after, a_after, 6.0, corridor_half_width=3.0)
+        self.assertFalse(c_after)
+        self.assertAlmostEqual(p_after, 6.0, places=9)
+
+        o_same, a_same = traj([0.0, 3.0, 6.5], collide={2})
+        p_same, c_same = ec.collision_window(o_same, a_same, 6.0, corridor_half_width=3.0)
+        self.assertTrue(c_same)
+        self.assertAlmostEqual(p_same, 6.0, places=9)
+
+        # 2) waypoint 任务：步 2 已进 r=1.5 圆，步 4 才撞 -> 分子为 0
+        wp = {"x": 4.0, "y": 0.0}
+        o_wp, a_wp = traj([0.0, 1.5, 2.8, 3.5, 4.0], collide={4})
+        p_wp, c_wp = ec.collision_window(o_wp, a_wp, 6.0, waypoint=wp, stop_radius=0.5, goal_radius=1.5)
+        self.assertFalse(c_wp)
+        self.assertAlmostEqual(p_wp, 2.5, places=9)
+
+    def test_single_step_collision_uses_step_zero_chord_not_none(self):
+        actions = [{"step": 0, "collision": True, "src": "contact", "action_executed": 1,
+                    "pose_before": {"x": -0.5, "y": 0.0, "z": 2.0}}]
+        oracle = [{"step": 0, "pose_gt": {"x": -0.25, "y": 0.0, "z": 2.0}}]
+        self.assertAlmostEqual(ec.flight_path_m(oracle, actions, 6.0, corridor_half_width=3.0), 0.25, places=9)
+        rep = run_eval("base", {1: (oracle, actions)}, corridor="3.0")
+        self.assertAlmostEqual(rep["collisions_per_100m"], 400.0, places=9)
 
 
 if __name__ == "__main__":
