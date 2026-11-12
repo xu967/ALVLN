@@ -1,0 +1,236 @@
+{
+ "schema": "e2e-r1.sweep_summary.v1",
+ "seeds": [
+  30012,
+  30043,
+  30084,
+  30094,
+  30115,
+  30119,
+  30130,
+  30131,
+  30168,
+  30189,
+  30263,
+  30384,
+  30400,
+  30409,
+  30420,
+  30475,
+  30627,
+  30632,
+  30776,
+  30944
+ ],
+ "extra_tag": "R2e",
+ "levels": {
+  "m0.5": {
+   "delta": -0.5,
+   "complete": true,
+   "total": 36,
+   "per_seed": {
+    "0": 13,
+    "1": 9,
+    "2": 14
+   },
+   "range": 5,
+   "outcomes": {
+    "success": 36,
+    "collision": 5,
+    "corridor": 19,
+    "not_reached": 0,
+    "late": 0,
+    "aborted": 0
+   },
+   "action_shares": {
+    "S": 0.0032679738562091504,
+    "F": 0.9146241830065359,
+    "L": 0.04044117647058824,
+    "R": 0.041666666666666664
+   },
+   "action_counts": {
+    "0": 8,
+    "1": 2239,
+    "2": 99,
+    "3": 102
+   },
+   "steps": 2448,
+   "clean_episodes": 60,
+   "n": 60
+  },
+  "0": {
+   "delta": 0.0,
+   "complete": true,
+   "total": 40,
+   "per_seed": {
+    "0": 17,
+    "1": 14,
+    "2": 9
+   },
+   "range": 8,
+   "outcomes": {
+    "success": 40,
+    "collision": 9,
+    "corridor": 11,
+    "not_reached": 0,
+    "late": 0,
+    "aborted": 0
+   },
+   "action_shares": {
+    "S": 0.0034653465346534654,
+    "F": 0.9143564356435644,
+    "L": 0.03861386138613861,
+    "R": 0.04356435643564356
+   },
+   "action_counts": {
+    "0": 7,
+    "1": 1847,
+    "2": 78,
+    "3": 88
+   },
+   "steps": 2020,
+   "clean_episodes": 60,
+   "n": 60
+  },
+  "p0.5": {
+   "delta": 0.5,
+   "complete": true,
+   "total": 39,
+   "per_seed": {
+    "0": 15,
+    "1": 10,
+    "2": 14
+   },
+   "range": 5,
+   "outcomes": {
+    "success": 39,
+    "collision": 12,
+    "corridor": 9,
+    "not_reached": 0,
+    "late": 0,
+    "aborted": 0
+   },
+   "action_shares": {
+    "S": 0.0026288117770767614,
+    "F": 0.923764458464774,
+    "L": 0.031019978969505785,
+    "R": 0.04258675078864353
+   },
+   "action_counts": {
+    "0": 5,
+    "1": 1757,
+    "2": 59,
+    "3": 81
+   },
+   "steps": 1902,
+   "clean_episodes": 60,
+   "n": 60
+  }
+ },
+ "tests": {
+  "m0.5_vs_0": {
+   "diff": -4,
+   "geoms_nonzero": 12,
+   "geoms_pos": 6,
+   "geoms_neg": 6,
+   "p_cluster": 0.54931640625,
+   "ci": [
+    -14,
+    5
+   ],
+   "mcnemar_b": 8,
+   "mcnemar_c": 12,
+   "p_mcnemar": 0.5034446716308594,
+   "agree": true
+  },
+  "p0.5_vs_0": {
+   "diff": -1,
+   "geoms_nonzero": 11,
+   "geoms_pos": 6,
+   "geoms_neg": 5,
+   "p_cluster": 1.0,
+   "ci": [
+    -11,
+    8
+   ],
+   "mcnemar_b": 9,
+   "mcnemar_c": 10,
+   "p_mcnemar": 1.0,
+   "agree": true
+  },
+  "m0.5_vs_p0.5": {
+   "diff": -3,
+   "geoms_nonzero": 12,
+   "geoms_pos": 5,
+   "geoms_neg": 7,
+   "p_cluster": 0.70703125,
+   "ci": [
+    -13,
+    7
+   ],
+   "mcnemar_b": 9,
+   "mcnemar_c": 12,
+   "p_mcnemar": 0.6636238098144531,
+   "agree": true
+  },
+  "extra_vs_0": {
+   "diff": 1,
+   "geoms_nonzero": 15,
+   "geoms_pos": 9,
+   "geoms_neg": 6,
+   "p_cluster": 1.0,
+   "ci": [
+    -13,
+    14
+   ],
+   "mcnemar_b": 13,
+   "mcnemar_c": 12,
+   "p_mcnemar": 1.0,
+   "agree": true
+  }
+ },
+ "verdicts": {
+  "spread": {
+   "code": "between",
+   "text": "三档成功数 -0.5 nat 36/60、0（原校准） 40/60、+0.5 nat 39/60；最高与最低相差 4 集，落在 4–7 之间：两条预注册线都没覆盖，如实记录，不下「敏感」或「不敏感」的结论"
+  },
+  "extra": {
+   "pass": true,
+   "text": "三个训练种子成功数 14/14/13，极差 1（≤ 3，过）；总数 41，同批几何上 0 档 40，下限 37（过）"
+  }
+ },
+ "extra": {
+  "tag": "R2e",
+  "complete": true,
+  "total": 41,
+  "per_seed": {
+   "0": 14,
+   "1": 14,
+   "2": 13
+  },
+  "range": 1,
+  "outcomes": {
+   "success": 41,
+   "collision": 3,
+   "corridor": 16,
+   "not_reached": 0,
+   "late": 0,
+   "aborted": 0
+  },
+  "action_shares": {
+   "S": 0.0,
+   "F": 0.9198678232135481,
+   "L": 0.0375877736472532,
+   "R": 0.042544403139198675
+  },
+  "action_counts": {
+   "0": 0,
+   "1": 2227,
+   "2": 91,
+   "3": 103
+  },
+  "steps": 2421,
+  "clean_episodes": 60,
+  "n": 60
+ }
+}
