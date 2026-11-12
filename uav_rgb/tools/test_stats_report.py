@@ -625,6 +625,129 @@ def test_success_counts_agrees_with_run_denominator():
             assert c["k"] == sum(1 for v in vals if v) and c["failed"] == failed and c["done"] == n_done, (i, c)
 
 
+def test_dynamics_profile_from_per_episode_and_params():
+    """I2-1：常规 Gazebo 评测不在顶层写 dynamics_profile，load_eval 须从 per_episode 取（单值取该串，多值拼成排序串并触发
+    协议不一致报错）；per_episode 为空且顶层有 cf_sitl_params 时用 values_sha256[:8] 参与比较。"""
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+        seeds = [1, 2, 3, 4]
+        old_lib = _fake_eval(os.path.join(tmp, "old_lib.json"), seeds, [1, 1, 0, 0],
+                             extra={"dynamics_profile": "cf_sitl_v1:bd0dcd43"})
+        new_lib = _fake_eval(os.path.join(tmp, "new_lib.json"), seeds, [1, 0, 1, 0],
+                             extra={"dynamics_profile": "cf_sitl_v1:1bc8fedf:lib31"})
+        new_lib2 = _fake_eval(os.path.join(tmp, "new_lib2.json"), seeds, [0, 1, 1, 0],
+                              extra={"dynamics_profile": "cf_sitl_v1:1bc8fedf:lib31"})
+        assert sr.load_eval(old_lib)["dynamics_profile"] == "cf_sitl_v1:bd0dcd43"
+        # 相同逐集 dynamics_profile 放行并记录到口径表；不同固件库默认报错，加 --allow-mixed-protocol 放行。
+        rep_same = sr.build_report([("A", "gz", new_lib), ("B", "gz", new_lib2)], metrics=("SR",), n_boot=10)
+        assert rep_same["protocol"]["gz"]["values"]["dynamics_profile"] == ["cf_sitl_v1:1bc8fedf:lib31"]
+        try:
+            sr.build_report([("old", "gz", old_lib), ("new", "gz", new_lib)], metrics=("SR",), n_boot=10)
+            assert False, "不同 per_episode dynamics_profile 混表没有报错"
+        except sr.ProtocolMismatch as e:
+            assert "dynamics_profile" in str(e) and "bd0dcd43" in str(e) and "1bc8fedf:lib31" in str(e), str(e)
+        rep_mix = sr.build_report([("old", "gz", old_lib), ("new", "gz", new_lib)], metrics=("SR",), n_boot=10,
+                                  allow_mixed_protocol=True)
+        assert rep_mix["mixed_protocol"] == {"gz": ["dynamics_profile"]}, rep_mix["mixed_protocol"]
+
+        # 单文件内 per_episode 含多个 dynamics_profile（或顶层为列表）：load_eval 返回排序拼接串，单独或同表均触发 ProtocolMismatch。
+        mixed_ep = os.path.join(tmp, "mixed_ep.json")
+        _fake_eval(mixed_ep, [1, 2], [1, 0])
+        doc = json.load(open(mixed_ep, encoding="utf-8"))
+        doc["per_episode"][0]["dynamics_profile"] = "cf_sitl_v1:b"
+        doc["per_episode"][1]["dynamics_profile"] = "cf_sitl_v1:a"
+        json.dump(doc, open(mixed_ep, "w", encoding="utf-8"))
+        assert "cf_sitl_v1:a" in sr.load_eval(mixed_ep)["dynamics_profile"]
+        for entries in ([("M", "gz", mixed_ep)], [("M", "gz", mixed_ep), ("N", "gz", new_lib)]):
+            try:
+                sr.build_report(entries, metrics=("SR",), n_boot=10)
+                assert False, (entries, "单文件内多 dynamics_profile 没有报错")
+            except sr.ProtocolMismatch as e:
+                assert "dynamics_profile" in str(e) and "cf_sitl_v1:a" in str(e) and "cf_sitl_v1:b" in str(e), str(e)
+
+        # per_episode 为空（全败臂）且带 cf_sitl_params：用 values_sha256[:8] 参与比较。
+        params_a = {"path": "/p/a.json", "sha256": "1" * 64, "values_sha256": "06e5f017" + "0" * 56}
+        params_b = {"path": "/p/b.json", "sha256": "2" * 64, "values_sha256": "deadbeef" + "0" * 56}
+        soc_fail_a = _fake_eval(os.path.join(tmp, "soc_fail_a.json"), [], [], episodes_requested=2, failed_count=2,
+                                failed=[{"seed": 1}, {"seed": 2}], dynamics_profile=None, cf_sitl_params=params_a)
+        soc_fail_a2 = _fake_eval(os.path.join(tmp, "soc_fail_a2.json"), [], [], episodes_requested=2, failed_count=2,
+                                 failed=[{"seed": 1}, {"seed": 2}], dynamics_profile=None, cf_sitl_params=params_a)
+        soc_fail_b = _fake_eval(os.path.join(tmp, "soc_fail_b.json"), [], [], episodes_requested=2, failed_count=2,
+                                failed=[{"seed": 1}, {"seed": 2}], dynamics_profile=None, cf_sitl_params=params_b)
+        no_param_fail = _fake_eval(os.path.join(tmp, "no_param_fail.json"), [], [], episodes_requested=2, failed_count=2,
+                                   failed=[{"seed": 1}, {"seed": 2}])
+        assert sr.load_eval(soc_fail_a)["dynamics_profile"] == "06e5f017"
+        sr.build_report([("A1", "gz", soc_fail_a), ("A2", "gz", soc_fail_a2)], metrics=("SR",), n_boot=10)
+        for other in (new_lib, no_param_fail, soc_fail_b):
+            try:
+                sr.build_report([("soc_fail", "gz", soc_fail_a), ("other", "gz", other)], metrics=("SR",), n_boot=10)
+                assert False, (other, "cf_sitl_params 全败臂与异构臂混表没有报错")
+            except sr.ProtocolMismatch as e:
+                assert "dynamics_profile" in str(e) and "06e5f017" in str(e), str(e)
+
+
+def test_skipped_and_common_failed_cluster_consistency():
+    """I2-3：1) 占请求名额的 skipped 集与 failed 集一样在配对与整簇区间里记 0，主表与配对表成功率一致；
+    2) 两侧所有 run 都未完成的 seed 单独按 ('seed', s) 成簇，不把整张配对表退回按 seed 聚类；
+    3) failed / skipped 重复记录去重，不重复累加分母；范围扫描里不占请求名额的多余 skipped 不混入配对。"""
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+        # 复现审核 I2 TEST 3c：2 个 run、请求 4 集（seed 1,2 共享 G_12，seed 3 两侧共同失败，seed 4 在 A 跳过、在 B 完成失败）。
+        a_runs, b_runs = [], []
+        for r_idx in range(2):
+            pa = _gid_eval(os.path.join(tmp, f"a_{r_idx}.json"), [1, 2], [1, 1], lambda _s: "G_12",
+                           episodes_requested=4, failed_count=1, skipped_count=1,
+                           failed=[{"seed": 3}], skipped=[{"seed": 4, "reason": "skip"}])
+            pb = _gid_eval(os.path.join(tmp, f"b_{r_idx}.json"), [1, 2, 4], [0, 0, 0],
+                           lambda s: "G_12" if s in (1, 2) else "G_4",
+                           episodes_requested=4, failed_count=1, skipped_count=0,
+                           failed=[{"seed": 3}])
+            a_runs.append(pa)
+            b_runs.append(pb)
+        rep = sr.build_report([("A", "gz", p) for p in a_runs] + [("B", "gz", p) for p in b_runs],
+                              metrics=("SR",), n_boot=200, seed=0)
+        ca = rep["cells"]["A"]["gz"]["SR"]
+        cb = rep["cells"]["B"]["gz"]["SR"]
+        pr = rep["paired"]["gz"]["SR"]["pairwise"][0]
+        assert close(ca["point"], 0.5) and ca["n"] == 4 and ca["cluster_key"] == "geometry_gid" and ca["n_clusters"] == 3, ca
+        assert close(cb["point"], 0.0) and cb["n"] == 4 and cb["cluster_key"] == "geometry_gid" and cb["n_clusters"] == 3, cb
+        assert pr["n_common"] == 8 and close(pr["rate_A"], ca["point"]) and close(pr["rate_B"], cb["point"]), pr
+        assert (pr["b"], pr["c"]) == (4, 0), pr
+        assert pr["cluster"]["key"] == "geometry_gid" and pr["cluster"]["n_clusters"] == 3 and pr["cluster"]["n_nonzero"] == 1, pr
+        # 单 run 配对同样把占名额的 skipped 集记 0。
+        rep1 = sr.build_report([("A", "gz", a_runs[0]), ("B", "gz", b_runs[0])], metrics=("SR",), n_boot=20, seed=0)
+        pr1 = rep1["paired"]["gz"]["SR"]["pairwise"][0]
+        assert (pr1["n_common"], pr1["b"], pr1["c"]) == (4, 2, 0) and close(pr1["rate_A"], 0.5), pr1
+
+        # failed 含重复记录且 missing > 1：同一个未完成 seed 在单 run 内的分母只记 1，不累加多次。
+        dup_f = [_gid_eval(os.path.join(tmp, f"df_{i}.json"), [1, 2, 3], [1, 1, 0],
+                           episodes_requested=6, failed_count=2, failed=[{"seed": 4}, {"seed": 4}])
+                 for i in range(2)]
+        evs = [sr.load_eval(p) for p in dup_f]
+        assert evs[0]["missing_seeds"] == [4] and evs[0]["failed_seeds"] == [4], evs[0]
+        clusters, ckey = sr.cell_clusters(evs, "success", "binary", [6, 6], True)
+        assert ckey == "geometry_gid" and len(clusters) == 3 + 1 + 4, (ckey, clusters)
+        assert all(c[1] <= 1 and c[3] <= 1 for c in clusters), clusters
+        assert sum(c[1] for c in clusters) == 6 and sum(c[3] for c in clusters) == 6, clusters
+
+        # 范围扫描里已满请求名额（done == requested）的多余 skipped（如 split=train）不混进配对。
+        scan_a = _gid_eval(os.path.join(tmp, "sa.json"), [1, 2, 3, 4], [1, 1, 1, 0],
+                           episodes_requested=4, skipped_count=2,
+                           skipped=[{"seed": 98, "reason": "split=train"}, {"seed": 99, "reason": "split=val"}])
+        scan_b = _gid_eval(os.path.join(tmp, "sb.json"), [1, 2, 3, 4], [1, 0, 0, 0],
+                           episodes_requested=4, skipped_count=2,
+                           skipped=[{"seed": 98, "reason": "split=train"}, {"seed": 99, "reason": "split=val"}])
+        reps = sr.build_report([("A", "gz", scan_a), ("B", "gz", scan_b)], metrics=("SR",), n_boot=20, seed=0)
+        prs = reps["paired"]["gz"]["SR"]["pairwise"][0]
+        assert prs["n_common"] == 4 and close(prs["rate_A"], 0.75) and close(prs["rate_B"], 0.25), prs
+
+        # 全部集均被跳过（完成 0、请求 4、skipped 4）：主表与配对表同记 0.00 (n=4)。
+        all_sk = _fake_eval(os.path.join(tmp, "all_sk.json"), [], [], episodes_requested=4, skipped_count=4,
+                            skipped=[{"seed": s, "reason": "no_corridor"} for s in (1, 2, 3, 4)])
+        ok4 = _fake_eval(os.path.join(tmp, "ok4.json"), [1, 2, 3, 4], [1, 1, 0, 0])
+        repk = sr.build_report([("sk", "gz", all_sk), ("ok", "gz", ok4)], metrics=("SR",), n_boot=20, seed=0)
+        assert repk["cells"]["sk"]["gz"]["SR"]["point"] == 0.0 and repk["cells"]["sk"]["gz"]["SR"]["n"] == 4
+        assert (repk["paired"]["gz"]["SR"]["pairwise"][0]["n_common"], repk["paired"]["gz"]["SR"]["pairwise"][0]["c"]) == (4, 2)
+
+
 def main():
     for fn in (test_distributions, test_wilson, test_mcnemar, test_cochran_holm, test_iqm_bootstrap,
                test_power, test_report_end_to_end, test_mixed_metric_version_header,
@@ -633,7 +756,8 @@ def main():
                test_multi_run_cell_cluster_interval, test_multi_run_cell_failed_and_spl,
                test_duplicate_seed_in_one_run_is_error, test_pairing_counts_infra_failed_seed_as_zero,
                test_all_failed_cell_shows_zero_with_requested_denominator, test_protocol_keys_mismatch_raises_unless_allowed,
-               test_success_counts_agrees_with_run_denominator):
+               test_success_counts_agrees_with_run_denominator, test_dynamics_profile_from_per_episode_and_params,
+               test_skipped_and_common_failed_cluster_consistency):
         fn()
         print("ok", fn.__name__)
     print("test_stats_report: PASS")

@@ -323,7 +323,7 @@ gap size。旧 v2 几何（`LANE_SEP=1.302 m`，缝 0.902 m）的数据不能与
   - 两方法同一 seed 集：**McNemar**（不一致对 b+c < 25 用精确二项，否则带连续性校正的卡方）；
     ≥3 个单 run 方法另给 **Cochran's Q**（全体共同 seed）作总体检验；两两 McNemar 照做、不以 Q 显著为前提，
     **Holm** 族 = 同一场景、同一指标的全部两两行（`stats_report.py` 就是这么做的，表注会写）。配对按共同 seed 对齐
-    （成功类指标取两侧请求 seed 交集，失败集记 0；越低越好指标取两侧都完成的 seed，见 §5.6）。
+    （成功类指标取两侧请求 seed 交集，失败与占请求名额的跳过集记 0；越低越好指标取两侧都完成的 seed，见 §5.6）。
     默认表列 SR/CR/false_forward/SPL；`task_success` 在没有 waypoint 的 base 任务恒为 0，要显式 `--metrics` 加。
   - 样本量：两比例功效估算（正态近似，另给 Fleiss 连续性校正）。0.80 vs 0.90、α=0.05、功效 0.8
     每臂约 199 集（校正后 219）；配对设计可更少。n < 20 的格只算 pilot。
@@ -399,16 +399,20 @@ longcourse 分段打点）+ 策略段的墙钟耗时折成的仿真时间；后�
     k ≤ 20 精确（与枚举 2^k 种符号等价；20 个几何的主比较恒为精确），k > 20 用固定种子蒙特卡洛（p = (命中 + 1) / (抽样 + 1)），
     表里写明抽样次数（默认 100000，`--n-draws`）。
   - 区间：A−B 成功率差的整簇 bootstrap 百分位 95%（B=2000，seed 固定）。簇键 = `per_episode[*].geometry_gid`，
-    没有该字段时回退为 seed，表注写明。
+    没有该字段或两侧同 seed 的 `geometry_gid` 不一致时整表回退为 seed，表注写明；两侧所有 run 都未完成（失败或跳过）的共同 seed
+    单独按 seed 成簇，不把其余已完成集的 `geometry_gid` 聚类退回 seed。
   - 配对方式：同一方法的多个 run 按 `--eval` 的给出顺序对齐，第 i 个 run 对第 i 个 run，单元 = (run, seed)；
     两侧 run 数不同只配前 min 个。同一个 run 内 seed 重复直接报错，不静默覆盖。单 run 的方法配对表不加这两列。
-  - 越高越好的指标配对时，一侧基础设施失败的 seed 记 0，与主表同分母，n 共同 = 两侧请求 seed 的交集；全部失败的格显示 `0.00 (n=请求数)`。
-    越低越好的指标失败集没有观测，只配两侧都完成的 seed。
+  - 越高越好的指标配对与整簇区间里，未完成（基础设施失败或占请求名额的跳过，`failed` 与 `skipped` 合并去重）的 seed 记 0，
+    与主表同分母，n 共同 = 两侧请求 seed 的交集（范围扫描里已满请求名额的多余 `skipped` 不混入）；全部失败或全部跳过的格显示 `0.00 (n=请求数)`。
+    越低越好的指标失败与跳过集没有观测，只配两侧都完成的 seed。
   - Holm 校正只作用于逐集 McNemar 的 p；几何聚类 p 不做 Holm。
 - **协议一致性**（`tools/stats_report.py`）。同一场景（同一列组）内，`action_latency_s`、`heading_guard`、`rtf`、`student_cond`、
-  `dynamics_profile` 五个键必须一致，缺键 = 旧协议，`heading_guard=0` 与 `student_cond=prev-action` 等价于缺键。不一致报错（rc 2），
-  信息列出场景、键、各取值与方法；确实要混表（例如有护栏对无护栏）加 `--allow-mixed-protocol`，表头标「混合协议」。
-  `cf_sitl_params` 含路径，不比较，参数内容由 `dynamics_profile` 里的哈希覆盖。`metric_version`、`success_criterion`、`hold_s`、
+  `dynamics_profile` 五个键必须一致，缺键 = 旧协议，`heading_guard=0` 与 `student_cond=prev-action` 等价于缺键。
+  其中 `dynamics_profile` 在顶层没有该键时从 `per_episode[*].dynamics_profile` 取（单文件内出现多个取值也判不一致），
+  `per_episode` 为空且顶层有 `cf_sitl_params` 时回退取 `values_sha256[:8]`。不一致报错（rc 2），
+  信息列出场景、键、各取值与方法；确实要混表（例如有护栏对无护栏、不同固件库对照）加 `--allow-mixed-protocol`，表头标「混合协议」。
+  `cf_sitl_params` 含路径，不直接比较路径，参数内容由 `dynamics_profile` 或 `values_sha256[:8]` 覆盖。`metric_version`、`success_criterion`、`hold_s`、
   `dynamics`、`vehicle`、`window_from`、`task` 仍只警告。
 - **预注册与样本内外划分**：起跑前在入口脚本头部写下预测、证伪条件和主比较；主比较的配对不超过 3 个；参数在起跑前定死，不在评测 seed 上调。
   设计时看过冻结 20 个评测 seed（`EVAL_SEEDS_BASE_20`）上轨迹的方法（护栏阈值、规则、条件码阈值），在这 20 个 seed 上的数字算样本内；

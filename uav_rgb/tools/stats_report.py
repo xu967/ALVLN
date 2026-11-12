@@ -263,6 +263,37 @@ def protocol_value(key, v):
     return str(v)
 
 
+def resolve_dynamics_profile(e, per):
+    """eval.json 的 dynamics_profile（I2-1）：顶层有值时优先用顶层（列表去重排序）；常规 Gazebo 评测顶层不写该键，
+    从 per_episode 取（单值取该串，多值拼成排序后的 ' + ' 串触发一致性检查报错）；per_episode 为空且顶层有 cf_sitl_params 时，
+    回退用它的 values_sha256[:8] 参与比较。"""
+    top = e.get("dynamics_profile")
+    if isinstance(top, list):
+        profiles = sorted({str(x) for x in top if x})
+    elif top:
+        profiles = [str(top)]
+    else:
+        profiles = sorted({str(ep["dynamics_profile"]) for ep in per if isinstance(ep, dict) and ep.get("dynamics_profile")})
+        if not profiles and not per and isinstance(e.get("cf_sitl_params"), dict):
+            vsha = str(e["cf_sitl_params"].get("values_sha256") or "")[:8]
+            if vsha:
+                profiles = [vsha]
+    if not profiles:
+        return None
+    return profiles[0] if len(profiles) == 1 else " + ".join(profiles)
+
+
+def _unique_seeds(*records_lists):
+    """按出现顺序提取去重后的未完成 seed（I2-3：先 failed 后 skipped，重复记录不累加）。"""
+    seen, out = set(), []
+    for records in records_lists:
+        for r in records or ():
+            if isinstance(r, dict) and r.get("seed") is not None and r["seed"] not in seen:
+                seen.add(r["seed"])
+                out.append(r["seed"])
+    return out
+
+
 def load_eval(path):
     """eval.json（或含它的目录）-> 报表需要的字段。失败/跳过集不在 per_episode 里，另记数。"""
     if os.path.isdir(path):
@@ -272,19 +303,23 @@ def load_eval(path):
     per = e.get("per_episode") or []
     check_unique_seeds(per, path)
     hold = e.get("hold_s")
+    failed_cnt = e.get("failed_count")
+    skipped_cnt = e.get("skipped_count")
     return {
         "path": os.path.abspath(path), "per_episode": per,
         "episodes_done": e.get("episodes_done", len(per)),
         "episodes_requested": e.get("episodes_requested"),
-        "failed": e.get("failed_count", len(e.get("failed") or [])),
-        "failed_seeds": [f["seed"] for f in (e.get("failed") or []) if isinstance(f, dict) and f.get("seed") is not None],
-        "skipped": e.get("skipped_count", len(e.get("skipped") or [])),
+        "failed": len(e.get("failed") or []) if failed_cnt is None else failed_cnt,
+        "failed_seeds": _unique_seeds(e.get("failed")),
+        "skipped": len(e.get("skipped") or []) if skipped_cnt is None else skipped_cnt,
+        "missing_seeds": _unique_seeds(e.get("failed"), e.get("skipped")),
         "hold_s": hold, "metric_version": e.get("metric_version"),
         "success_criterion": e.get("success_criterion"), "dynamics": e.get("dynamics"),
         "vehicle": e.get("vehicle"), "window_from": e.get("window_from"),
         "task": e.get("task"), "route": (e.get("scene") or {}).get("route") if isinstance(e.get("scene"), dict) else None,
         "spl_reference": e.get("spl_reference"),
         **{k: e.get(k) for k in STRICT_PROTOCOL_KEYS},
+        "dynamics_profile": resolve_dynamics_profile(e, per),
     }
 
 
@@ -322,20 +357,31 @@ def uses_requested(metric):
 
 
 def all_failed(ev):
-    """请求的集全部失败：完成 0 集、有失败记录、请求数已知。没有 per_episode 的聚合文件（完成数不是 0）与缺这个指标字段的旧文件都不是全失败，
-    它们的格仍是「—」，不能被写成 0。"""
-    return ev["episodes_done"] == 0 and ev["failed"] > 0 and bool(ev.get("episodes_requested"))
+    """请求的集全部未完成（失败或跳过）：完成 0 集、有失败或跳过记录、请求数已知。没有 per_episode 的聚合文件（完成数不是 0）
+    与缺这个指标字段的旧文件都不是全失败，它们的格仍是「—」，不能被写成 0。"""
+    return ev["episodes_done"] == 0 and (ev["failed"] + ev.get("skipped", 0)) > 0 and bool(ev.get("episodes_requested"))
+
+
+def missing_seeds_for(ev, done_seeds, denom):
+    """需要记 0 的未完成 seed（I2-3）：从去重后的 missing_seeds（先 failed 后 skipped）去掉已完成集，最多补满请求分母缺口
+    denom − len(done_seeds)。范围扫描里已满请求名额（done + failed == denom）的多余 skipped 不会混进来。"""
+    need = denom - len(done_seeds)
+    if need <= 0:
+        return []
+    raw = ev["missing_seeds"] if "missing_seeds" in ev else ev.get("failed_seeds", ())
+    return [sd for sd in raw if sd not in done_seeds][:need]
 
 
 def run_outcomes(ev, field, requested):
-    """一个 run 的 {seed: 值}，配对用。requested（越高越好的二值指标）时基础设施失败的 seed 记 False，与主表的请求集分母同口径；
-    越低越好的指标失败集没有观测，不进。run 里没有这个字段（旧文件）而且不是全失败时，不给失败集补 False（没有观测可对）。
-    同一个 seed 既完成又在 failed 里（重试成功）以完成的为准。没有 seed 的空位（episodes_requested 大于完成加失败，旧文件里有）
-    配不上对，不进。"""
+    """一个 run 的 {seed: 值}，配对用。requested（越高越好的二值指标）时未完成（失败或占请求名额的跳过）的 seed 记 False，
+    与主表的请求集分母同口径；越低越好的指标未完成集没有观测，不进。run 里没有这个字段（旧文件）而且不是全失败时，
+    不给未完成集补 False（没有观测可对）。同一个 seed 既完成又在 failed 里（重试成功）以完成的为准。没有 seed 的空位
+    （episodes_requested 大于完成加未完成记录，旧文件里有）配不上对，不进。"""
     out = dict(metric_values(ev["per_episode"], field))
     if requested and (out or all_failed(ev)):
-        for sd in ev.get("failed_seeds", []):
-            out.setdefault(sd, False)
+        denom = run_denominator(ev, len(out), True)
+        for sd in missing_seeds_for(ev, out, denom):
+            out[sd] = False
     return out
 
 
@@ -392,16 +438,20 @@ def summarize_cell(runs, field, kind, n_boot, seed, requested=False):
 
 def cell_clusters(evs, field, kind, denoms, with_missing):
     """多 run 格的整簇重采样数据：每个簇一个元组 (run0 分子, run0 分母, run1 分子, run1 分母, ...)，返回 (簇列表, 聚类键)。
-    簇 = geometry_gid（所有完成集都有），否则 seed（同一个 seed 在各 run 里同一簇）。分子分母与点估计同一套：
-    二值指标 = 成功数 / 集数，连续指标 = 值之和 / 集数；with_missing（越高越好的二值指标，分母取请求集）时，失败集记 0 落进它所在的几何簇
-    （几何由别的 run 里同 seed 的集给出，查不到就是以 seed 为键的单点簇），记录里没有 seed 的空位各自一个单点簇。"""
-    use_gid = all(ep.get("geometry_gid") is not None for ev in evs for ep in ev["per_episode"] if ep.get(field) is not None)
-    geom = {}
+    簇 = geometry_gid（所有完成集都有且同 seed 一致），否则 seed（同一个 seed 在各 run 里同一簇）。分子分母与点估计同一套：
+    二值指标 = 成功数 / 集数，连续指标 = 值之和 / 集数；with_missing（越高越好的二值指标，分母取请求集）时，失败与占名额的跳过集记 0
+    落进它所在的几何簇（几何由别的 run 里同 seed 的集给出，查不到就是以 seed 为键的独立簇），记录里没有 seed 的空位各自一个单点簇。"""
+    obs_eps = [ep for ev in evs for ep in ev["per_episode"] if ep.get(field) is not None]
+    gids_by_seed = {}
     for ev in evs:
-        geom.update(run_geometries(ev))
+        for sd, g in run_geometries(ev).items():
+            gids_by_seed.setdefault(sd, set()).add(g)
+    use_gid = (bool(obs_eps) and all(ep.get("geometry_gid") is not None for ep in obs_eps)
+               and all(len(gs) == 1 for gs in gids_by_seed.values()))
+    geom = {sd: next(iter(gs)) for sd, gs in gids_by_seed.items() if len(gs) == 1}
 
     def cid(sd, gid):
-        return gid if use_gid and gid is not None else ("seed", sd)
+        return ("gid", gid) if use_gid and gid is not None else ("seed", sd)
 
     acc = []
     for i, ev in enumerate(evs):
@@ -415,12 +465,11 @@ def cell_clusters(evs, field, kind, denoms, with_missing):
             e = a.setdefault(cid(sd, ep.get("geometry_gid")), [0.0, 0])
             e[0] += (1 if v else 0) if kind == "binary" else v
             e[1] += 1
-        missing = denoms[i] - len(done)
-        if with_missing and missing > 0:
-            fs = [sd for sd in ev.get("failed_seeds", []) if sd not in done][:missing]
-            for sd in fs:
+        if with_missing:
+            ms = missing_seeds_for(ev, done, denoms[i])
+            for sd in ms:
                 a.setdefault(cid(sd, geom.get(sd)), [0.0, 0])[1] += 1
-            for j in range(missing - len(fs)):
+            for j in range(denoms[i] - len(done) - len(ms)):
                 a[("pad", i, j)] = [0.0, 1]
         acc.append(a)
     ids = list(dict.fromkeys(c for a in acc for c in a))
@@ -460,26 +509,37 @@ def run_geometries(ev):
 
 def pair_units(runs_a, runs_b, field, requested=False):
     """两个方法的配对单元 [(簇, a, b)]（a、b 为 0/1）：第 i 个 run 对第 i 个 run（按 --eval 给出的顺序），每个 run 内按共同 seed 配对。
-    键是 (run, seed)，不同 run 的同一个 seed 各是一个单元，不会互相覆盖。requested 见 run_outcomes（失败集记 0，共同 seed =
-    两侧请求 seed 的交集）。簇 = geometry_gid（每个单元两边都有且相同；失败集没有自己的 gid，取同 seed 在别的 run 里的），
-    否则整张表回退成 seed。返回 (units, 聚类键, 配对的 run 数)。"""
+    键是 (run, seed)，不同 run 的同一个 seed 各是一个单元，不会互相覆盖。requested 见 run_outcomes（失败与跳过集记 0，共同 seed =
+    两侧请求 seed 的交集）。簇 = geometry_gid（全部已完成单元都有 geometry_gid 且同 seed 一致；未完成集取同 seed 在别的 run 里的
+    geometry_gid，两侧所有 run 都未完成的 seed 单独按 ('seed', seed) 成簇，不把整张表退回 seed），否则整张表回退成 seed。
+    返回 (units, 聚类键, 配对的 run 数)。"""
     # shortcut: 两边 run 数不同时只配前 min(nA, nB) 个 run，多出来的 run 不参与；改成按几何取均值再配对，几何差就不再是整数，
     #   精确符号翻转不适用。
     m = min(len(runs_a), len(runs_b))
-    geom = {}
+    gids_by_seed = {}
     for ev in list(runs_a) + list(runs_b):
         for sd, g in run_geometries(ev).items():
-            geom.setdefault(sd, g)
-    rows, use_gid = [], True
+            gids_by_seed.setdefault(sd, set()).add(g)
+    rows, any_gid, gid_ok = [], False, True
     for i in range(m):
+        da = metric_values(runs_a[i]["per_episode"], field)
+        db = metric_values(runs_b[i]["per_episode"], field)
         va = run_outcomes(runs_a[i], field, requested)
         vb = run_outcomes(runs_b[i], field, requested)
         ga, gb = run_geometries(runs_a[i]), run_geometries(runs_b[i])
         for s in sorted(set(va) & set(vb)):
-            g = ga.get(s, geom.get(s))
-            use_gid = use_gid and g is not None and g == gb.get(s, geom.get(s))
+            if (s in da and s not in ga) or (s in db and s not in gb):
+                gid_ok = False
+            gs = gids_by_seed.get(s, set())
+            if len(gs) > 1:
+                gid_ok = False
+            g = next(iter(gs)) if len(gs) == 1 else None
+            if g is not None:
+                any_gid = True
             rows.append((s, g, int(bool(va[s])), int(bool(vb[s]))))
-    return [((g if use_gid else s), a, b) for s, g, a, b in rows], ("geometry_gid" if use_gid else "seed"), m
+    use_gid = gid_ok and any_gid
+    return [((("gid", g) if use_gid and g is not None else ("seed", s)), a, b) for s, g, a, b in rows], (
+        "geometry_gid" if use_gid else "seed"), m
 
 
 def paired_tests(runs, field, n_boot=2000, seed=0, n_draws=paired_stats.DEFAULT_DRAWS, requested=False):
@@ -571,7 +631,10 @@ def build_report(entries, metrics=DEFAULT_METRICS, pair_metrics=("SR",), n_boot=
             by_value = {}
             for m in methods:
                 for ev in groups[m].get(scene, []):
-                    by_value.setdefault(protocol_value(k, ev.get(k)), set()).add(m)
+                    pv = protocol_value(k, ev.get(k))
+                    parts = pv.split(" + ") if k == "dynamics_profile" and " + " in pv else (pv,)
+                    for part in parts:
+                        by_value.setdefault(part, set()).add(m)
             if set(by_value) != {NO_VALUE}:         # 整个场景都缺键 = 旧协议，不进口径行
                 vals[k] = sorted(by_value)
             if len(by_value) > 1:
@@ -690,9 +753,9 @@ def to_markdown(rep):
                 lines.append("| " + " | ".join(cells) + " |")
             lines.append(f"\n注：两两 McNemar 不以 Q 显著为前提（Q 只是总体检验）；Holm 族 = 本表全部 {len(t['pairwise'])} 行"
                          f"（场景 `{scene}` × {pm}），跨指标/跨场景不合并校正。"
-                         + (" 越高越好的指标：一侧基础设施失败的 seed 记失败（失败集记 0，与主表同分母），n 共同 = 两侧请求 seed 的交集。"
+                         + (" 越高越好的指标：一侧基础设施失败或跳过的 seed 记失败（失败集记 0、跳过集记 0，与主表同分母），n 共同 = 两侧请求 seed 的交集。"
                             if uses_requested(pm) else
-                            " 越低越好的指标：失败集没有观测，只配两侧都完成的 seed。"))
+                            " 越低越好的指标：失败与跳过集没有观测，只配两侧都完成的 seed。"))
             if cl:
                 first = next(r["cluster"] for r in t["pairwise"] if "cluster" in r)
                 lines += ["", "多 run 的行：第 i 个 run 对第 i 个 run，按 (run, seed) 对齐，一个 (run, seed) 是一个单元。"
