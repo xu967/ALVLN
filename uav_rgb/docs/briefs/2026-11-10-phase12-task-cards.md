@@ -1080,12 +1080,20 @@ gz 的上限随核数定（24 核 7 个，12 核 3 个，公共规则 §4），�
 - 验收：审核者的重演（0417 数据里被重试救活的 349 步）在 v8 下机头转准后能前进的比例、两步来回的比例；20 个冻结 seed 的教师闭环不低于 v7（Gazebo 池，排在今天的队列后面）；近柱状态的影子标签不再左右交替。
 - I1-10：`make_counterfactual.py` 按源集的载具与教师版本设好再重算标签。
 
-### 卡 W1-15c：流水线与交付配方的条件通路（审核 I2-2 第 1、3 点、I2-5 第 1、3 点、I2-7；等 `p12-e2e-1` 合进 main、卡 W1-15b 第二轮交回后开工）
+### 卡 W1-15c：流水线与交付配方的条件通路（审核 I2-2 第 1、3 点、I2-5、I2-7、I1-6，第一轮 C6 的工具一侧；`p12-e2e-1` 的代码 09:03 合进 main、卡 W1-15b 第二轮 08:58 合并，11-12 09:04 开工）
 
 - 只动三条流水线、`tools/pipeline_common.py`、`tools/average_ckpt.py`、`sim/tools/nav_cond.py` 里读 `<ckpt>.json` 的那一段与它们的测试。
   1. I2-2 第 1 点：两条流水线的 `deliver_check` 在 `preflight` 里就拒绝 `average_ckpt` 不支持的配置（文本、双帧；带条件的在 `dc8e5ff` 之后支持），不等采集与训练跑完才报。
   2. I2-2 第 3 点、I2-7：`dagger_gz_pipeline` 的汇总按请求集报分母（用 `paired_stats.success_counts`），自带的配对检验把失败集记 0；调 `stats_report` 时基线与新臂的协议键不同就传 `--allow-mixed-protocol`，报表照出并带混合协议的表头；`stats_report` 非零退出要进日志并在汇总里写明没有出表。
   3. I2-5 第 1、3 点：`average_ckpt` 写出的 `.json` 记数据集的条件类型（`meta.cond`）与数据集的绝对路径，改成先写临时文件再改名；流水线判断「校准做完了」时要读得出这个 `.json`；`nav_cond.check_student_cond` 在 `.json` 里有记录时优先用它，不再因为相对路径或数据集被挪走而退化成只警告。
+- 11-12 09:04 加的三条（文件范围相应加上 `tools/select_ckpt.py`、`tools/exp_lib.sh`、`experiments/_template/README.md`）：
+  4. I1-6：`nav_cond.find_train_config` 在每个候选目录先看 `config.resume.json` 再看 `config.json`（同目录续训换过数据集的情形）；checkpoint 头里记的数据集 sha256 与配置里的不同就判对不上；
+     显式要求 `prev-action` 而模型是纯图像（`prev_dim` 为 0）时判对不上。最后这一点在 `nav_cond.py` 里做成函数的一个参数（调用方说明这个取值是不是用户显式给的），
+     `eval_closed_loop.py` 里 `--student-cond` 的缺省值从 `prev-action` 改成空的那一行不在这张卡里改（卡 W1-13 第二轮正在改这个文件），把要改的那一处写进报告。
+  5. 第一轮 C6 的工具一侧（I2-5 第 2 点；C++ 一侧卡 C1a 已修，`e7ee56d`）：`average_ckpt` 的校准剔不剔碰撞步跟 checkpoint 训练契约里的 `drop_collision` 位走（现在恒剔），`.json` 里记下用的是哪种；
+     `select_ckpt.py` 在没有 `config.json` 时读 checkpoint 的契约位，两处都没有就拒绝，不再告警后按不剔算。现有交付权重（都是 `drop_collision` 为真训的）重新校准的结果逐字节不变，用测试锁住。
+  6. 训练进程等 GPU 时不自旋（卡 C1a 的 `25c1d03`：一个训练进程从 0.93 核降到 0.10 核，每轮耗时不变，权重逐字节相同）：三条流水线起 `uavrgb_train` 时环境里缺省带 `UAVRGB_CUDA_BLOCKING_SYNC=1`（外面已经设了就照外面的），
+     `tools/exp_lib.sh` 的 `exp_start` 同样缺省导出；日志里记一行这个开关的取值。命令行与 dry-run 的输出逐字不变。顺手修 `exp_lib.sh` 时序健康那一行：被限流时长按核累计，除以墙钟会超过 100%，改成除以「墙钟乘核数配额」或者不报比例，选一种写明。
 
 ## 5. 第三波规格（细化后再开工，不要照这一节直接写代码）
 

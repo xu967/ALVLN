@@ -34,6 +34,8 @@
 | S1b 第一轮（11-12 08:29） | `2b3eee7` | `f0d2747` | 13 个文件，+2496 −27 | `sim/3dgs/collision.py` 的 `collision_model`（缺省 v1 不变；v2 未定稿）、`planner.py`、`collect_3dgs.py`、新文件 `route_dirs.py`；重定基线的入口 |
 | W1-15b（11-12 08:11） | `035b398` | `cc48b27` | 13 个文件，+1775 −119 | `tools/pipeline_common.py`（实例锁、`run.pid`、`eval_state`、`retire_dir`）；三条流水线的续跑、分母、`action_latency` / `rtf` 透传；两个旧工具的提示 |
 | W1-15b 第二轮（11-12 08:58） | `f3b7a14` | `b7118e9` | 9 个文件，+320 −14 | `eval_3dgs` 的三个调用方（`tools/dagger_pipeline.py`、`tools/compare_datasets.py`、`tools/train_student_with_video.py`）显式传 `--allow-train-scene`，汇总标注实际划分；三条流水线文件头的起跑食谱 `>` 改 `>>` |
+| C1a（11-12 09:03） | `a9fa8b4` | 待推 | 17 个文件，+1604 −79 | `src/trainer.cpp`（增强随机数随 seed、续训继承 `max_grad_norm`、`--log-grad-norm`）；`src/trainer_eval.cpp`（eval-only 的碰撞口径取自 config 与 checkpoint 契约）；`src/checkpoint.cpp`（读契约位）；`--cuda-blocking-sync`；7 个新 CTest |
+| E2E-1 的代码部分（11-12 09:03） | `13ad44f` | 待推 | 24 个文件，+4291 −10 | `tools/average_ckpt.py`（校准支持带条件输入的模型）；`experiments/2026-11-12-e2e-heading-code/`（入口、汇总器、对拍、演练测试）。实验结果另起一次合并 |
 | W1-13 第一、二部分（11-12 08:05） | `e40c693` | `7770479` | 15 个文件，+2637 −36 | `sim/tools/collect.py`、`cf_sitl_exec.py`、`eval_closed_loop.py` 的三项记账与 `protocol_notes`；`collect_parallel.py` 的透传；`tools/preprocess.py --drop-late-and-stall` |
 | W1-15a（11-12 08:03） | `f2c1107` | `a177ab2` | 7 个文件，+1500 | 新文件 `tools/exp_lib.sh`、`tools/stop_daemon.sh`、`experiments/_template/`；`tools/check.sh` 的 E-13 三行 |
 | W1-14（11-12 07:42） | `0d7f3b5` | `c284175` | 6 个文件，+1195 −68 | 新文件 `tools/paired_stats.py`；`tools/stats_report.py` 的多 run 配对、整簇区间、协议一致性键、失败集记 0；`docs/EVAL_STANDARD.md` §5 |
@@ -58,7 +60,7 @@
 | W1-15a（11-12 08:03 已合并，`f2c1107`） | E-2、E-4、E-5、E-6、E-9、E-10、E-11、E-13（实验入口的公共脚本） | `p12-w1-15a` |
 | W1-15b（11-12 08:11 已合并，`035b398`；第二轮 08:58 已合并，`f3b7a14`：`eval_3dgs` 的三个调用方，分支 `p12-w1-15b2`） | E-3、E-7、E-8、E-9、A2 的流水线部分 | `p12-w1-15b` |
 | T1（在做） | F2、F4、F5（C++ 测试） | `p12-t1` |
-| C1a（等 T1） | H8、H9、C6 与上一轮 `src.md` 的 D2、D3、D6、D9 | 未建 |
+| C1a（11-12 09:03 已合并，`a9fa8b4`；全量 `check.sh` 在试合并提交上 rc=0） | H8、H9、C6 的 C++ 一侧与上一轮 `src.md` 的 D2、D3、D6、D9；另加 `--cuda-blocking-sync` | `p12-c1a` |
 
 ## 总览：按严重程度（主会话 11-12 01:30 排）
 
@@ -132,7 +134,7 @@
 | C3 | checkpoint 与推理进程的握手行都不记录条件字节的语义（上一步动作还是航向码）；客户端不传时默认喂模型自己的上一步输出 | `src/checkpoint.cpp:174-175`；`src/infer_main.cpp:69-72`；`sim/tools/student.py:106-125` | 读代码确认 | 条件喂错不报错。W1-9 的一致性闸门靠训练配置与数据集路径去推，3DGS 线与板端没有 | 卡 E2E-C1（C++：checkpoint 升版加 `cond_kind`，握手行带出来，客户端核对）。E2E-1 出结果后开工 |
 | C4 | 条件码的维度写死成 4，翻转增强里的镜像规则写死成左转与右转互换 | `src/trainer_dev.cpp:47-59`、`:150-151`；`src/aux_sidecar.cpp:104`；`sim/tools/student.py:76-78` | 读代码确认 | 加宽历史码（E2）要先改这里 | 卡 E2E-C1 |
 | C5 | 深度辅助头接在 FiLM 之后，辅助损失的梯度会把条件调制往「与条件无关」的方向拉 | `src/include/uavrgb/model.hpp:37-39`；`src/model_dev_aux.cu:53`、`:79-82` | 读代码确认；影响是推断 | 条件输入与几何辅助头一起用（E2）时互相抵消 | 卡 E2E-C1：辅助头可选接在 FiLM 之前。先在 PyTorch 原型线上比两种接法 |
-| C6 | 平均后的权重做 `--eval-only` 时，碰撞过滤静默回落到命令行缺省；`average_ckpt.py` 自己总是剔除碰撞步，不看契约 | `src/train_main.cpp:200-218`；`tools/average_ckpt.py:154-171` | 读代码确认 | 离线指标的口径可能与训练时不同 | 卡 E2E-C1 |
+| C6 | 平均后的权重做 `--eval-only` 时，碰撞过滤静默回落到命令行缺省；`average_ckpt.py` 自己总是剔除碰撞步，不看契约 | `src/train_main.cpp:200-218`；`tools/average_ckpt.py:154-171` | 读代码确认 | 离线指标的口径可能与训练时不同 | 卡 E2E-C1 进展：C++ 一侧已修（卡 C1a，`e7ee56d`，11-12 09:03 合入 `a9fa8b4`）：碰撞口径取自同目录 config 与 checkpoint 的训练契约，两处都没有或矛盾就拒绝。工具一侧（`average_ckpt.py`、`select_ckpt.py`）归卡 W1-15c。 |
 | C7 | 打包时丢碰撞步会造出「上一帧等于自身、条件值不是 SAFE」的组合，只在训练里出现 | `tools/preprocess.py:258-263`、`:858-861` | 读代码确认 | 小 | 记录在案，随 W1-13 的 `preprocess` 改动一起看 |
 | C8 | 辅助头的分带语义与文本词表不进 checkpoint | `src/include/uavrgb/checkpoint.hpp:4-24`；`src/include/uavrgb/text.hpp:3-11` | 读代码确认 | 词表或分带改了不会被发现 | 卡 E2E-C1 |
 | C9 | 双帧顺序与条件字节没有「训练路径等于推理路径」的回归测试 | `src/tests/test_infer_io.cpp:112-118`；`tools/check_input_parity.py` | 读代码确认 | 测试缺口 | 卡 E2E-P0 的前向对拍覆盖了一部分；回归测试并入 E2E-C1 |
@@ -206,6 +208,6 @@
 | H5 | FiLM 的位置让条件输入等价于「类偏置表加通道增益」 | `src/model.cpp:186-226`、`:243`；`src/model_dev_film.cu:47-56` | 代码与推导已核实 | 条件输入容易变成捷径 | 卡 E2E-P1（FiLM 前移、条件置空） |
 | H6 | 类权重 auto：逐批归一化放大梯度噪声，事后校准实际在撤销类权重 | `src/class_weights.cpp:52-77`；`src/softmax_cuda.cu:93-111` | 已核实（算式与日志） | 训练方差大 | 卡 E2E-R1（显式类权重的臂）；logit adjustment 进 E2E-P1 |
 | H7 | 没有归一化层，初始化按 tanh 的口径 | `src/model.cpp:82-91`；`src/augment_dev.cu:21` | 代码已核实；影响推断 | 与 H3 叠加 | 卡 E2E-P1（随列结构头一起加 BN） |
-| H8 | 增强实现了没用过；翻转与 W1-9 的航向码兼容（上一轮「不要一起开」的提醒不成立）；增强的随机数种子写死，不随 `--seed` 变 | `src/trainer_dev.cpp:46-65`、`:71-98`；`src/include/uavrgb/trainer.hpp:187` | 代码已核实 | 开增强后三个训练种子看到同一串增强参数，种子方差会被低估 | 种子那一行并入卡 E2E-C1；在它修好之前，开增强的臂不用来比种子方差 |
-| H9 | 训练器不记梯度范数，看不出裁剪是否在起作用 | `src/trainer.cpp:555` | 代码已核实 | 小 | 并入卡 E2E-C1 |
+| H8 | 增强实现了没用过；翻转与 W1-9 的航向码兼容（上一轮「不要一起开」的提醒不成立）；增强的随机数种子写死，不随 `--seed` 变 | `src/trainer_dev.cpp:46-65`、`:71-98`；`src/include/uavrgb/trainer.hpp:187` | 代码已核实 | 开增强后三个训练种子看到同一串增强参数，种子方差会被低估 | 种子那一行并入卡 E2E-C1；在它修好之前，开增强的臂不用来比种子方差 进展：种子一条已修（卡 C1a，`4ea91cd`，合入 `a9fa8b4`）：增强的随机数随 `--seed` 派生，续训继承后重新播种；不开增强时逐位不变。 |
+| H9 | 训练器不记梯度范数，看不出裁剪是否在起作用 | `src/trainer.cpp:555` | 代码已核实 | 小 | 并入卡 E2E-C1 进展：已修（卡 C1a，`232bac4`，合入 `a9fa8b4`）：`--log-grad-norm` 每轮记裁剪前范数的中位数、最大值与被裁剪的步数占比，默认关。 |
 | H10 | 条件维度绑在类别数上；单字节协议够 E2 用（54 个取值以内） | `src/trainer_dev.cpp:151` | 代码已核实 | 加宽历史码要先改这里 | 同 C4，卡 E2E-C1 |
