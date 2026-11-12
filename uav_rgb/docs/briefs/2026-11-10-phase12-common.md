@@ -76,6 +76,8 @@
     已经写了这个条件的入口（冒烟脚本也算）：门槛改成 8（`IDLE_MAX_CORES=8` 或改配置区），最长等待改成 600 s，改动写进起跑记录与报告。
     时序健康不靠起跑时的空闲来保证：每个臂起止各记一次 cgroup 的 `usage_usec`、`nr_throttled`、`throttled_usec`，汇总里每个臂给一行
     （平均核数、被限流的时长占墙钟的比例、迟到步数）；带 `--action-latency` 的臂照入口脚本的规则重跑迟到的集。
+    11-12 20:36 补（卡 W1-15c 合并，`7e143db`）：`tools/exp_lib.sh` 的健康摘要从这次合并起写「占配额 x%」，分母是墙钟乘配额核数。
+    在这之前的输出（含冻结代码跑的 E2E-1 与样本外补评）写的是「占墙钟 y%」，`throttled_usec` 按运行队列累加再除以墙钟，会超过 100%，不是时间占比；两种写法的数不能直接比。
   - 卡的配置再变时，以 `nvidia-smi -L` 为准并向用户确认用哪一张，不要自己挑。
 - Python：数据工具 `$R/.venv-tools/bin/python`（无 torch）；3DGS `$D/3dgs-venv/bin/python`（torch + gsplat）；`$D/teacher-venv` 也有 torch，
   只给对照基线与教师工具用。主线训练推理禁用 PyTorch。不往现有 venv 里装包。
