@@ -751,27 +751,64 @@ class Arms(Base):
         self.assertEqual(group_members(p.pid), [])
 
     def test_health_line_comes_from_the_start_and_end_snapshots(self):
+        # throttle=6.0：每秒墙钟累计 6 核·秒限流（旧写法除墙钟会报 600%，新写法除「墙钟×12核配额」应约 50.0%，不超过 100%）
         entry = self.sb.entry("""
             exp_start
             exp_arm timed sleep 1.2
             exp_finish 0 "跑完"
         """)
-        with self.sb.busy_cpu(3, throttle=0.5):
+        with self.sb.busy_cpu(3, throttle=6.0):
             rc, err = self.sb.run(entry)
         self.assertEqual(rc, 0, err)
         marks = read(self.out("timed.cg")).splitlines()
         self.assertEqual([m.split()[0] for m in marks], ["start", "end"])
         self.assertTrue(all(len(m.split()) == 5 for m in marks), marks)
         line = read(self.out("health.txt")).strip()
-        import re
-        m = re.fullmatch(r"timed 墙钟 (\d+)s 平均 ([\d.]+) 核 nr_throttled \+(\d+) 被限流 ([\d.]+)s（占墙钟 (\d+)%）", line)
+        m = re.fullmatch(r"timed 墙钟 (\d+)s 平均 ([\d.]+) 核 nr_throttled \+(\d+) 被限流 ([\d.]+)s（占配额 ([\d.]+)%）", line)
         self.assertIsNotNone(m, line)
         wall, cores, nthr, thr_s, pct = (float(x) for x in m.groups())
         self.assertTrue(2.5 <= cores <= 3.5, line)
         self.assertTrue(10 < nthr < 200, line)
-        self.assertTrue(0.4 <= thr_s <= 0.9, line)
-        self.assertTrue(35 <= pct <= 65, line)
+        self.assertGreater(thr_s, wall, "被限流按核累计大于墙钟，用来确认比例不会超过 100%")
+        self.assertTrue(35.0 <= pct <= 65.0, line)
         self.assertIn(line, read(self.out("run.log")))
+
+    def test_health_line_handles_unlimited_cpu_max_and_cuda_blocking_sync_exported(self):
+        """第 6 条：exp_start 缺省导出 UAVRGB_CUDA_BLOCKING_SYNC=1 并在日志/launches.log 记录；
+        外部已设 0 则保留 0；非法值 rc=2 拒绝；cpu.max=max 时健康行标注配额无上限。"""
+        self.sb.write_file(self.sb.cpu_max, "max 100000\n")
+        entry = self.sb.entry("""
+            exp_start
+            exp_arm probe bash -c 'mkdir -p "$ARM_DIR"; printf "%s" "$UAVRGB_CUDA_BLOCKING_SYNC" > "$ARM_DIR/bs.txt"'
+            exp_finish 0 "ok"
+        """)
+        rc, err = self.sb.run(entry)
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(read(self.out("probe/bs.txt")), "1")
+        self.assertIn("cuda_blocking_sync 1 source=default", read(self.out("launches.log")))
+        self.assertIn("UAVRGB_CUDA_BLOCKING_SYNC=1", read(self.out("run.log")))
+        self.assertIn("（配额无上限）", read(self.out("health.txt")))
+
+        # 外部显式设 0：照外部保留 0
+        sb0 = Sandbox(self.base)
+        self.addCleanup(sb0.cleanup)
+        entry0 = sb0.entry("""
+            exp_start
+            exp_arm probe bash -c 'mkdir -p "$ARM_DIR"; printf "%s" "$UAVRGB_CUDA_BLOCKING_SYNC" > "$ARM_DIR/bs.txt"'
+            exp_finish 0 "ok"
+        """)
+        rc0, err0 = sb0.run(entry0, env={"UAVRGB_CUDA_BLOCKING_SYNC": "0"})
+        self.assertEqual(rc0, 0, err0)
+        self.assertEqual(read(os.path.join(sb0.out, "probe/bs.txt")), "0")
+        self.assertIn("cuda_blocking_sync 0 source=env", read(os.path.join(sb0.out, "launches.log")))
+
+        # 非法取值（如 yes）：preflight rc=2 拒绝
+        sbb = Sandbox(self.base)
+        self.addCleanup(sbb.cleanup)
+        entryb = sbb.entry("exp_start\nexp_finish 0 'never'\n")
+        rcb, errb = sbb.run(entryb, env={"UAVRGB_CUDA_BLOCKING_SYNC": "yes"})
+        self.assertEqual(rcb, 2, errb)
+        self.assertIn("UAVRGB_CUDA_BLOCKING_SYNC", errb)
 
 
 STOP = os.path.join(HERE, "stop_daemon.sh")

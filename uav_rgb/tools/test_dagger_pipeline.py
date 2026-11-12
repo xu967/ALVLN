@@ -586,6 +586,39 @@ def test_d1_real_eval_3dgs_on_synthetic_train_corridor():
     print("ok D1 实跑（合成 train 走廊 + mock 渲染 + cf_blackbox）：带 --allow-train-scene rc=0 写 diag-train-scene，去掉则 rc=2")
 
 
+def test_train_passes_cuda_blocking_sync():
+    """第 6 条：dagger_pipeline 起 uavrgb_train 缺省传 UAVRGB_CUDA_BLOCKING_SYNC=1，外部设 0 则沿用。"""
+    saved_sh, saved_dry = dp.sh, dp.DRY
+    saved_env = os.environ.get("UAVRGB_CUDA_BLOCKING_SYNC")
+    seen_envs = []
+    tmp = tempfile.mkdtemp(prefix="test_dagger_bs_")
+
+    def fake_sh(cmd, *_a, **kw):
+        seen_envs.append(kw.get("env_extra"))
+        out = cmd[cmd.index("--out") + 1]
+        _touch(os.path.join(out, "ckpt_best.bin"), "c")
+        _touch(os.path.join(out, "metrics.jsonl"), DONE_LINE)
+
+    dp.sh, dp.DRY = fake_sh, False
+    try:
+        os.environ.pop("UAVRGB_CUDA_BLOCKING_SYNC", None)
+        dp.train(os.path.join(tmp, "ds"), os.path.join(tmp, "run1"), "hard")
+        assert seen_envs == [{"UAVRGB_CUDA_BLOCKING_SYNC": "1"}], seen_envs
+
+        seen_envs.clear()
+        os.environ["UAVRGB_CUDA_BLOCKING_SYNC"] = "0"
+        dp.train(os.path.join(tmp, "ds"), os.path.join(tmp, "run2"), "hard")
+        assert seen_envs == [{"UAVRGB_CUDA_BLOCKING_SYNC": "0"}], seen_envs
+    finally:
+        dp.sh, dp.DRY = saved_sh, saved_dry
+        if saved_env is None:
+            os.environ.pop("UAVRGB_CUDA_BLOCKING_SYNC", None)
+        else:
+            os.environ["UAVRGB_CUDA_BLOCKING_SYNC"] = saved_env
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("ok 第 6 条（dagger_pipeline）：uavrgb_train 默认传 UAVRGB_CUDA_BLOCKING_SYNC=1，外部设 0 则沿用")
+
+
 def main():
     test_train_resume_by_metrics_done()
     test_partial_collect_and_pack_retired_and_excluded_from_glob()
@@ -599,6 +632,7 @@ def main():
     test_dry_run_creates_nothing()
     test_d1_dry_run_and_split_summary_annotations()
     test_d1_real_eval_3dgs_on_synthetic_train_corridor()
+    test_train_passes_cuda_blocking_sync()
     print("test_dagger_pipeline: PASS")
     return 0
 

@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
 sys.path.insert(0, os.path.join(REPO, "sim", "tools"))
 import dagger_gz_pipeline as dg  # noqa: E402
 import split_manifest as sm  # noqa: E402
+import stats_report  # noqa: E402
 
 ROUND0_MANIFEST = {   # trunc/col 的真实字段子集（lib v1 采、离线截断；没有 teacher_tiebreak）
     "schema": "navlab.episode.v1", "teacher": "plan_action", "planner": "astar",
@@ -729,6 +730,222 @@ class MainTests(unittest.TestCase):
             rc, _out = self._run("--rounds", "1", "--baselines", "", "--epochs", "2", "--stop-after-preflight")
             self.assertEqual(rc, 1, bad)
 
+    def test_calswa_rejects_unsupported_inputs_at_preflight_and_allows_heading_code(self):
+        """I2-2 第 1 点：dc8e5ff 合入后 calswa + heading-code（prev_dim=4）在 preflight 与 dry-run 均放行；
+        而文本（text_dim>0）、双帧（two_frame/in_c=6）、非 4 维条件或未知 student_cond 在 preflight 即拒绝，不等训练完才报错。"""
+        # 1) calswa + heading-code 放行且命令链完整
+        dg.CFG.update(round0_collection=self.col, round0_ckpt=self.ckpt, deliver="calswa", student_cond="heading-code")
+        rc, out = self._run("--dry-run", "--rounds", "1", "--eps-per-round", "2", "--instances", "2",
+                            "--steps", "12", "--eval-seeds", "1,113", "--epochs", "10", "--baselines", "trunc")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("--prev-action", out)
+        self.assertIn("--save-every-epoch", out)
+        self.assertIn("average_ckpt.py", out)
+        self.assertIn("--student-cond heading-code", out)
+        rc_pf, out_pf = self._run("--rounds", "1", "--baselines", "", "--epochs", "10", "--stop-after-preflight")
+        self.assertEqual(rc_pf, 0, out_pf)
+
+        # 2) average_ckpt 不支持的配置在 preflight 即失败，提示 E1_DELIVER=best（未知 student_cond 连 best 也拒）
+        for bad in (dict(text_dim=16), dict(two_frame=True), dict(in_c=6), dict(prev_dim=8)):
+            dg.CFG.clear()
+            dg.CFG.update(self.saved, plugin_dir=os.path.join(self.tmp, "gz"),
+                          round0_collection=self.col, round0_ckpt=self.ckpt, deliver="calswa", **bad)
+            rc_bad, _ = self._run("--rounds", "1", "--baselines", "", "--epochs", "10", "--stop-after-preflight")
+            self.assertEqual(rc_bad, 1, bad)
+            st = json.load(open(os.path.join(self.tmp, "out", "status.json"), encoding="utf-8"))
+            self.assertEqual(st["preflight"]["state"], "failed", bad)
+            self.assertIn("E1_DELIVER=best", st["preflight"]["error"], bad)
+
+        dg.CFG.clear()
+        dg.CFG.update(self.saved, plugin_dir=os.path.join(self.tmp, "gz"),
+                      round0_collection=self.col, round0_ckpt=self.ckpt, deliver="best", student_cond="9way-unknown")
+        rc_cond, _ = self._run("--rounds", "1", "--baselines", "", "--epochs", "2", "--stop-after-preflight")
+        self.assertEqual(rc_cond, 1)
+
+        # 3) deliver=best 时文本与双帧在 deliver_check 不受限
+        dg.CFG.clear()
+        dg.CFG.update(self.saved, plugin_dir=os.path.join(self.tmp, "gz"),
+                      round0_collection=self.col, round0_ckpt=self.ckpt, deliver="best", text_dim=16, two_frame=True)
+        rc_best, out_best = self._run("--rounds", "1", "--baselines", "", "--epochs", "2", "--stop-after-preflight")
+        self.assertEqual(rc_best, 0, out_best)
+
+    def test_summary_requested_denominator_mixed_protocol_and_stats_report_failure(self):
+        """I2-2 第 3 点 + I2-7：
+        1) summary 按请求集报分母（paired_stats.success_counts），配对检验把失败/跳过集记 0；
+        2) 新臂与基线协议键不同（如 dagger 带 student_cond='heading-code' 而基线无）时，自动给 stats_report 传 --allow-mixed-protocol，
+           真实 stats_report.py 正常出表并标混合协议；协议一致时不传该开关；
+        3) stats_report 非零退出时记入日志，并在 summary.md 与 summary.json 写明没有出表。"""
+        out = os.path.join(self.tmp, "out_sum")
+        os.makedirs(out)
+        base_ev = {"schema": "uavrgb.eval.v1", "metric_version": "sim09.v2.coast1s.corridor3m",
+                   "success_criterion": "route_choice", "hold_s": 1.0, "dynamics": "cf_sitl",
+                   "vehicle": "e1_mini", "window_from": "observation", "task": "base"}
+        # dagger：请求 20，完成 18，失败 2（seed 19, 20），成功 9（seed 1..9）
+        dg_ev = {**base_ev, "student_cond": "heading-code", "episodes_requested": 20, "episodes_done": 18,
+                 "failed_count": 2, "skipped_count": 0, "requested_success_rate": 0.45,
+                 "wilson_ci": {"requested": [0.26, 0.66]}, "spl": 0.40,
+                 "failed": [{"seed": 19}, {"seed": 20}],
+                 "per_episode": [{"seed": i, "geometry_gid": f"g{i}", "success": i <= 9, "collision": False}
+                                 for i in range(1, 19)]}
+        # trunc 基线：无 student_cond，请求 20，完成 20，seed 1..10 与 19, 20 成功（共 12 成功）
+        tr_ev = {**base_ev, "episodes_requested": 20, "episodes_done": 20, "failed_count": 0, "skipped_count": 0,
+                 "requested_success_rate": 0.60, "wilson_ci": {"requested": [0.39, 0.78]}, "spl": 0.48,
+                 "per_episode": [{"seed": i, "geometry_gid": f"g{i}", "success": (i <= 10 or i >= 19), "collision": False}
+                                 for i in range(1, 21)]}
+        # eval60-dagger：请求 60，完成 58，失败 2，成功 30
+        e60_ev = {**base_ev, "student_cond": "heading-code", "episodes_requested": 60, "episodes_done": 58,
+                  "failed_count": 2, "skipped_count": 0, "requested_success_rate": 0.50,
+                  "wilson_ci": {"requested": [0.38, 0.62]},
+                  "failed": [{"seed": 59}, {"seed": 60}],
+                  "per_episode": [{"seed": i, "geometry_gid": f"g{i}", "success": i <= 30, "collision": False}
+                                  for i in range(1, 59)]}
+        for rel, doc in (("eval20-dagger", dg_ev), ("eval20-trunc", tr_ev), ("eval60-dagger", e60_ev)):
+            os.makedirs(os.path.join(out, rel), exist_ok=True)
+            dg.write_json(os.path.join(out, rel, "eval.json"), doc)
+
+        dg.CFG.update(eval60_arms=("dagger",), eval60_count=60)
+        csv60 = ",".join(str(i) for i in range(1, 61))
+        decisions = {"trunc": {"source": "re-eval", "path": os.path.join(out, "eval20-trunc")}}
+
+        # (a) 真实运行 stats_report 子进程：混合协议自动传 --allow-mixed-protocol，rc=0 出表
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res = dg.summary(out, 1, [("dagger", "student", "ck")], decisions, csv60)
+        self.assertEqual(res["arms"]["dagger"]["n"], 20)
+        self.assertEqual(res["arms"]["dagger"]["episodes_done"], 18)
+        self.assertEqual(res["arms"]["dagger"]["success"], 9)
+        self.assertEqual(res["eval60"]["dagger"]["n"], 60)
+        self.assertEqual((res["mcnemar_vs_dagger"]["trunc"]["b"],
+                          res["mcnemar_vs_dagger"]["trunc"]["c"],
+                          res["mcnemar_vs_dagger"]["trunc"]["n_common"]), (0, 3, 20))
+        md = open(os.path.join(out, "summary.md"), encoding="utf-8").read()
+        self.assertIn("| dagger | 9/20 | [0.26, 0.66] |", md)
+        self.assertIn("| dagger (60 seed 清单) | 0.5 (60) |", md)
+        self.assertNotIn("没有出表", md)
+        self.assertNotIn("stats_report_error", res)
+        sr_md_path = os.path.join(out, "stats", "stats_report.md")
+        self.assertTrue(os.path.isfile(sr_md_path), buf.getvalue())
+        self.assertIn("混合协议（--allow-mixed-protocol）", open(sr_md_path, encoding="utf-8").read())
+        self.assertIn("--allow-mixed-protocol", buf.getvalue())
+
+        # (b) 协议一致时不传 --allow-mixed-protocol
+        dg_ev_same = dict(dg_ev)
+        dg_ev_same.pop("student_cond", None)
+        dg.write_json(os.path.join(out, "eval20-dagger", "eval.json"), dg_ev_same)
+        seen_cmds = []
+        saved_run = dg.run
+        dg.run = lambda cmd, **_kw: (seen_cmds.append(list(cmd)), 0)[1]
+        try:
+            dg.summary(out, 1, [("dagger", "student", "ck")], decisions, csv60)
+            self.assertEqual(len(seen_cmds), 1)
+            self.assertNotIn("--allow-mixed-protocol", seen_cmds[0])
+
+            # (c) stats_report 非零退出：日志、summary.md、summary.json 三处均写明失败且没有出表
+            dg.run = lambda cmd, **_kw: 2
+            buf_fail = io.StringIO()
+            with contextlib.redirect_stdout(buf_fail):
+                res_fail = dg.summary(out, 1, [("dagger", "student", "ck")], decisions, csv60)
+            md_fail = open(os.path.join(out, "summary.md"), encoding="utf-8").read()
+            self.assertIn("stats_report", buf_fail.getvalue())
+            self.assertIn("rc=2", buf_fail.getvalue())
+            self.assertIn("没有出表", md_fail)
+            self.assertEqual(res_fail.get("stats_report_error", {}).get("rc"), 2)
+        finally:
+            dg.run = saved_run
+
+    def _eval20_dirs(self, **arms):
+        """写 eval20-<臂>/eval.json（协议键相同）；返回 (out, decisions)，decisions 是 dagger 以外的臂（来源 re-eval）。"""
+        out = tempfile.mkdtemp(prefix="sum_", dir=self.tmp)
+        base_ev = {"schema": "uavrgb.eval.v1", "metric_version": "sim09.v2.coast1s.corridor3m",
+                   "success_criterion": "route_choice", "hold_s": 1.0, "dynamics": "cf_sitl",
+                   "vehicle": "e1_mini", "window_from": "observation", "task": "base"}
+        for name, doc in arms.items():
+            os.makedirs(os.path.join(out, f"eval20-{name}"))
+            dg.write_json(os.path.join(out, f"eval20-{name}", "eval.json"), {**base_ev, **doc})
+        return out, {n: {"source": "re-eval", "path": os.path.join(out, f"eval20-{n}")} for n in arms if n != "dagger"}
+
+    def test_summary_mcnemar_pairing_is_the_pairing_stats_report_uses(self):
+        """更正 192762d（P-2）：summary 的 McNemar 配对结果集直接取 stats_report.run_outcomes，不另抄一份。
+        构造：dagger 请求 4、完成 4（seed 1..4 成功 T,T,F,F），另有一条名额之外的 skipped（seed 7，范围扫描里会出现）；
+        trunc 请求 7、完成 7（seed 1..7 成功 T,F,T,F,T,T,T）。stats_report 的口径里 seed 7 不占 dagger 的请求名额，不进配对，
+        共同 seed 是 1..4，b=1（seed 2）、c=1（seed 3）；手抄的版本把 seed 7 记成 False，多出一个不一致对（c=2，n_common=5）。
+        期望值同时取 stats_report 自己的 paired_tests，所以主线上 stats_report 把口径改成别的样子时，这条仍是对的。"""
+        dag = {"episodes_requested": 4, "episodes_done": 4, "failed_count": 0, "skipped_count": 1,
+               "skipped": [{"seed": 7}], "requested_success_rate": 0.5, "spl": 0.4,
+               "wilson_ci": {"requested": [0.15, 0.85]},
+               "per_episode": [{"seed": i, "geometry_gid": f"g{i}", "success": ok, "collision": False}
+                               for i, ok in zip(range(1, 5), (True, True, False, False))]}
+        trn = {"episodes_requested": 7, "episodes_done": 7, "failed_count": 0, "skipped_count": 0,
+               "requested_success_rate": 5 / 7, "spl": 0.5, "wilson_ci": {"requested": [0.36, 0.92]},
+               "per_episode": [{"seed": i, "geometry_gid": f"g{i}", "success": ok, "collision": False}
+                               for i, ok in zip(range(1, 8), (True, False, True, False, True, True, True))]}
+        out, decisions = self._eval20_dirs(dagger=dag, trunc=trn)
+        dg.CFG.update(eval60_arms=())
+        saved_run = dg.run
+        dg.run = lambda cmd, **_kw: 0
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                res = dg.summary(out, 1, [("dagger", "student", "ck")], decisions, "")
+        finally:
+            dg.run = saved_run
+        row = stats_report.paired_tests(
+            {"dagger": [stats_report.load_eval(os.path.join(out, "eval20-dagger"))],
+             "trunc": [stats_report.load_eval(os.path.join(out, "eval20-trunc"))]},
+            "success", n_boot=20, requested=stats_report.uses_requested("SR"))["pairwise"][0]
+        got = res["mcnemar_vs_dagger"]["trunc"]
+        self.assertEqual((got["b"], got["c"], got["n_common"]), (row["b"], row["c"], row["n_common"]))
+        self.assertEqual((got["b"], got["c"], got["n_common"]), (1, 1, 4))
+        self.assertNotIn("pairing_errors", res)
+
+    @staticmethod
+    def _three_episode_eval(seeds, success=lambda i: True):
+        return {"episodes_requested": 3, "episodes_done": 3, "failed_count": 0, "skipped_count": 0,
+                "requested_success_rate": 2 / 3, "spl": 0.5, "wilson_ci": {"requested": [0.2, 0.94]},
+                "per_episode": [{"seed": i, "geometry_gid": f"g{i}", "success": success(i), "collision": False}
+                                for i in seeds]}
+
+    def test_summary_records_arm_that_stats_report_rejects_instead_of_silently_overwriting(self):
+        """更正 192762d（P-2 的另一面）：per_episode 里 seed 重复，stats_report 拒收（InputError）；手抄的配对集合用
+        {seed: 值} 让后一集静默覆盖前一集。取 stats_report 的结果集以后这一臂不能再静默配对：不参与 McNemar，
+        原因记进 summary.json 的 pairing_errors、summary.md 与日志，summary 本身照常写出（单臂，没有别的臂牵连）。"""
+        out, decisions = self._eval20_dirs(dagger=self._three_episode_eval((1, 2, 2)))
+        dg.CFG.update(eval60_arms=())
+        saved_run = dg.run
+        dg.run = lambda cmd, **_kw: 0
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                res = dg.summary(out, 1, [("dagger", "student", "ck")], decisions, "")
+        finally:
+            dg.run = saved_run
+        md = open(os.path.join(out, "summary.md"), encoding="utf-8").read()
+        self.assertIn("seed [2] 重复", res["pairing_errors"]["dagger"])
+        self.assertEqual(res["arms"]["dagger"]["episodes_done"], 3)
+        for text in (md, buf.getvalue()):
+            self.assertIn("dagger", text)
+            self.assertIn("不参与 McNemar", text)
+
+    def test_summary_still_written_when_stats_report_rejects_one_eval_json(self):
+        """更正 192762d（P-3）：两个臂里有一个的 eval.json 被 stats_report 拒收（per_episode 里 seed 重复）时，判断混合协议
+        那一步不能抛错：summary.json 与 summary.md 仍要写出，坏的那一臂不参与 McNemar；真实的 stats_report 子进程照旧运行，
+        它对同一份文件报错，退出码与原因记进 summary.json 的 stats_report_error 与 summary.md。"""
+        out, decisions = self._eval20_dirs(dagger=self._three_episode_eval((1, 2, 3), lambda i: i != 3),
+                                           trunc=self._three_episode_eval((1, 2, 2)))
+        dg.CFG.update(eval60_arms=())
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            res = dg.summary(out, 1, [("dagger", "student", "ck")], decisions, "")
+        md = open(os.path.join(out, "summary.md"), encoding="utf-8").read()
+        self.assertTrue(os.path.isfile(os.path.join(out, "summary.json")))
+        self.assertEqual(res["arms"]["trunc"]["episodes_done"], 3)
+        self.assertNotIn("trunc", res["mcnemar_vs_dagger"])
+        self.assertIn("seed [2] 重复", res["pairing_errors"]["trunc"])
+        self.assertNotIn("dagger", res["pairing_errors"])
+        self.assertIn("不参与 McNemar", md)
+        self.assertNotEqual(res["stats_report_error"]["rc"], 0)
+        self.assertIn("重复", open(os.path.join(out, "stats.log"), encoding="utf-8").read())
+        self.assertIn("没有出表", md)
+
 
 def _dry_cmds(out):
     """dry-run 输出里每条 `$ ` 命令的 token 列表（去掉时间戳与 `  > 日志` 后缀）。"""
@@ -842,6 +1059,33 @@ class DeliverTests(unittest.TestCase):
         os.remove(self.swa + ".json")
         dg.train_into(self.ds, self.run_dir)
         self.assertEqual(self._tools(), ["average_ckpt.py"])
+        # I2-5 第 3 点：损坏或空的 .json 不算完成
+        self.calls.clear()
+        self._touch(self.swa + ".json", "")
+        dg.train_into(self.ds, self.run_dir)
+        self.assertEqual(self._tools(), ["average_ckpt.py"])
+
+    def test_dry_run_skip_line_unchanged_for_finished_calibration(self):
+        """更正 c973059：dry-run 预演一个已做完校准的目录，同改前一样只打印「跳过校准平均」，不打印 average_ckpt 命令
+        （c973059 把跳过判断改成 `not DRY and ...`，预演输出变了）；.json 半截损坏时不算做完，dry-run 也照旧打印命令。
+        用真实的 dg.run 与 DRY=True：dry-run 只打印、不起进程。"""
+        self._touch(self.swa)
+        self._touch(self.swa + ".json", "{}")
+        dg.run, dg.DRY = self.real_run, True
+
+        def dry_calibrate():
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                dg.calibrate_into(self.ds, self.run_dir)
+            return buf.getvalue()
+
+        out = dry_calibrate()
+        self.assertIn("跳过校准平均", out)
+        self.assertNotIn("average_ckpt.py", out, "dry-run 预演已做完校准的目录不该打印校准命令")
+        self._touch(self.swa + ".json", '{"half_written": ')
+        out = dry_calibrate()
+        self.assertIn("average_ckpt.py", out)
+        self.assertNotIn("跳过校准平均", out)
 
     def test_average_failure_stops_without_fallback(self):
         self.fail_on = ("average_ckpt.py",)
@@ -884,6 +1128,32 @@ class DeliverTests(unittest.TestCase):
         self.assertEqual(dg.deliver_ckpt(self.run_dir), self.swa)
         dg.CFG["deliver"] = "best"
         self.assertEqual(dg.deliver_ckpt(self.run_dir), os.path.join(self.run_dir, "ckpt_best.bin"))
+
+    def test_train_into_passes_cuda_blocking_sync(self):
+        """第 6 条：dagger_gz_pipeline 起 uavrgb_train 缺省传 UAVRGB_CUDA_BLOCKING_SYNC=1，外部设 0 则照传 0，非法值拒绝。"""
+        saved_env = os.environ.get("UAVRGB_CUDA_BLOCKING_SYNC")
+        try:
+            dg.CFG["deliver"] = "best"
+            os.environ.pop("UAVRGB_CUDA_BLOCKING_SYNC", None)
+            dg.train_into(self.ds, self.run_dir)
+            self.assertEqual(self.calls[0][1], {"UAVRGB_CUDA_BLOCKING_SYNC": "1"})
+
+            self.calls.clear()
+            shutil.rmtree(self.run_dir)
+            os.environ["UAVRGB_CUDA_BLOCKING_SYNC"] = "0"
+            dg.train_into(self.ds, self.run_dir)
+            self.assertEqual(self.calls[0][1], {"UAVRGB_CUDA_BLOCKING_SYNC": "0"})
+
+            self.calls.clear()
+            shutil.rmtree(self.run_dir)
+            os.environ["UAVRGB_CUDA_BLOCKING_SYNC"] = "bad"
+            with self.assertRaises(RuntimeError):
+                dg.train_into(self.ds, self.run_dir)
+        finally:
+            if saved_env is None:
+                os.environ.pop("UAVRGB_CUDA_BLOCKING_SYNC", None)
+            else:
+                os.environ["UAVRGB_CUDA_BLOCKING_SYNC"] = saved_env
 
 
 if __name__ == "__main__":

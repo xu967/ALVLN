@@ -5,6 +5,8 @@
 import json
 import os
 import shutil
+import struct
+import subprocess
 import sys
 import tempfile
 
@@ -141,6 +143,105 @@ def test_epoch_row_and_ckpts(tmp):
     assert [e for e, _ in sc.epoch_ckpts(run)] == [1, 2, 10]
 
 
+def write_ckpt_header(path, version=6, drop_collision=True, zero_contract=False, ds_sha="ab" * 32, lr=1e-3, batch=128):
+    """按 src/checkpoint.cpp 布局写最小 ckpt_epNN.bin 头（足够解析 v5 训练契约）。"""
+    nw = 4
+    buf = bytearray(struct.pack("<8sIIiiiiIII", b"UAVRCK01", version, 1, 8, 8, 3, 4, 10, 1, nw))
+    buf += struct.pack("<4f", 1.0, 1.0, 1.0, 1.0)
+    if version >= 3:
+        buf += struct.pack("<f", 0.5)
+    if version >= 4:
+        buf += struct.pack("<i", 0)
+    if version >= 5:
+        if zero_contract:
+            buf += b"\x00" * 113
+        else:
+            buf += (bytes.fromhex(ds_sha) + struct.pack("<B", 1 if drop_collision else 0) + b"\x00" * 32
+                    + struct.pack("<ffIi", 0.0, lr, 42, batch) + b"\x00" * 32)
+    if version >= 6:
+        buf += struct.pack("<ii", 0, 0)
+    with open(path, "wb") as f:
+        f.write(bytes(buf))
+
+
+def test_resolve_drop_collision_and_cli(tmp):
+    """C6：select_ckpt 没有 config.json 时从 ckpt v5 契约读 drop_collision；先看 config.resume.json；
+    config 与契约矛盾或两处均无记录时拒绝（对齐 src/trainer_eval.cpp:194-212）。"""
+    # 1) 无 config.json，仅 ckpt 契约有记录（True / False）
+    for want in (True, False):
+        rdir = os.path.join(tmp, f"run_nocfg_{want}")
+        os.makedirs(rdir)
+        p1 = os.path.join(rdir, "ckpt_ep01.bin")
+        write_ckpt_header(p1, drop_collision=want)
+        assert sc.resolve_drop_collision(rdir, [(1, p1)]) is want
+
+    # 2) 同目录续训：config.resume.json 优先于旧 config.json
+    r_res = os.path.join(tmp, "run_res")
+    os.makedirs(r_res)
+    p_res = os.path.join(r_res, "ckpt_ep02.bin")
+    write_ckpt_header(p_res, drop_collision=True)
+    with open(os.path.join(r_res, "config.json"), "w", encoding="utf-8") as f:
+        json.dump({"drop_collision": False}, f)
+    with open(os.path.join(r_res, "config.resume.json"), "w", encoding="utf-8") as f:
+        json.dump({"drop_collision": True}, f)
+    assert sc.resolve_drop_collision(r_res, [(2, p_res)]) is True
+
+    # 3) config.json 与 ckpt 契约矛盾 → 报错拒绝
+    r_conflict = os.path.join(tmp, "run_conflict")
+    os.makedirs(r_conflict)
+    p_conf = os.path.join(r_conflict, "ckpt_ep01.bin")
+    write_ckpt_header(p_conf, drop_collision=True)
+    with open(os.path.join(r_conflict, "config.json"), "w", encoding="utf-8") as f:
+        json.dump({"drop_collision": False}, f)
+    try:
+        sc.resolve_drop_collision(r_conflict, [(1, p_conf)])
+    except ValueError as e:
+        assert "矛盾" in str(e), e
+    else:
+        raise AssertionError("config 与 ckpt 契约矛盾时应报错")
+
+    # 4) 无含 drop_collision 的 config，且 ckpt 为全零契约或 v4（无契约）→ 报错拒绝，不静默回落 False
+    for tag, kw in (("zero", {"version": 6, "zero_contract": True}), ("v4", {"version": 4})):
+        r_none = os.path.join(tmp, f"run_none_{tag}")
+        os.makedirs(r_none)
+        p_none = os.path.join(r_none, "ckpt_ep01.bin")
+        write_ckpt_header(p_none, **kw)
+        with open(os.path.join(r_none, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"lr": 1e-3}, f)   # 无 drop_collision 键
+        try:
+            sc.resolve_drop_collision(r_none, [(1, p_none)])
+        except ValueError as e:
+            assert "drop_collision" in str(e) or "契约" in str(e), e
+        else:
+            raise AssertionError(f"{tag}: 两处都无记录时应报错拒绝")
+
+    # 5) 端到端 CLI：无 config.json、ckpt 契约 drop_collision=True 时剔除 val 碰撞帧（4 帧而非 5 帧）；全零契约时非零退出
+    fake_infer = os.path.join(tmp, "fake_infer")
+    with open(fake_infer, "w", encoding="utf-8") as f:
+        f.write(f"#!{sys.executable}\nimport json, sys\n"
+                "print(json.dumps({'in_h':8,'in_w':8,'in_c':3,'num_classes':4,'text_dim':0,"
+                "'prev_action_dim':0,'aux_classes':0}), flush=True)\n"
+                "while sys.stdin.buffer.read(8*8*3):\n"
+                "    print(json.dumps({'action':1,'probs':[0.1,0.7,0.1,0.1]}), flush=True)\n")
+    os.chmod(fake_infer, 0o755)
+    ds_path = os.path.join(tmp, "dataset.uavr")   # test_uavr_and_poses 已写出（val 5 帧含 1 帧碰撞）
+    out_ok = os.path.join(tmp, "sel_ok")
+    res_ok = subprocess.run([sys.executable, os.path.join(REPO, "tools", "select_ckpt.py"),
+                             "--run", os.path.join(tmp, "run_nocfg_True"), "--data", ds_path,
+                             "--out", out_ok, "--infer-bin", fake_infer, "--no-check-metrics"],
+                            capture_output=True, text=True)
+    assert res_ok.returncode == 0, res_ok.stderr
+    ep_json = json.load(open(os.path.join(out_ok, "epochs.json"), encoding="utf-8"))
+    assert ep_json["n"] == 4 and ep_json["rows"][0]["n"] == 4, f"应按契约 drop_collision=True 剔除 1 个碰撞帧：{ep_json}"
+    assert ep_json.get("drop_collision") is True
+
+    res_bad = subprocess.run([sys.executable, os.path.join(REPO, "tools", "select_ckpt.py"),
+                              "--run", os.path.join(tmp, "run_none_zero"), "--data", ds_path,
+                              "--out", os.path.join(tmp, "sel_bad"), "--infer-bin", fake_infer, "--no-check-metrics"],
+                             capture_output=True, text=True)
+    assert res_bad.returncode != 0, "无 config 且全零契约时 CLI 必须非零退出"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="test_select_ckpt_")
     try:
@@ -148,6 +249,7 @@ def main():
         test_uavr_and_poses(tmp)
         test_select_epoch()
         test_epoch_row_and_ckpts(tmp)
+        test_resolve_drop_collision_and_cli(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("PASS: select_ckpt 四件套 / UAVR 读取与过滤 / 样本→位姿 / 空画面 / 选模规则")

@@ -812,9 +812,43 @@ def test_calswa_resume():
             os.remove(calswa + ".json")
             ep.train(tmp)
             assert [_tool(c) for c, _ in calls] == ["average_ckpt.py"], calls
+            # I2-5 第 3 点：.json 存在但为空或半截损坏 JSON 时，不算校准完成，不跳过
+            calls.clear()
+            _touch(calswa + ".json", '{"half_written": ')
+            ep.train(tmp)
+            assert [_tool(c) for c, _ in calls] == ["average_ckpt.py"], calls
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print("ok calswa 续跑：训完只补平均，产物齐了跳过，只剩 .bin 不当完成")
+
+
+def test_calswa_dry_run_skip_line_unchanged():
+    """更正 c973059：dry-run 预演一个已做完校准的目录，同改前一样只打印「跳过校准平均」，不打印 average_ckpt 命令
+    （c973059 把跳过判断改成 `not DRY and ...`，预演输出变了）；.json 半截损坏时不算做完，dry-run 也照旧打印命令。
+    用真实的 sh 与 pc.DRY=True：dry-run 只打印、不起进程。"""
+    tmp = tempfile.mkdtemp(prefix="test_e1_pipeline_")
+    try:
+        ds, run_dir = os.path.join(tmp, "ds"), os.path.join(tmp, "run")
+        calswa = os.path.join(run_dir, "ckpt_calswa.bin")
+        _touch(os.path.join(ds, "dataset.uavr"))
+        _touch(calswa)
+        _touch(calswa + ".json", "{}")
+
+        def dry_calibrate():
+            buf = io.StringIO()
+            with _cfg(deliver="calswa"), _patched(ep, DRY=True), _patched(ep.pc, DRY=True), contextlib.redirect_stdout(buf):
+                ep.calibrate_swa(ds, run_dir)
+            return buf.getvalue()
+
+        out = dry_calibrate()
+        assert "跳过校准平均" in out, out
+        assert "average_ckpt.py" not in out, f"dry-run 预演已做完校准的目录不该打印校准命令：{out}"
+        _touch(calswa + ".json", '{"half_written": ')
+        out = dry_calibrate()
+        assert "average_ckpt.py" in out and "跳过校准平均" not in out, out
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("ok calswa dry-run：校准做完的目录只打印跳过，半截 .json 照旧打印命令")
 
 
 def test_calswa_failure_stops_pipeline():
@@ -941,6 +975,65 @@ def test_action_latency_and_rtf_passthrough():
     print("ok A2（e1）：action_latency / rtf 缺省 None 逐字不变，设值透传到采集与评测，非法取值报错")
 
 
+def test_calswa_refuses_unsupported_model_configs_at_preflight():
+    """I2-2 第 1 点：deliver=calswa 在 preflight（deliver_check）即拒绝 average_ckpt 不支持的配置（文本 text_dim>0、
+    双帧 two_frame/in_c=6、未知 prev_dim），不等采集与训练跑完才炸；prev_dim=4（prev_action）自 dc8e5ff 起放行；
+    deliver=best 时文本与双帧均不受限。"""
+    tmp = tempfile.mkdtemp(prefix="test_e1_pipeline_")
+    calls = []
+    try:
+        _touch(os.path.join(tmp, "ds", "dataset.uavr"))
+        for bad in (dict(text_dim=16), dict(two_frame=True), dict(in_c=6), dict(prev_dim=3)):
+            with _cfg(deliver="calswa", epochs=30, **bad), _patched(ep, sh=_fake_sh(calls)):
+                for where, fn in (("preflight", ep.preflight), ("train", lambda: ep.train(tmp))):
+                    try:
+                        fn()
+                    except RuntimeError as e:
+                        assert "E1_DELIVER=best" in str(e), (where, bad, e)
+                    else:
+                        raise AssertionError(f"{where} 应拒绝 calswa 不支持的配置 {bad}")
+                assert calls == [], (bad, calls)
+        # prev_dim=4（带条件输入）现在支持；deliver=best 不受 average_ckpt 限制
+        with _cfg(deliver="calswa", epochs=30, text_dim=0, prev_action=True):
+            ep.deliver_check()
+        with _cfg(deliver="best", epochs=30, text_dim=16, two_frame=True):
+            ep.deliver_check()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("ok I2-2.1（e1）：calswa 在 preflight 拦截文本/双帧/未知 prev_dim，放行 prev_dim=4 与 deliver=best")
+
+
+def test_train_passes_cuda_blocking_sync():
+    """第 6 条：e1_pipeline 起 uavrgb_train 缺省传 UAVRGB_CUDA_BLOCKING_SYNC=1 并打一行日志；外部设 0 则照传 0。"""
+    import contextlib
+    import io
+    tmp = tempfile.mkdtemp(prefix="test_e1_bs_")
+    calls = []
+    saved_env = os.environ.get("UAVRGB_CUDA_BLOCKING_SYNC")
+    try:
+        _touch(os.path.join(tmp, "ds", "dataset.uavr"))
+        os.environ.pop("UAVRGB_CUDA_BLOCKING_SYNC", None)
+        buf = io.StringIO()
+        with _cfg(deliver="best"), _patched(ep, sh=_fake_sh(calls)), contextlib.redirect_stdout(buf):
+            ep.train(tmp)
+        assert len(calls) == 1 and calls[0][1].get("env_extra") == {"UAVRGB_CUDA_BLOCKING_SYNC": "1"}, calls
+        assert "UAVRGB_CUDA_BLOCKING_SYNC=1" in buf.getvalue(), buf.getvalue()
+
+        calls.clear()
+        shutil.rmtree(os.path.join(tmp, "run"))
+        os.environ["UAVRGB_CUDA_BLOCKING_SYNC"] = "0"
+        with _cfg(deliver="best"), _patched(ep, sh=_fake_sh(calls)):
+            ep.train(tmp)
+        assert len(calls) == 1 and calls[0][1].get("env_extra") == {"UAVRGB_CUDA_BLOCKING_SYNC": "0"}, calls
+    finally:
+        if saved_env is None:
+            os.environ.pop("UAVRGB_CUDA_BLOCKING_SYNC", None)
+        else:
+            os.environ["UAVRGB_CUDA_BLOCKING_SYNC"] = saved_env
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("ok 第 6 条（e1）：uavrgb_train 默认传 UAVRGB_CUDA_BLOCKING_SYNC=1，外部设 0 则沿用")
+
+
 def main():
     test_corridor_half_width_in_eval_commands()
     test_teacher_planner_passthrough()
@@ -961,10 +1054,13 @@ def main():
     test_evaluate_uses_delivered_ckpt_without_fallback()
     test_calswa_needs_enough_epochs_and_known_value()
     test_calswa_resume()
+    test_calswa_dry_run_skip_line_unchanged()
     test_calswa_failure_stops_pipeline()
     test_dry_run_deliver_commands()
     test_deliver_env_overrides()
     test_action_latency_and_rtf_passthrough()
+    test_calswa_refuses_unsupported_model_configs_at_preflight()
+    test_train_passes_cuda_blocking_sync()
     print("test_e1_pipeline: PASS")
     return 0
 

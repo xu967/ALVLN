@@ -45,6 +45,8 @@ YAW = (2, 3)
 HEADER = struct.Struct("<4sHHIHHBBBBQQQI")   # tools/DATASET_FORMAT.md §1.1
 AUX_HEADER = struct.Struct("<8sQIHHBBH")      # §6.1 前 28 B；整头 128 B
 AUX_HEADER_SIZE = 128
+CKPT_HEAD = struct.Struct("<8sIIiiiiIII")     # src/checkpoint.cpp 定长头 44 B
+CKPT_CONTRACT_BYTES = 113                     # v5 训练契约 113 B
 
 
 class Uavr:
@@ -255,6 +257,59 @@ def metrics_val_f1(run_dir):
     return out
 
 
+def read_ckpt_drop_collision(path):
+    """按 src/checkpoint.cpp:read_v5_contract 读 ckpt 头的训练契约位 → (has_drop_collision, drop_collision)。
+    v2..v4 或全零占位契约返回 (False, False)；损坏或非法头抛 ValueError。"""
+    with open(path, "rb") as f:
+        raw = f.read(CKPT_HEAD.size)
+        if len(raw) != CKPT_HEAD.size:
+            raise ValueError(f"{path}: checkpoint 头不足 {CKPT_HEAD.size} B")
+        magic, ver, _np, _h, _w, _c, _nc, _at, _ep, nw = CKPT_HEAD.unpack(raw)
+        if magic != b"UAVRCK01" or ver < 2 or ver > 6 or nw > 64:
+            raise ValueError(f"{path}: 非法 UAVRCK01 头（magic={magic!r} version={ver}）")
+        if ver < 5:
+            return False, False
+        f.seek(4 * nw + 8, os.SEEK_CUR)      # class_weights + v3 best_macro_f1 + v4 text_dim
+        contract = f.read(CKPT_CONTRACT_BYTES)
+    if len(contract) != CKPT_CONTRACT_BYTES:
+        raise ValueError(f"{path}: v5 训练契约被截断（{len(contract)} < {CKPT_CONTRACT_BYTES}）")
+    distill_alpha, lr, _seed, batch = struct.unpack_from("<ffIi", contract, 65)
+    if not (math.isfinite(distill_alpha) and math.isfinite(lr)):
+        raise ValueError(f"{path}: 训练契约含非有限值")
+    present = not (lr == 0.0 and batch == 0 and contract[:32] == b"\x00" * 32)
+    return present, bool(contract[32] & 1)
+
+
+def resolve_drop_collision(run_dir, ckpts):
+    """对齐 src/trainer_eval.cpp:194-212（C6）：先读 config.resume.json 再读 config.json，并核对 ckpt v5 训练契约；
+    两处矛盾或两处均无记录时抛 ValueError 拒绝静默回落。"""
+    has_cfg, cfg_drop, cfg_used = False, False, None
+    for name in ("config.resume.json", "config.json"):
+        p = os.path.join(run_dir, name)
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as f:
+                cfg = json.load(f)
+            if isinstance(cfg, dict) and "drop_collision" in cfg:
+                if not isinstance(cfg["drop_collision"], bool):
+                    raise ValueError(f"{p}: drop_collision 必须是布尔值")
+                has_cfg, cfg_drop, cfg_used = True, cfg["drop_collision"], p
+            break
+    has_ck, ck_drop = False, False
+    seen = set()
+    for _ep, path in ckpts:
+        present, val = read_ckpt_drop_collision(path)
+        if present:
+            has_ck, ck_drop = True, val
+            seen.add(val)
+    if len(seen) > 1:
+        raise ValueError(f"{run_dir}: 不同轮 ckpt_ep*.bin 的训练契约 drop_collision 不一致")
+    if has_cfg and has_ck and cfg_drop != ck_drop:
+        raise ValueError(f"{cfg_used} 的 drop_collision({cfg_drop}) 与 checkpoint 训练契约({ck_drop}) 矛盾")
+    if not has_cfg and not has_ck:
+        raise ValueError(f"{run_dir} 无含 drop_collision 的 config.json，且 checkpoint 无训练契约，拒绝静默回落")
+    return cfg_drop if has_cfg else ck_drop
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--run", required=True, help="--save-every-epoch 训出的 run 目录（含 ckpt_epNN.bin、config.json）")
@@ -267,13 +322,13 @@ def main():
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
 
-    cfg_path = os.path.join(args.run, "config.json")
-    drop = False
-    if os.path.isfile(cfg_path):
-        with open(cfg_path, encoding="utf-8") as f:
-            drop = bool(json.load(f).get("drop_collision", False))
-    else:
-        print(f"警告: {cfg_path} 不存在，按 drop_collision=false 取样本", file=sys.stderr)
+    ckpts = epoch_ckpts(args.run)
+    if not ckpts:
+        sys.exit(f"{args.run} 没有 ckpt_ep*.bin（训练要加 --save-every-epoch）")
+    try:
+        drop = resolve_drop_collision(args.run, ckpts)
+    except (ValueError, OSError) as exc:
+        sys.exit(str(exc))
     ds = Uavr(args.data)
     idx = ds.split_indices(args.split, drop)
     if not len(idx):
@@ -289,9 +344,6 @@ def main():
     aux = read_aux(os.path.join(os.path.dirname(args.data), "dataset.aux"))
     prev_index, prev_action = (aux["prev_index"], aux["prev_action"]) if aux else (None, None)
 
-    ckpts = epoch_ckpts(args.run)
-    if not ckpts:
-        sys.exit(f"{args.run} 没有 ckpt_ep*.bin（训练要加 --save-every-epoch）")
     rows, prev_pred = [], None
     for epoch, path in ckpts:
         inf = Infer(path, args.infer_bin)

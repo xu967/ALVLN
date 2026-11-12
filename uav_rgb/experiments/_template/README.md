@@ -34,9 +34,9 @@
 ## 2. 查看进度、停止与续跑
 
 - **看进度与记录**：
-  - 实时日志：`tail -f <OUT>/run.log`
-  - 起跑与续跑追加记录（提交号、冻结副本 sha256、环境变量覆盖项、输入 sha256、等锁时长、Gazebo 起跑核数、各臂退出码）：`cat <OUT>/launches.log`
-  - 每臂 cgroup 时序健康摘要（墙钟、平均核数、`nr_throttled` 增量、被限流时长及占墙钟比例）：`cat <OUT>/health.txt`（原始起止快照在 `<OUT>/<臂名>.cg`）
+  - 实时日志：`tail -f <OUT>/run.log`（`exp_start` 缺省导出 `UAVRGB_CUDA_BLOCKING_SYNC=1` 让训练器等 GPU 时不自旋，外部已设 `0` 或 `1` 则沿用外部值并在日志记录）
+  - 起跑与续跑追加记录（提交号、冻结副本 sha256、环境变量覆盖项、`cuda_blocking_sync`、输入 sha256、等锁时长、Gazebo 起跑核数、各臂退出码）：`cat <OUT>/launches.log`
+  - 每臂 cgroup 时序健康摘要（墙钟、平均核数、`nr_throttled` 增量、被限流时长及占「墙钟×核数配额」比例）：`cat <OUT>/health.txt`（原始起止快照在 `<OUT>/<臂名>.cg`）
   - 完成标记：`cat <OUT>/DONE`（`rc=0` 为全部臂成功；有臂失败自动改为 `rc=11` 并列出失败臂名；被信号终止落 `rc=130`；脚本中途异常退出也由 `EXIT` 钩子补写非零 `DONE`）
 - **停止守护进程**：
   ```bash

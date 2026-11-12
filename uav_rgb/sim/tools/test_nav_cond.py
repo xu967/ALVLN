@@ -4,7 +4,9 @@
 
 运行（仓库根）：.venv-tools/bin/python sim/tools/test_nav_cond.py
 """
+import ast
 import hashlib
+import inspect
 import json
 import os
 import struct
@@ -182,6 +184,212 @@ class ConditionGateTests(unittest.TestCase):
         self.assertEqual(set(got), {"status", "requested", "trained", "source", "message"})
         self.assertEqual(got["requested"], "heading-code")
         self.assertIn(ds, got["source"])
+
+    def test_sidecar_json_dataset_cond_and_abs_data_prevent_unverified_degradation(self):
+        """I2-5 第 1 点：<ckpt>.json 记有 dataset_cond 或绝对路径 data 时优先使用，
+        即使训练 config.json 写相对路径、切换工作目录、甚至原 dataset.uavr 已被归档移走，也不退化为 unverified。"""
+        # 1) 新版 <ckpt>.json 记了 dataset_cond：连 dataset.uavr 与 run/config.json 都删掉仍能准确拦截或放行
+        cal_hc = self.path("exp1", "exported", "cal_hc.bin")
+        os.makedirs(os.path.dirname(cal_hc), exist_ok=True)
+        with open(cal_hc, "wb") as f:
+            f.write(b"dummy")
+        with open(cal_hc + ".json", "w", encoding="utf-8") as f:
+            json.dump({"tool": "tools/average_ckpt.py", "run": self.path("exp1", "gone_run"),
+                       "data": self.path("exp1", "gone_ds", "dataset.uavr"), "data_sha256": "a" * 64,
+                       "dataset_cond": "heading_code.v1"}, f)
+        self.assertEqual(nav_cond.check_student_cond("heading-code", cal_hc, 4)["status"], "ok")
+        bad = nav_cond.check_student_cond("prev-action", cal_hc, 4)
+        self.assertEqual((bad["status"], bad["trained"]), ("mismatch", "heading-code"))
+
+        # dataset_cond 为 null（prev-action 数据集）：同样无需原数据集文件即可判定 prev-action
+        cal_pa = self.path("exp1", "exported", "cal_pa.bin")
+        with open(cal_pa, "wb") as f:
+            f.write(b"dummy")
+        with open(cal_pa + ".json", "w", encoding="utf-8") as f:
+            json.dump({"tool": "tools/average_ckpt.py", "data": self.path("exp1", "gone_ds", "pa.uavr"),
+                       "dataset_cond": None}, f)
+        self.assertEqual((nav_cond.check_student_cond("prev-action", cal_pa, 4)["status"],
+                          nav_cond.check_student_cond("prev-action", cal_pa, 4)["trained"]), ("ok", "prev-action"))
+        self.assertEqual(nav_cond.check_student_cond("heading-code", cal_pa, 4)["status"], "mismatch")
+
+        # 2) 旧 dc8e5ff 产出的 <ckpt>.json（只有绝对路径 data 与 data_sha256，无 dataset_cond），而 run/config.json 是相对路径：
+        # 复现审核 I2 verify_i2_part2.py TEST 6，切到其它 cwd 时应通过 sidecar["data"] 拦下错配，不能退化为 unverified
+        exp2 = self.path("exp2")
+        ds2 = os.path.join(exp2, "ds", "dataset.uavr")
+        os.makedirs(os.path.dirname(ds2), exist_ok=True)
+        write_dataset(ds2, {"schema": "uavrgb.dataset.v1", "cond": "heading_code.v1"})
+        sha2 = hashlib.sha256(open(ds2, "rb").read()).hexdigest()
+        os.makedirs(os.path.join(exp2, "run"), exist_ok=True)
+        with open(os.path.join(exp2, "run", "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"schema": "uavrgb.train_config.v1", "data": "ds/dataset.uavr", "dataset_sha256": sha2}, f)
+        cal_dc = os.path.join(exp2, "exported", "cal.bin")
+        os.makedirs(os.path.dirname(cal_dc), exist_ok=True)
+        open(cal_dc, "wb").write(b"dummy")
+        with open(cal_dc + ".json", "w", encoding="utf-8") as f:
+            json.dump({"tool": "tools/average_ckpt.py", "run": os.path.join(exp2, "run"),
+                       "data": ds2, "data_sha256": sha2,
+                       "cond": {"prev_dim": 4, "column": "prev_action", "val_value_counts": [10, 0, 2, 2]}}, f)
+        other_cwd = self.path("other_cwd")
+        os.makedirs(other_cwd, exist_ok=True)
+        old_cwd = os.getcwd()
+        try:
+            os.chdir(other_cwd)
+            got_dc = nav_cond.check_student_cond("prev-action", cal_dc, 4)
+        finally:
+            os.chdir(old_cwd)
+        self.assertEqual((got_dc["status"], got_dc["trained"]), ("mismatch", "heading-code"))
+
+        # 3) 若 <ckpt>.json 记了 out_sha256 而权重文件本身被覆盖替换，也必须判 mismatch 而不盲信旧 sidecar
+        with open(cal_hc + ".json", "w", encoding="utf-8") as f:
+            json.dump({"tool": "tools/average_ckpt.py", "dataset_cond": "heading_code.v1",
+                       "out_sha256": hashlib.sha256(b"other-bytes").hexdigest()}, f)
+        self.assertEqual(nav_cond.check_student_cond("heading-code", cal_hc, 4)["status"], "mismatch")
+
+    @staticmethod
+    def _write_v6_ckpt_header(path, dataset_sha_hex, nw=4, lr=1e-3, batch=128):
+        """构造足够读出 v5 训练契约的 UAVRCK01 v6 头（对齐 src/checkpoint.cpp:save_checkpoint）。"""
+        head = struct.pack("<8sIIiiiiIII", b"UAVRCK01", 6, 1, 120, 160, 3, 4, 10, 5, nw)
+        weights = struct.pack(f"<{nw}f", *([1.0] * nw))
+        v3_v4 = struct.pack("<fi", 0.5, 0)
+        contract = (bytes.fromhex(dataset_sha_hex) + struct.pack("<B", 1) + b"\x00" * 32
+                    + struct.pack("<ffIi", 0.0, lr, 42, batch) + b"\x00" * 32)
+        v6 = struct.pack("<ii", 0, 4)
+        with open(path, "wb") as f:
+            f.write(head + weights + v3_v4 + contract + v6)
+
+    def test_resume_config_takes_precedence_over_initial_config(self):
+        """I1-6 第 1 点：同目录续训时先看 config.resume.json 再看 config.json（直接同目录与经 sidecar run 目录均如此）。"""
+        ds_pa = self.path("pa.uavr")
+        ds_hc = self.path("hc.uavr")
+        write_dataset(ds_pa, {"schema": "uavrgb.dataset.v1"})
+        write_dataset(ds_hc, {"schema": "uavrgb.dataset.v1", "cond": "heading_code.v1"})
+        sha_pa = hashlib.sha256(open(ds_pa, "rb").read()).hexdigest()
+        sha_hc = hashlib.sha256(open(ds_hc, "rb").read()).hexdigest()
+
+        run = self.path("run_resumed")
+        os.makedirs(run)
+        with open(os.path.join(run, "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"schema": "uavrgb.train_config.v1", "data": ds_pa, "dataset_sha256": sha_pa}, f)
+        with open(os.path.join(run, "config.resume.json"), "w", encoding="utf-8") as f:
+            json.dump({"schema": "uavrgb.train_config.v1", "data": ds_hc, "dataset_sha256": sha_hc}, f)
+        ckpt = os.path.join(run, "ckpt_best.bin")
+        open(ckpt, "wb").close()
+
+        cfg_path, _ = nav_cond.find_train_config(ckpt)
+        self.assertEqual(cfg_path, os.path.join(run, "config.resume.json"))
+        ok = nav_cond.check_student_cond("heading-code", ckpt, 4)
+        self.assertEqual((ok["status"], ok["trained"]), ("ok", "heading-code"))
+        bad = nav_cond.check_student_cond("prev-action", ckpt, 4)
+        self.assertEqual((bad["status"], bad["trained"]), ("mismatch", "heading-code"))
+
+        # 经 <out>.json 的 run 字段查找时也优先读 config.resume.json
+        cal = self.path("exported", "cal.bin")
+        os.makedirs(os.path.dirname(cal))
+        open(cal, "wb").close()
+        with open(cal + ".json", "w", encoding="utf-8") as f:
+            json.dump({"tool": "tools/average_ckpt.py", "run": run}, f)
+        self.assertEqual(nav_cond.find_train_config(cal)[0], os.path.join(run, "config.resume.json"))
+        self.assertEqual(nav_cond.check_student_cond("heading-code", cal, 4)["status"], "ok")
+
+    def test_ckpt_header_dataset_sha256_mismatch_is_caught(self):
+        """I1-6 第 2 点：ckpt 二进制头内嵌的训练契约 dataset_sha256 与配置或侧车不一致时判 mismatch。"""
+        ckpt, ds_hc = self.make_run("hc_dir", {"schema": "uavrgb.dataset.v1", "cond": "heading_code.v1"})
+        sha_hc = hashlib.sha256(open(ds_hc, "rb").read()).hexdigest()
+        other_sha = "ab" * 32
+
+        # 契约 sha256 与 config.json 一致 -> ok
+        self._write_v6_ckpt_header(ckpt, sha_hc)
+        self.assertEqual(nav_cond.check_student_cond("heading-code", ckpt, 4)["status"], "ok")
+
+        # 把别的运行训出的 ckpt 拷进 hc_dir（契约记 other_sha != config.json 的 sha_hc）-> mismatch
+        self._write_v6_ckpt_header(ckpt, other_sha)
+        got = nav_cond.check_student_cond("heading-code", ckpt, 4)
+        self.assertEqual((got["status"], got["trained"]), ("mismatch", None))
+        self.assertIn("dataset_sha256", got["message"])
+
+        # 配置未写 dataset_sha256，但磁盘数据集 sha256 与 ckpt 契约不符 -> mismatch
+        with open(os.path.join(os.path.dirname(ckpt), "config.json"), "w", encoding="utf-8") as f:
+            json.dump({"schema": "uavrgb.train_config.v1", "data": ds_hc}, f)
+        self.assertEqual(nav_cond.check_student_cond("heading-code", ckpt, 4)["status"], "mismatch")
+
+        # <ckpt>.json 侧车记的 data_sha256 与 ckpt 契约不符 -> mismatch
+        cal = self.path("cal_mismatch.bin")
+        self._write_v6_ckpt_header(cal, other_sha)
+        with open(cal + ".json", "w", encoding="utf-8") as f:
+            json.dump({"tool": "tools/average_ckpt.py", "dataset_cond": "heading_code.v1",
+                       "data": ds_hc, "data_sha256": sha_hc}, f)
+        self.assertEqual(nav_cond.check_student_cond("heading-code", cal, 4)["status"], "mismatch")
+
+        # 全零占位契约（测试假权重）按无契约处理，不误拒
+        ckpt_zero, _ = self.make_run("zero_dir", {"schema": "uavrgb.dataset.v1", "cond": "heading_code.v1"})
+        self._write_v6_ckpt_header(ckpt_zero, "00" * 32, lr=0.0, batch=0)
+        self.assertEqual(nav_cond.check_student_cond("heading-code", ckpt_zero, 4)["status"], "ok")
+
+    def test_explicit_prev_action_on_pure_image_model_is_mismatch(self):
+        """I1-6 第 3 点：显式要求 prev-action 而模型 prev_dim=0 时判 mismatch；默认 explicit=False 保持兼容放行。"""
+        ckpt, _ = self.make_run("r_img", {"schema": "uavrgb.dataset.v1"})
+        # 默认 explicit=False（兼容现有未改的调用方）：ok
+        ok_default = nav_cond.check_student_cond("prev-action", ckpt, 0)
+        self.assertEqual((ok_default["status"], ok_default["trained"]), ("ok", "none"))
+        # explicit=True：显式传 --student-cond prev-action 给纯视觉模型必须拦截
+        bad_exp = nav_cond.check_student_cond("prev-action", ckpt, 0, explicit=True)
+        self.assertEqual((bad_exp["status"], bad_exp["trained"]), ("mismatch", "none"))
+        self.assertIn("不会生效", bad_exp["message"])
+        # prev_dim=4 的 prev-action 模型在 explicit=True 下正常放行
+        ok_pa = nav_cond.check_student_cond("prev-action", ckpt, 4, explicit=True)
+        self.assertEqual((ok_pa["status"], ok_pa["trained"]), ("ok", "prev-action"))
+
+    def test_three_positional_args_call_like_collect_py_on_main(self):
+        """卡 W1-13 第二轮（main 的 abad4cf）在 sim/tools/collect.py:1846 这样调：
+        nav_cond.check_student_cond(args.student_cond, args.student_ckpt, getattr(student, "prev_dim", 0))
+        三个位置参数、不带 explicit。本卡加的 explicit 必须有缺省值 False，这个调用的判定与结果同改前一致；
+        仓库里所有对它的调用都能绑到当前签名，也没有谁用位置参数传第 4 个（explicit 只能用关键字）。"""
+        sig = inspect.signature(nav_cond.check_student_cond)
+        names = list(sig.parameters)
+        self.assertEqual(names[:3], ["requested", "ckpt", "prev_dim"])
+        self.assertTrue(all(sig.parameters[n].default is not inspect.Parameter.empty for n in names[3:]),
+                        f"第 3 个之后的参数都要有缺省值：{names}")
+        self.assertIs(sig.parameters["explicit"].default, False)
+
+        class Student:   # 推理进程没报 prev_dim 时 collect.py 取缺省 0
+            pass
+        no_attr = getattr(Student(), "prev_dim", 0)
+        ckpt_img, _ = self.make_run("r_img", {"schema": "x"})
+        ckpt_pa, _ = self.make_run("r_pa", {"schema": "x"})
+        ckpt_hc, _ = self.make_run("r_hc", {"schema": "x", "cond": "heading_code.v1"})
+        ckpt_none, _ = self.make_run("r_none", {"schema": "x"}, with_config=False)
+        cases = [   # (--student-cond, ckpt, prev_dim, 期望 (status, trained))
+            ("prev-action", ckpt_img, no_attr, ("ok", "none")),
+            ("heading-code", ckpt_img, no_attr, ("mismatch", "none")),
+            ("prev-action", ckpt_pa, 4, ("ok", "prev-action")),
+            ("heading-code", ckpt_pa, 4, ("mismatch", "prev-action")),
+            ("heading-code", ckpt_hc, 4, ("ok", "heading-code")),
+            ("prev-action", ckpt_hc, 4, ("mismatch", "heading-code")),
+            ("prev-action", ckpt_none, 4, ("unverified", None)),
+        ]
+        for requested, ckpt, prev_dim, want in cases:
+            got = nav_cond.check_student_cond(requested, ckpt, prev_dim)   # collect.py 的调用形态
+            self.assertEqual((got["status"], got["trained"]), want, (requested, ckpt, prev_dim))
+            self.assertEqual(got, nav_cond.check_student_cond(requested, ckpt, prev_dim, explicit=False))
+
+        here = os.path.dirname(os.path.abspath(__file__))
+        scanned = 0
+        for folder in (here, os.path.join(here, "..", "..", "tools")):
+            for fn in sorted(os.listdir(folder)):
+                if not fn.endswith(".py") or fn.startswith("test_") or fn == "nav_cond.py":
+                    continue
+                path = os.path.join(folder, fn)
+                with open(path, encoding="utf-8") as f:
+                    tree = ast.parse(f.read(), filename=path)
+                for node in ast.walk(tree):
+                    if not (isinstance(node, ast.Call) and getattr(node.func, "attr", getattr(node.func, "id", None)) == "check_student_cond"):
+                        continue
+                    scanned += 1
+                    self.assertLessEqual(len(node.args), 3, f"{fn}:{node.lineno} 不该用位置参数传 explicit")
+                    if any(isinstance(a, ast.Starred) for a in node.args) or any(k.arg is None for k in node.keywords):
+                        continue   # *args / **kwargs 静态看不出形态
+                    sig.bind(*[None] * len(node.args), **{k.arg: None for k in node.keywords})   # 绑不上就 TypeError
+        self.assertGreaterEqual(scanned, 1, "sim/tools 里至少 eval_closed_loop.py 有一处调用")
 
 
 if __name__ == "__main__":

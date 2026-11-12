@@ -42,8 +42,11 @@ BUILD = os.environ.get("UAV_RGB_BUILD_DIR", os.path.join(REPO, "build", "check")
 PY = sys.executable
 sys.path.insert(0, os.path.join(REPO, "tools"))
 sys.path.insert(0, os.path.join(REPO, "sim", "tools"))
+import average_ckpt  # noqa: E402  calswa 可校准性单源判据
 import e1_pipeline  # noqa: E402  评测 seed 单源、GZ_ENV、训练配置的出处
 import eval_seeds as es  # noqa: E402  60 seed 清单单源
+import nav_cond  # noqa: E402  条件类型枚举
+import paired_stats  # noqa: E402  请求集分母单源
 import pipeline_common as pc  # noqa: E402
 import split_manifest as sm  # noqa: E402
 import cf_sitl_exec  # noqa: E402  当前 e1_mini.json 的 dynamics_profile，与 collect.py 同一函数
@@ -515,13 +518,26 @@ def preprocess_into(ds, eps):
 
 
 def deliver_check():
-    """交付权重配置查错（同 e1_pipeline.deliver_check）：值不认识、calswa 的轮数不够（取不到末 avg_last_k 轮）都在起任何命令之前报错。
-    preflight 与 train_into 都调：前者让它在开跑时就失败，不等采集几小时后训练步才炸。"""
+    """交付权重与条件配置查错（同 e1_pipeline.deliver_check）：值不认识、calswa 轮数不够、或模型输入（文本/双帧/非 4 维条件）
+    不被 average_ckpt 支持，都在 preflight 与 train_into 起任何命令之前报错，不等采集几小时后训练步才炸。"""
+    cond = CFG.get("student_cond", "prev-action")
+    if cond not in nav_cond.COND_CHOICES:
+        raise RuntimeError(f"CFG student_cond={cond!r} 只能是 {nav_cond.COND_CHOICES}")
+    if int(CFG.get("text_dim", 0)) < 0:
+        raise RuntimeError(f"CFG text_dim={CFG.get('text_dim')!r} 不能为负")
     if CFG["deliver"] not in ("calswa", "best"):
         raise RuntimeError(f"CFG deliver={CFG['deliver']!r}（环境变量 E1_DELIVER）只能是 calswa 或 best")
-    if CFG["deliver"] == "calswa" and CFG["epochs"] < CFG["avg_last_k"]:
-        raise RuntimeError(f"deliver=calswa 要末 {CFG['avg_last_k']} 轮的权重平均，但 epochs={CFG['epochs']} 取不到；"
-                           "改 E1_DELIVER=best（用 ckpt_best.bin），或把 --epochs 加到不小于 avg_last_k")
+    if CFG["deliver"] == "calswa":
+        if CFG["epochs"] < CFG["avg_last_k"]:
+            raise RuntimeError(f"deliver=calswa 要末 {CFG['avg_last_k']} 轮的权重平均，但 epochs={CFG['epochs']} 取不到；"
+                               "改 E1_DELIVER=best（用 ckpt_best.bin），或把 --epochs 加到不小于 avg_last_k")
+        in_c = 6 if CFG.get("two_frame") else int(CFG.get("in_c", 3))
+        text_dim = int(CFG.get("text_dim", 0))
+        prev_dim = int(CFG.get("prev_dim", 4 if (cond == "heading-code" or CFG.get("prev_action")) else 0))
+        try:
+            average_ckpt.check_calibratable(in_c=in_c, text_dim=text_dim, prev_dim=prev_dim)
+        except ValueError as e:
+            raise RuntimeError(f"deliver=calswa 不可用：{e}；改 E1_DELIVER=best（用 ckpt_best.bin）") from e
 
 
 def deliver_ckpt(run_dir):
@@ -536,12 +552,14 @@ def calibrate_into(ds, run_dir):
     if CFG["deliver"] != "calswa":
         return
     swa = deliver_ckpt(run_dir)
-    if os.path.isfile(swa) and os.path.isfile(swa + ".json"):
+    if pc.calswa_finished(swa):   # dry-run 也判：预演已做完的目录同改前一样只打印跳过（c973059 曾加 not DRY，预演输出变了）
         return log(f"跳过校准平均：{swa} 已有")
     sh([PY, f"{REPO}/tools/average_ckpt.py", "--run", run_dir, "--data", f"{ds}/dataset.uavr", "--out", swa,
         "--last-k", str(CFG["avg_last_k"]), "--infer-bin", f"{BUILD}/uavrgb_infer"],
        env_extra={"CUDA_VISIBLE_DEVICES": CFG["gpu"]}, log_path=None if DRY else run_dir + ".average.log")
     need(swa, "average_ckpt 退出码 0 但没写出产物")
+    if not DRY and not pc.calswa_finished(swa):
+        raise RuntimeError(f"average_ckpt 退出码 0 但 {swa}.json 缺失或不可解析")
 
 
 def train_into(ds, run_dir):
@@ -562,7 +580,7 @@ def train_into(ds, run_dir):
         cmd.append("--prev-action")   # 读侧车里的航向码列；不加就训出忽略条件输入的模型
     if CFG["deliver"] == "calswa":
         cmd.append("--save-every-epoch")   # 平均要用末 avg_last_k 轮的 ckpt_epNN.bin（每个约 1.2 MB）
-    sh(cmd, log_path=None if DRY else run_dir + ".log")
+    sh(cmd, env_extra=pc.train_env(DRY), log_path=None if DRY else run_dir + ".log")
     need(f"{run_dir}/ckpt_best.bin", "训练结束但没有 best ckpt，看 run/metrics.jsonl")
     if not DRY and not train_done(run_dir):
         raise RuntimeError(f"{run_dir}/metrics.jsonl 末行不是 done:，训练没正常结束")
@@ -726,9 +744,30 @@ def seeds60(out):
     return ",".join(map(str, seeds))
 
 
+def _requested_outcomes(path):
+    """summary 里 McNemar 配对用的 {seed: bool}：直接取 stats_report.run_outcomes（SR 的请求集口径），不另抄一份；
+    stats_report 拒收的文件（run 内 seed 重复等）在这里同样抛错（更正 192762d：手抄的版本口径与它不同，重复 seed 还会静默覆盖）。"""
+    field = stats_report.METRICS["SR"][0]
+    ev = stats_report.load_eval(path)
+    return {sd: bool(v) for sd, v in stats_report.run_outcomes(ev, field, stats_report.uses_requested("SR")).items()}
+
+
+def _has_mixed_protocol(paths):
+    """各臂 eval.json 在严格协议键（或逐集 dynamics_profile）上是否不同；不同时给 stats_report 传 --allow-mixed-protocol（I2-2）。"""
+    if len(paths) < 2:
+        return False
+    loaded = [stats_report.load_eval(p) for p in paths]
+    for k in stats_report.STRICT_PROTOCOL_KEYS:
+        if len({stats_report.protocol_value(k, ev.get(k)) for ev in loaded}) > 1:
+            return True
+    profs = {tuple(sorted({ep.get("dynamics_profile") for ep in ev["per_episode"] if ep.get("dynamics_profile")}))
+             for ev in loaded}
+    return len(profs) > 1
+
+
 def summary(out, rounds, arms, decisions, seeds60_csv):
-    """每轮统计 + 各臂 SR/碰撞/乱飞 + 与 dagger 臂的 McNemar；stats_report 的完整表另起子进程（失败不致命）。"""
-    rows, per = {}, {}
+    """每轮统计 + 各臂 SR/碰撞/乱飞 + 与 dagger 臂的 McNemar；stats_report 的完整表另起子进程（失败记入日志与汇总）。"""
+    rows, per, pairing_errors = {}, {}, {}
     sources = {name: os.path.join(out, f"eval20-{name}") for name, _p, _c in arms}
     sources.update({n: d["path"] for n, d in decisions.items()})
     for name, edir in sources.items():
@@ -737,17 +776,22 @@ def summary(out, rounds, arms, decisions, seeds60_csv):
             continue
         e = read_json(path)
         eps = e.get("per_episode") or []
-        per[name] = {ep["seed"]: bool(ep.get("success")) for ep in eps}
-        rows[name] = {"n": e.get("episodes_done"), "success": sum(1 for ep in eps if ep.get("success")),
-                      "SR": e.get("requested_success_rate"), "wilson95": (e.get("wilson_ci") or {}).get("requested"),
+        sc = paired_stats.success_counts(e)
+        try:
+            per[name] = _requested_outcomes(path)
+        except Exception as exc:   # stats_report 拒收的文件：这一臂不参与配对，原因写进摘要，不让整份摘要写不出来
+            pairing_errors[name] = f"{type(exc).__name__}: {exc}"
+        rows[name] = {"n": sc["denominator"], "episodes_done": sc["done"], "success": sc["k"],
+                      "SR": e.get("requested_success_rate") if e.get("requested_success_rate") is not None else sc["rate"],
+                      "wilson95": (e.get("wilson_ci") or {}).get("requested") or paired_stats.wilson_ci(sc["k"], sc["denominator"]),
                       "collision": sum(1 for ep in eps if ep.get("collision")),
                       "stray": sum(1 for ep in eps if not ep.get("success") and not ep.get("collision")),   # 无碰撞的失败 = 乱飞/超时
                       "stuck": sum(1 for ep in eps if ep.get("stuck")), "false_forward": sum(1 for ep in eps if ep.get("false_forward")),
-                      "spl": e.get("spl"), "failed": e.get("failed_count"), "metric_version": e.get("metric_version"),
+                      "spl": e.get("spl"), "failed": sc["failed"], "metric_version": e.get("metric_version"),
                       "source": decisions.get(name, {}).get("source", "self"), "path": path}
     pairs = {}
     for name in rows:
-        if name != "dagger" and "dagger" in per:
+        if name != "dagger" and "dagger" in per and name in per:
             b, c, n = stats_report.paired_outcomes(per["dagger"], per[name])
             pairs[name] = dict(stats_report.mcnemar(b, c), n_common=n)
     round_rows = {}
@@ -766,8 +810,11 @@ def summary(out, rounds, arms, decisions, seeds60_csv):
         p = os.path.join(out, f"eval60-{name}", "eval.json")
         if os.path.isfile(p):
             e = read_json(p)
-            eval60[name] = {"n": e.get("episodes_done"), "SR": e.get("requested_success_rate"),
-                            "wilson95": (e.get("wilson_ci") or {}).get("requested"), "collision_rate": e.get("collision_rate")}
+            sc60 = paired_stats.success_counts(e)
+            eval60[name] = {"n": sc60["denominator"], "episodes_done": sc60["done"],
+                            "SR": e.get("requested_success_rate") if e.get("requested_success_rate") is not None else sc60["rate"],
+                            "wilson95": (e.get("wilson_ci") or {}).get("requested") or paired_stats.wilson_ci(sc60["k"], sc60["denominator"]),
+                            "collision_rate": e.get("collision_rate")}
     md_plan = os.path.join(out, "more_demos", "plan.json")
     retired = pc.read_retired(out)
     res = {"cfg": {k: v for k, v in CFG.items() if k != "baselines"}, "rounds": round_rows, "arms": rows, "mcnemar_vs_dagger": pairs,
@@ -776,7 +823,8 @@ def summary(out, rounds, arms, decisions, seeds60_csv):
            "inputs": read_json(os.path.join(out, "inputs.json")) if os.path.isfile(os.path.join(out, "inputs.json")) else None}
     if retired:
         res["retired"] = retired
-    write_json(os.path.join(out, "summary.json"), res)
+    if pairing_errors:
+        res["pairing_errors"] = pairing_errors
     lines = ["| round | β | 集 ok/req | 步 | 不一致率（学生步） | 到线 | 碰撞集 |", "| --- | --- | --- | --- | --- | --- | --- |"]
     for k, r in round_rows.items():
         dr = "-" if r["disagree_rate"] is None else f"{r['disagree_rate']:.3f} ({r['student_steps']})"
@@ -793,19 +841,30 @@ def summary(out, rounds, arms, decisions, seeds60_csv):
         lines.append(f"| {name} ({n60} seed 清单) | {r['SR']} ({r['n']}) | {_ci(r['wilson95'])} | - | - | - | - | self |")
     if seeds60_csv and n60 < CFG["eval60_count"]:
         lines.append(f"\n注意：独立 test 几何只有 {n60} 个（要 {CFG['eval60_count']}），见 eval_seeds60.json；「60 seed 区间」按 {n60} 个看。")
+    for name, why in pairing_errors.items():
+        lines.append(f"\n⚠ {name} 的 eval.json 被 stats_report 拒收，不参与 McNemar：{why}")
     lines.append(f"\n口径：SR 分母 = 请求集；{settings_line(res)}；n=20 的 Wilson 半宽约 ±0.2，结论要带区间与配对 p 值。")
     if retired:
         lines += [""] + pc.retired_lines(out)
-    with open(os.path.join(out, "summary.md"), "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
     for line in lines:
         log(line)
     evals = [x for name, r in rows.items() for x in ("--eval", name, "gazebo", r["path"])]
     if evals:
-        rc = run([PY, f"{REPO}/tools/stats_report.py", "--out-dir", os.path.join(out, "stats"), *evals],
-                 log_path=os.path.join(out, "stats.log"))
+        sr_cmd = [PY, f"{REPO}/tools/stats_report.py", "--out-dir", os.path.join(out, "stats")]
+        # stats_report 拒收的臂读不出协议键，不参与判断（更正 192762d）；它在下面的子进程里对同一份文件自己报错，记入 stats_report_error
+        if _has_mixed_protocol([r["path"] for n, r in rows.items() if n not in pairing_errors]):
+            sr_cmd.append("--allow-mixed-protocol")
+        sr_cmd.extend(evals)
+        sr_log = os.path.join(out, "stats.log")
+        rc = run(sr_cmd, log_path=sr_log)
         if rc:
-            log(f"stats_report rc={rc}（不致命，summary.md 已有主数字），见 {out}/stats.log")
+            err_msg = f"⚠ stats_report 退出码 rc={rc}，没有出表（未生成 stats/stats_report.md，见 {sr_log}）。"
+            log(err_msg)
+            lines += ["", err_msg]
+            res["stats_report_error"] = {"rc": rc, "log": sr_log, "message": err_msg}
+    write_json(os.path.join(out, "summary.json"), res)
+    with open(os.path.join(out, "summary.md"), "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
     return res
 
 

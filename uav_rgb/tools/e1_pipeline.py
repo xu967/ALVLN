@@ -30,6 +30,7 @@ DATA_ROOT = os.environ.get("DATA_ROOT", "/root/rivermind-data")
 BUILD = os.environ.get("UAV_RGB_BUILD_DIR", os.path.join(REPO, "build", "check"))  # check.sh 的构建目录
 PY = sys.executable   # 用 $UAV_RGB_PYTHON 启动本脚本，子进程继承它（preprocess/eval 需要 PIL、numpy、cv2）
 sys.path.insert(0, os.path.join(REPO, "tools"))
+import average_ckpt  # noqa: E402  - calswa 可校准性单源判据
 import eval_seeds  # noqa: E402  - 冻结评测 seed 的唯一来源
 import pipeline_common as pc  # noqa: E402  - 三条流水线共用：续跑判定等
 
@@ -103,7 +104,7 @@ CFG = dict(
                              # best = trainer 按 dev 宏 F1 存的 run/ckpt_best.bin（改前的行为，训练命令不加 --save-every-epoch）。
                              # 11-10 闭环 60 集（走廊内）：ckpt_best 27 → calswa 39；只平均不校准 20（tools/average_ckpt.py 文件头）。
                              # epochs < avg_last_k 时 calswa 取不到窗口，preflight 与 train 都报错并提示改 best。环境变量 E1_DELIVER 切换。
-                             # average_ckpt 只支持单帧纯视觉 ckpt（text_dim=0）：l1 那种 text_dim>0 的配置校准会报错停下，要设 best
+                             # average_ckpt 支持单帧无文本 ckpt（prev_dim 为 0 或 4）；text_dim>0 或双帧配置在 preflight 即拒绝，要设 best
     avg_last_k=10,           # calswa 平均末几轮；11-10 闭环只测过 10（average_ckpt.LAST_K），改它之前先在闭环上测
     gpu=os.environ.get("E1_GPU", "GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740"),
                              # 校准推理（average_ckpt 起 uavrgb_infer）钉的那张卡，写进 CUDA_VISIBLE_DEVICES。11-11 19:23 起 nvidia-smi -L 只列这一张
@@ -283,12 +284,23 @@ def preprocess(out):
 
 
 def deliver_check():
-    """交付权重配置查错：值不认识、calswa 的轮数不够（取不到末 avg_last_k 轮）都在起任何命令之前报错。preflight 与 train 都调。"""
+    """交付权重配置查错：值不认识、calswa 轮数不够、或模型结构（文本/双帧/非 4 维条件）不被 average_ckpt 支持，
+    都在 preflight 与 train 起任何命令之前报错。"""
+    if int(CFG.get("text_dim", 0)) < 0:
+        raise RuntimeError(f"CFG text_dim={CFG.get('text_dim')!r} 不能为负")
     if CFG["deliver"] not in ("calswa", "best"):
         raise RuntimeError(f"CFG deliver={CFG['deliver']!r}（环境变量 E1_DELIVER）只能是 calswa 或 best")
-    if CFG["deliver"] == "calswa" and CFG["epochs"] < CFG["avg_last_k"]:
-        raise RuntimeError(f"deliver=calswa 要末 {CFG['avg_last_k']} 轮的权重平均，但 epochs={CFG['epochs']} 取不到；"
-                           "改 E1_DELIVER=best（用 ckpt_best.bin），或把 CFG epochs 加到不小于 avg_last_k")
+    if CFG["deliver"] == "calswa":
+        if CFG["epochs"] < CFG["avg_last_k"]:
+            raise RuntimeError(f"deliver=calswa 要末 {CFG['avg_last_k']} 轮的权重平均，但 epochs={CFG['epochs']} 取不到；"
+                               "改 E1_DELIVER=best（用 ckpt_best.bin），或把 CFG epochs 加到不小于 avg_last_k")
+        in_c = 6 if CFG.get("two_frame") else int(CFG.get("in_c", 3))
+        text_dim = int(CFG.get("text_dim", 0))
+        prev_dim = int(CFG.get("prev_dim", 4 if CFG.get("prev_action") else 0))
+        try:
+            average_ckpt.check_calibratable(in_c=in_c, text_dim=text_dim, prev_dim=prev_dim)
+        except ValueError as e:
+            raise RuntimeError(f"deliver=calswa 不可用：{e}；改 E1_DELIVER=best（用 ckpt_best.bin）") from e
 
 
 def deliver_ckpt(run_dir):
@@ -303,12 +315,14 @@ def calibrate_swa(ds, run_dir):
     if CFG["deliver"] != "calswa":
         return
     swa = deliver_ckpt(run_dir)
-    if os.path.isfile(swa) and os.path.isfile(swa + ".json"):
+    if pc.calswa_finished(swa):   # dry-run 也判：预演已做完的目录同改前一样只打印跳过（c973059 曾加 not DRY，预演输出变了）
         return log(f"跳过校准平均：{swa} 已有")
     sh([PY, f"{REPO}/tools/average_ckpt.py", "--run", run_dir, "--data", f"{ds}/dataset.uavr", "--out", swa,
         "--last-k", str(CFG["avg_last_k"]), "--infer-bin", f"{BUILD}/uavrgb_infer"],
        env_extra={"CUDA_VISIBLE_DEVICES": CFG["gpu"]})
     need(swa, "average_ckpt 退出码 0 但没写出产物")
+    if not DRY and not pc.calswa_finished(swa):
+        raise RuntimeError(f"average_ckpt 退出码 0 但 {swa}.json 缺失或不可解析")
 
 
 def train(out):
@@ -332,7 +346,7 @@ def train(out):
         cmd.append("--vision-only")   # 数据带指令却要纯视觉基线时 trainer 要求显式声明
     if CFG["deliver"] == "calswa":
         cmd.append("--save-every-epoch")   # 平均要用末 avg_last_k 轮的 ckpt_epNN.bin（每个约 1.2 MB）
-    sh(cmd)
+    sh(cmd, env_extra=pc.train_env(DRY))
     need(f"{run_dir}/ckpt_best.bin", "训练结束但没有 best ckpt，看 run/metrics.jsonl")
     calibrate_swa(ds, run_dir)
 

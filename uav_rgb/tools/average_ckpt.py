@@ -14,6 +14,7 @@ prev_action 列（UAVRAUX1，tools/DATASET_FORMAT.md §6；prev-action 包里是
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import struct
@@ -49,6 +50,20 @@ def sha256_file(path):
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
+
+def parse_v5_contract(contract):
+    """按 src/checkpoint.cpp:read_v5_contract 解析 113 B v5 训练契约；全零占位 present=False。"""
+    if len(contract) != 113:
+        raise ValueError(f"v5 训练契约长度应为 113 B，得到 {len(contract)}")
+    ds_sha = contract[:32]
+    flags = contract[32]
+    distill_alpha, lr, seed, batch = struct.unpack_from("<ffIi", contract, 65)
+    if not (math.isfinite(distill_alpha) and math.isfinite(lr)):
+        raise ValueError("训练契约含非有限值")
+    present = not (lr == 0.0 and batch == 0 and ds_sha == b"\x00" * 32)
+    return {"present": present, "dataset_sha256": ds_sha.hex(), "drop_collision": bool(flags & 1),
+            "distill_alpha": distill_alpha, "lr": lr, "seed": seed, "batch": batch}
 
 
 def read_ckpt(path):
@@ -157,24 +172,42 @@ def calibrate(probs, target):
     return delta
 
 
-def read_val(path):
-    """dataset.uavr 的 val 分区（tools/DATASET_FORMAT.md §1–§2）→ (images NCHW memmap, 样本下标, 标签)。
-    剔除碰撞步与 src/dataset.cpp 的 drop_collision 同义：collision_flags 缺失、长度≠N、含 0/1 以外字符都报错，不当成无碰撞。"""
+def read_uavr_meta(path):
+    """读 dataset.uavr 尾部的 meta JSON 对象，并校验文件头与偏移自洽。"""
     with open(path, "rb") as f:
-        magic, ver, hs, n, h, w, c, idt, ldt, _r, io, lo, mo, ml = DS_HEAD.unpack(f.read(DS_HEAD.size))
+        head = f.read(DS_HEAD.size)
+        if len(head) != DS_HEAD.size:
+            raise ValueError(f"{path}: 不是 UAVR v1 的 RGB uint8 数据集")
+        magic, ver, hs, n, h, w, c, idt, ldt, _r, io, lo, mo, ml = DS_HEAD.unpack(head)
         if (magic, ver, hs, c, idt, ldt) != (b"UAVR", 1, 48, 3, 1, 1):
             raise ValueError(f"{path}: 不是 UAVR v1 的 RGB uint8 数据集")
         if (io, lo, mo) != (48, 48 + n * c * h * w, 48 + n * c * h * w + n) or os.path.getsize(path) != mo + ml:
             raise ValueError(f"{path}: 头里的偏移与文件长度不自洽")
         f.seek(mo)
         meta = json.loads(f.read(ml).decode("utf-8"))
-    flags = meta.get("collision_flags")
-    if not isinstance(flags, str) or len(flags) != n or set(flags) - {"0", "1"}:
-        raise ValueError(f"{path}: meta 缺 collision_flags 或格式不符（长度须等于 N、只含 0/1）；不当成无碰撞")
-    idx = np.asarray([i for ep in meta["episodes"] if ep["split"] == "val"
-                      for i in range(ep["sample_start"], ep["sample_start"] + ep["sample_count"]) if flags[i] == "0"], dtype=np.int64)
-    if not idx.size:
-        raise ValueError(f"{path}: val 分区剔除碰撞步后没有样本")
+    if not isinstance(meta, dict):
+        raise ValueError(f"{path}: meta 顶层不是对象")
+    return meta, (n, c, h, w, io, lo)
+
+
+def read_val(path, drop_collision=True):
+    """dataset.uavr 的 val 分区（tools/DATASET_FORMAT.md §1–§2）→ (images NCHW memmap, 样本下标, 标签)。
+    drop_collision=True 与 src/dataset.cpp 的 drop_collision 同义：collision_flags 缺失、长度≠N、含 0/1 以外字符都报错，不当成无碰撞；
+    drop_collision=False 保留 val 分区全部样本（同 src/dataset.cpp:519）。"""
+    meta, (n, c, h, w, io, lo) = read_uavr_meta(path)
+    if drop_collision:
+        flags = meta.get("collision_flags")
+        if not isinstance(flags, str) or len(flags) != n or set(flags) - {"0", "1"}:
+            raise ValueError(f"{path}: meta 缺 collision_flags 或格式不符（长度须等于 N、只含 0/1）；不当成无碰撞")
+        idx = np.asarray([i for ep in meta["episodes"] if ep["split"] == "val"
+                          for i in range(ep["sample_start"], ep["sample_start"] + ep["sample_count"]) if flags[i] == "0"], dtype=np.int64)
+        if not idx.size:
+            raise ValueError(f"{path}: val 分区剔除碰撞步后没有样本")
+    else:
+        idx = np.asarray([i for ep in meta["episodes"] if ep["split"] == "val"
+                          for i in range(ep["sample_start"], ep["sample_start"] + ep["sample_count"])], dtype=np.int64)
+        if not idx.size:
+            raise ValueError(f"{path}: val 分区没有样本")
     return np.memmap(path, np.uint8, "r", io, (n, c, h, w)), idx, np.fromfile(path, dtype=np.uint8, count=n, offset=lo)[idx]
 
 
@@ -242,17 +275,29 @@ def infer_probs(binary, ckpt, images, idx, cond=None):
     return out
 
 
+def check_calibratable(in_c=3, text_dim=0, prev_dim=0):
+    """校验模型输入结构能否由本工具从数据集经行协议还原做校准（流水线 preflight 与本工具共用同一判据）。
+    单帧无文本（in_c=3, text_dim=0）且 prev_dim ∈ {0, 4} 支持；文本指令、双帧与其它条件维度拒绝校准。"""
+    if (in_c, text_dim) != (3, 0) or prev_dim not in (0, PREV_DIM):
+        raise ValueError(f"暂不支持校准：ckpt 带 in_c={in_c} text_dim={text_dim} prev_dim={prev_dim}，"
+                         "这些输入无法从数据集经行协议还原（只平均请加 --no-calibrate）")
+
+
 def calibrate_and_write(args, last, params, out):
     """平均后的 ckpt 真实推理 val → δ → 写 fc.b[FORWARD]+δ 的 ckpt，再对写出的文件真实推理核对占比，通过才落到 out。返回 json 字段。
     shortcut: 只支持单帧、无文本的 ckpt（可带 prev_dim=4 的条件输入，条件取自侧车 prev_action 列）。文本指令（逐集 --text）与双帧（要读 prev_index 取上一帧）
     行协议还原不出来，宁可报错也不算出一个错的 δ；需要时按 student.py / select_ckpt.predict_indices 的写法补。"""
-    if (last["in_c"], last["text_dim"]) != (3, 0) or last["prev_dim"] not in (0, PREV_DIM):
-        raise ValueError(f"暂不支持校准：ckpt 带 in_c={last['in_c']} text_dim={last['text_dim']} prev_dim={last['prev_dim']}，"
-                         "这些输入无法从数据集经行协议还原（只平均请加 --no-calibrate）")
-    images, idx, y = read_val(args.data)
+    check_calibratable(last["in_c"], last["text_dim"], last["prev_dim"])
+    contract = parse_v5_contract(last["contract"])
+    if not contract["present"]:
+        raise ValueError("ckpt 训练契约全零（无训练记录），无法确定 drop_collision 与训练数据集 sha256，拒绝校准")
+    drop_collision = contract["drop_collision"]
+    ds_meta, _ = read_uavr_meta(args.data)
+    ds_cond = ds_meta.get("cond")
+    images, idx, y = read_val(args.data, drop_collision=drop_collision)
     if images.shape[2:] != (last["in_h"], last["in_w"]):
         raise ValueError(f"数据集 {images.shape[2:]} 与 ckpt 输入 {(last['in_h'], last['in_w'])} 不符")
-    data_sha, trained_on = sha256_file(args.data), last["contract"][:32].hex()   # 契约开头 32 B = trainer 记的训练数据集 sha256
+    data_sha, trained_on = sha256_file(args.data), contract["dataset_sha256"]
     if data_sha != trained_on:
         raise ValueError(f"--data 的 sha256 {data_sha[:12]} 与 ckpt 训练契约里的 {trained_on[:12]} 不同：校准只在训练用的那份数据的 val 上做")
     cond, cond_info = None, {}
@@ -260,6 +305,7 @@ def calibrate_and_write(args, last, params, out):
         col, aux_path = read_aux_cond(args.data, data_sha)
         cond = col[idx]
         cond_info = {"cond": {"prev_dim": last["prev_dim"], "aux": aux_path, "aux_sha256": sha256_file(aux_path), "column": "prev_action",
+                              "dataset_cond": ds_cond,
                               "val_value_counts": [int((cond == v).sum()) for v in range(PREV_DIM)]}}
     with tempfile.TemporaryDirectory(prefix=".average_ckpt_", dir=os.path.dirname(out)) as tmp:
         write_ckpt(last, params, f"{tmp}/avg.bin")
@@ -271,7 +317,8 @@ def calibrate_and_write(args, last, params, out):
         if abs(after - target) * len(idx) > VERIFY_FRAMES:
             raise ValueError(f"写出的 ckpt 真实推理 FORWARD 占比 {after:.4f} 偏离目标 {target:.4f}，不落盘")
         os.replace(f"{tmp}/cal.bin", out)
-    return {"data": os.path.abspath(args.data), "data_sha256": data_sha,
+    return {"data": os.path.abspath(args.data), "data_sha256": data_sha, "dataset_cond": ds_cond,
+            "drop_collision": drop_collision,
             "split": "val", "n_frames": int(len(idx)), "forward_target": target, "forward_frac_before": forward_frac(probs), "delta": float(delta),
             "forward_frac_after_real": after, "infer_bin": os.path.abspath(args.infer_bin), "infer_bin_sha256": sha256_file(args.infer_bin), **cond_info}
 
@@ -291,8 +338,10 @@ def run(args):
     else:
         meta.update(calibrate_and_write(args, last, params, out))
     meta["out_sha256"] = sha256_file(out)
-    with open(out + ".json", "w", encoding="utf-8") as f:
+    json_path = out + ".json"
+    with open(json_path + ".tmp", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=1, ensure_ascii=False)
+    os.replace(json_path + ".tmp", json_path)
     print(f"average_ckpt: ep{files[0][0]}..ep{files[-1][0]}（k={args.last_k}）→ {out}  sha256={meta['out_sha256']}")
     if meta["calibrated"]:
         print(f"average_ckpt: val {meta['n_frames']} 帧，FORWARD 占比 {meta['forward_frac_before']:.4f} → {meta['forward_frac_after_real']:.4f}"

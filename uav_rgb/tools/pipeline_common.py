@@ -291,6 +291,31 @@ def train_finished(run_dir):
                 and str(row.get("message", "")).startswith("done:"))
 
 
+def calswa_finished(ckpt_path):
+    """I2-5：average_ckpt 产物与旁边的 .json 都在，且 .json 可解析为 JSON 对象才算完成（空文件或截断半截不算）。"""
+    if not os.path.isfile(ckpt_path) or not os.path.isfile(ckpt_path + ".json"):
+        return False
+    try:
+        return isinstance(read_json(ckpt_path + ".json"), dict)
+    except (ValueError, OSError):
+        return False
+
+
+def train_env(dry=False):
+    """起 uavrgb_train 的环境变量（卡 C1a 配套）：缺省带 UAVRGB_CUDA_BLOCKING_SYNC=1（等 GPU 不自旋），
+    外部已设 0 或 1 时沿用外部值；非 0/1 取值直接抛错（新 uavrgb_train 会 rc=2）。dry-run 下不打日志以免改变输出。"""
+    raw = os.environ.get("UAVRGB_CUDA_BLOCKING_SYNC", "")
+    if raw == "":
+        val, src = "1", "缺省"
+    elif raw in ("0", "1"):
+        val, src = raw, "继承环境"
+    else:
+        raise RuntimeError(f"环境变量 UAVRGB_CUDA_BLOCKING_SYNC={raw!r} 非法：uavrgb_train 只接受 '0' 或 '1'")
+    if not (DRY or dry):
+        log(f"训练同步: UAVRGB_CUDA_BLOCKING_SYNC={val}（{src}）")
+    return {"UAVRGB_CUDA_BLOCKING_SYNC": val}
+
+
 def metric_version_for(dynamics, corridor_half_width=None):
     """与 sim/tools/eval_closed_loop.report_metric_version 同一规则（tools/ 不 import sim/，由单测逐组对账）。"""
     v = SIM_METRIC_VERSION if dynamics not in COAST_WINDOW_S else f"{SIM_METRIC_VERSION}.coast{COAST_WINDOW_S[dynamics]:g}s"

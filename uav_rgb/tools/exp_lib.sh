@@ -92,6 +92,13 @@ exp_preflight() {  # 保证（只读，不过就 exp_refuse）：入口是进程
   EXP_CORES=max; [[ $quota == max ]] || EXP_CORES=$(awk -v q="$quota" -v p="${period:-100000}" 'BEGIN { printf "%.2f", q / p }')
   [[ $EXP_CORES == max ]] || awk -v c="$EXP_CORES" -v m="$MIN_CORES" 'BEGIN { exit !(c >= m) }' \
     || exp_refuse 13 "cgroup 配额 $EXP_CORES 核 < $MIN_CORES 核（$CPU_MAX_FILE：$quota $period）"
+  if [[ -z "${UAVRGB_CUDA_BLOCKING_SYNC:-}" ]]; then
+    EXP_CUDA_BS_SRC=default; export UAVRGB_CUDA_BLOCKING_SYNC=1
+  elif [[ $UAVRGB_CUDA_BLOCKING_SYNC == 0 || $UAVRGB_CUDA_BLOCKING_SYNC == 1 ]]; then
+    EXP_CUDA_BS_SRC=env; export UAVRGB_CUDA_BLOCKING_SYNC
+  else
+    exp_refuse 2 "UAVRGB_CUDA_BLOCKING_SYNC=$UAVRGB_CUDA_BLOCKING_SYNC 非法（uavrgb_train 只接受 0 或 1）"
+  fi
   EXP_HEAD=$head; EXP_SRC=$src
 }
 
@@ -113,8 +120,9 @@ exp_begin() {  # 保证：到这里才开始写状态：日志进 run.log、旧 
   exp_rec "entry $EXP_ENTRY $(sha256sum < "$EXP_ENTRY" | cut -d' ' -f1)"; exp_rec "lib $EXP_LIB $(sha256sum < "$EXP_LIB" | cut -d' ' -f1)"
   for v in "${EXP_OVERRIDES[@]}"; do exp_rec "override $v"; done
   exp_rec "gpu ${EXP_GPU_LINE:-无}"; exp_rec "cpu_quota_cores $EXP_CORES min_cores=$MIN_CORES"
+  exp_rec "cuda_blocking_sync $UAVRGB_CUDA_BLOCKING_SYNC source=${EXP_CUDA_BS_SRC:-default}"
   for f in $INPUTS; do exp_rec "input $f $(sha256sum "$f" | cut -d' ' -f1)"; done
-  exp_log "开始 PGID=$$ OUT=$OUT 提交 $EXP_HEAD 覆盖：${EXP_OVERRIDES[*]:-无}"
+  exp_log "开始 PGID=$$ OUT=$OUT 提交 $EXP_HEAD 覆盖：${EXP_OVERRIDES[*]:-无} UAVRGB_CUDA_BLOCKING_SYNC=$UAVRGB_CUDA_BLOCKING_SYNC（${EXP_CUDA_BS_SRC:-default}）"
 }
 
 exp_lock_pool() {  # 保证：POOL 对应的池锁（gazebo→machine.lock、gs3d→gs3d.lock、train→train.lock，在 $LOCK_DIR 下）拿到才返回，持有到本进程退出；POOL=none 不碰锁
@@ -147,10 +155,12 @@ exp_cg() {  # 保证：打印一行 cgroup 快照「时刻 usage_usec nr_throttl
   awk -v t="$(date +%s.%N)" '$1 == "usage_usec" { u = $2 } $1 == "nr_throttled" { n = $2 } $1 == "throttled_usec" { h = $2 } END { print t, u + 0, n + 0, h + 0 }' "$CPU_STAT_FILE"
 }
 
-exp_health() {  # 保证：把臂 $1 的时序健康一行（墙钟、平均核数、nr_throttled 增量、被限流时长及占墙钟的比例）打印并追加进 health.txt；数据取自起止快照 $OUT/$1.cg
-  awk -v a="$1" '$1 == "start" { t0 = $2; u0 = $3; n0 = $4; h0 = $5 } $1 == "end" { t1 = $2; u1 = $3; n1 = $4; h1 = $5 }
+exp_health() {  # 保证：把臂 $1 的时序健康一行（墙钟、平均核数、nr_throttled 增量、被限流时长及占「墙钟×核数配额」的比例）打印并追加进 health.txt；数据取自起止快照 $OUT/$1.cg
+  awk -v a="$1" -v q="${EXP_CORES:-max}" '$1 == "start" { t0 = $2; u0 = $3; n0 = $4; h0 = $5 } $1 == "end" { t1 = $2; u1 = $3; n1 = $4; h1 = $5 }
     END { w = t1 - t0; if (w <= 0) { print a, "没有起止快照"; exit }
-          printf "%s 墙钟 %.0fs 平均 %.2f 核 nr_throttled +%d 被限流 %.1fs（占墙钟 %.0f%%）\n", a, w, (u1 - u0) / 1e6 / w, n1 - n0, (h1 - h0) / 1e6, 100 * (h1 - h0) / 1e6 / w }' "$OUT/$1.cg" | tee -a "$OUT/health.txt"
+          hs = (h1 - h0) / 1e6
+          if (q == "max" || q + 0 <= 0) printf "%s 墙钟 %.0fs 平均 %.2f 核 nr_throttled +%d 被限流 %.1fs（配额无上限）\n", a, w, (u1 - u0) / 1e6 / w, n1 - n0, hs
+          else printf "%s 墙钟 %.0fs 平均 %.2f 核 nr_throttled +%d 被限流 %.1fs（占配额 %.1f%%）\n", a, w, (u1 - u0) / 1e6 / w, n1 - n0, hs, 100 * hs / (w * q) }' "$OUT/$1.cg" | tee -a "$OUT/health.txt"
 }
 
 exp_arm() {  # 保证：$1=臂名，其余是命令，环境里有 ARM 与 ARM_DIR（=$OUT/$1）。有 $ARM_DIR/.ok 就跳过；没有 .ok 的旧目录改名 $1.partial-<时刻> 留着再做；

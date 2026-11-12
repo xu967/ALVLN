@@ -183,7 +183,7 @@ def train(ds, run_dir, arm):
         cmd += ["--soft-targets", f"{ds}/soft_targets.bin", "--distill-alpha", str(CFG["distill_alpha"])]
     if CFG["drop_collision"]:
         cmd.append("--drop-collision")
-    sh(cmd, log_path=None if DRY else run_dir + ".log")
+    sh(cmd, env_extra=pc.train_env(DRY), log_path=None if DRY else run_dir + ".log")
     # 单几何场景（3DGS pilot）按几何组分 split 后没有 val：trainer 不选 best（避免用训练集挑权重），
     # 两臂都用末轮 ckpt.bin（同 epoch、无选择），有 val 时才用 ckpt_best.bin。
     if DRY or os.path.isfile(f"{run_dir}/ckpt_best.bin"):

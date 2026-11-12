@@ -42,6 +42,20 @@ def test_train_finished():
         _write(os.path.join(tmp, "run2", "metrics.jsonl"), "not json\n")
         assert pc.train_finished(os.path.join(tmp, "run2")) is False, "坏行不抛，算未完成"
     print("ok train_finished")
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as tmp:
+        swa = os.path.join(tmp, "ckpt_calswa.bin")
+        assert pc.calswa_finished(swa) is False, "文件不存在"
+        _write(swa, "bin")
+        assert pc.calswa_finished(swa) is False, "缺 .json"
+        _write(swa + ".json", "")
+        assert pc.calswa_finished(swa) is False, "空 .json（被杀残留）不算完成"
+        _write(swa + ".json", '{"tool":')
+        assert pc.calswa_finished(swa) is False, "截断半截 .json 不算完成"
+        _write(swa + ".json", "[1, 2]")
+        assert pc.calswa_finished(swa) is False, "非 dict 的 .json 不算完成"
+        _write(swa + ".json", '{"tool": "tools/average_ckpt.py"}')
+        assert pc.calswa_finished(swa) is True
+    print("ok calswa_finished")
 
 
 def test_eval_finished():
@@ -478,6 +492,50 @@ def test_shared_helpers():
     print("ok 共享 helper 单一份；wilson_ci 与 eval_closed_loop 一致")
 
 
+def test_train_env_cuda_blocking_sync():
+    """第 6 条（C1a 配套）：train_env 缺省带 UAVRGB_CUDA_BLOCKING_SYNC=1，外部设 0/1 照外部，非法值抛错，dry-run 零日志。"""
+    import contextlib
+    import io
+    saved_env = os.environ.get("UAVRGB_CUDA_BLOCKING_SYNC")
+    saved_dry = pc.DRY
+    try:
+        pc.DRY = False
+        os.environ.pop("UAVRGB_CUDA_BLOCKING_SYNC", None)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            assert pc.train_env() == {"UAVRGB_CUDA_BLOCKING_SYNC": "1"}
+        assert "UAVRGB_CUDA_BLOCKING_SYNC=1" in buf.getvalue(), buf.getvalue()
+
+        os.environ["UAVRGB_CUDA_BLOCKING_SYNC"] = "0"
+        buf0 = io.StringIO()
+        with contextlib.redirect_stdout(buf0):
+            assert pc.train_env() == {"UAVRGB_CUDA_BLOCKING_SYNC": "0"}
+        assert "UAVRGB_CUDA_BLOCKING_SYNC=0" in buf0.getvalue(), buf0.getvalue()
+
+        # dry-run 不打日志（保证 dry-run 输出逐字不变）
+        buf_dry = io.StringIO()
+        with contextlib.redirect_stdout(buf_dry):
+            assert pc.train_env(dry=True) == {"UAVRGB_CUDA_BLOCKING_SYNC": "0"}
+        assert buf_dry.getvalue() == "", buf_dry.getvalue()
+
+        # 非 0/1 取值直接拒绝（新 uavrgb_train 会 rc=2）
+        for bad in ("yes", "true", "2"):
+            os.environ["UAVRGB_CUDA_BLOCKING_SYNC"] = bad
+            try:
+                pc.train_env()
+            except RuntimeError as e:
+                assert "UAVRGB_CUDA_BLOCKING_SYNC" in str(e), e
+            else:
+                raise AssertionError(f"非法取值 {bad!r} 应抛 RuntimeError")
+    finally:
+        pc.DRY = saved_dry
+        if saved_env is None:
+            os.environ.pop("UAVRGB_CUDA_BLOCKING_SYNC", None)
+        else:
+            os.environ["UAVRGB_CUDA_BLOCKING_SYNC"] = saved_env
+    print("ok train_env：缺省 1、继承 0/1、dry-run 零输出、拒绝非法值")
+
+
 def main():
     test_train_finished()
     test_eval_finished()
@@ -494,6 +552,7 @@ def main():
     test_signal_handlers_and_child_groups()
     test_torch_extensions_dir()
     test_shared_helpers()
+    test_train_env_cuda_blocking_sync()
     print("test_pipeline_common: PASS")
     return 0
 

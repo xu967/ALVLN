@@ -6,7 +6,7 @@
       [uavrgb_train 参数...]
   python3 tools/train_student_with_video.py --data <dataset.uavr> --out <run_dir> --dry-run
 
-先跑 $UAV_RGB_BUILD_DIR/uavrgb_train（默认 <repo>/src/build/uavrgb_train），成功后
+先跑 $UAV_RGB_BUILD_DIR/uavrgb_train（默认 <repo>/build/check/uavrgb_train，tools/check.sh 的构建目录，同其它工具），成功后
 读 .uavr 尾部 meta 推断 task/split/dynamics，再跑
 `eval_closed_loop.py --policy student --ckpt <out>/ckpt_best.bin --record-video
 --episodes 1`，录像写到 <out>/closed_loop_eval_<UTCstamp>/videos/。
@@ -172,6 +172,15 @@ def build_eval_command(python, eval_script, ckpt, out_dir, params):
                "--scene", scene, "--out", str(out_dir),
                "--ckpt", str(ckpt), "--episodes", "1", "--record-video",
                "--allow-train-scene"]
+        # eval_3dgs 不再静默用 scene.step_s（AUDIT #12）：窗口来源必须显式，否则参数解析阶段 resolve_hold 就 p.error 退出 2。
+        # --data 让它自己读 .uavr meta 的 hold_s 并把来源写进产物；数据集不是 .uavr（read_hold_from_data 读不了）时退回 --hold。
+        # 两个来源都没有就在这里拒绝，不生成一条注定失败的命令（main() 据此跳过并写原因）。
+        if data and str(data).endswith(".uavr"):
+            cmd += ["--data", str(data)]
+        elif params.get("hold_s") is not None:
+            cmd += ["--hold", repr(float(params["hold_s"]))]
+        else:
+            raise ValueError("3DGS 自动评测需要 .uavr 数据集（--data）或 hold_s，eval_3dgs 不再静默用 scene.step_s")
         if params.get("infer_bin"):
             cmd += ["--infer-bin", str(params["infer_bin"])]
         return cmd
@@ -222,7 +231,9 @@ def main(argv=None):
     except (OSError, ValueError) as exc:
         p.error(f"读取 .uavr meta 失败: {exc}")
     params, reason = auto_eval_params(meta)
-    build_dir = Path(os.environ.get("UAV_RGB_BUILD_DIR") or (REPO_ROOT / "src" / "build"))
+    # 默认 build/check：tools/check.sh 的构建目录，与 e1_pipeline、dagger_gz_pipeline、compare_datasets、average_ckpt、
+    # sim/tools/student.py、ui/studio.py 同一个（CLAUDE.md、README.md）；src/build 是历史路径，里面是 11-04 的旧二进制。
+    build_dir = Path(os.environ.get("UAV_RGB_BUILD_DIR") or (REPO_ROOT / "build" / "check"))
     trainer = build_dir.expanduser() / "uavrgb_train"
     if params is not None:
         params["data"] = str(data)
@@ -252,7 +263,7 @@ def main(argv=None):
 
     if not os.access(trainer, os.X_OK):
         print(f"train_student_with_video: 找不到可执行的 trainer: {trainer}\n"
-              "先构建 src/build（或设置 UAV_RGB_BUILD_DIR）", file=sys.stderr)
+              "先运行 bash tools/check.sh 构建 build/check（或设置 UAV_RGB_BUILD_DIR）", file=sys.stderr)
         return 2
     rc = subprocess.run(train_cmd).returncode
     if rc != 0:

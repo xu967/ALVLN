@@ -7,7 +7,9 @@
 
 复现性验收的产物落在 UAVRGB_REPRO_OUT（父目录，默认 TMPDIR）下新建的目录里；推理二进制用 UAVRGB_REPRO_INFER 换。
 """
+import ast
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -36,14 +38,21 @@ def rand_params(seed):
     return [(rng.standard_normal(s) * 3).astype(np.float32) for s in SHAPES]
 
 
-def write_ckpt(path, params, epoch, version=6, text_dim=0, prev=0, in_c=3, in_h=H, trailing=b"", ds_sha=None):
+def write_ckpt(path, params, epoch, version=6, text_dim=0, prev=0, in_c=3, in_h=H, trailing=b"", ds_sha=None,
+               drop_collision=None, zero_contract=False):
     """独立于工具的 v6 写法（布局见 src/include/uavrgb/checkpoint.hpp）。契约 113 B 与 Adam m/v 随轮次变，用来核对「沿用最后一轮」。"""
     b = bytearray(b"UAVRCK01" + struct.pack("<II", version, len(params)))
     b += struct.pack("<4i", in_h, W, in_c, 4) + struct.pack("<3I", 100 + epoch, epoch, 4)
     b += struct.pack("<4f", 36.6, 0.3, 3.2, 3.3) + struct.pack("<f", 0.4) + struct.pack("<i", text_dim)
-    contract = bytes((epoch + i) % 256 for i in range(113))
-    if ds_sha:   # 契约开头 32 B 是训练数据集 sha256
-        contract = bytes.fromhex(ds_sha) + contract[32:]
+    if zero_contract:
+        contract = b"\x00" * 113
+    else:
+        c_buf = bytearray((epoch + i) % 256 for i in range(113))
+        if ds_sha:   # 契约开头 32 B 是训练数据集 sha256
+            c_buf[:32] = bytes.fromhex(ds_sha)
+        if drop_collision is not None:   # 偏移 32 的 u8 最低位为 drop_collision（src/checkpoint.cpp:136）
+            c_buf[32] = (c_buf[32] & ~1) | (1 if drop_collision else 0)
+        contract = bytes(c_buf)
     b += contract + struct.pack("<2i", 0, prev)
     for p in params:
         b += struct.pack("<I", p.ndim) + struct.pack(f"<{p.ndim}q", *p.shape) + p.astype("<f4").tobytes()
@@ -63,10 +72,10 @@ def make_run(root, epochs, params_of, name="run", **kw):
     return d
 
 
-def write_uavr(path, n_per_split, labels, collisions, images):
+def write_uavr(path, n_per_split, labels, collisions, images, extra_meta=None):
     """按 tools/DATASET_FORMAT.md §1 写小数据集：每个 split 一集；collisions 为 '0'/'1' 串或 None（不写该字段）。"""
     n = sum(n_per_split.values())
-    meta = {"episodes": [], "split_policy": "scene_id"}
+    meta = {"episodes": [], "split_policy": "scene_id", **(extra_meta or {})}
     start = 0
     for sp, cnt in n_per_split.items():
         meta["episodes"].append({"split": sp, "sample_start": start, "sample_count": cnt, "scene_id": start})
@@ -434,6 +443,87 @@ class TestEndToEnd(Base):
         with self.assertRaises(SystemExit):
             ac.main(["--run", self.run_dir, "--out", os.path.join(self.tmp, "o.bin"), "--last-k", "2"])
 
+    def test_calibration_follows_contract_drop_collision_and_locks_delivered_bytes(self):
+        """C6 / I2-5 第 2 点：average_ckpt 按最后一轮 ckpt 契约的 drop_collision 位决定是否剔除碰撞步，
+        在 .json 记下 drop_collision，全零契约报错拒绝，且 drop_collision=True 校准产物与改前逐字节一致。"""
+        # 1) 锁死改前 drop_collision=True 的校准产物逐字节不变
+        out_drop = os.path.join(self.tmp, "cal_drop_true.bin")
+        rc = ac.main(["--run", self.run_dir, "--data", self.data, "--out", out_drop, "--last-k", "3", "--infer-bin", self.fake])
+        self.assertEqual(rc, 0)
+        self.assertEqual(sha(out_drop), "aa39f3cd40e6887ebf69b38dbb60afe3c337286e85a3908d27b5e9a519c00c51",
+                         "drop_collision=True 的校准产物字节不得改变")
+        meta_drop = load_json(out_drop + ".json")
+        self.assertIs(meta_drop.get("drop_collision"), True)
+        self.assertEqual(meta_drop["n_frames"], 76)
+
+        # 2) drop_collision=False：保留 val 全部 80 帧（令 4 个碰撞帧标签全为 0 以拉大与 76 帧目标的差距）
+        labels2 = self.labels.copy()
+        for i in (35, 36, 37, 38):
+            labels2[i] = 0
+        data_keep = os.path.join(self.tmp, "keep.uavr")
+        write_uavr(data_keep, self.n_split, labels2, self.flags, self.images)
+        run_keep = make_run(self.tmp, range(1, 6), lambda e: rand_params(e), name="run_keep",
+                            ds_sha=sha(data_keep), drop_collision=False)
+        out_keep = os.path.join(self.tmp, "cal_drop_false.bin")
+        self.assertEqual(ac.main(["--run", run_keep, "--data", data_keep, "--out", out_keep,
+                                  "--last-k", "3", "--infer-bin", self.fake]), 0)
+        meta_keep = load_json(out_keep + ".json")
+        self.assertIs(meta_keep.get("drop_collision"), False)
+        self.assertEqual(meta_keep["n_frames"], 80)
+        self.assertAlmostEqual(meta_keep["forward_target"], float((labels2[30:110] == 1).mean()), places=12)
+
+        # 3) drop_collision=False 时即使老数据集没有 collision_flags 字段也可正常按全量 val 校准（同 src/dataset.cpp:519）
+        data_noflags = os.path.join(self.tmp, "noflags.uavr")
+        write_uavr(data_noflags, self.n_split, labels2, None, self.images)
+        run_noflags = make_run(self.tmp, range(1, 6), lambda e: rand_params(e), name="run_noflags",
+                               ds_sha=sha(data_noflags), drop_collision=False)
+        out_noflags = os.path.join(self.tmp, "cal_noflags.bin")
+        self.assertEqual(ac.main(["--run", run_noflags, "--data", data_noflags, "--out", out_noflags,
+                                  "--last-k", "3", "--infer-bin", self.fake]), 0)
+        self.assertEqual(load_json(out_noflags + ".json")["n_frames"], 80)
+
+        # 4) 全零契约（read_v5_contract 返回 false）：无训练记录，拒绝静默回落
+        run_zero = make_run(self.tmp, range(1, 6), lambda e: rand_params(e), name="run_zero", zero_contract=True)
+        with self.assertRaises(SystemExit) as cm:
+            ac.main(["--run", run_zero, "--data", self.data, "--out", os.path.join(self.tmp, "zero.bin"),
+                     "--last-k", "3", "--infer-bin", self.fake])
+        self.assertIn("训练契约全零", str(cm.exception.code))
+
+        # 5) 若数据盘上存在现有交付权重，只读核验其契约全部解析为 present=True, drop_collision=True
+        real_dir = os.path.join(_DATA_TMP, "..", "exp-swa-calib-20261110", "ckpt")
+        if os.path.isdir(real_dir):
+            checked = 0
+            for fn in sorted(os.listdir(real_dir)):
+                if fn.endswith(".bin"):
+                    c = ac.parse_v5_contract(ac.read_ckpt(os.path.join(real_dir, fn))["contract"])
+                    self.assertTrue(c["present"] and c["drop_collision"], f"{fn}: {c}")
+                    checked += 1
+            self.assertGreater(checked, 0)
+
+    def test_read_val_call_shape_matches_verify_infer_vs_evalonly(self):
+        """experiments/2026-11-12-e2e-heading-code/verify_infer_vs_evalonly.py 这样用：`images, idx, y = ac.read_val(args.data)`。
+        用 ast 取出那个脚本里对 ac.read_val 的全部调用：每个都能绑到当前签名，结果被解成三个名字；
+        再按脚本的形态（一个位置参数）真调一次，缺省仍剔除碰撞帧（改前的行为）。"""
+        script = os.path.join(REPO, "experiments", "2026-11-12-e2e-heading-code", "verify_infer_vs_evalonly.py")
+        with open(script, encoding="utf-8") as f:
+            tree = ast.parse(f.read(), filename=script)
+
+        def is_read_val(call):
+            return (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and call.func.attr == "read_val"
+                    and isinstance(call.func.value, ast.Name) and call.func.value.id == "ac")
+        calls = [n for n in ast.walk(tree) if is_read_val(n)]
+        widths = [len(n.targets[0].elts) for n in ast.walk(tree)
+                  if isinstance(n, ast.Assign) and is_read_val(n.value) and isinstance(n.targets[0], ast.Tuple)]
+        self.assertTrue(calls, "脚本里应有 ac.read_val 的调用")
+        sig = inspect.signature(ac.read_val)
+        for call in calls:
+            self.assertFalse(any(isinstance(a, ast.Starred) for a in call.args))
+            sig.bind(*[None] * len(call.args), **{k.arg: None for k in call.keywords})   # 绑不上就 TypeError
+        self.assertTrue(widths and all(w == 3 for w in widths), f"脚本应把 read_val 的结果解成三个名字：{widths}")
+        images, idx, y = ac.read_val(self.data)
+        self.assertEqual((len(idx), len(y)), (76, 76), "缺省 drop_collision=True：80 帧 val 剔掉 4 个碰撞帧")
+        self.assertEqual(len(images), len(self.images))
+
 
 class TestAuxCond(Base):
     """UAVRAUX1 侧车的 prev_action 列读取：逐项绑定核对，任何不符都报错（同 src/aux_sidecar.cpp）。"""
@@ -616,6 +706,42 @@ class TestEndToEndCond(Base):
         out = os.path.join(self.tmp, "avg.bin")
         ac.main(["--run", self.run_dir, "--out", out, "--last-k", "2", "--no-calibrate"])
         self.assertTrue(os.path.isfile(out))
+
+    def test_json_records_dataset_cond_abs_data_and_writes_atomically(self):
+        """I2-5 第 1、3 点：.json 记录数据集 meta.cond（heading_code.v1 或 None）与数据集绝对路径（即使 --data 给相对路径），
+        且通过 .json.tmp -> os.replace 原子落盘（写 JSON 中途失败不留半截 .json）。"""
+        hc_data = os.path.join(self.tmp, "sub", "hc.uavr")
+        os.makedirs(os.path.dirname(hc_data), exist_ok=True)
+        write_uavr(hc_data, self.n_split, self.labels, self.flags, self.images, extra_meta={"cond": "heading_code.v1"})
+        write_aux(hc_data, self.cond)
+        hc_run = make_run(self.tmp, range(1, 6), lambda e: rand_params(e), name="run_hc", ds_sha=sha(hc_data), prev=4)
+        out_hc = os.path.join(self.tmp, "cal_hc.bin")
+        old_cwd = os.getcwd()
+        replaced = []
+        real_replace = ac.os.replace
+        ac.os.replace = lambda s, d: (replaced.append((s, d)), real_replace(s, d))[1]
+        try:
+            os.chdir(self.tmp)
+            rc = ac.main(["--run", hc_run, "--data", os.path.join("sub", "hc.uavr"),
+                          "--out", out_hc, "--last-k", "3", "--infer-bin", self.fake])
+        finally:
+            ac.os.replace = real_replace
+            os.chdir(old_cwd)
+        self.assertEqual(rc, 0)
+        meta_hc = load_json(out_hc + ".json")
+        self.assertEqual(meta_hc["data"], os.path.abspath(hc_data))
+        self.assertEqual(meta_hc["dataset_cond"], "heading_code.v1")
+        self.assertEqual(meta_hc["cond"]["dataset_cond"], "heading_code.v1")
+        self.assertIn((out_hc + ".json.tmp", out_hc + ".json"), replaced, "写 .json 必须先写 .json.tmp 再 os.replace")
+        self.assertFalse(os.path.exists(out_hc + ".json.tmp"))
+
+        # 无 cond 键的 prev-action 数据集：dataset_cond 显式记为 None（键存在）
+        out_pa, _ = self.calibrate(name="cal_pa_meta")
+        meta_pa = load_json(out_pa + ".json")
+        self.assertIn("dataset_cond", meta_pa)
+        self.assertIsNone(meta_pa["dataset_cond"])
+        self.assertIn("dataset_cond", meta_pa["cond"])
+        self.assertIsNone(meta_pa["cond"]["dataset_cond"])
 
 
 # 今天闭环实验用的权重（exp-swa-calib-20261110/inputs.txt 的 sha256）
