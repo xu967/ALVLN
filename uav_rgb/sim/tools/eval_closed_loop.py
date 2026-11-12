@@ -230,6 +230,39 @@ def protocol_mismatches(protocol, actual):
             if key in protocol and protocol[key] != actual.get(key)]
 
 
+NOTE_TRAIN_WITHOUT_ACTION_LATENCY = "train_protocol_without_action_latency"
+
+
+def protocol_notes(protocol, actual):
+    """协议比对之外的口径提示（W1-13 A2：不判 OOD、不拦 --strict-protocol，非空时写进 eval.json 的 protocol_notes）。
+
+    训练数据的协议快照没有 action_latency_s（旧协议数据）而本次给了 --action-latency L 时，记 train_protocol_without_action_latency。
+    """
+    notes = []
+    if isinstance(protocol, dict) and "action_latency_s" not in protocol and actual.get("action_latency_s") is not None:
+        notes.append(NOTE_TRAIN_WITHOUT_ACTION_LATENCY)
+    return notes
+
+
+def train_dataset_meta_for_ckpt(ckpt):
+    """沿 ckpt 的训练配置（nav_cond.find_train_config）读训练数据集 meta；缺文件或 sha256 不符返回 None。"""
+    if not ckpt:
+        return None
+    _, cfg = nav_cond.find_train_config(ckpt)
+    if cfg is None:
+        return None
+    data = cfg.get("data")
+    if not isinstance(data, str):
+        return None
+    try:
+        want_sha = cfg.get("dataset_sha256")
+        if want_sha and sha256_file(data) != want_sha:
+            return None
+        return nav_cond.read_dataset_meta(data)
+    except (OSError, ValueError):
+        return None
+
+
 def wilson_ci(successes, n, z=1.96):
     """Wilson 95% 区间；n=0 返回 None。用于 requested 与 done-set 两个分母。"""
     if not n:
@@ -566,6 +599,10 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
     大于 FRAME_GAP_FLAG_FACTOR(1.2) × hold 时再写 frame_gap_flag: true（不大于则不写这个键）。hold 是每动作仿真秒，
     调用方给（run_episode 传 --hold）；没给时用行里 sim_dt 的中位数，都没有就只写间隔、不打旗。
     没有 rgb_ts（旧数据）、一步集、空集不多任何键。
+    步间记账（W1-13，只加不改）：actions 行有 safe_gap_s（本步派发戳减上一步执行器截止，秒，首步 null）时，写其非空值的
+    中位数 safe_gap_s_median 与最大值 safe_gap_s_max（下一动作先到时为负，照常进分布）；没有非空值（旧数据）不写键。
+    actions 行有 obs_gap_s（本观测戳减上一观测戳，秒，首步 null）时，写其最大值 obs_gap_s_max、停顿步数 stall_steps
+    （间隔 > 名义步周期 0.9 s + 0.2 s，collect.is_stall_gap）；有停顿步时再写 stall_step_ids。没有非空值（旧数据）不写任何一个。
     """
     goal_radius_stop = float(stop_radius) if stop_radius is not None else None
     metric_version = (METRIC_VERSION if coast_window_s is None
@@ -686,6 +723,22 @@ def summarize_episode(actions, oracle, goal_x, waypoint=None,
         ref = frame_gap_reference_s(actions, hold)
         if ref is not None and ref > 0 and gap > FRAME_GAP_FLAG_FACTOR * ref:
             stat["frame_gap_flag"] = True
+    # W1-13 A1：步间 SAFE 空档（collect 每步记 safe_gap_s = 本步派发戳减上一步执行器截止；首步 null）。
+    # 旧数据、旧 collect 的集没有这个字段，没有非空值时不写键；下一动作先到时为负，照常进分布。
+    safe_gaps = [a["safe_gap_s"] for a in actions if a.get("safe_gap_s") is not None]
+    if safe_gaps:
+        stat["safe_gap_s_median"] = statistics.median(safe_gaps)
+        stat["safe_gap_s_max"] = max(safe_gaps)
+    # W1-13 A3：相邻观测间隔（collect 每步记 obs_gap_s；首步 null）与停顿步。数值与 W1-3 的 max_frame_gap_s 同口径（新数据上两者相等），
+    # 这里逐步可追到是哪几步。旧数据没有这个字段，没有非空值时不写键。
+    obs_gaps = [(a.get("step", i), a["obs_gap_s"]) for i, a in enumerate(actions) if a.get("obs_gap_s") is not None]
+    if obs_gaps:
+        ref_hold = frame_gap_reference_s(actions, hold)
+        stall_ids = [k for k, g in obs_gaps if collect.is_stall_gap(g, hold=ref_hold)]
+        stat["obs_gap_s_max"] = max(g for _, g in obs_gaps)
+        stat["stall_steps"] = len(stall_ids)
+        if stall_ids:
+            stat["stall_step_ids"] = stall_ids
     return stat
 
 
@@ -1019,7 +1072,7 @@ def run_episode(seed, args, workdir, seen_gids):
     return summary, None
 
 
-def scan_episodes(seed_list, episodes, run_fn, log=print, state=None):
+def scan_episodes(seed_list, episodes, run_fn, log=print, state=None, fail_on_stall=False, hold=None):
     """固定请求集扫描（AUDIT #11）：成功与采集失败都占一个名额，不再为失败补扫新 seed。
 
     之前按 len(results) 停：1 集失败就多扫 1 个 seed 补上，requested_SR 的分母名义上是
@@ -1029,6 +1082,8 @@ def scan_episodes(seed_list, episodes, run_fn, log=print, state=None):
     返回 (results, failures, skips, scanned, attempted)。
     state（可选 dict）：开扫前就挂上这五个列表和正在跑的 current seed，SIGTERM/Ctrl-C
     （SystemExit/KeyboardInterrupt 不在这里捕获）打断后调用方仍拿得到已完成的部分（A2）。
+    fail_on_stall（W1-13 A3，main 在给了 --action-latency 时传 True）：含停顿步（summary["stall_steps"] > 0）的集与含迟到步的集
+    同样处理：进 failures、占请求名额、不计成功；同一集既有迟到步又有停顿步时合成一条。默认 False：停顿步只记在 summary 里。
     """
     results, seen, failures, skips, scanned, attempted = [], set(), [], [], [], []
     if state is not None:
@@ -1053,6 +1108,7 @@ def scan_episodes(seed_list, episodes, run_fn, log=print, state=None):
             continue
         attempted.append(seed)
         late = summary.get("late_dispatch_steps") or 0   # 只有给了 --action-latency 才有这个键
+        stall = (summary.get("stall_steps") or 0) if fail_on_stall else 0   # W1-13 A3
         if summary["collect_rc"] != 0 or summary["steps"] == 0:
             # 采集中途失败不是「学生飞得差」，不计进 SR 分子，但占请求名额。
             failures.append({"seed": seed, "rc": summary["collect_rc"],
@@ -1062,20 +1118,32 @@ def scan_episodes(seed_list, episodes, run_fn, log=print, state=None):
             log(f"[seed {seed}] 采集失败 rc={summary['collect_rc']}，占请求名额、不计入成功",
                 flush=True)
             continue
-        if late > 0:
-            # 迟到步 = 派发时刻偏离了固定的 观测戳 + L：这一集的动作生效时长不可比。与采集失败同样处理：
-            # 基础设施失败，占请求名额、不计入成功，原因与迟到明细随 failed[] 留证。
-            failures.append({"seed": seed, "rc": summary["collect_rc"],
-                             "error": f"late_dispatch: {late} 步迟到（动作就绪时已超过 观测戳 + L + 0.02 s），"
-                                      "派发时刻不再固定，本集不计成功",
-                             "late_dispatch_steps": late, "late_step_ids": summary.get("late_step_ids", []),
-                             "dispatch_lag_s_median": summary.get("dispatch_lag_s_median"),
-                             "dispatch_lag_s_max": summary.get("dispatch_lag_s_max"),
+        if late > 0 or stall > 0:
+            # 迟到步 = 派发时刻偏离了固定的 观测戳 + L：这一集的动作生效时长不可比。停顿步 = 相邻观测间隔超过
+            # 名义步周期 + 0.2 s：步间执行器回 SAFE 刹停了更久，同样不可比。与采集失败同样处理：
+            # 基础设施失败，占请求名额、不计入成功，原因与明细随 failed[] 留证。
+            errors, detail = [], {}
+            if late > 0:
+                errors.append(f"late_dispatch: {late} 步迟到（动作就绪时已超过 观测戳 + L + 0.02 s），"
+                              "派发时刻不再固定，本集不计成功")
+                detail.update({"late_dispatch_steps": late, "late_step_ids": summary.get("late_step_ids", []),
+                               "dispatch_lag_s_median": summary.get("dispatch_lag_s_median"),
+                               "dispatch_lag_s_max": summary.get("dispatch_lag_s_max")})
+                log(f"[seed {seed}] 迟到派发 {late} 步（步号 {summary.get('late_step_ids')}），基础设施失败，"
+                    "占请求名额、不计入成功", flush=True)
+            if stall > 0:
+                nom_s = collect.nominal_step_period_s(hold)
+                errors.append(f"stall: {stall} 步停顿（相邻观测间隔超过 名义步周期 {nom_s:g} s + "
+                              f"{collect.STALL_MARGIN_S:g} s），步间执行器回 SAFE 刹停更久，动作生效时长不可比，本集不计成功")
+                detail.update({"stall_steps": stall, "stall_step_ids": summary.get("stall_step_ids", []),
+                               "obs_gap_s_max": summary.get("obs_gap_s_max"),
+                               "safe_gap_s_max": summary.get("safe_gap_s_max")})
+                log(f"[seed {seed}] 停顿 {stall} 步（步号 {summary.get('stall_step_ids')}，最大观测间隔 "
+                    f"{summary.get('obs_gap_s_max')} s），基础设施失败，占请求名额、不计入成功", flush=True)
+            failures.append({"seed": seed, "rc": summary["collect_rc"], "error": "；".join(errors), **detail,
                              "stderr_tail": summary.get("stderr_tail"),
                              "performance": summary.get("performance"),
                              "render_backend_requested": summary.get("render_backend_requested")})
-            log(f"[seed {seed}] 迟到派发 {late} 步（步号 {summary.get('late_step_ids')}），基础设施失败，"
-                "占请求名额、不计入成功", flush=True)
             continue
         seen.add(summary["dedup_key"])
         results.append(summary)
@@ -1240,7 +1308,8 @@ def main():
     p.add_argument("--action-latency", type=float, default=None, metavar="L",
                    help="透传给 collect.py：把动作派发时刻固定到仿真时间（观测戳 + L 秒），动作生效时长固定为 hold - L，"
                         "迟到步（就绪时已超过 L + 0.02 s）记账。含迟到步的集算基础设施失败（eval.json failed[] 与 "
-                        "late_dispatch_episodes 单列），不计入成功。默认关（旧口径逐位不变）；开了以后 eval.json 顶层记 "
+                        "late_dispatch_episodes 单列），不计入成功；含停顿步（相邻观测间隔 > 0.9 s + 0.2 s，W1-13）的集同样处理"
+                        "（stall_episodes 单列）。默认关（旧口径逐位不变）；开了以后 eval.json 顶层记 "
                         "action_latency_s，新旧 SR 不可混报。只能配 --window-from observation，且 0 < L < --hold")
     p.add_argument("--rtf", type=float, default=None,
                    help="透传给 scene_gen：世界物理的目标实时因子（只能压低，缺省用模板值 1.0）。eval.json 顶层记 rtf")
@@ -1297,6 +1366,7 @@ def main():
             print(f"警告: protocol 不一致（本次结果 ood=true）: {detail}",
                   file=sys.stderr, flush=True)
     ood = bool(mismatches)
+    notes = protocol_notes(protocol, actual_protocol)
 
     try:
         seed_list = parse_seeds(args.seeds) if args.seeds else []
@@ -1421,6 +1491,10 @@ def main():
         if args.text_mode != "keep" and args.task not in ("l1", "campus", "campus_assets"):
             p.error("--text-mode 只对 --task l1/campus 有意义")
         args.infer_bin = infer_bin  # 让 run_episode 与 report 用同一个路径
+        if protocol is None and args.action_latency is not None:
+            notes = protocol_notes(train_dataset_meta_for_ckpt(args.ckpt), actual_protocol)
+    if notes:
+        print(f"提示: protocol_notes={notes}（不判 OOD，已记进 eval.json）", file=sys.stderr, flush=True)
     out = os.path.abspath(args.out)
     if os.path.isdir(out) and os.listdir(out):
         p.error(f"--out {out} 非空；请用新目录")
@@ -1453,14 +1527,16 @@ def main():
     try:
         try:
             scan_episodes(seed_list, args.episodes,
-                          lambda seed, seen: run_episode(seed, args, workdir, seen), state=state)
+                          lambda seed, seen: run_episode(seed, args, workdir, seen), state=state,
+                          fail_on_stall=args.action_latency is not None, hold=args.hold)
         except BaseException as e:  # noqa: BLE001 - 见上
             interrupted = interruption(e, state)
             print(f"中断：{interrupted['reason']}（seed {interrupted['seed']}）；"
                   f"写出部分结果 eval.json partial=true", file=sys.stderr, flush=True)
         finally:
             cp.cleanup_all()
-        rc = write_report(args, out, state, interrupted, protocol, mismatches, ood, text_dim, infer_bin, started)
+        rc = write_report(args, out, state, interrupted, protocol, mismatches, ood, text_dim, infer_bin, started,
+                          notes=notes)
     finally:
         if args.keep_work:
             print(f"原始文件保留在 {workdir}")
@@ -1494,7 +1570,7 @@ def cf_sitl_params_record(path):
     return {"path": path, "sha256": p.sha256, "values_sha256": p.values_sha256}
 
 
-def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_dim, infer_bin, started):
+def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_dim, infer_bin, started, notes=()):
     """汇总 + 写 <out>/eval.json + 打印；返回进程退出码（中断时是 143/130/1）。"""
     results, failures, skips = state["results"], state["failures"], state["skips"]
     scanned_seeds, attempted_seeds = state["scanned"], state["attempted"]
@@ -1553,6 +1629,7 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
               "protocol_mismatches": [{"key": k, "protocol": v, "actual": g}
                                       for k, v, g in mismatches],
               "ood": ood,
+              **({"protocol_notes": list(notes)} if notes else {}),
               "strict_protocol": args.strict_protocol,
               "goal_margin": args.goal_margin,
               "corridor_half_width": args.corridor_half_width,
@@ -1569,7 +1646,11 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
                   "late_dispatch_episodes": [
                       {k: f.get(k) for k in ("seed", "late_dispatch_steps", "late_step_ids",
                                              "dispatch_lag_s_median", "dispatch_lag_s_max")}
-                      for f in failures if f.get("late_dispatch_steps")]}
+                      for f in failures if f.get("late_dispatch_steps")],
+                  # W1-13 A3：含停顿步的集同样不进 per_episode，单列在 stall_episodes（只在给了开关时写键）。
+                  "stall_episodes": [
+                      {k: f.get(k) for k in ("seed", "stall_steps", "stall_step_ids", "obs_gap_s_max", "safe_gap_s_max")}
+                      for f in failures if f.get("stall_steps")]}
                  if args.action_latency is not None else {}),
               **({"rtf": args.rtf} if args.rtf is not None else {}),
               # W1-10：参数副本。只在给了 --cf-sitl-params 时写键（默认 eval.json 逐位不变）：路径与两个 sha 随结果留证；
@@ -1644,6 +1725,8 @@ def write_report(args, out, state, interrupted, protocol, mismatches, ood, text_
     if args.corridor_half_width is not None:
         print(f"corridor: half_width={args.corridor_half_width:g}m "
               f"violations={agg['corridor_violations']}/{agg['episodes_done']}")
+    if notes:
+        print(f"protocol_notes: {', '.join(notes)}")
     print(f"action distribution: {agg['action_distribution']}")
     print(f"-> {path}" + ("  （partial=true：中断写出的部分结果）" if interrupted else ""))
     if interrupted:

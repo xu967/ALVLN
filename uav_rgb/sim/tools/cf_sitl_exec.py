@@ -74,6 +74,13 @@ IDX_SIM_T, IDX_LATE, IDX_ERRORS = 32, 33, 34
 IDX_STICKS = 35          # [35..38] roll pitch yaw throttle（cf_sitl.h 2026-11-06 追加）
 IDX_LIB_VERSION = 39     # CF_SITL_LIB_VERSION（cf_sitl.h 2026-11-09 追加）；start() 读到首帧后填进 params.lib_version
 STATE_FIELDS = 40
+# W1-13 A5：state 订阅的环形缓冲帧数。state 是 200 Hz（插件每 5 步发一帧），缓冲 600 帧 = 3 仿真秒，远大于一步窗口（hold 1 s = 200 帧）：
+# 主线程每 20 ms 墙钟才轮询一次、负载高时更慢，窗口走完后回扫缓冲才找得到「截止第一次变成本步截止」的那一帧（ack_sim_t）。
+# 旧值 4（约 20 ms）只够读最新一帧；latest() 的语义与缓冲大小无关。
+STATE_BUF = 600
+# 重建出的截止与本步发出的截止相差不到这么多就算同一条动作：固件里截止是 float32（相对 SITL 零点，< 128 s 时舍入 < 8e-6 s），
+# 而相邻两步的截止至少差一个步周期的量级（> 0.5 s）。
+ACK_UNTIL_TOL_S = 1e-3
 EXEC_STATES = {0: "DISARMED", 1: "TAKEOFF", 2: "READY", 3: "ACTING", 4: "FAILSAFE"}
 EXEC_DISARMED, EXEC_TAKEOFF, EXEC_READY, EXEC_ACTING, EXEC_FAILSAFE = range(5)
 
@@ -449,7 +456,7 @@ class CfSitlExecutor:
 
     def start(self, abort_check=None):
         """等 state → reset → arm_takeoff → READY。失败抛 RuntimeError（已尽量停桨）。"""
-        self._sub = gz_io.TopicSub(STATE_TOPIC, buf=4, stamp_fn=state_stamp_ns)
+        self._sub = gz_io.TopicSub(STATE_TOPIC, buf=STATE_BUF, stamp_fn=state_stamp_ns)
         try:
             try:
                 st = self._wait_state(lambda st: True, STATE_WAIT_S, "等 cf_sitl state 首帧")
@@ -497,6 +504,26 @@ class CfSitlExecutor:
         self._pub.action(action, until)
         self._last_until = until
         self.dispatched += 1
+
+    def ack_sim_t(self):
+        """最近一次 dispatch 的动作在插件侧生效的仿真秒（W1-13 A5）；确认不到返回 None。
+
+        在 state 缓冲里（旧 -> 新）找第一帧：用该帧自己的 [32] gz 仿真秒减 [0] SITL 秒得到零点 base，[5] 截止（SITL 秒）加 base
+        得到仿真秒的截止，与本步发出的截止相差不到 ACK_UNTIL_TOL_S。返回这一帧的 [32]。插件在 PreUpdate 里先 DrainActions
+        再发 state，所以这一帧的仿真秒就是插件拿到动作的那个物理步（state 每 5 步发一帧，分辨率 5 ms）。
+        只认截止、不认动作字段：连着两步都是 FORWARD 时动作字段不变；到达时已过截止的动作固件立即视为过期（state[4] 为 -1），
+        截止字段却已更新。截止不会重复（相邻两步差一个步周期）。缓冲里没有这样的帧（动作还没到插件、帧被淘汰、订阅停了）返回 None。
+        """
+        if self._sub is None or self._last_until is None:
+            return None
+        for _, msg in self._sub.frames():
+            data = msg.get("data") if isinstance(msg, dict) else None
+            if not isinstance(data, list) or len(data) < STATE_FIELDS:
+                continue
+            until_sim = data[IDX_UNTIL] + (data[IDX_SIM_T] - data[IDX_T])
+            if abs(until_sim - self._last_until) <= ACK_UNTIL_TOL_S:
+                return float(data[IDX_SIM_T])
+        return None
 
     def set_action(self, action):
         now = self.sim_time_s()

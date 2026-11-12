@@ -266,7 +266,7 @@ class ActionLatencyMain(unittest.TestCase):
     def test_flag_records_manifest_keys_and_row_flags(self):
         man, acts, code, _ = tc.run_main(["--action-latency", "0.16"], late_rows([False, True, False, True]))
         self.assertIsNone(code)
-        self.assertEqual(set(man), MANIFEST_KEYS_TEACHER | {"action_latency_s", "late_dispatch_steps"})
+        self.assertEqual(set(man), MANIFEST_KEYS_TEACHER | {"action_latency_s", "late_dispatch_steps", "stall_steps"})   # W1-13 A3：多 stall_steps
         self.assertEqual(man["action_latency_s"], 0.16)
         self.assertEqual(man["late_dispatch_steps"], 2)
         self.assertEqual([a["late_dispatch"] for a in acts], [False, True, False, True])
@@ -484,6 +484,80 @@ class EvalPassThrough(unittest.TestCase):
                                      expect_exit=True)
         self.assertEqual(code, 2)
         self.assertIn("--action-latency 必须小于 --hold", cmds["stderr"])
+
+
+class ProtocolNotesForLegacyTrainingData(unittest.TestCase):
+    """W1-13 A2：训练数据的协议快照（--protocol 或学生数据集 meta）没有 action_latency_s 而本次给了 L 时，
+    eval.json 记 protocol_notes，不判 OOD、不拦 --strict-protocol；没有偏移时不写该键（逐位不变）。"""
+
+    @staticmethod
+    def _write_uavr(path, meta_dict):
+        import nav_cond
+        raw = json.dumps(meta_dict).encode("utf-8")
+        head = nav_cond._UAVR_HEAD.pack(
+            b"UAVR", 1, nav_cond._UAVR_HEAD.size, 0, 120, 160, 3, 1, 0, 0,
+            nav_cond._UAVR_HEAD.size, nav_cond._UAVR_HEAD.size, nav_cond._UAVR_HEAD.size, len(raw))
+        Path(path).write_bytes(head + raw)
+
+    def test_pure_function_protocol_notes(self):
+        self.assertEqual(ec.protocol_notes({"hold_s": 1.0}, {"hold_s": 1.0, "action_latency_s": 0.2}),
+                         ["train_protocol_without_action_latency"])
+        self.assertEqual(ec.protocol_notes({"hold_s": 1.0}, {"hold_s": 1.0, "action_latency_s": None}), [])
+        self.assertEqual(ec.protocol_notes({"hold_s": 1.0, "action_latency_s": 0.2},
+                                           {"hold_s": 1.0, "action_latency_s": 0.2}), [])
+        self.assertEqual(ec.protocol_notes(None, {"action_latency_s": 0.2}), [])
+
+    def test_explicit_legacy_protocol_with_latency_records_note_and_is_not_ood(self):
+        with tempfile.TemporaryDirectory() as d:
+            proto = Path(d) / "protocol.json"
+            proto.write_text(json.dumps({"window_from": "observation", "hold_s": 1.0, "steps": 1, "task": "campus"}))
+            report, _ = EvalHarness.run(
+                ["--protocol", str(proto), "--strict-protocol", "--action-latency", "0.2"],
+                eval_rows([0.2]), {"action_latency_s": 0.2, "late_dispatch_steps": 0})
+            self.assertFalse(report["ood"])
+            self.assertEqual(report["protocol_mismatches"], [])
+            self.assertEqual(report["protocol_notes"], ["train_protocol_without_action_latency"])
+
+            # 同样的旧快照，本次不给 --action-latency：不写 protocol_notes 键
+            report_no_l, _ = EvalHarness.run(["--protocol", str(proto)], eval_rows([0.13], flagged=False))
+            self.assertNotIn("protocol_notes", report_no_l)
+
+    def test_student_ckpt_linked_to_legacy_uavr_records_note_without_explicit_protocol(self):
+        class _Probe:
+            text_dim = 0
+            prev_dim = 0
+            def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as d:
+            ckpt = Path(d) / "ckpt.bin"
+            infer = Path(d) / "infer_bin"
+            uavr = Path(d) / "dataset.uavr"
+            ckpt.write_bytes(b"ckpt")
+            infer.write_bytes(b"bin")
+            self._write_uavr(uavr, {"window_from": "observation", "hold_s": 1.0})
+            (Path(d) / "config.json").write_text(json.dumps({
+                "data": str(uavr), "dataset_sha256": ec.sha256_file(str(uavr)),
+            }))
+            with patch("student.StudentPolicy", return_value=_Probe()):
+                rep, _ = EvalHarness.run(
+                    ["--policy", "student", "--ckpt", str(ckpt), "--infer-bin", str(infer),
+                     "--action-latency", "0.2"],
+                    eval_rows([0.2]), {"action_latency_s": 0.2, "late_dispatch_steps": 0})
+            self.assertFalse(rep["ood"])
+            self.assertEqual(rep["protocol_notes"], ["train_protocol_without_action_latency"])
+
+            # 训练数据已有相同 action_latency_s 时不写 protocol_notes
+            self._write_uavr(uavr, {"window_from": "observation", "hold_s": 1.0, "action_latency_s": 0.2})
+            (Path(d) / "config.json").write_text(json.dumps({
+                "data": str(uavr), "dataset_sha256": ec.sha256_file(str(uavr)),
+            }))
+            with patch("student.StudentPolicy", return_value=_Probe()):
+                rep_same, _ = EvalHarness.run(
+                    ["--policy", "student", "--ckpt", str(ckpt), "--infer-bin", str(infer),
+                     "--action-latency", "0.2"],
+                    eval_rows([0.2]), {"action_latency_s": 0.2, "late_dispatch_steps": 0})
+            self.assertNotIn("protocol_notes", rep_same)
 
 
 if __name__ == "__main__":

@@ -40,6 +40,9 @@ RGB 仍然是**动作前**的观测（M1：rgb_ts < action_start_ts），动作�
                          pose_rgb_gap_ns/rgb_ts/action_start_ns/pose_before/yaw_before
                          + depth_file（仅 --save-depth）
                          + probs（仅 --policy student：学生四类概率，下标 = 动作编号，保留 4 位小数；零样本基线是 one-hot）
+                         + safe_gap_s（每步都有，首步 null：本步派发戳减上一步执行器截止，秒，下一动作先到时为负；W1-13 A1）
+                         + obs_gap_s（每步都有，首步 null：本观测戳减上一观测戳，秒；超过 0.9 + 0.2 s 的步是停顿步；W1-13 A3）
+                         + plugin_ack_sim_t（仅 cf_sitl：插件侧第一次看到本步截止的 gz 仿真秒，没确认到为 null；W1-13 A5）
   oracle.jsonl           每步 step/timestamp_ns(动作后 pose)/pose_gt + 动作起止 sim-time
   rgb_%05d.png           320x240 原图（降采样到 160x120 由 tools/preprocess.py 负责）
   depth/depth_%05d.png   --save-depth 时：16 位灰度 PNG，单位毫米（0=无回波）
@@ -124,6 +127,26 @@ MIN_WINDOW_RTF = 0.05 # 动作窗口的墙钟兜底：仿真时间走不动时�
 # --action-latency L：动作就绪时仿真戳已超过「观测戳 + L」这么多纳秒（0.02 s）就记迟到。
 # 迟到步的派发时刻不再是观测戳 + L，该集的动作生效时长不可比，评测把含迟到步的集当基础设施失败。
 LATE_DISPATCH_TOL_NS = 20_000_000
+# W1-13 A3：停顿步。相邻两步的观测戳（RGB 戳）间隔名义上就是步周期：相机 10 Hz、hold 1.0 s、L 0.2 s 时
+# frame_dt 恒为 0.9 s（round-2 学习者臂 4,972/4,972 个相邻步对实测）。间隔超过 名义 + 0.2 s 说明这一步前主循环/相机停顿过，
+# 执行器在这段时间里回 SAFE 刹停，动作生效时长与别的步不可比。阈值等价于审核 A 的「SAFE 空档 > 0.3 s」（L=0.2、hold=1.0 时
+# safe_gap = obs_gap − 0.8）。只用观测戳判，不依赖 L，所以不给 --action-latency 也能记。
+CAMERA_PERIOD_S = 0.1
+NOMINAL_STEP_PERIOD_S = 0.9
+STALL_MARGIN_S = 0.2
+STALL_TOL_S = 1e-6    # 浮点容差：恰好 名义 + 0.2 s 不算停顿
+
+
+def nominal_step_period_s(hold=None):
+    """给定动作窗口 hold（秒；None 按默认 1.0 s），相机 10 Hz 下的名义相邻观测间隔（hold − 0.1 s）。"""
+    if hold is None:
+        return NOMINAL_STEP_PERIOD_S
+    return max(CAMERA_PERIOD_S, round(float(hold) - CAMERA_PERIOD_S, 9))
+
+
+def is_stall_gap(obs_gap_s, hold=None):
+    """obs_gap_s（秒，可为 None）严格大于 名义步周期 + 余量（加 1e-6 s 容差）即停顿；None 不是停顿。"""
+    return obs_gap_s is not None and obs_gap_s > nominal_step_period_s(hold) + STALL_MARGIN_S + STALL_TOL_S
 
 # 动作 -> 速度指令。forward=+X，left=+Y，up=+Z；yaw 正 z = 左转（右手定则）。
 # vz 是**高度保持**分量（见 altitude_vz）：速度控制器只吃速度指令，z:0 是「零垂直速度」
@@ -827,7 +850,8 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
                 predictive_teacher=None, rl_teacher=None, sil=None,
                 tiebreak="legacy", beta=0.0, rng=None, prev_executed=None,
                 costmap_opts=None, heading_guard=0, net_yaw=0, rule_hfov_deg=60.0, last_turn=None,
-                rule_version="v0", rule_mem=None, action_latency_s=None, student_cond="prev-action"):
+                rule_version="v0", rule_mem=None, action_latency_s=None, student_cond="prev-action",
+                prev_until_ns=None):
     """采一步。成功返回 (row, None)，I/O 失败返回 (None, 原因)。
 
     dyn=None 为 x3_velocity 旧行为（定速 + 窗口末刹停）；给 CfStab 时按摇杆模型
@@ -852,6 +876,13 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     None = 旧行为：派发在最新位姿戳，不等、不记迟到、标签位置不变；row["dispatch_lag_s"]（派发戳减观测戳，秒）两种情况都记。
     student_cond（--student-cond，W1-9）：只在 policy == "student" 时起作用。"prev-action"=现状，传给学生的是 prev_executed；
     "heading-code"=传 nav_cond.heading_code(net_yaw)（net_yaw 由主循环按已执行动作维护，首帧 0 → 码 0），该步多记 cond_code。
+    prev_until_ns（W1-13 A1）：上一步的执行器截止（ns，仿真戳；主循环把上一步 row["until_ns"] 带进来，首步 None）。
+    row["safe_gap_s"] = 本步派发戳（exec_ts）减它，秒；首步 None；下一动作先于截止到达时为负。cf_sitl 执行器在截止后回 SAFE
+    （速度参考 0 加位置保持，主动刹停），所以它就是步间刹停的时长。row["until_ns"] = 本步的执行器截止，只给主循环带给下一步，不落盘。
+    row["obs_gap_s"]（W1-13 A3）= 本观测戳（RGB 戳）减 prev_rgb_ts，秒；prev_rgb_ts 为 0（首步）时 None；超过 名义步周期 + 余量
+    的步是停顿步（is_stall_gap）。与 W1-3 评测侧的 max_frame_gap_s 同一口径，这里逐步落盘。
+    row["plugin_ack_sim_t"]（W1-13 A5）= sil.ack_sim_t()：插件侧第一次看到本步截止的仿真秒，窗口走完后读；只有 sil 有 ack_sim_t
+    （cf_sitl）才写这个键，确认不到为 None。只记录，不参与迟到判据。
     """
     if window_from not in ("dispatch", "observation"):
         raise ValueError(f"window_from 无效: {window_from!r}")
@@ -881,6 +912,8 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     rgb_ts = stamp_ns(rgb_msg)
     if rgb_ts <= 0:
         return None, "RGB 帧缺少 header.stamp"
+    # W1-13 A3：相邻观测戳间隔（秒）；首步没有上一戳（prev_rgb_ts == 0）记 None。
+    obs_gap_s = (rgb_ts - prev_rgb_ts) / 1e9 if prev_rgb_ts else None
 
     if not subs["depth"].healthy():
         return None, "depth 订阅进程已退出"
@@ -1059,6 +1092,8 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         pose_exec = pose_before
     if yaw_exec is None:
         yaw_exec = yaw_before
+    # W1-13 A1：上一步截止到本步派发的仿真秒（SAFE 空档）；首步 None，下一动作先到则为负。
+    safe_gap_s = None if prev_until_ns is None else (exec_ts - prev_until_ns) / 1e9
 
     # contact 是稀疏触发话题（无接触时 0 msg/s），不能把「长时间无消息」当停更；
     # 这里只拒绝订阅进程退出。话题静默/插件不发布的检测需要额外心跳，见 D4 记录。
@@ -1260,6 +1295,10 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
         # 派发时的仿真戳减观测戳（秒）：每步都记，不依赖 --action-latency；late_dispatch 只有给了它才非 None。
         "dispatch_lag_s": (exec_ts - pose_before_ts) / 1e9,
         "late_dispatch": late_dispatch,
+        # W1-13 A1：safe_gap_s 落盘（action_row）；until_ns 只在行里，主循环带给下一步算 safe_gap_s。
+        "safe_gap_s": safe_gap_s,
+        "obs_gap_s": obs_gap_s,     # W1-13 A3：本观测戳减上一观测戳（秒），首步 None
+        "until_ns": hold_end_ns,    # 执行器截止：动作窗口起点 + hold
         "cond_code": cond_code,      # None 时 action_row 不落盘（默认的字段集与旧版完全一致）
         "action_end_ns": pose_ts,
         "displacement_m": dist,
@@ -1280,6 +1319,10 @@ def collect_one(out_dir, step_idx, hold, policy, subs, publisher,
     }
     if probs is not None:     # 只有学生策略才有 probs 键；其它策略的行逐键不变
         row["probs"] = probs
+    # W1-13 A5：插件侧实际生效的仿真秒（执行器从 state 缓冲里回扫截止第一次变成本步截止的那一帧）。窗口走完才读，帧一定已在缓冲里。
+    # 只有执行器给得出（cf_sitl 的 ack_sim_t）才有这个键，没确认到帧时为 None；x3_velocity / cf_stab / 假执行器的行逐键不变。
+    if sil is not None and hasattr(sil, "ack_sim_t"):
+        row["plugin_ack_sim_t"] = sil.ack_sim_t()
     return row, None
 
 
@@ -1344,6 +1387,15 @@ def action_row(r, save_depth=False):
               "probs"):
         if r.get(k) is not None:
             row[k] = r[k]
+    # W1-13 A1：safe_gap_s（本步派发戳减上一步执行器截止，秒）；A3：obs_gap_s（本观测戳减上一观测戳，秒）。真 collect_one 的行每步都有
+    # 这两个键（首步值为 None，落盘 null）；行里没有这个键（旧代码构造的行、合成行）就不写，旧字段集逐键不变。
+    # 排在 W1-0 的两个键之前，旧键的行内顺序不变。
+    for k in ("safe_gap_s", "obs_gap_s"):
+        if k in r:
+            row[k] = r[k]
+    # W1-13 A5：plugin_ack_sim_t（插件侧实际生效的仿真秒）只有 cf_sitl 的行才有这个键；确认不到时为 null。
+    if "plugin_ack_sim_t" in r:
+        row["plugin_ack_sim_t"] = r["plugin_ack_sim_t"]
     # W1-0：dispatch_lag_s（派发的仿真戳减观测戳，秒）每步都记，排在最后（旧键的行内顺序不变）；
     # late_dispatch（bool）只有给了 --action-latency 才有。
     for k in ("dispatch_lag_s", "late_dispatch"):
@@ -1727,8 +1779,10 @@ def main():
     last_turn = None           # 最近一次执行的转向方向 YAW_LEFT / YAW_RIGHT（rule-oracle 平局时沿用）
     rule_mem = []              # rule-oracle v1 的短期障碍记忆 [(世界 X, 世界 Y, 产生步号)]；每集（每次进程）从空开始
     prev_rgb_ts = 0
+    prev_until_ns = None       # W1-13 A1：上一步的执行器截止，collect_one 用它算 safe_gap_s（首步 None）
     timings = []
     late_dispatch_steps = 0    # --action-latency：动作就绪时已超过 观测戳 + L + 0.02 s 的步数
+    stall_steps = 0            # W1-13 A3：停顿步数（相邻观测间隔 > 名义步周期 + 0.2 s）；默认只在行里记，manifest 只在 --action-latency 下写
     # DAgger（--policy student）：β 混合的随机源按 seed 固定，同 seed 可复现哪些步换成了教师执行。
     dagger = None
     if args.policy == "student" and pillars:
@@ -1846,7 +1900,8 @@ def main():
                                     rule_hfov_deg=args.rule_hfov_deg, last_turn=last_turn,
                                     rule_version=args.rule_version, rule_mem=rule_mem,
                                     action_latency_s=args.action_latency,
-                                    student_cond=args.student_cond)
+                                    student_cond=args.student_cond,
+                                    prev_until_ns=prev_until_ns)
             if r is None:
                 error = f"step {i}: {reason}"
                 print(error + "，终止", file=sys.stderr)
@@ -1861,6 +1916,7 @@ def main():
             # 只推进到本步已检查的序号，步间漂移产生的事件归下一步。
             contact_seq0 = r["contact_seq_end"]
             prev_rgb_ts = r["rgb_ts"]
+            prev_until_ns = r.get("until_ns")
             gap_ns = r["rgb_ts"] - r["depth_ts"] if r["depth_ts"] else None
             # 配对残差用**观测帧**位姿（pose_before_ts），action_start_ns 是派发时刻。
             pose_gap_ns = r["pose_before_ts"] - r["rgb_ts"]
@@ -1879,6 +1935,7 @@ def main():
             oracle_f.flush()
             rows_written += 1
             late_dispatch_steps += bool(r.get("late_dispatch"))
+            stall_steps += is_stall_gap(r.get("obs_gap_s"), args.hold)
             timings.append(r["timing"] | {"depth_gap_ns": gap_ns,
                                           "pose_gap_ns": pose_gap_ns,
                                           "rgb_before_start": r["rgb_ts"] < r["action_start_ns"]})
@@ -2045,7 +2102,9 @@ def main():
             "window_from": args.window_from,
             # W1-0：只在给了 --action-latency 时写键（默认 manifest 逐位不变）。preprocess 把 action_latency_s 当口径键，
             # 与旧数据、与不同 L 的数据都不能混包；late_dispatch_steps > 0 的集在评测里算基础设施失败。
-            **({"action_latency_s": args.action_latency, "late_dispatch_steps": late_dispatch_steps}
+            # W1-13 A3：stall_steps 同样只在 --action-latency 下写（含停顿步的集在评测里与含迟到步的集同样算基础设施失败）。
+            **({"action_latency_s": args.action_latency, "late_dispatch_steps": late_dispatch_steps,
+                "stall_steps": stall_steps}
                if args.action_latency is not None else {}),
             "task_version": task_version,
             "instruction": instruction_text,

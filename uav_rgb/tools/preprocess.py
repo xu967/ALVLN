@@ -138,6 +138,17 @@ def diag_split(gid, salt):
 FAILED_TEACHER_GOAL_MARGIN_M = 1.0
 # load_episode 的返回哨兵：教师没过线而整集跳过。与碰撞整集丢弃的 None 区分，scan 分开计数、meta 分开记。
 SKIP_FAILED_TEACHER = "failed_teacher"
+# --drop-late-and-stall（W1-13 A2/A3）：停顿判据与 sim/tools/collect.py 的 is_stall_gap 同源（test_preprocess_timing_filter 锁相等）。
+CAMERA_PERIOD_S = 0.1
+NOMINAL_STEP_PERIOD_S = 0.9
+STALL_MARGIN_S = 0.2
+STALL_TOL_S = 1e-6
+
+
+def is_stall_obs_gap(obs_gap_s, hold=None):
+    """相邻观测间隔 obs_gap_s（秒）是否超过 名义步周期（hold − 0.1 s，默认 0.9 s）+ 0.2 s 余量。"""
+    nom = NOMINAL_STEP_PERIOD_S if hold is None else max(CAMERA_PERIOD_S, round(float(hold) - CAMERA_PERIOD_S, 9))
+    return obs_gap_s is not None and obs_gap_s > nom + STALL_MARGIN_S + STALL_TOL_S
 
 
 def teacher_crossed_goal(ep_dir, man, executed_by):
@@ -174,7 +185,7 @@ def teacher_crossed_goal(ep_dir, man, executed_by):
 
 def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
                  split_salt=None, allow_frozen=False, allow_diagnostic=False,
-                 exclude_failed_teacher=False, stats=None):
+                 exclude_failed_teacher=False, stats=None, drop_late_and_stall=False):
     """读 manifest + actions.jsonl，只建立样本索引，不碰像素（内存友好）。
 
     exclude_collision_episodes=True 时，只要该集有 collision=true 就返回 None
@@ -350,6 +361,28 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
         if drop_collision and collision:
             dropped += 1
             continue
+        if drop_late_and_stall:
+            late = row.get("late_dispatch")
+            if late is not None and not isinstance(late, bool):
+                die("%s step %d: late_dispatch 必须是 true/false/null（实际 %r）"
+                    % (actions_path, step, late))
+            obs_gap = row.get("obs_gap_s")
+            if obs_gap is not None:
+                if isinstance(obs_gap, bool) or not isinstance(obs_gap, (int, float)) or not math.isfinite(obs_gap):
+                    die("%s step %d: obs_gap_s 必须是有限数值或 null（实际 %r）"
+                        % (actions_path, step, obs_gap))
+            elif "obs_gap_s" not in row and prev_row is not None:
+                cur_ts, prev_ts = row.get("rgb_ts"), prev_row.get("rgb_ts")
+                if isinstance(cur_ts, int) and isinstance(prev_ts, int) and cur_ts > 0 and prev_ts > 0:
+                    obs_gap = (cur_ts - prev_ts) / 1e9
+            is_late = late is True
+            is_stall = is_stall_obs_gap(obs_gap, hold=man.get("hold_s"))
+            if is_late or is_stall:
+                if stats is not None:
+                    stats["late_dropped"] = stats.get("late_dropped", 0) + int(is_late)
+                    stats["stall_dropped"] = stats.get("stall_dropped", 0) + int(is_stall)
+                    stats["timing_dropped"] = stats.get("timing_dropped", 0) + 1
+                continue
         png = os.path.join(ep_dir, "rgb_%05d.png" % step)
         if not os.path.isfile(png):
             die("缺帧：%s（actions.jsonl 与 rgb_*.png 不同步）" % png)
@@ -446,7 +479,8 @@ def _check_uniform_keys(episodes, allow_mixed=False, allow_mixed_dynamics=False)
 
 def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
          split_salt=None, allow_frozen=False, allow_diagnostic=False, allow_mixed=False,
-         allow_mixed_dynamics=False, exclude_failed_teacher=False, skip_stats=None):
+         allow_mixed_dynamics=False, exclude_failed_teacher=False, skip_stats=None,
+         drop_late_and_stall=False):
     """加载全部 episode 索引，并检查 scene_id 的 split 唯一性。
 
     返回值的 skipped 只数碰撞整集丢弃（--exclude-collision-episodes，含义不变）；--exclude-failed-teacher 的跳过数
@@ -464,7 +498,8 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
             die("重复的 episode 目录：%s（同一集只能打包一次）" % real)
         seen_dirs.add(real)
         ep = load_episode(d, drop_collision, exclude_collision_episodes, split_salt,
-                          allow_frozen, allow_diagnostic, exclude_failed_teacher, skip_stats)
+                          allow_frozen, allow_diagnostic, exclude_failed_teacher, skip_stats,
+                          drop_late_and_stall=drop_late_and_stall)
         if ep == SKIP_FAILED_TEACHER:
             failed_teacher += 1
             continue
@@ -964,7 +999,8 @@ def aux_payload(episodes, size, envelope_radius_m, cond=nav_cond.COND_PREV_ACTIO
         by_step = {s["step"]: ep["sample_start"] + i for i, s in enumerate(ep["samples"])}
         for i, s in enumerate(ep["samples"]):
             g = ep["sample_start"] + i
-            # 上一步被 --drop-collision 丢掉时 step-1 不在 by_step：同首帧处理（指向自身）。
+            # 上一步被 --drop-collision 或 --drop-late-and-stall 丢掉时 step-1 不在 by_step：同首帧处理（指向自身）。
+            # shortcut: 被丢步之后的下一步若用双帧加 prev-action，prev_index 指向自身而 prev_action 非 SAFE（审核 C7），待双帧线升级时按需保留被丢帧供索引。
             prev_index[g] = by_step.get(s["step"] - 1, g)
             prev_action[g] = s["heading_code"] if cond == nav_cond.COND_HEADING_CODE else s["prev_action"]
     if depth_source == "analytic":
@@ -1208,6 +1244,9 @@ def main():
                    help="输出分辨率；160x120 保持 4:3，128x128 会压扁画面（对照实验）")
     p.add_argument("--drop-collision", action="store_true",
                    help="跳过 collision=true 的步（专家撞墙后的标签本身是错的）")
+    p.add_argument("--drop-late-and-stall", action="store_true",
+                   help="跳过迟到步（late_dispatch=true）与停顿步（obs_gap_s 超过 名义步周期 + 0.2 s；旧行缺 obs_gap_s 时按相邻 rgb_ts 算）；"
+                        "默认关（输出逐字节不变），打开时 meta.collision_filter 记 drop_late_and_stall 与丢弃计数（W1-13 A2/A3）")
     p.add_argument("--exclude-collision-episodes", action="store_true",
                    help="整集丢弃含 collision 步的 episode（T2 硬约束）")
     p.add_argument("--exclude-failed-teacher", action="store_true",
@@ -1253,7 +1292,8 @@ def main():
         args.episodes, args.drop_collision, args.exclude_collision_episodes,
         args.split_by_map, args.allow_frozen_geometry, args.allow_diagnostic_split,
         args.allow_mixed_geometry, args.allow_mixed_dynamics,
-        args.exclude_failed_teacher, skip_stats)
+        args.exclude_failed_teacher, skip_stats,
+        drop_late_and_stall=args.drop_late_and_stall)
     if args.cond == nav_cond.COND_HEADING_CODE:
         with_waypoint = [ep["dir"] for ep in episodes if ep.get("waypoint") is not None]
         if with_waypoint:
@@ -1271,6 +1311,14 @@ def main():
             "exclude_failed_teacher": True,
             "failed_teacher_skipped": skip_stats.get("failed_teacher", 0),
             "failed_teacher_goal_margin_m": FAILED_TEACHER_GOAL_MARGIN_M,
+        })
+    if args.drop_late_and_stall:
+        # 只在开关打开时加键：默认关的数据集 meta 逐字节不变。键名不含 "episodes"/split_（C++ 读端按子串定位）。
+        collision_filter.update({
+            "drop_late_and_stall": True,
+            "late_dropped": skip_stats.get("late_dropped", 0),
+            "stall_dropped": skip_stats.get("stall_dropped", 0),
+            "timing_dropped": skip_stats.get("timing_dropped", 0),
         })
     # 先校验侧车内容，再替换 dataset.uavr；有指令时先删旧侧车。
     # 这样侧车写失败时结果是「新数据集、没有侧车」（文本模型会显式报错），
@@ -1355,6 +1403,11 @@ def main():
     seen = total + dropped
     print("collision: dropped %d of %d steps (%.1f%%), kept %d"
           % (dropped, seen, 100.0 * dropped / seen if seen else 0.0, total))
+    if args.drop_late_and_stall:
+        print("timing: dropped %d steps (late=%d, stall=%d)"
+              % (skip_stats.get("timing_dropped", 0),
+                 skip_stats.get("late_dropped", 0),
+                 skip_stats.get("stall_dropped", 0)))
     for ep in episodes:
         print("  episode_id=%s scene_id=%s split=%s steps=%d sample_start=%d"
               % (ep["episode_id"], ep["scene_id"], ep["split"],

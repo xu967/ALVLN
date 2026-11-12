@@ -440,6 +440,9 @@ def collect_command(task, args):
         cmd.append("--save-depth")
     if getattr(args, "vehicle", None) and args.vehicle != "x3":
         cmd += ["--vehicle", args.vehicle]   # x3 不传：旧命令行逐字不变
+    action_latency = getattr(args, "action_latency", None)
+    if action_latency is not None:
+        cmd += ["--action-latency", f"{action_latency:g}"]   # W1-13 A2：没给不传，旧命令行逐字不变
     return cmd
 
 
@@ -663,6 +666,11 @@ def main():
     p.add_argument("--tiebreak", choices=("legacy", "visible"), default="legacy",
                    help="透传给 collect.py：A* 教师左右近平局的决定方式（visible=按学生视锥内最近柱定；"
                         "DISTILL §3.3）；legacy 逐位不变")
+    p.add_argument("--action-latency", type=float, default=None, metavar="L",
+                   help="透传给 collect.py（W1-13 A2）：把动作派发时刻固定到 观测戳 + L 秒，默认关（旧命令行逐字不变）；"
+                        "只能配 --window-from observation，且 0 < L < --hold")
+    p.add_argument("--rtf", type=float, default=None,
+                   help="透传给 scene_gen（W1-13 A2）：世界物理的目标实时因子（只能压低，缺省用模板值 1.0，不传）")
     p.add_argument("--save-depth", action="store_true",
                    help="透传给 collect.py：每步另存 depth/depth_%%05d.png（16 位 PNG，毫米）")
     p.add_argument("--template", default=None,
@@ -684,6 +692,15 @@ def main():
     # NaN <= 0 是 False，只判 <=0 会让 --hold nan 一路跑进 sleep 里挂死。
     if not (math.isfinite(args.hold) and args.hold > 0):
         p.error("--hold must be finite and > 0")
+    if args.action_latency is not None:
+        if not (math.isfinite(args.action_latency) and args.action_latency > 0):
+            p.error("--action-latency 必须是有限正数")
+        if args.action_latency >= args.hold:
+            p.error(f"--action-latency 必须小于 --hold（L={args.action_latency:g} hold={args.hold:g}）")
+        if args.window_from != "observation":
+            p.error("--action-latency 只能配 --window-from observation")
+    if args.rtf is not None and not (math.isfinite(args.rtf) and args.rtf > 0):
+        p.error("--rtf 必须是有限正数")
     if args.episode_timeout <= 0 or args.sim_timeout <= 0:
         p.error("timeouts must be > 0")
     # default 出生在 y=0，assign_landmarks 找不到跨轴同色柱对会直接抛错；
@@ -900,6 +917,8 @@ def main():
             **({"student_ckpt": os.path.abspath(args.student_ckpt), "beta": args.beta,
                 "dagger_round": args.dagger_round} if args.policy == "student" else {}),
             **({"student_cond": args.student_cond} if args.student_cond != nav_cond.COND_PREV_ACTION else {}),
+            **({"action_latency_s": args.action_latency} if args.action_latency is not None else {}),
+            **({"rtf": args.rtf} if args.rtf is not None else {}),
             "split": args.split,
             "seeds": args.seeds,
             "spawn_mode": args.spawn_mode,

@@ -641,7 +641,9 @@ ROW_KEYS_LEGACY = {"step", "timestamp_ns", "action_expert", "action_executed", "
                    "frame", "src", "rgb_ts", "depth_ts", "depth_rgb_gap_ns", "pose_ts", "pose_rgb_gap_ns",
                    "dyaw_deg", "displacement_m", "infer_ms", "action_start_ns", "pose_before", "yaw_before"}
 # W1-0：每步行多记 dispatch_lag_s（派发时的仿真戳减观测戳；不给 --action-latency 也记，只加键、排在最后）。
-ROW_KEYS_DEFAULT = ROW_KEYS_LEGACY | {"dispatch_lag_s"}
+# W1-13 A1：多记 safe_gap_s（本步派发戳减上一步执行器截止，秒；首步 null，可为负；不给 --action-latency 也记）。
+# W1-13 A3：多记 obs_gap_s（本观测戳减上一观测戳，秒；首步 null；不给 --action-latency 也记）。
+ROW_KEYS_DEFAULT = ROW_KEYS_LEGACY | {"dispatch_lag_s", "safe_gap_s", "obs_gap_s"}
 # 成功线 = 最远柱 4.97 + 1.0 = 5.97
 SCENE = {"pillars": [{"x": 1.0, "y": 0.3, "z": 1.5, "size": [0.4, 0.4, 3.0]},
                      {"x": 4.97, "y": -0.5, "z": 1.5, "size": [0.4, 0.4, 3.0]}]}
@@ -660,6 +662,8 @@ def fake_row(step, x, **over):
          "speed_after_mps": None, "infer_ms": None, "action_wall_s": 1.0, "src": None,
          "tie_margin_steps": None, "executed_by": None,
          "dispatch_lag_s": 0.129, "late_dispatch": None,   # 与真 collect_one 的返回一致：late_dispatch 只有 --action-latency 才非 None
+         "safe_gap_s": None, "until_ns": s * 10**9 + 10**7 + 10**9,   # 首步 None；until_ns = 动作窗口起点 + hold，主循环带给下一步
+         "obs_gap_s": None,   # 首步 None；其余 = 本观测戳减上一观测戳（秒）
          "timing": {"io": 0.01, "window": 1.0, "block": 1.0, "tail": 0.01, "total": 1.02,
                     "dispatch_sim_dt": 1.0}}
     r.update(over)

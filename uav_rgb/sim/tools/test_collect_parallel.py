@@ -85,6 +85,105 @@ class CommandTests(unittest.TestCase):
         cmd = parallel.collect_command(task(), args_ns(costmap_tol=0.0))   # astar 下不透传
         self.assertNotIn("--costmap-tol", cmd)
 
+    def test_action_latency_and_rtf_pass_through_and_default_invariance(self):
+        import contextlib
+        import io
+        import json
+        import os
+        import sys
+        from pathlib import Path
+
+        # 1) 默认 collect_command 与 scene_gen_extra 逐字不变
+        default_cmd = parallel.collect_command(task(), args_ns())
+        self.assertNotIn("--action-latency", default_cmd)
+        self.assertEqual(parallel.scene_gen_extra(args_ns()), [])
+        # 2) 给了才追加
+        cmd_lat = parallel.collect_command(task(), args_ns(action_latency=0.20))
+        self.assertEqual(cmd_lat[:-2], default_cmd)
+        self.assertEqual(cmd_lat[-2:], ["--action-latency", "0.2"])
+        self.assertEqual(parallel.scene_gen_extra(args_ns(rtf=0.5)), ["--rtf", "0.5"])
+
+        # 3) 完整 main() CLI 透传、manifest 记录与默认逐字不变
+        def run_main(extra_argv, expect_exit=False):
+            seen = {"scene_gen": [], "collect": []}
+            pillars = [{"x": 1.5, "y": 0.0, "z": 1.5, "size": [0.4, 0.4, 3.0]}]
+
+            def fake_run(cmd, **_kw):
+                if parallel.SCENE_GEN in cmd:
+                    seen["scene_gen"].append(list(cmd))
+                    w = Path(cmd[cmd.index("--out") + 1])
+                    w.write_text("<sdf/>")
+                    w.with_suffix(".json").write_text(json.dumps({"pillars": pillars, "pillar_count": 1}))
+                return Mock(returncode=0, stdout="", stderr="")
+
+            def fake_popen_collect(item, args_obj, _env, _log):
+                seen["collect"].append(parallel.collect_command(item, args_obj))
+                os.makedirs(item.staging, exist_ok=True)
+                Path(item.staging, "episode_manifest.json").write_text(json.dumps({
+                    "num_steps": args_obj.steps,
+                    "validity": {"episode_executed": True, "camera_verified": True, "physics_verified": True},
+                }))
+                proc, pump = Mock(), Mock()
+                proc.wait.return_value = 0
+                return proc, pump
+
+            err = io.StringIO()
+            with tempfile.TemporaryDirectory() as d:
+                out = os.path.join(d, "out")
+                argv = ["collect_parallel.py", "--instances", "1", "--episodes-per-instance", "1",
+                        "--seeds", "2", "--steps", "5", "--out", out] + extra_argv
+                with patch.object(sys, "argv", argv), \
+                     patch.object(parallel.subprocess, "run", side_effect=fake_run), \
+                     patch.object(parallel, "_start_sim", return_value=Mock(pid=99)), \
+                     patch.object(parallel, "wait_ready"), \
+                     patch.object(parallel, "_popen_collect", side_effect=fake_popen_collect), \
+                     patch.object(parallel, "stop_group"), \
+                     patch.object(parallel, "cleanup_all"), \
+                     patch.object(parallel, "_sweep_world_ruby", return_value=[]), \
+                     patch.object(parallel, "_ruby_pids", return_value=[]), \
+                     patch.object(parallel, "XDG_RUNTIME_DIR", os.path.join(d, "xdg")), \
+                     patch.object(parallel.time, "sleep"), \
+                     patch.object(parallel.signal, "signal"), \
+                     contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                    if expect_exit:
+                        with self.assertRaises(SystemExit) as cm:
+                            parallel.main()
+                        return cm.exception.code, err.getvalue(), seen, None
+                    rc = parallel.main()
+                man = json.loads(Path(out, "collection_manifest.json").read_text())
+                return rc, err.getvalue(), seen, man
+
+        rc0, _, seen0, man0 = run_main([])
+        self.assertEqual(rc0, 0)
+        self.assertNotIn("--rtf", seen0["scene_gen"][0])
+        self.assertNotIn("--action-latency", seen0["collect"][0])
+        self.assertNotIn("action_latency_s", man0)
+        self.assertNotIn("rtf", man0)
+
+        rc1, _, seen1, man1 = run_main(["--action-latency", "0.20", "--rtf", "0.5"])
+        self.assertEqual(rc1, 0)
+        self.assertEqual(seen1["scene_gen"][0][-2:], ["--rtf", "0.5"])
+        self.assertEqual(seen1["collect"][0][-2:], ["--action-latency", "0.2"])
+        self.assertEqual(man1["action_latency_s"], 0.2)
+        self.assertEqual(man1["rtf"], 0.5)
+        # 去掉末尾两个新参数后，两条子进程命令行与默认运行逐项一致（除临时目录路径外）
+        self.assertEqual([x for x in seen1["collect"][0][:-2] if not x.startswith("/")],
+                         [x for x in seen0["collect"][0] if not x.startswith("/")])
+
+        for bad_argv, msg in (
+            (["--action-latency", "0"], "--action-latency 必须"),
+            (["--action-latency", "-0.1"], "--action-latency 必须"),
+            (["--action-latency", "nan"], "--action-latency 必须"),
+            (["--action-latency", "1.0"], "--action-latency 必须小于 --hold"),
+            (["--action-latency", "0.2", "--window-from", "dispatch"], "--window-from observation"),
+            (["--rtf", "0"], "--rtf 必须"),
+            (["--rtf", "-0.5"], "--rtf 必须"),
+            (["--rtf", "inf"], "--rtf 必须"),
+        ):
+            code, stderr, _, _ = run_main(bad_argv, expect_exit=True)
+            self.assertEqual(code, 2, bad_argv)
+            self.assertIn(msg, stderr, bad_argv)
+
 
 class StopTests(unittest.TestCase):
     """AUDIT Q1/Q2：停止位置位后 worker 不重试、不起下一集，否则 Ctrl-C/SIGTERM 之后还会起新 gz。"""
