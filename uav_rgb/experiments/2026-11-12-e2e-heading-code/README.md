@@ -12,6 +12,7 @@
 | `prepare.sh` | 训练池一侧（守护进程）：重建核对 → 航向码重打包 → 训练 9 个新 run → 配方核对 → 末 10 轮平均 + 校准 → 与 eval-only 对拍 → 离线报告；写 `PREP_DONE` |
 | `run.sh` | Gazebo 池一侧（守护进程）：12 个评测臂（4 臂 × 3 训练种子，各 20 集），训练种子优先的顺序，迟到集重跑一次，写 `DONE`、`summary.md`、`verdicts.json` |
 | `summarize_e2e.py` | 汇总与判定（M1–M3、W2-2 只报告、2×2、逐种子、动作占比、cond_code 自检、每步生效时长、离线探针）；随时可跑，缺的臂标「未完成」 |
+| `cluster_report.py` | 按几何聚类的补报与异常集分母修正（审核 M-4、M-6；调 `tools/paired_stats.py`，只读输出目录并写 `<OUT>/cluster/cluster_report.{md,json}`） |
 | `e2e_arms.py` | 臂与路径约定的 Python 版（`lib.sh` 里有 bash 版，`test_e2e_arms.py` 核对两边一致） |
 | `compare_packs.py`、`check_cond_codes.py`、`check_recipe.py`、`make_dagger_dirs.py` | 重建核对、航向码独立重算、训练配方逐键核对、dagger 的 592 个集目录清单 |
 | `verify_infer_vs_evalonly.py`、`offline_report.py` | 交付权重的逐帧推理与 `uavrgb_train --eval-only` 对拍；训练曲线、val 指标、反事实探针 |
@@ -29,6 +30,8 @@ setsid nohup bash run.sh > /dev/null 2>&1 < /dev/null &                         
 
 - 停：`kill -- -$(cat $OUT/prepare.pid)`（或 `run.pid`），只按进程组，不用 `pkill -f`。续跑：同一条命令重起，完成的阶段与评完的臂跳过，半成品挪到 `<名>.partial-<时刻>`，不删。
 - 进度：`tail -f $OUT/prepare.log`、`tail -f $OUT/run.log`；汇总随时可跑：`<解释器> $OUT/code/experiments/2026-11-12-e2e-heading-code/summarize_e2e.py $OUT`。
+- 聚类补报（闭环结束后由收尾执行者在主仓库或工作树运行，不改 `$OUT/code` 冻结副本）：
+  `nice -n 10 /root/claude-code-backup-20261028/code/uav_rgb/.venv-tools/bin/python experiments/2026-11-12-e2e-heading-code/cluster_report.py $OUT`（可选 `--out-dir <目录>`，缺省写 `$OUT/cluster/cluster_report.{md,json}`）。
 - 锁：训练拿 `train.lock`（阻塞等待，≤ 3 个训练进程）；任何 Gazebo 评测拿 `machine.lock`，拿到后核对没有 gz sim 进程且 30 s 窗口内容器低于 8 核才起跑，不满足就每分钟复查，最多等 600 s，到点照样起跑并把当时的核数记进 `start.txt`（公共规则 §4「2026-11-12 01:40 起」，主仓库提交 89b7804）。
 - rc 表在两个脚本的文件头（`prepare.sh`：0/3/4/12/20/21/22/23/30/31/32/33/34/130；`run.sh`：0/3/4/5/6/7/11/12/13/130）。
 
@@ -43,6 +46,7 @@ setsid nohup bash run.sh > /dev/null 2>&1 < /dev/null &                         
 | 测试 | 覆盖 | 时长 |
 | --- | --- | --- |
 | `test_summarize_e2e.py`（25） | 配对与精确 McNemar、M1–M3 与 W2-2 的阈值边界、失败分类、航向码统计、完整世界与缺臂「不判」、迟到重跑的三种结果、W2-2 参照读到 53/60 | 约 10 s |
+| `test_cluster_report.py`（8） | 与冻结汇总器干净数据一致、崩溃集保持 60 分母并重算、7/8 几何离散分辨率与 5 几何「成立而聚类不显著」、M2 剔除（迟到/停顿/崩溃）与缺逐步记录标注、seed↔gid 一一对应校验、未完臂不判 | 约 15 s |
 | `test_pack_checks.py`（13） | 打包对账、侧车核对、码独立重算（含篡改必须被抓住） | 约 5 s |
 | `test_e2e_arms.py`（14） | `lib.sh` 与 `e2e_arms.py` 的路径约定一致 | 约 5 s |
 | `test_verify_offline.py`（10） | 指标定义（缺类按 0、除以 4）、对拍容差、码 2↔3 对调、探针统计、曲线读取 | 约 1 s |
