@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""打包的标签来源与图像对齐回归（纯 CPU，临时目录，约 2 s）。
+"""打包的标签来源与图像对齐回归（纯 CPU，临时目录）。
 
 锁住两条打包契约。在此之前 `tools/check.sh --python-only` 里没有测试守它们（交叉审核 F3，2026-11-12）：
   1. 标签 = actions.jsonl 的 action_expert（教师标签）。DAgger 集（executed_by=student）里
@@ -12,10 +12,14 @@
 
 变异检查（在副本里改 preprocess.py，不碰工作树）：标签取 action_executed、帧号 +1、帧号取
 「已保留样本数」、标签取上一步，都应让本文件变红。
+
+T2a（审核 P-10）：夹具在 setUpModule 里造一次（TMPDIR 下，模块结束清掉），用例各拷一份再改，每个用例结束核对
+夹具内容哈希没变；打包默认进程内调 preprocess.main()。两个用例走真子进程，锁命令行契约：
+test_labels_are_teacher_and_pixels_follow_step 锁成功路径的退出码 0，test_cli_missing_frame_exits_1_with_stderr_keyword
+锁失败路径的退出码 1 与 stderr 的「缺帧」。
 """
 import json
 import struct
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -24,14 +28,16 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
-REPO = Path(__file__).resolve().parents[1]
-PY = sys.executable
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from preprocess_testlib import SharedFixture, make_synthetic, run_preprocess, run_preprocess_cli  # noqa: E402
+
 # tools/DATASET_FORMAT.md §1.1 的 48 字节小端头；读端不借用 preprocess.HEADER，写端改了布局这里会红。
 HEADER = struct.Struct("<4sHHIHHBBBBQQQI")
 SRC_W, SRC_H = 320, 240
 # 每集相对教师标签的执行动作偏移：集 0 = DAgger 学生自采，集 1 = 旧格式教师集（没有 action_executed 键），
 # 集 2 = 差 3（即 -1）。集 0、集 2 的执行动作逐步不同于教师标签，取错来源一定改变标签。
 EXEC_OFFSET = (1, None, 3)
+FIXTURE = None  # setUpModule 里造；用例只读，要改先 copy_to
 
 
 def frame_color(ep_idx, step):
@@ -57,43 +63,70 @@ def read_uavr(path):
     return images, labels, meta
 
 
+def read_rows(ep):
+    """一集按 step 序的 actions 行。"""
+    rows = [json.loads(x) for x in (ep / "actions.jsonl").read_text().splitlines() if x]
+    return sorted(rows, key=lambda r: r["step"])
+
+
+def write_rows(eps, all_rows):
+    """落盘 actions.jsonl；集 2 的行序倒着写，打包必须按 step 而不是行序排样本。"""
+    for k, ep in enumerate(eps):
+        rows = all_rows[k][::-1] if k == 2 else all_rows[k]
+        (ep / "actions.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def build_fixture(root):
+    make_synthetic(root)
+    eps = [root / n for n in ("ep1", "ep2", "ep3")]
+    all_rows = []
+    for k, ep in enumerate(eps):
+        rows = read_rows(ep)
+        for r in rows:
+            if EXEC_OFFSET[k] is None:
+                r.pop("action_executed")
+            else:
+                r["action_executed"] = (r["action_expert"] + EXEC_OFFSET[k]) % 4
+                if r["action_executed"] == r["action_expert"]:
+                    raise AssertionError("夹具自检：执行动作须不同于标签")
+        all_rows.append(rows)
+        for step in range(len(rows) + 1):
+            Image.new("RGB", (SRC_W, SRC_H), frame_color(k, step)).save(ep / ("rgb_%05d.png" % step))
+    man = json.loads((eps[0] / "episode_manifest.json").read_text())
+    man.update(executed_by="student", dagger_round=1, beta=0.0)
+    (eps[0] / "episode_manifest.json").write_text(json.dumps(man))
+    write_rows(eps, all_rows)
+
+
+def setUpModule():
+    global FIXTURE
+    FIXTURE = SharedFixture("label-alignment", build_fixture)
+    unittest.addModuleCleanup(FIXTURE.cleanup)
+
+
+def tearDownModule():
+    FIXTURE.verify()
+
+
 class LabelAlignmentTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
-        subprocess.run([PY, str(REPO / "tools/make_synthetic_episode.py"), "--out", str(self.tmp / "ep")],
-                       check=True, capture_output=True)
+        FIXTURE.copy_to(self.tmp / "ep")
         self.eps = [self.tmp / "ep" / n for n in ("ep1", "ep2", "ep3")]
-        self.rows = []  # 每集按 step 序的 actions 行，即打包前落盘的真值
-        for k, ep in enumerate(self.eps):
-            rows = [json.loads(x) for x in (ep / "actions.jsonl").read_text().splitlines() if x]
-            for r in rows:
-                if EXEC_OFFSET[k] is None:
-                    r.pop("action_executed")
-                else:
-                    r["action_executed"] = (r["action_expert"] + EXEC_OFFSET[k]) % 4
-                    self.assertNotEqual(r["action_executed"], r["action_expert"], "夹具自检：执行动作须不同于标签")
-            self.rows.append(rows)
-            for step in range(len(rows) + 1):
-                Image.new("RGB", (SRC_W, SRC_H), frame_color(k, step)).save(ep / ("rgb_%05d.png" % step))
-        man = json.loads((self.eps[0] / "episode_manifest.json").read_text())
-        man.update(executed_by="student", dagger_round=1, beta=0.0)
-        (self.eps[0] / "episode_manifest.json").write_text(json.dumps(man))
-        self.write_rows()
+        self.rows = [read_rows(ep) for ep in self.eps]  # 每集按 step 序的 actions 行，即打包前落盘的真值
 
     def tearDown(self):
-        self._tmp.cleanup()
+        FIXTURE.verify()
 
     def write_rows(self):
-        """落盘 actions.jsonl；集 2 的行序倒着写，打包必须按 step 而不是行序排样本。"""
-        for k, ep in enumerate(self.eps):
-            rows = self.rows[k][::-1] if k == 2 else self.rows[k]
-            (ep / "actions.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        write_rows(self.eps, self.rows)
 
-    def pack(self, *flags):
+    def pack(self, *flags, cli=False):
         out = self.tmp / "ds"
-        r = subprocess.run([PY, str(REPO / "tools/preprocess.py"), "--out", str(out), *flags, *map(str, self.eps)],
-                           capture_output=True, text=True)
+        run = run_preprocess_cli if cli else run_preprocess
+        r = run("--out", out, *flags, *self.eps)
         self.assertEqual(r.returncode, 0, r.stderr)
         return read_uavr(out / "dataset.uavr")
 
@@ -112,7 +145,7 @@ class LabelAlignmentTests(unittest.TestCase):
             self.assertEqual(decode_color(planes[:, 0, 0]), (k, step), where + "：像素必须来自 rgb_%05d.png" % step)
 
     def test_labels_are_teacher_and_pixels_follow_step(self):
-        images, labels, meta = self.pack()
+        images, labels, meta = self.pack(cli=True)  # 真子进程：成功路径的命令行退出码 0
         self.assert_samples(images, labels, self.expected())
         starts = [e["sample_start"] for e in meta["episodes"]]
         self.assertEqual(starts, [0, len(self.rows[0]), len(self.rows[0]) + len(self.rows[1])])
@@ -127,6 +160,16 @@ class LabelAlignmentTests(unittest.TestCase):
         images, labels, meta = self.pack("--drop-collision")
         self.assertEqual(meta["collision_dropped"], len(drops))
         self.assert_samples(images, labels, self.expected(drops))
+
+    def test_cli_missing_frame_exits_1_with_stderr_keyword(self):
+        # 命令行契约（真子进程）：actions.jsonl 有这一步而 rgb 帧缺了，退出码 1，stderr 点明「缺帧」与文件名，不写数据集。
+        (self.eps[1] / "rgb_00001.png").unlink()
+        out = self.tmp / "ds"
+        r = run_preprocess_cli("--out", out, *self.eps)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("缺帧", r.stderr)
+        self.assertIn("rgb_00001.png", r.stderr)
+        self.assertFalse((out / "dataset.uavr").exists())
 
 
 if __name__ == "__main__":

@@ -8,12 +8,16 @@
      保留样本的图像与 step 对齐、标签取 action_expert；被丢步之后的 prev_action 与 heading_code 仍反映真实已执行动作；
      meta.collision_filter 记 drop_late_and_stall / late_dropped / stall_dropped / timing_dropped。
   4. 非法类型的 late_dispatch（如字符串 "false"）拒绝打包。
+
+T2a（审核 P-10）：三集夹具（帧、时间戳、迟到/停顿字段的基线）在 setUpModule 造一次（TMPDIR 下，模块结束清掉），用例各拷
+一份再改，每个用例结束核对夹具内容哈希没变。打包默认进程内调 pre.main()（固定 datetime，两次输出才能逐字节比）；
+两个用例走真子进程，锁命令行契约：test_hold_two_seconds_respects_scaled_nominal_period 锁成功路径的退出码 0，
+test_non_bool_late_dispatch_is_rejected 锁失败路径的退出码非 0 与 stderr 里的 late_dispatch。
 """
 import contextlib
 import io
 import json
 import struct
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -29,9 +33,10 @@ sys.path.insert(0, str(REPO / "sim" / "tools"))
 sys.path.insert(0, str(REPO / "tools"))
 import collect  # noqa: E402
 import preprocess as pre  # noqa: E402
+from preprocess_testlib import SharedFixture, make_synthetic, run_preprocess_cli  # noqa: E402
 
-PY = sys.executable
 HEADER = struct.Struct("<4sHHIHHBBBBQQQI")
+FIXTURE = None  # setUpModule 里造；用例只读，要改先 copy_to
 AUX_HEADER = struct.Struct("<8sQIHHBBH")
 SRC_W, SRC_H = 320, 240
 NS = 10**9
@@ -61,39 +66,63 @@ def read_uavr_and_aux(ds_dir):
     return images, labels, meta, prev_index, prev_action
 
 
+def read_rows(ep):
+    return [json.loads(x) for x in (ep / "actions.jsonl").read_text().splitlines() if x]
+
+
+def write_rows(eps, all_rows):
+    for ep, rows in zip(eps, all_rows):
+        (ep / "actions.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def build_fixture(root):
+    make_synthetic(root)
+    eps = [root / n for n in ("ep1", "ep2", "ep3")]
+    all_rows = []
+    for k, ep in enumerate(eps):
+        man = json.loads((ep / "episode_manifest.json").read_text())
+        man["action_latency_s"] = 0.2
+        man["window_from"] = "observation"
+        man["hold_s"] = 1.0
+        (ep / "episode_manifest.json").write_text(json.dumps(man))
+        rows = read_rows(ep)
+        ts = 10 * NS
+        for i, r in enumerate(rows):
+            if i > 0:
+                ts += int(round(0.9 * NS))
+            r["rgb_ts"] = ts
+            r["obs_gap_s"] = None if i == 0 else 0.9
+            r["late_dispatch"] = False
+            r["action_executed"] = (r["action_expert"] + 1) % 4
+            Image.new("RGB", (SRC_W, SRC_H), frame_color(k, r["step"])).save(ep / ("rgb_%05d.png" % r["step"]))
+        all_rows.append(rows)
+    write_rows(eps, all_rows)
+
+
+def setUpModule():
+    global FIXTURE
+    FIXTURE = SharedFixture("timing-filter", build_fixture)
+    unittest.addModuleCleanup(FIXTURE.cleanup)
+
+
+def tearDownModule():
+    FIXTURE.verify()
+
+
 class PreprocessTimingFilterTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
-        subprocess.run([PY, str(REPO / "tools/make_synthetic_episode.py"), "--out", str(self.tmp / "ep")],
-                       check=True, capture_output=True)
+        FIXTURE.copy_to(self.tmp / "ep")
         self.eps = [self.tmp / "ep" / n for n in ("ep1", "ep2", "ep3")]
-        self.rows = []
-        for k, ep in enumerate(self.eps):
-            man = json.loads((ep / "episode_manifest.json").read_text())
-            man["action_latency_s"] = 0.2
-            man["window_from"] = "observation"
-            man["hold_s"] = 1.0
-            (ep / "episode_manifest.json").write_text(json.dumps(man))
-            rows = [json.loads(x) for x in (ep / "actions.jsonl").read_text().splitlines() if x]
-            ts = 10 * NS
-            for i, r in enumerate(rows):
-                if i > 0:
-                    ts += int(round(0.9 * NS))
-                r["rgb_ts"] = ts
-                r["obs_gap_s"] = None if i == 0 else 0.9
-                r["late_dispatch"] = False
-                r["action_executed"] = (r["action_expert"] + 1) % 4
-                Image.new("RGB", (SRC_W, SRC_H), frame_color(k, r["step"])).save(ep / ("rgb_%05d.png" % r["step"]))
-            self.rows.append(rows)
-        self.flush_rows()
+        self.rows = [read_rows(ep) for ep in self.eps]
 
     def tearDown(self):
-        self._tmp.cleanup()
+        FIXTURE.verify()
 
     def flush_rows(self):
-        for ep, rows in zip(self.eps, self.rows):
-            (ep / "actions.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        write_rows(self.eps, self.rows)
 
     def run_inproc(self, out_dir, extra_flags=()):
         fixed_dt = datetime(2026, 11, 12, 7, 0, 0, tzinfo=timezone.utc)
@@ -187,7 +216,8 @@ class PreprocessTimingFilterTests(unittest.TestCase):
         self.rows[1][1]["obs_gap_s"] = 2.25   # 只有这一步超过 1.9 + 0.2 = 2.1
         self.flush_rows()
         out = self.tmp / "ds_hold2"
-        self.run_inproc(out, ("--drop-late-and-stall",))
+        r = run_preprocess_cli("--out", out, "--drop-late-and-stall", *self.eps)  # 真子进程：成功路径的退出码 0
+        self.assertEqual(r.returncode, 0, r.stderr)
         _, labels, meta, _, _ = read_uavr_and_aux(out)
         self.assertEqual(meta["collision_filter"]["stall_dropped"], 1)
         self.assertEqual(meta["collision_filter"]["timing_dropped"], 1)
@@ -196,9 +226,7 @@ class PreprocessTimingFilterTests(unittest.TestCase):
     def test_non_bool_late_dispatch_is_rejected(self):
         self.rows[0][1]["late_dispatch"] = "false"
         self.flush_rows()
-        r = subprocess.run([PY, str(REPO / "tools/preprocess.py"), "--drop-late-and-stall",
-                            "--out", str(self.tmp / "ds_bad"), *map(str, self.eps)],
-                           capture_output=True, text=True)
+        r = run_preprocess_cli("--drop-late-and-stall", "--out", self.tmp / "ds_bad", *self.eps)  # 真子进程：失败路径
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("late_dispatch", r.stderr)
 

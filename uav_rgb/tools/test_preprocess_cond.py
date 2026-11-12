@@ -6,10 +6,14 @@ heading-code 的列 = 按集从头累计「已执行」动作得到的航向码�
 默认值（prev-action）的列与 meta 不变；waypoint 任务拒绝 heading-code（H 未定义）。
 
 运行（仓库根）：.venv-tools/bin/python tools/test_preprocess_cond.py
+
+T2a（审核 P-10）：三集夹具（合成 episode + 每集的 actions.jsonl）在 setUpModule 造一次（TMPDIR 下，模块结束清掉），
+用例各拷一份再改，每个用例结束核对夹具内容哈希没变。打包默认进程内调 preprocess.main()；两个用例走真子进程，锁命令行契约：
+test_unknown_cond_is_rejected_by_argparse 锁 argparse 报错的退出码 2 与 stderr 里的 --cond，
+test_waypoint_episode_is_refused_for_heading_code_only 的第一次打包锁 die() 的退出码非 0 与 stderr 里的 waypoint / heading-code。
 """
 import json
 import struct
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -17,10 +21,12 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "sim" / "tools"))
+sys.path.insert(0, str(REPO / "tools"))
 import nav_cond  # noqa: E402
+from preprocess_testlib import SharedFixture, make_synthetic, run_preprocess, run_preprocess_cli  # noqa: E402
 
-PY = sys.executable
 AUX_HEADER_SIZE = 128
+FIXTURE = None  # setUpModule 里造；用例只读，要改先 copy_to
 F, L, R = 1, 2, 3
 
 # 每集：(执行动作, 教师标签, 碰撞步集合)。标签故意与执行动作不同（DAgger 形态）：码按执行动作算，标签列照教师。
@@ -52,24 +58,39 @@ def read_aux(path):
     return list(struct.unpack("<%dI" % n, body[:4 * n])), list(body[4 * n:])
 
 
+def build_fixture(root):
+    make_synthetic(root)
+    for name, (executed, expert, collided) in EPISODES.items():
+        rows = [{"step": i, "timestamp_ns": 1_000_000_000 + 100_000_000 * i, "action_expert": expert[i],
+                 "action_executed": executed[i], "collision": i in collided} for i in range(len(executed))]
+        (root / name / "actions.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+
+def setUpModule():
+    global FIXTURE
+    FIXTURE = SharedFixture("cond", build_fixture)
+    unittest.addModuleCleanup(FIXTURE.cleanup)
+
+
+def tearDownModule():
+    FIXTURE.verify()
+
+
 class PreprocessCondTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
-        subprocess.run([PY, str(REPO / "tools/make_synthetic_episode.py"), "--out", str(self.tmp / "ep")],
-                       check=True, capture_output=True)
+        FIXTURE.copy_to(self.tmp / "ep")
         self.eps = {n: self.tmp / "ep" / n for n in EPISODES}
-        for name, (executed, expert, collided) in EPISODES.items():
-            rows = [{"step": i, "timestamp_ns": 1_000_000_000 + 100_000_000 * i, "action_expert": expert[i],
-                     "action_executed": executed[i], "collision": i in collided} for i in range(len(executed))]
-            (self.eps[name] / "actions.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
 
-    def pack(self, name, *flags, eps=None, check=True):
+    def tearDown(self):
+        FIXTURE.verify()
+
+    def pack(self, name, *flags, eps=None, check=True, cli=False):
         out = self.tmp / name
-        r = subprocess.run([PY, str(REPO / "tools/preprocess.py"), "--out", str(out), *flags,
-                            *map(str, eps if eps is not None else self.eps.values())],
-                           capture_output=True, text=True)
+        run = run_preprocess_cli if cli else run_preprocess
+        r = run("--out", out, *flags, *(eps if eps is not None else self.eps.values()))
         if check:
             self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         return out, r
@@ -154,14 +175,14 @@ class PreprocessCondTests(unittest.TestCase):
         man = json.loads(man_path.read_text(encoding="utf-8"))
         man["waypoint"] = {"x": 3.0, "y": 0.5}
         man_path.write_text(json.dumps(man), encoding="utf-8")
-        _, r = self.pack("hc", "--cond", "heading-code", check=False)
+        _, r = self.pack("hc", "--cond", "heading-code", check=False, cli=True)  # 真子进程：die() 的退出码与 stderr 关键字
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("waypoint", r.stderr)
         self.assertIn("heading-code", r.stderr)
         self.pack("default", "--drop-collision")   # 默认路径不受影响
 
     def test_unknown_cond_is_rejected_by_argparse(self):
-        _, r = self.pack("bad", "--cond", "bogus", check=False)
+        _, r = self.pack("bad", "--cond", "bogus", check=False, cli=True)  # 真子进程：argparse 报错的退出码 2
         self.assertEqual(r.returncode, 2)
         self.assertIn("--cond", r.stderr)
 

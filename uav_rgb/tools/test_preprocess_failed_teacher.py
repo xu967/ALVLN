@@ -7,11 +7,15 @@
 带 waypoint 的任务、DAgger 学生自采集、缺 scene.json 柱子或 oracle 的集不适用，不跳。
 
 用 make_synthetic_episode 生成 3 条小 episode，再写 scene.json 与 oracle；不读真实数据。
+
+T2a（审核 P-10）：三集夹具（合成 episode + oracle 爬升到各自 max x + scene.json + geometry_gid）在 setUpModule 造一次
+（TMPDIR 下，模块结束清掉），用例各拷一份再改，每个用例结束核对夹具内容哈希没变。打包默认进程内调 preprocess.main()；
+两个用例走真子进程，锁命令行契约：test_flag_skips_only_the_episode_below_the_line 锁成功路径的退出码 0 与输出（stdout 加 stderr 合起来找）
+里的「跳过整集 1 个」，test_all_episodes_skipped_is_an_error_not_an_empty_dataset 锁失败路径的退出码非 0 与 stderr 的「没有可写样本」。
 """
 import itertools
 import json
 import struct
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -21,8 +25,9 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "sim" / "tools"))
 sys.path.insert(0, str(REPO / "tools"))
 import split_manifest as sm  # noqa: E402
+from preprocess_testlib import SharedFixture, make_synthetic, run_preprocess, run_preprocess_cli  # noqa: E402
 
-PY = sys.executable
+FIXTURE = None  # setUpModule 里造；用例只读，要改先 copy_to
 # 一根柱 x=0.5 → 成功线 1.5；合成集的 ep1/ep2/ep3 步数 6/4/5。
 PILLAR = {"name": "p0", "x": 0.5, "y": 0.0, "z": 1.5, "size": [0.4, 0.4, 3.0]}
 LINE_X = 1.5
@@ -46,38 +51,57 @@ def gid_for(split, tag="g"):
     raise AssertionError("找不到 %s split 的 gid" % split)
 
 
+def build_fixture(root):
+    make_synthetic(root)
+    eps = [root / n for n in ("ep1", "ep2", "ep3")]
+    # ep1 过线（max x 2.0）、ep2 没过线（max x 1.0）、ep3 max x 正好等于成功线（不算失败）。
+    FailedTeacherTests.set_max_x(eps[0], 2.0)
+    FailedTeacherTests.set_max_x(eps[1], 1.0)
+    FailedTeacherTests.set_max_x(eps[2], LINE_X)
+    for ep in eps:
+        FailedTeacherTests.write_scene(ep, [PILLAR])
+        man = FailedTeacherTests.man(ep)
+        man["geometry_gid"] = gid_for(man["split"], ep.name)
+        FailedTeacherTests.save(ep, man)
+
+
+def setUpModule():
+    global FIXTURE
+    FIXTURE = SharedFixture("failed-teacher", build_fixture)
+    unittest.addModuleCleanup(FIXTURE.cleanup)
+
+
+def tearDownModule():
+    FIXTURE.verify()
+
+
 class FailedTeacherTests(unittest.TestCase):
     def setUp(self):
         self._out_n = itertools.count()
         self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
-        subprocess.run([PY, str(REPO / "tools/make_synthetic_episode.py"), "--out", str(self.tmp / "ep")],
-                       check=True, capture_output=True)
+        FIXTURE.copy_to(self.tmp / "ep")
         self.eps = [self.tmp / "ep" / n for n in ("ep1", "ep2", "ep3")]
-        # ep1 过线（max x 2.0）、ep2 没过线（max x 1.0）、ep3 max x 正好等于成功线（不算失败）。
-        self.set_max_x(self.eps[0], 2.0)
-        self.set_max_x(self.eps[1], 1.0)
-        self.set_max_x(self.eps[2], LINE_X)
-        for ep in self.eps:
-            self.write_scene(ep, [PILLAR])
-            man = self.man(ep)
-            man["geometry_gid"] = gid_for(man["split"], ep.name)
-            self.save(ep, man)
 
     def tearDown(self):
-        self._tmp.cleanup()
+        FIXTURE.verify()
 
     # ---- 夹具 ----
-    def man(self, ep):
+    @staticmethod
+    def man(ep):
         return json.loads((ep / "episode_manifest.json").read_text(encoding="utf-8"))
 
-    def save(self, ep, man):
+    @staticmethod
+    def save(ep, man):
         (ep / "episode_manifest.json").write_text(json.dumps(man), encoding="utf-8")
 
-    def write_scene(self, ep, pillars):
+    @staticmethod
+    def write_scene(ep, pillars):
         (ep / "scene.json").write_text(json.dumps({"pillars": pillars}), encoding="utf-8")
 
-    def set_max_x(self, ep, max_x):
+    @staticmethod
+    def set_max_x(ep, max_x):
         """oracle.jsonl 的 pose_gt.x 线性爬升，最后一步到 max_x。"""
         path = ep / "oracle.jsonl"
         rows = [json.loads(line) for line in path.read_text().splitlines() if line]
@@ -86,9 +110,9 @@ class FailedTeacherTests(unittest.TestCase):
             row["pose_gt"]["x"] = max_x * (i + 1) / n
         path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
 
-    def run_pre(self, out, *flags, eps=None):
-        return subprocess.run([PY, str(REPO / "tools/preprocess.py"), "--out", str(out), *flags,
-                               *map(str, eps or self.eps)], capture_output=True, text=True)
+    def run_pre(self, out, *flags, eps=None, cli=False):
+        run = run_preprocess_cli if cli else run_preprocess
+        return run("--out", out, *flags, *(eps or self.eps))
 
     def meta_of(self, out):
         return read_meta(Path(out) / "dataset.uavr")
@@ -110,7 +134,7 @@ class FailedTeacherTests(unittest.TestCase):
 
     # ---- 打开：跳过没过线的集 ----
     def test_flag_skips_only_the_episode_below_the_line(self):
-        r = self.run_pre(self.tmp / "ds", "--exclude-failed-teacher")
+        r = self.run_pre(self.tmp / "ds", "--exclude-failed-teacher", cli=True)  # 真子进程：成功路径的退出码 0 与 stdout
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("跳过整集 1 个（--exclude-failed-teacher", r.stdout + r.stderr)
         meta = self.meta_of(self.tmp / "ds")
@@ -332,9 +356,9 @@ class FailedTeacherTests(unittest.TestCase):
     def test_all_episodes_skipped_is_an_error_not_an_empty_dataset(self):
         for ep in self.eps:
             self.set_max_x(ep, 0.5)
-        r = self.run_pre(self.tmp / "ds", "--exclude-failed-teacher")
+        r = self.run_pre(self.tmp / "ds", "--exclude-failed-teacher", cli=True)  # 真子进程：失败路径的退出码与 stderr 关键字
         self.assertNotEqual(r.returncode, 0)
-        self.assertIn("没有可写样本", r.stdout + r.stderr)
+        self.assertIn("没有可写样本", r.stderr)  # die() 走 stderr；原先是 stdout+stderr 合起来找，真子进程用例里收紧到 stderr
 
     # ---- 口径与 collect/eval 同一来源 ----
     def test_goal_margin_equals_collect_and_eval(self):

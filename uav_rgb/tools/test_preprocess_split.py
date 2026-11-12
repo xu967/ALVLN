@@ -2,11 +2,14 @@
 """preprocess 的 split 事实/诊断门禁/冻结复算/碰撞过滤回归（纯 CPU，临时目录）。
 
 用 make_synthetic_episode 生成 3 条小 episode，再改写 manifest；不读真实数据。
+
+T2a（审核 P-10）：合成 episode 在 setUpModule 造一次（TMPDIR 下，模块结束清掉），用例各拷一份再改，每个用例结束核对夹具
+内容哈希没变。打包默认进程内调 preprocess.main()；两个用例走真子进程，锁命令行契约：
+test_records_real_split_facts 锁成功路径的退出码 0，test_same_scene_cross_split_rejected 锁失败路径的退出码非 0 与 stderr 里的 scene_id。
 """
 import hashlib
 import json
 import struct
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -14,11 +17,13 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "sim" / "tools"))
+sys.path.insert(0, str(REPO / "tools"))
 import asset_campus  # noqa: E402
 import scene_forest as sf  # noqa: E402
 import split_manifest as sm  # noqa: E402
+from preprocess_testlib import run_preprocess, run_preprocess_cli, synthetic_fixture  # noqa: E402
 
-PY = sys.executable
+FIXTURE = None  # setUpModule 里造；用例只读，要改先 copy_to
 # t5 test/200561 的真实 gid：v3→test，当前 v5→train。
 FROZEN_V3_GID = "0226c6cbd9d1a7e5"
 
@@ -40,17 +45,26 @@ def gid_for(split, tag="g", salt=None):
     raise AssertionError("找不到 %s split 的 gid" % split)
 
 
+def setUpModule():
+    global FIXTURE
+    FIXTURE = synthetic_fixture()
+    unittest.addModuleCleanup(FIXTURE.cleanup)
+
+
+def tearDownModule():
+    FIXTURE.verify()
+
+
 class PreprocessSplitTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
-        subprocess.run([PY, str(REPO / "tools/make_synthetic_episode.py"),
-                        "--out", str(self.tmp / "ep")], check=True,
-                       capture_output=True)
+        FIXTURE.copy_to(self.tmp / "ep")
         self.eps = [self.tmp / "ep" / n for n in ("ep1", "ep2", "ep3")]
 
     def tearDown(self):
-        self._tmp.cleanup()
+        FIXTURE.verify()
 
     def man(self, ep):
         return json.loads((ep / "episode_manifest.json").read_text(encoding="utf-8"))
@@ -58,10 +72,9 @@ class PreprocessSplitTests(unittest.TestCase):
     def save(self, ep, man):
         (ep / "episode_manifest.json").write_text(json.dumps(man), encoding="utf-8")
 
-    def run_pre(self, out, eps, *flags):
-        return subprocess.run(
-            [PY, str(REPO / "tools/preprocess.py"), "--out", str(out),
-             *flags, *map(str, eps)], capture_output=True, text=True)
+    def run_pre(self, out, eps, *flags, cli=False):
+        run = run_preprocess_cli if cli else run_preprocess
+        return run("--out", out, *flags, *eps)
 
     def test_records_real_split_facts(self):
         expect = {}
@@ -70,7 +83,7 @@ class PreprocessSplitTests(unittest.TestCase):
             man["geometry_gid"] = gid_for(man["split"], ep.name)
             expect[man["geometry_gid"]] = man["split"]
             self.save(ep, man)
-        r = self.run_pre(self.tmp / "ds", self.eps)
+        r = self.run_pre(self.tmp / "ds", self.eps, cli=True)  # 真子进程：成功路径的退出码 0
         self.assertEqual(r.returncode, 0, r.stderr)
         meta = read_meta(self.tmp / "ds" / "dataset.uavr")
         self.assertEqual(meta["split_policy"], "geometry_gid")
@@ -112,7 +125,7 @@ class PreprocessSplitTests(unittest.TestCase):
             man["split"] = split
             man["geometry_gid"] = gid_for(split, ep.name)
             self.save(ep, man)
-        r = self.run_pre(self.tmp / "ds", self.eps[:2])
+        r = self.run_pre(self.tmp / "ds", self.eps[:2], cli=True)  # 真子进程：失败路径的退出码与 stderr 关键字
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("scene_id", r.stderr)
 

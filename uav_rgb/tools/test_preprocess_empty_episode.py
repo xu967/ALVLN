@@ -7,11 +7,14 @@
      单独计数并打印「跳过整集 N 个（行级过滤后剩余 0 步）」，collision_dropped 照实累加被丢步数。
   2. --drop-late-and-stall 把整集全部步滤空时同样跳过并打印，timing_dropped 照实累加。
   3. 所有输入集均被行级过滤淘空时（total == 0）报错「没有可写样本」，不写出空数据集。
+
+T2a（审核 P-10）：四集夹具在 setUpModule 造一次（TMPDIR 下，模块结束清掉），用例各拷一份再改，每个用例结束核对夹具
+内容哈希没变。第 1、3 条走真子进程，分别锁成功路径的退出码 0 与失败路径的退出码非 0、stderr 含「没有可写样本」；
+第 2 条本来就直接调 pre.scan。
 """
 import json
 import shutil
 import struct
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -22,9 +25,10 @@ sys.path.insert(0, str(REPO / "sim" / "tools"))
 sys.path.insert(0, str(REPO / "tools"))
 import preprocess as pre  # noqa: E402
 import split_manifest as sm  # noqa: E402
+from preprocess_testlib import SharedFixture, make_synthetic, run_preprocess_cli  # noqa: E402
 
-PY = sys.executable
 HEADER = struct.Struct("<4sHHIHHBBBBQQQI")
+FIXTURE = None  # setUpModule 里造；用例只读，要改先 copy_to
 
 
 def gid_for(split, tag="g"):
@@ -41,34 +45,48 @@ def read_meta(uavr_path: Path):
     return n, json.loads(raw[mo:mo + ml].decode("utf-8"))
 
 
+def build_fixture(root):
+    make_synthetic(root)
+    # 构造 4 集：ep1(train,6步), ep2(train,4步), ep3(train,5步), ep4(val,5步)，每集独立 scene_id 与 gid，均带合法指令
+    shutil.copytree(root / "ep3", root / "ep4")
+    specs = [("ep1", 1, 101, "train"), ("ep2", 2, 102, "train"),
+             ("ep3", 3, 103, "train"), ("ep4", 4, 104, "val")]
+    for name, eid, sid, sp in specs:
+        mp = root / name / "episode_manifest.json"
+        man = json.loads(mp.read_text(encoding="utf-8"))
+        man.update({
+            "episode_id": eid,
+            "scene_id": sid,
+            "split": sp,
+            "geometry_gid": gid_for(sp, name),
+            "instruction": "fly to the red pillar and stop",
+            "window_from": "observation",
+            "hold_s": 1.0,
+            "action_latency_s": 0.2,
+        })
+        mp.write_text(json.dumps(man), encoding="utf-8")
+
+
+def setUpModule():
+    global FIXTURE
+    FIXTURE = SharedFixture("empty-episode", build_fixture)
+    unittest.addModuleCleanup(FIXTURE.cleanup)
+
+
+def tearDownModule():
+    FIXTURE.verify()
+
+
 class EmptyAfterStepFilterTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
-        subprocess.run([PY, str(REPO / "tools/make_synthetic_episode.py"), "--out", str(self.tmp / "ep")],
-                       check=True, capture_output=True)
-        # 构造 4 集：ep1(train,6步), ep2(train,4步), ep3(train,5步), ep4(val,5步)，每集独立 scene_id 与 gid，均带合法指令
-        shutil.copytree(self.tmp / "ep/ep3", self.tmp / "ep/ep4")
+        FIXTURE.copy_to(self.tmp / "ep")
         self.eps = [self.tmp / "ep" / n for n in ("ep1", "ep2", "ep3", "ep4")]
-        specs = [("ep1", 1, 101, "train"), ("ep2", 2, 102, "train"),
-                 ("ep3", 3, 103, "train"), ("ep4", 4, 104, "val")]
-        for ep, (name, eid, sid, sp) in zip(self.eps, specs):
-            mp = ep / "episode_manifest.json"
-            man = json.loads(mp.read_text(encoding="utf-8"))
-            man.update({
-                "episode_id": eid,
-                "scene_id": sid,
-                "split": sp,
-                "geometry_gid": gid_for(sp, name),
-                "instruction": "fly to the red pillar and stop",
-                "window_from": "observation",
-                "hold_s": 1.0,
-                "action_latency_s": 0.2,
-            })
-            mp.write_text(json.dumps(man), encoding="utf-8")
 
     def tearDown(self):
-        self._tmp.cleanup()
+        FIXTURE.verify()
 
     def set_all_collision(self, ep: Path):
         ap = ep / "actions.jsonl"
@@ -90,8 +108,7 @@ class EmptyAfterStepFilterTests(unittest.TestCase):
         self.set_all_collision(self.eps[1])
         self.set_all_collision(self.eps[2])
         out = self.tmp / "ds_coll"
-        r = subprocess.run([PY, str(REPO / "tools/preprocess.py"), "--out", str(out), "--drop-collision",
-                            *map(str, self.eps)], capture_output=True, text=True)
+        r = run_preprocess_cli("--out", out, "--drop-collision", *self.eps)  # 真子进程：成功路径的退出码 0
         self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
         self.assertIn("跳过整集 2 个（行级过滤后剩余 0 步）", r.stdout)
         n, meta = read_meta(out / "dataset.uavr")
@@ -131,11 +148,10 @@ class EmptyAfterStepFilterTests(unittest.TestCase):
         for ep in self.eps:
             self.set_all_collision(ep)
         out = self.tmp / "ds_all_empty"
-        r = subprocess.run([PY, str(REPO / "tools/preprocess.py"), "--out", str(out), "--drop-collision",
-                            *map(str, self.eps)], capture_output=True, text=True)
+        r = run_preprocess_cli("--out", out, "--drop-collision", *self.eps)  # 真子进程：失败路径的退出码与 stderr 关键字
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("跳过整集 4 个（行级过滤后剩余 0 步）", r.stdout + r.stderr)
-        self.assertIn("没有可写样本", r.stdout + r.stderr)
+        self.assertIn("没有可写样本", r.stderr)  # die() 走 stderr；原先是 stdout+stderr 合起来找，真子进程用例收紧到 stderr
         self.assertFalse((out / "dataset.uavr").exists())
 
 

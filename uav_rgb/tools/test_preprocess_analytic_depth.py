@@ -8,13 +8,18 @@
   - 命令行：meta 记 depth_source、侧车分带 = 函数输出（有 / 无包络膨胀）、忽略深度文件、不支持的集（waypoint、3DGS、非 e1_mini、缺 scene.json / 位姿）报错；
   - `--depth-source file`（默认）的输出与改动前逐字节相同：标签区、侧车 payload、规范化后的 meta 的 sha256 取自 3e03e7e 的 preprocess.py 在同一夹具上的输出；
     meta 里没有 depth_source 键。
+
+T2a（审核 P-10）：合成 episode 在 setUpModule 造一次（TMPDIR 下，模块结束清掉），用例各拷一份再改，每个用例结束核对夹具
+内容哈希没变。命令行用例默认进程内调 preprocess.main()；两个用例走真子进程，锁命令行契约：
+test_cli_writes_analytic_bands_without_envelope 锁成功路径的退出码 0，
+test_unknown_depth_source_is_rejected 锁 argparse 报错的退出码 2 与 stderr 关键字。
+设了环境变量 PREPROCESS_PY（指到旧版副本核对 GOLDEN）时，所有命令行用例都改走真子进程跑那份脚本。
 """
 import hashlib
 import json
 import math
 import os
 import struct
-import subprocess
 import sys
 import tempfile
 import unittest
@@ -26,10 +31,12 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "tools"))
 sys.path.insert(0, str(REPO / "sim" / "tools"))
 import preprocess as pre  # noqa: E402
+from preprocess_testlib import run_preprocess, run_preprocess_cli, synthetic_fixture  # noqa: E402
 
-PY = sys.executable
+FIXTURE = None  # setUpModule 里造；用例只读，要改先 copy_to
 # 命令行用例跑的 preprocess.py；PREPROCESS_PY 可指到旧版副本，核对 GOLDEN 取自改动前的输出。
 PRE_PY = Path(os.environ.get("PREPROCESS_PY") or REPO / "tools" / "preprocess.py")
+PRE_PY_OVERRIDDEN = bool(os.environ.get("PREPROCESS_PY"))
 SRC_W, SRC_H = 320, 240
 GRID = (15, 20)
 RAYS = 3                                            # 卡：每格 3×3 条射线
@@ -143,16 +150,26 @@ def read_aux(ds_dir):
     return b, n, depth, (dh, dw)
 
 
+def setUpModule():
+    global FIXTURE
+    FIXTURE = synthetic_fixture()
+    unittest.addModuleCleanup(FIXTURE.cleanup)
+
+
+def tearDownModule():
+    FIXTURE.verify()
+
+
 class Fixture(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
-        subprocess.run([PY, str(REPO / "tools/make_synthetic_episode.py"), "--out", str(self.tmp / "ep")],
-                       check=True, capture_output=True)
+        FIXTURE.copy_to(self.tmp / "ep")
         self.eps = [self.tmp / "ep" / n for n in ("ep1", "ep2", "ep3")]
 
     def tearDown(self):
-        self._tmp.cleanup()
+        FIXTURE.verify()
 
     def man(self, ep):
         return json.loads((ep / "episode_manifest.json").read_text(encoding="utf-8"))
@@ -187,9 +204,10 @@ class Fixture(unittest.TestCase):
                 row["yaw_before"] = yaw
             self.save_rows(ep, rows)
 
-    def run_pre(self, out, eps, *flags):
-        return subprocess.run([PY, str(PRE_PY), "--out", str(out), *flags, *map(str, eps)],
-                              capture_output=True, text=True)
+    def run_pre(self, out, eps, *flags, cli=False):
+        if cli or PRE_PY_OVERRIDDEN:
+            return run_preprocess_cli("--out", out, *flags, *eps, script=PRE_PY)
+        return run_preprocess("--out", out, *flags, *eps)
 
 
 class AnalyticGeometryTests(unittest.TestCase):
@@ -362,7 +380,8 @@ class AnalyticCliTests(Fixture):
         return np.concatenate(out)
 
     def test_cli_writes_analytic_bands_without_envelope(self):
-        r = self.run_pre(self.tmp / "ds", self.eps, "--depth-source", "analytic", "--envelope-radius", "0")
+        r = self.run_pre(self.tmp / "ds", self.eps, "--depth-source", "analytic", "--envelope-radius", "0",
+                         cli=True)  # 真子进程：成功路径的退出码 0
         self.assertEqual(r.returncode, 0, r.stderr)
         meta = read_meta(self.tmp / "ds" / "dataset.uavr")
         self.assertEqual(meta["aux_sidecar"]["depth"], True)
@@ -466,7 +485,7 @@ class AnalyticCliTests(Fixture):
         self.assertIn("pose_before", r.stderr)
 
     def test_unknown_depth_source_is_rejected(self):
-        r = self.run_pre(self.tmp / "ds", self.eps, "--depth-source", "magic")
+        r = self.run_pre(self.tmp / "ds", self.eps, "--depth-source", "magic", cli=True)  # 真子进程：argparse 报错的退出码 2
         self.assertEqual(r.returncode, 2)
         self.assertIn("--depth-source", r.stderr)
         self.assertIn("invalid choice", r.stderr)
