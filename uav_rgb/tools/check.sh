@@ -3,6 +3,9 @@
 set -euo pipefail
 uav_check_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$uav_check_root/env.sh"
+# 字节码与临时目录不写根分区（只剩几 GB；E-13）：TMPDIR 已设就照用，没设且数据盘的 tmp 在就用它，都没有沿用系统缺省。
+export PYTHONDONTWRITEBYTECODE=1
+if [[ -z "${TMPDIR:-}" && -d "$DATA_ROOT/uav_rgb/tmp" ]]; then export TMPDIR="$DATA_ROOT/uav_rgb/tmp"; fi
 uav_check_build="${UAV_RGB_BUILD_DIR:-$uav_check_root/build/check}"
 uav_check_skipped=()   # 被 SKIP 的段；末行 PASS 要把它们列出来，免得「没检查」被读成「检查过了」（R2-REPRO 2026-11-07）
 
