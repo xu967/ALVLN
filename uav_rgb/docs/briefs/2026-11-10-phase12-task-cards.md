@@ -958,6 +958,40 @@ gz 的上限随核数定（24 核 7 个，12 核 3 个，公共规则 §4），�
     （主线的 `--student-cond` 认不认 9 档码、评测端怎么算 n）。第二轮（闭环，20 个 val 几何 × 3 个训练种子，几何清单用 E2E-R1 冻结的那 20 个）由主会话看过第一轮结果之后定臂。
   - 不做：按偏航平移的列特征缓存与循环单元（等第一轮结果；E2E-0 量到宽视场只多 0.04–0.09）；条件码按角度定义的对照（要固件的偏航估计进数据，另立卡）；改 `proto/` 之外的任何文件；起 Gazebo；在 test 上挑臂。
 
+## 4c. 第二轮交叉审核的修复卡（11-12 08:20 起；清单 `docs/reviews/2026-11-12-review-round2/FIXLIST2.md`）
+
+规矩同第一轮的修复卡：公共规则 §5 的 11-12 四条（一条发现一个提交，说明第一行带发现编号，代码与测试同一个提交）与 §8；缺省行为逐位不变，变了的在报告里单列；每条先红后绿。
+
+### 卡 W1-14b：统计工具的三处补丁（审核 I2-1、I2-3；11-12 08:20 立，可以开工）
+
+- 依据：`docs/reviews/2026-11-12-review-round2/review2-i2.md` 的 I2-1、I2-3（各有最小修法与复现脚本 `$D/tmp/phase12-cards/review2-i2/verify_i2.py`）。
+- 只动 `tools/stats_report.py`、`tools/paired_stats.py` 与它们的测试、`docs/EVAL_STANDARD.md` §5。分支 `p12-w1-14b` 从 main 起。
+  1. I2-1：`load_eval` 在顶层没有 `dynamics_profile` 时从 `per_episode` 取（单值取它，多值拼成排序后的串让一致性检查报错）；`per_episode` 为空而顶层有 `cf_sitl_params` 时用它的 `values_sha256` 前 8 位参与比较。
+     这一条会让以前能出表的输入开始报错（不同固件库的评测混在一张表里）：在报告里列出数据盘上现有的 eval.json 按 `dynamics_profile` 分成哪几桶、哪些已有的出表命令会因此要加 `--allow-mixed-protocol`。
+  2. I2-3：`load_eval` 取出去重后的未完成 seed（`failed` 与 `skipped` 合并），`run_outcomes` 与 `cell_clusters` 共用；`pair_units` 遇到两侧都没有几何号的共同未完成 seed 时只让它单独成簇，不把整张表退回按 seed 聚类；失败记录重复不重复累加分母。
+     验收：审核者的 `TEST 3c`（2 个 run、4 个 seed）下主表与配对表的成功率、聚类键一致。
+  3. 没有跳过集、没有共同失败 seed、`dynamics_profile` 一致的输入，报表逐项不变（沿用卡 W1-14 的对比脚本 `$D/tmp/phase12-cards/w1-14/check_invariance_full.py`，把结果写进报告）。
+- 不做：改 `eval_closed_loop.py`（全失败时顶层写什么，并入卡 W1-13 第二轮）；改三条流水线里自带的简表（卡 W1-15c）。
+
+### 卡 PK1：打包的健壮性（审核 I2-4、I2-6、I2-8 第 2 点、I2-9 第 2 点，第一轮 C7；11-12 08:20 立，可以开工）
+
+- 依据：`review2-i2.md` 的 I2-4、I2-6、I2-8、I2-9（复现脚本同上，`TEST 2a`–`2f`）；第一轮 `review-c.md` 的 C7。
+- 只动 `tools/preprocess.py`、`tools/test_preprocess_*.py`（新测试文件可以加）、`tools/DATASET_FORMAT.md`。分支 `p12-pk1` 从 main 起。
+  1. I2-4：`teacher_crossed_goal` 区分「文件不存在或不是柱阵任务」（仍是不适用）与「文件在但读不懂、数值不是有限数」（报错停下，写清是哪个文件哪一行）；`actions.jsonl` 行数与 `manifest` 不符的检查挪到两个整集过滤之前；
+     某个 split 被过滤跳空时报错（train、val 任一为 0），给一个显式开关才放行。
+  2. I2-6：整集的步被行级过滤全部滤掉时，这一集不进 `episodes`、不进指令侧车，单独计数并打印；每一行自己的 `action_executed` 直接校验是 0–3 的整数，不再靠查上一步；步号有缺口时两种条件（上一步动作、航向码）的处理写成同一个规则并写进 `DATASET_FORMAT.md`。
+  3. C7：行级过滤丢掉某一步之后，下一步的「上一帧」指向自己而条件值不是 SAFE 的组合。先量现有数据集里这种样本有多少（示范集、DAgger 聚合集、两个航向码包），再定是保留现状加文档，还是给这种样本的条件值一个明确的规则；只报数与建议，改不改由主会话定。
+  4. I2-8 第 2 点：解析深度里圆柱补上顶盖与底盖的求交，与方柱一致；相机低于柱顶时（现有全部数据）结果逐位不变，用现有的对拍数据核一遍。
+  5. I2-9 第 2 点：给 `build_meta` 的「几何组跨 split」那道门加一条直接调用的测试。
+- 缺省行为：合法输入下打包结果逐字节不变（用审核者的四集夹具与 0417 的 6 集真实数据各核一遍）。变严的地方（坏文件报错、空 split 报错）在报告里逐条列出。
+
+### 卡 W1-15c：流水线与交付配方的条件通路（审核 I2-2 第 1、3 点、I2-5 第 1、3 点、I2-7；等 `p12-e2e-1` 合进 main、卡 W1-15b 第二轮交回后开工）
+
+- 只动三条流水线、`tools/pipeline_common.py`、`tools/average_ckpt.py`、`sim/tools/nav_cond.py` 里读 `<ckpt>.json` 的那一段与它们的测试。
+  1. I2-2 第 1 点：两条流水线的 `deliver_check` 在 `preflight` 里就拒绝 `average_ckpt` 不支持的配置（文本、双帧；带条件的在 `dc8e5ff` 之后支持），不等采集与训练跑完才报。
+  2. I2-2 第 3 点、I2-7：`dagger_gz_pipeline` 的汇总按请求集报分母（用 `paired_stats.success_counts`），自带的配对检验把失败集记 0；调 `stats_report` 时基线与新臂的协议键不同就传 `--allow-mixed-protocol`，报表照出并带混合协议的表头；`stats_report` 非零退出要进日志并在汇总里写明没有出表。
+  3. I2-5 第 1、3 点：`average_ckpt` 写出的 `.json` 记数据集的条件类型（`meta.cond`）与数据集的绝对路径，改成先写临时文件再改名；流水线判断「校准做完了」时要读得出这个 `.json`；`nav_cond.check_student_cond` 在 `.json` 里有记录时优先用它，不再因为相对路径或数据集被挪走而退化成只警告。
+
 ## 5. 第三波规格（细化后再开工，不要照这一节直接写代码）
 
 | 项 | 要点 | 验收的形状 |
