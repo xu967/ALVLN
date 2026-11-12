@@ -188,7 +188,7 @@ gsplat 用例默认 skip，`RUN_3DGS_REAL=1` 开启）；其余单测全过。
 ## 八、Git 与推送
 
 - `uav_rgb` 本地无 remote；本轮最新提交以 `git log --oneline -1` 为准。
-- 推送走 `ALVLN` 镜像：
+- 推送走 `ALVLN` 镜像。11-12 起用 `bash tools/git_mirror_alvln.sh`（逐个提交重放并推送）；下面手工 rsync 的做法已停用，会弄乱镜像的游标，留着只作记录：
 
 ```bash
 cd /root/claude-code-backup-20261028/code

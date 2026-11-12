@@ -4,22 +4,28 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
+**现行入口（2026-11-12 09:35 加；第二轮审核 O-2、O-8、O-9）**：第十二阶段的通用约定在 `docs/briefs/2026-11-10-phase12-common.md`，计划在 `docs/PLAN_2026-11-10_phase12.md`（先读 §0 与 §10），任务卡在 `docs/briefs/2026-11-10-phase12-task-cards.md`，现状在 `progress.md`。
+本文件下面的状态说明、`docs/HANDOFF.md` 与 `docs/TASKS.md` 大部分写于 11-05 之前（X3 载具、L1 v4），与现行主线（E1 MINI 固件在环、带航向码的端到端学生）不一致的地方以上面四份为准。
+现行的硬约定里与下文冲突的四条：显卡只有一张 `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`（每次以 `nvidia-smi -L` 为准）；命令用 `$UAV_RGB_PYTHON`（`.venv-tools/bin/python`），不用裸 `python3`；输出一律写 `$DATA_ROOT/uav_rgb`，不写 `/tmp`；
+停守护进程用 `bash tools/stop_daemon.sh <输出目录>`，推 GitHub 用 `bash tools/git_mirror_alvln.sh`。
+
 `uav_rgb` 已实现单目 RGB 四动作 CNN、CPU/CUDA 数值算子、Adam、UAVR 数据读取、checkpoint/resume（含按 dev 宏 F1 保存的 `ckpt_best.bin`）、eval-only 复评、Gazebo 专家采集、数据验收闸门（11 条不变量，含标签复算）、常驻推理进程与学生闭环评测。**2026-10-30：T1–T7 全部完成**——T5 采集 599 集 / 23960 步（audit 11/11 PASS）；T6 best 权重 test `acc 0.9186 / macro_f1 0.8589 / bal_acc 0.8497`，四类 recall `[1.000, 0.952, 0.700, 0.747]`；T7 旧版（observation 语义）`SR 0.90`；v1 当前环境复测（observation）`SR 0.90`（18/20）；T7-R（dispatch 语义）`SR 0.55`（11/20）；T5b dispatch 重采重训 `SR 0.60`（12/20），未达 v1−5pp，**不采纳**；v1 observation 是唯一 baseline。A/B 证明 R01 窗口语义是主因（seed 49/57 observation 2/2 vs dispatch 0/2）。v1 与 dispatch 数字禁止混报，以 `docs/HANDOFF.md §4.1` 为准。GRU/语言导航、板端部署尚未实现。**接手先读 [`docs/HANDOFF.md`](docs/HANDOFF.md)**，任务与验收以 [`docs/TASKS.md`](docs/TASKS.md) 为准，实验数字见 `docs/experiments/`。设计规格仍位于 `../ALVLN/references/reviews/UBUNTU_BASE_GUIDE_V1.md`。文档与代码注释保持中文。
 
 Design boundaries that must not be violated:
 - The vision model outputs only four discrete high-level actions: `SAFE_NEUTRAL`, `FORWARD_SLOW`, `YAW_LEFT`, `YAW_RIGHT`. It must never output PWM, motor speeds, or unprotected attitude commands; the ESP32 flight controller keeps final veto.
 - Training/inference are to be self-written C++/CUDA (tensor, ops, trainer, inferencer). No PyTorch, TensorRT, or other training frameworks are part of the plan.
+  例外（用户 2026-11-12 批准）：结构与配方的探索可以在 `proto/` 原型线上用 PyTorch（借 `$DATA_ROOT/uav_rgb/teacher-venv`）；主线 `src/`、`sim/`、`tools/` 不 import 它，原型线的数标 `proto`，交付的训练与推理栈仍是自写的 C++/CUDA。
 - The LicheePi model and ESP32 action protocol are still unconfirmed. Do not assume they support a given input format or FPS.
 
 ## Environment constraints (actual machine, not the spec's assumptions)
 
 **2026-11-09 实测**：显卡又换回 **NVIDIA GeForce RTX 2080 Ti（sm_75，22 GB，驱动 580.119.02）**，与仓库 CMake 写死的 sm_75 一致（原生 cubin，不再走 PTX JIT）。**显卡型号以每次会话开头 `nvidia-smi -L` 为准，不要信文档**：2026-11-06 至 11-07 曾是 RTX 4080 SUPER（sm_89，32 GB，驱动 595.99.02，产物经 PTX JIT 运行），eval3 / sgvis / 森林评测与 0417、截断、sgvis 三个 ckpt 都在那块卡上产生；新臂与它们比之前先同 seed 重跑一臂对拍（`docs/experiments/2026-11-07-e1-demo-plan.md` §3.3 补记）。cgroup 实际 **12 核**（`nproc` 显示 88 不可信，构建 `--parallel 4–8`）。根分区只剩约 4 GB：构建目录、worktree、临时文件一律放 `/root/rivermind-data/uav_rgb/tmp/`。本容器 Gazebo 的 gpu 渲染后端会段错误（EGL 库是 0 字节占位），**只能 `UAVRGB_RENDER_BACKEND=software`**（约 3 s/步）。
 
-**2026-11-10 00:11 起本机两张 RTX 2080 Ti，uav_rgb 只能用一张（用户要求）**：所有用 CUDA 的进程（`uavrgb_train` / `uavrgb_infer` / 3DGS gsplat / torch）都带 `CUDA_VISIBLE_DEVICES=GPU-dbc6435f-4db3-f704-bd1d-3b40bff73a70`（PCI 82:00.0，`nvidia-smi` 1 号，加卡前的 0 号）；按 UUID 钉，不用编号。0 号卡 `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`（02:00.0）留给其它项目（YOLOVOmodal 的 `run_exp.sh` 写死 `CUDA_VISIBLE_DEVICES=0`）。看显存用 `nvidia-smi --id=<UUID>`。Gazebo 走软件渲染，不占 GPU。
+**（这一段已过时，以下一段为准）2026-11-10 00:11 起本机两张 RTX 2080 Ti，uav_rgb 只能用一张（用户要求）**：所有用 CUDA 的进程（`uavrgb_train` / `uavrgb_infer` / 3DGS gsplat / torch）都带 `CUDA_VISIBLE_DEVICES=GPU-dbc6435f-4db3-f704-bd1d-3b40bff73a70`（PCI 82:00.0，`nvidia-smi` 1 号，加卡前的 0 号）；按 UUID 钉，不用编号。0 号卡 `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`（02:00.0）留给其它项目（YOLOVOmodal 的 `run_exp.sh` 写死 `CUDA_VISIBLE_DEVICES=0`）。看显存用 `nvidia-smi --id=<UUID>`。Gazebo 走软件渲染，不占 GPU。
 
 **2026-11-11 19:23 起本机只有一张卡（用户指示：uav_rgb 就放在这一张卡上跑）**：`nvidia-smi -L` 只列出 `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`（上一段写的留给其它项目的那张），`GPU-dbc6435f-…` 不在机器上，按它钉卡时 CUDA 看不到任何设备。这段时间所有用 CUDA 的进程带 `CUDA_VISIBLE_DEVICES=GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`。YOLOVOmodal 的训练（`CUDA_VISIBLE_DEVICES=0`）也落在这张卡上：起实验前看 `nvidia-smi` 的显存占用，3DGS 实验每个驱动进程占 1–4 GB，显存不够时减并行度。`experiments/2026-11-10-*` 里写死的旧 UUID 是冻结的实验记录，不改；新写的入口脚本用当前 UUID。卡的配置再变时以 `nvidia-smi -L` 为准，并向用户确认用哪一张。同一时刻 cgroup 是 12 核、内存上限 62 GB（11-10 晚是 24 核）；`/proc/loadavg` 反映的是宿主机，容器自己的占用看 `/sys/fs/cgroup/cpu.stat`。
 
-The machine has **two NVIDIA GeForce RTX 2080 Ti (sm_75, 22 GiB / 21.49 GiB usable, 68 SM each)** since 2026-11-10; uav_rgb may use only `GPU-dbc6435f-4db3-f704-bd1d-3b40bff73a70` (see above). Not the RTX 5090 described in the spec. (Earlier records said "Tesla T4"; the current device node is `/dev/nvidia0`.)
+The machine has **one NVIDIA GeForce RTX 2080 Ti (sm_75, 22 GiB / 21.49 GiB usable, 68 SM)** since 2026-11-11 19:23: `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740` (see the paragraph above; `GPU-dbc6435f-…` is no longer in the machine, pinning it makes CUDA see no device). Not the RTX 5090 described in the spec. (Earlier records said "Tesla T4"; the current device node is `/dev/nvidia0`.)
 
 - CUDA Toolkit **12.8** at `/usr/local/cuda-12.8`; driver 580.119.02（2026-11-06 至 11-07 曾为 595.99.02）. Do not install CUDA 13.x (driver caps at CUDA 13.0, and Turing/sm_75 gains nothing) and never compile for sm_120.
 - Installed and usable: OpenCV 4.6 (C++), Eigen 3.4, Gazebo Harmonic 8.15 (`gz sim`), CMake 3.28 + Ninja, GCC 13.3, ncu/nsys/cuobjdump/nvdisasm.
@@ -89,7 +95,7 @@ python3 "$UAV_RGB_ROOT/sim/tools/scene_gen.py" --seed 42 --out /tmp/w.sdf   # �
 
 **split 已改为按几何组**（`sim/tools/split_manifest.py`，2026-10-29）：同几何永远同 split，跨 split 交集为 0；旧 `scene_id % 10` 策略在 seed 0..1999 上实测 241 组跨 split，已废弃。旧 FORWARD ≈89% 是旧场景统计，当前密场景的正式分布尚未验收。传感器停更/陈旧位姿处理、学生闭环评测仍缺。详见 `README.md` 和本轮审查记录。
 
-**进程管理**：`pkill -f 'gz sim'` 会杀掉自己的 shell（命令行自匹配）。用 `setsid` + `kill -- -PGID`；残留 `ruby` 按 `comm` 找 PID。
+**进程管理**：`pkill -f 'gz sim'` 会杀掉自己的 shell（命令行自匹配）。用 `setsid` 起，按进程组停。实验入口与流水线自己写 `run.pid`（PID、PGID、启动时刻、命令行），停用 `bash tools/stop_daemon.sh <输出目录>`：它先核对启动时刻再 `kill -- -PGID`，容器重启后 PID 会被别的进程用掉，只凭 PID 停会误杀。残留 `ruby` 按 `comm` 找 PID。
 
 Run the training-monitor UI (native Tkinter desktop app, reads `results.csv` / `metrics.jsonl` directly — no HTTP server, no browser):
 
@@ -137,7 +143,7 @@ The planned pipeline (spec §3) has six interfaces: `SimObservation` (RGB + time
 并列出「已知未修项」，避免重复发现。本文档管环境与边界，`EVAL_STANDARD.md` 管口径。
 
 **Git**：本地仓库在 `.git`；远端是 `git@github.com:xu967/ALVLN.git` 的 `uav_rgb/` 子目录。
-推送在 `../ALVLN`（完整克隆）里做：替换 `uav_rgb/` → commit → push。重新克隆要 12 分钟，别删。
+推送用 `bash tools/git_mirror_alvln.sh`（在 `../ALVLN` 完整克隆里把 main 上的提交逐个重放成镜像提交并推送，靠 `uav_rgb/.mirror_src_commit` 记上次同步到哪）；不要手工 rsync 再提交，那样会把多张卡压成一团并弄乱这个游标。`../ALVLN` 重新克隆要 12 分钟，别删。
 本仓库有并发会话，提交前逐文件确认归属，不要 `git add -A`。
 
 **报任何数字前先读 `docs/EVAL_STANDARD.md`**：离地用 scikit-learn 宏指标（`acc` 单独无效），

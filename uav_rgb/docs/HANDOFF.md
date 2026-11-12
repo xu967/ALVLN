@@ -469,8 +469,8 @@ python3 sim/tools/probe_text_effect.py --src .../l1-v4-relation-500 \
 - 不提交密钥/Token/私钥/`.env`/缓存/日志/临时脚本/生成产物。
 - 不改已推送历史，**禁 `git push --force` / `--force-with-lease`**。
 - 远端是 `git@github.com:xu967/ALVLN.git` 的 **`uav_rgb/` 子目录**。推送走
-  `../ALVLN`（完整克隆，**不要删**，重克隆约 12 分钟）：rsync 替换 `uav_rgb/`
-  → `git add uav_rgb` → commit → push。不要用 partial clone（会卡在 `git-upload-pack`）。
+  `../ALVLN`（完整克隆，**不要删**，重克隆约 12 分钟）：`bash tools/git_mirror_alvln.sh`（11-12 起；逐个提交重放并推送，
+  靠 `uav_rgb/.mirror_src_commit` 记游标；不要手工 rsync 再提交）。不要用 partial clone（会卡在 `git-upload-pack`）。
   推送后核对 `git status --short --branch` 与 `git ls-remote --heads origin`。
 
 ### 其他

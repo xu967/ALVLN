@@ -20,7 +20,7 @@
 6. 硬约束（违反任何一条就不要提交）：
    - C++ 单文件 **≤280 行**、CUDA 单文件 **≤360 行**。超了拆文件，**不许压注释**。
    - 只编 **sm_75**，绝不 sm_120、绝不 `-arch=native`。
-   - 禁 PyTorch / TensorRT / cuDNN / cuBLAS / ROS 2。
+   - 禁 PyTorch / TensorRT / cuDNN / cuBLAS / ROS 2。例外（用户 2026-11-12 批准）：结构探索可在 `proto/` 原型线上用 PyTorch，主线 `src/`、`sim/`、`tools/` 不 import，数标 `proto`。
    - 模型只输出 4 个离散动作；仿真真值（位置、障碍几何、深度）**不进学生输入**，
      只能用来生成教师标签。
    - 数据 split 按场景/几何组，不按帧随机拆。
@@ -58,9 +58,8 @@
 18. 提交信息用可读前缀 `fix:` / `feat:` / `docs:` / `test:` / `chore:`，一次提交一个主题。
 19. **每次提交后构建都必须是绿的**。所以互相依赖的源文件要放进同一次提交
     （典型坑：CMakeLists 引用了还没 `git add` 的新测试文件 → 干净 clone 直接 configure 失败）。
-20. 远端是 `git@github.com:xu967/ALVLN.git` 的 `uav_rgb/` 子目录，推送在 `../ALVLN`
-    里做，流程见 `docs/worklog/2026-10-29-1900-attribution-and-git-baseline.md` 的
-    「维护方式」。**不要用 partial clone**（会卡死），不要强推。
+20. 远端是 `git@github.com:xu967/ALVLN.git` 的 `uav_rgb/` 子目录，推送用 `bash tools/git_mirror_alvln.sh`
+    （11-12 起；在 `../ALVLN` 里逐个提交重放并推送，不要手工 rsync）。**不要用 partial clone**（会卡死），不要强推。
 
 ## 六、清理
 
