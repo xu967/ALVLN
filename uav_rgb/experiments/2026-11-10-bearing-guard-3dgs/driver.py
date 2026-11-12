@@ -43,6 +43,11 @@ config 里 split_from_identity = true 才改成取场景身份里按哈希得到
                        true：每条路线把身份交给 eval_3dgs.eval_split(identity, True)，用它给的 (split, split_policy) 传给 run_episode：哈希 test 的场景仍是
                        ("test", "diag-eval-fixed-test")，train / val 的场景写真实 split 与 "diag-train-scene"（诊断评测，preprocess 默认拒收）。
                        给了这个键（true 或 false），done.json 末尾多记 split 与 split_policy（生效值）；没给就没有，旧产物的键不变。值不是布尔时启动就报错，早于加载场景
+2026-11-12-3dgs-rebaseline（任务卡 S1b）再加的全局可选键（缺省时同样与原版逐位一致，test_driver_collision_model.py 锁定）：
+  collision_model  "v1" | "v2"：传给 collision.from_scene(base, collision_model=…)；不给 = 不传（等于 v1，改动前的判法）。
+                   v2 = 审核 B 的发现 1、2、3：结构元素按欧氏距离、高度按层带取并、每步沿 SITL trace 折线扫（出生检查随之统一成层带口径，
+                   所以 v2 下任何臂的 spawn_two_layer 为 true 都在启动时报错，早于加载场景）。给了这个键，每集 metrics.json 与 done.json
+                   末尾多记 collision_model 与 metric_version（v2 带 +coll.v2 后缀；没给就没有，旧产物的键不变）
 """
 import importlib
 import json
@@ -86,6 +91,16 @@ for _a in ARMS:         # 配置错在加载场景（约 200 s）之前就报，
                          f"spawn_two_layer={_a['spawn_two_layer']!r} jitter={CFG['jitter']!r}")
 if "split_from_identity" in CFG and not isinstance(CFG["split_from_identity"], bool):
     raise ValueError(f"split_from_identity 要是 true / false，得到 {CFG['split_from_identity']!r}")
+
+
+if "collision_model" in CFG:        # 值域与 collision.COLLISION_MODELS 同；同样在加载场景之前报
+    if CFG["collision_model"] not in ("v1", "v2"):
+        raise ValueError(f"collision_model 只能是 v1 或 v2，得到 {CFG['collision_model']!r}")
+    for _a in ARMS:
+        if CFG["collision_model"] == "v2" and _a.get("spawn_two_layer") is True:
+            raise ValueError(f"臂 {_a['name']}：collision_model=v2 的出生检查已是层带口径（B7），不与 spawn_two_layer=true（W1-12 的两层判空）叠用")
+CM_KW = {"collision_model": CFG["collision_model"]} if "collision_model" in CFG else {}      # 没给键就不传：旧配置的调用与原版逐位相同
+METRIC_VERSION = "3dgs.pilot.v2+stop.v1"      # 同 teacher-tol / teacher-clearance 的 analyze.py；v2 口径另加 +coll.v2（collision.metric_version）
 
 
 def log(msg):
@@ -164,7 +179,7 @@ path = os.path.join(CFG["scenes_dir"], SCENE, "scene.json")
 raw_routes = json.load(open(path, encoding="utf-8"))["routes"]
 t0 = time.time()
 base = scene_mod.load_scene(path)
-occ = coll.from_scene(base)
+occ = coll.from_scene(base, **CM_KW)
 renderer = renderer_mod.make_renderer(base, False, None, None, None, "cuda")
 occ_planner = planner_mod.OccPlanner(occ)
 ply_sha = c3._sha256(base["ply_path"])
@@ -283,6 +298,9 @@ for arm in ARMS:
                     with open(os.path.join(ep_dir, "rule.jsonl"), "w", encoding="utf-8") as f:
                         for row in policy.rows:
                             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                if CM_KW:      # 新键追加在最后，给了 collision_model 才有
+                    m["collision_model"] = occ.collision_model
+                    m["metric_version"] = coll.metric_version(METRIC_VERSION, occ.collision_model)
                 with open(os.path.join(ep_dir, "metrics.json"), "w", encoding="utf-8") as f:
                     json.dump(m, f, ensure_ascii=False, indent=1)
                 eps.append({"episode": k, "seed": seed, "steps": m["steps"], "success_stop": m["success_stop"],
@@ -300,6 +318,9 @@ for arm in ARMS:
                 done["spawn_two_layer"] = spawn_kw["spawn_two_layer"]
             if "split_from_identity" in CFG:      # 新键只追加在最后，给了才有；记生效的 split / split_policy（不记开关）
                 done["split"], done["split_policy"] = split, split_policy
+            if CM_KW:
+                done["collision_model"] = occ.collision_model
+                done["metric_version"] = coll.metric_version(METRIC_VERSION, occ.collision_model)
             with open(os.path.join(d, "done.json"), "w", encoding="utf-8") as f:
                 json.dump(done, f, ensure_ascii=False, indent=1)
             log(f"[{g}] r{r} {len(eps)}/{CFG['k']} 集 失败 {len(fails)} 到点 {sum(e['success_stop'] for e in eps)} "

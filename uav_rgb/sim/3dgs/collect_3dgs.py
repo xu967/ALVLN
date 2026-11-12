@@ -259,7 +259,11 @@ def _spawn_two_layer_ok(occ, x, y, z):
 def _spawn_for_episode(scene, occ, jitter_m, rng, two_layer=False):
     """two_layer=False（缺省）：出生位姿与 rng 的消耗顺序与加这个参数之前逐位相同（test_teacher_clearance.py 锁住）。
     True：抖动候选还要过 _spawn_two_layer_ok；被它多拒绝的候选多消耗 rng，所以开关打开后出生位姿序列可以与关闭时不同。
+    collision_model="v2"（B7）：候选只过 occ.collides（层带口径，出生高度压在层边界上也盖到上下两层），
+    不再有两层判空与巡航高度常数 SPAWN_CRUISE_DZ_M；v2 下 two_layer=True 报错（两套办法解同一个问题，不叠用）。
     jitter_m <= 0 时直接返回 scene.spawn，不抽样也不检查。"""
+    if two_layer and getattr(occ, "collision_model", "v1") == "v2":      # getattr：旧调用方与测试的替身占据没有这个属性 = v1
+        raise ValueError("collision_model='v2' 的出生检查已是层带口径（B7），不与 spawn_two_layer（W1-12 的两层判空）叠用")
     s = scene["spawn"]
     x, y, yaw = float(s["x"]), float(s["y"]), float(s.get("yaw_deg", 0.0))
     if jitter_m <= 0:
@@ -270,6 +274,22 @@ def _spawn_for_episode(scene, occ, jitter_m, rng, two_layer=False):
         if not occ.collides(nx, ny, float(s["z"])) and (not two_layer or _spawn_two_layer_ok(occ, nx, ny, float(s["z"]))):
             return nx, ny, yaw + rng.uniform(-10.0, 10.0)
     raise RuntimeError(f"spawn 抖动 {jitter_m} m 内找不到自由点")
+
+
+def _step_collision(occ, p0, p1, trace, n_tr0):
+    """本步碰撞判定，返回 (是否碰, 首个碰撞点或 None)。
+
+    collision_model="v2" 且动力学带 trace（cf_sitl：窗口内每 0.1 s 一个中间位置，末点 = 本步终点）：沿 [起点, 本步的 trace 点]
+    折线逐段扫（B3：hold 1.0 s 时弦外横偏最大 6.8 cm，弦会漏掉擦过的障碍）；trace 末点不是终点时补上终点。
+    v1、没有 trace 的动力学（cf_blackbox）：起点到终点一条弦，与改动前相同。
+    n_tr0：本步开始前 trace 的长度（trace 是整集累积的，只取本步新增的点）。
+    """
+    if getattr(occ, "collision_model", "v1") == "v2" and trace is not None and len(trace) > n_tr0:
+        pts = [tuple(p0)] + [tuple(e["pos"]) for e in trace[n_tr0:]]
+        if pts[-1] != tuple(p1):
+            pts.append(tuple(p1))
+        return occ.sweep_path(pts)
+    return occ.sweep(p0, p1)
 
 
 def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, dagger=None,
@@ -321,6 +341,13 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
         dyn = make_blackbox(scene, dynamics_path, params)
         dyn.x, dyn.y = x, y
         dyn.yaw = math.radians(yaw)
+        # B6：cf_blackbox 的 z 固定（params.z_target_m，缺省 2.0）。占据栅格的高度范围不含它时，每一步都查不到任何占据，
+        # 只剩地面，集永远不撞（室内 z_slice 1.0–1.4 的场景以前静默这样跑）。栅格为空时不查（本来就只有地面）。
+        z_range = getattr(occ, "z_range", None)
+        if z_range is not None and getattr(occ, "grid", np.zeros(0)).size and not (z_range[0] <= dyn.z < z_range[1]):
+            raise ValueError(
+                f"cf_blackbox 的飞行高度固定为 z={dyn.z:g} m，不在占据栅格的高度范围 z_slice=[{z_range[0]:g}, {z_range[1]:g}) 内：碰撞判定"
+                f"查不到任何占据、集永远不会撞。室内等 z_slice 不含 {dyn.z:g} m 的场景请用 --dynamics cf_sitl。")
     else:
         raise ValueError(f"dynamics 必须是 cf_blackbox 或 cf_sitl，得到 {dynamics!r}")
     actions, oracle, render_ms = [], [], []
@@ -376,10 +403,11 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                       else None if policy.name == "student" else action)
             x0, y0, yaw0 = dyn.x, dyn.y, dyn.yaw
             z0 = dyn.z
+            n_tr0 = len(getattr(dyn, "trace", None) or ())      # 本步开始前的 trace 长度（v2 逐段扫只取新增的点）
             state = dyn.step(action, hold_s)
             x, y, yaw = state["x"], state["y"], state["yaw_deg"]
-            # 沿整段位移扫掠（AUDIT #3）：只查终点时 0.69 m 一步能穿过 0.6 m 的障碍。
-            collided, hit_pt = occ.sweep((x0, y0, z0), (x, y, state["z"]))
+            # 沿整段位移扫掠（AUDIT #3）：只查终点时 0.69 m 一步能穿过 0.6 m 的障碍。v2 且有 trace 时沿折线扫（B3）。
+            collided, hit_pt = _step_collision(occ, (x0, y0, z0), (x, y, state["z"]), getattr(dyn, "trace", None), n_tr0)
             # 撞过一次之后机体已在障碍里/穿过障碍，后续画面与标签都不可信：整段都标碰撞（src 区分真撞与穿模）。
             src = "voxel_proxy" if collided else ("post_collision" if hit_once else None)
             hit_once = hit_once or bool(collided)
@@ -552,6 +580,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                               "low_frac": round(n_low_quality / rows_ok, 4) if rows_ok else None},
             "renderer": renderer.stats(),
             "collision_proxy": occ.summary(),
+            "collision_model": getattr(occ, "collision_model", "v1"),      # 碰撞口径（S1b）：v1 = 改动前的判法，v2 = B1 + B2 + B3
             "validity": {
                 # 碰撞提前结束时也认为本集执行过；只要求每步都有帧、无异常。「跑没跑完」看 completed。
                 "camera_verified": bool(all_rgb_ok and rows_ok > 0),
@@ -638,6 +667,9 @@ def main():
     p.add_argument("--spawn-two-layer", action="store_true",
                    help="出生抖动的候选点要在出生高度与巡航高度两层都不碰撞、且净空够（需要 --spawn-jitter > 0；缺省关，"
                         "关时出生位姿与随机数消耗不变）")
+    p.add_argument("--collision-model", choices=collision_mod.COLLISION_MODELS, default=collision_mod.DEFAULT_COLLISION_MODEL,
+                   help="碰撞口径（S1b，交叉审核 B）：v1 = 改动前的判法（缺省，逐位不变）；v2 = 结构元素按欧氏距离、高度按层带取并、"
+                        "每步沿 SITL trace 折线扫（v2 的出生检查已是层带口径，不能再加 --spawn-two-layer）")
     p.add_argument("--teacher-clearance", choices=planner_mod.CLEARANCE_MODES, default="ray",
                    help="占据 A* 教师前向净空检查的形状：ray = 沿机头一条线段（缺省，与以前逐步相同）；swept = 机头线段通过后再沿预测位移"
                         "（加 reserve）做扫掠，教师版本 v3（只用于 --policy astar / student，且 hold 必须是 1.0）")
@@ -657,6 +689,8 @@ def main():
         p.error("--spawn-jitter 必须有限且 >= 0")
     if args.spawn_two_layer and args.spawn_jitter <= 0:
         p.error("--spawn-two-layer 需要 --spawn-jitter > 0（抖动为 0 时不抽样，开关没有作用，manifest 却会记成开）")
+    if args.spawn_two_layer and args.collision_model == "v2":
+        p.error("--collision-model v2 的出生检查已是层带口径（B7），不与 --spawn-two-layer（W1-12 的两层判空）叠用")
     if args.teacher_clearance != "ray":
         if args.policy not in ("astar", "student"):
             p.error(f"--teacher-clearance {args.teacher_clearance} 只用于 --policy astar / student（占据 A* 教师）")
@@ -682,8 +716,8 @@ def main():
     # 高斯源只读一次 PLY：飞行层占据 + 飞行层以下的 ToF 地形层（AUDIT_SIM #2 打标）共用。
     gaussians = (scene_mod.read_gaussian_ply(scene["ply_path"])
                  if scene.get("collision", {}).get("source", "gaussians") == "gaussians" else None)
-    occ = collision_mod.from_scene(scene, gaussians=gaussians)
-    terrain = collision_mod.terrain_from_scene(scene, gaussians=gaussians)
+    occ = collision_mod.from_scene(scene, gaussians=gaussians, collision_model=args.collision_model)
+    terrain = collision_mod.terrain_from_scene(scene, gaussians=gaussians)      # ToF 地形层只打标，不参与碰撞判定，口径不变
     del gaussians
     route_name = (scene.get("route") or {}).get("name")
     renderer = renderer_mod.make_renderer(scene, args.mock_renderer, args.width,
@@ -753,6 +787,7 @@ def main():
         "split": split, "split_policy": split_policy,
         "policy": args.policy, "steps": steps, "hold_s": hold,
         "teacher_clearance": args.teacher_clearance, "spawn_two_layer": args.spawn_two_layer,
+        "collision_model": args.collision_model,
         "dagger": dagger,
         "dynamics": args.dynamics,
         "dynamics_profile": params.profile(),

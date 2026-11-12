@@ -152,15 +152,20 @@ def yaw_tol_deg(hold_s):
 
 
 class OccPlanner:
-    """Occupancy -> 2D 硬栅格（膨胀占据，沿 z 任一层）+ 软余量代价；plan() 在裁剪窗口上跑 A*。"""
+    """Occupancy -> 2D 硬栅格 + 软余量代价；plan() 在裁剪窗口上跑 A*。
 
-    def __init__(self, occ, margin_m=MARGIN_M, margin_cost=MARGIN_COST):
+    硬栅格（B4）：collision_model="v1" 是膨胀占据沿 z 各层取并（改动前的做法，z 不起作用）；
+    "v2" 是飞行高度 z 处的层带取并（与碰撞判定同一个口径，Occupancy.planning_grid），z 缺省取 occ.cruise_z（= scene.spawn.z）。
+    z 放在最后，位置参数的旧调用方不受影响。
+    """
+
+    def __init__(self, occ, margin_m=MARGIN_M, margin_cost=MARGIN_COST, z=None):
         if occ.grid.size == 0:
             raise ValueError("占据栅格为空，无法规划")
         self.occ = occ
         self.voxel = float(occ.voxel)
         self.origin = np.asarray(occ.origin[:2], dtype=np.float64)
-        self.hard = occ.grid.any(axis=2)
+        self.hard = occ.planning_grid(z)
         k = int(round(margin_m / self.voxel))
         self.soft = _dilate2d(self.hard, k) & ~self.hard
         self.cost = np.where(self.soft, float(margin_cost), 0.0)
