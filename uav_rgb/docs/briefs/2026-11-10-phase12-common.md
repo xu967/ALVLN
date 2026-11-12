@@ -113,6 +113,9 @@
 
 - 超过几分钟的实验一律守护进程：`setsid nohup bash run.sh > /dev/null 2>&1 < /dev/null &`；脚本自己写 `run.pid`、追加 `run.log`、结束落 `DONE`（rc 加时间）；
   开头 `flock -n` 互斥。样板：`experiments/2026-11-10-action-latency/run_r2.sh`（11-12 起；原先点名的 `heading-guard/run.sh` 的 DONE 只反映汇总脚本的退出码，不要照它写）。
+  2026-11-12 08:05 起（卡 W1-15a 合并之后）：新入口从 `experiments/_template/run.sh` 起步（说明在同目录 `README.md`），`source tools/exp_lib.sh`，只写配置区与自己的臂。
+  实例锁、带启动时刻的 `run.pid`、冻结代码、只追加的起跑记录 `launches.log`、按池拿锁、Gazebo 池的起跑条件（缺省低于 8 核、最多等 600 s）、每个臂的 cgroup 快照、反映臂失败的 `DONE` 都由它负责。
+  评测命令行的参数可以照 `run_r2.sh` 的 `acc_job`；它的锁与等空闲的外壳不要再抄。要同时轮询几把锁的入口（独占标定）设 `POOL none` 自己管锁。
   启动后用 `ps -o pid,pgid,etime,cmd` 确认活着。
   2026-11-12（交叉审核 E）新入口脚本另守五条：起跑时把代码冻结到输出目录（`git archive`），之后只从冻结副本里跑；起跑记录（HEAD、输入文件的 sha、被环境变量覆盖过的配置项）只追加不覆盖；
   正式运行遇到覆盖配置的环境变量，要么拒绝，要么逐个写进起跑记录；先拿实例锁，再写任何状态文件；DONE 的 rc 要反映臂的失败。
@@ -122,6 +125,8 @@
 - 停进程只按 PGID：`kill -- -<PGID>`，禁止 `pkill -f`。结束前确认没有自己起的残留进程。
   2026-11-12（交叉审核 E-4）：容器重启之后 PID 会被重新分配，旧的 `run.pid` 可能指向别的进程。停之前先核对：`ps -o lstart=,args= -p <PID>` 的启动时刻晚于容器启动（`ps -o lstart= -p 1`），
   并且命令行是自己的入口脚本。对不上就说明那个守护进程已经不在了，不要 kill。
+  2026-11-12 08:05 起：用 `exp_lib.sh` 起的守护进程一律 `bash tools/stop_daemon.sh <输出目录>` 停。它核对 `run.pid` 里的 PID 现在的启动时刻、命令行、进程组都与记录一致才发 TERM，对不上就不杀；不会自动升级成 KILL。
+  旧入口留下的只有 PID 的 `run.pid` 它不认（rc=2），仍按上面的办法人工核对后 `kill -- -<PGID>`。
 - 评测数字带 `metric_version`；分母用请求集数。
 
 ## 7. 交付
