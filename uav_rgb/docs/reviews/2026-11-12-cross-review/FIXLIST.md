@@ -139,7 +139,7 @@
 | C4 | 条件码的维度写死成 4，翻转增强里的镜像规则写死成左转与右转互换 | `src/trainer_dev.cpp:47-59`、`:150-151`；`src/aux_sidecar.cpp:104`；`sim/tools/student.py:76-78` | 读代码确认 | 加宽历史码（E2）要先改这里 | 卡 E2E-C1 |
 | C5 | 深度辅助头接在 FiLM 之后，辅助损失的梯度会把条件调制往「与条件无关」的方向拉 | `src/include/uavrgb/model.hpp:37-39`；`src/model_dev_aux.cu:53`、`:79-82` | 读代码确认；影响是推断 | 条件输入与几何辅助头一起用（E2）时互相抵消 | 卡 E2E-C1：辅助头可选接在 FiLM 之前。先在 PyTorch 原型线上比两种接法 |
 | C6 | 平均后的权重做 `--eval-only` 时，碰撞过滤静默回落到命令行缺省；`average_ckpt.py` 自己总是剔除碰撞步，不看契约 | `src/train_main.cpp:200-218`；`tools/average_ckpt.py:154-171` | 读代码确认 | 离线指标的口径可能与训练时不同 | 卡 E2E-C1 进展：C++ 一侧已修（卡 C1a，`e7ee56d`，11-12 09:03 合入 `a9fa8b4`）：碰撞口径取自同目录 config 与 checkpoint 的训练契约，两处都没有或矛盾就拒绝。工具一侧（`average_ckpt.py`、`select_ckpt.py`）归卡 W1-15c。 |
-| C7 | 打包时丢碰撞步会造出「上一帧等于自身、条件值不是 SAFE」的组合，只在训练里出现 | `tools/preprocess.py:258-263`、`:858-861` | 读代码确认 | 小 | 记录在案，随 W1-13 的 `preprocess` 改动一起看 |
+| C7 | 打包时丢碰撞步会造出「上一帧等于自身、条件值不是 SAFE」的组合，只在训练里出现 | `tools/preprocess.py:258-263`、`:858-861` | 读代码确认 | 小 | 记录在案，随 W1-13 的 `preprocess` 改动一起看 进展（11-12 09:52）：卡 PK1 在四个数据集上量了「上一帧索引指向自己且条件不为 0」的样本，占 0.02%–0.12%（demo 2/9,663，DAgger 第 3 轮 22/20,291，两份航向码包 10/9,663 与 20/20,291）。主会话定：单帧阶段不改（航向码不能置 0，那样会抹掉真实的累计偏航）；做双帧的时候再保留被丢掉的帧供索引。 |
 | C8 | 辅助头的分带语义与文本词表不进 checkpoint | `src/include/uavrgb/checkpoint.hpp:4-24`；`src/include/uavrgb/text.hpp:3-11` | 读代码确认 | 词表或分带改了不会被发现 | 卡 E2E-C1 |
 | C9 | 双帧顺序与条件字节没有「训练路径等于推理路径」的回归测试 | `src/tests/test_infer_io.cpp:112-118`；`tools/check_input_parity.py` | 读代码确认 | 测试缺口 | 卡 E2E-P0 的前向对拍覆盖了一部分；回归测试并入 E2E-C1 |
 
