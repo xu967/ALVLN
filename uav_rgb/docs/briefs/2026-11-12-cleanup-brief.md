@@ -127,3 +127,16 @@
    - 删完之后的死链清单接着第一轮的（94 处）更新，交主会话（归卡 DOC1）。
    - 验证：删掉的文件没有被任何代码 import 或调用（`git grep`）；剩下的实验测试逐个跑一遍；`tools/check.sh --python-only`（守护脚本排 `check.lock`）rc=0；`git status --short` 为空。
 - 报告 `$D/tmp/phase12-cards/reports/cln2-b.md`，草稿 `$D/tmp/phase12-cards/cln2-b/`，过程文档 `docs/worklog/2026-11-12-<HHMM>-cleanup-round2.md` 在 `p12-cleanup2` 上提交。
+
+### 5.4 第二轮交回之后的定案（11-12 19:45，主会话）
+
+- 卡 CLN2-B 交回：工作树移除 37 个（分支保留）；仓库删 10 个文件 1988 行，已合并（`426198d`，合并前的标签 `pre-cleanup2-20261112`）。
+- 拿不准的六组都留：`recipe-stability/test_recheck_sweep.py`（结果记录点名的归档件）；`w1-13-newprotocol` 的演练脚本与桩（卡 W1-13 第三轮在做）；
+  `sim/assets/campus_textures/` 与 `sim/worlds/campus_textures/` 的六张图（后三张是生成脚本的输出，共 48 KB，数据盘上已生成的世界文件会不会按路径引用没查）；
+  三份 11-12 的实验解读文档；第一轮恢复的 8 份调研与场地文档。
+- 以后再跑引用图：根集合加上 `experiments/*/README.md` 与 `experiments/*/RESULT.md`，引用源加上 `$D/3dgs-scenes/*/scene.json`。
+- 永久保留、不再评：`docs/experiments/3dgs-site-*.md`、`docs/RESEARCH_2026-11-07_fastlab_*.md`、`docs/RESEARCH_BACKLOG_2026-11-04.md`（用户要的调研）。
+- 工作树：`wt/p12-w1-9` 等卡 E2E-1 合并后移除；`wt/p12-rulev1` 留（`experiments/2026-11-10-rule-oracle-v1/summarize.py` 缺省从它读代码）；`wt/p12-longcourse` 的两个漏合的提交已合进 main（`7b5b2ca`），工作树可以移除。
+- 卡 CLN2-C（同一个执行者接着做）：数据盘上 15 个有未提交文件的老工作树，先把未提交的内容存档到 `$D/archive/wt-salvage-20261112/<名>/`（补丁、未跟踪文件的包、哈希），在临时检出上核对能逐字节还原，再 `git worktree remove --force`；
+  `wt-sim-dyn` 的 `sim/tools/cf_sitl_sweep.py` 与 `wt-teacher-3dgs` 的 `sim/3dgs/test_teacher_occ.py` 等 main 里没有的内容由存档保住。`tmp/cursor-1110/wt` 与 `wt-r1` 是别的会话的，不动，等用户定。
+- 死链 139 处交卡 DOC1（19:46 派）。`experiments/2026-11-12-e2e-heading-code/test_prepare_rehearsal.py` 有 1 个用例偶发失败（根因没查），等卡 E2E-1 的执行者交回时交给它。
