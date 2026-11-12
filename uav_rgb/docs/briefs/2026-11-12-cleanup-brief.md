@@ -65,3 +65,65 @@
 - 报告 `$D/tmp/phase12-cards/reports/cleanup.md`，中文，边做边写；过程文档 `docs/worklog/2026-11-12-<开工时刻>-cleanup.md` 在 `p12-cleanup` 上提交（做了什么、没做什么与原因、待确认、验证到哪一步、风险与遗留）。
 - 写作：不用程度副词，不用套话，不用破折号作同位语；数字要有出处；没核实的写「未核实」。
 - 最后给主会话的回复不超过 30 行：仓库删了几类、各多少份、多少行，分支与提交号；数据盘「删」「可瘦身」「问」各多少 GB、最大的十项；工作树里能移除的有几个、多大；拿不准的清单在哪；验证结果。
+
+## 5. 第二轮（2026-11-12 17:05 立；用户 16:56：「加派 agent 去审核删除多余的结果文件、测试脚本、日志什么的，没有用的都可以删除了」）
+
+- 第一轮的结果：仓库删了 157 个文件（合并 `40fd9a3`，恢复其中 8 份 `d33a114`）；数据盘清单 `$D/tmp/cleanup-20261112/manifest.{tsv,md}` 里「删」类 230 项，主会话 16:22 批准并删了 225 项，21.7 GiB
+  （批准记录 `approval_notes_1112.md`，删除记录 `deleted.log`）。数据盘可用 40 GB，根分区可用 2.5 GB（紧）。没动的：「可瘦身」26 项、「问」59 项、72 个登记的 git 工作树（70 条分支里 58 条已全部进 main）。
+- 这一轮分两张卡，都只动 uav_rgb 的东西（范围同第 0 节：数据盘 `$D`，仓库与它的工作树 `/root/claude-code-backup-20261028/code/{uav_rgb,wt}`；别的项目一律不看不动）：
+  CLN2-A 管数据盘，CLN2-B 管 git 工作树与仓库。
+- 机器现在很挤：12 核与磁盘是与用户另外两个项目共用的，IO 压力高。统计一律 `ionice -c3 nice -n 19`，同一时刻只跑一个 `du` / `find` / `sha256sum`；第一轮量过的大小直接用清单里的，不重量。
+
+### 5.1 现在在用的，一律不进任何删除或瘦身清单
+
+- `$D/tmp/phase12-cards/` 里：`reports/`、四把锁、两份 `HANDOFF-*.md`，以及正在做的卡的草稿目录
+  `s1b`、`w1-15c`、`dep1`、`t2a`、`e2e-1`、`e2e-p0`、`e2e-p1`、`p1b`、`p1c`、`w1-10`、`bl1`、`bl2`、`bl3`、`bl4`、`cleanup`、`cln2-a`、`cln2-b`。
+- 第十二阶段的全部实验输出目录（`exp-*2026111[0-2]*`、`exp-2026-11-12-*`）：有的正被别的卡读（样本外补评读 `exp-e2e-heading-code-20261112` 的冻结代码与权重；原型线读 `exp-proto-p1-20261112` 的逐轮权重；
+  开源对比读 K1 的三个目录），这一轮整个不动，只在清单里记「以后可瘦身多少」。
+- 基础设施：第一轮 `keep.txt` 与脚本内置名单里的全部（venv、`3dgs-scenes`、`datasets`、`baselines`、`bin-snapshots`、`torch-cache`、`tmp/build-cf-sitl*`、`tmp/agent6-distill/trunc`、`exp-dagger-gz-20261109`、
+  `exp-student-select-20261109`、`exp-swa-calib-20261110`、`e1-pipeline-20261107-0417*`、`pubdata/sage3d` 等），外加 `tmp/phase12-20261110/`（主会话的脚本与日志）、`tmp/cleanup-20261112/`、
+  `tmp/build-check-main-1112`、`tmp/build-check-main-1112-cf-sitl`（全量检查的构建缓存）。
+- 工作树：当前 12 张卡的工作树（`wt/p12-s1b`、`p12-w1-15b`、`p12-dep1`、`p12-pk1`、`p12-e2e-1`、`p12-e2e-p0`、`p12-e2e-p1`、`p12-e2e-p1b`、`p12-w1-10`、`p12-bl2`、`p12-bl3`、`p12-bl4`）、
+  主会话的 `wt/merge-try` 与 `wt/check-main`、主工作树。
+- 旧 teacher 线的数据（`ds-teacher400`、`teacher-400-20261102`、`teacher-600-20261102`、`teacher-1000-merged`、`runs`）：等用户定 `teacher/` 这条线的去留，这一轮不动。
+
+### 5.2 卡 CLN2-A：数据盘第二批（只出清单与脚本，不删；主会话逐项核对后执行）
+
+数据盘上的东西删了找不回，所以执行权仍在主会话。你把「审核」做扎实，让主会话照着清单就能放心执行。
+
+1. 第一轮「可瘦身」里第十二阶段之前的 10 项（`xeval-3dgs-20261109`、`tmp/agent6-viz-layout`、`tmp/agent4-teacher-p1`、`3dgs-smoke-20261107`、`exp-teacher-3dgs-20261109`、`xeval-3dgs-20261109-teacher-h05`、
+   `exp-viz3-20261110`、`campus-paired-20261103`、`demo-e1-20261110`、`e1-pipeline-20261107-0417-eval3`；`tmp/cursor-1110` 里有两个登记的 git 工作树，归 CLN2-B，其余部分归你）：
+   逐项给出要删的路径（目录或带通配规则展开后的文件清单），只删逐步的图像帧、未压缩的原始帧、已被成片取代的旧视频；`eval.json`、`summary*`、`manifest*`、`actions.jsonl`、`oracle.jsonl`、`trace`、`DONE`、日志、成片 mp4、
+   每集的首帧都留。第一轮的草稿里有量好的分项（`$D/tmp/phase12-cards/cleanup/slim_breakdown.json`、`measure_slim_savings.py`），先用它。
+   每一项写明：留下的东西够不够复原结论（哪份文档引用了它的哪个数）。
+2. 已经合并、不在 5.1 名单里的第十二阶段任务卡草稿目录（`$D/tmp/phase12-cards/` 下的 `w1-0` 到 `w1-9`、`w1-11` 到 `w1-15b`、`k1`、`k3`、`c1a`、`pk1`、`t1`、`s1a`、`e2e-0`、`e2e-r1`、`e2e-1-cluster`、
+   `review-*`、`review2-*`、`tmp-*`、`check-queue-sonnet`）：只列其中的大件，逐目录给出「删哪些子路径、各多大、留什么」。可删的是：构建目录、代码副本树（冻结副本、变异检查用的副本、基线快照）、`tmp/` 子目录、重复的数据副本、逐帧图像。
+   留的是：`red/`、`green/`、各种日志、脚本、json 与 md 结果、`OWNER`（报告拿它们作证据）。某个子路径被报告 `reports/<卡>.md` 当作证据点名，就留。
+3. 第一轮「问」里的：`downloads`（逐个大文件核对它在 `3dgs-scenes` 里有没有同 inode 或同 sha256 的副本，有才列为可删；重新下载的代价写明：11-09 记录过 Inria 直连 29 KB/s）；
+   `pubdata/extract-airsim10k`（核对 `airsim10k-uavr` 确实是它打包出来的、`HANDOFF.md` 里确认不需要的那句话在哪一行）；11-10 19:00 之后留下的 nvcc 中间文件与 `tmp/tmp*` 残留（核对没有进程在用、不是今天的执行者正在写的）；
+   `tmp/phase12-cards/tmp-*` 与 `check-queue-sonnet`。
+4. 第一轮之后新出现或当时因为在用而留下的：`tmp/build-p12-c1a`、`tmp/build-p12-t1`（两张卡都已合并）、`tmp/build-check-main-1111*`（被 1112 取代）、`tmp/build-student-select`，以及 `$D` 顶层与 `$D/tmp` 下第一轮清单里没有的新条目（逐个说明是什么、谁建的、还在不在用）。
+5. 日志：`$D` 下体积在 5 MiB 以上的 `*.log` 列一张表（路径、大小、属于哪个实验、还有没有文档引用），已结束实验的超大逐步日志可以列为可删或可压缩，结论性的日志（`run.log`、`launches.log`、汇总日志）留。
+- 交付（都放 `$D/tmp/cleanup-20261112/round2/`）：`manifest2.tsv` 与 `manifest2.md`（每条：路径、大小、分类、依据、留下什么）；`approved2_candidate.txt`（一行一个要删的绝对路径，可以是 5.1 之外目录内部的子路径）；
+  `delete_approved2.sh`：在第一轮脚本的四项核对之上，保护名单换成 5.1（内置），允许删保护名单之外目录的内部子路径，拒绝任何落在保护名单内或是其上级的路径，支持 `--dry-run`，照第一轮的办法在假目录树上演练并把真实输出贴进报告；
+  用候选清单跑一遍 `--dry-run` 的日志。报告 `$D/tmp/phase12-cards/reports/cln2-a.md`，草稿 `$D/tmp/phase12-cards/cln2-a/`。
+- 这张卡不提交仓库文件（脚本在数据盘上）；过程文档写在报告末尾三节里，主会话收进自己的过程文档。
+
+### 5.3 卡 CLN2-B：git 工作树与仓库第二批
+
+1. 工作树（72 个登记的；`/root/claude-code-backup-20261028/code/wt/` 在根分区上共 546 MB，根分区只剩 2.5 GB；另有 `$D/tmp/wt-*` 与 `$D/tmp/cursor-1110/{wt,wt-r1}`）：逐个列表（路径、分支或游离的提交、大小、
+   是否已全部进 main、工作树是否干净含未跟踪文件、有没有进程的工作目录或打开的文件在里面、是不是某个还要用的冻结代码来源）。
+   同时满足下面五条的可以由你直接移除（`git worktree remove <路径>`，不带 `--force`；分支一律保留，不删分支）：
+   不在 5.1 的名单里；HEAD 是 main 的祖先（`git merge-base --is-ancestor`）；`git status --porcelain --untracked-files=all` 为空；`/proc/*/cwd` 与 `/proc/*/fd` 里没有它下面的路径；
+   它的路径不出现在任何还没有 `DONE` 的实验输出目录的 `launches.log`、`config.env`、`inputs.txt` 里。移除前把清单写进报告，逐个移除、逐个记一行（时刻、路径、分支、HEAD、移除前的大小）。
+   不满足的不动，列出来并写清卡在哪一条（比如有未提交的改动：列出是哪些文件）。
+2. 仓库（分支 `p12-cleanup2`，新工作树 `/root/claude-code-backup-20261028/code/wt/p12-cleanup2`，从 main 起；`git rm`，一类一个提交，找回办法照第 2 节）：
+   - 实验测试脚本（第 2 节的 c 类，判定条件不变）：第一轮之后跑完并已合并的实验，例如 `experiments/2026-11-12-decidability-audit/`、`experiments/2026-11-12-recipe-stability/` 的 `test_*.py` 与桩。
+     还没合并的分支在动的实验目录不碰（先 `git diff --name-only main...<分支>` 把 `p12-s1b2`、`p12-w1-15c`、`p12-dep1`、`p12-t2a`、`p12-e2e-1`、`p12-e2e-p0`、`p12-e2e-p1b`、`p12-w1-10`、`p12-bl2`、`p12-bl3`、`p12-bl4` 碰到的文件列出来）；
+     `experiments/2026-11-12-e2e-heading-code/`（样本外补评在用）、`experiments/2026-11-11-soc100-parity/`、`experiments/2026-11-12-3dgs-rebaseline/`、共用驱动的 `test_driver_*.py` 这一轮都留。
+   - 第一轮恢复的 8 份（`docs/experiments/3dgs-site-*.md`、`docs/RESEARCH_2026-11-07_fastlab_*.md`、`docs/RESEARCH_BACKLOG_2026-11-04.md`）不删。
+   - 仓库里跟踪着的结果文件、日志、图片：列一张表（路径、大小、谁引用）。被 `RESULT.md` / `README.md` 点名的结果文件留；没人引用的才删。
+   - 再跑一遍第 2 节的引用图（根集合不变，传递一层），看今天的合并之后有没有新变成无引用的文档；`docs/worklog/` 里 11-10 之后的仍然都留。
+   - 删完之后的死链清单接着第一轮的（94 处）更新，交主会话（归卡 DOC1）。
+   - 验证：删掉的文件没有被任何代码 import 或调用（`git grep`）；剩下的实验测试逐个跑一遍；`tools/check.sh --python-only`（守护脚本排 `check.lock`）rc=0；`git status --short` 为空。
+- 报告 `$D/tmp/phase12-cards/reports/cln2-b.md`，草稿 `$D/tmp/phase12-cards/cln2-b/`，过程文档 `docs/worklog/2026-11-12-<HHMM>-cleanup-round2.md` 在 `p12-cleanup2` 上提交。
