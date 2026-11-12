@@ -140,3 +140,15 @@
 - 卡 CLN2-C（同一个执行者接着做）：数据盘上 15 个有未提交文件的老工作树，先把未提交的内容存档到 `$D/archive/wt-salvage-20261112/<名>/`（补丁、未跟踪文件的包、哈希），在临时检出上核对能逐字节还原，再 `git worktree remove --force`；
   `wt-sim-dyn` 的 `sim/tools/cf_sitl_sweep.py` 与 `wt-teacher-3dgs` 的 `sim/3dgs/test_teacher_occ.py` 等 main 里没有的内容由存档保住。`tmp/cursor-1110/wt` 与 `wt-r1` 是别的会话的，不动，等用户定。
 - 死链 139 处交卡 DOC1（19:46 派）。`experiments/2026-11-12-e2e-heading-code/test_prepare_rehearsal.py` 有 1 个用例偶发失败（根因没查），等卡 E2E-1 的执行者交回时交给它。
+
+### 5.5 卡 CLN2-C 交回之后（11-12 20:52，主会话）
+
+- 数据盘上 15 个有未提交文件的老工作树已移除，`wt/p12-longcourse` 与 `wt/p12-cleanup2` 也已移除（后一个由主会话 20:51 移除）。分支都保留。登记的工作树从 72 个降到 23 个（含主工作树）。
+- 存档 `$D/archive/wt-salvage-20261112/`（2.0 MB，15 个子目录，每个有补丁、未跟踪文件的包、哈希与还原核对的记录；`restore.sh` 与 `README.md` 说明怎样还原）。
+  移除前与移除后各做了一遍还原核对：189 个脏文件里 188 个的哈希与可执行位一致，1 个已删文件确实不存在。
+- **`$D/archive/` 进保护名单，任何清理都不碰。** 下面这些内容只有存档这一份，仓库的任何分支里都没有：
+  `wt-sim-dyn` 的 `sim/tools/cf_sitl_sweep.py`（469 行）；`wt-teacher-3dgs` 的 `sim/3dgs/test_teacher_occ.py`（528 行）与 `planner.py`、`collect_3dgs.py` 的改动（一版没做完的 `astar_occ_tol`，任务卡里写过只作参考、不合并）。
+- 被移除的工作树还被这些入口脚本当缺省的源码目录：`experiments/2026-11-10-long-course/{calibrate_timing,run,run_v2}.sh` 的 `SRC=`（`wt/p12-longcourse`）；CLN2-B 报告 1.7 节另列了 13 处。
+  这些实验都已跑完；要重跑，先用 `$D/tmp/phase12-cards/cln2-b/worktrees_restore.sh <名字片段>` 把工作树建回原路径。
+- `$D/tmp/build-student-select` 的源码目录随 `wt-student-select` 一起没了，里面的 `uavrgb_train` 二进制被 E2E 的实验记录引用，留着不清。
+- 没动、等用户定：`tmp/cursor-1110/wt` 与 `tmp/cursor-1110/wt-r1`（别的会话的工作树）。等卡 E2E-1 合并后移除：`wt/p12-w1-9`。
