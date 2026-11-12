@@ -187,12 +187,102 @@ class ResumeAndReuseTests(unittest.TestCase):
         # 中断写出的半成品（eval_closed_loop 收到 SIGTERM 写 partial=true）：续跑要挪开重评，不能当评完跳过
         self._write("eval/eval.json", {"failed_count": 0, "episodes_done": 7, "partial": True})
         self.assertFalse(dg.eval_done(edir))
+        # E-8：被跳过或截短的评测不算评完；metric_version 或 ckpt 对不上当前配置时也不算评完
+        self._write("eval/eval.json", {"episodes_requested": 20, "episodes_done": 5, "failed_count": 0, "skipped_count": 15})
+        self.assertFalse(dg.eval_done(edir))
+        self._write("eval/eval.json", {"episodes_requested": 20, "episodes_done": 12, "failed_count": 0, "skipped_count": 0})
+        self.assertFalse(dg.eval_done(edir))
+        ck1, ck2 = self._write("a.bin", text="a"), self._write("b.bin", text="b")
+        self._write("eval/eval.json", {"episodes_requested": 2, "episodes_done": 2, "failed_count": 0, "skipped_count": 0,
+                                       "metric_version": "sim09.v2.coast1s", "ckpt": ck1})
+        self.assertTrue(dg.eval_done(edir, metric_version="sim09.v2.coast1s", ckpt=ck1))
+        self.assertFalse(dg.eval_done(edir, metric_version="sim09.v2.coast1s.corridor3m", ckpt=ck1))
+        self.assertFalse(dg.eval_done(edir, metric_version="sim09.v2.coast1s", ckpt=ck2))
+        # E-8：reusable 基线如果本身是被跳过截短的 eval.json，不能当可复用基线放行
+        trunc_base = self._baseline("trunc_base", eval={"episodes_requested": 20, "episodes_done": 2, "skipped_count": 18})
+        ok, _why = dg.reusable(trunc_base, seeds={1, 113}, metric_version="sim09.v1.coast1s",
+                               plugin_sha="plug-a", infer_sha="infer-a", profile="cf_sitl_v1:683e7400")
+        self.assertFalse(ok)
 
     def test_collect_done_is_manifest(self):
         col = os.path.join(self.tmp, "col")
         self.assertFalse(dg.collect_done(col))
         self._write("col/collection_manifest.json", {"episodes_ok": 1})
         self.assertTrue(dg.collect_done(col))
+
+    def test_partial_collect_ds_and_train_retired_on_resume_and_rename_failure_stops(self):
+        """E-9：半成品采集 / 打包 / 训练目录自动挪成 *.partial-<时刻> 后重做，记进 retired_dirs.jsonl；
+        改名失败时停下报错，不在旧目录上重做。"""
+        out = os.path.join(self.tmp, "out")
+        os.makedirs(out)
+        dg.pc.lock_out(out)
+        self.addCleanup(dg.pc.unlock_out)
+        saved_cfg, saved_run, saved_dry = dict(dg.CFG), dg.run, dg.DRY
+        self.addCleanup(lambda: (dg.CFG.clear(), dg.CFG.update(saved_cfg),
+                                 setattr(dg, "run", saved_run), setattr(dg, "DRY", saved_dry)))
+        dg.DRY = False
+        dg.CFG.update(gz_total_max=0, deliver="best", epochs=2)
+        settings = dict(hold=1.0, window_from="observation", dynamics="cf_sitl", vehicle="e1_mini",
+                        tiebreak="legacy", stop_at_goal=False)
+        calls = []
+
+        def fake_run(cmd, **_kw):
+            first = os.path.basename(cmd[0])
+            tool = first if first == "uavrgb_train" else os.path.basename(cmd[1])
+            target = _flag(cmd, "--out")
+            self.assertFalse(os.path.exists(target), f"{target} 应已让空")
+            calls.append(tool)
+            if tool == "collect_parallel.py":
+                os.makedirs(target, exist_ok=True)
+                dg.write_json(os.path.join(target, "collection_manifest.json"),
+                              {"episodes_ok": 4, "episodes_requested": 4, "steps_completed_total": 40,
+                               "splits": {"train": ["5101"], "val": [], "test": []}, "end_to_end_wall_s": 1.0})
+            elif tool == "preprocess.py":
+                os.makedirs(target, exist_ok=True)
+                open(os.path.join(target, "dataset.uavr"), "wb").close()
+            elif tool == "uavrgb_train":
+                os.makedirs(target, exist_ok=True)
+                open(os.path.join(target, "ckpt_best.bin"), "wb").close()
+                with open(os.path.join(target, "metrics.jsonl"), "w", encoding="utf-8") as f:
+                    f.write('{"event":"status","message":"done: 1"}\n')
+            return 0
+
+        dg.run = fake_run
+        col = os.path.join(out, "round_1", "collect")
+        ds = os.path.join(out, "round_1", "ds")
+        run_dir = os.path.join(out, "round_1", "run")
+        self._write("out/round_1/collect/logs/partial.log", text="half-col")
+        self._write("out/round_1/ds/tmp.part", text="half-ds")
+        self._write("out/round_1/run/ckpt.bin", text="half-run")
+        ep_dir = self._write("ep0/episode_manifest.json", {"seed": 1})
+        dg.collect_into(col, [5101, 5102], settings)
+        dg.preprocess_into(ds, [os.path.dirname(ep_dir)])
+        dg.train_into(ds, run_dir)
+        self.assertEqual(calls, ["collect_parallel.py", "preprocess.py", "uavrgb_train"])
+        rd_entries = os.listdir(os.path.join(out, "round_1"))
+        for prefix in ("collect.partial-", "ds.partial-", "run.partial-"):
+            self.assertTrue(any(d.startswith(prefix) for d in rd_entries), (prefix, rd_entries))
+        self.assertEqual([(r["kind"], r["path"]) for r in dg.pc.read_retired(out)],
+                         [("partial", "round_1/collect"), ("partial", "round_1/ds"), ("partial", "round_1/run")])
+
+        # 改名失败：抛 RuntimeError，不调子命令，旧目录保留
+        calls.clear()
+        col_busy = os.path.join(out, "busy_col")
+        run_busy = os.path.join(out, "busy_run")
+        self._write("out/busy_col/x", text="keep1")
+        self._write("out/busy_run/ckpt.bin", text="keep2")
+        real_rename = dg.pc.os.rename
+        dg.pc.os.rename = lambda *_a: (_ for _ in ()).throw(PermissionError("locked"))
+        try:
+            with self.assertRaises(RuntimeError):
+                dg.collect_into(col_busy, [5101], settings)
+            with self.assertRaises(RuntimeError):
+                dg.train_into(ds, run_busy)
+        finally:
+            dg.pc.os.rename = real_rename
+        self.assertEqual(calls, [])
+        self.assertTrue(os.path.isfile(os.path.join(col_busy, "x")))
+        self.assertTrue(os.path.isfile(os.path.join(run_busy, "ckpt.bin")))
 
     def _baseline(self, name="eval-x", **over):
         e = {"failed_count": 0, "episodes_done": 2, "seeds": [1, 113], "metric_version": "sim09.v1.coast1s",
@@ -279,6 +369,7 @@ class MainTests(unittest.TestCase):
         dg.CFG.clear()
         dg.CFG.update(self.saved)
         dg.BUILD = self.saved_build
+        dg.pc.DRY = dg.DRY = False
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _run(self, *argv):
@@ -449,6 +540,46 @@ class MainTests(unittest.TestCase):
             st = json.load(f)
         self.assertEqual(st["preflight"]["state"], "failed")
         self.assertIn("missing.bin", st["preflight"]["error"])
+        import fcntl
+        self.assertTrue(os.path.exists(os.path.join(o, ".pipeline.lock")), "E-3：main 起跑应拿过实例锁")
+        with open(os.path.join(o, ".pipeline.lock"), "a+", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)   # E-3：收尾（DONE 写完）已放锁，同目录马上能再起
+        with open(os.path.join(o, "run.pid"), encoding="utf-8") as f:   # E-4：run.pid 带启动时刻
+            rec = dict(ln.split("=", 1) for ln in f.read().splitlines())
+        self.assertEqual(rec["pid"], str(os.getpid()))
+        self.assertEqual(rec["start"], dg.pc.proc_stat_field(os.getpid(), 22))
+
+    def test_second_instance_exits_before_touching_out(self):
+        """E-3：输出目录已被另一个实例占着时，main 在写任何文件之前退出 3：第一个实例的 config.json、DONE、run.pid 原样留着，不进 preflight
+        （preflight 换成会抛的替身，没拦住也起不了任何子进程）。"""
+        import fcntl
+        out = os.path.join(self.tmp, "out")
+        os.makedirs(out)
+        holder = open(os.path.join(out, ".pipeline.lock"), "a+", encoding="utf-8")   # 另一个实例：约定的锁文件名 + flock
+        self.addCleanup(holder.close)
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for name, text in (("DONE", "rc=0 first-instance\n"), ("config.json", '{"first": true}'),
+                           ("run.pid", "pid=1\npgid=1\nstart=1\ncmd=first-instance\n")):
+            with open(os.path.join(out, name), "w", encoding="utf-8") as f:
+                f.write(text)
+        dg.CFG.update(round0_collection=self.col, round0_ckpt=self.ckpt)
+
+        def boom(*_a, **_k):
+            raise AssertionError("拿不到锁却走到了 preflight")
+
+        saved = dg._preflight_all
+        dg._preflight_all = boom
+        self.addCleanup(setattr, dg, "_preflight_all", saved)
+        with self.assertRaises(SystemExit) as cm:
+            self._run("--rounds", "1", "--baselines", "")
+        self.assertEqual(cm.exception.code, 3)
+        self.assertEqual(sorted(os.listdir(out)), [".pipeline.lock", "DONE", "config.json", "run.pid"])
+        with open(os.path.join(out, "DONE"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "rc=0 first-instance\n")
+        with open(os.path.join(out, "config.json"), encoding="utf-8") as f:
+            self.assertEqual(json.load(f), {"first": True})
+        with open(os.path.join(out, "run.pid"), encoding="utf-8") as f:
+            self.assertEqual(f.read(), "pid=1\npgid=1\nstart=1\ncmd=first-instance\n")
 
     def test_preflight_records_both_dynamics_profiles(self):
         dg.CFG.update(round0_collection=self.col, round0_ckpt=self.ckpt)
@@ -464,6 +595,139 @@ class MainTests(unittest.TestCase):
             inputs = json.load(f)
         for key in ("libCfSitlSystem.so", "e1_mini.json", "uavrgb_train", "uavrgb_infer", "round0_ckpt"):
             self.assertIn(key, inputs)
+
+    def test_evaluate_and_summary_retire_stale_and_truncated(self):
+        """E-8：evaluate 与 baselines 续跑遇到 metric_version / ckpt 不一致挪 .stale-<时刻>，遇到截断/跳过挪 .failed-<时刻>，
+        一致的跳过；summary 把挪走的目录列进 summary.md 与 summary.json['retired']，没挪过时不改输出。"""
+        import subprocess
+        out = os.path.join(self.tmp, "out")
+        os.makedirs(out)
+        dg.pc.lock_out(out)
+        self.addCleanup(dg.pc.unlock_out)
+        settings = dict(hold=1.0, window_from="observation", dynamics="cf_sitl", vehicle="e1_mini",
+                        tiebreak="legacy", stop_at_goal=False)
+        dg.CFG.update(corridor_half_width=3.0, gz_total_max=0, eval60_arms=())
+        mv_now, mv_old = "sim09.v2.coast1s.corridor3m", "sim09.v2.coast1s"
+        calswa = os.path.join(out, "round_1", "run", "ckpt_calswa.bin")
+        best = os.path.join(out, "round_1", "run", "ckpt_best.bin")
+        md_ckpt = os.path.join(out, "more_demos", "run", "ckpt_calswa.bin")
+        trunc_ckpt = os.path.join(self.tmp, "trunc.bin")
+        for p in (calswa, best, md_ckpt, trunc_ckpt):
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "wb").close()
+        dg.CFG["baselines"] = {"trunc": ("student", trunc_ckpt, "")}
+        dg.write_json(os.path.join(out, "inputs.json"), {"libCfSitlSystem.so": "p", "uavrgb_infer": "i"})
+        saved_popen, saved_run = subprocess.Popen, dg.run
+        dg.run = lambda *_a, **_k: 0   # summary 末尾的 stats_report 子进程替身
+        self.addCleanup(setattr, subprocess, "Popen", saved_popen)
+        self.addCleanup(setattr, dg, "run", saved_run)
+
+        def put(rel, **over):
+            doc = {"episodes_requested": 2, "episodes_done": 2, "failed_count": 0, "skipped_count": 0,
+                   "metric_version": mv_now, "ckpt": None, "requested_success_rate": 0.5,
+                   "per_episode": [{"seed": 1, "success": True, "dynamics_profile": "p"},
+                                   {"seed": 113, "success": False, "dynamics_profile": "p"}]}
+            doc.update(over)
+            p = os.path.join(out, rel, "eval.json")
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            dg.write_json(p, doc)
+
+        # 未挪走任何目录时 summary 不带 retired
+        put("eval20-dagger", ckpt=calswa)
+        put("eval20-more_demos", ckpt=md_ckpt)
+        res0 = dg.summary(out, 1, [("dagger", "student", calswa), ("more_demos", "student", md_ckpt)], {}, "")
+        self.assertNotIn("retired", res0)
+        with open(os.path.join(out, "summary.md"), encoding="utf-8") as f:
+            self.assertNotIn("续跑挪走", f.read())
+
+        # 造三种续跑现场：dagger 评的是旧 best 权重（stale），more_demos 一致（done），基线 trunc 旧口径无走廊（stale），另测截断（failed）
+        put("eval20-dagger", ckpt=best)
+        put("eval20-trunc", metric_version=mv_old, ckpt=trunc_ckpt)
+        put("eval20-forward_tmp", episodes_done=1, skipped_count=1)
+        dg.CFG["baselines"]["forward_tmp"] = ("forward", None, "")
+        started = []
+
+        class FakeEvalProc:
+            returncode = 0
+            def poll(self):
+                return 0
+            def wait(self):
+                return 0
+
+        def fake_popen(cmd, **_kw):
+            edir = _flag(cmd, "--out")
+            self.assertFalse(os.path.exists(edir), f"{edir} 应已挪空")
+            started.append(os.path.basename(edir))
+            ck = _flag(cmd, "--ckpt") if "--ckpt" in cmd else None
+            put(os.path.relpath(edir, out), ckpt=ck)
+            return FakeEvalProc()
+
+        subprocess.Popen = fake_popen
+
+        arms = [("dagger", "student", calswa), ("more_demos", "student", md_ckpt)]
+        dg.evaluate(out, arms, "1,113", "eval20", settings)
+        decisions = dg.baselines(out, ["trunc", "forward_tmp"], "1,113", settings)
+        self.assertEqual(started, ["eval20-dagger", "eval20-trunc", "eval20-forward_tmp"])
+        names = os.listdir(out)
+        self.assertTrue(any(d.startswith("eval20-dagger.stale-") for d in names), names)
+        self.assertTrue(any(d.startswith("eval20-trunc.stale-") for d in names), names)
+        self.assertTrue(any(d.startswith("eval20-forward_tmp.failed-") for d in names), names)
+        res = dg.summary(out, 1, arms, decisions, "")
+        self.assertEqual([(r["kind"], r["path"]) for r in res["retired"]],
+                         [("stale", "eval20-dagger"), ("stale", "eval20-trunc"), ("failed", "eval20-forward_tmp")])
+        with open(os.path.join(out, "summary.md"), encoding="utf-8") as f:
+            md = f.read()
+        self.assertIn("续跑挪走的目录", md)
+        self.assertIn("eval20-dagger.stale-", md)
+        self.assertIn("eval20-forward_tmp.failed-", md)
+
+    def test_action_latency_and_rtf_passthrough_and_validation(self):
+        """A2：CFG 的 action_latency 与 rtf 缺省均为 None（从 e1_pipeline.CFG 继承，E1_ACTION_LATENCY / E1_RTF 可覆盖），
+        默认 dry-run 命令行逐字不变；给了之后透传到全部采集（各轮学生自采 + more_demos 教师采）与全部评测（eval20 / 基线重评 / eval60）；
+        非法取值在 preflight 报错。"""
+        import subprocess
+        self.assertIsNone(self.saved["action_latency"])
+        self.assertIsNone(self.saved["rtf"])
+        base_cmds = _dry_cmds("\n".join(self._dry_lines()))
+        both_cmds = _dry_cmds("\n".join(self._dry_lines(action_latency=0.20, rtf=0.5)))
+        self.assertEqual(len(base_cmds), len(both_cmds))
+
+        def strip_pair(cmd, flag):
+            return [t for i, t in enumerate(cmd) if t != flag and (i == 0 or cmd[i - 1] != flag)]
+
+        collects, evals = 0, 0
+        for b, w in zip(base_cmds, both_cmds):
+            first = os.path.basename(b[0])
+            tool = first if first == "uavrgb_train" else os.path.basename(b[1])
+            self.assertNotIn("--action-latency", b)
+            self.assertNotIn("--rtf", b)
+            if tool in ("collect_parallel.py", "eval_closed_loop.py"):
+                collects += tool == "collect_parallel.py"
+                evals += tool == "eval_closed_loop.py"
+                self.assertEqual(_flag(w, "--action-latency"), "0.2", w)
+                self.assertEqual(_flag(w, "--rtf"), "0.5", w)
+                self.assertEqual(strip_pair(strip_pair(w, "--action-latency"), "--rtf"), b)
+            else:
+                self.assertEqual(w, b, tool)
+        self.assertEqual((collects, evals), (3, 4))   # round_1 + round_2 + more_demos；eval20 3 条 + eval60 1 条
+
+        # 新进程环境变量覆盖验证
+        code = ("import sys; sys.path[:0] = [%r, %r]; import dagger_gz_pipeline as dg; "
+                "print(dg.CFG['action_latency'], dg.CFG['rtf'])"
+                % (os.path.join(REPO, "sim", "tools"), os.path.join(REPO, "tools")))
+        env = {k: v for k, v in os.environ.items() if k not in ("E1_ACTION_LATENCY", "E1_RTF")}
+        r0 = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=120)
+        self.assertEqual((r0.returncode, r0.stdout.strip()), (0, "None None"), r0.stderr)
+        r1 = subprocess.run([sys.executable, "-c", code],
+                            env=dict(env, E1_ACTION_LATENCY="0.2", E1_RTF="0.5"),
+                            capture_output=True, text=True, timeout=120)
+        self.assertEqual((r1.returncode, r1.stdout.strip()), (0, "0.2 0.5"), r1.stderr)
+
+        # 非法取值在 preflight 失败
+        for bad in (dict(action_latency=0.0, rtf=None), dict(action_latency=1.0, rtf=None), dict(action_latency=None, rtf=0.0)):
+            dg.CFG.update(round0_collection=self.col, round0_ckpt=self.ckpt, **bad)
+            rc, _out = self._run("--rounds", "1", "--baselines", "", "--epochs", "2", "--stop-after-preflight")
+            self.assertEqual(rc, 1, bad)
 
 
 def _dry_cmds(out):

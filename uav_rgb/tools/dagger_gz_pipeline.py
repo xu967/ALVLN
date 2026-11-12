@@ -8,12 +8,14 @@
   export TMPDIR=$DATA_ROOT/uav_rgb/tmp/agent10-dagger-gz/tmp UAV_RGB_BUILD_DIR=$DATA_ROOT/uav_rgb/exp-dagger-gz-20261109/bin
   OUT=$DATA_ROOT/uav_rgb/exp-dagger-gz-20261109/full-$(date +%m%d-%H%M); mkdir -p "$OUT"
   setsid nohup $UAV_RGB_PYTHON tools/dagger_gz_pipeline.py --out "$OUT" > "$OUT/run.log" 2>&1 < /dev/null &
-  echo $! > "$OUT/run.pid"; ps -o pid,pgid,etime,cmd -p "$(cat "$OUT/run.pid")"    # 停：kill -- -<PGID>
+  sleep 3; cat "$OUT/run.pid"   # 进程自己写 run.pid：pid= pgid= start=（/proc/<pid>/stat 第 22 列）cmd=；不要再 echo $! > run.pid，重复起会冲掉第一个的记录
+  # 停：先核对 start 与该 PID 现在的启动时刻一致（容器重启后 PID 可能已被别的进程拿走），再 kill -- -<pgid>
 看进度：tail -f $OUT/run.log；每步 $OUT/status.json；结束落 $OUT/DONE（rc + 时间 + 最后一步）。
 续跑：同一 --out 重跑；产物齐的步骤跳过（采集 = collection_manifest.json；训练 = run/metrics.jsonl 末行 done:；
-评测 = eval.json 且 failed_count==0 且 episodes_done>0 且不是 partial）。半成品的采集/训练目录要手动删（脚本会指出是哪个），
-半成品评测目录自动挪到 <目录>.failed-<时间> 再重评。
+评测 = pipeline_common.eval_state == done）。半成品的采集/打包/训练目录自动挪到 <目录>.partial-<时刻> 后重做，
+未完成或口径不符的评测目录自动挪到 <目录>.failed-<时刻> / .stale-<时刻> 再重评。
 --dry-run 只打印命令、不建目录；--stop-after-preflight 只查缺件、写 inputs.json 与两份 dynamics_profile。
+同一个 --out 只许一个实例：起跑先拿 $OUT/.pipeline.lock（flock），拿不到就退出 3、不改 $OUT 里任何文件；锁随进程消失，被杀后原命令可直接再起。
 交付权重默认 calswa（每次训练后加一步 average_ckpt：末 10 轮平均 + 校准，要 GPU，见 e1_pipeline.CFG["deliver"]）；E1_DELIVER=best 回到 ckpt_best。
 smoke（--epochs 2 不满 10 轮，calswa 取不到窗口，要带 E1_DELIVER=best）：
   E1_DELIVER=best … tools/dagger_gz_pipeline.py --rounds 1 --eps-per-round 4 --steps 12 --instances 2 --eval-seeds 1,113 --epochs 2 --baselines trunc --eval60-arms ""
@@ -80,6 +82,9 @@ CFG = dict(
     # 条件输入（W1-9）：prev-action=现状；heading-code=采集喂航向码（--student-cond）、打包写航向码（preprocess --cond）、训练加 --prev-action、
     # 流水线自训的臂评测带 --student-cond（基线不带）。非默认时 round0_ckpt 也必须是同类条件训的模型（本流水线不校验；评测端闸门兜底）。
     student_cond="prev-action",
+    # 协议时序与实时因子（审核 A2）：默认 None 不传，命令行逐字不变；给了就透传给采集（需卡 W1-13 collect_parallel 支持）与评测
+    action_latency=e1_pipeline.CFG["action_latency"],   # --action-latency L（仿真秒，0 < L < hold 且 observation）；环境变量 E1_ACTION_LATENCY
+    rtf=e1_pipeline.CFG["rtf"],                         # --rtf R（有限正数）；环境变量 E1_RTF
     # 评测：20 seed 从 e1_pipeline.CFG 读（单源，不复制字面量）；80 步；每臂 1 gz
     eval_seeds=e1_pipeline.CFG["eval_seeds"],
     eval_steps=e1_pipeline.CFG["eval_steps"],
@@ -197,9 +202,13 @@ def train_done(run_dir):
         return False
 
 
-def eval_done(edir):
-    """评完 = pipeline_common.eval_finished：eval.json 在、failed_count == 0、episodes_done > 0、不是中断写出的 partial。"""
-    return pc.eval_finished(edir)
+def eval_metric_version(settings):
+    return pc.metric_version_for(settings["dynamics"], CFG["corridor_half_width"] if CFG["corridor_half_width"] > 0 else None)
+
+
+def eval_done(edir, metric_version=None, ckpt=None):
+    """评完 = pipeline_common.eval_finished：完整无跳过/失败/截断，且与给定的 metric_version / ckpt 一致。"""
+    return pc.eval_finished(edir, metric_version=metric_version, ckpt=ckpt)
 
 
 # ───────────────────────────── round0 / seed / 命令行 ─────────────────────────────
@@ -259,12 +268,32 @@ def pick_round_seeds(base, count, exclude_gids):
     return seeds
 
 
+def protocol_check(settings):
+    """校验 action_latency 与 rtf（与 eval_closed_loop 的参数约束对齐）。"""
+    lat, rtf = CFG["action_latency"], CFG["rtf"]
+    if lat is not None:
+        if not (isinstance(lat, (int, float)) and not isinstance(lat, bool) and math.isfinite(lat) and lat > 0):
+            raise RuntimeError(f"CFG action_latency={lat!r}（环境变量 E1_ACTION_LATENCY）必须是有限正数")
+        if lat >= float(settings["hold"]):
+            raise RuntimeError(f"CFG action_latency={lat:g} 必须小于 hold={float(settings['hold']):g}")
+        if settings["window_from"] != "observation":
+            raise RuntimeError(f"CFG action_latency 只能配 window_from='observation'，当前是 {settings['window_from']!r}")
+    if rtf is not None:
+        if not (isinstance(rtf, (int, float)) and not isinstance(rtf, bool) and math.isfinite(rtf) and rtf > 0):
+            raise RuntimeError(f"CFG rtf={rtf!r}（环境变量 E1_RTF）必须是有限正数")
+
+
 def collect_cmd(col, seeds, settings, instances, steps, policy="teacher", ckpt=None, beta=0.0, dagger_round=0):
     """collect_parallel 命令行：开关从 round0 继承；student 是 DAgger 自采（影子教师 A* 打标、β 混合）。"""
+    protocol_check(settings)
     cmd = [PY, f"{REPO}/sim/tools/collect_parallel.py", "--instances", str(instances),
            "--seeds", ",".join(map(str, seeds)), "--steps", str(steps), "--task", "base", "--keep-worlds",
            "--out", col, "--dynamics", settings["dynamics"], "--vehicle", settings["vehicle"],
            "--hold", str(settings["hold"]), "--window-from", settings["window_from"]]
+    if CFG["action_latency"] is not None:
+        cmd += ["--action-latency", f"{CFG['action_latency']:g}"]
+    if CFG["rtf"] is not None:
+        cmd += ["--rtf", f"{CFG['rtf']:g}"]
     if CFG["no_aux_cameras"]:
         cmd.append("--no-aux-cameras")
     if settings["stop_at_goal"]:
@@ -290,10 +319,11 @@ def more_demos_n(new_frames, frames_per_episode, instances):
     return math.ceil(n / instances) * instances if n else 0
 
 
-def reusable(edir, seeds, metric_version, plugin_sha, infer_sha, profile):
+def reusable(edir, seeds, metric_version, plugin_sha, infer_sha, profile, ckpt=None):
     """基线行能否直接用现成 eval.json：四项缺一不复用。返回 (bool, 原因)。"""
-    if not eval_done(edir):
-        return False, "没有完整的 eval.json（failed_count==0 且 episodes_done>0 且不是 partial）"
+    if not eval_done(edir, metric_version=metric_version, ckpt=ckpt):
+        state, why = pc.eval_state(edir, metric_version=metric_version, ckpt=ckpt)
+        return False, f"eval.json 未完成或口径不符（{state}: {why}）"
     e = read_json(os.path.join(edir, "eval.json"))
     if set(e.get("seeds") or []) != set(seeds):
         return False, "seeds 不同"
@@ -385,6 +415,7 @@ def step(out, name, fn, *args, **kw):
 def preflight(out, settings, baseline_names):
     """开跑前把会在几小时后才炸的缺件一次查完；记 inputs.json（各臂同一套二进制/库/参数）与两份 dynamics_profile。"""
     deliver_check()
+    protocol_check(settings)
     need(f"{BUILD}/uavrgb_train", "先 bash tools/check.sh 构建并复制到快照目录，设 UAV_RGB_BUILD_DIR")
     need(f"{BUILD}/uavrgb_infer", "同上")
     plugin = os.path.join(CFG["plugin_dir"], "libCfSitlSystem.so")
@@ -416,10 +447,11 @@ def preflight(out, settings, baseline_names):
 
 def collect_into(col, seeds, settings, **kw):
     """采一个集合；manifest 成功率低于 collect_min_ok 就停。collect_parallel 一集失败 rc=1 是常态，按 manifest 判。"""
-    if collect_done(col):
+    if not DRY and collect_done(col):
         return log(f"跳过采集（已有 {col}/collection_manifest.json）")
-    if os.path.isdir(col) and os.listdir(col):
-        raise RuntimeError(f"{col} 非空且没有 collection_manifest.json（半成品）：删掉再跑")
+    if not DRY and os.path.isdir(col) and os.listdir(col):
+        moved = pc.retire_dir(col, "partial", "没有 collection_manifest.json")
+        log(f"{col} 上次采集没跑完，旧目录挪到 {moved}，重采")
     wait_gz_gate()
     run(collect_cmd(col, seeds, settings, CFG["instances"], CFG["steps"], **kw), env_extra=gz_env(),
         log_path=None if DRY else col + ".log")
@@ -466,6 +498,9 @@ def preprocess_into(ds, eps):
     """并集打包：round0 + 各轮自采。动力学档不一致按 CFG.allow_mixed_dynamics 放行（meta 记 dynamics_profiles）。"""
     if not DRY and os.path.isfile(os.path.join(ds, "dataset.uavr")):
         return log(f"跳过打包（已有 {ds}/dataset.uavr）")
+    if not DRY and os.path.isdir(ds) and os.listdir(ds):
+        moved = pc.retire_dir(ds, "partial", "没有 dataset.uavr")
+        log(f"{ds} 上次打包没跑完，旧目录挪到 {moved}，重打")
     if not DRY and not eps:
         raise RuntimeError("没有可打包的集目录")
     cmd = [PY, f"{REPO}/tools/preprocess.py", "--out", ds]
@@ -510,11 +545,12 @@ def calibrate_into(ds, run_dir):
 
 def train_into(ds, run_dir):
     deliver_check()
-    if train_done(run_dir):
+    if not DRY and train_done(run_dir):
         log(f"跳过训练（{run_dir}/metrics.jsonl 已 done）")
         return calibrate_into(ds, run_dir)   # 训练做完、校准平均没做完（被打断）时在这里补
-    if os.path.isdir(run_dir) and os.listdir(run_dir):
-        raise RuntimeError(f"{run_dir} 非空且没训完：uavrgb_train 的 RunOwner 拒绝复用，删掉再跑")
+    if not DRY and os.path.isdir(run_dir) and os.listdir(run_dir):
+        moved = pc.retire_dir(run_dir, "partial", "训练没跑完（metrics.jsonl 末行不是 done:）")
+        log(f"{run_dir} 上次训练没跑完，旧目录挪到 {moved}，重训")
     need(os.path.join(ds, "dataset.uavr"), "先打包")
     cmd = [f"{BUILD}/uavrgb_train", "--data", f"{ds}/dataset.uavr", "--out", run_dir,
            "--epochs", str(CFG["epochs"]), "--batch", str(CFG["batch"]), "--lr", repr(float(CFG["lr"])),
@@ -576,11 +612,16 @@ def run_more_demos(out, settings, exclude_gids, rounds):
 
 
 def eval_cmd(policy, ckpt, seeds_csv, edir, settings, student_cond=None):
+    protocol_check(settings)
     cmd = [PY, f"{REPO}/sim/tools/eval_closed_loop.py", "--policy", policy, "--task", "base", "--split", "test",
            "--seeds", seeds_csv, "--episodes", str(len(seeds_csv.split(","))), "--steps", str(CFG["eval_steps"]),
            "--out", edir, "--sim-timeout", str(CFG["sim_timeout"]), "--episode-timeout", str(CFG["episode_timeout"]),
            "--dynamics", settings["dynamics"], "--vehicle", settings["vehicle"],
            "--hold", str(settings["hold"]), "--window-from", settings["window_from"]]
+    if CFG["action_latency"] is not None:
+        cmd += ["--action-latency", f"{CFG['action_latency']:g}"]
+    if CFG["rtf"] is not None:
+        cmd += ["--rtf", f"{CFG['rtf']:g}"]
     if CFG["corridor_half_width"] > 0:
         cmd += ["--corridor-half-width", f"{CFG['corridor_half_width']:g}"]
     if ckpt:
@@ -593,16 +634,18 @@ def eval_cmd(policy, ckpt, seeds_csv, edir, settings, student_cond=None):
 def evaluate(out, arms, seeds_csv, prefix, settings, student_cond=None):
     """arms = [(名, policy, ckpt)]；同时 ≤ eval_parallel 个（各 1 gz）；等齐所有组再查产物（e1_pipeline 4e44e70 的教训）。
     student_cond：流水线自训的臂（dagger / more_demos）传 CFG.student_cond；基线臂（baselines()）不传。"""
+    mv = eval_metric_version(settings)
+    ckpt_by_name = {name: ckpt for name, _p, ckpt in arms}
     running, launched, logs = {}, [], []
     for name, policy, ckpt in arms:
         edir = os.path.join(out, f"{prefix}-{name}")
-        if eval_done(edir):
+        state, moved, why = pc.settle_eval(edir, metric_version=mv, ckpt=ckpt)
+        if state == "done":
             log(f"跳过 {prefix}-{name}：已有完整 eval.json")
             continue
-        if not DRY and os.path.isdir(edir) and os.listdir(edir):
-            aside = f"{edir}.failed-{time.strftime('%m%d-%H%M%S')}"
-            os.replace(edir, aside)   # eval_closed_loop 拒绝非空 --out；半成品留着看日志
-            log(f"{edir} 不完整，挪到 {aside} 后重评")
+        if moved:
+            kind_msg = "与当前配置不一致" if state == "stale" else "不完整"
+            log(f"{edir} {kind_msg}（{why}），挪到 {moved} 后重评")
         if ckpt:
             need(ckpt, f"{name} 的 ckpt")
         while len(running) >= CFG["eval_parallel"]:
@@ -626,9 +669,10 @@ def evaluate(out, arms, seeds_csv, prefix, settings, student_cond=None):
         log(f"{prefix}-{n} rc={rc}" + ("（有失败/跳过集，见 eval.json 的 failed）" if rc else ""))
     for f in logs:
         f.close()
-    bad = [n for n in launched if not DRY and not eval_done(os.path.join(out, f"{prefix}-{n}"))]
+    bad = [n for n in launched if not DRY and not eval_done(os.path.join(out, f"{prefix}-{n}"),
+                                                            metric_version=mv, ckpt=ckpt_by_name[n])]
     if bad:
-        raise RuntimeError(f"{bad} 没评完（eval.json 缺失、failed_count>0 或 partial），看 {out}/{prefix}-<名>.log；"
+        raise RuntimeError(f"{bad} 没评完（eval.json 缺失、有失败/跳过集或 partial），看 {out}/{prefix}-<名>.log；"
                            "同一 --out 重跑会把该臂目录挪开重评")
 
 
@@ -637,19 +681,20 @@ def baselines(out, names, seeds_csv, settings):
     decisions, todo = {}, []
     ref_path = os.path.join(out, "eval20-dagger", "eval.json")
     ref = read_json(ref_path) if not DRY else None
+    mv = ref["metric_version"] if ref else eval_metric_version(settings)
     inputs = read_json(os.path.join(out, "inputs.json")) if not DRY else {}
     for name in names:
         policy, ckpt, reuse_dir = CFG["baselines"][name]
         edir = os.path.join(out, f"eval20-{name}")
-        if eval_done(edir):
+        if eval_done(edir, metric_version=mv, ckpt=ckpt):
             decisions[name] = {"source": "self", "path": edir}
             continue
         if DRY:
             ok, why = False, "dry-run 不判复用"
         else:
-            want = dict(seeds=[int(s) for s in seeds_csv.split(",")], metric_version=ref["metric_version"],
+            want = dict(seeds=[int(s) for s in seeds_csv.split(",")], metric_version=mv,
                         plugin_sha=inputs.get("libCfSitlSystem.so"), infer_sha=inputs.get("uavrgb_infer") if ckpt else None,
-                        profile=(ref["per_episode"] or [{}])[0].get("dynamics_profile"))
+                        profile=(ref["per_episode"] or [{}])[0].get("dynamics_profile"), ckpt=ckpt)
             ok, why = reusable(reuse_dir, **want) if reuse_dir and os.path.isdir(reuse_dir) else (False, f"没有可复用目录 {reuse_dir}")
         if ok:
             log(f"基线 {name} 复用 {reuse_dir}")
@@ -723,10 +768,13 @@ def summary(out, rounds, arms, decisions, seeds60_csv):
             eval60[name] = {"n": e.get("episodes_done"), "SR": e.get("requested_success_rate"),
                             "wilson95": (e.get("wilson_ci") or {}).get("requested"), "collision_rate": e.get("collision_rate")}
     md_plan = os.path.join(out, "more_demos", "plan.json")
+    retired = pc.read_retired(out)
     res = {"cfg": {k: v for k, v in CFG.items() if k != "baselines"}, "rounds": round_rows, "arms": rows, "mcnemar_vs_dagger": pairs,
            "eval60": eval60, "eval_seeds60": seeds60_csv, "baselines": decisions,
            "more_demos_plan": read_json(md_plan) if os.path.isfile(md_plan) else None,
            "inputs": read_json(os.path.join(out, "inputs.json")) if os.path.isfile(os.path.join(out, "inputs.json")) else None}
+    if retired:
+        res["retired"] = retired
     write_json(os.path.join(out, "summary.json"), res)
     lines = ["| round | β | 集 ok/req | 步 | 不一致率（学生步） | 到线 | 碰撞集 |", "| --- | --- | --- | --- | --- | --- | --- |"]
     for k, r in round_rows.items():
@@ -745,6 +793,8 @@ def summary(out, rounds, arms, decisions, seeds60_csv):
     if seeds60_csv and n60 < CFG["eval60_count"]:
         lines.append(f"\n注意：独立 test 几何只有 {n60} 个（要 {CFG['eval60_count']}），见 eval_seeds60.json；「60 seed 区间」按 {n60} 个看。")
     lines.append(f"\n口径：SR 分母 = 请求集；{settings_line(res)}；n=20 的 Wilson 半宽约 ±0.2，结论要带区间与配对 p 值。")
+    if retired:
+        lines += [""] + pc.retired_lines(out)
     with open(os.path.join(out, "summary.md"), "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
     for line in lines:
@@ -791,7 +841,7 @@ def main(argv=None):
     p.add_argument("--dry-run", action="store_true", help="只打印命令、不建目录")
     p.add_argument("--stop-after-preflight", action="store_true", help="只查缺件并写 inputs.json / status.json")
     a = p.parse_args(argv)
-    DRY = a.dry_run
+    pc.DRY = DRY = a.dry_run
     if a.rounds < 1:
         p.error("--rounds 至少 1")
     CFG.update(rounds=a.rounds, eps_per_round=a.eps_per_round, steps=a.steps, instances=a.instances,
@@ -806,6 +856,8 @@ def main(argv=None):
     out = os.path.abspath(a.out)
     if not DRY:
         os.makedirs(out, exist_ok=True)
+        pc.lock_out(out)   # E-3：已有实例在跑就退出 3；要赶在 config.json / DONE 之前，第二个实例不能碰第一个的状态
+        pc.write_run_pid(out)   # E-4：run.pid 记 pid / pgid / 启动时刻 / 命令行，停进程前能核对 PID 还是不是这个进程
         write_json(os.path.join(out, "config.json"),
                    {"cfg": CFG, "baselines": names, "argv": sys.argv, "repo": REPO, "build": BUILD, "python": PY,
                     "gz_env": gz_env(), "git": subprocess.run(["git", "-C", REPO, "rev-parse", "HEAD"],
@@ -849,6 +901,7 @@ def main(argv=None):
         if not DRY:
             with open(os.path.join(out, "DONE"), "w", encoding="utf-8") as f:
                 f.write(f"rc={rc} {time.strftime('%F %T')} last_step={last}\n")
+        pc.unlock_out()   # DONE 写完才放锁，别的实例起得来时标记已经是最新的
     return rc
 
 

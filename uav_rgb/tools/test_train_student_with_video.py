@@ -147,13 +147,70 @@ def check_dry_run():
         with contextlib.redirect_stdout(buf):
             rc = cli.main(["--data", str(empty), "--out", str(out), "--dry-run"])
         assert rc == 0 and "跳过" in buf.getvalue() and "test/val" in buf.getvalue(), buf.getvalue()
+        assert "旧口径，未带走廊" not in text, text
     print("dry-run PASS")
+
+
+def test_legacy_corridor_note_for_base():
+    """W1-15b 第 6 条：柱阵 base 评测打印「旧口径，未带走廊」提示，build_eval_command 与录像命令行本身不改。"""
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as d:
+        out = Path(d) / "run"
+        base_uavr = Path(d) / "base.uavr"
+        write_uavr(base_uavr, {"geometry_version": "uavrgb.geom.v5",
+                               "splits": {"train": 1, "val": 0, "test": 1},
+                               "dynamics_profile": "cf_sitl_v1:abc", "window_from": "observation", "hold_s": 1.0})
+        buf = io.StringIO()
+        old_run2 = cli.subprocess.run
+        cli.subprocess.run = lambda *a, **k: (_ for _ in ()).throw(AssertionError("--dry-run 不能执行命令"))
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = cli.main(["--data", str(base_uavr), "--out", str(out), "--dry-run"])
+        finally:
+            cli.subprocess.run = old_run2
+        base_dry = buf.getvalue()
+        eval_line = [ln for ln in base_dry.splitlines() if ln.startswith("录像:")][0]
+        assert rc == 0 and "旧口径，未带走廊" in base_dry and "--corridor-half-width" not in eval_line, base_dry
+
+        # 真跑路径（替身 subprocess.run，不起训练器与 gz）同样输出该提示
+        build = Path(d) / "build_exec"
+        build.mkdir(parents=True, exist_ok=True)
+        trainer = build / "uavrgb_train"
+        trainer.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        trainer.chmod(0o755)
+        ran_cmds = []
+
+        def fake_subproc(cmd, **_kw):
+            ran_cmds.append(list(cmd))
+            if Path(cmd[0]).name == "uavrgb_train":
+                out.mkdir(parents=True, exist_ok=True)
+                (out / "ckpt_best.bin").write_bytes(b"ck")
+            return type("R", (), {"returncode": 0})()
+
+        old_env, old_which, old_sub = os.environ.get("UAV_RGB_BUILD_DIR"), cli.shutil.which, cli.subprocess.run
+        os.environ["UAV_RGB_BUILD_DIR"] = str(build)
+        cli.shutil.which = lambda name: "/fake/gz" if name == "gz" else old_which(name)
+        cli.subprocess.run = fake_subproc
+        buf = io.StringIO()
+        try:
+            with contextlib.redirect_stdout(buf):
+                rc = cli.main(["--data", str(base_uavr), "--out", str(out)])
+        finally:
+            cli.subprocess.run, cli.shutil.which = old_sub, old_which
+            if old_env is None:
+                os.environ.pop("UAV_RGB_BUILD_DIR", None)
+            else:
+                os.environ["UAV_RGB_BUILD_DIR"] = old_env
+        assert rc == 0 and len(ran_cmds) == 2, (rc, ran_cmds)
+        assert "旧口径，未带走廊" in buf.getvalue(), buf.getvalue()
+        assert "--corridor-half-width" not in ran_cmds[1], ran_cmds[1]
+    print("legacy-corridor-note PASS")
 
 
 def main():
     check_inference()
     check_commands()
     check_dry_run()
+    test_legacy_corridor_note_for_base()
     print("test_train_student_with_video: PASS")
 
 

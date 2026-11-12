@@ -190,6 +190,9 @@ def build_eval_command(python, eval_script, ckpt, out_dir, params):
     return cmd
 
 
+LEGACY_CORRIDOR_NOTE = "提示: 柱阵录像评测为旧口径，未带走廊（--corridor-half-width），且评 ckpt_best.bin，仅作诊断参考"
+
+
 def _eval_out_dir(out):
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     return Path(out) / f"closed_loop_eval_{stamp}"
@@ -238,9 +241,12 @@ def main(argv=None):
                                           out / "ckpt_best.bin", eval_out, params)
         except ValueError as exc:
             params, reason = None, str(exc)
+    is_base_gz = bool(eval_cmd and params and params.get("renderer") != "3dgs" and params.get("task") == "base")
     if args.dry_run:
         print("训练: " + shlex.join(train_cmd))
         print("录像: " + (shlex.join(eval_cmd) if eval_cmd else f"跳过（{reason}）"))
+        if is_base_gz:
+            print(LEGACY_CORRIDOR_NOTE)
         return 0
 
     if not os.access(trainer, os.X_OK):
@@ -269,6 +275,8 @@ def main(argv=None):
             print(f"警告: 跳过 3DGS 录像：找不到 {_3dgs_python()}",
                   file=sys.stderr)
             return 0
+    if is_base_gz:
+        print(LEGACY_CORRIDOR_NOTE)
     try:
         rc = subprocess.run(eval_cmd).returncode
     except OSError as exc:

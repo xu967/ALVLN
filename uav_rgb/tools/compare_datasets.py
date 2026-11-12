@@ -385,6 +385,8 @@ def summary(out):
     notes.append(f"- 域口径：gazebo hold {CFG['gazebo']['hold']} s / {CFG['gazebo']['window_from']} / "
                  f"{len(CFG['gazebo']['seeds'].split(','))} 个独立几何 seed（请求数 = seed 数）；"
                  f"3dgs hold {CFG['gs']['hold']} s / 路线 {list(CFG['gs']['routes'])}（pilot v3 路线都在训练集里，不是留出路线）。")
+    if "gazebo" in EVAL_DOMAINS:
+        notes.append("- 口径提示：gazebo 柱阵评测为旧口径，未带走廊（--corridor-half-width），且交付权重仍为 ckpt_best.bin，数字与带走廊的主表不可直接比。")
     if abs(CFG["gazebo"]["hold"] - CFG["gs"]["hold"]) > 1e-9:
         notes.append(f"- **两域 hold 不同（gazebo {CFG['gazebo']['hold']} s vs 3dgs {CFG['gs']['hold']} s）**：学生每步位移不同，跨域列不可与域内列直接比，"
                      "报告里必须标注（dataset-compare-plan §5）。")

@@ -4,9 +4,11 @@
 运行（仓库根，先 source env.sh）：
   OUT=$DATA_ROOT/uav_rgb/e1-pipeline-$(date +%Y%m%d-%H%M); mkdir -p "$OUT"
   setsid nohup "$UAV_RGB_PYTHON" tools/e1_pipeline.py --out "$OUT" > "$OUT/run.log" 2>&1 < /dev/null &
-  echo $! > "$OUT/run.pid"; ps -o pid,pgid,etime,cmd -p "$(cat "$OUT/run.pid")"   # 停：kill -- -<PGID>
+  sleep 3; cat "$OUT/run.pid"   # 进程自己写 run.pid：pid= pgid= start=（/proc/<pid>/stat 第 22 列）cmd=；不要再 echo $! > run.pid，重复起会冲掉第一个的记录
+  # 停：先核对 start 与该 PID 现在的启动时刻一致（容器重启后 PID 可能已被别的进程拿走），再 kill -- -<pgid>
 看进度：tail -f $OUT/run.log；每步状态 $OUT/status.json；结束落 $OUT/DONE（rc + 时间 + 最后一步）。
-续跑：--from train（跳过前面的步骤，要求它们的产物已在 OUT 里）。--dry-run 只打印命令不执行。
+续跑：同一 --out 原命令重跑自动跳过已完成的步骤，半成品的采集/打包/训练目录挪到 <目录>.partial-<时刻> 后重做；也可 --from train 指定起点。--dry-run 只打印命令不执行。
+同一个 --out 只许一个实例：起跑先拿 $OUT/.pipeline.lock（flock），拿不到就退出 3、不改 $OUT 里任何文件；锁随进程消失，被杀后原命令可直接再起。
 改参数只改 CFG，不改函数。
 交付权重（CFG deliver，环境变量 E1_DELIVER）：默认 calswa = 训练后再做末 10 轮权重平均 + FORWARD 先验校准（tools/average_ckpt.py，
 产物 run/ckpt_calswa.bin，校准推理占 GPU，卡由 CFG gpu / E1_GPU 指定），评测评它；E1_DELIVER=best 回到 trainer 存的 ckpt_best.bin。
@@ -30,6 +32,11 @@ sys.path.insert(0, os.path.join(REPO, "tools"))
 import eval_seeds  # noqa: E402  - 冻结评测 seed 的唯一来源
 import pipeline_common as pc  # noqa: E402  - 三条流水线共用：续跑判定等
 
+def _opt_float_env(name, default=None):
+    raw = os.environ.get(name, "").strip()
+    return default if not raw else float(raw)
+
+
 # ───────────────────────────── 配置区（改这里） ─────────────────────────────
 CFG = dict(
     # 载具 / 动力学（采集与四组评测共用，保证训练数据和评测协议是同一套）
@@ -37,6 +44,11 @@ CFG = dict(
     vehicle="e1_mini",       # 选 sim/worlds/uav_rgb_e1.sdf；cf_sitl 必须显式给
     hold=1.0,                # 每动作仿真秒。沿用 X3 基线 1.0 便于对比；固件里杆量保持到下一次派发
     window_from="observation",   # 唯一被采纳的基线语义；dispatch 只用于复现 T7-R，数字不可混报
+    action_latency=_opt_float_env("E1_ACTION_LATENCY", None),
+                             # 观测到派发的固定仿真秒（--action-latency L，0 < L < hold 且要求 observation 语义）；缺省 None = 旧协议不传该开关；
+                             # W1-0 第二轮标定值为 0.20（E1_ACTION_LATENCY 可覆盖；采集端依赖卡 W1-13 的 collect_parallel 支持）
+    rtf=_opt_float_env("E1_RTF", None),
+                             # Gazebo 世界实时因子（--rtf R，有限正数）；缺省 None = 用世界模板原值不传该开关（长课程/密林慢策略可用 0.5，E1_RTF 可覆盖）
     plugin_dir=os.environ.get("E1_CF_SITL_PLUGIN_DIR", f"{DATA_ROOT}/uav_rgb/tmp/build-cf-sitl/gz"),
                              # 真库插件（sim/cf_sitl/gz/README 的构建路径）。显式给，免得 collect_parallel 兜底找到桩库 build-gz-stub。
                              # 环境变量覆盖用于换库过渡期：库升版要重建这个目录，但正在跑的旧代码实验还在加载旧插件时，
@@ -142,10 +154,33 @@ DRY = False   # main 里与 pipeline_common.DRY 一起置位；helper 都在 too
 log, run, sh, read_json, write_json, mark, need = pc.log, pc.run_cmd, pc.sh, pc.read_json, pc.write_json, pc.mark, pc.need
 
 
+def protocol_check(hold=None, window_from=None):
+    """校验 action_latency 与 rtf（与 eval_closed_loop 参数约束一致，起跑前即拦下非法取值）。"""
+    hold = CFG["hold"] if hold is None else hold
+    window_from = CFG["window_from"] if window_from is None else window_from
+    lat, rtf = CFG["action_latency"], CFG["rtf"]
+    if lat is not None:
+        if not (isinstance(lat, (int, float)) and not isinstance(lat, bool) and math.isfinite(lat) and lat > 0):
+            raise RuntimeError(f"CFG action_latency={lat!r}（环境变量 E1_ACTION_LATENCY）必须是有限正数")
+        if lat >= float(hold):
+            raise RuntimeError(f"CFG action_latency={lat:g} 必须小于 hold={float(hold):g}")
+        if window_from != "observation":
+            raise RuntimeError(f"CFG action_latency 只能配 window_from='observation'，当前是 {window_from!r}")
+    if rtf is not None:
+        if not (isinstance(rtf, (int, float)) and not isinstance(rtf, bool) and math.isfinite(rtf) and rtf > 0):
+            raise RuntimeError(f"CFG rtf={rtf!r}（环境变量 E1_RTF）必须是有限正数")
+
+
 def vehicle_flags():
-    """采集和评测共用的动力学/载具参数。"""
-    return ["--dynamics", CFG["dynamics"], "--vehicle", CFG["vehicle"],
-            "--hold", str(CFG["hold"]), "--window-from", CFG["window_from"]]
+    """采集和评测共用的动力学/载具/协议参数。"""
+    protocol_check()
+    flags = ["--dynamics", CFG["dynamics"], "--vehicle", CFG["vehicle"],
+             "--hold", str(CFG["hold"]), "--window-from", CFG["window_from"]]
+    if CFG["action_latency"] is not None:
+        flags += ["--action-latency", f"{CFG['action_latency']:g}"]
+    if CFG["rtf"] is not None:
+        flags += ["--rtf", f"{CFG['rtf']:g}"]
+    return flags
 
 
 def set_dir(out, spec):
@@ -155,8 +190,12 @@ def set_dir(out, spec):
 
 def collect_into(col, episodes, base_seed, spec="base"):
     """collect_parallel 一集失败就 rc=1，300 集里丢 1 集是常态；按 manifest 的成功率判，不拿 rc 当成败。"""
-    if os.path.isdir(col) and os.listdir(col):
-        raise RuntimeError(f"{col} 非空：collect_parallel 拒绝复用目录。删掉它或换 --out；想跳过用 --from")
+    man = os.path.join(col, "collection_manifest.json")
+    if not DRY and os.path.isfile(man):
+        return log(f"跳过采集（已有 {man}）")
+    if not DRY and os.path.isdir(col) and os.listdir(col):
+        moved = pc.retire_dir(col, "partial", "没有 collection_manifest.json")
+        log(f"{col} 上次采集没跑完，旧目录挪到 {moved}，重采")
     per = math.ceil(episodes / CFG["instances"])
     task, _, density = spec.partition(":")   # "forest_e1:sparse" -> --task forest_e1 --density sparse
     cmd = [PY, f"{REPO}/sim/tools/collect_parallel.py",
@@ -189,7 +228,8 @@ def collect_into(col, episodes, base_seed, spec="base"):
 
 def audit_dir(col):
     report = os.path.join(col, "audit.json")
-    run([PY, f"{REPO}/sim/tools/audit_dataset.py", "--dataset", col, "--out", report])   # 有 FAIL 时 rc=1
+    if DRY or not os.path.isfile(report):
+        run([PY, f"{REPO}/sim/tools/audit_dataset.py", "--dataset", col, "--out", report])   # 有 FAIL 时 rc=1
     if DRY:
         return
     need(report, "audit_dataset 没写出 audit.json")
@@ -225,6 +265,11 @@ def audit(out):
 def preprocess(out):
     """各集合的集目录合并进一个 dataset.uavr（preprocess 自己按 manifest 复算 split、拒绝混口径）。"""
     cols, ds = [set_dir(out, spec) for spec, _n, _s in CFG["collect_sets"]], os.path.join(out, "ds")
+    if not DRY and os.path.isfile(os.path.join(ds, "dataset.uavr")):
+        return log(f"跳过 preprocess（已有 {ds}/dataset.uavr）")
+    if not DRY and os.path.isdir(ds) and os.listdir(ds):
+        moved = pc.retire_dir(ds, "partial", "没有 dataset.uavr")
+        log(f"{ds} 上次打包没跑完，旧目录挪到 {moved}，重打")
     eps = sorted(d for col in cols for s in ("train", "val", "test") for d in glob.glob(f"{col}/{s}/*/"))
     if not DRY and not eps:
         raise RuntimeError(f"{cols} 下没有 train/val/test 集目录")
@@ -269,12 +314,12 @@ def train(out):
     ds, run_dir = os.path.join(out, "ds"), os.path.join(out, "run")
     need(os.path.join(ds, "dataset.uavr"), "先跑 preprocess")
     deliver_check()
-    if pc.train_finished(run_dir):   # 续跑：完成 = metrics.jsonl 末行 done:（ckpt 文件每轮都写，不算）
+    if not DRY and pc.train_finished(run_dir):   # 续跑：完成 = metrics.jsonl 末行 done:（ckpt 文件每轮都写，不算）
         log(f"跳过 train：{run_dir}/metrics.jsonl 已记 done")
         return calibrate_swa(ds, run_dir)   # 训练做完、校准平均没做完（被打断）时在这里补
-    if os.path.isdir(run_dir) and os.listdir(run_dir):
-        raise RuntimeError(f"{run_dir} 非空且训练没跑完（metrics.jsonl 末行不是 done:）："
-                           "uavrgb_train 的 RunOwner 拒绝复用；删掉或换 --out")
+    if not DRY and os.path.isdir(run_dir) and os.listdir(run_dir):
+        moved = pc.retire_dir(run_dir, "partial", "训练没跑完（metrics.jsonl 末行不是 done:）")
+        log(f"{run_dir} 上次训练没跑完，旧目录挪到 {moved}，重训")
     cmd = [f"{BUILD}/uavrgb_train", "--data", f"{ds}/dataset.uavr", "--out", run_dir,
            "--epochs", str(CFG["epochs"]), "--batch", str(CFG["batch"]), "--lr", repr(float(CFG["lr"])),
            "--seed", str(CFG["seed"]), "--class-weights", CFG["class_weights"]]
@@ -291,6 +336,11 @@ def train(out):
     calibrate_swa(ds, run_dir)
 
 
+def eval_metric_version():
+    """本次配置下 eval_closed_loop 会写进 eval.json 的 metric_version（续跑时据此识别旧口径并挪 .stale-）。"""
+    return pc.metric_version_for(CFG["dynamics"], CFG["corridor_half_width"] if CFG["corridor_half_width"] > 0 else None)
+
+
 def evaluate(out):
     """四组并行，各自 1 个 gz；eval_closed_loop 有失败集时 rc=1 但 eval.json 已写，四组全跑完再一起看。"""
     ckpts = dict(old_x3_ckpt=CFG["old_x3_ckpt"], new_ckpt=deliver_ckpt(os.path.join(out, "run")))
@@ -299,16 +349,18 @@ def evaluate(out):
             ckpts[ckpt_key] = ckpt_key      # 探索臂：键就是 ckpt 路径
     for key, path in ckpts.items():
         need(path, f"{key} 不存在")
+    mv = eval_metric_version()
     procs = {}
     for name, policy, ckpt_key in eval_groups():
         edir = os.path.join(out, f"eval-{name}")
-        if pc.eval_finished(edir):   # 完成 = eval.json 在、failed_count==0、episodes_done>0、非 partial
+        ckpt = ckpts[ckpt_key] if ckpt_key else None
+        state, moved, why = pc.settle_eval(edir, metric_version=mv, ckpt=ckpt)
+        if state == "done":
             log(f"跳过 {name}：eval.json 完整")
             continue
-        if not DRY:
-            moved = pc.retire_unfinished_eval(edir)   # 有 eval.json 但没完成（失败集/中断）：让出目录重跑
-            if moved:
-                log(f"{name} 上次没跑完，旧目录挪到 {moved}，重跑")
+        if moved:
+            kind_msg = "与当前配置不一致" if state == "stale" else "上次没跑完"
+            log(f"{name} {kind_msg}（{why}），旧目录挪到 {moved}，重跑")
         cmd = [PY, f"{REPO}/sim/tools/eval_closed_loop.py", "--policy", policy, "--task", "base",
                "--split", "test", "--seeds", CFG["eval_seeds"],
                "--episodes", str(len(CFG["eval_seeds"].split(","))),
@@ -349,8 +401,12 @@ def summary(out):
         rows[name]["wilson95"] = (e.get("wilson_ci") or {}).get("requested")
         rows[name]["infer_p50_ms"] = (e.get("inference_ms") or {}).get("p50")
         rows[name]["infer_p95_ms"] = (e.get("inference_ms") or {}).get("p95")
+    retired = pc.read_retired(out)
     if not DRY:
-        write_json(os.path.join(out, "summary.json"), {"cfg": CFG, "groups": rows})
+        doc = {"cfg": CFG, "groups": rows}
+        if retired:
+            doc["retired"] = retired
+        write_json(os.path.join(out, "summary.json"), doc)
     fmt = "%-16s %6s %6s %6s %6s %5s %5s %8s  %s"
     versions = sorted({str(r["metric_version"]) for r in rows.values()})
     lines = []
@@ -367,6 +423,7 @@ def summary(out):
     lines.append(f"口径：SR 分母 = 请求集 {len(CFG['eval_seeds'].split(','))}（失败集计入分母）；四组同一批 seed、"
                  f"E1 机体 {CFG['dynamics']} / {CFG['window_from']} / hold {CFG['hold']}；"
                  "E1 外径 0.20 m vs X3 0.71 m，与历史 X3 数字不可比；详见 docs/EVAL_STANDARD.md")
+    lines.extend(pc.retired_lines(out))
     for line in lines:
         log(line)
     if not DRY:
@@ -381,6 +438,7 @@ RUN = dict(pilot=pilot, collect=collect, audit=audit, preprocess=preprocess,
 def preflight():
     """开跑前把会在几小时后才炸的缺件一次查完。"""
     deliver_check()
+    protocol_check()
     need(f"{BUILD}/uavrgb_train", "先 bash tools/check.sh 构建，或设 UAV_RGB_BUILD_DIR")
     need(f"{BUILD}/uavrgb_infer", "同上")
     need(CFG["old_x3_ckpt"], "旧 X3 学生 ckpt")
@@ -403,6 +461,8 @@ def main():
     out = os.path.abspath(a.out)
     if not DRY:   # dry-run 不建目录、不写文件（A6）
         os.makedirs(out, exist_ok=True)
+        pc.lock_out(out)   # E-3：已有实例在跑就退出 3；要赶在 config.json / DONE 之前，第二个实例不能碰第一个的状态
+        pc.write_run_pid(out)   # E-4：run.pid 记 pid / pgid / 启动时刻 / 命令行，停进程前能核对 PID 还是不是这个进程
         write_json(os.path.join(out, "config.json"),   # 这次实验到底用了哪套参数，事后不用翻 manifest
                    {"cfg": CFG, "groups": eval_groups(), "gz_env": GZ_ENV, "argv": sys.argv,
                     "repo": REPO, "build": BUILD, "python": PY,
@@ -435,6 +495,7 @@ def main():
         if not DRY:
             with open(os.path.join(out, "DONE"), "w", encoding="utf-8") as f:
                 f.write(f"rc={rc} {time.strftime('%F %T')} last_step={last}\n")
+        pc.unlock_out()   # DONE 写完才放锁，别的实例起得来时标记已经是最新的
     return rc
 
 

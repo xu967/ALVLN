@@ -13,8 +13,10 @@
   OUT=$DATA_ROOT/uav_rgb/tmp/agent4-teacher-p1/dagger-$(date +%Y%m%d-%H%M); mkdir -p "$OUT"
   export TMPDIR=$DATA_ROOT/uav_rgb/tmp UAV_RGB_BUILD_DIR=$DATA_ROOT/uav_rgb/tmp/agent4-teacher-p1/bin   # 冻结的二进制快照：各臂同一 uavrgb_train
   setsid nohup .venv-tools/bin/python tools/dagger_pipeline.py --out "$OUT" > "$OUT/run.log" 2>&1 < /dev/null &
-  echo $! > "$OUT/run.pid"
+  sleep 3; cat "$OUT/run.pid"   # 进程自己写 run.pid：pid= pgid= start=（/proc/<pid>/stat 第 22 列）cmd=；不要再 echo $! > run.pid，重复起会冲掉第一个的记录
+  # 停：先核对 start 与该 PID 现在的启动时刻一致（容器重启后 PID 可能已被别的进程拿走），再 kill -- -<pgid>
 看进度：tail -f $OUT/run.log；每步 $OUT/status.json；结束落 $OUT/DONE。--dry-run 只打印命令。
+同一个 --out 只许一个实例：起跑先拿 $OUT/.pipeline.lock（flock），拿不到就退出 3、不改 $OUT 里任何文件；锁随进程消失，被杀后原命令可直接再起。
 断点续跑：同一 --out 重跑，完成的步骤跳过（标注 npz、ds、训练 = run/metrics.jsonl 末行 done:、评测 = eval.json 完整且
 无失败集；没完成的评测目录改名 .failed-<时间> 后重评），汇总重算（tools/pipeline_common）。
 --collect-round0：第 0 轮用 astar 教师现采（与 DAgger 轮同一份固件参数；pilot 的 dynamics_profile 与新采集不同，不能混包）。
@@ -71,6 +73,7 @@ CFG = dict(
 )
 # gsplat JIT 缓存目录在 main 里按本机 GPU 计算能力解析（torch_extensions_dir）：不同卡的 .so 不混用。
 ENV_3DGS = dict(UAV_RGB_BUILD_DIR=BUILD)   # student.py 按 UAV_RGB_BUILD_DIR 找 uavrgb_infer
+EVAL_METRIC_VERSION = "3dgs.pilot.v2"      # 与 sim/3dgs/eval_3dgs.METRIC_VERSION 同步（test_pipeline_common 对账）
 # ──────────────────────────────────────────────────────────────────────────
 
 DRY = False   # main 里与 pipeline_common.DRY 一起置位；helper 都在 tools/pipeline_common.py（A4）
@@ -99,10 +102,14 @@ def round0_dirs(out):
         return dirs
     root = os.path.join(out, "round_0", "collect")
     for r in CFG["routes"]:
-        if done(os.path.join(root, f"route_{r}", "run.json")):
+        rdir = os.path.join(root, f"route_{r}")
+        if done(os.path.join(rdir, "run.json")):
             continue
+        if not DRY and os.path.isdir(rdir) and os.listdir(rdir):
+            moved = pc.retire_dir(rdir, "partial", "没有 run.json")
+            log(f"round_0 route_{r} 上次采集没跑完，旧目录挪到 {moved}，重采")
         sh([PY3DGS, "-m", "sim.3dgs.collect_3dgs", "--scene", CFG["scene"], "--route", str(r),
-            "--out", os.path.join(root, f"route_{r}"), "--policy", "astar", "--episodes", str(CFG["round0_eps_per_route"]),
+            "--out", rdir, "--policy", "astar", "--episodes", str(CFG["round0_eps_per_route"]),
             "--seed", str(CFG["round0_seed"] + r * 100), "--hold", str(CFG["hold"]), "--dynamics", CFG["dynamics"],
             "--dynamics-params", CFG["dynamics_params"], "--spawn-jitter", str(CFG["spawn_jitter"])],
            env_extra=ENV_3DGS, log_path=None if DRY else os.path.join(root, f"collect_route_{r}.log"))
@@ -116,6 +123,8 @@ def good_episode_dirs(collect_root):
     """自采产物里可进训练集的集：manifest 无 error、validity 全 true、没有动力学异常。"""
     out = []
     for d in sorted(glob.glob(os.path.join(collect_root, "route_*", "ep_*"))):
+        if "." in os.path.basename(os.path.dirname(d)):
+            continue   # 排除 route_<r>.partial-<时刻> 等退居目录里的残余集
         mp = os.path.join(d, "episode_manifest.json")
         if not os.path.isfile(mp):
             continue
@@ -146,8 +155,9 @@ def pack(dirs, npzs, ds):
     """preprocess 打包 + join_soft_targets（无侧车：flags=0，按 UAVR 记录的 source_dir 找 episode）。"""
     if done(f"{ds}/dataset.uavr", f"{ds}/soft_targets.bin"):
         return log(f"跳过打包（已有 {ds}）")
-    if os.path.isdir(ds) and os.listdir(ds):
-        raise RuntimeError(f"{ds} 非空且不完整：删掉再跑")
+    if not DRY and os.path.isdir(ds) and os.listdir(ds):
+        moved = pc.retire_dir(ds, "partial", "缺少 dataset.uavr 或 soft_targets.bin")
+        log(f"{ds} 上次打包没跑完，旧目录挪到 {moved}，重打")
     cmd = [PY, f"{REPO}/tools/preprocess.py", "--out", ds]
     if CFG["drop_collision"]:
         cmd.append("--drop-collision")
@@ -160,8 +170,9 @@ def train(ds, run_dir, arm):
     if not DRY and pc.train_finished(run_dir):   # 完成 = metrics.jsonl 末行 done:（ckpt.bin 每轮都写，不算）
         log(f"跳过训练（{run_dir}/metrics.jsonl 已记 done）")
         return f"{run_dir}/ckpt_best.bin" if os.path.isfile(f"{run_dir}/ckpt_best.bin") else f"{run_dir}/ckpt.bin"
-    if os.path.isdir(run_dir) and os.listdir(run_dir):
-        raise RuntimeError(f"{run_dir} 非空且训练没跑完（metrics.jsonl 末行不是 done:）：uavrgb_train 的 RunOwner 拒绝复用，删掉再跑")
+    if not DRY and os.path.isdir(run_dir) and os.listdir(run_dir):
+        moved = pc.retire_dir(run_dir, "partial", "训练没跑完（metrics.jsonl 末行不是 done:）")
+        log(f"{run_dir} 上次训练没跑完，旧目录挪到 {moved}，重训")
     cmd = [f"{BUILD}/uavrgb_train", "--data", f"{ds}/dataset.uavr", "--out", run_dir,
            "--epochs", str(CFG["epochs"]), "--batch", str(CFG["batch"]), "--lr", repr(float(CFG["lr"])),
            "--seed", str(CFG["seed"])]
@@ -184,10 +195,14 @@ def train(ds, run_dir, arm):
 def collect_dagger(k, ckpt, beta, out_root):
     """第 k 轮学生自采（3DGS）：每条路线 N 集，astar 教师打标，β 混合。"""
     for r in CFG["routes"]:
-        if done(os.path.join(out_root, f"route_{r}", "run.json")):
+        rdir = os.path.join(out_root, f"route_{r}")
+        if done(os.path.join(rdir, "run.json")):
             continue
+        if not DRY and os.path.isdir(rdir) and os.listdir(rdir):
+            moved = pc.retire_dir(rdir, "partial", "没有 run.json")
+            log(f"round_{k} route_{r} 上次采集没跑完，旧目录挪到 {moved}，重采")
         sh([PY3DGS, "-m", "sim.3dgs.collect_3dgs", "--scene", CFG["scene"], "--route", str(r),
-            "--out", os.path.join(out_root, f"route_{r}"), "--policy", "student", "--ckpt", ckpt,
+            "--out", rdir, "--policy", "student", "--ckpt", ckpt,
             "--beta", str(beta), "--dagger-round", str(k), "--episodes", str(CFG["dagger_eps_per_route"]),
             "--seed", str(CFG["dagger_seed"] + k * 1000 + r * 100), "--hold", str(CFG["hold"]),
             "--dynamics", CFG["dynamics"], "--dynamics-params", CFG["dynamics_params"],
@@ -196,17 +211,20 @@ def collect_dagger(k, ckpt, beta, out_root):
 
 
 def evaluate(ckpt, out_root):
-    """6 路线 × N 集；返回汇总 dict。每路线一个 eval_3dgs 进程（串行，共用一张卡）。"""
-    rows, failed = [], 0
+    """6 路线 × N 集；返回汇总 dict。每路线一个 eval_3dgs 进程（串行，共用一张卡）。
+    E-7：成功类指标（success / task_success）与对应 Wilson 区间分母取请求集数 n_req（失败/剔除集计入分母、成功记 0），
+    越低越好的碰撞率分母取完成集 n_done（与 W1-2 / stats_report 同口径），failed 单独列出。"""
+    rows, failed, n_req = [], 0, 0
+    route_req, route_failed = {}, {}
     for r in CFG["routes"]:
         edir = os.path.join(out_root, f"route_{r}")
-        if DRY or not pc.eval_finished(edir):   # 完成 = eval.json 在、failed_count==0、episodes_done>0、非 partial
-            if not DRY:
-                moved = pc.retire_unfinished_eval(edir)   # 有 eval.json 但有剔除集/中断：让出目录重跑这条路线
-                if moved:
-                    log(f"route {r} 上次评测有失败集或没跑完，旧目录挪到 {moved}，重跑")
+        state, moved, why = pc.settle_eval(edir, metric_version=EVAL_METRIC_VERSION, ckpt=ckpt)
+        if DRY or state != "done":
+            if moved:
+                kind_msg = "与当前配置不一致" if state == "stale" else "有失败集或没跑完"
+                log(f"route {r} 上次评测{kind_msg}（{why}），旧目录挪到 {moved}，重跑")
             # eval_3dgs 有集被 physics_verified=false（cf_sitl 失控保护）剔除时退出码 1 但 eval.json 照写：
-            # 本轮只要 eval.json 在就继续汇总，剔除数记进 failed；文件都没有才算真失败。续跑时这条路线会重评。
+            # 本轮只要 eval.json 在就继续汇总，剔除数记进 failed 并计入请求集数分母；文件都没有才算真失败。续跑时这条路线会重评。
             rc = run([PY3DGS, "-m", "sim.3dgs.eval_3dgs", "--scene", CFG["scene"], "--route", str(r), "--out", edir,
                       "--policy", "student", "--ckpt", ckpt, "--episodes", str(CFG["eval_eps_per_route"]),
                       "--seed", str(CFG["eval_seed"] + r * 10), "--hold", str(CFG["hold"]),
@@ -220,25 +238,36 @@ def evaluate(ckpt, out_root):
         if DRY:
             continue
         rep = read_json(os.path.join(edir, "eval.json"))
-        failed += len(rep.get("failed", []))
+        eps = rep.get("per_episode") or []
+        r_failed = rep.get("failed_count", len(rep.get("failed") or []))
+        r_skipped = rep.get("skipped_count", len(rep.get("skipped") or []))
+        r_req = rep["episodes_requested"] if rep.get("episodes_requested") is not None else (len(eps) + r_failed + r_skipped)
+        failed += r_failed
+        n_req += r_req
+        route_req[r], route_failed[r] = r_req, r_failed
         # eval.json（uavrgb.eval.v1）的逐集记录在 per_episode：success = 轨迹曾进 reach 半径且无碰撞，
         # task_success 还要求在半径内发 SAFE 停住（3dgs.pilot.v2 口径，都不是 Gazebo/AvoidBench 的正式数字）
-        for e in rep.get("per_episode", []):
+        for e in eps:
             rows.append({"route": r, "success": bool(e.get("success")), "task_success": bool(e.get("task_success")),
                          "collision": bool(e.get("collision")), "stuck": bool(e.get("stuck")),
                          "steps": e.get("steps")})
-    n = len(rows)
+    n_done = len(rows)
     cnt = {key: sum(x[key] for x in rows) for key in ("success", "task_success", "collision", "stuck")}
 
-    def ci95(k):   # [lo, hi] 保留 3 位（summary.json 的历史格式）；公式只在 pipeline_common.wilson_ci
-        w = pc.wilson_ci(k, n)
+    def ci95(k, denom):   # [lo, hi] 保留 3 位（summary.json 的历史格式）；公式只在 pipeline_common.wilson_ci
+        w = pc.wilson_ci(k, denom)
         return None if w is None else [round(w[0], 3), round(w[1], 3)]
 
-    return {"n": n, "failed": failed, **cnt,
-            "success_rate": cnt["success"] / n if n else None, "collision_rate": cnt["collision"] / n if n else None,
-            "success_ci95": ci95(cnt["success"]), "task_success_ci95": ci95(cnt["task_success"]),
-            "collision_ci95": ci95(cnt["collision"]),
-            "per_route": {str(r): {"n": sum(1 for x in rows if x["route"] == r),
+    return {"n": n_req, "episodes_done": n_done, "failed": failed, **cnt,
+            "success_rate": cnt["success"] / n_req if n_req else None,
+            "task_success_rate": cnt["task_success"] / n_req if n_req else None,
+            "collision_rate": cnt["collision"] / n_done if n_done else None,
+            "success_ci95": ci95(cnt["success"], n_req),
+            "task_success_ci95": ci95(cnt["task_success"], n_req),
+            "collision_ci95": ci95(cnt["collision"], n_done),
+            "per_route": {str(r): {"n": route_req.get(r, 0),
+                                   "episodes_done": sum(1 for x in rows if x["route"] == r),
+                                   "failed": route_failed.get(r, 0),
                                    **{key: sum(x[key] for x in rows if x["route"] == r)
                                       for key in ("success", "task_success", "collision", "stuck")}}
                           for r in CFG["routes"]}}
@@ -277,6 +306,8 @@ def main():
     out = os.path.abspath(a.out)
     if not DRY:   # dry-run 不建目录、不写文件（A6）
         os.makedirs(out, exist_ok=True)
+        pc.lock_out(out)   # E-3：已有实例在跑就退出 3；要赶在 config.json / DONE 之前，第二个实例不能碰第一个的状态
+        pc.write_run_pid(out)   # E-4：run.pid 记 pid / pgid / 启动时刻 / 命令行，停进程前能核对 PID 还是不是这个进程
         ext_dir = torch_extensions_dir()   # 按本机卡命名的 gsplat JIT 缓存；问不到 torch 就用默认缓存
         if ext_dir:
             ENV_3DGS["TORCH_EXTENSIONS_DIR"] = ext_dir
@@ -336,13 +367,20 @@ def main():
                 last = f"round_{k}.eval_{arm}"
                 mark(out, last, "running")
                 res[arm] = evaluate(ckpts[arm], os.path.join(rd, f"eval_{arm}"))
-                mark(out, last, "ok", **{kk: res[arm][kk] for kk in ("n", "success", "task_success", "collision")})
+                mark(out, last, "ok", **{kk: res[arm][kk] for kk in ("n", "episodes_done", "failed", "success", "task_success", "collision")})
                 log(f"round {k} {arm}: SR {res[arm]['success']}/{res[arm]['n']} CI95 {res[arm]['success_ci95']} "
-                    f"task {res[arm]['task_success']}/{res[arm]['n']} collision {res[arm]['collision']}/{res[arm]['n']}")
+                    f"task {res[arm]['task_success']}/{res[arm]['n']} collision {res[arm]['collision']}/{res[arm]['episodes_done']}"
+                    + (f" failed {res[arm]['failed']}" if res[arm]["failed"] else ""))
             stats = read_json(os.path.join(rd, "soft_stats.json"))["summary"] if not DRY else None
             summary["rounds"][str(k)] = {"episodes": len(all_dirs), "eval": res, "label_stats": stats}
             if not DRY:
+                retired = pc.read_retired(out)
+                if retired:
+                    summary["retired"] = retired
                 write_json(os.path.join(out, "summary.json"), summary)
+        if not DRY:
+            for line in pc.retired_lines(out):
+                log(line)
     except pc.Interrupted as e:
         rc = e.rc
         n = pc.terminate_children()
@@ -356,6 +394,7 @@ def main():
         if not DRY:
             with open(os.path.join(out, "DONE"), "w", encoding="utf-8") as f:
                 f.write(f"rc={rc} {time.strftime('%F %T')} last_step={last}\n")
+        pc.unlock_out()   # DONE 写完才放锁，别的实例起得来时标记已经是最新的
     return rc
 
 

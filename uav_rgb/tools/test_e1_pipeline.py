@@ -155,27 +155,111 @@ def _touch(path, text=""):
 
 @_cfg(deliver="best")   # 这条只管训练续跑，用 deliver=best 排除校准平均步（calswa 的续跑见 test_calswa_resume）
 def test_train_resume_by_metrics_done():
-    """训练完成的判据是 metrics.jsonl 末行 done:，不是 ckpt 文件在（trainer 每轮都写 ckpt.bin，被杀的 run 也有）。"""
+    """训练完成的判据是 metrics.jsonl 末行 done:，不是 ckpt 文件在（trainer 每轮都写 ckpt.bin，被杀的 run 也有）；
+    E-9：半成品 run/ 挪成 run.partial-<时刻> 后重训，不用人手删。"""
     real_sh = ep.sh
     calls = []
-    ep.sh = lambda cmd, *a, **k: calls.append(cmd)
+    tmp = tempfile.mkdtemp(prefix="test_e1_pipeline_")
     try:
-        tmp = tempfile.mkdtemp(prefix="test_e1_pipeline_")
+        ep.sh = _fake_sh(calls)
         _touch(os.path.join(tmp, "ds", "dataset.uavr"))
-        _touch(os.path.join(tmp, "run", "ckpt_best.bin"))
-        try:
-            ep.train(tmp)
-        except RuntimeError as e:
-            assert "非空" in str(e), e
-        else:
-            raise AssertionError("run/ 非空但没跑完（没有 done 行）应报错，不能当训练完成")
-        _touch(os.path.join(tmp, "run", "metrics.jsonl"), DONE_LINE)
-        ep.train(tmp)      # 完成 → 跳过
+        _touch(os.path.join(tmp, "run", "ckpt_best.bin"), "stale-partial")
+        ep.train(tmp)      # 没有 done 行 → 不当完成跳过，挪成 run.partial-* 后重起 uavrgb_train
+        assert [_tool(c) for c, _ in calls] == ["uavrgb_train"], calls
+        partials = [d for d in os.listdir(tmp) if d.startswith("run.partial-")]
+        assert len(partials) == 1, os.listdir(tmp)
+        assert open(os.path.join(tmp, partials[0], "ckpt_best.bin"), encoding="utf-8").read() == "stale-partial"
+        calls.clear()
+        ep.train(tmp)      # 现在 metrics.jsonl 已有 done 行 → 跳过
         assert calls == [], f"训练已完成不该再起 uavrgb_train：{calls}"
     finally:
         ep.sh = real_sh
         shutil.rmtree(tmp, ignore_errors=True)
-    print("ok train：按 metrics.jsonl done 行续跑")
+    print("ok train：无 done 行的半成品挪 .partial-* 后重训，有 done 行跳过")
+
+
+@_cfg(deliver="best")
+def test_partial_collect_pack_and_train_resume_and_rename_failure():
+    """E-9：采集、打包、训练的半成品目录自动改名 *.partial-<时刻> 后重做，原命令（不带 --from）可续跑；
+    已完成的采集与打包自动跳过；改名失败时立刻报错停下，绝不在旧目录上重做。"""
+    import pipeline_common as pc
+    tmp = tempfile.mkdtemp(prefix="test_e1_pipeline_")
+    ran, sh_calls = [], []
+
+    def fake_run(cmd, **_kw):
+        tool = _tool(cmd)
+        ran.append(tool)
+        if tool == "collect_parallel.py":
+            col = _flag(cmd, "--out")
+            assert not os.path.exists(col), f"{col} 应已让空给 collect_parallel"
+            _touch(os.path.join(col, "train", "3100", "episode_manifest.json"), "{}")
+            _touch(os.path.join(col, "collection_manifest.json"), json.dumps(
+                {"episodes_ok": 20, "episodes_requested": 20,
+                 "splits": {"train": ["3100"], "val": [], "test": []}, "end_to_end_wall_s": 1.0}))
+        elif tool == "audit_dataset.py":
+            _touch(_flag(cmd, "--out"), json.dumps({"checks": []}))
+        return 0
+
+    def fake_sh(cmd, **kw):
+        tool = _tool(cmd)
+        sh_calls.append(tool)
+        if tool == "preprocess.py":
+            ds = _flag(cmd, "--out")
+            assert not os.path.exists(ds), f"{ds} 半成品应已挪空"
+            _touch(os.path.join(ds, "dataset.uavr"), "uavr")
+        else:
+            _fake_sh([])(cmd, **kw)
+
+    pc.lock_out(tmp)
+    try:
+        # pilot 已完成，collection / ds / run 都是半成品
+        _touch(os.path.join(tmp, "pilot", "collection_manifest.json"), json.dumps(
+            {"episodes_ok": 20, "episodes_requested": 20,
+             "splits": {"train": ["3000"], "val": [], "test": []}, "end_to_end_wall_s": 1.0}))
+        _touch(os.path.join(tmp, "pilot", "audit.json"), json.dumps({"checks": []}))
+        _touch(os.path.join(tmp, "collection", ".staging", "scene_3100", "x"), "half-col")
+        _touch(os.path.join(tmp, "ds", "dataset.uavr.tmp"), "half-ds")
+        _touch(os.path.join(tmp, "run", "ckpt.bin"), "half-run")
+        with _patched(ep, run=fake_run, sh=fake_sh):
+            for step_name in ("pilot", "collect", "audit", "preprocess", "train"):
+                ep.RUN[step_name](tmp)
+            # 再从头跑一遍：全部已完成，采集 / 打包 / 训练都不再重起
+            ran.clear()
+            sh_calls.clear()
+            for step_name in ("pilot", "collect", "preprocess", "train"):
+                ep.RUN[step_name](tmp)
+            assert "collect_parallel.py" not in ran and sh_calls == [], (ran, sh_calls)
+        entries = os.listdir(tmp)
+        for prefix in ("collection.partial-", "ds.partial-", "run.partial-"):
+            assert any(d.startswith(prefix) for d in entries), (prefix, entries)
+        assert not any(d.startswith("pilot.partial-") for d in entries), entries
+        rows = pc.read_retired(tmp)
+        assert [(r["kind"], r["path"]) for r in rows] == [
+            ("partial", "collection"), ("partial", "ds"), ("partial", "run")], rows
+
+        # 改名失败：停下并报错，采集与训练命令都不执行，旧文件不动
+        _touch(os.path.join(tmp, "col_busy", "x.txt"), "keep-col")
+        _touch(os.path.join(tmp, "run_busy_root", "ds", "dataset.uavr"), "uavr")
+        _touch(os.path.join(tmp, "run_busy_root", "run", "ckpt.bin"), "keep-run")
+        ran.clear()
+        sh_calls.clear()
+        boom_rename = lambda *_a: (_ for _ in ()).throw(PermissionError("rename denied"))
+        with _patched(ep, run=fake_run, sh=fake_sh), _patched(pc.os, rename=boom_rename):
+            for fn, label in ((lambda: ep.collect_into(os.path.join(tmp, "col_busy"), 4, 3100), "collect"),
+                              (lambda: ep.train(os.path.join(tmp, "run_busy_root")), "train")):
+                try:
+                    fn()
+                except RuntimeError as e:
+                    assert "rename denied" in str(e), (label, e)
+                else:
+                    raise AssertionError(f"{label} 改名失败应停下报错")
+        assert ran == [] and sh_calls == [], f"改名失败不该在旧目录上重做：{ran} / {sh_calls}"
+        assert open(os.path.join(tmp, "col_busy", "x.txt"), encoding="utf-8").read() == "keep-col"
+        assert open(os.path.join(tmp, "run_busy_root", "run", "ckpt.bin"), encoding="utf-8").read() == "keep-run"
+    finally:
+        pc.unlock_out()
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("ok E-9（e1）：半成品挪 .partial-* 后原命令续跑，改名失败停下不在旧目录重做")
 
 
 def test_evaluate_resume_by_eval_finished():
@@ -220,6 +304,128 @@ def test_evaluate_resume_by_eval_finished():
     print("ok evaluate：按 eval_finished 续跑，未完成目录（含只剩 videos/ 的录像组）改名重跑")
 
 
+@_cfg(corridor_half_width=3.0, dynamics="cf_sitl", deliver="calswa", extra_students="")
+def test_evaluate_retires_stale_and_truncated_evals():
+    """E-8（W1-1 第 3 项、W1-5 第 5 项）：续跑时已有的 eval.json 对不上当前配置就不算评完，旧目录挪走重评，不拿旧数字顶替。
+    四组各一种情形：teacher 与当前配置一致，跳过；student-x3-old 的 metric_version 是没带走廊的旧口径，挪 .stale-；
+    student-e1-new 评的是 ckpt_best.bin 而当前交付 ckpt_calswa.bin，挪 .stale-；forward 只评了 5 集、跳过 15 集
+    （旧判据 failed==0 且 done>0 当评完），挪 .failed-。重评前目录都是空的（eval_closed_loop 的要求），台账记三条。"""
+    import pipeline_common as pc
+    mv_now, mv_old = "sim09.v2.coast1s.corridor3m", "sim09.v2.coast1s"
+    tmp = tempfile.mkdtemp(prefix="test_e1_pipeline_")
+    real_popen, real_ckpt = subprocess.Popen, ep.CFG["old_x3_ckpt"]
+    started = []
+    pc.lock_out(tmp)
+    try:
+        old_x3 = os.path.join(tmp, "old_x3.bin")
+        best = os.path.join(tmp, "run", "ckpt_best.bin")
+        for path in (old_x3, os.path.join(tmp, DELIVERED), best):
+            _touch(path)
+        ep.CFG["old_x3_ckpt"] = old_x3
+        teacher, x3_old, e1_new, forward = [g[0] for g in ep.eval_groups()]
+
+        def put(name, **over):
+            doc = {"episodes_requested": 20, "episodes_done": 20, "failed_count": 0, "skipped_count": 0,
+                   "metric_version": mv_now, "ckpt": None}
+            doc.update(over)
+            _touch(os.path.join(tmp, f"eval-{name}", "eval.json"), json.dumps(doc))
+
+        put(teacher)
+        put(x3_old, metric_version=mv_old, ckpt=old_x3)
+        put(e1_new, ckpt=best)
+        put(forward, episodes_done=5, skipped_count=15)
+
+        def fake_popen(cmd, **_kw):
+            edir = cmd[cmd.index("--out") + 1]
+            name = os.path.basename(edir)[len("eval-"):]
+            started.append(name)
+            assert not os.path.exists(edir), f"{edir} 应先让出来（eval_closed_loop 要求 --out 为空）"
+            ckpt_arg = cmd[cmd.index("--ckpt") + 1] if "--ckpt" in cmd else None
+
+            class MatchingProc(FakeProc):
+                def wait(self):
+                    rc = super().wait()
+                    put(name, ckpt=ckpt_arg)
+                    return rc
+
+            return MatchingProc(name, edir, write_eval=True)
+
+        subprocess.Popen = fake_popen
+        ep.evaluate(tmp)
+        assert started == [x3_old, e1_new, forward], f"应只重评对不上与截断的三组，实际 {started}"
+        names = sorted(os.listdir(tmp))
+        stale = [d for d in names if ".stale-" in d and d.endswith(tuple("0123456789"))]
+        failed = [d for d in names if ".failed-" in d]
+        assert sorted(d.split(".stale-")[0] for d in stale) == [f"eval-{e1_new}", f"eval-{x3_old}"], names
+        assert [d.split(".failed-")[0] for d in failed] == [f"eval-{forward}"], names
+        for d in stale + failed:
+            assert os.path.isfile(os.path.join(tmp, d, "eval.json")), f"旧目录要原样留着：{d}"
+        assert json.load(open(os.path.join(tmp, f"eval-{teacher}", "eval.json"), encoding="utf-8"))["metric_version"] == mv_now
+        rows = pc.read_retired(tmp)
+        assert sorted((r["kind"], r["path"]) for r in rows) == sorted(
+            [("stale", f"eval-{x3_old}"), ("stale", f"eval-{e1_new}"), ("failed", f"eval-{forward}")]), rows
+        why = {r["path"]: r["why"] for r in rows}
+        assert mv_old in why[f"eval-{x3_old}"] and mv_now in why[f"eval-{x3_old}"], why
+        assert "ckpt_best.bin" in why[f"eval-{e1_new}"] and "ckpt_calswa.bin" in why[f"eval-{e1_new}"], why
+        assert "skipped_count=15" in why[f"eval-{forward}"], why
+        # 再续跑一次：四组现在都与当前配置对得上，一组都不重评
+        started.clear()
+        ep.evaluate(tmp)
+        assert started == [], f"重评对齐后再续跑应全部跳过，实际 {started}"
+    finally:
+        subprocess.Popen, ep.CFG["old_x3_ckpt"] = real_popen, real_ckpt
+        pc.unlock_out()
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("ok evaluate：metric_version / 权重对不上 → .stale-，只评了一部分 → .failed-，一致的跳过")
+
+
+@_cfg(corridor_half_width=3.0, dynamics="cf_sitl")
+def test_eval_metric_version_follows_cfg():
+    """评测命令带不带 --corridor-half-width，决定 eval.json 的 metric_version；流水线核对的期望值跟着同一个 CFG 走。"""
+    assert ep.eval_metric_version() == "sim09.v2.coast1s.corridor3m"
+    ep.CFG["corridor_half_width"] = 0.0   # E1_CORRIDOR_HALF_WIDTH=0：命令不带该开关，版本不带 .corridor
+    assert ep.eval_metric_version() == "sim09.v2.coast1s"
+    ep.CFG.update(corridor_half_width=2.5, dynamics="x3_velocity")
+    assert ep.eval_metric_version() == "sim09.v2.corridor2.5m"
+    print("ok eval_metric_version 跟随 CFG")
+
+
+def test_summary_lists_retired_dirs():
+    """E-8 / E-9：续跑挪走的目录（旧目录没删）列进 summary 的输出、summary.md 与 summary.json 的 retired；
+    一个都没挪过时三处都与改前逐字相同。"""
+    import pipeline_common as pc
+    tmp = tempfile.mkdtemp(prefix="test_e1_pipeline_")
+    try:
+        groups = [g[0] for g in ep.eval_groups()]
+        for name in groups:
+            _eval_json(tmp, name, "sim09.v2.coast1s")
+
+        def run_summary():
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                ep.summary(tmp)
+            return (buf.getvalue(), open(os.path.join(tmp, "summary.md"), encoding="utf-8").read(),
+                    json.load(open(os.path.join(tmp, "summary.json"), encoding="utf-8")))
+
+        printed, md, doc = run_summary()
+        assert "续跑挪走" not in printed + md and "retired" not in doc and sorted(doc) == ["cfg", "groups"], (printed, doc.keys())
+        pc.lock_out(tmp)
+        try:
+            _touch(os.path.join(tmp, "old", "eval.json"), "{}")
+            pc.retire_dir(os.path.join(tmp, "old"), "stale", "metric_version 不同")
+            _touch(os.path.join(tmp, "collection", "x"), "")
+            pc.retire_dir(os.path.join(tmp, "collection"), "partial", "没有 collection_manifest.json")
+        finally:
+            pc.unlock_out()
+        printed, md, doc = run_summary()
+        for text, where in ((printed, "stdout"), (md, "summary.md")):
+            assert "续跑挪走的目录" in text and "old.stale-" in text and "collection.partial-" in text, f"{where}:\n{text}"
+        assert [(r["kind"], r["path"]) for r in doc["retired"]] == [("stale", "old"), ("partial", "collection")], doc.get("retired")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("ok summary：续跑挪走的目录列在 stdout / summary.md / summary.json")
+
+
 def test_main_records_interrupt_with_real_rc():
     """SIGTERM/Ctrl-C：status.json 该步标 interrupted，DONE 写真实 rc（以前 Ctrl-C 写 DONE rc=0）。"""
     import signal
@@ -241,6 +447,10 @@ def test_main_records_interrupt_with_real_rc():
         assert done.startswith("rc=143 "), done
         for s in (signal.SIGTERM, signal.SIGINT):
             assert signal.getsignal(s) not in (signal.SIG_DFL, None), "main 应装 SIGTERM/SIGINT 处理器"
+        assert os.path.exists(os.path.join(tmp, ".pipeline.lock")), "E-3：main 起跑应拿过实例锁"
+        _hold_lock(tmp).close()   # E-3：收尾（DONE 写完）已放锁，同目录马上能再起
+        rec = dict(ln.split("=", 1) for ln in open(os.path.join(tmp, "run.pid"), encoding="utf-8").read().splitlines())
+        assert rec["pid"] == str(os.getpid()) and rec["start"] == pc.proc_stat_field(os.getpid(), 22), rec   # E-4：run.pid 带启动时刻
     finally:
         ep.RUN["summary"], ep.preflight, sys.argv, handlers = saved
         for s, h in handlers.items():
@@ -269,6 +479,51 @@ def test_dry_run_creates_nothing():
             signal.signal(s, h)
         shutil.rmtree(tmp, ignore_errors=True)
     print("ok --dry-run 不建目录不写文件")
+
+
+def _hold_lock(out):
+    """另一个实例占着输出目录：按约定的锁文件名 <out>/.pipeline.lock 加 flock。返回文件对象，关掉就放锁；已被占会抛 BlockingIOError。"""
+    import fcntl
+    os.makedirs(out, exist_ok=True)
+    f = open(os.path.join(out, ".pipeline.lock"), "a+", encoding="utf-8")
+    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    return f
+
+
+def test_main_second_instance_exits_before_touching_out():
+    """E-3：输出目录已被另一个实例占着时，main 在写任何文件之前退出 3：第一个实例的 config.json、DONE、run.pid 原样留着
+    （第二个实例不能把第一个的 run.pid 换成自己的），不写 status.json，也不进 preflight / 任何步骤（后面的步骤都换成会抛的替身，没拦住也起不了 gz）。"""
+    import signal
+    tmp = tempfile.mkdtemp(prefix="test_e1_pipeline_")
+    holder = _hold_lock(tmp)
+    saved = (sys.argv, {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)})
+
+    def boom(*_a, **_k):
+        raise AssertionError("拿不到锁却走到了后面的步骤")
+
+    try:
+        _touch(os.path.join(tmp, "DONE"), "rc=0 first-instance\n")
+        _touch(os.path.join(tmp, "config.json"), '{"first": true}')
+        _touch(os.path.join(tmp, "run.pid"), "pid=1\npgid=1\nstart=1\ncmd=first-instance\n")
+        sys.argv = ["e1_pipeline.py", "--out", tmp]
+        with _patched(ep, preflight=boom, RUN={k: boom for k in ep.RUN}):
+            try:
+                ep.main()
+            except SystemExit as e:
+                assert e.code == 3, e.code
+            else:
+                raise AssertionError("输出目录被占着，main 应退出 3")
+        assert sorted(os.listdir(tmp)) == [".pipeline.lock", "DONE", "config.json", "run.pid"], os.listdir(tmp)
+        assert open(os.path.join(tmp, "DONE"), encoding="utf-8").read() == "rc=0 first-instance\n"
+        assert json.load(open(os.path.join(tmp, "config.json"), encoding="utf-8")) == {"first": True}
+        assert open(os.path.join(tmp, "run.pid"), encoding="utf-8").read() == "pid=1\npgid=1\nstart=1\ncmd=first-instance\n"
+    finally:
+        holder.close()
+        sys.argv, handlers = saved
+        for s, h in handlers.items():
+            signal.signal(s, h)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("ok main：输出目录被占 → 退出 3，config.json / DONE 原样，不进任何步骤")
 
 
 def test_teacher_planner_passthrough():
@@ -595,7 +850,8 @@ def test_calswa_failure_stops_pipeline():
 
 def _dry_run_cmds(out, from_step, **env_extra):
     """子进程跑 `e1_pipeline.py --from <步> --dry-run`，返回打印出的每条命令（token 列表，去掉时间戳与重定向）。"""
-    env = {k: v for k, v in os.environ.items() if k not in ("E1_CORRIDOR_HALF_WIDTH", "E1_DELIVER", "E1_GPU")}
+    env = {k: v for k, v in os.environ.items()
+           if k not in ("E1_CORRIDOR_HALF_WIDTH", "E1_DELIVER", "E1_GPU", "E1_ACTION_LATENCY", "E1_RTF")}
     env.update(env_extra)
     r = subprocess.run([sys.executable, os.path.join(REPO, "tools", "e1_pipeline.py"),
                         "--out", out, "--from", from_step, "--dry-run"],
@@ -642,15 +898,63 @@ def test_deliver_env_overrides():
     print("ok CFG：deliver 缺省 calswa / 环境变量切 best，gpu 缺省 UUID / 环境变量覆盖")
 
 
+def test_action_latency_and_rtf_passthrough():
+    """A2：CFG 的 action_latency 与 rtf 缺省均为 None，全链 dry-run 命令行逐字不变；
+    给了之后透传 --action-latency <L:g> 与 --rtf <R:g> 到所有采集（pilot + collect）与评测命令，训练/打包不带；
+    环境变量 E1_ACTION_LATENCY / E1_RTF 可覆盖；非法取值（L<=0、L>=hold、非 observation、rtf<=0）在 preflight 报错。"""
+    out = os.path.join(tempfile.gettempdir(), "test_e1_pipeline_a2_never")
+    assert ep.CFG["action_latency"] is None and ep.CFG["rtf"] is None, (ep.CFG.get("action_latency"), ep.CFG.get("rtf"))
+    base_cmds = _dry_run_cmds(out, "pilot", E1_ACTION_LATENCY="", E1_RTF="")
+    both_cmds = _dry_run_cmds(out, "pilot", E1_ACTION_LATENCY="0.20", E1_RTF="0.5")
+    assert len(base_cmds) == len(both_cmds), (len(base_cmds), len(both_cmds))
+    n_col_eval = 0
+    for base_c, both_c in zip(base_cmds, both_cmds):
+        tool = _tool(base_c)
+        assert "--action-latency" not in base_c and "--rtf" not in base_c, base_c
+        if tool in ("collect_parallel.py", "eval_closed_loop.py"):
+            n_col_eval += 1
+            assert _flag(both_c, "--action-latency") == "0.2", both_c
+            assert _flag(both_c, "--rtf") == "0.5", both_c
+            stripped = _without_pair(_without_pair(both_c, "--action-latency"), "--rtf")
+            assert stripped == base_c, f"{tool} 除新增开关外应逐字不变：{stripped} vs {base_c}"
+        else:
+            assert both_c == base_c, f"{tool} 不该受 action_latency/rtf 影响：{both_c}"
+    assert n_col_eval == 2 + len(ep.eval_groups()), n_col_eval   # pilot + collect + 4 组 eval
+    # 单独只设其中一个开关
+    only_lat = _dry_run_cmds(out, "eval", E1_ACTION_LATENCY="0.16", E1_RTF="")
+    assert all(_flag(c, "--action-latency") == "0.16" and "--rtf" not in c for c in only_lat), only_lat
+    only_rtf = _dry_run_cmds(out, "eval", E1_ACTION_LATENCY="", E1_RTF="0.75")
+    assert all(_flag(c, "--rtf") == "0.75" and "--action-latency" not in c for c in only_rtf), only_rtf
+    # 静态核对 eval_closed_loop.py 确实认这两个开关（collect_parallel.py 由卡 W1-13 同步添加）
+    ec_known = _cli_flags(os.path.join(REPO, "sim", "tools", "eval_closed_loop.py"), r'add_argument\("(--[\w-]+)"')
+    assert {"--action-latency", "--rtf"} <= ec_known, ec_known
+    # 非法值在 preflight / vehicle_flags 报错
+    for bad_over in (dict(action_latency=0.0), dict(action_latency=-0.1), dict(action_latency=1.0, hold=1.0),
+                     dict(action_latency=0.2, window_from="dispatch"), dict(rtf=0.0), dict(rtf=-1.0)):
+        with _cfg(**bad_over):
+            try:
+                ep.preflight()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError(f"非法配置应报错：{bad_over}")
+    print("ok A2（e1）：action_latency / rtf 缺省 None 逐字不变，设值透传到采集与评测，非法取值报错")
+
+
 def main():
     test_corridor_half_width_in_eval_commands()
     test_teacher_planner_passthrough()
     test_evaluate_waits_all_groups()
     test_summary_marks_mixed_metric_version()
     test_train_resume_by_metrics_done()
+    test_partial_collect_pack_and_train_resume_and_rename_failure()
     test_evaluate_resume_by_eval_finished()
+    test_evaluate_retires_stale_and_truncated_evals()
+    test_eval_metric_version_follows_cfg()
+    test_summary_lists_retired_dirs()
     test_main_records_interrupt_with_real_rc()
     test_dry_run_creates_nothing()
+    test_main_second_instance_exits_before_touching_out()
     test_calswa_train_commands()
     test_calswa_flags_exist_in_tools()
     test_deliver_best_keeps_old_behavior()
@@ -660,6 +964,7 @@ def main():
     test_calswa_failure_stops_pipeline()
     test_dry_run_deliver_commands()
     test_deliver_env_overrides()
+    test_action_latency_and_rtf_passthrough()
     print("test_e1_pipeline: PASS")
     return 0
 
