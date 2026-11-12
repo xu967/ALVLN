@@ -33,6 +33,7 @@
 | T1（第二批，11-12 06:54） | `b706b2f` | `fe6ca32` | 5 个文件，+544 | 只加测试（审核 F4、F5 的两个 C++ 测试与公共夹具） |
 | S1b 第一轮（11-12 08:29） | `2b3eee7` | 推镜像后补 | 13 个文件，+2496 −27 | `sim/3dgs/collision.py` 的 `collision_model`（缺省 v1 不变；v2 未定稿）、`planner.py`、`collect_3dgs.py`、新文件 `route_dirs.py`；重定基线的入口 |
 | W1-15b（11-12 08:11） | `035b398` | `cc48b27` | 13 个文件，+1775 −119 | `tools/pipeline_common.py`（实例锁、`run.pid`、`eval_state`、`retire_dir`）；三条流水线的续跑、分母、`action_latency` / `rtf` 透传；两个旧工具的提示 |
+| W1-15b 第二轮（11-12 08:58） | `f3b7a14` | 待推 | 9 个文件，+320 −14 | `eval_3dgs` 的三个调用方（`tools/dagger_pipeline.py`、`tools/compare_datasets.py`、`tools/train_student_with_video.py`）显式传 `--allow-train-scene`，汇总标注实际划分；三条流水线文件头的起跑食谱 `>` 改 `>>` |
 | W1-13 第一、二部分（11-12 08:05） | `e40c693` | `7770479` | 15 个文件，+2637 −36 | `sim/tools/collect.py`、`cf_sitl_exec.py`、`eval_closed_loop.py` 的三项记账与 `protocol_notes`；`collect_parallel.py` 的透传；`tools/preprocess.py --drop-late-and-stall` |
 | W1-15a（11-12 08:03） | `f2c1107` | `a177ab2` | 7 个文件，+1500 | 新文件 `tools/exp_lib.sh`、`tools/stop_daemon.sh`、`experiments/_template/`；`tools/check.sh` 的 E-13 三行 |
 | W1-14（11-12 07:42） | `0d7f3b5` | `c284175` | 6 个文件，+1195 −68 | 新文件 `tools/paired_stats.py`；`tools/stats_report.py` 的多 run 配对、整簇区间、协议一致性键、失败集记 0；`docs/EVAL_STANDARD.md` §5 |
@@ -55,7 +56,7 @@
 | W1-13（第一、二部分 11-12 08:05 已合并，`e40c693`；第三部分下一轮） | A1、A3、A5、G5（步间刹停与记账）、A2 的采集并行器部分；动作持续到下一次派发并重标定 | `p12-w1-13` |
 | W1-14（11-12 07:42 已合并，`0d7f3b5`） | D2、D4、D5、D7、A4 与卡 W1-2 的遗留 | `p12-w1-14` |
 | W1-15a（11-12 08:03 已合并，`f2c1107`） | E-2、E-4、E-5、E-6、E-9、E-10、E-11、E-13（实验入口的公共脚本） | `p12-w1-15a` |
-| W1-15b（11-12 08:11 已合并，`035b398`；第二轮在做：`eval_3dgs` 的三个调用方，分支 `p12-w1-15b2`） | E-3、E-7、E-8、E-9、A2 的流水线部分 | `p12-w1-15b` |
+| W1-15b（11-12 08:11 已合并，`035b398`；第二轮 08:58 已合并，`f3b7a14`：`eval_3dgs` 的三个调用方，分支 `p12-w1-15b2`） | E-3、E-7、E-8、E-9、A2 的流水线部分 | `p12-w1-15b` |
 | T1（在做） | F2、F4、F5（C++ 测试） | `p12-t1` |
 | C1a（等 T1） | H8、H9、C6 与上一轮 `src.md` 的 D2、D3、D6、D9 | 未建 |
 
@@ -140,7 +141,7 @@
 
 | 编号 | 问题 | 位置 | 状态 | 影响 | 处理 |
 | --- | --- | --- | --- | --- | --- |
-| D1 | 3DGS 的 9 个评测场景按几何哈希 8 个在 train、1 个在 val，没有一个在 test；`eval_3dgs` 把 split 写死成 test，不核对 | `sim/3dgs/eval_3dgs.py:219-223`、`:248`、`:328`；`sim/3dgs/collect_3dgs.py:96-98` | 划分已复现；泄漏后果是推断（E4 没开工） | E4 在这些场景采数、又在同一批场景评，就是场景级泄漏，结果还会标成 test | 已修：卡 S1a 的 `8e2a383`（合并 `5387747`）。`eval_3dgs` 在哈希为 train / val 的场景上默认 rc=2，`--allow-train-scene` 才放行并写真实 split 与 `diag-train-scene`；共用驱动加 `split_from_identity`（缺省不变）。9 个场景复算仍是 8 个 train、1 个 val、0 个 test。遗留：直接调 `eval_3dgs` 的三个工具（`tools/dagger_pipeline.py:210`、`tools/train_student_with_video.py:171`、`tools/compare_datasets.py:264`，后者 `:300` 的教师组还自己写 `"split": "test"`）要显式传开关，归卡 W1-15b 的下一轮。E4 的卡里把划分写死这一条仍然要做 |
+| D1 | 3DGS 的 9 个评测场景按几何哈希 8 个在 train、1 个在 val，没有一个在 test；`eval_3dgs` 把 split 写死成 test，不核对 | `sim/3dgs/eval_3dgs.py:219-223`、`:248`、`:328`；`sim/3dgs/collect_3dgs.py:96-98` | 划分已复现；泄漏后果是推断（E4 没开工） | E4 在这些场景采数、又在同一批场景评，就是场景级泄漏，结果还会标成 test | 已修：卡 S1a 的 `8e2a383`（合并 `5387747`）。`eval_3dgs` 在哈希为 train / val 的场景上默认 rc=2，`--allow-train-scene` 才放行并写真实 split 与 `diag-train-scene`；共用驱动加 `split_from_identity`（缺省不变）。9 个场景复算仍是 8 个 train、1 个 val、0 个 test。遗留：直接调 `eval_3dgs` 的三个工具（`tools/dagger_pipeline.py:210`、`tools/train_student_with_video.py:171`、`tools/compare_datasets.py:264`，后者 `:300` 的教师组还自己写 `"split": "test"`）要显式传开关，归卡 W1-15b 的下一轮。E4 的卡里把划分写死这一条仍然要做 调用方（W1-15b 第二轮，`8399e32`，08:58 合入）：三个直接调 `eval_3dgs` 的工具显式传 `--allow-train-scene` 并在汇总里标注实际划分。 |
 | D2 | 60 集主比较把 60 对当独立样本，没有按几何聚类（20 个几何 × 3 个训练种子） | `docs/briefs/2026-11-10-phase12-common.md:24`；`docs/EVAL_STANDARD.md:319`；各实验的 `summarize.py` | 已复现（重算） | 按几何的符号翻转精确检验：平均加校准对 `ckpt_best`（20 对 8）p 从 0.036 变成 0.089；只校准对 `ckpt_best` 从 0.078 变成 0.139；平均加校准对只校准是 12 对 9，p = 0.664，闭环里看不出权重平均在校准之外的作用。护栏对 `ckpt_best` 仍然显著（p = 0.0034） | 公共规则 §2 加一条（11-12）：主比较按几何聚类报检验，逐集 McNemar 只作参考。已修：卡 W1-14 的 `401be6b`（合并 `0d7f3b5`），`tools/paired_stats.py` 与 `stats_report` 配对表的两列；主会话用入库的命令行重算出 0.089 / 0.139 / 0.003 / 0.672，与这里的数一致。E2E-1 的分析在数据出来之前追加这一项（见该卡的 11-12 补充） |
 | D3 | 航向护栏的阈值与规则 v1 都是看过 20 个冻结 seed 上的轨迹之后设计的，结果又报在同一组 seed 上 | `experiments/2026-11-10-heading-guard/run.sh:3-5`、`:30`；`experiments/2026-11-10-rule-oracle-v1/run.sh:18` | 读代码与文档确认；偏乐观多少未核实 | 47/60、50/60、57/60 是样本内的数。航向码的阈值沿用护栏的 2，E2E-1 在同一组 seed 上评也带这一层 | E2E-1 之后在另外 40 个 test 分区几何（`EVAL_SEEDS_BASE_60` 去掉冻结 20 个）上给胜出的臂与参照臂各补一遍。公共规则 §2 加一条 |
 | D4 | `stats_report` 的多 run 格区间偏窄，多 run 组不做配对 | `tools/stats_report.py:174-198`、`:286-290`、`:361-367` | 读代码确认 | 报表里的区间偏乐观 | 已修：`21ab8bb`（多 run 的格区间按几何整簇重采样，多 run 组也配对） |
