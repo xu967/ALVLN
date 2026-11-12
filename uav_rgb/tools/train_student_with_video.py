@@ -170,7 +170,8 @@ def build_eval_command(python, eval_script, ckpt, out_dir, params):
             raise ValueError("3DGS 自动评测需要 scene.json（数据集旁或 --scene）")
         cmd = [_3dgs_python(), "-m", "sim.3dgs.eval_3dgs",
                "--scene", scene, "--out", str(out_dir),
-               "--ckpt", str(ckpt), "--episodes", "1", "--record-video"]
+               "--ckpt", str(ckpt), "--episodes", "1", "--record-video",
+               "--allow-train-scene"]
         if params.get("infer_bin"):
             cmd += ["--infer-bin", str(params["infer_bin"])]
         return cmd

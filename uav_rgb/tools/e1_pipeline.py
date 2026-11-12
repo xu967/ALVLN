@@ -3,7 +3,8 @@
 
 运行（仓库根，先 source env.sh）：
   OUT=$DATA_ROOT/uav_rgb/e1-pipeline-$(date +%Y%m%d-%H%M); mkdir -p "$OUT"
-  setsid nohup "$UAV_RGB_PYTHON" tools/e1_pipeline.py --out "$OUT" > "$OUT/run.log" 2>&1 < /dev/null &
+  setsid nohup "$UAV_RGB_PYTHON" tools/e1_pipeline.py --out "$OUT" >> "$OUT/run.log" 2>&1 < /dev/null &
+  # 用 >> 不用 >：误起第二个实例或续跑时，外层 shell 会在 Python 拿锁退出前先执行重定向，> 会把第一个实例正在写的 run.log 截断
   sleep 3; cat "$OUT/run.pid"   # 进程自己写 run.pid：pid= pgid= start=（/proc/<pid>/stat 第 22 列）cmd=；不要再 echo $! > run.pid，重复起会冲掉第一个的记录
   # 停：先核对 start 与该 PID 现在的启动时刻一致（容器重启后 PID 可能已被别的进程拿走），再 kill -- -<pgid>
 看进度：tail -f $OUT/run.log；每步状态 $OUT/status.json；结束落 $OUT/DONE（rc + 时间 + 最后一步）。

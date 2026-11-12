@@ -7,7 +7,8 @@
 运行（在自己的 worktree 根；Python 用主仓库 .venv-tools）：
   export TMPDIR=$DATA_ROOT/uav_rgb/tmp/agent10-dagger-gz/tmp UAV_RGB_BUILD_DIR=$DATA_ROOT/uav_rgb/exp-dagger-gz-20261109/bin
   OUT=$DATA_ROOT/uav_rgb/exp-dagger-gz-20261109/full-$(date +%m%d-%H%M); mkdir -p "$OUT"
-  setsid nohup $UAV_RGB_PYTHON tools/dagger_gz_pipeline.py --out "$OUT" > "$OUT/run.log" 2>&1 < /dev/null &
+  setsid nohup $UAV_RGB_PYTHON tools/dagger_gz_pipeline.py --out "$OUT" >> "$OUT/run.log" 2>&1 < /dev/null &
+  # 用 >> 不用 >：误起第二个实例或续跑时，外层 shell 会在 Python 拿锁退出前先执行重定向，> 会把第一个实例正在写的 run.log 截断
   sleep 3; cat "$OUT/run.pid"   # 进程自己写 run.pid：pid= pgid= start=（/proc/<pid>/stat 第 22 列）cmd=；不要再 echo $! > run.pid，重复起会冲掉第一个的记录
   # 停：先核对 start 与该 PID 现在的启动时刻一致（容器重启后 PID 可能已被别的进程拿走），再 kill -- -<pgid>
 看进度：tail -f $OUT/run.log；每步 $OUT/status.json；结束落 $OUT/DONE（rc + 时间 + 最后一步）。

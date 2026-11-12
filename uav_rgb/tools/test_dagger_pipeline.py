@@ -427,6 +427,165 @@ def test_dry_run_creates_nothing():
     print("ok --dry-run 不建目录不写文件")
 
 
+def test_d1_dry_run_and_split_summary_annotations():
+    """D1：dry-run 里所有 eval_3dgs 命令显式带 --allow-train-scene（collect_3dgs 不带）；
+    eval.json 的 scene.split 非 test 时，evaluate 返回值、status.json、summary.json 与日志均写明该分区不是留出评测；
+    scene.split == 'test' 时三处都不加任何额外文字或字段，输出与改前逐字相同。"""
+    import contextlib
+    import io
+    import signal
+    import pipeline_common as pc
+    tmp = tempfile.mkdtemp(prefix="test_dagger_d1_")
+    saved = (dp.need, dp.round0_dirs, dp.label, dp.pack, dp.train, dp.run, dp.torch_extensions_dir,
+             sys.argv, dict(dp.CFG), {s: signal.getsignal(s) for s in (signal.SIGTERM, signal.SIGINT)})
+    try:
+        # 1) dry-run 命令行核对
+        dp.torch_extensions_dir = lambda *a, **k: None
+        ep0 = os.path.join(tmp, "ep0")
+        _touch(os.path.join(ep0, "actions.jsonl"), "{}\n")
+        eps_txt = os.path.join(tmp, "episodes.txt")
+        _touch(eps_txt, ep0 + "\n")
+        dp.CFG["round0_episodes"] = eps_txt
+        buf = io.StringIO()
+        sys.argv = ["dagger_pipeline.py", "--out", os.path.join(tmp, "dry"), "--dry-run", "--rounds", "0"]
+        with contextlib.redirect_stdout(buf):
+            assert dp.main() == 0
+        pc.DRY = dp.DRY = False
+        eval_lines = [ln for ln in buf.getvalue().splitlines() if "sim.3dgs.eval_3dgs" in ln]
+        assert len(eval_lines) == len(dp.CFG["arms"]) * len(dp.CFG["routes"]) and eval_lines
+        assert all("--allow-train-scene" in ln for ln in eval_lines), eval_lines[0]
+
+        # 2) 非留出场景（train） vs 留出场景（test）的汇总、status.json 与日志核对
+        dp.CFG.update(routes=(0,), eval_eps_per_route=2, arms=("soft",))
+        dp.need = lambda *a, **k: None
+        dp.round0_dirs = lambda _o: [ep0]
+        dp.label = lambda _d, npz, st: (_touch(npz, "n"), _touch(st, json.dumps({"summary": {"ok": 1}})))
+        dp.pack = lambda *_a: None
+        dp.train = lambda _ds, rdir, _arm: (_touch(os.path.join(rdir, "ckpt_best.bin"), "c"), os.path.join(rdir, "ckpt_best.bin"))[1]
+
+        def run_case(sub, split, split_policy):
+            out = os.path.join(tmp, sub)
+
+            def fake_run(cmd, *_a, **_k):
+                assert "--allow-train-scene" in cmd, cmd
+                edir = cmd[cmd.index("--out") + 1]
+                _touch(os.path.join(edir, "eval.json"), json.dumps({
+                    "metric_version": dp.EVAL_METRIC_VERSION, "ckpt": cmd[cmd.index("--ckpt") + 1],
+                    "episodes_requested": 2, "episodes_done": 2, "failed_count": 0, "skipped_count": 0, "failed": [],
+                    "scene": {"split": split, "split_policy": split_policy},
+                    "per_episode": [{"success": True, "task_success": True, "collision": False, "stuck": False, "steps": 4},
+                                    {"success": True, "task_success": False, "collision": False, "stuck": False, "steps": 5}]}))
+                return 0
+
+            dp.run = fake_run
+            sys.argv = ["dagger_pipeline.py", "--out", out, "--rounds", "0", "--arms", "soft"]
+            log_buf = io.StringIO()
+            with contextlib.redirect_stdout(log_buf):
+                rc = dp.main()
+            assert rc == 0, log_buf.getvalue()
+            return (log_buf.getvalue(),
+                    json.load(open(os.path.join(out, "summary.json"), encoding="utf-8")),
+                    json.load(open(os.path.join(out, "status.json"), encoding="utf-8")))
+
+        log_tr, sum_tr, st_tr = run_case("out_train", "train", "diag-train-scene")
+        ev_tr = sum_tr["rounds"]["0"]["eval"]["soft"]
+        st_ev_tr = st_tr["round_0.eval_soft"]
+        assert ev_tr.get("scene_split") == "train" and ev_tr.get("scene_split_policy") == "diag-train-scene", ev_tr
+        assert "评测场景按几何哈希属于 train 分区" in ev_tr.get("split_note", "") and "不是留出评测" in ev_tr["split_note"], ev_tr
+        assert st_ev_tr.get("scene_split") == "train" and st_ev_tr.get("split_note") == ev_tr["split_note"], st_ev_tr
+        sr_line_tr = [ln for ln in log_tr.splitlines() if "round 0 soft: SR " in ln][0]
+        assert "评测场景按几何哈希属于 train 分区" in sr_line_tr and "不是留出评测" in sr_line_tr, sr_line_tr
+
+        log_te, sum_te, st_te = run_case("out_test", "test", "diag-eval-fixed-test")
+        ev_te = sum_te["rounds"]["0"]["eval"]["soft"]
+        st_ev_te = st_te["round_0.eval_soft"]
+        for k in ("scene_split", "scene_split_policy", "split_note"):
+            assert k not in ev_te and k not in st_ev_te, (k, ev_te, st_ev_te)
+        sr_line_te = [ln for ln in log_te.splitlines() if "round 0 soft: SR " in ln][0]
+        assert sr_line_te.endswith("round 0 soft: SR 2/2 CI95 [0.342, 1.0] task 1/2 collision 0/2"), sr_line_te
+    finally:
+        (dp.need, dp.round0_dirs, dp.label, dp.pack, dp.train, dp.run, dp.torch_extensions_dir,
+         sys.argv, cfg, handlers) = saved
+        dp.CFG.clear()
+        dp.CFG.update(cfg)
+        pc.DRY = dp.DRY = False
+        for s, h in handlers.items():
+            signal.signal(s, h)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("ok D1（dagger_pipeline）：dry-run 带 --allow-train-scene；train 场景三处标注非留出，test 场景逐字不变")
+
+
+def test_d1_real_eval_3dgs_on_synthetic_train_corridor():
+    """D1 端到端（合成走廊 seed=3，哈希 split=train，mock 渲染 + cf_blackbox + 假 uavrgb_infer，3dgs-venv python）：
+    evaluate 实跑 rc=0、写出 eval.json 且 split_policy == 'diag-train-scene'；去掉 --allow-train-scene 则 rc=2 拒绝。"""
+    import importlib
+    import subprocess
+    sys.path.insert(0, dp.REPO)
+    c3 = importlib.import_module("sim.3dgs.collect_3dgs")
+    scene_mod = importlib.import_module("sim.3dgs.scene")
+    tmp = tempfile.mkdtemp(prefix="test_dagger_real3dgs_")
+    saved_run, saved_dry, saved_cfg, saved_env = dp.run, dp.DRY, dict(dp.CFG), dict(dp.ENV_3DGS)
+    captured_cmds = []
+    try:
+        scene_dir = os.path.join(tmp, "scene")
+        sc = scene_mod.make_corridor(scene_dir, seed=3, length=12.0)
+        sc["max_steps"] = 2
+        scene_json = os.path.join(scene_dir, "scene.json")
+        scene_mod.save_scene(sc, scene_json)
+        ident = c3.scene_identity(scene_mod.load_scene(scene_json))
+        assert ident["split"] == "train", ident
+
+        bin_dir = os.path.join(tmp, "bin")
+        os.makedirs(bin_dir, exist_ok=True)
+        infer = os.path.join(bin_dir, "uavrgb_infer")
+        _touch(infer, ("#!/usr/bin/env python3\nimport json, sys\n"
+                       'print(json.dumps({"in_h":2,"in_w":2,"in_c":3,"num_classes":4,"text_dim":0,"prev_action_dim":0}), flush=True)\n'
+                       "while sys.stdin.buffer.read(12):\n"
+                       '    print(json.dumps({"action":1,"probs":[0.25]*4,"infer_ms":0.1}), flush=True)\n'))
+        os.chmod(infer, 0o755)
+        ckpt = os.path.join(tmp, "ckpt.bin")
+        _touch(ckpt, "ck")
+
+        dp.DRY = False
+        dp.ENV_3DGS["UAV_RGB_BUILD_DIR"] = bin_dir
+        dp.CFG.update(scene=scene_json, routes=(0,), eval_eps_per_route=1, hold=0.5,
+                      dynamics="cf_blackbox",
+                      dynamics_params=os.path.join(dp.REPO, "sim", "dynamics", "cf_blackbox_v1.json"),
+                      spawn_jitter=0.0)
+
+        def mock_render_run(cmd, env_extra=None, log_path=None, cwd=dp.REPO):
+            # 只补 --mock-renderer --steps 2 以免触发真实 gsplat 渲染，其余参数（含是否带 --allow-train-scene）原样来自 dp.evaluate
+            full = list(cmd) + ["--mock-renderer", "--steps", "2"]
+            captured_cmds.append(full)
+            return saved_run(full, env_extra=env_extra, log_path=log_path, cwd=cwd)
+
+        dp.run = mock_render_run
+        eval_out = os.path.join(tmp, "eval")
+        rep = dp.evaluate(ckpt, eval_out)
+        assert len(captured_cmds) == 1 and "--allow-train-scene" in captured_cmds[0], captured_cmds
+        ej = json.load(open(os.path.join(eval_out, "route_0", "eval.json"), encoding="utf-8"))
+        assert ej["scene"]["split"] == "train" and ej["scene"]["split_policy"] == "diag-train-scene", ej["scene"]
+        assert rep.get("scene_split") == "train" and rep.get("scene_split_policy") == "diag-train-scene", rep
+        assert "不是留出评测" in rep.get("split_note", ""), rep
+
+        # 对照：去掉 --allow-train-scene 时 eval_3dgs 以 rc=2 拒绝，不建输出目录
+        cmd_without = [t for t in captured_cmds[0] if t != "--allow-train-scene"]
+        refused_out = os.path.join(tmp, "eval_refused")
+        cmd_without[cmd_without.index("--out") + 1] = refused_out
+        r_refuse = subprocess.run(cmd_without, cwd=dp.REPO, env=dict(os.environ, **dp.ENV_3DGS),
+                                  capture_output=True, text=True, timeout=120)
+        assert r_refuse.returncode == 2 and "--allow-train-scene" in r_refuse.stderr, (r_refuse.returncode, r_refuse.stderr)
+        assert not os.path.exists(refused_out), os.listdir(refused_out)
+    finally:
+        dp.run, dp.DRY = saved_run, saved_dry
+        dp.CFG.clear()
+        dp.CFG.update(saved_cfg)
+        dp.ENV_3DGS.clear()
+        dp.ENV_3DGS.update(saved_env)
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("ok D1 实跑（合成 train 走廊 + mock 渲染 + cf_blackbox）：带 --allow-train-scene rc=0 写 diag-train-scene，去掉则 rc=2")
+
+
 def main():
     test_train_resume_by_metrics_done()
     test_partial_collect_and_pack_retired_and_excluded_from_glob()
@@ -438,6 +597,8 @@ def main():
     test_no_dead_gazebo_branch_and_no_hardcoded_paths()
     test_torch_extensions_dir_uses_pipeline_common()
     test_dry_run_creates_nothing()
+    test_d1_dry_run_and_split_summary_annotations()
+    test_d1_real_eval_3dgs_on_synthetic_train_corridor()
     print("test_dagger_pipeline: PASS")
     return 0
 

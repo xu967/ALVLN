@@ -259,9 +259,10 @@ def eval_3dgs_cmd(out, name, policy, ckpt, route):
     if g["steps"] is not None:
         common += ["--steps", str(g["steps"])]
     if policy == "teacher":
-        cmd = [g["python"], "-m", "sim.3dgs.collect_3dgs", "--policy", "astar", "--stop-on-collision", "--split", "test"] + common
+        # D1：不写死 --split test，让 collect_3dgs 按几何哈希写实际的 split，与下面 teacher_3dgs_eval_json 调 eval_split 的结果一致
+        cmd = [g["python"], "-m", "sim.3dgs.collect_3dgs", "--policy", "astar", "--stop-on-collision"] + common
     else:
-        cmd = [g["python"], "-m", "sim.3dgs.eval_3dgs", "--policy", policy] + common
+        cmd = [g["python"], "-m", "sim.3dgs.eval_3dgs", "--policy", policy, "--allow-train-scene"] + common
         if ckpt:
             cmd += ["--ckpt", ckpt, "--infer-bin", f"{BUILD}/uavrgb_infer"]
     return cmd, g["env"], edir
@@ -269,12 +270,17 @@ def eval_3dgs_cmd(out, name, policy, ckpt, route):
 
 def teacher_3dgs_eval_json(edir, route):
     """把 collect_3dgs --policy astar 的采集目录按 eval_3dgs 的格式写成 eval.json（同一套 summarize/aggregate，含 SPL）。"""
+    c3 = importlib.import_module("sim.3dgs.collect_3dgs")
     scene_mod = importlib.import_module("sim.3dgs.scene")
     collision = importlib.import_module("sim.3dgs.collision")
     planner = importlib.import_module("sim.3dgs.planner")
     ev = importlib.import_module("sim.3dgs.eval_3dgs")
     run_meta = read_json(os.path.join(edir, "run.json"))
     scene = scene_mod.apply_route(scene_mod.load_scene(CFG["gs"]["scene"]), route)
+    identity = c3.scene_identity(scene, ply_sha256=(run_meta.get("scene") or {}).get("ply_sha256"))
+    split, split_policy = ev.eval_split(identity, True)
+    if run_meta.get("split") is not None and run_meta["split"] != split:
+        raise RuntimeError(f"{edir}/run.json 的 split={run_meta['split']!r} 与几何哈希 {split!r} 不一致")
     occ_planner = planner.OccPlanner(collision.from_scene(scene))
     results, failures = [], list(run_meta.get("failures") or [])
     for ep in run_meta.get("episodes") or []:
@@ -296,8 +302,10 @@ def teacher_3dgs_eval_json(edir, route):
               "source": "collect_3dgs --policy astar --stop-on-collision，由 tools/compare_datasets.teacher_3dgs_eval_json 汇总",
               "metric_version": ev.METRIC_VERSION, "success_criterion": ev.SUCCESS_CRITERION,
               "reach_radius_m": ev.reach_radius_of(scene), "spl_reference": ev.SPL_REFERENCE,
-              "scene": {"name": scene.get("name"), "path": scene["path"], "route": scene.get("route"),
-                        "waypoint": scene.get("waypoint"), "spawn": scene.get("spawn"), "split": "test"},
+              "scene": {"name": scene.get("name"), "path": scene["path"],
+                        "geometry_gid": identity["geometry_gid"], "route": scene.get("route"),
+                        "waypoint": scene.get("waypoint"), "spawn": scene.get("spawn"),
+                        "split": split, "split_policy": split_policy},
               "dynamics": run_meta.get("dynamics"), "dynamics_profile": run_meta.get("dynamics_profile"),
               "episodes_requested": n_req, "steps": run_meta.get("steps"), "hold_s": run_meta.get("hold_s"),
               "seeds": [r["seed"] for r in results], "per_episode": results, "failed": failures, **agg}

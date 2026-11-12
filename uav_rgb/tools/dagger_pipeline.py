@@ -12,7 +12,8 @@
 运行（仓库根，3DGS 域）：
   OUT=$DATA_ROOT/uav_rgb/tmp/agent4-teacher-p1/dagger-$(date +%Y%m%d-%H%M); mkdir -p "$OUT"
   export TMPDIR=$DATA_ROOT/uav_rgb/tmp UAV_RGB_BUILD_DIR=$DATA_ROOT/uav_rgb/tmp/agent4-teacher-p1/bin   # 冻结的二进制快照：各臂同一 uavrgb_train
-  setsid nohup .venv-tools/bin/python tools/dagger_pipeline.py --out "$OUT" > "$OUT/run.log" 2>&1 < /dev/null &
+  setsid nohup .venv-tools/bin/python tools/dagger_pipeline.py --out "$OUT" >> "$OUT/run.log" 2>&1 < /dev/null &
+  # 用 >> 不用 >：误起第二个实例或续跑时，外层 shell 会在 Python 拿锁退出前先执行重定向，> 会把第一个实例正在写的 run.log 截断
   sleep 3; cat "$OUT/run.pid"   # 进程自己写 run.pid：pid= pgid= start=（/proc/<pid>/stat 第 22 列）cmd=；不要再 echo $! > run.pid，重复起会冲掉第一个的记录
   # 停：先核对 start 与该 PID 现在的启动时刻一致（容器重启后 PID 可能已被别的进程拿走），再 kill -- -<pgid>
 看进度：tail -f $OUT/run.log；每步 $OUT/status.json；结束落 $OUT/DONE。--dry-run 只打印命令。
@@ -215,7 +216,7 @@ def evaluate(ckpt, out_root):
     E-7：成功类指标（success / task_success）与对应 Wilson 区间分母取请求集数 n_req（失败/剔除集计入分母、成功记 0），
     越低越好的碰撞率分母取完成集 n_done（与 W1-2 / stats_report 同口径），failed 单独列出。"""
     rows, failed, n_req = [], 0, 0
-    route_req, route_failed = {}, {}
+    route_req, route_failed, non_test_splits = {}, {}, []
     for r in CFG["routes"]:
         edir = os.path.join(out_root, f"route_{r}")
         state, moved, why = pc.settle_eval(edir, metric_version=EVAL_METRIC_VERSION, ckpt=ckpt)
@@ -225,11 +226,12 @@ def evaluate(ckpt, out_root):
                 log(f"route {r} 上次评测{kind_msg}（{why}），旧目录挪到 {moved}，重跑")
             # eval_3dgs 有集被 physics_verified=false（cf_sitl 失控保护）剔除时退出码 1 但 eval.json 照写：
             # 本轮只要 eval.json 在就继续汇总，剔除数记进 failed 并计入请求集数分母；文件都没有才算真失败。续跑时这条路线会重评。
+            # D1：本流水线在自采场景上评测，本身不是留出场景评测，显式传 --allow-train-scene 并在汇总标注实际 split。
             rc = run([PY3DGS, "-m", "sim.3dgs.eval_3dgs", "--scene", CFG["scene"], "--route", str(r), "--out", edir,
                       "--policy", "student", "--ckpt", ckpt, "--episodes", str(CFG["eval_eps_per_route"]),
                       "--seed", str(CFG["eval_seed"] + r * 10), "--hold", str(CFG["hold"]),
                       "--dynamics", CFG["dynamics"], "--dynamics-params", CFG["dynamics_params"],
-                      "--spawn-jitter", str(CFG["spawn_jitter"])],
+                      "--spawn-jitter", str(CFG["spawn_jitter"]), "--allow-train-scene"],
                      env_extra=ENV_3DGS, log_path=None if DRY else edir + ".log")
             if rc != 0 and not DRY:
                 if not os.path.isfile(os.path.join(edir, "eval.json")):
@@ -238,6 +240,12 @@ def evaluate(ckpt, out_root):
         if DRY:
             continue
         rep = read_json(os.path.join(edir, "eval.json"))
+        sc = rep.get("scene") if isinstance(rep.get("scene"), dict) else {}
+        sp, pol = sc.get("split"), sc.get("split_policy")
+        if (sp and sp != "test") or pol == "diag-train-scene":
+            pair = (sp or "non-test", pol or "diag-train-scene")
+            if pair not in non_test_splits:
+                non_test_splits.append(pair)
         eps = rep.get("per_episode") or []
         r_failed = rep.get("failed_count", len(rep.get("failed") or []))
         r_skipped = rep.get("skipped_count", len(rep.get("skipped") or []))
@@ -258,6 +266,15 @@ def evaluate(ckpt, out_root):
         w = pc.wilson_ci(k, denom)
         return None if w is None else [round(w[0], 3), round(w[1], 3)]
 
+    extra_split = {}
+    if non_test_splits:
+        sp_str = "/".join(dict.fromkeys(s for s, _ in non_test_splits))
+        pol_str = "/".join(dict.fromkeys(p for _, p in non_test_splits))
+        extra_split = {
+            "scene_split": sp_str,
+            "scene_split_policy": pol_str,
+            "split_note": f"评测场景按几何哈希属于 {sp_str} 分区，不是留出评测（split_policy={pol_str}）",
+        }
     return {"n": n_req, "episodes_done": n_done, "failed": failed, **cnt,
             "success_rate": cnt["success"] / n_req if n_req else None,
             "task_success_rate": cnt["task_success"] / n_req if n_req else None,
@@ -270,7 +287,8 @@ def evaluate(ckpt, out_root):
                                    "failed": route_failed.get(r, 0),
                                    **{key: sum(x[key] for x in rows if x["route"] == r)
                                       for key in ("success", "task_success", "collision", "stuck")}}
-                          for r in CFG["routes"]}}
+                          for r in CFG["routes"]},
+            **extra_split}
 
 
 def main():
@@ -367,10 +385,15 @@ def main():
                 last = f"round_{k}.eval_{arm}"
                 mark(out, last, "running")
                 res[arm] = evaluate(ckpts[arm], os.path.join(rd, f"eval_{arm}"))
-                mark(out, last, "ok", **{kk: res[arm][kk] for kk in ("n", "episodes_done", "failed", "success", "task_success", "collision")})
+                mark_extra = {kk: res[arm][kk] for kk in ("n", "episodes_done", "failed", "success", "task_success", "collision")}
+                for kk in ("scene_split", "scene_split_policy", "split_note"):
+                    if kk in res[arm]:
+                        mark_extra[kk] = res[arm][kk]
+                mark(out, last, "ok", **mark_extra)
                 log(f"round {k} {arm}: SR {res[arm]['success']}/{res[arm]['n']} CI95 {res[arm]['success_ci95']} "
                     f"task {res[arm]['task_success']}/{res[arm]['n']} collision {res[arm]['collision']}/{res[arm]['episodes_done']}"
-                    + (f" failed {res[arm]['failed']}" if res[arm]["failed"] else ""))
+                    + (f" failed {res[arm]['failed']}" if res[arm]["failed"] else "")
+                    + (f"（{res[arm]['split_note']}）" if "split_note" in res[arm] else ""))
             stats = read_json(os.path.join(rd, "soft_stats.json"))["summary"] if not DRY else None
             summary["rounds"][str(k)] = {"episodes": len(all_dirs), "eval": res, "label_stats": stats}
             if not DRY:

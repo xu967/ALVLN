@@ -209,12 +209,62 @@ def test_summary_warns_legacy_no_corridor():
     print("ok summary（第 6 条）：输出、summary.md、summary.json 均提示「旧口径，未带走廊」")
 
 
+def test_d1_3dgs_allow_train_scene_and_teacher_eval_split():
+    """D1：compare_datasets 的 3DGS 学生与 forward 评测命令显式带 --allow-train-scene（Gazebo 不带）；
+    3DGS 教师采集命令不写死 --split test（让 collect_3dgs 按几何哈希写实际 split，与 teacher_3dgs_eval_json 一致）；
+    teacher_3dgs_eval_json 用 eval_3dgs.eval_split(identity, True) 写入真实 split 与 split_policy。"""
+    import importlib
+    sys.path.insert(0, REPO)
+    c3 = importlib.import_module("sim.3dgs.collect_3dgs")
+    scene_mod = importlib.import_module("sim.3dgs.scene")
+    with Fixture() as fx:
+        cd.EVAL_DOMAINS = ("gazebo", "3dgs")
+        _label, run_dir = cd.train_runs(fx.tmp, "A")[0]
+        _touch(os.path.join(run_dir, "ckpt_best.bin"))
+        jobs = cd.eval_jobs(fx.tmp)
+        gz_cmds = [cmd for dom, _n, _s, cmd, _e, _ed, _r in jobs if dom == "gazebo"]
+        gs_eval_cmds = [cmd for dom, n, _s, cmd, _e, _ed, _r in jobs if dom == "3dgs" and n != "teacher"]
+        gs_teacher_cmds = [cmd for dom, n, _s, cmd, _e, _ed, _r in jobs if dom == "3dgs" and n == "teacher"]
+        assert gz_cmds and gs_eval_cmds and len(gs_teacher_cmds) == 1
+        assert all("--allow-train-scene" not in c for c in gz_cmds), gz_cmds
+        assert all("--allow-train-scene" in c and "sim.3dgs.eval_3dgs" in c for c in gs_eval_cmds), gs_eval_cmds
+        t_cmd = gs_teacher_cmds[0]
+        assert "sim.3dgs.collect_3dgs" in t_cmd and "--stop-on-collision" in t_cmd, t_cmd
+        assert "--split" not in t_cmd, f"教师采集不应硬编码 --split test（会与非 test 场景哈希冲突）：{t_cmd}"
+
+        # 在哈希为 train（seed=3）与 test（seed=0）的合成走廊上实跑 collect_3dgs + teacher_3dgs_eval_json，核对两处一致
+        py3dgs = cd.CFG["gs"]["python"]
+        bb_json = os.path.join(REPO, "sim", "dynamics", "cf_blackbox_v1.json")
+        for seed, want_split, want_policy in ((3, "train", "diag-train-scene"),
+                                              (0, "test", "diag-eval-fixed-test")):
+            sdir = os.path.join(fx.tmp, f"corridor_s{seed}")
+            sc = scene_mod.make_corridor(sdir, seed=seed, length=12.0)
+            sc["waypoint"] = {"x": 5.0, "y": 0.0, "z": 2.0}   # length=12 时默认 x=30 在走廊外，挪到走廊内无柱自由区
+            sjson = os.path.join(sdir, "scene.json")
+            scene_mod.save_scene(sc, sjson)
+            assert c3.scene_identity(scene_mod.load_scene(sjson))["split"] == want_split
+            cd.CFG["gs"] = dict(cd.CFG["gs"], scene=sjson, routes=(0,), episodes_per_route=1,
+                                steps=3, hold=0.5, dynamics="cf_blackbox", dynamics_params=bb_json, spawn_jitter=0.0)
+            cmd, env, edir = cd.eval_3dgs_cmd(fx.tmp, f"teacher_s{seed}", "teacher", None, 0)
+            r = subprocess.run(cmd + ["--mock-renderer"], cwd=REPO, env=dict(os.environ, **env),
+                               capture_output=True, text=True, timeout=120)
+            assert r.returncode == 0, r.stderr
+            run_meta = json.load(open(os.path.join(edir, "run.json"), encoding="utf-8"))
+            ep_man = json.load(open(os.path.join(edir, "ep_00000", "episode_manifest.json"), encoding="utf-8"))
+            rep = cd.teacher_3dgs_eval_json(edir, 0)
+            assert run_meta["split"] == want_split and ep_man["split"] == want_split, (run_meta["split"], ep_man["split"])
+            assert rep["scene"]["split"] == want_split, rep["scene"]
+            assert rep["scene"].get("split_policy") == want_policy, rep["scene"]
+    print("ok D1（compare_datasets）：3DGS 学生/forward 带 --allow-train-scene，教师采集与 eval.json 的 split / split_policy 一致")
+
+
 def main():
     test_train_resume_by_metrics_done()
     test_evaluate_resume_and_waits_all_before_need()
     test_evaluate_retires_skipped_or_truncated_eval()
     test_main_records_interrupt_with_real_rc()
     test_summary_warns_legacy_no_corridor()
+    test_d1_3dgs_allow_train_scene_and_teacher_eval_split()
     print("test_compare_datasets: PASS")
     return 0
 

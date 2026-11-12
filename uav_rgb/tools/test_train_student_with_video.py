@@ -104,7 +104,12 @@ def check_commands():
     assert cmd[cmd.index("--scene") + 1] == "/d/ds/scene.json", cmd
     assert cmd[cmd.index("--ckpt") + 1] == "/run/ckpt_best.bin", cmd
     assert cmd[cmd.index("--infer-bin") + 1] == "/build/uavrgb_infer", cmd
-    assert "--record-video" in cmd and "--task" not in cmd, cmd
+    assert "--record-video" in cmd and "--allow-train-scene" in cmd and "--task" not in cmd, cmd
+    assert [t for t in cmd if t != "--allow-train-scene"] == [
+        cli._3dgs_python(), "-m", "sim.3dgs.eval_3dgs",
+        "--scene", "/d/ds/scene.json", "--out", "/run/closed_loop_eval_x",
+        "--ckpt", "/run/ckpt_best.bin", "--episodes", "1", "--record-video",
+        "--infer-bin", "/build/uavrgb_infer"], cmd
     print("commands PASS")
 
 
@@ -206,11 +211,34 @@ def test_legacy_corridor_note_for_base():
     print("legacy-corridor-note PASS")
 
 
+def test_d1_3dgs_dry_run_and_gazebo_exact_lock():
+    """D1：3DGS 自动录像 dry-run 命令行含 --allow-train-scene（Studio 共用同一 build_eval_command）；
+    Gazebo 支路逐字锁死不变，不含 --allow-train-scene。"""
+    assert cli.build_eval_command("/py", "/eval.py", "/r/ckpt_best.bin", "/r/ev", {
+        "task": "base", "split": "test", "dynamics": "cf_sitl", "episodes": 1,
+        "window_from": "observation", "hold_s": 1.0, "renderer": "gazebo"}) == [
+        "/py", "/eval.py", "--policy", "student", "--ckpt", "/r/ckpt_best.bin",
+        "--task", "base", "--split", "test", "--dynamics", "cf_sitl", "--episodes", "1",
+        "--record-video", "--out", "/r/ev", "--vehicle", "e1_mini",
+        "--window-from", "observation", "--hold", "1.0"]
+    with tempfile.TemporaryDirectory(dir=os.environ.get("TMPDIR")) as d:
+        gs_uavr = Path(d) / "gs.uavr"
+        write_uavr(gs_uavr, {"renderer_backend": "gsplat", "splits": {"train": 2, "val": 1, "test": 0},
+                             "dynamics_profile": "cf_sitl_v1:abc", "hold_s": 0.5})
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.main(["--data", str(gs_uavr), "--out", str(Path(d) / "run"), "--dry-run"])
+        eval_line = [ln for ln in buf.getvalue().splitlines() if ln.startswith("录像:")][0]
+        assert rc == 0 and "sim.3dgs.eval_3dgs" in eval_line and "--allow-train-scene" in eval_line, eval_line
+    print("d1-3dgs-and-gazebo-lock PASS")
+
+
 def main():
     check_inference()
     check_commands()
     check_dry_run()
     test_legacy_corridor_note_for_base()
+    test_d1_3dgs_dry_run_and_gazebo_exact_lock()
     print("test_train_student_with_video: PASS")
 
 
