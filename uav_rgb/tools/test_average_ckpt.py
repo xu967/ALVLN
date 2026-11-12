@@ -9,6 +9,7 @@
 """
 import hashlib
 import json
+import math
 import os
 import struct
 import sys
@@ -102,6 +103,61 @@ while True:
     p = [x / sum(e) for x in e]
     print('{{"action":%d,"probs":[%s],"infer_ms":0.1}}' % (z.index(m), ",".join("%g" % x for x in p)), flush=True)
 """
+
+
+COND_COEF = (0.0, 0.4, -0.3, 0.2)   # 条件字节对各类 logit 的影响：条件值不同概率就不同（FAKE_INFER_COND 与测试里的独立算法共用）
+FAKE_INFER_COND = """#!{py}
+import json, math, os, sys
+sys.path.insert(0, {tools!r})
+import average_ckpt as ac
+ck = ac.read_ckpt(sys.argv[sys.argv.index("--ckpt") + 1])
+fc_b = ck["params"][7]
+pd = ck["prev_dim"]
+print(json.dumps({{"in_h": ck["in_h"], "in_w": ck["in_w"], "in_c": ck["in_c"], "num_classes": 4, "text_dim": ck["text_dim"],
+                  "prev_action_dim": int(os.environ.get("FAKE_HELLO_PREV", pd)), "aux_classes": 0}}), flush=True)
+n = ck["in_h"] * ck["in_w"] * 3
+frame = n + (1 if pd else 0)          # 同 src/infer.cpp：prev_dim>0 时一帧 = HWC 字节 + 1 字节条件
+log = os.environ.get("COND_LOG")
+seen = 0
+while True:
+    buf = sys.stdin.buffer.read(frame)
+    if not buf:
+        break
+    if len(buf) != frame:
+        sys.exit(4)
+    c = buf[n] if pd else 0
+    if pd and c >= pd:                # 同 src/infer.cpp：条件字节 >= prev_dim 报错退出
+        sys.exit(3)
+    if log:
+        with open(log, "a") as f:
+            f.write("%d %d\\n" % (len(buf), c))
+    z = [float(fc_b[k]) + buf[k] / 64.0 + c * {coef!r}[k] for k in range(4)]
+    z[1] += 1e-3 * seen
+    seen += 1
+    m = max(z)
+    e = [math.exp(x - m) for x in z]
+    p = [x / sum(e) for x in e]
+    print('{{"action":%d,"probs":[%s],"infer_ms":0.1}}' % (z.index(m), ",".join("%g" % x for x in p)), flush=True)
+"""
+
+
+def write_aux(data_path, prev_action, *, depth_hw=None, magic=b"UAVRAUX1", n_override=None, flags_override=None,
+              unknown=255, uavr_sha=None, corrupt_payload=False, trailing=b"", drop_tail=0):
+    """按 tools/DATASET_FORMAT.md §6 写 <data>.aux（独立于工具的写法）；各个 *_override / corrupt 参数造单项损坏。"""
+    n = len(prev_action)
+    flags = 1 if depth_hw else 0
+    dh, dw = depth_hw or (0, 0)
+    payload = np.arange(n, dtype="<u4").tobytes() + np.asarray(prev_action, np.uint8).tobytes()   # prev_index 全取自身（首帧口径），本工具不读
+    if depth_hw:
+        payload += bytes(n * dh * dw)
+    pay_sha = hashlib.sha256(payload).digest()
+    if corrupt_payload:
+        payload = payload[:-1] + bytes([payload[-1] ^ 1])
+    head = struct.pack("<8sQIHHBBH", magic, n if n_override is None else n_override, flags if flags_override is None else flags_override,
+                       dh, dw, 8, unknown, 0)
+    head += bytes.fromhex(uavr_sha or sha(data_path)) + pay_sha + struct.pack("<7f", 0.3, 0.5, 0.8, 1.2, 1.8, 2.5, 4.0) + struct.pack("<fI", 0.102, 0)
+    assert len(head) == 128
+    spit(os.path.splitext(data_path)[0] + ".aux", (head + payload + trailing)[:len(head + payload + trailing) - drop_tail])
 
 
 def slurp(path):
@@ -360,8 +416,10 @@ class TestEndToEnd(Base):
         self.assertFalse(os.path.exists(out) or os.path.exists(out + ".json"))
 
     def test_unsupported_inputs_are_refused_not_guessed(self):
-        # 文本条件 / prev-action / 双帧：行协议无法从数据集还原这些输入，不能静默算出错的 δ
-        for name, kw in (("text", {"text_dim": 16}), ("prev", {"prev": 4}), ("two_frame", {"in_c": 6})):
+        # 文本条件 / 双帧 / 认不得的 prev_dim：行协议无法从数据集还原这些输入，不能静默算出错的 δ。
+        # prev_dim=4（prev-action 与航向码）自卡 E2E-1 起支持，见 TestEndToEndCond。
+        for name, kw in (("text", {"text_dim": 16}), ("prev_dim3", {"prev": 3}), ("two_frame", {"in_c": 6}),
+                         ("prev_two_frame", {"prev": 4, "in_c": 6}), ("prev_text", {"prev": 4, "text_dim": 16})):
             run = make_run(self.tmp, [1, 2], lambda e: rand_params(e), name="run_" + name, **kw)
             with self.assertRaises(SystemExit, msg=name) as cm:
                 ac.main(["--run", run, "--data", self.data, "--out", os.path.join(self.tmp, name + ".bin"),
@@ -375,6 +433,189 @@ class TestEndToEnd(Base):
     def test_data_required_unless_no_calibrate(self):
         with self.assertRaises(SystemExit):
             ac.main(["--run", self.run_dir, "--out", os.path.join(self.tmp, "o.bin"), "--last-k", "2"])
+
+
+class TestAuxCond(Base):
+    """UAVRAUX1 侧车的 prev_action 列读取：逐项绑定核对，任何不符都报错（同 src/aux_sidecar.cpp）。"""
+
+    def setUp(self):
+        super().setUp()
+        rng = np.random.default_rng(11)
+        self.n_split = {"train": 12, "val": 9, "test": 4}
+        n = sum(self.n_split.values())
+        images = rng.integers(0, 256, size=(n, 3, H, W), dtype=np.uint8)
+        self.data = os.path.join(self.tmp, "dataset.uavr")
+        write_uavr(self.data, self.n_split, rng.integers(0, 4, size=n), "0" * n, images)
+        self.sha = sha(self.data)
+        self.cond = rng.choice([0, 2, 3], size=n).astype(np.uint8)
+
+    def test_returns_the_prev_action_column_with_and_without_depth(self):
+        for depth in (None, (1, 2)):
+            write_aux(self.data, self.cond, depth_hw=depth)
+            got, path = ac.read_aux_cond(self.data, self.sha)
+            self.assertEqual(got.tolist(), self.cond.tolist(), f"depth={depth}")
+            self.assertEqual(path, os.path.join(self.tmp, "dataset.aux"))
+
+    def test_sidecar_name_follows_the_dataset_name(self):
+        other = os.path.join(self.tmp, "other.uavr")
+        spit(other, slurp(self.data))
+        write_aux(other, self.cond)
+        self.assertEqual(ac.read_aux_cond(other, self.sha)[1], os.path.join(self.tmp, "other.aux"))
+
+    def test_every_binding_check_fires(self):
+        n = len(self.cond)
+        bad_value = self.cond.copy()
+        bad_value[3] = 4                      # prev_dim=4 → 合法值 0..3
+        cases = [
+            ("missing", None, {}, "不存在"),
+            ("magic", self.cond, {"magic": b"UAVRAUX2"}, "头不合法"),
+            ("n", self.cond, {"n_override": n + 1}, "头不合法"),
+            ("flags", self.cond, {"flags_override": 2}, "头不合法"),
+            ("unknown_code", self.cond, {"unknown": 254}, "头不合法"),
+            ("uavr_sha", self.cond, {"uavr_sha": "00" * 32}, "uavr sha256"),
+            ("payload_sha", self.cond, {"corrupt_payload": True}, "payload sha256"),
+            ("trailing", self.cond, {"trailing": b"x"}, "文件长"),
+            ("truncated", self.cond, {"drop_tail": 1}, "文件长"),
+            ("out_of_range", bad_value, {}, "越界"),
+        ]
+        for name, col, kw, want in cases:
+            aux = os.path.splitext(self.data)[0] + ".aux"
+            if os.path.exists(aux):
+                os.remove(aux)
+            if col is not None:
+                write_aux(self.data, col, **kw)
+            with self.assertRaises(ValueError, msg=name) as cm:
+                ac.read_aux_cond(self.data, self.sha)
+            self.assertIn(want, str(cm.exception), name)
+
+
+class TestEndToEndCond(Base):
+    """prev_dim=4 的 ckpt：条件字节取自侧车 prev_action 列、只对 val 非碰撞帧、按帧序发出；δ 与独立算法一致；不带条件的 ckpt 不多发字节。"""
+
+    def setUp(self):
+        super().setUp()
+        self.fake = os.path.join(self.tmp, "fake_infer_cond")
+        with open(self.fake, "w") as f:
+            f.write(FAKE_INFER_COND.format(py=sys.executable, tools=os.path.join(REPO, "tools"), coef=COND_COEF))
+        os.chmod(self.fake, 0o755)
+        rng = np.random.default_rng(5)
+        self.n_split = {"train": 30, "val": 80, "test": 20}
+        n = sum(self.n_split.values())
+        self.images = rng.integers(0, 256, size=(n, 3, H, W), dtype=np.uint8)
+        self.labels = rng.integers(0, 4, size=n)
+        self.labels[30:110] = np.where(rng.random(80) < 0.7, 1, rng.integers(2, 4, size=80))
+        flags = ["0"] * n
+        for i in (35, 36, 37, 38):     # val 里 4 帧碰撞：不进校准，条件也不能错位
+            flags[i] = "1"
+        self.flags = "".join(flags)
+        self.cond = rng.choice([0, 2, 3], size=n, p=[0.5, 0.25, 0.25]).astype(np.uint8)   # 码 0/2/3，帧间无规律：错位取值必被发现
+        self.data = os.path.join(self.tmp, "dataset.uavr")
+        write_uavr(self.data, self.n_split, self.labels, self.flags, self.images)
+        write_aux(self.data, self.cond)
+        self.val = [i for i in range(30, 110) if self.flags[i] == "0"]
+        self.run_dir = make_run(self.tmp, range(1, 6), lambda e: rand_params(e), ds_sha=sha(self.data), prev=4)
+
+    def expected_delta(self, avg_fc_b, cond):
+        """独立于工具与假二进制脚本之外重算一遍：与 FAKE_INFER_COND 同一个 logit 公式，概率按 %g 取 6 位，再用工具的二分求 δ。"""
+        probs = []
+        for seen, (g, c) in enumerate(zip(self.val, cond)):
+            buf = np.ascontiguousarray(self.images[g].transpose(1, 2, 0)).tobytes()
+            z = [float(avg_fc_b[k]) + buf[k] / 64.0 + int(c) * COND_COEF[k] for k in range(4)]
+            z[1] += 1e-3 * seen
+            m = max(z)
+            e = [math.exp(x - m) for x in z]
+            probs.append([float("%g" % (x / sum(e))) for x in e])
+        return ac.calibrate(np.array(probs), float((self.labels[self.val] == 1).mean()))
+
+    def calibrate(self, run=None, name="cal", **env):
+        out = os.path.join(self.tmp, name + ".bin")
+        log = os.path.join(self.tmp, name + ".condlog")
+        old = {k: os.environ.get(k) for k in ("COND_LOG", *env)}
+        os.environ["COND_LOG"] = log
+        os.environ.update(env)
+        try:
+            ac.main(["--run", run or self.run_dir, "--data", self.data, "--out", out, "--last-k", "3", "--infer-bin", self.fake])
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        lines = [tuple(map(int, ln.split())) for ln in slurp(log).decode().splitlines()] if os.path.exists(log) else []
+        return out, lines
+
+    def test_condition_bytes_reach_inference_in_val_order_and_delta_matches_independent_value(self):
+        out, lines = self.calibrate()
+        want = [int(self.cond[g]) for g in self.val]
+        n = H * W * 3
+        self.assertEqual(len(lines), 2 * len(self.val), "平均权重与校准后权重各推理一遍 val")
+        self.assertEqual({ln[0] for ln in lines}, {n + 1}, "每帧 h*w*3 字节 + 1 字节条件")
+        self.assertEqual([ln[1] for ln in lines[:len(self.val)]], want, "第一遍：条件取自侧车 val 非碰撞帧，按帧序")
+        self.assertEqual([ln[1] for ln in lines[len(self.val):]], want, "第二遍（校准后核对）同样")
+        self.assertGreater(len(set(want)), 1, "造的条件列要有不止一个取值，否则测不出错位")
+        avg = os.path.join(self.tmp, "avg.bin")
+        ac.main(["--run", self.run_dir, "--out", avg, "--last-k", "3", "--no-calibrate"])
+        fc_b = ac.read_ckpt(avg)["params"][7]
+        meta = load_json(out + ".json")
+        self.assertEqual(meta["delta"], self.expected_delta(fc_b, want), "δ 必须等于按真实条件列独立算出的值")
+        self.assertNotAlmostEqual(meta["delta"], self.expected_delta(fc_b, [0] * len(self.val)), places=4,
+                                  msg="条件全置 0 的 δ 应不同，否则这个测试对条件不敏感")
+        target = float((self.labels[self.val] == 1).mean())
+        self.assertLessEqual(abs(meta["forward_frac_after_real"] - target), 2.0 / len(self.val) + 1e-12)
+        self.assertEqual(meta["cond"]["prev_dim"], 4)
+        self.assertEqual(meta["cond"]["aux"], os.path.join(self.tmp, "dataset.aux"))
+        self.assertEqual(meta["cond"]["aux_sha256"], sha(os.path.join(self.tmp, "dataset.aux")))
+        self.assertEqual(meta["cond"]["val_value_counts"], [want.count(v) for v in range(4)])
+        # 输出仍是「只平均 + fc.b[FORWARD] 加 δ」：别的张量逐位等于只平均的产物
+        a, c = ac.read_ckpt(avg), ac.read_ckpt(out)
+        for i in range(8):
+            if i != 7:
+                self.assertEqual(a["params"][i].tobytes(), c["params"][i].tobytes())
+        self.assertEqual(c["params"][7][FWD], a["params"][7][FWD] + np.float32(meta["delta"]))
+        self.assertEqual(c["prev_dim"], 4)
+
+    def test_missing_or_foreign_sidecar_is_refused_and_nothing_is_written(self):
+        os.remove(os.path.join(self.tmp, "dataset.aux"))
+        out = os.path.join(self.tmp, "x.bin")
+        with self.assertRaises(SystemExit) as cm:
+            ac.main(["--run", self.run_dir, "--data", self.data, "--out", out, "--last-k", "2", "--infer-bin", self.fake])
+        self.assertIn("dataset.aux", str(cm.exception.code))
+        write_aux(self.data, self.cond, uavr_sha="11" * 32)       # 别的数据集的侧车
+        with self.assertRaises(SystemExit) as cm:
+            ac.main(["--run", self.run_dir, "--data", self.data, "--out", out, "--last-k", "2", "--infer-bin", self.fake])
+        self.assertIn("uavr sha256", str(cm.exception.code))
+        self.assertFalse(os.path.exists(out) or os.path.exists(out + ".json"))
+        self.assertEqual([n for n in os.listdir(self.tmp) if n.startswith(".average_ckpt")], [])
+
+    def test_infer_process_that_does_not_take_a_condition_is_refused(self):
+        # hello 报 prev_action_dim=0 而 ckpt 需要条件：每帧长度对不上，后面全部错位，必须在第一帧之前拦下
+        with self.assertRaises(SystemExit) as cm:
+            self.calibrate(name="hello", FAKE_HELLO_PREV="0")
+        self.assertIn("prev_action_dim", str(cm.exception.code))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "hello.bin")))
+
+    def test_ckpt_without_condition_sends_no_extra_byte_and_has_no_cond_record(self):
+        run0 = make_run(self.tmp, range(1, 6), lambda e: rand_params(e), name="run_plain", ds_sha=sha(self.data))
+        out, lines = self.calibrate(run=run0, name="plain")
+        self.assertEqual({ln[0] for ln in lines}, {H * W * 3}, "不带条件的 ckpt 每帧只发图像字节")
+        self.assertEqual({ln[1] for ln in lines}, {0})
+        meta = load_json(out + ".json")
+        self.assertNotIn("cond", meta)
+        # 与原假二进制（只认 h*w*3 字节一帧）算出同一个 δ：协议没有为这类 ckpt 改动
+        fake_old = os.path.join(self.tmp, "fake_infer_old")
+        with open(fake_old, "w") as f:
+            f.write(FAKE_INFER.format(py=sys.executable, tools=os.path.join(REPO, "tools")))
+        os.chmod(fake_old, 0o755)
+        out_old = os.path.join(self.tmp, "plain_old.bin")
+        ac.main(["--run", run0, "--data", self.data, "--out", out_old, "--last-k", "3", "--infer-bin", fake_old])
+        self.assertEqual(load_json(out_old + ".json")["delta"], meta["delta"])
+        self.assertEqual(sha(out_old), sha(out), "不带条件的 ckpt：两种假二进制得到逐字节相同的产物")
+
+    def test_only_average_still_works_for_condition_ckpt_without_sidecar(self):
+        os.remove(os.path.join(self.tmp, "dataset.aux"))
+        out = os.path.join(self.tmp, "avg.bin")
+        ac.main(["--run", self.run_dir, "--out", out, "--last-k", "2", "--no-calibrate"])
+        self.assertTrue(os.path.isfile(out))
 
 
 # 今天闭环实验用的权重（exp-swa-calib-20261110/inputs.txt 的 sha256）

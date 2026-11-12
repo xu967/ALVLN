@@ -7,6 +7,9 @@ run 目录要有 --save-every-epoch 训出的 ckpt_epNN.bin；GPU 由调用方�
 校准：真实 uavrgb_infer 在 val 分区（剔除碰撞步）逐帧推理，二分求 δ，使 FORWARD 的 logit 加 δ 后预测为 FORWARD 的占比等于 val 标签里 FORWARD 的占比，再 fc.b[FORWARD] += δ。
 --data 的 sha256 必须等于 ckpt 训练契约里记的数据集 sha256：传错数据集，目标占比就不是训练分布的，δ 会静默偏掉。
 只平均不校准比 ckpt_best 还差（闭环 20/60 对 27/60），两步必须一起用；--no-calibrate 只给对拍与消融。
+带条件输入的 ckpt（prev_dim=4：--prev-action 训出的 prev-action 模型与航向码模型，卡 E2E-1）：校准时每帧多发 1 字节条件，取自 --data 同名 .aux 侧车的
+prev_action 列（UAVRAUX1，tools/DATASET_FORMAT.md §6；prev-action 包里是上一步动作，--cond heading-code 的包里是航向码），推理协议同 sim/tools/student.py：
+一帧 = h*w*3 字节 HWC RGB + 1 字节条件。侧车与数据集的绑定（N、uavr sha256、payload sha256、长度）逐项核对，不符报错；不带条件输入的 ckpt 走原路径，输出逐字节不变。
 """
 import argparse
 import hashlib
@@ -34,6 +37,9 @@ DEFAULT_INFER = os.path.join(os.environ.get("UAV_RGB_BUILD_DIR") or os.path.join
 CK_HEAD = struct.Struct("<8sII4i3I")         # magic、version、param_count、in_h in_w in_c num_classes、adam_t、epoch、weight_count（44 B）
 DS_HEAD = struct.Struct("<4sHHIHHBBBBQQQI")  # tools/DATASET_FORMAT.md §1.1
 SAME = ("param_count", "in_h", "in_w", "in_c", "num_classes", "text_dim", "aux_classes", "prev_dim")   # 末 k 轮的模型结构必须一致
+PREV_DIM = 4                                 # 条件输入的维度（四动作 one-hot；prev-action 与航向码共用），同 sim/tools/student.py 只认 0 或 4
+AUX_HEAD = struct.Struct("<8sQIHHBBH")       # UAVRAUX1 头前 28 B（DATASET_FORMAT.md §6.1）：magic、N、flags、depth_h、depth_w、K、unknown_code、reserved
+AUX_HEAD_BYTES = 128                         # 整头；其后依次 prev_index u32[N]、prev_action u8[N]、（flags bit0 时）深度 u8[N*depth_h*depth_w]
 # 数据集读法不 import select_ckpt.Uavr：它经 student 拉进 PIL 与 teacher，本工具只依赖 numpy 与标准库。
 
 
@@ -172,8 +178,38 @@ def read_val(path):
     return np.memmap(path, np.uint8, "r", io, (n, c, h, w)), idx, np.fromfile(path, dtype=np.uint8, count=n, offset=lo)[idx]
 
 
-def infer_probs(binary, ckpt, images, idx):
+def read_aux_cond(data, data_sha):
+    """<data 去掉后缀>.aux（UAVRAUX1，DATASET_FORMAT.md §6，路径规则同 src/aux_sidecar.cpp）的 prev_action 列 → u8[N]。
+    逐项核对侧车与数据集的绑定，同 src/aux_sidecar.cpp：N、flags、头里的 uavr sha256、文件长、payload sha256、列值 < PREV_DIM；任何不符报错，不猜。
+    data_sha：调用方已算好的 --data 整文件 sha256（hex），N 取数据集头。"""
+    path = os.path.splitext(os.path.abspath(data))[0] + ".aux"
+    if not os.path.isfile(path):
+        raise ValueError(f"{path} 不存在：带条件输入的 ckpt 要从数据集侧车的 prev_action 列取每帧条件，数据集须用新版 preprocess.py 打包")
+    with open(path, "rb") as f:
+        raw = f.read()
+    with open(data, "rb") as f:
+        n = DS_HEAD.unpack(f.read(DS_HEAD.size))[3]
+    if len(raw) < AUX_HEAD_BYTES:
+        raise ValueError(f"{path}: 文件头不足 {AUX_HEAD_BYTES} B")
+    magic, n_aux, flags, dh, dw, _k, unknown, _res = AUX_HEAD.unpack_from(raw)
+    if magic != b"UAVRAUX1" or n_aux != n or flags > 1 or unknown != 255:
+        raise ValueError(f"{path}: 头不合法或与数据集不符（magic={magic!r} N={n_aux}（数据集 {n}）flags={flags} unknown_code={unknown}）")
+    if raw[28:60].hex() != data_sha:
+        raise ValueError(f"{path}: 头里的 uavr sha256 {raw[28:40].hex()}… 与 --data 的 {data_sha[:12]}… 不同：侧车不是从这份数据集生成的，请重新 preprocess")
+    expect = AUX_HEAD_BYTES + 5 * n + (n * dh * dw if flags & 1 else 0)
+    if len(raw) != expect:
+        raise ValueError(f"{path}: 文件长 {len(raw)} != 期望 {expect}")
+    if hashlib.sha256(raw[AUX_HEAD_BYTES:]).digest() != raw[60:92]:
+        raise ValueError(f"{path}: payload sha256 不匹配（文件损坏或被改过）")
+    cond = np.frombuffer(raw, np.uint8, n, AUX_HEAD_BYTES + 4 * n)   # prev_action 紧跟在 prev_index（u32[N]）之后
+    if int(cond.max(initial=0)) >= PREV_DIM:
+        raise ValueError(f"{path}: prev_action 列有越界值 {int(cond.max())}（须 < {PREV_DIM}）")
+    return cond, path
+
+
+def infer_probs(binary, ckpt, images, idx, cond=None):
     """起 uavrgb_infer 子进程，按 sim/tools/student.py 的行协议逐帧喂 HWC RGB（写一帧读一行，不会撑满管道）→ probs[len(idx), 4]。
+    cond：None = 不带条件输入的 ckpt，每帧 h*w*3 字节（与改动前逐字节相同）；u8[len(idx)] = prev_dim=4 的 ckpt，每帧后多 1 字节 cond[k]。
     shortcut: 读回复没有超时，进程挂死会卡住；接流水线时由外层守护脚本兜（student.py 有 30 s 超时，但要 PIL）。"""
     h, w = images.shape[2:]
     out = np.zeros((len(idx), 4))
@@ -190,8 +226,11 @@ def infer_probs(binary, ckpt, images, idx):
             hello = reply()
             if (hello["in_h"], hello["in_w"], hello["in_c"], hello["num_classes"]) != (h, w, 3, 4):
                 raise RuntimeError(f"推理进程 hello 与数据集不符: {hello}")
+            if int(hello.get("prev_action_dim", 0)) != (0 if cond is None else PREV_DIM):   # 帧长不符会让后面每一帧错位，先拦
+                raise RuntimeError(f"推理进程 hello 的 prev_action_dim={hello.get('prev_action_dim')} 与条件输入（{'无' if cond is None else PREV_DIM}）不符: {hello}")
             for k, g in enumerate(idx):
-                p.stdin.write(np.ascontiguousarray(images[g].transpose(1, 2, 0)).tobytes())   # NCHW → HWC，同 student.py 发的图
+                frame = np.ascontiguousarray(images[g].transpose(1, 2, 0)).tobytes()   # NCHW → HWC，同 student.py 发的图
+                p.stdin.write(frame if cond is None else frame + bytes([int(cond[k])]))   # 条件 1 字节跟在帧后，同 student.py
                 p.stdin.flush()
                 out[k] = reply()["probs"]
             p.stdin.close()
@@ -205,9 +244,9 @@ def infer_probs(binary, ckpt, images, idx):
 
 def calibrate_and_write(args, last, params, out):
     """平均后的 ckpt 真实推理 val → δ → 写 fc.b[FORWARD]+δ 的 ckpt，再对写出的文件真实推理核对占比，通过才落到 out。返回 json 字段。
-    shortcut: 只支持单帧纯视觉 ckpt。文本指令（逐集 --text）与双帧/prev-action（要读 dataset.aux 的 prev_index/prev_action）行协议还原不出来，
-    宁可报错也不算出一个错的 δ；需要时按 student.py / select_ckpt.predict_indices 的写法补。"""
-    if (last["in_c"], last["text_dim"], last["prev_dim"]) != (3, 0, 0):
+    shortcut: 只支持单帧、无文本的 ckpt（可带 prev_dim=4 的条件输入，条件取自侧车 prev_action 列）。文本指令（逐集 --text）与双帧（要读 prev_index 取上一帧）
+    行协议还原不出来，宁可报错也不算出一个错的 δ；需要时按 student.py / select_ckpt.predict_indices 的写法补。"""
+    if (last["in_c"], last["text_dim"]) != (3, 0) or last["prev_dim"] not in (0, PREV_DIM):
         raise ValueError(f"暂不支持校准：ckpt 带 in_c={last['in_c']} text_dim={last['text_dim']} prev_dim={last['prev_dim']}，"
                          "这些输入无法从数据集经行协议还原（只平均请加 --no-calibrate）")
     images, idx, y = read_val(args.data)
@@ -216,19 +255,25 @@ def calibrate_and_write(args, last, params, out):
     data_sha, trained_on = sha256_file(args.data), last["contract"][:32].hex()   # 契约开头 32 B = trainer 记的训练数据集 sha256
     if data_sha != trained_on:
         raise ValueError(f"--data 的 sha256 {data_sha[:12]} 与 ckpt 训练契约里的 {trained_on[:12]} 不同：校准只在训练用的那份数据的 val 上做")
+    cond, cond_info = None, {}
+    if last["prev_dim"]:
+        col, aux_path = read_aux_cond(args.data, data_sha)
+        cond = col[idx]
+        cond_info = {"cond": {"prev_dim": last["prev_dim"], "aux": aux_path, "aux_sha256": sha256_file(aux_path), "column": "prev_action",
+                              "val_value_counts": [int((cond == v).sum()) for v in range(PREV_DIM)]}}
     with tempfile.TemporaryDirectory(prefix=".average_ckpt_", dir=os.path.dirname(out)) as tmp:
         write_ckpt(last, params, f"{tmp}/avg.bin")
-        probs = infer_probs(args.infer_bin, f"{tmp}/avg.bin", images, idx)
+        probs = infer_probs(args.infer_bin, f"{tmp}/avg.bin", images, idx, cond)
         target = float((y == FORWARD).mean())
         delta = calibrate(probs, target)
         write_ckpt(last, shift_forward_bias(params, delta), f"{tmp}/cal.bin")
-        after = float((infer_probs(args.infer_bin, f"{tmp}/cal.bin", images, idx).argmax(1) == FORWARD).mean())
+        after = float((infer_probs(args.infer_bin, f"{tmp}/cal.bin", images, idx, cond).argmax(1) == FORWARD).mean())
         if abs(after - target) * len(idx) > VERIFY_FRAMES:
             raise ValueError(f"写出的 ckpt 真实推理 FORWARD 占比 {after:.4f} 偏离目标 {target:.4f}，不落盘")
         os.replace(f"{tmp}/cal.bin", out)
     return {"data": os.path.abspath(args.data), "data_sha256": data_sha,
             "split": "val", "n_frames": int(len(idx)), "forward_target": target, "forward_frac_before": forward_frac(probs), "delta": float(delta),
-            "forward_frac_after_real": after, "infer_bin": os.path.abspath(args.infer_bin), "infer_bin_sha256": sha256_file(args.infer_bin)}
+            "forward_frac_after_real": after, "infer_bin": os.path.abspath(args.infer_bin), "infer_bin_sha256": sha256_file(args.infer_bin), **cond_info}
 
 
 def run(args):
