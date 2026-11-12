@@ -61,8 +61,9 @@ DEFAULT_CONTROL = os.path.join(D, "exp-action-latency-r2-20261111")   # 对照 =
 EXPECT_CONTROL_PROFILE = "cf_sitl_v1:1bc8fedf:lib31"   # 对照臂各集 manifest 的 dynamics_profile（默认参数，电量 50%）
 EXPECT_FULL_PROFILE = "cf_sitl_v1:06e5f017:lib31"      # 满电臂各集 manifest 的 dynamics_profile（起跑时 config.env 可覆盖）
 PAIR_KEYS = ("infer_bin_sha256", "ckpt_sha256", "heading_guard", "hold_s", "window_from", "corridor_half_width", "action_latency_s",
-             "dynamics", "vehicle", "template_sha256", "split", "seeds", "task", "metric_version", "steps", "blocks", "policy",
+             "dynamics", "vehicle", "template_sha256", "split", "requested_seeds", "task", "metric_version", "steps", "blocks", "policy",
              "camera_rate_hz", "aux_cameras")        # 两档对应臂的 eval.json 这些键必须相同，配对才成立
+# 不用 seeds：它是评完的集，含迟到步的集进 failed[] 不在里面（真实臂 soc100-L0.20-k1-s1 少 seed 113），用它会让每个重跑过的臂判 INVALID；请求的全集是 requested_seeds
 RETRY = s2.RETRY_SUFFIX
 EXIT = {"PASS": 0, "FAIL": 1, "INCOMPLETE": 2, "FALSIFIED": 3, "INVALID": 4}
 

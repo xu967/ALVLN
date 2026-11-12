@@ -173,7 +173,9 @@ def main():
               "corridor_half_width": a.corridor_half_width or 3.0,
               "metric_version": "sim09.v2.coast1s.corridor3m", "blocks": a.blocks or None, "policy": a.policy, "task": a.task,
               "heading_guard": a.heading_guard, "hold_s": a.hold, "window_from": a.window_from, "action_latency_s": L, "dynamics": a.dynamics,
-              "vehicle": a.vehicle, "template_sha256": sha_text("template"), "split": a.split, "seeds": parse_seeds(a.seeds), "steps": a.steps,
+              "vehicle": a.vehicle, "template_sha256": sha_text("template"), "split": a.split, "steps": a.steps,
+              # 真入口：seeds = 评完的集（迟到 / 失败的集不在里面），requested_seeds = 请求的全集（2026-11-12 02:15:48 写出的第一个真实臂 soc100-L0.20-k1-s1 的 eval.json：seeds 19 个，requested_seeds 20 个）
+              "seeds": [e["seed"] for e in per_episode], "requested_seeds": parse_seeds(a.seeds),
               "infer_bin_sha256": sha_text(a.infer_bin or ""), "ckpt_sha256": sha_text(a.ckpt or ""), "camera_rate_hz": None, "aux_cameras": True,
               **({"late_dispatch_episodes": late_eps} if L is not None else {}),
               **({"rtf": a.rtf} if a.rtf is not None else {}),

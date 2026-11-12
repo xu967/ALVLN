@@ -268,6 +268,32 @@ class AnalyzeTests(unittest.TestCase):
         self.assertEqual(A["status"], "INVALID")
         self.assertEqual([k for k, _c, _f in A["proto_diff"][(1, 1)]], ["heading_guard"])
 
+    def test_retried_arm_keeps_pair_protocol(self):
+        """真入口里含迟到步的集进 failed[]，eval.json 的 seeds 不含它，requested_seeds 才是请求的全集；对照臂没有迟到集。
+        配对协议键不能因此判 INVALID（第一个真实臂 soc100-L0.20-k1-s1 暴露：旧版把 seeds 放进 PAIR_KEYS，重跑过的臂必判 INVALID）。"""
+        late = {"STUB_STUDENT_LATE_SEEDS": "113", "STUB_STUDENT_LATE_ARM": "soc100-L0.20-k1-s1"}
+        ctrl, out = self.build(late)
+        run_stub(os.path.join(out, "soc100-L0.20-k1-s1-retry1"), task="base", ckpt="x_s1_k10.bin", full=True, seeds="113", episodes=1, env=late)
+        with open(os.path.join(out, "soc100-L0.20-k1-s1", "eval.json"), encoding="utf-8") as f:
+            e = json.load(f)
+        self.assertNotIn(113, e["seeds"], "桩应与真入口一致：迟到的集不在 seeds 里")
+        self.assertIn(113, e["requested_seeds"])
+        A = sp.analyze(out, ctrl, 0.20, "cruise")
+        self.assertEqual(A["proto_diff"], {})
+        self.assertEqual(A["status"], "PASS")
+
+    def test_invalid_when_requested_seeds_differ(self):
+        ctrl, out = self.build()
+        p = os.path.join(out, "soc100-L0.20-k3-s0", "eval.json")
+        with open(p, encoding="utf-8") as f:
+            e = json.load(f)
+        e["requested_seeds"] = e["requested_seeds"][:-1]
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(e, f)
+        A = sp.analyze(out, ctrl, 0.20, "cruise")
+        self.assertEqual(A["status"], "INVALID")
+        self.assertEqual([k for k, _c, _f in A["proto_diff"][(3, 0)]], ["requested_seeds"])
+
     def test_incomplete_when_arm_missing(self):
         ctrl, out = self.build()
         shutil.rmtree(os.path.join(out, "soc100-L0.20-k3-s2"))
