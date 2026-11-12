@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# uavrgb_infer 的 PyTorch 原型启动器：命令行与 C++ 二进制相同（--ckpt、--text），
+# sim/tools/student.py 与各评测脚本的 --infer-bin 指到本文件即可，不用改 sim/ 与 tools/。
+# 解释器：UAV_RGB_PROTO_PYTHON，默认数据盘上的 teacher-venv（torch + numpy；原型线只借用，不装包）。
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY="${UAV_RGB_PROTO_PYTHON:-${DATA_ROOT:-/root/rivermind-data}/uav_rgb/teacher-venv/bin/python}"
+[[ -x "$PY" ]] || { echo "uavrgb_infer_proto: 找不到解释器 $PY（可设 UAV_RGB_PROTO_PYTHON）" >&2; exit 1; }
+export PYTHONDONTWRITEBYTECODE=1
+# 每个推理进程单线程：闭环里多路并行，线程超订会拖慢 Gazebo 的仿真时钟
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}" MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
+exec "$PY" "$HERE/infer_wrap.py" "$@"
