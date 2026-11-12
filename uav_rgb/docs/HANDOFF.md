@@ -781,9 +781,10 @@ R3 最小转向评分，约 +110–130 行。**故意排在数据采集之后**�
     20 个 test seed 的几何；并集重训 = dagger 臂，教师再采帧数对齐 = more_demos 臂；每轮
     `round_k/stats.json` 记学生步上的专家不一致率。起（守护进程，二进制走 `UAV_RGB_BUILD_DIR`
     快照 `$DATA_ROOT/uav_rgb/exp-dagger-gz-20261109/bin`）：
-    `OUT=...; mkdir -p $OUT; setsid nohup $UAV_RGB_PYTHON tools/dagger_gz_pipeline.py --out $OUT > $OUT/run.log 2>&1 < /dev/null & echo $! > $OUT/run.pid`；
+    `OUT=...; mkdir -p $OUT; setsid nohup $UAV_RGB_PYTHON tools/dagger_gz_pipeline.py --out $OUT >> $OUT/run.log 2>&1 < /dev/null &`
+    （11-12 起：重定向用 `>>`，误起第二个实例时不截断第一个的日志；`run.pid` 由进程自己写，不要再 `echo $! > run.pid`）；
     看：`tail -f $OUT/run.log`、`$OUT/status.json`、`$OUT/summary.md`，结束落 `$OUT/DONE`（rc）；
-    停：`kill -- -$(cat $OUT/run.pid)`（PGID，脚本把 SIGTERM 转发给子进程），同一 `--out` 再起即按产物续跑
+    停：`bash tools/stop_daemon.sh $OUT`（先核对 `run.pid` 里的启动时刻再按 PGID 停；脚本把 SIGTERM 转发给子进程），同一 `--out` 再起即按产物续跑
     （采完 = `collection_manifest.json`，训完 = `metrics.jsonl` 末行 `done:`，评完 = `eval.json` 且
     `failed_count==0`）。三个坑：round0 与新轮次 `dynamics_profile` 不同（lib v1 vs v3.1），并集走
     `preprocess.py --allow-mixed-dynamics`（meta `dynamics_profiles` 记全部值，缺字段仍拒）；eval4 基线行

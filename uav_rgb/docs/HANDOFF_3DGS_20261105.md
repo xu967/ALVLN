@@ -129,7 +129,7 @@ $DATA_ROOT/uav_rgb/3dgs-venv/bin/python -m sim.3dgs.collect_3dgs \
   --out $DATA_ROOT/uav_rgb/run/train \
   --epochs 2 --batch 8 --lr 0.001 --seed 1
 
-# 5) 单独评测
+# 5) 单独评测（11-12 起：场景按几何哈希属于 train 或 val 分区时默认拒绝评测，rc=2；自采场景上做诊断要加 --allow-train-scene，eval.json 会标 split_policy=diag-train-scene）
 $DATA_ROOT/uav_rgb/3dgs-venv/bin/python -m sim.3dgs.eval_3dgs \
   --scene $DATA_ROOT/uav_rgb/run/ds/scene.json \
   --out $DATA_ROOT/uav_rgb/run/eval \
