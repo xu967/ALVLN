@@ -61,7 +61,7 @@ def bands_of(pose, pillars):
 # ---------------------------------------------------------------- 独立的三维求交（测试里的真值）
 def oracle_cell_depth(pose, pillars, rays=3):
     """每格 rays×rays 条射线沿光轴的最小深度。射线方向取前向分量为 1 的向量，参数 t 就是沿光轴的深度。
-    方柱 = 轴对齐方盒（三维 slab），圆柱 = 竖直圆柱（xy 二次方程 + 高度区间），地面 z=0。相机低于柱顶，不处理顶面。"""
+    方柱 = 轴对齐方盒（三维 slab），圆柱 = 闭竖直圆柱（侧面 + 顶底圆盘面），地面 z=0。"""
     x, y, z, yaw = pose
     cy_, sy_ = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
     o = np.array([x + MOUNT[0] * cy_, y + MOUNT[0] * sy_, z + MOUNT[1]])
@@ -95,17 +95,24 @@ def _hit3(o, d, p, zlo, zhi):
     if p.get("radius") is not None:
         R = float(p["radius"])
         ox, oy = o[0] - p["x"], o[1] - p["y"]
+        if ox * ox + oy * oy <= R * R and zlo <= o[2] <= zhi:
+            return 0.0
+        cands = []
         a = d[0] ** 2 + d[1] ** 2
-        b = 2 * (ox * d[0] + oy * d[1])
-        cc = ox * ox + oy * oy - R * R
-        disc = b * b - 4 * a * cc
-        if disc < 0:
-            return None
-        t1, t2 = (-b - math.sqrt(disc)) / (2 * a), (-b + math.sqrt(disc)) / (2 * a)
-        if t2 < 0:
-            return None
-        t = max(t1, 0.0)
-        return t if zlo <= o[2] + d[2] * t <= zhi else None
+        if a > 1e-15:
+            b = 2 * (ox * d[0] + oy * d[1])
+            cc = ox * ox + oy * oy - R * R
+            disc = b * b - 4 * a * cc
+            if disc >= 0:
+                for t in ((-b - math.sqrt(disc)) / (2 * a), (-b + math.sqrt(disc)) / (2 * a)):
+                    if t >= 0 and zlo <= o[2] + d[2] * t <= zhi:
+                        cands.append(t)
+        if abs(d[2]) > 1e-15:
+            for zcap in (zlo, zhi):
+                tc = (zcap - o[2]) / d[2]
+                if tc >= 0 and (ox + tc * d[0]) ** 2 + (oy + tc * d[1]) ** 2 <= R * R:
+                    cands.append(tc)
+        return min(cands) if cands else None
     hx, hy = p["size"][0] / 2, p["size"][1] / 2
     lo, hi = -math.inf, math.inf
     for k, (c, hh) in enumerate(((p["x"], hx), (p["y"], hy), (p["z"], (zhi - zlo) / 2))):
@@ -234,6 +241,29 @@ class AnalyticGeometryTests(unittest.TestCase):
         self.assertEqual(b[7, 0], 7)
         np.testing.assert_allclose(cells_of((0.0, 0.0, 1.985, 0.0), [trunk]),     # float32 的相对误差 ≤ 6e-8
                                    oracle_cell_depth((0.0, 0.0, 1.985, 0.0), [trunk]), rtol=1e-6)
+
+    def test_cylinder_top_and_bottom_caps_match_box_and_oracle(self):
+        # I2-8 第 2 点 / TEST 2f：相机高于柱顶（oz=2.115 > 柱顶 2.0）向下看 x=1.0 m 处高 2.0 m 的柱顶中心，
+        # 圆柱不能穿透顶盖直落地面（15.700 m），必须命中顶盖圆盘，与同外接方柱及独立 3D oracle 一致；
+        # 悬空圆柱从下方抬头看底盖（zc - zh）同样命中底盖。
+        box_p = [{"name": "b", "x": 1.0, "y": 0.0, "z": 1.0, "size": [0.4, 0.4, 2.0]}]
+        cyl_p = [{"name": "c", "x": 1.0, "y": 0.0, "z": 1.0, "radius": 0.2, "size": [0.4, 0.4, 2.0]}]
+        pose_high = (0.0, 0.0, 2.1, 0.0)  # 相机 oz = 2.115 > 柱顶 2.0
+        d_box = cells_of(pose_high, box_p)
+        d_cyl = cells_of(pose_high, cyl_p)
+        self.assertLess(float(d_cyl[9, 10]), 1.2, "圆柱顶盖必须被命中，不能穿透到地面 15.7 m")
+        self.assertAlmostEqual(float(d_cyl[9, 10]), float(d_box[9, 10]), places=3)
+        np.testing.assert_allclose(d_cyl, oracle_cell_depth(pose_high, cyl_p), rtol=1e-6)
+
+        # 底盖（zc - zh = 1.5 > 相机 oz = 1.0）：向上射线打到底面圆盘
+        float_cyl = [{"name": "fc", "x": 1.0, "y": 0.0, "z": 2.0, "radius": 0.25, "size": [0.5, 0.5, 1.0]}]
+        pose_low = (0.0, 0.0, 1.0 - MOUNT[1], 0.0)  # oz = 1.0 < 底面 1.5
+        d_bot = cells_of(pose_low, float_cyl)
+        want_bot = oracle_cell_depth(pose_low, float_cyl)
+        self.assertTrue(np.isfinite(want_bot[:5, 9:11]).any(), "夹具上方射线应打到悬空圆柱底盖")
+        fin = np.isfinite(want_bot)
+        self.assertEqual(np.isinf(d_bot).tolist(), np.isinf(want_bot).tolist())
+        np.testing.assert_allclose(d_bot[fin], want_bot[fin], rtol=1e-6)
 
     def test_azimuth_is_left_positive_and_yaw_is_counter_clockwise(self):
         # 柱在机头左前方（x 前 1.0、y 左 0.4，方位 +21.8°）：出现在画面左侧（小列号），右侧没有。

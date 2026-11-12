@@ -202,8 +202,8 @@ P1 软标签（UAVSOFT1）要对新包重新 `join_soft_targets`，旧 `.bin` �
 
 | 段 | 类型 | 说明 |
 |---|---|---|
-| prev_index | `u32[N]` | 全局样本下标：同 episode 内 step−1 的样本；首帧、或上一步被打包侧 `--drop-collision` 丢掉时 = 自身下标。读端由此派生 `first_frame[i] = (prev_index[i] == i)` 供工具/分析用；训练器目前直接按 prev_index 取上一帧，不读 first_frame |
-| prev_action | `u8[N]` | 上一步**执行**的动作（`actions.jsonl` 的 `action_executed`，旧数据退回 `action_expert`）；首帧 = 0（SAFE_NEUTRAL）。注意：上一步被丢掉时它仍取该步真实执行的动作。`--cond heading-code` 的包（meta `cond="heading_code.v1"`）这一列改写航向码：按集从头累计**已执行**的 YAW_LEFT−YAW_RIGHT 得 n（含被丢掉的步），取该步执行前的 n，\|n\|≤1→0、n≥2→2、n≤−2→3，码 1 不用，首帧 0（`sim/tools/nav_cond.py`）；训练器同样用 `--prev-action` 读它 |
+| prev_index | `u32[N]` | 全局样本下标：同 episode 内 step−1 的样本；首帧、源 `actions.jsonl` 缺 `step−1` 行、或上一步被打包侧 `--drop-collision` / `--drop-late-and-stall` 丢掉时 = 自身下标。读端由此派生 `first_frame[i] = (prev_index[i] == i)` 供工具/分析用；训练器目前直接按 prev_index 取上一帧，不读 first_frame |
+| prev_action | `u8[N]` | 上一步**执行**的动作（`actions.jsonl` 每行直接校验 `action_executed` 为 `0..3` 整数，无该键的旧数据退回 `action_expert`）；首帧 = 0（SAFE_NEUTRAL）。`--cond heading-code` 的包（meta `cond="heading_code.v1"`）这一列改写航向码：按连续步段累计**已执行**的 YAW_LEFT−YAW_RIGHT 得 n，取该步执行前的 n，\|n\|≤1→0、n≥2→2、n≤−2→3，码 1 不用，首帧 0（`sim/tools/nav_cond.py`）；训练器同样用 `--prev-action` 读它。**步号缺口与打包丢步的统一规则**：(1) 打包期行级过滤（`--drop-collision`、`--drop-late-and-stall`）丢掉某步时，源 `actions.jsonl` 仍有 `step−1` 行，真实执行动作已知，`prev-action` 仍取该步执行动作、`heading-code` 仍计入该步转向；若整集所有步都被滤空，该集不进 `meta.episodes` 与 `instructions.jsonl`；(2) 若源 `actions.jsonl` 自身步号存在缺口（`step−1` 不在源文件中，缺失步的执行动作未知），两种条件统一在缺口处断链重置为段首初值 `0`，随后在新连续段内重新传递或累计 |
 | depth（flags bit0） | `u8[N·depth_h·depth_w]` | 行优先 `[n][r][c]`，0..K−1 为分带（K−1 含「没打到东西」），255 = 未知（损失屏蔽） |
 
 深度目标的生成（`preprocess.aux_payload`）：源分辨率深度图 → 每格（源图按 H/8×W/8 均分）
@@ -224,8 +224,8 @@ f 取**该样本所属 episode** 的 manifest `camera.fx`，没有则按 60° HF
 **深度来源 `preprocess.py --depth-source`**（W1-8）：缺省 `file` = 读 episode 的深度文件，即上面的全部流程，输出与加这个开关之前逐字节相同。
 `analytic` = 不读深度文件，由几何真值解析算：`actions.jsonl` 的 `pose_before{x,y,z}` 与 `yaw_before`（动作前的机体位姿，度，逆时针为正）、
 manifest 的 `vehicle`（只认 `e1_mini`：相机在机体中心前 0.045 m、上 0.015 m，朝向 = 机头，水平安装）、同目录 `scene.json` 的 `pillars`
-（轴对齐方柱，或带 `radius` 的 forest 竖直圆柱）。每格取 3×3 条子射线（落在源图子块中心），与每根柱子和地面（z = 0）求交，
-深度 = 沿光轴的深度（= 水平射线距离 · cosφ），命中点高度超过柱顶的射线不算打到（+inf，第 8 带），格内取最小；之后与文件路径同一套：
+（轴对齐方柱，或带 `radius` 的 forest 闭竖直圆柱，含侧面与顶底圆盘面）。每格取 3×3 条子射线（落在源图子块中心），与每根柱子和地面（z = 0）求交，
+深度 = 沿光轴的深度（= 水平射线距离 · cosφ），越过柱顶且未打到顶面的射线不算打到（+inf，第 8 带），格内取最小；之后与文件路径同一套：
 按该集 `camera.fx` 做包络膨胀 → `searchsorted(band_edges)`。解析深度没有「未知」，不产生 255。**忽略机体 roll/pitch**（慢速前进倾角 < 10°，
 未量化）。waypoint 任务、3DGS episode、非 `e1_mini`、缺 `scene.json` / `pillars` / 位姿的集在写任何输出之前报错。
 meta 的 `aux_sidecar.depth_source` 记 `"analytic"`；缺省 `file` 不加这个键，旧包的 meta 不变。侧车头、payload 布局与读端不变。
@@ -237,9 +237,9 @@ meta 的 `aux_sidecar.depth_source` 记 `"analytic"`；缺省 `file` 不加这�
 
 两处 `--drop-collision` 对上一帧链的作用不同，别混用：
 
-| 丢碰撞步的位置 | 碰撞步在文件里 | 下一步的 prev_index | 下一步的 prev_action |
+| 丢步的位置 | 被丢步在文件里 | 下一步的 prev_index | 下一步的 prev_action / heading_code |
 |---|---|---|---|
-| 打包侧 `preprocess.py --drop-collision` | 不在（N 已减少） | 指向自身（当首帧） | 仍是碰撞步真实执行的动作 |
+| 打包侧 `--drop-collision` / `--drop-late-and-stall` | 不在（N 已减少） | 指向自身（当首帧） | 仍计入被丢步真实执行的动作 |
 | 训练器侧 `--drop-collision`（`LoadOptions`） | 在，只是不进 train/val/test 下标 | **仍指向碰撞步**，双帧输入照样把它当上一帧读进来 | 同上 |
 
 也就是说训练器侧过滤只影响「哪些样本当目标」，不改侧车链；想让上一帧链也绕开碰撞步，

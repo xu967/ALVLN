@@ -151,36 +151,194 @@ def is_stall_obs_gap(obs_gap_s, hold=None):
     return obs_gap_s is not None and obs_gap_s > nom + STALL_MARGIN_S + STALL_TOL_S
 
 
+def _pillar_lineno(raw_text, idx=None):
+    pos = raw_text.find('"pillars"')
+    if pos < 0:
+        return 1
+    if idx is not None:
+        arr = raw_text.find("[", pos)
+        if arr >= 0:
+            depth, in_str, seen, i = 0, False, -1, arr + 1
+            while i < len(raw_text):
+                ch = raw_text[i]
+                if in_str:
+                    if ch == "\\":
+                        i += 1
+                    elif ch == '"':
+                        in_str = False
+                elif ch == '"':
+                    in_str = True
+                elif ch == "{":
+                    if depth == 0:
+                        seen += 1
+                        if seen == idx:
+                            return raw_text.count("\n", 0, i) + 1
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                elif ch == "]" and depth == 0:
+                    break
+                i += 1
+    return raw_text.count("\n", 0, pos) + 1
+
+
+def _read_goal_pillar_xs(scene_path):
+    """读取 scene.json 的柱子 x 列表；文件不存在或无柱子返回 None，文件损坏或字段非法直接 die。"""
+    try:
+        with open(scene_path, encoding="utf-8") as f:
+            raw_text = f.read()
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        die("%s 第 1 行: 读取失败（%s）" % (scene_path, exc))
+    try:
+        doc = json.loads(raw_text)
+    except json.JSONDecodeError as exc:
+        die("%s 第 %d 行: JSON 解析失败（%s）" % (scene_path, exc.lineno, exc.msg))
+    if not isinstance(doc, dict):
+        die("%s 第 1 行: 顶层必须是 JSON 对象（实际 %s）" % (scene_path, type(doc).__name__))
+    pillars = doc.get("pillars")
+    if pillars is None:
+        return None
+    if not isinstance(pillars, list):
+        die("%s 第 %d 行: pillars 必须是列表（实际 %r）" % (scene_path, _pillar_lineno(raw_text), pillars))
+    if not pillars:
+        return None
+    xs = []
+    for k, p in enumerate(pillars):
+        if not isinstance(p, dict) or "x" not in p or isinstance(p["x"], bool):
+            die("%s 第 %d 行: pillars[%d].x 缺失或类型非法（%r）"
+                % (scene_path, _pillar_lineno(raw_text, k), k, p))
+        try:
+            px = float(p["x"])
+        except (TypeError, ValueError):
+            die("%s 第 %d 行: pillars[%d].x=%r 不是数值"
+                % (scene_path, _pillar_lineno(raw_text, k), k, p["x"]))
+        if not math.isfinite(px):
+            die("%s 第 %d 行: pillars[%d].x=%r 不是有限数值"
+                % (scene_path, _pillar_lineno(raw_text, k), k, p["x"]))
+        xs.append(px)
+    return xs
+
+
+def _read_oracle_max_x(oracle_path):
+    """读取 oracle.jsonl 的最大 pose_gt.x；文件不存在或无 pose_gt.x 返回 None，文件损坏或类型非法直接 die。"""
+    try:
+        f = open(oracle_path, encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        die("%s 第 1 行: 读取失败（%s）" % (oracle_path, exc))
+    max_x = None
+    with f:
+        try:
+            for lineno, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError as exc:
+                    die("%s 第 %d 行: JSON 解析失败（%s）" % (oracle_path, lineno, exc))
+                if not isinstance(rec, dict):
+                    die("%s 第 %d 行: 必须是 JSON 对象（实际 %s）" % (oracle_path, lineno, type(rec).__name__))
+                pose_gt = rec.get("pose_gt")
+                if pose_gt is None:
+                    continue
+                if not isinstance(pose_gt, dict):
+                    die("%s 第 %d 行: pose_gt 必须是对象或 null（实际 %r）" % (oracle_path, lineno, pose_gt))
+                raw_x = pose_gt.get("x")
+                if raw_x is None:
+                    continue
+                if isinstance(raw_x, bool):
+                    die("%s 第 %d 行: pose_gt.x 不能是布尔值（实际 %r）" % (oracle_path, lineno, raw_x))
+                try:
+                    xv = float(raw_x)
+                except (TypeError, ValueError):
+                    die("%s 第 %d 行: pose_gt.x=%r 不是数值" % (oracle_path, lineno, raw_x))
+                if not math.isfinite(xv):
+                    die("%s 第 %d 行: pose_gt.x=%r 不是有限数值" % (oracle_path, lineno, raw_x))
+                if max_x is None or xv > max_x:
+                    max_x = xv
+        except OSError as exc:
+            die("%s 第 1 行: 读取失败（%s）" % (oracle_path, exc))
+    return max_x
+
+
 def teacher_crossed_goal(ep_dir, man, executed_by):
     """B1：教师自采集是否越过成功线。True = 越过；False = 没越过（oracle 最大 x < 最远柱 x + 1.0）；None = 不适用。
 
     不适用（不跳，原样打包）：executed_by 不是 teacher（DAgger 学生自采，轨迹是学生的，不是教师示范）；带 waypoint 的任务
-    （成功判据是到点，不是过线）；缺 scene.json / pillars，或 oracle.jsonl 里没有有效的 pose_gt.x（没有依据，
-    不能按「没过线」丢整集）。成功线与 max_x 都取真值：最远柱 x（scene.json）与 oracle pose_gt.x（每步动作后的位姿）。
+    （成功判据是到点，不是过线）；缺 scene.json / pillars，或 oracle.jsonl 不存在/为空/不含 pose_gt.x（没有依据，
+    不能按「没过线」丢整集）。文件存在但 JSON 损坏或字段类型非法则直接 die 报错。
     """
     if executed_by != "teacher" or man.get("waypoint") is not None:
         return None
-    try:
-        with open(os.path.join(ep_dir, "scene.json"), encoding="utf-8") as f:
-            pillar_xs = [float(p["x"]) for p in json.load(f).get("pillars")]
-    except (OSError, ValueError, TypeError, KeyError, AttributeError):
-        return None
+    pillar_xs = _read_goal_pillar_xs(os.path.join(ep_dir, "scene.json"))
     if not pillar_xs:
         return None
-    max_x = None
-    try:
-        with open(os.path.join(ep_dir, man.get("oracle_ref") or "oracle.jsonl"), encoding="utf-8") as f:
-            for line in f:
-                if not line.strip():
-                    continue
-                x = (json.loads(line).get("pose_gt") or {}).get("x")
-                if x is not None and (max_x is None or float(x) > max_x):
-                    max_x = float(x)
-    except (OSError, ValueError, TypeError, AttributeError):
-        return None
+    max_x = _read_oracle_max_x(os.path.join(ep_dir, man.get("oracle_ref") or "oracle.jsonl"))
     if max_x is None:
         return None
     return max_x >= max(pillar_xs) + FAILED_TEACHER_GOAL_MARGIN_M
+
+
+def _read_actions_jsonl(actions_path):
+    """读取 actions.jsonl，返回 (rows, line_nos)；语法错误、非对象行或空文件报错并指明文件与行号。"""
+    try:
+        f = open(actions_path, encoding="utf-8")
+    except OSError as exc:
+        die("读取 %s 第 1 行失败：%s" % (actions_path, exc))
+    rows, line_nos = [], []
+    with f:
+        try:
+            for lineno, line in enumerate(f, 1):
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except ValueError as exc:
+                    die("%s 第 %d 行: JSON 解析失败（%s）" % (actions_path, lineno, exc))
+                if not isinstance(rec, dict):
+                    die("%s 第 %d 行: 必须是 JSON 对象（实际 %s）"
+                        % (actions_path, lineno, type(rec).__name__))
+                rows.append(rec)
+                line_nos.append(lineno)
+        except OSError as exc:
+            die("读取 %s 第 1 行失败：%s" % (actions_path, exc))
+    if not rows:
+        die("%s 第 1 行: actions.jsonl 为空" % actions_path)
+    return rows, line_nos
+
+
+def _require_action_int(val, actions_path, lineno, field, step):
+    if isinstance(val, bool) or not isinstance(val, int) or val not in range(len(ACTION_NAMES)):
+        die("%s 第 %d 行 (step %d): %s=%r 必须是 0..3 的整数"
+            % (actions_path, lineno, step, field, val))
+    return val
+
+
+def _cond_by_step(ordered_step_exec):
+    """按连续 step 段计算每步的 (prev_action, heading_code)。
+
+    源 actions.jsonl 步号连续时整集是一段（含后续被 --drop-collision / --drop-late-and-stall 丢掉的步）；
+    若源文件自身步号有缺口（step - 1 不在文件中），缺失步的真实执行动作未知，两种条件统一在缺口处断链重置为 0，
+    随后从该步起按新连续段调 nav_cond.heading_codes 重新累计。
+    """
+    out, seg = {}, []
+    for item in ordered_step_exec:
+        if seg and item[0] != seg[-1][0] + 1:
+            _fill_cond_segment(seg, out)
+            seg = []
+        seg.append(item)
+    if seg:
+        _fill_cond_segment(seg, out)
+    return out
+
+
+def _fill_cond_segment(seg, out):
+    execs = [ex for _, ex in seg]
+    for i, ((step, _), code) in enumerate(zip(seg, nav_cond.heading_codes(execs))):
+        out[step] = (0 if i == 0 else execs[i - 1], code)
 
 
 def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
@@ -292,14 +450,17 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
     src_h = int(camera.get("height") or 240)
 
     actions_path = os.path.join(ep_dir, man.get("actions_ref") or "actions.jsonl")
-    try:
-        with open(actions_path, encoding="utf-8") as f:
-            rows = [json.loads(line) for line in f if line.strip()]
-    except (OSError, ValueError) as exc:
-        die("读取 %s 失败：%s" % (actions_path, exc))
-    if not rows:
-        die("%s: actions.jsonl 为空" % ep_dir)
+    rows, line_nos = _read_actions_jsonl(actions_path)
+    expected = man.get("num_steps")
+    if isinstance(expected, int) and not isinstance(expected, bool) and len(rows) != expected:
+        die("%s 第 %d 行: actions.jsonl %d 行 != manifest num_steps %d（文件被截断？）"
+            % (actions_path, line_nos[-1], len(rows), expected))
+    if stats is not None:
+        stats.setdefault("input_split_episodes", {})[split] = (
+            stats.get("input_split_episodes", {}).get(split, 0) + 1)
     if exclude_collision_episodes and any(r.get("collision") is True for r in rows):
+        if stats is not None:
+            stats.setdefault("filtered_split_example", {}).setdefault(split, actions_path)
         return None
     if exclude_failed_teacher:
         crossed = teacher_crossed_goal(ep_dir, man, executed_by)
@@ -307,43 +468,35 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
             if stats is not None:
                 stats["failed_teacher_na"] = stats.get("failed_teacher_na", 0) + 1
         elif not crossed:
+            if stats is not None:
+                stats.setdefault("filtered_split_example", {}).setdefault(
+                    split, os.path.join(ep_dir, man.get("oracle_ref") or "oracle.jsonl"))
             return SKIP_FAILED_TEACHER
-    expected = man.get("num_steps")
-    if isinstance(expected, int) and len(rows) != expected:
-        die("%s: actions.jsonl %d 行 != manifest num_steps %d（文件被截断？）"
-            % (actions_path, len(rows), expected))
 
-    samples, seen = [], set()
-    dropped = 0
-    # prev-action 取上一步**执行**的动作（DAgger 数据里学生执行的 ≠ 教师标签；它要补偿的是
-    # 相机真实的自运动）；旧数据没有 action_executed 时退回 action_expert。
-    by_step = {}
-    for row in rows:
-        try:
-            by_step[int(row["step"])] = row
-        except (KeyError, TypeError, ValueError):
-            die("%s: action 行缺 step：%r" % (actions_path, row))
+    samples, dropped = [], 0
+    # 逐行直接校验自身 step / action_expert / action_executed（旧数据无 action_executed 键时退回 action_expert）。
+    by_step, parsed = {}, []
+    for row, lineno in zip(rows, line_nos):
+        raw_step = row.get("step")
+        if isinstance(raw_step, bool) or not isinstance(raw_step, int) or raw_step < 0:
+            die("%s 第 %d 行: step=%r 必须是非负整数" % (actions_path, lineno, raw_step))
+        step = raw_step
+        if step in by_step:
+            die("%s 第 %d 行: step %d 重复" % (actions_path, lineno, step))
+        if "action_expert" not in row:
+            die("%s 第 %d 行 (step %d): 缺 action_expert" % (actions_path, lineno, step))
+        action = _require_action_int(row["action_expert"], actions_path, lineno, "action_expert", step)
+        executed = (_require_action_int(row["action_executed"], actions_path, lineno, "action_executed", step)
+                    if "action_executed" in row else action)
+        by_step[step] = row
+        parsed.append((step, lineno, row, action, executed))
+
+    ordered = sorted(parsed, key=lambda item: item[0])
+    cond_at = _cond_by_step([(step, executed) for step, _, _, _, executed in ordered])
     depth_format = man.get("depth_format")
-    for row in sorted(rows, key=lambda r: int(r["step"])):
-        try:
-            step = int(row["step"])
-            action = int(row["action_expert"])
-        except (KeyError, TypeError, ValueError):
-            die("%s: action 行缺 step/action_expert：%r" % (actions_path, row))
-        if action not in range(len(ACTION_NAMES)):
-            die("%s step %d: action_expert=%d 超出 0..3" % (actions_path, step, action))
-        if step in seen:
-            die("%s: step %d 重复" % (actions_path, step))
-        seen.add(step)
+    for step, lineno, row, action, _executed in ordered:
         prev_row = by_step.get(step - 1)
-        prev_action = 0  # 首帧：没有上一步，按 SAFE_NEUTRAL
-        if prev_row is not None:
-            try:
-                prev_action = int(prev_row.get("action_executed", prev_row["action_expert"]))
-            except (KeyError, TypeError, ValueError):
-                die("%s step %d: 上一步缺 action_executed/action_expert" % (actions_path, step))
-            if prev_action not in range(len(ACTION_NAMES)):
-                die("%s step %d: 上一步动作 %d 超出 0..3" % (actions_path, step, prev_action))
+        prev_action, heading_code = cond_at[step]
         depth = row.get("depth_file")
         if depth is not None:
             if depth_format not in DEPTH_LOADERS:
@@ -356,21 +509,21 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
         # 必须是真正的 bool：bool("false") 是 True，字符串会让过滤彻底失效。
         collision = row.get("collision", False)
         if not isinstance(collision, bool):
-            die("%s step %d: collision 必须是 true/false（实际 %r）"
-                % (actions_path, step, collision))
+            die("%s 第 %d 行 (step %d): collision 必须是 true/false（实际 %r）"
+                % (actions_path, lineno, step, collision))
         if drop_collision and collision:
             dropped += 1
             continue
         if drop_late_and_stall:
             late = row.get("late_dispatch")
             if late is not None and not isinstance(late, bool):
-                die("%s step %d: late_dispatch 必须是 true/false/null（实际 %r）"
-                    % (actions_path, step, late))
+                die("%s 第 %d 行 (step %d): late_dispatch 必须是 true/false/null（实际 %r）"
+                    % (actions_path, lineno, step, late))
             obs_gap = row.get("obs_gap_s")
             if obs_gap is not None:
                 if isinstance(obs_gap, bool) or not isinstance(obs_gap, (int, float)) or not math.isfinite(obs_gap):
-                    die("%s step %d: obs_gap_s 必须是有限数值或 null（实际 %r）"
-                        % (actions_path, step, obs_gap))
+                    die("%s 第 %d 行 (step %d): obs_gap_s 必须是有限数值或 null（实际 %r）"
+                        % (actions_path, lineno, step, obs_gap))
             elif "obs_gap_s" not in row and prev_row is not None:
                 cur_ts, prev_ts = row.get("rgb_ts"), prev_row.get("rgb_ts")
                 if isinstance(cur_ts, int) and isinstance(prev_ts, int) and cur_ts > 0 and prev_ts > 0:
@@ -388,22 +541,13 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
             die("缺帧：%s（actions.jsonl 与 rgb_*.png 不同步）" % png)
         samples.append({"png": png, "label": action, "step": step,
                         "collision": collision, "prev_action": prev_action,
+                        "heading_code": heading_code,
                         "depth": depth, "depth_format": depth_format,
                         # 位姿只给 --depth-source analytic 用（缺也不在这里报错：file 路径不需要）
                         "pose_before": row.get("pose_before"), "yaw_before": row.get("yaw_before")})
 
-    # 航向码（--cond heading-code，任务卡 W1-9）：按集从头累计**已执行**动作的净转向数（含被 --drop-collision 丢掉的步：
-    # 机体照样转过了），每步取执行前的 n。末行的动作不影响任何码；非末行的坏值上面的主循环已经 die 过，所以转换失败按「非转向」处理。
-    ordered = sorted(rows, key=lambda r: int(r["step"]))
-
-    def executed_or_none(r):
-        try:
-            return int(r.get("action_executed", r["action_expert"]))
-        except (TypeError, ValueError):
-            return None
-    code_at = dict(zip((int(r["step"]) for r in ordered), nav_cond.heading_codes([executed_or_none(r) for r in ordered])))
-    for s in samples:
-        s["heading_code"] = code_at[s["step"]]
+    if not samples and stats is not None:
+        stats.setdefault("filtered_split_example", {}).setdefault(split, actions_path)
 
     return {
         "dir": os.path.abspath(ep_dir),
@@ -477,17 +621,35 @@ def _check_uniform_keys(episodes, allow_mixed=False, allow_mixed_dynamics=False)
                    else "；跨族合并实验请显式 --allow-mixed-geometry"))
 
 
+def _check_nonempty_splits(episodes, skip_stats, allow_empty_split):
+    """train / val 在输入中存在集目录但被整集或行级过滤清空时默认报错，防止训练退化或校准崩溃。"""
+    if allow_empty_split:
+        return
+    in_splits = skip_stats.get("input_split_episodes", {})
+    kept = {s: 0 for s in SPLITS}
+    for ep in episodes:
+        kept[ep["split"]] += ep["num_samples"]
+    examples = skip_stats.get("filtered_split_example", {})
+    for sp in ("train", "val"):
+        if in_splits.get(sp, 0) > 0 and kept[sp] == 0:
+            ex = examples.get(sp)
+            where = "%s 第 1 行: " % ex if ex else ""
+            die("%ssplit=%s 的 %d 个输入集被过滤跳空（剩余 0 个样本），"
+                "会导致训练退化或校准失败；确需放行请显式加 --allow-empty-split"
+                % (where, sp, in_splits[sp]))
+
+
 def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
          split_salt=None, allow_frozen=False, allow_diagnostic=False, allow_mixed=False,
          allow_mixed_dynamics=False, exclude_failed_teacher=False, skip_stats=None,
-         drop_late_and_stall=False):
+         drop_late_and_stall=False, allow_empty_split=False):
     """加载全部 episode 索引，并检查 scene_id 的 split 唯一性。
 
     返回值的 skipped 只数碰撞整集丢弃（--exclude-collision-episodes，含义不变）；--exclude-failed-teacher 的跳过数
     放进调用方给的 skip_stats["failed_teacher"]，不适用的集数放进 skip_stats["failed_teacher_na"]。
     """
     episodes, scene_split, gid_split, total, dropped = [], {}, {}, 0, 0
-    skipped = failed_teacher = 0
+    skipped = failed_teacher = emptied = 0
     if skip_stats is None:
         skip_stats = {}
     seen_dirs = set()
@@ -505,6 +667,10 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
             continue
         if ep is None:
             skipped += 1
+            continue
+        if not ep["samples"]:
+            dropped += ep["dropped"]
+            emptied += 1
             continue
         sid = ep["scene_id"]
         if sid in scene_split and scene_split[sid] != ep["split"]:
@@ -527,6 +693,9 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
         episodes.append(ep)
     if skipped:
         print("preprocess: 跳过整集 %d 个（--exclude-collision-episodes）" % skipped)
+    if emptied:
+        print("preprocess: 跳过整集 %d 个（行级过滤后剩余 0 步）" % emptied)
+    skip_stats["emptied_by_step_filter"] = emptied
     if exclude_failed_teacher:
         # 开关打开时跳过 0 集也打印：日志里没有这一行不能和「跳过 0 集」混为一谈。
         na = skip_stats.get("failed_teacher_na", 0)
@@ -536,6 +705,7 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
         skip_stats["failed_teacher"] = failed_teacher
     if total == 0:
         die("没有可写样本")
+    _check_nonempty_splits(episodes, skip_stats, allow_empty_split)
     _check_uniform_keys(episodes, allow_mixed, allow_mixed_dynamics)
     # L0：指令要么全有、要么全无。部分集有指令会让「文本是否可用」变成静默偏置。
     have = [bool(ep.get("instruction") and ep["instruction"].strip()) for ep in episodes]
@@ -1050,21 +1220,30 @@ def episode_focal_px(ep):
 # 对拍里若地面格或柱边缘格显示系统偏差，再把 roll/pitch 带进相机朝向。
 def _pillar_hit_t(ox, oy, oz, dx, dy, dz, p):
     """一根柱子的最近命中参数 t（射线 o + t·d，d 的前向分量为 1，所以 t 就是沿光轴的深度）；没命中 +inf，起点在柱内记 0。
-    方盒（scene.json 的 x/y/z 是中心，size 是边长）：三维 slab；圆柱（有 radius，forest 树干）：xy 圆 + 高度区间。
-    高度区间取 z ± size[2]/2：越过柱顶的射线命中不了。"""
+    方盒（scene.json 的 x/y/z 是中心，size 是边长）：三维 slab；圆柱（有 radius，forest 树干）：闭圆柱（侧面 + 顶底圆盘面）。
+    高度区间取 z ± size[2]/2：越过柱顶且未打到顶面的射线命中不了。"""
     zc, zh = float(p["z"]), float(p["size"][2]) / 2.0
     with np.errstate(divide="ignore", invalid="ignore"):
         if p.get("radius") is not None:
+            r2 = float(p["radius"]) ** 2
             rx, ry = ox - float(p["x"]), oy - float(p["y"])
+            inside_xy = (rx * rx + ry * ry) <= r2
+            inside = inside_xy & (oz >= zc - zh) & (oz <= zc + zh)
             a = dx * dx + dy * dy
             b = rx * dx + ry * dy
-            disc = b * b - a * (rx * rx + ry * ry - float(p["radius"]) ** 2)
-            ok = disc >= 0.0
-            root = np.sqrt(np.where(ok, disc, 0.0))
-            ok &= (-b + root) / a >= 0.0
-            t = np.maximum((-b - root) / a, 0.0)
-            z_hit = oz + dz * t
-            ok &= (z_hit >= zc - zh) & (z_hit <= zc + zh)
+            disc = b * b - a * (rx * rx + ry * ry - r2)
+            ok_side = (a > 0.0) & (disc >= 0.0)
+            root = np.sqrt(np.where(ok_side, disc, 0.0))
+            ok_side &= (-b + root) / a >= 0.0
+            t_side = np.maximum((-b - root) / a, 0.0)
+            z_hit = oz + dz * t_side
+            ok_side &= (z_hit >= zc - zh) & (z_hit <= zc + zh)
+            best = np.where(ok_side, t_side, np.inf)
+            for z_cap in (zc - zh, zc + zh):
+                t_cap = (z_cap - oz) / dz
+                ok_cap = (dz != 0.0) & (t_cap >= 0.0) & (((rx + dx * t_cap) ** 2 + (ry + dy * t_cap) ** 2) <= r2)
+                best = np.minimum(best, np.where(ok_cap, t_cap, np.inf))
+            return np.where(inside, 0.0, best)
         else:
             lo = np.full(dx.shape, -np.inf)
             hi = np.full(dx.shape, np.inf)
@@ -1254,6 +1433,8 @@ def main():
                         "< 最远柱 x + 1.0 m；带 waypoint / DAgger 学生自采 / 缺 scene.json 柱子或 oracle 的集不适用、不跳。"
                         "打开时 meta.collision_filter 多记 exclude_failed_teacher / failed_teacher_skipped / "
                         "failed_teacher_goal_margin_m（默认关，不加键）")
+    p.add_argument("--allow-empty-split", action="store_true",
+                   help="【诊断专用】允许输入中存在的 train 或 val 分区经整集/行级过滤后剩余 0 个样本（默认报错拒绝）")
     p.add_argument("--allow-frozen-geometry", action="store_true",
                    help="【诊断专用】允许冻结版本（如 campus.v1）打包；仍强制全包版本一致")
     p.add_argument("--split-by-map", metavar="SALT", default=None,
@@ -1293,7 +1474,8 @@ def main():
         args.split_by_map, args.allow_frozen_geometry, args.allow_diagnostic_split,
         args.allow_mixed_geometry, args.allow_mixed_dynamics,
         args.exclude_failed_teacher, skip_stats,
-        drop_late_and_stall=args.drop_late_and_stall)
+        drop_late_and_stall=args.drop_late_and_stall,
+        allow_empty_split=args.allow_empty_split)
     if args.cond == nav_cond.COND_HEADING_CODE:
         with_waypoint = [ep["dir"] for ep in episodes if ep.get("waypoint") is not None]
         if with_waypoint:

@@ -588,6 +588,46 @@ class PreprocessSplitTests(unittest.TestCase):
         self.assertIsNone(meta["split_salt"])
         self.assertEqual(meta["split_groups"], [])
 
+    def test_build_meta_directly_rejects_cross_split_geometry_gid(self):
+        """I2-9 第 2 点：绕过 load_episode 与 scan（如 airsim_to_uavr 直接构造 episode 字典调 write_dataset -> build_meta）
+        时，build_meta 自身的第三层几何隔离门必须拦住同 geometry_gid 跨 split，并报出独有文案「几何组 … 跨 split」。"""
+        sys.path.insert(0, str(REPO / "tools"))
+        import preprocess as pre
+
+        def fake_ep(eid, split, gid, start):
+            return {
+                "dir": "/fake/ep%d" % eid,
+                "episode_id": eid,
+                "scene_id": eid,
+                "seed": eid,
+                "version": "synthetic",
+                "split": split,
+                "geometry_gid": gid,
+                "geometry_version": sm.SPLIT_SALT,
+                "src_w": 320,
+                "src_h": 240,
+                "num_samples": 1,
+                "sample_start": start,
+                "samples": [{"label": 1, "collision": False}],
+            }
+
+        ok_meta = pre.build_meta(
+            [fake_ep(1, "train", "gid_train_only", 0), fake_ep(2, "val", "gid_val_only", 1)],
+            total=2, size=(160, 120))
+        self.assertEqual(ok_meta["split_groups"], [
+            {"geometry_gid": "gid_train_only", "split": "train"},
+            {"geometry_gid": "gid_val_only", "split": "val"},
+        ])
+
+        with self.assertRaises(SystemExit) as cm:
+            pre.build_meta(
+                [fake_ep(1, "train", "shared_gid_x", 0), fake_ep(2, "val", "shared_gid_x", 1)],
+                total=2, size=(160, 120))
+        msg = str(cm.exception)
+        self.assertIn("几何组 shared_gid_x 跨 split（train 与 val）", msg)
+        self.assertNotIn("同几何必须同 split", msg)
+        self.assertNotIn("按记录策略应属的 split", msg)
+
 
 if __name__ == "__main__":
     unittest.main()

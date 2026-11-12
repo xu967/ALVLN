@@ -165,6 +165,73 @@ class PreprocessCondTests(unittest.TestCase):
         self.assertEqual(r.returncode, 2)
         self.assertIn("--cond", r.stderr)
 
+    def test_invalid_action_executed_on_any_step_is_rejected_with_file_and_line(self):
+        # I2-6b / TEST 2e：无论跳号前的步（step=0,2 里的 step=0）还是集末步（step=5），
+        # 每行自身的 action_executed 都必须直接校验为 0..3 的整数，报错指明文件与行号。
+        ep1 = self.eps["ep1"]
+        act_path = ep1 / "actions.jsonl"
+        man_path = ep1 / "episode_manifest.json"
+        orig_man = json.loads(man_path.read_text(encoding="utf-8"))
+        orig_act = act_path.read_text(encoding="utf-8")
+
+        # 1) 跳号步 step = 0, 2 且 step=0 的 action_executed 非法
+        man = dict(orig_man, num_steps=2, instruction=None)
+        man_path.write_text(json.dumps(man), encoding="utf-8")
+        for bad in ("BAD_STR", 99, -1, True, None, 1.5):
+            act_path.write_text(
+                json.dumps({"step": 0, "action_expert": 1, "action_executed": bad, "collision": False}) + "\n" +
+                json.dumps({"step": 2, "action_expert": 1, "action_executed": 2, "collision": False}) + "\n",
+                encoding="utf-8",
+            )
+            for flags in (("--cond", "heading-code"), ("--cond", "prev-action")):
+                _, r = self.pack("bad_gap", *flags, eps=[ep1], check=False)
+                self.assertNotEqual(r.returncode, 0, (bad, flags))
+                self.assertIn(str(act_path), r.stderr)
+                self.assertIn("第 1 行", r.stderr)
+                self.assertIn("action_executed", r.stderr)
+
+        # 2) 连续步集末行（第 6 行，step=5）的 action_executed 非法：旧代码因无人查 step=5 作为上一步而漏检
+        man_path.write_text(json.dumps(orig_man), encoding="utf-8")
+        rows = [json.loads(ln) for ln in orig_act.splitlines() if ln.strip()]
+        for bad in ("BAD_LAST", 99, True):
+            bad_rows = [dict(x) for x in rows]
+            bad_rows[-1]["action_executed"] = bad
+            act_path.write_text("".join(json.dumps(x) + "\n" for x in bad_rows), encoding="utf-8")
+            for flags in (("--cond", "prev-action"), ("--cond", "heading-code")):
+                _, r = self.pack("bad_last", *flags, check=False)
+                self.assertNotEqual(r.returncode, 0, (bad, flags))
+                self.assertIn(str(act_path), r.stderr)
+                self.assertIn("第 6 行", r.stderr)
+
+    def test_step_gaps_in_source_actions_jsonl_reset_both_conditions_uniformly(self):
+        # I2-6b：输入 actions.jsonl 自身步号有缺口（缺 step=2，只存 step=0,1,3,4,5）时，
+        # 两种条件统一在缺口处断链重置为 0，随后在新连续段内重新传递/累计。
+        from PIL import Image
+        import numpy as np
+
+        ep1 = self.eps["ep1"]
+        man_path = ep1 / "episode_manifest.json"
+        man = json.loads(man_path.read_text(encoding="utf-8"))
+        man["num_steps"] = 5
+        man_path.write_text(json.dumps(man), encoding="utf-8")
+        # 补一张 rgb_00005.png（原 ep1 有 0..5 共 6 张图，已齐）
+        assert (ep1 / "rgb_00005.png").is_file()
+        steps_exec = [(0, L), (1, L), (3, L), (4, L), (5, F)]
+        rows = [{"step": st, "timestamp_ns": 1_000_000_000 + 100_000_000 * st,
+                 "action_expert": F, "action_executed": ex, "collision": False}
+                for st, ex in steps_exec]
+        (ep1 / "actions.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+        out_pa, _ = self.pack("gap_pa", "--cond", "prev-action")
+        out_hc, _ = self.pack("gap_hc", "--cond", "heading-code")
+        idx_pa, col_pa = read_aux(out_pa / "dataset.aux")
+        idx_hc, col_hc = read_aux(out_hc / "dataset.aux")
+        self.assertEqual(idx_pa[:5], [0, 0, 2, 2, 3])
+        self.assertEqual(idx_hc[:5], [0, 0, 2, 2, 3])
+        # 段 1 (step 0,1): prev=[0, L], hc=[0, 0]；缺口后段 2 (step 3,4,5): prev=[0, L, L], hc=[0, 0, 2]
+        self.assertEqual(self.per_episode(out_pa, col_pa)["ep1"], [0, L, 0, L, L])
+        self.assertEqual(self.per_episode(out_hc, col_hc)["ep1"], [0, 0, 0, 0, 2])
+
 
 if __name__ == "__main__":
     unittest.main()
