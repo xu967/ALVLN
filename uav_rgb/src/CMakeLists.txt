@@ -236,3 +236,42 @@ add_executable(test_train_cli tests/test_train_cli.cpp)
 target_link_libraries(test_train_cli PRIVATE uavrgb_core)
 add_dependencies(test_train_cli uavrgb_train)
 add_test(NAME test_train_cli COMMAND test_train_cli $<TARGET_FILE:uavrgb_train>)
+
+# D3：warmup、余弦退火与 AdamW 解耦衰减的手算数值测试（卡 C1a）。
+add_executable(test_lr_adamw tests/test_lr_adamw.cpp)
+target_link_libraries(test_lr_adamw PRIVATE uavrgb_core CUDA::cudart)
+add_test(NAME test_lr_adamw COMMAND test_lr_adamw)
+
+# H8：增强随机数种子随 --seed 变化且 resume 继承后同步重播（卡 C1a）。
+add_executable(test_augment_seed tests/test_augment_seed.cpp)
+target_link_libraries(test_augment_seed PRIVATE uavrgb_core)
+add_test(NAME test_augment_seed COMMAND test_augment_seed)
+
+# H9/D2：--log-grad-norm 每轮裁剪前梯度范数的中位数、最大值与裁剪步数占比（卡 C1a）。
+add_executable(test_log_grad_norm tests/test_log_grad_norm.cpp)
+target_link_libraries(test_log_grad_norm PRIVATE uavrgb_core)
+add_dependencies(test_log_grad_norm uavrgb_train)
+add_test(NAME test_log_grad_norm COMMAND test_log_grad_norm $<TARGET_FILE:uavrgb_train>)
+
+# D6：续训时继承源 run 的 --max-grad-norm 且显式传参可覆盖（卡 C1a）。
+add_executable(test_resume_grad_norm tests/test_resume_grad_norm.cpp)
+target_link_libraries(test_resume_grad_norm PRIVATE uavrgb_core)
+add_dependencies(test_resume_grad_norm uavrgb_train)
+add_test(NAME test_resume_grad_norm COMMAND test_resume_grad_norm $<TARGET_FILE:uavrgb_train>)
+
+# C6：--eval-only 从 config.json 或 ckpt 契约读取碰撞过滤口径，缺记录或冲突时拒绝（卡 C1a）。
+add_executable(test_eval_only_drop_collision tests/test_eval_only_drop_collision.cpp)
+target_link_libraries(test_eval_only_drop_collision PRIVATE uavrgb_core)
+add_dependencies(test_eval_only_drop_collision uavrgb_train)
+add_test(NAME test_eval_only_drop_collision COMMAND test_eval_only_drop_collision $<TARGET_FILE:uavrgb_train>)
+
+# D9：卷积反传 conv2d_backward / conv2d_backward_cuda 的输入梯度 dx 有限差分检查（卡 C1a）。
+add_executable(test_conv_dx_gradcheck tests/test_conv_dx_gradcheck.cpp)
+target_link_libraries(test_conv_dx_gradcheck PRIVATE uavrgb_core)
+add_test(NAME test_conv_dx_gradcheck COMMAND test_conv_dx_gradcheck)
+
+# 第 7 条：--cuda-blocking-sync / UAVRGB_CUDA_BLOCKING_SYNC=1 降低自旋 CPU 占用且数值逐位不变（卡 C1a）。
+add_executable(test_cuda_blocking_sync tests/test_cuda_blocking_sync.cpp)
+target_link_libraries(test_cuda_blocking_sync PRIVATE uavrgb_core)
+add_dependencies(test_cuda_blocking_sync uavrgb_train)
+add_test(NAME test_cuda_blocking_sync COMMAND test_cuda_blocking_sync $<TARGET_FILE:uavrgb_train>)

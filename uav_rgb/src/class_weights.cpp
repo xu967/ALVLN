@@ -180,6 +180,8 @@ bool read_run_config(const std::string& run_dir, RunConfigSnapshot* out) {
   if (out->has_weight_decay) out->weight_decay = num("weight_decay", to_f);
   out->has_label_smoothing = !str("label_smoothing").empty();
   if (out->has_label_smoothing) out->label_smoothing = num("label_smoothing", to_f);
+  out->has_max_grad_norm = !str("max_grad_norm").empty();
+  if (out->has_max_grad_norm) out->max_grad_norm = num("max_grad_norm", to_f);
   return true;
 }
 

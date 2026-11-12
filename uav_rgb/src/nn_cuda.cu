@@ -317,4 +317,8 @@ float clip_grad_norm_cuda(std::vector<Tensor*> grads, float max_norm) {
   return coef;
 }
 
+void enable_cuda_blocking_sync() {
+  CUDA_CHECK(cudaSetDeviceFlags(cudaDeviceScheduleBlockingSync));
+}
+
 }  // namespace uavrgb

@@ -4,6 +4,7 @@
 #include "trainer_internal.hpp"
 #include "uavrgb/eval_metrics.hpp"
 #include "uavrgb/nn.hpp"
+#include "uavrgb/run_owner.hpp"
 #include "uavrgb/softmax_cuda.hpp"
 
 #include <algorithm>
@@ -13,6 +14,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -158,6 +160,77 @@ void Trainer::eval_only(const std::string& ckpt_path, bool eval_val, bool eval_t
   };
   if (eval_val) emit(ds.val_idx, Split::kVal, "val");
   if (eval_test) emit(ds.test_idx, Split::kTest, "test");
+}
+
+int run_eval_only_cli(TrainConfig& cfg, const std::string& eval_ckpt,
+                      const std::string& eval_split) {
+  // --out 是别的已完成 run 目录（有 config.json，而 ckpt 不在其中）时拒绝：
+  // 否则另一模型的 validation 事件会被追加进那个 run 的 metrics.jsonl，事后分不出来。
+  if (std::filesystem::exists(std::filesystem::path(cfg.out_dir) / "config.json") &&
+      !same_run_dir(cfg.out_dir, eval_ckpt)) {
+    std::fprintf(stderr,
+                 "eval-only: %s 已是另一个 run 的目录（有 config.json），而 %s 不在其中；"
+                 "请 --out 指向 ckpt 自己的 run 目录或一个新目录\n",
+                 cfg.out_dir.c_str(), eval_ckpt.c_str());
+    return 2;
+  }
+  // 输出目录通常就是训练 run-dir（非空），允许在已有产物上追加评估事件；
+  // 仍用 RunOwner 防止与正在写同一目录的训练并发。
+  std::optional<RunOwner> eval_owner;
+  try {
+    eval_owner.emplace(cfg.out_dir, true);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "%s\n", e.what());
+    return 2;
+  }
+  try {
+    // 碰撞过滤是数据身份的一部分：优先读同目录 config.json 与 checkpoint v5 训练契约；
+    // 两处都无记录或互相矛盾时直接拒绝，不再静默回落到命令行缺省 false（C6）。
+    // 放在 try 里：config.json / ckpt 损坏时抛异常走 rc=1，不能 abort。
+    const std::filesystem::path ckpt_dir =
+        std::filesystem::path(eval_ckpt).parent_path().empty()
+            ? std::filesystem::path(".")
+            : std::filesystem::path(eval_ckpt).parent_path();
+    const CheckpointMeta ck_meta = read_checkpoint_meta(eval_ckpt);
+    RunConfigSnapshot snap;
+    const bool has_cfg = read_run_config(ckpt_dir.string(), &snap) && snap.has_drop_collision;
+    const bool has_ck = ck_meta.has_drop_collision;
+    if (has_cfg && has_ck && snap.drop_collision != ck_meta.drop_collision) {
+      std::fprintf(stderr,
+                   "eval-only: %s/config.json 的 drop_collision(%s) 与 checkpoint 契约(%s) 矛盾\n",
+                   ckpt_dir.string().c_str(), snap.drop_collision ? "true" : "false",
+                   ck_meta.drop_collision ? "true" : "false");
+      return 2;
+    }
+    if (!has_cfg && !has_ck) {
+      std::fprintf(stderr,
+                   "eval-only: %s 无含 drop_collision 的 config.json，且 checkpoint 无训练契约，"
+                   "拒绝静默回落\n",
+                   ckpt_dir.string().c_str());
+      return 2;
+    }
+    const bool trained_drop = has_cfg ? snap.drop_collision : ck_meta.drop_collision;
+    if (cfg.drop_collision_set && cfg.drop_collision != trained_drop) {
+      std::fprintf(stderr,
+                   "eval-only: --drop-collision 与训练记录不一致（训练 %s）；"
+                   "碰撞步去留不同会让指标不可比\n",
+                   trained_drop ? "true" : "false");
+      return 2;
+    }
+    cfg.drop_collision = trained_drop;
+    Trainer tr(cfg);
+    tr.eval_only(eval_ckpt, eval_split != "test", eval_split != "val");
+    // test 评估单独留痕：查询次数/日期/数据身份，不改历史 metrics。
+    // 数据集 SHA 由 eval_only 加载时算好（config().dataset_sha256），这里不再读一遍。
+    if (eval_split != "val") {
+      append_test_eval_record(cfg.out_dir, "eval_only", eval_ckpt, cfg.data_path,
+                              tr.config().dataset_sha256, cfg.drop_collision, 0);
+    }
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "评估失败: %s\n", e.what());
+    return 1;
+  }
+  return 0;
 }
 
 }  // namespace uavrgb

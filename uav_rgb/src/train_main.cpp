@@ -9,6 +9,7 @@
 // eval-only 只向 metrics.jsonl 追加 validation 事件，不写 results.csv、不更新权重。
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <optional>
@@ -30,7 +31,7 @@ void usage() {
                "[--allow-resume-mismatch] [--strict-distill] "
                "[--augment all|photo,shift,flip] [--warmup N] [--cosine-lr] [--weight-decay W] [--label-smoothing E]\n"
                "       [--two-frame] [--prev-action] [--depth-aux [--aux-lambda L]]  （需要 dataset.aux 侧车）\n"
-               "       [--save-every-epoch]  （每轮另存 <run_dir>/ckpt_epNN.bin）\n"
+               "       [--save-every-epoch] [--log-grad-norm] [--cuda-blocking-sync]\n"
                "  或: uavrgb_train --data <dataset.uavr> --eval-only <ckpt> --out "
                "<run_dir> [--batch B] [--split val|test|all] [--drop-collision]\n");
 }
@@ -41,6 +42,7 @@ int main(int argc, char** argv) {
   uavrgb::TrainConfig cfg;
   std::string eval_ckpt;
   std::string eval_split = "all";
+  bool cuda_blocking_sync = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&](const char* name) -> std::string {
@@ -75,6 +77,7 @@ int main(int argc, char** argv) {
         cfg.seed_set = true;
       } else if (a == "--max-grad-norm") {
         cfg.max_grad_norm = std::stof(next("--max-grad-norm"));
+        cfg.max_grad_norm_set = true;
       } else if (a == "--class-weights") {
         cfg.class_weights = next("--class-weights");
       } else if (a == "--drop-collision") {
@@ -142,6 +145,10 @@ int main(int argc, char** argv) {
         cfg.aux_lambda_set = true;
       } else if (a == "--save-every-epoch") {
         cfg.save_every_epoch = true;
+      } else if (a == "--log-grad-norm") {
+        cfg.log_grad_norm = true;
+      } else if (a == "--cuda-blocking-sync") {
+        cuda_blocking_sync = true;
       } else if (a == "--eval-only") {
         eval_ckpt = next("--eval-only");
       } else if (a == "--split") {
@@ -160,9 +167,26 @@ int main(int argc, char** argv) {
       return 2;
     }
   }
+  if (const char* env_bs = std::getenv("UAVRGB_CUDA_BLOCKING_SYNC")) {
+    const std::string v(env_bs);
+    if (v == "1") {
+      cuda_blocking_sync = true;
+    } else if (!v.empty() && v != "0") {
+      std::fprintf(stderr, "UAVRGB_CUDA_BLOCKING_SYNC 只接受 0 或 1（当前 '%s'）\n", env_bs);
+      return 2;
+    }
+  }
   if (cfg.data_path.empty() || cfg.out_dir.empty()) {
     usage();
     return 2;
+  }
+  if (cuda_blocking_sync) {
+    try {
+      uavrgb::enable_cuda_blocking_sync();
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "%s\n", e.what());
+      return 1;
+    }
   }
   if (!eval_ckpt.empty()) {
     if (cfg.batch <= 0) {
@@ -174,61 +198,7 @@ int main(int argc, char** argv) {
       usage();
       return 2;
     }
-    // --out 是别的已完成 run 目录（有 config.json，而 ckpt 不在其中）时拒绝：
-    // 否则另一模型的 validation 事件会被追加进那个 run 的 metrics.jsonl，事后分不出来。
-    if (std::filesystem::exists(std::filesystem::path(cfg.out_dir) / "config.json") &&
-        !uavrgb::same_run_dir(cfg.out_dir, eval_ckpt)) {
-      std::fprintf(stderr,
-                   "eval-only: %s 已是另一个 run 的目录（有 config.json），而 %s 不在其中；"
-                   "请 --out 指向 ckpt 自己的 run 目录或一个新目录\n",
-                   cfg.out_dir.c_str(), eval_ckpt.c_str());
-      return 2;
-    }
-    // 输出目录通常就是训练 run-dir（非空），允许在已有产物上追加评估事件；
-    // 仍用 RunOwner 防止与正在写同一目录的训练并发。
-    std::optional<uavrgb::RunOwner> eval_owner;
-    try {
-      eval_owner.emplace(cfg.out_dir, true);
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "%s\n", e.what());
-      return 2;
-    }
-    try {
-      // 碰撞过滤是数据身份的一部分：eval-only 默认继承训练 run 的 drop_collision，
-      // 显式传入但与训练 config 不一致时拒绝（否则同权重同数据的指标对不上）。
-      // 放在 try 里：config.json 字段损坏时 read_run_config 的 stof/stoi 会抛，不能 abort。
-      const std::filesystem::path ckpt_dir =
-          std::filesystem::path(eval_ckpt).parent_path().empty()
-              ? std::filesystem::path(".")
-              : std::filesystem::path(eval_ckpt).parent_path();
-      uavrgb::RunConfigSnapshot snap;
-      if (uavrgb::read_run_config(ckpt_dir.string(), &snap) && snap.has_drop_collision) {
-        if (cfg.drop_collision_set && cfg.drop_collision != snap.drop_collision) {
-          std::fprintf(stderr,
-                       "eval-only: --drop-collision 与训练 config 不一致（训练 %s）；"
-                       "碰撞步去留不同会让指标不可比\n",
-                       snap.drop_collision ? "true" : "false");
-          return 2;
-        }
-        cfg.drop_collision = snap.drop_collision;
-      } else {
-        std::fprintf(stderr,
-                     "警告: %s 的 config 无 drop_collision，无法继承（按命令行值）\n",
-                     ckpt_dir.string().c_str());
-      }
-      uavrgb::Trainer tr(cfg);
-      tr.eval_only(eval_ckpt, eval_split != "test", eval_split != "val");
-      // test 评估单独留痕：查询次数/日期/数据身份，不改历史 metrics。
-      // 数据集 SHA 由 eval_only 加载时算好（config().dataset_sha256），这里不再读一遍。
-      if (eval_split != "val") {
-        uavrgb::append_test_eval_record(cfg.out_dir, "eval_only", eval_ckpt, cfg.data_path,
-                                        tr.config().dataset_sha256, cfg.drop_collision, 0);
-      }
-    } catch (const std::exception& e) {
-      std::fprintf(stderr, "评估失败: %s\n", e.what());
-      return 1;
-    }
-    return 0;
+    return uavrgb::run_eval_only_cli(cfg, eval_ckpt, eval_split);
   }
   // max_grad_norm=0 会把所有梯度按 0 缩放，训练照跑但模型完全不动，必须挡在入口。
   if (!(cfg.max_grad_norm > 0.0f)) {

@@ -245,8 +245,15 @@ void merge_resume_config(TrainConfig* cfg) {
   if (!cfg->label_smoothing_set && snap.has_label_smoothing) {
     cfg->label_smoothing = snap.label_smoothing;
   }
+  if (!cfg->max_grad_norm_set && snap.has_max_grad_norm) {
+    cfg->max_grad_norm = snap.max_grad_norm;
+  }
   if (!(std::isfinite(cfg->lr) && cfg->lr > 0.0f && cfg->lr <= 1.0f)) {
     throw std::invalid_argument("resume: 源 config 的 lr 非法（" + num(cfg->lr) + "）");
+  }
+  if (!(std::isfinite(cfg->max_grad_norm) && cfg->max_grad_norm > 0.0f)) {
+    throw std::invalid_argument("resume: 源 config 的 max_grad_norm 非法（" +
+                                num(cfg->max_grad_norm) + "）");
   }
   if (cfg->batch <= 0) throw std::invalid_argument("resume: 源 config 的 batch 非法");
 }
@@ -505,6 +512,8 @@ void Trainer::run() {
   check_out(metrics, "metrics.jsonl");
 
   std::mt19937 rng(cfg_.seed);
+  // 续训在 merge_resume_config 后才拿到继承的 seed，增强流必须按最终生效的 seed 重新播种。
+  aug_rng_.seed(cfg_.seed ^ 0x9e3779b9u);
   std::vector<std::uint32_t> order = ds.train_idx;
   const Clock::time_point t0 = Clock::now();
   const int epoch_base = state_.epoch;  // 续训时 results.csv 接着编号
@@ -514,7 +523,9 @@ void Trainer::run() {
   for (int ep = 1; ep <= cfg_.epochs; ++ep) {
     std::shuffle(order.begin(), order.end(), rng);
     double ce_sum = 0.0, aux_ce_sum = 0.0;
-    std::uint64_t seen = 0, aux_valid = 0, aux_correct = 0;
+    std::uint64_t seen = 0, aux_valid = 0, aux_correct = 0, grad_clipped = 0;
+    std::vector<float> grad_norms;
+    if (cfg_.log_grad_norm) grad_norms.reserve(per_epoch);
     for (std::size_t s = 0; s < order.size(); s += bs) {
       const std::size_t e = std::min(order.size(), s + bs);
       const std::vector<std::uint32_t> part = detail::slice(order, s, e);
@@ -552,7 +563,12 @@ void Trainer::run() {
         aux_valid += a.valid;
         aux_correct += a.correct;
       }
-      dev_->backward_step(dlogits, cfg_.max_grad_norm, state_, cfg_.weight_decay);
+      const float grad_norm =
+          dev_->backward_step(dlogits, cfg_.max_grad_norm, state_, cfg_.weight_decay);
+      if (cfg_.log_grad_norm) {
+        grad_norms.push_back(grad_norm);
+        if (cfg_.max_grad_norm / (grad_norm + 1e-6f) < 1.0f) ++grad_clipped;
+      }
 
       ++step;
       const double elapsed = since(t0);
@@ -619,6 +635,20 @@ void Trainer::run() {
               << '\n';
     }
     std::printf("\n");
+    if (cfg_.log_grad_norm && !grad_norms.empty()) {
+      std::sort(grad_norms.begin(), grad_norms.end());
+      const std::size_t gn_n = grad_norms.size();
+      const double gn_med =
+          (gn_n % 2 == 1) ? static_cast<double>(grad_norms[gn_n / 2])
+                          : 0.5 * (static_cast<double>(grad_norms[gn_n / 2 - 1]) +
+                                   static_cast<double>(grad_norms[gn_n / 2]));
+      const double clip_frac = static_cast<double>(grad_clipped) / static_cast<double>(gn_n);
+      metrics << metrics_json(make_status("grad_norm epoch " + std::to_string(state_.epoch) +
+                                          ": median=" + num(gn_med) +
+                                          " max=" + num(grad_norms.back()) +
+                                          " clip_frac=" + num(clip_frac)))
+              << '\n';
+    }
     if (!class_weights_.empty()) {
       metrics << metrics_json(make_class_weights(static_cast<std::uint32_t>(state_.epoch), step,
                                                  class_weights_, class_weights_source_))

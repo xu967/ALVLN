@@ -72,6 +72,8 @@ struct CheckpointMeta {
   int text_dim = 0;  // 0 = 无文本分支（推理端据此决定要不要读 --text）
   int aux_classes = 0;  // v6：深度分带辅助头类别数（0 = 无；推理端不算它）
   int prev_dim = 0;     // v6：prev-action one-hot 维度（0 = 无；>0 时每帧多读 1 字节）
+  bool has_drop_collision = false;  // v5+ 非全零训练契约在场时为 true
+  bool drop_collision = false;      // v5+ 训练契约记录的碰撞过滤口径
 };
 CheckpointMeta read_checkpoint_meta(const std::string& path);
 

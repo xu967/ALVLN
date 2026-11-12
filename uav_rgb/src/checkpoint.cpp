@@ -15,7 +15,6 @@ namespace {
 constexpr char kMagic[8] = {'U', 'A', 'V', 'R', 'C', 'K', '0', '1'};
 constexpr std::uint32_t kVersion = 6;     // v6 追加 aux_classes / prev_dim（STUDENT-P2）
 constexpr std::uint32_t kMinVersion = 2;  // v2 没有 best_macro_f1，读回 -1
-constexpr std::streamoff kContractBytes = 113;  // v5 训练契约定长段
 
 [[noreturn]] void bad(const std::string& msg) {
   throw std::invalid_argument("checkpoint: " + msg);
@@ -129,6 +128,24 @@ std::int32_t read_text_dim(std::ifstream& f, std::uint32_t version) {
   return text_dim;
 }
 
+// 读 v5 定长 113 B 训练契约；返回该契约是否由真实训练填写（非测试直接写出的全零占位）。
+bool read_v5_contract(std::ifstream& f, CheckpointContract& c) {
+  get_sha(f, c.dataset_sha256, "dataset_sha256");
+  std::uint8_t flags = 0;
+  get<std::uint8_t>(f, flags, "contract_flags");
+  c.drop_collision = (flags & 1u) != 0;
+  get_sha(f, c.soft_targets_sha256, "soft_targets_sha256");
+  get<float>(f, c.distill_alpha, "distill_alpha");
+  get<float>(f, c.lr, "contract_lr");
+  std::uint32_t seed = 0;
+  get<std::uint32_t>(f, seed, "contract_seed");
+  c.seed = static_cast<unsigned>(seed);
+  get<std::int32_t>(f, c.batch, "contract_batch");
+  get_sha(f, c.split_scheme_sha256, "split_scheme_sha256");
+  if (!std::isfinite(c.distill_alpha) || !std::isfinite(c.lr)) bad("训练契约含非有限值");
+  return !(c.lr == 0.0f && c.batch == 0 && c.dataset_sha256 == Sha256{});
+}
+
 }  // namespace
 
 TrainState make_train_state(const CnnModel& model, float lr) {
@@ -215,9 +232,15 @@ CheckpointMeta read_checkpoint_meta(const std::string& path) {
     get<float>(f, best, "best_macro_f1");
   }
   const std::int32_t text_dim = read_text_dim(f, h.version);
-  if (h.version >= 5) f.seekg(kContractBytes, std::ios::cur);  // 契约对结构没有信息
+  bool has_drop = false, drop = false;
+  if (h.version >= 5) {
+    CheckpointContract c;
+    has_drop = read_v5_contract(f, c);
+    drop = c.drop_collision;
+  }
   const V6Fields v6 = read_v6(f, h.version);
-  return {h.in_h, h.in_w, h.in_c, h.num_classes, text_dim, v6.aux_classes, v6.prev_dim};
+  return {h.in_h, h.in_w, h.in_c, h.num_classes, text_dim, v6.aux_classes, v6.prev_dim,
+          has_drop, drop};
 }
 
 void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
@@ -261,20 +284,7 @@ void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
         std::to_string(model.text_dim) + "）");
   }
   if (version >= 5) {
-    CheckpointContract& c = st.contract;
-    get_sha(f, c.dataset_sha256, "dataset_sha256");
-    std::uint8_t flags = 0;
-    get<std::uint8_t>(f, flags, "contract_flags");
-    c.drop_collision = (flags & 1u) != 0;
-    get_sha(f, c.soft_targets_sha256, "soft_targets_sha256");
-    get<float>(f, c.distill_alpha, "distill_alpha");
-    get<float>(f, c.lr, "contract_lr");
-    std::uint32_t seed = 0;
-    get<std::uint32_t>(f, seed, "contract_seed");
-    c.seed = static_cast<unsigned>(seed);
-    get<std::int32_t>(f, c.batch, "contract_batch");
-    get_sha(f, c.split_scheme_sha256, "split_scheme_sha256");
-    if (!std::isfinite(c.distill_alpha) || !std::isfinite(c.lr)) bad("训练契约含非有限值");
+    (void)read_v5_contract(f, st.contract);
     st.contract_present = true;
   }
   const V6Fields v6 = read_v6(f, version);

@@ -42,6 +42,7 @@ struct TrainConfig {
   float distill_alpha = 0.5f;  // 软标签项权重；0 = 退化为纯硬标签
   // CLI 是否显式给出：resume 时只有未显式给出的项才从源 run 的 config.json 继承。
   bool lr_set = false;
+  bool max_grad_norm_set = false;
   bool batch_set = false;
   bool seed_set = false;
   bool drop_collision_set = false;
@@ -74,6 +75,8 @@ struct TrainConfig {
   // 选模研究要对每一轮做离线探针/闭环（DISTILL §2.4：ckpt_best 是噪声序列上的最大值），
   // 默认关：30 轮 × 1.2 MB 对流水线 run 是多余的。
   bool save_every_epoch = false;
+  // 每轮把裁剪前全局梯度范数的中位数、最大值与触发裁剪的步数占比写进 metrics.jsonl（默认关）。
+  bool log_grad_norm = false;
   // 以下由 trainer 在 run() 里按实际数据/环境补齐，再落进 config.json。
   std::string dataset_sha256, split_scheme, window_from, hold_s;
   std::string soft_targets_sha256, teacher_ckpt_sha256, teacher_select_split, source_git;
@@ -99,11 +102,11 @@ struct RunConfigSnapshot {
   bool two_frame = false, prev_action = false, depth_aux = false;
   float aux_lambda = 0.0f;
   bool has_augment = false, has_warmup_steps = false, has_cosine_lr = false,
-       has_weight_decay = false, has_label_smoothing = false;
+       has_weight_decay = false, has_label_smoothing = false, has_max_grad_norm = false;
   std::string augment;
   int warmup_steps = 0;
   bool cosine_lr = false;
-  float weight_decay = 0.0f, label_smoothing = 0.0f;
+  float weight_decay = 0.0f, label_smoothing = 0.0f, max_grad_norm = 0.0f;
 };
 bool read_run_config(const std::string& run_dir, RunConfigSnapshot* out);
 
@@ -116,6 +119,13 @@ void append_test_eval_record(const std::string& out_dir, const std::string& orig
                              const std::string& ckpt_path, const std::string& data_path,
                              const std::string& dataset_sha256, bool drop_collision,
                              std::size_t samples);
+
+// uavrgb_train --eval-only 的执行体（目录归属检查、RunOwner、碰撞过滤继承、评估与 test 留痕）。
+int run_eval_only_cli(TrainConfig& cfg, const std::string& eval_ckpt,
+                      const std::string& eval_split);
+
+// 在首次创建 CUDA 上下文前启用阻塞式同步（cudaDeviceScheduleBlockingSync），避免等待 GPU 时自旋占核。
+void enable_cuda_blocking_sync();
 
 // 一条 MetricsEvent 的 JSON 序列化（单行、无换行）。字段名与 event.hpp 一致。
 std::string metrics_json(const MetricsEvent& e);
@@ -137,7 +147,8 @@ struct EvalStats {
 
 class Trainer {
  public:
-  explicit Trainer(TrainConfig cfg) : cfg_(std::move(cfg)) {}
+  explicit Trainer(TrainConfig cfg)
+      : cfg_(std::move(cfg)), aug_rng_(cfg_.seed ^ 0x9e3779b9u) {}
 
   void run();
 
@@ -184,7 +195,7 @@ class Trainer {
   std::unique_ptr<DeviceCnn> dev_;    // 权重/Adam/激活常驻显存；存 checkpoint 前 download
   std::vector<std::uint8_t> u8_batch_;  // forward_batch 复用的像素缓冲
   std::vector<std::uint8_t> depth_batch_;  // 最近一批的深度分带目标（已按翻转镜像）
-  std::mt19937 aug_rng_{0x9e3779b9u};   // 增强专用，与打乱顺序的 rng 分开，A/B 时样本顺序不变
+  std::mt19937 aug_rng_{0x9e3779b9u};   // 增强专用：按 cfg_.seed ^ 0x9e3779b9u 播种，与初始化/打乱流解耦
   std::vector<float> class_weights_;          // 最终生效权重（同时写进 state_/checkpoint）
   std::string class_weights_source_ = "none";  // "none"/"auto"/"explicit"/"checkpoint"
   std::vector<float> soft_targets_;  // [n*C]；空 = 不蒸馏
