@@ -16,7 +16,14 @@ import time
 from pathlib import Path
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "config" / "uart_protocol.example.json"
-FIELD_KINDS = {"const", "seq", "action", "heartbeat", "ttl", "crc"}
+FIELD_KINDS = {"const", "seq", "action", "heartbeat", "ttl", "duration", "crc"}
+MAX_LINE_BYTES = 256  # 动作行仅含单个数字与空白；限制无换行残行长度，防异常上游耗尽板端内存
+SAFE_NEUTRAL = 0
+MAX_SPAN_MS = 0x7FFFFFFF  # 接收端（uart_codec.py）用 uint32 毫秒时钟做回绕比较，单个 ttl、duration 跨度不得超过 2^31 - 1
+# 上游静默超时默认值（占位）：动作窗口 hold 1000 ms 加 200 ms 推理/调度余量；0 表示关闭上游超时检查。
+# 对照：采集端停顿步门限是名义步周期 900 ms 加 200 ms = 1100 ms（sim/tools/collect.py），两者差 100 ms，是否对齐待主会话定；
+# 接收端按帧里的 duration（示例 950 ms）自行到期回 SAFE_NEUTRAL，早于这里的 1200 ms，这个超时只负责发显式 SAFE 帧和告警。
+DEFAULT_UPSTREAM_TIMEOUT_MS = 1200
 
 
 class ProtocolError(ValueError):
@@ -121,7 +128,7 @@ def validate_config(cfg):
         raise ProtocolError("frame 必须是非空数组")
     names = set()
     kinds = set()
-    action_size = ttl_size = None
+    action_size = ttl_size = duration_size = None
     for index, field in enumerate(fields):
         if not isinstance(field, dict):
             raise ProtocolError(f"frame[{index}] 必须是对象")
@@ -134,7 +141,7 @@ def validate_config(cfg):
         kind = field.get("kind")
         if kind not in FIELD_KINDS:
             raise ProtocolError(f"{name}.kind 不支持: {kind!r}")
-        if kind in ("seq", "action", "heartbeat", "ttl", "crc"):
+        if kind in ("seq", "action", "heartbeat", "ttl", "duration", "crc"):
             if kind in kinds:
                 raise ProtocolError(f"frame 中 {kind} 字段重复")
             kinds.add(kind)
@@ -162,6 +169,8 @@ def validate_config(cfg):
             action_size = size
         elif kind == "ttl":
             ttl_size = size
+        elif kind == "duration":
+            duration_size = size
         elif kind == "crc":
             _, bits = _crc_params(cfg)
             if size * 8 != bits:
@@ -174,7 +183,13 @@ def validate_config(cfg):
             raise ProtocolError(f"frame 缺少 {required} 字段")
 
     ttl = cfg.get("ttl_ms")
-    cfg["ttl_ms"] = _int(ttl, "ttl_ms", 1, (1 << (8 * ttl_size)) - 1)
+    cfg["ttl_ms"] = _int(ttl, "ttl_ms", 1, min((1 << (8 * ttl_size)) - 1, MAX_SPAN_MS))
+    if duration_size is not None:
+        cfg["duration_ms"] = _int(cfg.get("duration_ms"), "duration_ms", 1,
+                                  min((1 << (8 * duration_size)) - 1, MAX_SPAN_MS))
+    elif "duration_ms" in cfg:
+        raise ProtocolError("配置了 duration_ms，但 frame 里没有 duration 字段，有效时长发不到接收端；"
+                            "加上 duration 字段或删掉 duration_ms")
 
     encoding = cfg.get("action_encoding")
     if not isinstance(encoding, list) or len(encoding) != 4:
@@ -202,8 +217,8 @@ def _pack(value, size, endian):
     return int(value).to_bytes(size, endian)
 
 
-def encode_frame(cfg, action, seq, heartbeat):
-    """action 0..3；heartbeat=True 时 action 字段写 heartbeat_action。"""
+def encode_frame(cfg, action, seq, heartbeat, duration_ms=None):
+    """action 0..3；heartbeat=True 时仅作链路保活（duration 写 0，接收端忽略动作与时长字段）。"""
     if not 0 <= action < 4:
         raise ProtocolError(f"动作越界: {action}（只允许 0..3）")
     wire_action = cfg["heartbeat_action"] if heartbeat else action
@@ -227,6 +242,14 @@ def encode_frame(cfg, action, seq, heartbeat):
             body += _pack(1 if heartbeat else 0, field["size"], _endian(field, field["name"]))
         elif kind == "ttl":
             body += _pack(cfg["ttl_ms"], field["size"], _endian(field, field["name"]))
+        elif kind == "duration":
+            if heartbeat:
+                dur = 0
+            elif duration_ms is None:
+                dur = cfg["duration_ms"]
+            else:
+                dur = _int(duration_ms, "duration_ms", 1, min((1 << (8 * field["size"])) - 1, MAX_SPAN_MS))
+            body += _pack(dur, field["size"], _endian(field, field["name"]))
         else:  # validate_config 已拦截，这里防御未来新增 kind 漏处理。
             raise ProtocolError(f"未知字段类型: {kind}")
     crc_fn, _ = _crc_params(cfg)
@@ -302,6 +325,121 @@ def _emit(fd, frame, dry_run):
         write_frame(fd, frame)
 
 
+class _LineBuffer:
+    """基于原始字节块的增量行缓冲：避免 TextIOWrapper.readline 在无换行半行上阻塞主循环。"""
+
+    def __init__(self):
+        self.buf = bytearray()
+        self.eof = False
+
+    def feed(self, chunk):
+        if not chunk:
+            self.eof = True
+            return
+        self.buf.extend(chunk)
+        if b"\n" not in self.buf and len(self.buf) > MAX_LINE_BYTES:
+            raise ProtocolError(f"单行输入超过 {MAX_LINE_BYTES} 字节且缺少换行符")
+
+    def has_complete_line(self):
+        return b"\n" in self.buf
+
+    def pop_line(self):
+        nl = self.buf.find(b"\n")
+        if nl < 0:
+            return None
+        raw = bytes(self.buf[:nl])
+        del self.buf[:nl + 1]
+        return raw.decode("utf-8", "replace")
+
+
+def _default_poll(in_fd):
+    def _poll(timeout, stdin_open):
+        if stdin_open:
+            ready, _, _ = select.select([in_fd], [], [], timeout)
+            return os.read(in_fd, 4096) if ready else None
+        time.sleep(timeout)
+        return None
+    return _poll
+
+
+def _default_warn(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+def run_stream(cfg, emit_fn, *, max_frames=None, upstream_timeout_ms=DEFAULT_UPSTREAM_TIMEOUT_MS,
+               in_fd=None, clock_fn=time.monotonic, poll_fn=None, warn_fn=_default_warn):
+    """持续流主循环；poll_fn 与 clock_fn 可注入，便于无抖动测试半行、心跳与超时时序。"""
+    if isinstance(upstream_timeout_ms, bool) or not isinstance(upstream_timeout_ms, int) or upstream_timeout_ms < 0:
+        raise ProtocolError("--upstream-timeout-ms 必须是 >= 0 的整数（0 表示关闭）")
+    if in_fd is None:
+        in_fd = sys.stdin.fileno()
+    if poll_fn is None:
+        poll_fn = _default_poll(in_fd)
+    seq_size = next(f["size"] for f in cfg["frame"] if f["kind"] == "seq")
+    seq = 0
+    sent = 0
+    period = 1.0 / cfg["heartbeat_hz"]
+    upstream_timeout_s = upstream_timeout_ms / 1000.0
+    start_t = clock_fn()
+    next_tick = start_t
+    last_action_at = start_t
+    upstream_stalled = False
+    reader = _LineBuffer()
+    while max_frames is None or sent < max_frames:
+        next_deadline = next_tick
+        if upstream_timeout_s > 0.0 and not upstream_stalled:
+            next_deadline = min(next_deadline, last_action_at + upstream_timeout_s)
+        timeout = 0.0 if reader.has_complete_line() else max(0.0, next_deadline - clock_fn())
+        chunk = None if reader.has_complete_line() else poll_fn(timeout, not reader.eof)
+        if chunk is not None:
+            reader.feed(chunk)
+        emitted_action = False
+        while (max_frames is None or sent < max_frames) and (line := reader.pop_line()) is not None:
+            if line.strip():
+                action = parse_action(line.strip())
+                emit_fn(encode_frame(cfg, action, seq, False))
+                seq = next_seq(seq, seq_size)
+                sent += 1
+                last_action_at = clock_fn()
+                upstream_stalled = False
+                emitted_action = True
+        if max_frames is not None and sent >= max_frames:
+            break
+        if chunk is not None and len(chunk) >= 4096 and not reader.eof:
+            if emitted_action:
+                next_tick = clock_fn() + period
+            continue  # 单次读满 4 KiB 时立即继续排空内核管道，不等心跳周期
+        if reader.eof:
+            # 上游关闭管道：先发一帧 SAFE_NEUTRAL 取消当前转向/前飞，再立即退出把链路失联超时交还飞控 TTL
+            emit_fn(encode_frame(cfg, SAFE_NEUTRAL, seq, False))
+            seq = next_seq(seq, seq_size)
+            sent += 1
+            if bytes(reader.buf).strip():
+                raise ProtocolError("标准输入在未换行的半行处关闭")
+            break
+        now = clock_fn()
+        if upstream_timeout_s > 0.0 and not upstream_stalled and now - last_action_at >= upstream_timeout_s - 1e-12:
+            upstream_stalled = True
+            warn_fn(f"uart_action: 警告：上游超过 {upstream_timeout_ms} ms 未发新动作，已下发 SAFE_NEUTRAL")
+            emit_fn(encode_frame(cfg, SAFE_NEUTRAL, seq, False))
+            seq = next_seq(seq, seq_size)
+            sent += 1
+            emitted_action = True
+            if max_frames is not None and sent >= max_frames:
+                break
+        if emitted_action:
+            # 动作帧本身已刷新飞控侧链路存活计时，本轮不再紧跟心跳帧
+            next_tick = now + period
+        elif now >= next_tick:
+            emit_fn(encode_frame(cfg, cfg["heartbeat_action"], seq, True))
+            seq = next_seq(seq, seq_size)
+            sent += 1
+            next_tick += period
+            if next_tick <= now:  # 落后时不补发突发帧
+                next_tick = now + period
+    return 0
+
+
 def run(args):
     cfg = load_config(args.config)
     if cfg.get("placeholder"):
@@ -309,6 +447,9 @@ def run(args):
               file=sys.stderr)
     if args.frames is not None and args.frames <= 0:
         raise ProtocolError("--frames 必须 > 0")
+    upstream_timeout_ms = getattr(args, "upstream_timeout_ms", DEFAULT_UPSTREAM_TIMEOUT_MS)
+    if upstream_timeout_ms < 0:
+        raise ProtocolError("--upstream-timeout-ms 必须 >= 0")
 
     if args.action is not None:
         action = parse_action(str(args.action))
@@ -321,43 +462,16 @@ def run(args):
         return 0
 
     fd = None if args.dry_run else open_serial(cfg)
-    seq_size = next(f["size"] for f in cfg["frame"] if f["kind"] == "seq")
-    seq = 0
-    sent = 0
-    period = 1.0 / cfg["heartbeat_hz"]
-    next_tick = time.monotonic()
-    stdin_open = True
     try:
-        while args.frames is None or sent < args.frames:
-            timeout = max(0.0, next_tick - time.monotonic())
-            ready = []
-            if stdin_open:
-                ready, _, _ = select.select([sys.stdin], [], [], timeout)
-            else:
-                time.sleep(timeout)
-            if ready:
-                line = sys.stdin.readline()
-                if line == "":
-                    stdin_open = False  # EOF 后继续发心跳；进程存活即持续保活
-                elif line.strip():
-                    action = parse_action(line.strip())
-                    _emit(fd, encode_frame(cfg, action, seq, False), args.dry_run)
-                    seq = next_seq(seq, seq_size)
-                    sent += 1
-            if args.frames is not None and sent >= args.frames:
-                break
-            now = time.monotonic()
-            if now >= next_tick:
-                _emit(fd, encode_frame(cfg, cfg["heartbeat_action"], seq, True), args.dry_run)
-                seq = next_seq(seq, seq_size)
-                sent += 1
-                next_tick += period
-                if next_tick <= now:  # 落后时不补发突发帧
-                    next_tick = now + period
+        return run_stream(
+            cfg,
+            lambda frame: _emit(fd, frame, args.dry_run),
+            max_frames=args.frames,
+            upstream_timeout_ms=upstream_timeout_ms,
+        )
     finally:
         if fd is not None:
             os.close(fd)
-    return 0
 
 
 def main(argv=None):
@@ -368,6 +482,8 @@ def main(argv=None):
     parser.add_argument("--action", type=int, help="发送一个动作 0..3 后退出")
     parser.add_argument("--dry-run", action="store_true", help="只打印 hex，不打开串口")
     parser.add_argument("--frames", type=int, help="最多发送 N 帧后退出；默认持续发送")
+    parser.add_argument("--upstream-timeout-ms", type=int, default=DEFAULT_UPSTREAM_TIMEOUT_MS,
+                        help=f"上游超过该毫秒数无新动作则下发 SAFE_NEUTRAL 并告警（0=关闭，默认 {DEFAULT_UPSTREAM_TIMEOUT_MS}）")
     args = parser.parse_args(argv)
     try:
         return run(args)
