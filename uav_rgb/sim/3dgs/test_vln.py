@@ -22,6 +22,8 @@ vln = importlib.import_module("sim.3dgs.vln")
 collect = importlib.import_module("sim.3dgs.collect_3dgs")
 scene_mod = importlib.import_module("sim.3dgs.scene")
 runner = importlib.import_module("sim.3dgs.run_vln")
+reactive = importlib.import_module("sim.3dgs.reactive")
+dyn3dgs = importlib.import_module("sim.3dgs.dynamics")
 
 _DATA_TMP = os.path.join(os.environ.get("DATA_ROOT", "/root/rivermind-data"), "uav_rgb", "tmp")
 if "TMPDIR" not in os.environ and os.path.isdir(_DATA_TMP):
@@ -101,6 +103,56 @@ class TestMetrics(unittest.TestCase):
             self.assertAlmostEqual(s[key], want, msg=key)
         self.assertEqual(vln.summarize_by(rows, "type")["B"]["n"], 2)
         self.assertIsNone(vln.summarize([])["sr"])
+
+
+class TestReactiveGoalPolicy(unittest.TestCase):
+    def _state(self, x=0.0, y=0.0, yaw=0.0):
+        return SimpleNamespace(x=x, y=y, yaw=yaw)
+
+    def test_turns_towards_goal_without_global_planner(self):
+        policy = reactive.ReactiveGoalPolicy({"x": 0.0, "y": 5.0})
+        depth = np.full((10, 12), 4.0, dtype=np.float32)
+        action, _ = policy(None, depth, self._state())
+        self.assertEqual(action, dyn3dgs.YAW_LEFT)
+
+    def test_stops_inside_goal_radius(self):
+        policy = reactive.ReactiveGoalPolicy({"x": 0.5, "y": 0.0})
+        depth = np.full((10, 12), 4.0, dtype=np.float32)
+        action, _ = policy(None, depth, self._state())
+        self.assertEqual((action, policy.stop_requested), (collect.SAFE_NEUTRAL, True))
+
+    def test_turns_to_the_clearer_side_when_blocked(self):
+        policy = reactive.ReactiveGoalPolicy({"x": 5.0, "y": 0.0})
+        depth = np.full((10, 12), 4.0, dtype=np.float32)
+        depth[4:6, 4:8] = 0.5
+        depth[4:6, 0:4] = 2.0
+        action, _ = policy(None, depth, self._state())
+        self.assertEqual(action, dyn3dgs.YAW_RIGHT)
+
+    def test_keeps_avoidance_turn_until_front_opens(self):
+        policy = reactive.ReactiveGoalPolicy({"x": 5.0, "y": 0.0})
+        first = np.full((10, 12), 4.0, dtype=np.float32)
+        first[4:6, 4:8] = 0.5
+        first[4:6, 0:4] = 1.0
+        first[4:6, 8:12] = 2.0
+        second = first.copy()
+        second[4:6, 0:4] = 3.0
+        second[4:6, 8:12] = 1.0
+        a1, _ = policy(None, first, self._state())
+        a2, _ = policy(None, second, self._state())
+        self.assertEqual((a1, a2), (dyn3dgs.YAW_RIGHT, dyn3dgs.YAW_RIGHT))
+
+    def test_requires_three_clear_frames_before_releasing_avoidance(self):
+        policy = reactive.ReactiveGoalPolicy({"x": 0.0, "y": 5.0})
+        blocked = np.full((10, 12), 4.0, dtype=np.float32)
+        blocked[4:6, 4:8] = 0.5
+        blocked[4:6, 0:4] = 1.0
+        blocked[4:6, 8:12] = 2.0
+        clear = np.full((10, 12), 4.0, dtype=np.float32)
+        policy(None, blocked, self._state())
+        actions = [policy(None, clear, self._state())[0] for _ in range(3)]
+        self.assertEqual(actions[:2], [dyn3dgs.YAW_RIGHT, dyn3dgs.YAW_RIGHT])
+        self.assertEqual(actions[2], dyn3dgs.YAW_LEFT)
 
     def test_all_failed_is_zero_success_without_invented_motion_metrics(self):
         s = vln.summarize([], [{"error": "render failed"}])

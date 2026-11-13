@@ -8,8 +8,10 @@
 
 策略：
   teacher  占据 A* 教师，直接拿航线终点当目标：等于已经听懂了指令（特权），是上界，也是以后蒸馏的老师
+  reactive  目标条件局部控制，只看当前深度、位姿和目标方向，不在线查询全局占据图或调用 A*
   forward  一直前进、从不喊停，不看指令：下界
-两者只给出特权导航与盲飞对照，差值不等于语言理解收益；还没有读取语言的学生。
+teacher/reactive 都直接拿 waypoint，只用于验证控制层；它们都不是语言理解结果。
+真正的语言学生尚未接入。
 
 产物：<out>/<场景>/<航线>_<指令序号>/（run_episode 的逐步记录；前 --videos 集另有 views.mp4）、
 <out>/episodes.jsonl（每集一行）、<out>/vln_eval.json（总表，另按句式 / SAGE split / 场景分组）。
@@ -25,6 +27,7 @@ from . import collect_3dgs
 from . import collision as collision_mod
 from . import planner as planner_mod
 from . import renderer as renderer_mod
+from . import reactive
 from . import scene as scene_mod
 from . import video as video_mod
 from . import vln
@@ -35,9 +38,11 @@ METRIC_VERSION = "3dgs.vln.v3"
 STEPS_HOLD_S = 0.5      # 航线 max_steps 是导入时按 hold 0.5 估的（scene_import_sage3d），别的 hold 按时长换算
 
 
-def make_policy(name, occ_planner, waypoint, hold):
+def make_policy(name, occ_planner, waypoint, hold, stop_radius=1.0):
     if name == "teacher":
         return planner_mod.OccAstarTeacher(occ_planner, waypoint, hold_s=hold)
+    if name == "reactive":
+        return reactive.ReactiveGoalPolicy(waypoint, stop_radius=stop_radius)
     return collect_3dgs.ForwardPolicy()
 
 
@@ -81,7 +86,7 @@ def run_scene(path, args, params):
         scene["vln"] = ep
         ep_dir = os.path.join(args.out, scene["name"], f"{ep['route_name']}_{ep['instruction_index']}")
         steps = math.ceil(int(scene["max_steps"]) * STEPS_HOLD_S / args.hold)
-        policy = make_policy(args.policy, occ_planner, scene["waypoint"], args.hold)
+        policy = make_policy(args.policy, occ_planner, scene["waypoint"], args.hold, stop_radius=radius)
         try:
             man, err = collect_3dgs.run_episode(
                 scene, ep_dir, renderer, occ, params, policy, steps, args.hold,
@@ -121,7 +126,8 @@ def run_scene(path, args, params):
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--scene", action="append", required=True, help="SAGE-3D 导入的 scene.json，可给多个")
-    p.add_argument("--policy", choices=("teacher", "forward"), required=True)
+    p.add_argument("--policy", choices=("teacher", "reactive", "forward"), required=True,
+                   help="teacher = A* 特权上界；reactive = 不查全局地图的目标条件局部控制；forward = 盲目前进下界")
     p.add_argument("--out", required=True)
     p.add_argument("--hold", type=float, default=0.5, help="每步动作窗口（秒）")
     p.add_argument("--stop-mode", choices=("explicit", "legacy-safe"), default="explicit",
