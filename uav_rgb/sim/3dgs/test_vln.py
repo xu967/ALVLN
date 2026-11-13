@@ -114,11 +114,13 @@ class Scripted:
     """按顺序出动作的策略；序列用完就重复最后一个。"""
     name = "forward"
 
-    def __init__(self, seq):
+    def __init__(self, seq, stop_at=None):
         self.seq, self.i = list(seq), 0
+        self.stop_at, self.stop_requested = stop_at, False
 
     def __call__(self, rgb, depth, state):
         a = self.seq[min(self.i, len(self.seq) - 1)]
+        self.stop_requested = self.i == self.stop_at
         self.i += 1
         return a, None
 
@@ -146,6 +148,110 @@ class TestAgentStop(unittest.TestCase):
             self.assertEqual((m["num_steps"], m["stopped_by_agent"], m["stop_after_safe"]), (10, False, None))
 
 
+class TestExplicitStop(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        scene_dir = os.path.join(self.tmp.name, "scene")
+        scene_mod.make_corridor(scene_dir, seed=2, length=12.0)
+        self.scene = scene_mod.load_scene(os.path.join(scene_dir, "scene.json"))
+        self.renderer = importlib.import_module("sim.3dgs.renderer").make_renderer(self.scene, True)
+        self.occ = importlib.import_module("sim.3dgs.collision").from_scene(self.scene)
+        self.params = importlib.import_module("sim.3dgs.dynamics").CfBlackboxParams.from_json(None)
+        self.identity = collect.scene_identity(self.scene)
+
+    def run_policy(self, policy, **kw):
+        out = os.path.join(self.tmp.name, "episode")
+        manifest, err = collect.run_episode(
+            self.scene, out, self.renderer, self.occ, self.params, policy, 10, 0.5,
+            split=self.identity["split"], identity=self.identity, stop_on_request=True, **kw)
+        self.assertIsNone(err)
+        actions = runner._read_jsonl(os.path.join(out, "actions.jsonl"))
+        oracle = runner._read_jsonl(os.path.join(out, "oracle.jsonl"))
+        metrics = vln.episode_metrics(actions, oracle, self.scene["waypoint"], 1.0,
+                                      manifest["stopped_by_agent"])
+        return manifest, actions, metrics
+
+    def test_safe_at_goal_or_away_never_implies_completion(self):
+        for at_goal in (False, True):
+            with self.subTest(at_goal=at_goal):
+                if at_goal:
+                    self.scene["waypoint"] = dict(self.scene["spawn"])
+                policy = Scripted([collect.SAFE_NEUTRAL])
+                policy.stop_radius = 1.0      # 旧教师自动 goal-stop 在显式模式中必须禁用
+                man, actions, metrics = self.run_policy(policy)
+                self.assertEqual(man["num_steps"], 10)
+                self.assertFalse(man["stopped_on_goal"] or man["stopped_by_agent"])
+                self.assertEqual(man["terminal_reason"], "budget_exhausted")
+                self.assertFalse(any(a["stop_requested"] for a in actions))
+                self.assertFalse(metrics["success"])
+
+    def test_explicit_stop_maps_to_safe_and_wrong_goal_fails(self):
+        man, actions, metrics = self.run_policy(Scripted([collect.FORWARD_SLOW], stop_at=0))
+        self.assertEqual((man["num_steps"], man["terminal_reason"]), (1, "agent_stop"))
+        self.assertTrue(man["stopped_by_agent"] and man["stop_on_request"])
+        self.assertTrue(actions[0]["stop_requested"])
+        self.assertEqual(actions[0]["action_executed"], collect.SAFE_NEUTRAL)
+        self.assertEqual((metrics["success"], metrics["stopped"]), (False, True))
+
+    def test_explicit_stop_at_goal_succeeds(self):
+        self.scene["waypoint"] = dict(self.scene["spawn"])
+        man, _, metrics = self.run_policy(Scripted([collect.SAFE_NEUTRAL], stop_at=0))
+        self.assertEqual(man["terminal_reason"], "agent_stop")
+        self.assertTrue(metrics["success"])
+
+    def test_collision_overrides_simultaneous_stop(self):
+        self.scene["waypoint"] = dict(self.scene["spawn"])
+        with mock.patch.object(collect, "_step_collision", return_value=(True, [0, 0, 2])):
+            man, actions, metrics = self.run_policy(Scripted([collect.SAFE_NEUTRAL], stop_at=0))
+        self.assertTrue(actions[0]["stop_requested"])
+        self.assertFalse(man["stopped_by_agent"] or metrics["success"])
+        self.assertEqual(man["terminal_reason"], "collision")
+
+    def test_conflicting_or_missing_stop_contract_rejected(self):
+        with self.assertRaisesRegex(ValueError, "互斥"):
+            self.run_policy(Scripted([0]), stop_after_safe=3)
+        guarded = importlib.import_module("sim.3dgs.guard").OracleGuardedPolicy(
+            collect.ForwardPolicy(), lambda x, y: (x + 1, y), 0)
+        with self.assertRaisesRegex(ValueError, "bool stop_requested"):
+            self.run_policy(guarded)
+
+    def test_teacher_reset_failure_and_safety_wait_do_not_request_stop(self):
+        planner = mock.Mock()
+        teacher = runner.planner_mod.OccAstarTeacher(planner, {"x": 0, "y": 0}, hold_s=1.0, clearance="swept")
+        state = SimpleNamespace(x=0.0, y=0.0, z=2.0, yaw=0.0)
+        self.assertEqual(teacher(None, None, state)[0], collect.SAFE_NEUTRAL)
+        self.assertTrue(teacher.stop_requested)
+        teacher.reset()
+        self.assertFalse(teacher.stop_requested)
+        teacher.set_waypoint({"x": 10, "y": 0})
+        planner.plan.return_value = None
+        self.assertEqual(teacher(None, None, state)[0], collect.SAFE_NEUTRAL)
+        self.assertEqual(teacher.last_branch, "plan_fail")
+        self.assertFalse(teacher.stop_requested)
+        planner.plan.return_value = [(0, 0), (10, 0)]
+        planner.aim_point.return_value = (10, 0)
+        planner.occ.sweep.return_value = (False, None)
+        with mock.patch.object(teacher, "_swept_blocked", return_value=True):
+            self.assertEqual(teacher(None, None, state)[0], collect.SAFE_NEUTRAL)
+        self.assertEqual(teacher.last_branch, "wait_swept")
+        self.assertFalse(teacher.stop_requested)
+
+    def test_dagger_does_not_leak_expert_stop_into_student_execution(self):
+        expert = runner.planner_mod.OccAstarTeacher(mock.Mock(), {"x": 0, "y": 0})
+        student = mock.Mock(student_cond=None, stop_requested=False)
+        student.return_value = (collect.SAFE_NEUTRAL, None)
+        state = SimpleNamespace(x=0.0, y=0.0, z=2.0, yaw=0.0)
+        with mock.patch.object(collect, "StudentAdapter", return_value=student):
+            for beta in (0.0, 1.0):
+                dagger = collect.DaggerPolicy(None, expert, beta, np.random.default_rng(0))
+                dagger(None, None, state)
+                self.assertTrue(expert.stop_requested)
+                self.assertEqual(dagger.stop_requested, bool(beta))
+                dagger.reset()
+                self.assertFalse(dagger.stop_requested)
+
+
 class TestRunner(unittest.TestCase):
     def run_scene(self, outcome=None, records=None):
         scene = copy.deepcopy(SCENE)
@@ -157,7 +263,7 @@ class TestRunner(unittest.TestCase):
         actions, oracle = _steps([(0, 0), (1, 0), (4, 0)])
         manifest = {"stopped_by_agent": True, "validity": {"physics_verified": True, "camera_verified": True}}
         args = SimpleNamespace(split=None, all_instructions=False, seed=0, limit=0,
-                               out="unused", hold=0.5, policy="teacher", videos=0)
+                               out="unused", hold=0.5, policy="teacher", videos=0, stop_mode="explicit")
         with ExitStack() as stack:
             for module, attr, value in ((scene_mod, "load_scene", scene),
                                        (scene_mod, "read_gaussian_ply", None),
@@ -178,6 +284,8 @@ class TestRunner(unittest.TestCase):
         _, _, calls, _ = self.run_scene()
         self.assertEqual([c.kwargs.get("split_policy") for c in calls], ["diag-vln-eval"] * 2)
         self.assertNotEqual(calls[0].kwargs["identity"]["task_id"], calls[1].kwargs["identity"]["task_id"])
+        self.assertTrue(all(c.kwargs["stop_on_request"] for c in calls))
+        self.assertTrue(all(c.kwargs["stop_after_safe"] is None for c in calls))
 
     def test_spl_reference_starts_before_first_action(self):
         _, _, _, calls = self.run_scene()
@@ -209,6 +317,20 @@ class TestRunner(unittest.TestCase):
                 report = json.load(f)
         self.assertEqual(report["overall"]["sr"], 0.5)
         self.assertEqual(report["by_split"]["test_Instruction_Unseen"]["sr"], 0.0)
+        self.assertEqual(report["metric_version"], "3dgs.vln.v3")
+        self.assertEqual(report["stop_mode"], "explicit")
+        self.assertIsNone(report["stop_streak"])
+
+    def test_legacy_report_keeps_v2_and_streak_metadata(self):
+        rows, _, _, _ = self.run_scene()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(runner, "run_scene", return_value=(rows, [])), \
+                mock.patch.object(runner.CfSitlParams, "from_json", return_value=SimpleNamespace(profile=lambda: "test")):
+            self.assertEqual(runner.main(["--scene", "fixture", "--policy", "teacher", "--out", tmp,
+                                          "--stop-mode", "legacy-safe"]), 0)
+            with open(os.path.join(tmp, "vln_eval.json")) as f:
+                report = json.load(f)
+        self.assertEqual((report["metric_version"], report["stop_mode"], report["stop_streak"]),
+                         ("3dgs.vln.v2", "legacy-safe", 3))
 
     def test_empty_output_directory_is_allowed_but_empty_selection_fails(self):
         rows, _, _, _ = self.run_scene()

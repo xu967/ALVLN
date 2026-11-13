@@ -49,13 +49,16 @@ class StudentPolicy:
                 f"找不到推理程序 {binary}；先运行 bash tools/check.sh（支持 UAV_RGB_BUILD_DIR）")
         if not os.path.isfile(ckpt):
             raise RuntimeError(f"找不到 checkpoint {ckpt}")
+        self.ckpt = os.fspath(ckpt)
+        self.text_ids = tuple(text_ids) if text_ids is not None else ()
+        self.student_cond_check = None
         # stderr 用临时文件而不是 PIPE：长采集时 CUDA/驱动警告写满 64 KiB 管道会让
         # 子进程阻塞在 write，父进程的 readline 永远等不到结果（T5 卡死风险）。
         self._err = tempfile.TemporaryFile()
         cmd = [binary, "--ckpt", ckpt]
-        if text_ids:
+        if self.text_ids:
             # L0：单集一条指令；L2 才把 token 送进文本编码器。
-            cmd += ["--text", ",".join(str(int(t)) for t in text_ids)]
+            cmd += ["--text", ",".join(str(int(t)) for t in self.text_ids)]
         self.proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self._err, bufsize=0)
         os.set_blocking(self.proc.stdin.fileno(), False)
@@ -87,6 +90,27 @@ class StudentPolicy:
         self.text_dim = int(hello.get("text_dim", 0))
         self.frames = 0
         self._warmup()
+
+    def validate_inputs(self, requested_cond):
+        """导航适配器显式调用；Gazebo 的 blank 消融与只读 hello 探针保留原语义。"""
+        import nav_cond
+
+        # 0=<pad>、1=<unk> 都没有可执行语义；全是这两类时仍等价于空指令。
+        if self.text_dim > 0 and not any(int(t) > 1 for t in self.text_ids):
+            self._abort_start("文本模型缺少有效指令，不能把全 PAD 推理当作语言导航；"
+                              "3DGS 学生入口尚未接入语言，请使用纯视觉权重")
+        if self.text_dim == 0 and self.text_ids:
+            self._abort_start("纯视觉模型不接收文本，所提供的指令不会影响动作")
+        # 同一个推理进程跨集复用，不必每集重算训练数据的 SHA256。
+        if self.student_cond_check is not None and self.student_cond_check["requested"] == requested_cond:
+            return self.student_cond_check
+        check = nav_cond.check_student_cond(requested_cond, self.ckpt, self.prev_dim)
+        if check["status"] == "mismatch":
+            self._abort_start(check["message"])
+        if check["status"] == "unverified":
+            print(f"警告: 条件输入一致性未核实：{check['message']}", file=sys.stderr)
+        self.student_cond_check = check
+        return check
 
     def _warmup(self):
         """先跑一帧全零：把 CUDA 模块加载/首帧开销移出第 1 步动作。

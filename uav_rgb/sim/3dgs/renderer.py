@@ -47,7 +47,7 @@ class GsplatRenderer:
 
     渲染选项（scene.json "render" 段，默认 scene.RENDER_DEFAULTS）：
       sh_degree    用几阶球谐（场景没有 f_rest 时自动退回 0）；
-      max_scale_m  去掉最大轴 1σ 超过该值的巨型高斯（None 不过滤），碰撞端用同一值；
+      max_scale_m  去掉最大轴 1σ 超过该值的巨型高斯（0 / None 不过滤），碰撞端用同一值；
       supersample  整数 s：按 s 倍分辨率渲染再 s×s 盒滤波缩小（抗闪烁）。
     """
 
@@ -80,9 +80,8 @@ class GsplatRenderer:
         self.supersample = int(opts["supersample"])
         if self.supersample < 1:
             raise ValueError("supersample 必须 >= 1")
-        self.max_scale_m = (None if opts["max_scale_m"] in (None, 0)
-                            else float(opts["max_scale_m"]))
-        self.nav_to_world = scene.get("_nav_to_world")
+        self.max_scale_m = scene_mod.normalize_max_scale(opts["max_scale_m"])
+        self.nav_to_world = scene_mod.validate_nav_to_world(scene.get("_nav_to_world"))
         # 不用 gsplat 的 backgrounds：1.5.3 在 packed=True 时要求 (channels,)，
         # 与高层 [C,3] 的约定冲突。改为拿 alpha 后自己合成背景。
         self._bg = torch.tensor(background, dtype=torch.float32,
@@ -334,7 +333,7 @@ def main():
     p.add_argument("--sh-degree", type=int, default=None,
                    help="球谐阶数（默认 scene.render.sh_degree=3；0=只用 DC）")
     p.add_argument("--max-scale", type=float, default=None,
-                   help="去掉最大轴 1σ 超过该米数的高斯（默认 3.0；<=0 不过滤）")
+                   help="去掉最大轴 1σ 超过该米数的高斯（默认 3.0；0 不过滤）")
     p.add_argument("--supersample", type=int, default=None,
                    help="超采样倍数（默认 2；1=关闭）")
     args = p.parse_args()
@@ -346,10 +345,13 @@ def main():
     else:
         p.error("--scene 或 --ply 必填")
     pose = parse_pose(args.pose)
-    max_scale = None if args.max_scale is None else (args.max_scale if args.max_scale > 0 else 0)
+    try:
+        scene_mod.normalize_max_scale(args.max_scale)
+    except ValueError as e:
+        p.error(str(e))
     renderer = make_renderer(scene, args.mock, args.width, args.height, args.fov,
                              args.device, sh_degree=args.sh_degree,
-                             max_scale_m=max_scale, supersample=args.supersample)
+                             max_scale_m=args.max_scale, supersample=args.supersample)
     rgb, depth, ms = renderer.render_pose(*pose)
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     _save_rgb(args.out, rgb)

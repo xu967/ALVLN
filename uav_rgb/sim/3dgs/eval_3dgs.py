@@ -378,6 +378,7 @@ def main():
         "ckpt": os.path.abspath(args.ckpt) if args.ckpt else None,
         "ckpt_sha256": _sha256(args.ckpt),
         "infer_bin": os.path.abspath(args.infer_bin) if args.infer_bin else None,
+        **({"student_cond_check": student.student_cond_check} if student is not None else {}),
         "episodes_requested": args.episodes,
         "steps": steps, "hold_s": hold, "hold_source": hold_source,
         "seeds": [args.seed + i for i in range(args.episodes)],

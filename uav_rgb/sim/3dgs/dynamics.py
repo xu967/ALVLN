@@ -250,6 +250,10 @@ class CfSitlDynamics:
         dt = float(dt)
         if not math.isfinite(dt) or dt <= 0.0:
             raise ValueError(f"cf_sitl dt 必须有限且 > 0，得到 {dt!r}")
+        n_total = int(round(dt / SITL_DT_S))
+        if n_total < 1 or not math.isclose(dt, n_total * SITL_DT_S, rel_tol=0.0, abs_tol=1e-9):
+            raise ValueError(f"cf_sitl dt 必须是至少一个 1 ms tick 的整数倍，得到 {dt!r}")
+        dt = n_total * SITL_DT_S
         if self.takeoff_s is None:
             raise RuntimeError("先 reset() 起飞再 step()")
         # until_s 多给半个 SITL 步：执行器的判据是 t < until_s，窗口最后一步 t == t_sitl + dt 若不多给，
@@ -257,7 +261,6 @@ class CfSitlDynamics:
         # trace 里也会记成 action=-1 / exec_state=READY。下一窗口的 act 在继续步进之前到达，所以不会多执行。
         self._call({"cmd": "act", "action": action, "until_s": self.t_sitl + dt + 0.5 * SITL_DT_S})
         self.active = action          # 窗口内（含末刻）生效的动作
-        n_total = int(round(dt / SITL_DT_S))
         n_chunk = max(1, int(round(self.trace_dt / SITL_DT_S)))
         yaw_prev, done = self.yaw, 0
         while done < n_total:

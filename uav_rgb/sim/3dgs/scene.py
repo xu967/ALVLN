@@ -113,13 +113,24 @@ def read_gaussian_ply(path):
             "scales": scales, "quats": quats, "sh": sh, "sh_degree": sh_degree}
 
 
+def normalize_max_scale(max_scale_m):
+    """0 / None 关闭尺度过滤；其余值必须是有限正数（米）。"""
+    if max_scale_m is None:
+        return None
+    limit = float(max_scale_m)
+    if not math.isfinite(limit) or limit < 0:
+        raise ValueError("max_scale_m 必须是有限非负数或 None")
+    return None if limit == 0 else limit
+
+
 def scale_keep_mask(scales, max_scale_m):
-    """尺度过滤：保留最大轴 1σ <= max_scale_m 的高斯；None 表示不过滤。
+    """尺度过滤：保留最大轴 1σ <= max_scale_m 的高斯；0 / None 表示不过滤。
 
     巨型高斯（Callinstrasse 里 1σ 可到 6500 m）是训练时拟合天空/远景的"壳"，
     机载视角里它们盖在近景前面形成白雾；去掉后被它们遮住的洞会露出背景色。
     """
     scales = np.asarray(scales)
+    max_scale_m = normalize_max_scale(max_scale_m)
     if max_scale_m is None:
         return np.ones(len(scales), dtype=bool)
     return scales.max(axis=1) <= float(max_scale_m)
@@ -267,11 +278,21 @@ def load_scene(path):
     scene["ply_path"] = os.path.join(scene["dir"], scene["ply"])
     if not os.path.isfile(scene["ply_path"]):
         raise FileNotFoundError(f"scene.ply 不存在: {scene['ply_path']}")
-    m = np.asarray(scene.get("nav_to_world", np.eye(4).tolist()), dtype=np.float64)
-    if m.shape != (4, 4) or not np.isfinite(m).all():
-        raise ValueError(f"{path}: nav_to_world 必须是有限 4x4")
-    scene["_nav_to_world"] = m
+    scene["_nav_to_world"] = validate_nav_to_world(scene.get("nav_to_world"))
     return scene
+
+
+def validate_nav_to_world(nav_to_world):
+    """渲染和碰撞都用转置代替逆，只接受无缩放、无镜像的刚体变换。"""
+    m = np.asarray(np.eye(4) if nav_to_world is None else nav_to_world, dtype=np.float64)
+    if m.shape != (4, 4) or not np.isfinite(m).all():
+        raise ValueError("nav_to_world 必须是有限 4x4")
+    if not np.allclose(m[3], [0, 0, 0, 1], atol=1e-6, rtol=0):
+        raise ValueError("nav_to_world 的末行必须为 [0, 0, 0, 1]")
+    r = m[:3, :3]
+    if not np.allclose(r @ r.T, np.eye(3), atol=1e-6) or np.linalg.det(r) < 0:
+        raise ValueError("nav_to_world 的旋转块必须正交且 det=+1（不支持缩放/镜像）")
+    return m
 
 
 def apply_route(scene, route=None):
@@ -319,9 +340,7 @@ def viewmat_from_pose(x, y, z, yaw_deg, pitch_deg=0.0, nav_to_world=None):
     # gsplat/COLMAP 约定：相机 +z 朝前（不是 OpenGL 的 -z）。
     r_cn = np.stack([right, down, fwd])              # world->cam 旋转（nav 系）
     c_nav = np.array([x, y, z], dtype=np.float64)
-    if nav_to_world is None:
-        nav_to_world = np.eye(4)
-    m = np.asarray(nav_to_world, dtype=np.float64)
+    m = validate_nav_to_world(nav_to_world)
     r_m, t_m = m[:3, :3], m[:3, 3]
     r_cw = r_cn @ r_m.T
     c_world = r_m @ c_nav + t_m
@@ -359,7 +378,7 @@ def viewmat_from_quat(pos, quat, mount=None, nav_to_world=None):
                      [cp, 0.0, sp]])         # 相机前 = 机体 +x 抬头 pitch 后
     r_cn = r_cb @ r_nb.T
     c_nav = np.asarray(pos, dtype=np.float64) + r_nb @ xyz
-    m = np.asarray(np.eye(4) if nav_to_world is None else nav_to_world, dtype=np.float64)
+    m = validate_nav_to_world(nav_to_world)
     r_m, t_m = m[:3, :3], m[:3, 3]
     r_cw = r_cn @ r_m.T
     c_world = r_m @ c_nav + t_m

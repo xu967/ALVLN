@@ -112,9 +112,11 @@ class TestNavToWorld(unittest.TestCase):
 
     def test_rejects_non_rigid(self):
         m, s, q, o = thin_wall()
-        bad = np.diag([2.0, 1.0, 1.0, 1.0])
-        with self.assertRaises(ValueError):
-            col.Occupancy(m, s, q, o, nav_to_world=bad, **E1)
+        projective = np.eye(4)
+        projective[3, 0] = 0.1
+        for bad in (np.diag([2.0, 1.0, 1.0, 1.0]), projective):
+            with self.subTest(transform=bad.tolist()), self.assertRaisesRegex(ValueError, "nav_to_world"):
+                col.Occupancy(m, s, q, o, nav_to_world=bad, **E1)
 
 
 class TestEllipsoidExtent(unittest.TestCase):
@@ -168,6 +170,24 @@ class TestDilationShape(unittest.TestCase):
 
 
 class TestEnvelopeAndScene(unittest.TestCase):
+    def test_disabled_scale_filter_keeps_visible_wall_solid(self):
+        m, s, q, o = thin_wall()
+        gaussians = {"means": m, "scales": s, "quats": q, "opacities": o}
+        for source in ("render", "collision"):
+            for limit in (0, None):
+                with self.subTest(source=source, max_scale_m=limit):
+                    scene = {source: {"max_scale_m": limit}}
+                    occ = col.from_scene(scene, gaussians=gaussians)
+                    self.assertEqual(occ.n_kept, len(m))
+                    self.assertTrue(occ.sweep((4.6, 0, 2), (5.3, 0, 2))[0])
+                    self.assertIsNone(occ.summary()["max_scale_m"])
+
+    def test_rejects_invalid_scale_limits(self):
+        m, s, q, o = thin_wall()
+        for limit in (-1, float("nan"), float("inf")):
+            with self.subTest(max_scale_m=limit), self.assertRaisesRegex(ValueError, "max_scale_m"):
+                col.Occupancy(m, s, q, o, max_scale_m=limit)
+
     def test_e1_mini_envelope_from_params(self):
         env = col.load_body_envelope()
         self.assertAlmostEqual(env["radius_m"], 0.102, places=3)

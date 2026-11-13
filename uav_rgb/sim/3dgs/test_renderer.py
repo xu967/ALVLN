@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """渲染器测试：mock 尺寸/深度、viewmat/K、PLY 读写；真实 gsplat 用环境变量开启。"""
 import importlib
+import json
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -33,6 +35,40 @@ class TestMockRenderer(unittest.TestCase):
 
 
 class TestGeometry(unittest.TestCase):
+    def test_viewmat_preserves_camera_coordinates_under_rigid_transform(self):
+        angle = np.radians(37.0)
+        c, s = np.cos(angle), np.sin(angle)
+        transform = np.eye(4)
+        transform[:3, :3] = [[c, -s, 0], [s, c, 0], [0, 0, 1]]
+        transform[:3, 3] = [10, -3, 0.7]
+        expected = scene_mod.viewmat_from_pose(1, -2, 2, 0)
+        pose_view = scene_mod.viewmat_from_pose(1, -2, 2, 0, nav_to_world=transform)
+        quat_view = scene_mod.viewmat_from_quat((1, -2, 2), (1, 0, 0, 0), nav_to_world=transform)
+        np.testing.assert_allclose(pose_view @ transform, expected, atol=1e-9)
+        np.testing.assert_allclose(quat_view @ transform, expected, atol=1e-9)
+
+    def test_scene_and_camera_reject_non_rigid_transforms(self):
+        shear = np.eye(4)
+        shear[0, 1] = 0.2
+        projective = np.eye(4)
+        projective[3, 0] = 0.1
+        bad_transforms = [np.diag([2, 1, 1, 1]), np.diag([-1, 1, 1, 1]),
+                          np.diag([1, 1, 1, 2]), shear, projective,
+                          np.full((4, 4), np.nan), np.eye(3)]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "scene.json")
+            scene_mod.write_gaussian_ply(os.path.join(tmp, "x.ply"), np.zeros((1, 3)), np.ones((1, 3)))
+            for transform in bad_transforms:
+                with self.subTest(transform=transform.tolist()):
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump({"schema": "uavrgb.3dgs_scene.v1", "ply": "x.ply",
+                                   "nav_to_world": transform.tolist()}, f)
+                    for call in (lambda: scene_mod.load_scene(path),
+                                 lambda: scene_mod.viewmat_from_pose(0, 0, 2, 0, nav_to_world=transform),
+                                 lambda: scene_mod.viewmat_from_quat((0, 0, 2), (1, 0, 0, 0), nav_to_world=transform)):
+                        with self.assertRaisesRegex(ValueError, "nav_to_world"):
+                            call()
+
     def test_viewmat_forward(self):
         # 相机在 (0,0,2) 朝 +x：x+1 的点应在相机前方 +z（gsplat/COLMAP 约定）。
         v = scene_mod.viewmat_from_pose(0, 0, 2, 0)
@@ -89,11 +125,54 @@ class TestGeometry(unittest.TestCase):
         scales = np.array([[0.1, 0.1, 0.1], [0.1, 5.0, 0.1], [2.9, 0.2, 0.2]], np.float32)
         np.testing.assert_array_equal(scene_mod.scale_keep_mask(scales, 3.0), [True, False, True])
         np.testing.assert_array_equal(scene_mod.scale_keep_mask(scales, None), [True, True, True])
+        np.testing.assert_array_equal(scene_mod.scale_keep_mask(scales, 0), [True, True, True])
+        for bad in (-1, float("nan"), float("inf")):
+            with self.subTest(max_scale_m=bad), self.assertRaisesRegex(ValueError, "max_scale_m"):
+                scene_mod.scale_keep_mask(scales, bad)
+
+    def test_cli_rejects_invalid_scale_before_rendering(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            output = os.path.join(tmp, "rgb.png")
+            for limit in ("-1", "nan", "inf"):
+                with self.subTest(max_scale=limit):
+                    result = subprocess.run([sys.executable, "-m", "sim.3dgs.renderer", "--mock",
+                                             "--ply", "unused.ply", "--pose", "0,0,2,0",
+                                             "--out", output, "--max-scale", limit],
+                                            cwd=ROOT, capture_output=True, text=True, timeout=15)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("max_scale_m", result.stderr)
+                    self.assertFalse(os.path.exists(output))
 
 
 class TestClipPlanes(unittest.TestCase):
     """D10：gsplat 默认近/远裁剪 0.01 / 1e10，Gazebo 学生相机是 0.05 / 50 m（uav_rgb_e1.sdf），
     贴脸 1–5 cm 的高斯只会出现在 3DGS 画面里。renderer 固定传 Gazebo 的值并写进 stats()。"""
+
+    def test_scale_filter_matches_collision(self):
+        try:
+            import torch  # noqa: F401
+        except ImportError:
+            self.skipTest("无 torch（3dgs-venv）")
+        collision_mod = importlib.import_module("sim.3dgs.collision")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "wall.ply")
+            scene_mod.write_gaussian_ply(path, np.array([[5., 0., 2.]]), np.ones((1, 3)),
+                                         scales=np.full((1, 3), 0.1), opacities=np.array([0.95]))
+            scene = {"ply_path": path, "render": {}}
+            for limit in (0, None, 3.0):
+                with self.subTest(max_scale_m=limit):
+                    scene["render"]["max_scale_m"] = limit
+                    renderer = renderer_mod.GsplatRenderer(scene, device="cpu")
+                    occ = collision_mod.from_scene(scene)
+                    self.assertEqual(renderer.n_gaussians, occ.n_kept)
+                    self.assertEqual(renderer.n_gaussians, 1)
+                    self.assertTrue(occ.collides(5, 0, 2))
+            for limit in (-1, float("nan"), float("inf")):
+                with self.subTest(max_scale_m=limit), self.assertRaisesRegex(ValueError, "max_scale_m"):
+                    renderer_mod.GsplatRenderer(scene, device="cpu", max_scale_m=limit)
+            scene["_nav_to_world"] = np.diag([2, 2, 2, 1])
+            with self.assertRaisesRegex(ValueError, "nav_to_world"):
+                renderer_mod.GsplatRenderer(scene, device="cpu")
 
     def test_render_view_passes_gazebo_clip_planes(self):
         self.assertEqual((renderer_mod.NEAR_PLANE_M, renderer_mod.FAR_PLANE_M), (0.05, 50.0))

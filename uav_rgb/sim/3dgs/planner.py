@@ -274,10 +274,12 @@ class OccAstarTeacher:
         self.last_branch = None
         self.n_plan_fail = 0
         self._waits = 0           # 连续 wait_swept 的步数；run_episode 每集开头调 reset() 清零
+        self.stop_requested = False
 
     def reset(self):
         """集边界（run_episode 每集开头调用）：清连续等待计数。"""
         self._waits = 0
+        self.stop_requested = False
 
     def set_waypoint(self, waypoint):
         self.wp = (float(waypoint["x"]), float(waypoint["y"]))
@@ -298,11 +300,13 @@ class OccAstarTeacher:
         return bool(hit)
 
     def __call__(self, rgb, depth, state):
+        self.stop_requested = False
         waits, self._waits = self._waits, 0     # 只有 wait_swept 分支会把计数再加一；其余分支一律清零（等待必须连续）
         x, y, z = float(state.x), float(state.y), float(getattr(state, "z", 2.0))
         yaw_deg = math.degrees(float(state.yaw))
         if math.hypot(x - self.wp[0], y - self.wp[1]) <= self.stop_radius:
             self.last_branch = "stop"
+            self.stop_requested = True
             return SAFE_NEUTRAL, None
         path = self.planner.plan((x, y), self.wp)
         self.last_path = path

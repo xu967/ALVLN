@@ -158,6 +158,20 @@ class TestCfSitlDynamics(unittest.TestCase):
         self.assertEqual([r["step"] for r in self.d.trace][::5], [0, 1, 2, 3])
         self.assertTrue(all(abs(s["pitch_deg"]) < 20 and abs(s["roll_deg"]) < 20 for s in [s]))
 
+    def test_hold_requires_whole_sitl_ticks(self):
+        self.d.reset(-14.0, 0.0, 0.0)
+        before = self.d._state()
+        for hold in (0.0004, 0.1004, float("nan"), float("inf"), 0.0):
+            with self.subTest(hold=hold), self.assertRaises(ValueError):
+                self.d.step(dyn.FORWARD_SLOW, hold)
+            self.assertEqual(self.d._state(), before)
+            self.assertEqual(self.d.step_index, 0)
+            self.assertEqual(self.d.trace, [])
+        # 浮点加法形成的合法窗口不应被拒绝，日志时间必须等于实际推进时间。
+        s = self.d.step(dyn.FORWARD_SLOW, 0.1 + 0.2)
+        self.assertAlmostEqual(s["t"], 0.3, places=9)
+        self.assertEqual(len(self.d.trace), 3)
+
     def test_yaw_left_1s(self):
         s0 = self.d.reset(-14.0, 0.0, 0.0)
         s = self.d.step(dyn.YAW_LEFT, 0.5)

@@ -774,6 +774,10 @@ class TestCollisionRows(unittest.TestCase):
             self.assertEqual((m["completed"], m["validity"]["physics_verified"]), (False, True))
             m, _ = self._episode(tmp, "stop", self.HIT + 4, stop_on_collision=True)
             self.assertEqual((m["completed"], m["stopped_on_collision"]), (False, True))
+            # 碰撞恰好发生在最后一个预算步时，rows_ok == steps 也不能覆盖评测即停。
+            m, _ = self._episode(tmp, "stop-last", self.HIT + 1, stop_on_collision=True)
+            self.assertEqual((m["num_steps"], m["completed"], m["terminal_reason"]),
+                             (self.HIT + 1, False, "collision"))
             # goal-stop：出生点就在 waypoint 半径内，教师连续 3 步 SAFE 提前结束，也算 completed
             scene, renderer, occ, params, identity = _mock_env(tmp)
             scene["waypoint"] = {"x": scene["spawn"]["x"], "y": scene["spawn"]["y"], "z": 2.0}

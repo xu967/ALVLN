@@ -70,6 +70,12 @@ class TestEpisodeResult(unittest.TestCase):
         self.assertTrue(video.episode_result({"dynamics_anomaly": {"kind": "backward_under_forward"}}).startswith("ANOMALY"))
         self.assertEqual(video.episode_result({"num_steps": 7}), "NOT REACHED (7 steps)")
 
+    def test_legacy_goal_stop_cannot_override_failure(self):
+        man = {"stopped_on_goal": True}
+        self.assertEqual(video.episode_result(man, collided=True), "COLLISION")
+        self.assertEqual(video.episode_result(dict(man, stopped_on_collision=True)), "COLLISION")
+        self.assertTrue(video.episode_result(dict(man, dynamics_anomaly={"kind": "backward_under_forward"})).startswith("ANOMALY"))
+
     def test_reach_by_oracle_min_distance_without_goal_stop(self):
         man = {"num_steps": 3, "waypoint": WP, "stopped_on_goal": False}
         near = _oracle((0.0, 0.0), (9.0, 0.5), (12.0, 0.0))        # 中途进过 1.5 m 圈（距 1.12 m）

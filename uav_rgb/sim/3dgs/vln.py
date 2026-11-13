@@ -5,8 +5,9 @@
 {instruction_type, start, end, text}，start / end 是起点、终点物体名（如 track_light_1）。
 目标 = 航线 waypoint（SAGE 轨迹终点，就在终点物体旁边），成功半径 = scene.reach_radius_m。
 
-STOP：四个动作里没有单独的 STOP，约定连续 STOP_STREAK 步 SAFE_NEUTRAL = 「我到了」
-（与 A* 教师的 goal-stop 同口径），collect_3dgs.run_episode(stop_after_safe=STOP_STREAK) 在那一步结束本集。
+STOP：四个飞控动作不变，高层策略用独立 bool stop_requested 表示「任务完成」。
+collect_3dgs.run_episode(stop_on_request=True) 将它执行为一个 SAFE 窗口，随后结束并按末位姿评测。
+安全等待/避障 SAFE 不结束任务；这不是稳定悬停验收。旧 v1/v2 连续 STOP_STREAK 步 SAFE 只用于显式 legacy-safe 复现。
 
 参考 VLN-CE / Anderson et al. 2018 的指标名称；本项目用 xy 平面、目标圆盘、无碰撞约束，不能直接比公开榜单：
   SR   自己停下时离目标 <= 半径，且全程没撞
@@ -19,7 +20,7 @@ STOP：四个动作里没有单独的 STOP，约定连续 STOP_STREAK 步 SAFE_N
 import math
 import statistics
 
-STOP_STREAK = 3
+STOP_STREAK = 3     # 旧 v1/v2 兼容约定；新显式 STOP 不使用
 
 
 def episodes(scene, splits=None, types=None):

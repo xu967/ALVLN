@@ -282,13 +282,8 @@ def quat_to_rotmat(q):
 
 def _rigid_parts(nav_to_world):
     """4x4 -> (R, t)，只接受刚体变换（渲染端 viewmat_from_pose 也只按刚体用它）。"""
-    m = np.asarray(nav_to_world, dtype=np.float64)
-    if m.shape != (4, 4) or not np.isfinite(m).all():
-        raise ValueError("nav_to_world 必须是有限 4x4")
-    r = m[:3, :3]
-    if not np.allclose(r @ r.T, np.eye(3), atol=1e-6) or np.linalg.det(r) < 0:
-        raise ValueError("nav_to_world 的旋转块必须正交且 det=+1（不支持缩放/镜像）")
-    return r, m[:3, 3]
+    m = scene_mod.validate_nav_to_world(nav_to_world)
+    return m[:3, :3], m[:3, 3]
 
 
 class Occupancy:
@@ -317,7 +312,7 @@ class Occupancy:
         self.body_half_height = float(body_half_height_m)
         self.inflate = float(inflate_m)
         self.opacity_min = float(opacity_min)
-        self.max_scale = None if max_scale_m is None else float(max_scale_m)
+        self.max_scale = scene_mod.normalize_max_scale(max_scale_m)
         self.sigma_k = float(sigma_k)
         self.ground_z = float(ground_z)
         self.min_points = int(min_points)
@@ -346,8 +341,7 @@ class Occupancy:
         if scales is not None:
             sc = np.asarray(scales, dtype=np.float64)
             keep &= np.isfinite(sc).all(axis=1)
-            if self.max_scale is not None:
-                keep &= sc.max(axis=1) <= self.max_scale         # (b) 巨型天空高斯
+            keep &= scene_mod.scale_keep_mask(sc, self.max_scale)  # (b) 巨型天空高斯
         self.n_kept = int(keep.sum())
         pts = pts[keep]
         if scales is None:

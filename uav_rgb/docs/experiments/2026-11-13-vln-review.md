@@ -108,3 +108,26 @@ v2碰撞模型的几何规划也可达，最小净空0.8m/1.0m；但地形标记
 - 全量入口的CUDA CPU占用性能测试仍失败；不能宣称所有测试通过。
 - GUI交互、Gazebo实时闭环以及约120s长航程的真实机体稳定性没有在本轮验收。
 - 全量入口在CTest失败后未执行其后面的Python产物→C++ UAVR读回/软标签身份桥接检查；本次未改这些格式，实现卡E时必须补跑。
+
+## 6. 2026-11-14 恢复会话追加：卡 A 与回归
+
+本节基于审查分支 `review/uav-vln-20261113` 的新变更；测试数只覆盖相应命令，不能与上节 11-13 的指标混为一轮训练结果。
+
+- `collect_3dgs.run_episode` 新增独立 `stop_requested`。显式 STOP 将动作改为一个 `SAFE_NEUTRAL` 窗口，碰撞/异常优先；目标内 SAFE 不自动成功，目标外 STOP 计失败。A* 教师只在目标半径内发 STOP。`run_vln` 默认 `3dgs.vln.v3`，旧三连 SAFE 显式选择 `--stop-mode legacy-safe` 并记为 v2。
+- `StudentAdapter`/DAgger 校验条件类型。文本网络缺指令或全 PAD、纯视觉网络收到 token、heading-code 权重被当作 prev-action 输入时拒绝；未知训练来源只警告并记录。此项是输入安全合同，不是把 SAGE 文本接入模型。
+- `max_scale_m=0` 与 `None` 统一表示关闭过滤；非法值拒绝。`nav_to_world` 统一校验有限的 4×4 刚体变换。cf_sitl 的步长必须是至少一个 1 ms tick 的整数倍；旧视频的碰撞失败优先于 goal 标记。
+- 集成复核补出最后预算步碰撞被 `rows_ok == steps` 覆盖的问题；现已让碰撞、截断和动力学异常优先，并新增末步回归。
+
+| 检查 | 结果 |
+| --- | --- |
+| 改动相关 `test_collect_eval`、`test_vln`、`test_video`、`test_dynamics_sitl`、`test_student_inputs` | 86 tests，52.920 s，全部通过 |
+| 真正 GPU renderer + collision 回归（agent报告，`render-tests.log`） | 43/43，无跳过；RTX 2080 Ti / sm75 |
+| 本地场景刚体/视图检查（agent报告） | 13/13 场景通过 |
+| `tools/check.sh --python-only` | 退出 0，有 3 项 GUI SKIP；末步 completed 回归补入前运行，相关 86 项当前代码已另行通过 |
+| cf_sitl CTest / selftest | 9/9；自检 33 通过、0失败、0跳过 |
+| SAGE 特权教师显卡冒烟，`sage3d_841150` 两集 | 2/2，SR=1、OSR=1、碰撞率 0；这是 waypoint 已知的 A* 教师管线验证，不是语言策略效果 |
+| 完整 `tools/check.sh` | C++/CUDA 构建通过；CTest 43/44。唯一失败 `test_cuda_blocking_sync`：CPU核占用 `off=0.987944`，`cli=0.397291`、`env1=0.382025`，未达到现有 `<0.35×off` 阈值。没有放宽断言；脚本在 CTest 处停止 |
+
+记录目录：`/root/rivermind-data/uav_rgb/tmp/vln-review-20261113/`；完整构建与SITL日志另在 `.../tmp/vln-review-20261113-session/`。这些临时证据未纳入Git，仓库只保留摘要和可重跑命令。
+
+本轮没有训练语言 grounder/学生、扩数据、重跑 249 集、验证真机抖动或改 PID。后续按计划卡 B/C/D 先完成视角覆盖、控制分因和语言反事实闭环；现存可视化呈现指令与终点只表明任务/结果被记录，不表明模型使用了语言。

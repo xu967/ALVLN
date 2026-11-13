@@ -147,6 +147,7 @@ class ForwardPolicy:
     """盲前进基线；不读图像，用于打通链路/对照。"""
 
     name = "forward"
+    stop_requested = False
 
     def __call__(self, rgb, depth, state):
         return FORWARD_SLOW, None
@@ -159,9 +160,13 @@ class StudentAdapter:
     """
 
     name = "student"
+    stop_requested = False       # 当前四动作模型没有任务完成头，SAFE 不能代替 STOP
 
     def __init__(self, student):
         self.student = student
+        validate = getattr(student, "validate_inputs", None)
+        if validate is not None:
+            validate(nav_cond.COND_PREV_ACTION)
         # 学生喂的条件输入：prev-action = 上一步**实际执行**的动作（训练侧车取的就是 action_executed）；
         # None = 纯图像模型（prev_dim = 0），没有条件输入。run_episode 把非 None 的值写进 manifest 的 student_cond。
         self.student_cond = nav_cond.COND_PREV_ACTION if getattr(student, "prev_dim", 0) else None
@@ -212,6 +217,7 @@ class DaggerPolicy:
         self.stop_radius = expert.stop_radius
         self.last_expert = None
         self.n_expert_exec = 0
+        self.stop_requested = False
 
     def reset(self):
         """集边界：清学生的帧/动作缓存与上一步执行的动作（StudentAdapter 只在构造时 reset，而本对象整轮复用）；教师有集内状态（连续等待计数）也清。"""
@@ -219,6 +225,7 @@ class DaggerPolicy:
         if hasattr(self.expert, "reset"):
             self.expert.reset()
         self.last_expert = None
+        self.stop_requested = False
 
     def note_executed(self, action):
         """外层护栏改写了本策略的动作：转给学生适配器，下一步的上一步动作取改写之后的。"""
@@ -235,8 +242,10 @@ class DaggerPolicy:
     def __call__(self, rgb, depth, state):
         self.last_expert, _ = self.expert(rgb, depth, state)
         action, infer_ms = self.student(rgb, depth, state)
+        self.stop_requested = self.student.stop_requested
         if self.beta > 0.0 and self.rng.random() < self.beta:
             action = self.last_expert
+            self.stop_requested = getattr(self.expert, "stop_requested", False)
             self.n_expert_exec += 1
             self.student.note_executed(action)     # 学生下一步看到的上一步动作是教师动作，不是它自己的输出
         return action, infer_ms
@@ -300,7 +309,8 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                 save_depth=False, stop_on_collision=False, dynamics_path=None,
                 truncate_on_collision=False,
                 spawn_jitter=0.0, identity=None, split_policy=None,
-                dynamics="cf_blackbox", agl=None, spawn_two_layer=False, stop_after_safe=None):
+                dynamics="cf_blackbox", agl=None, spawn_two_layer=False, stop_after_safe=None,
+                stop_on_request=False):
     """跑一集，返回 (manifest, error)。产物写 out_dir；异常也尽量落 manifest。
 
     identity：scene_identity() 的结果（gid/scene_id/task_id）；None 时现算。
@@ -317,11 +327,16 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
     manifest 记 truncated_on_collision=true，stopped_on_collision 保持 false。两者互斥。
     spawn_two_layer：出生抖动的候选点要在出生高度与巡航高度两层都不碰撞、且净空够（_spawn_two_layer_ok）；缺省 False，
     出生位姿与随机数消耗不变。开关值写进 manifest 的 spawn_two_layer。
-    stop_after_safe：VLN 语义（sim/3dgs/vln.py）：策略在任何位置连续这么多步出 SAFE_NEUTRAL 就是喊停，本集在那一步结束，
-    manifest stopped_by_agent=true；不看离目标多远，到没到由评测算。None（缺省）= 旧行为。
+    stop_after_safe：仅复现旧 VLN 的连续 SAFE 喊停约定，不能与 stop_on_request 同用。
+    stop_on_request：策略每步公开 bool stop_requested；发 STOP 时执行一个 SAFE 窗口再结束，碰撞/异常优先。
+    不看目标真值，也不沿用教师连续 SAFE 的 goal-stop。是否到达与是否稳定悬停由评测另判。
     """
     if stop_on_collision and truncate_on_collision:
         raise ValueError("stop_on_collision（闭环评测）与 truncate_on_collision（训练采集）互斥")
+    if stop_on_request and stop_after_safe is not None:
+        raise ValueError("stop_on_request 与旧 stop_after_safe 互斥")
+    if stop_on_request and not isinstance(getattr(policy, "stop_requested", None), bool):
+        raise ValueError("显式 STOP 策略（含包装层）必须公开 bool stop_requested")
     os.makedirs(out_dir, exist_ok=True)
     identity = identity or scene_identity(scene)
     if split_policy is None:
@@ -365,6 +380,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
     wp = scene.get("waypoint") or {}
     stop_streak, stopped_on_goal = 0, False
     safe_streak, stopped_by_agent = 0, False
+    terminal_reason = "budget_exhausted"
     anomaly, back_streak = None, 0
     n_low_quality = 0
     error = None
@@ -402,6 +418,15 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                 raise RuntimeError(f"写 RGB 失败: {e}") from e
 
             action, infer_ms = policy(rgb, depth, dyn)
+            stop_requested = False
+            if stop_on_request:
+                stop_requested = policy.stop_requested
+                if not isinstance(stop_requested, bool):
+                    raise ValueError("策略 stop_requested 必须是 bool")
+                if stop_requested:
+                    action = SAFE_NEUTRAL
+                    if hasattr(policy, "note_executed"):
+                        policy.note_executed(action)
             # DAgger：执行的是学生（或 β 抽中的教师）动作，标签始终是教师的；教师/forward 策略两者相同；
             # 非 DAgger 的学生集（eval_3dgs 的 StudentAdapter）没有教师标签，action_expert 写 None，不再把学生动作记成标签
             # （preprocess 按 teacher 门禁拒收这类集，不会读到 None）。
@@ -438,6 +463,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                 "timestamp_ns": ts0,
                 "action_expert": expert,
                 "action_executed": action,
+                **({"stop_requested": stop_requested} if stop_on_request else {}),
                 "collision": hit_once,
                 # 与 collect.py 对齐：src 区分碰撞来源；voxel_proxy = 本步扫掠撞到，post_collision = 撞后穿模的步。
                 "src": src,
@@ -472,30 +498,41 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                   f"yaw={yaw:.1f} d={dist:.2f} collide={collided} "
                   f"render={ms:.1f}ms infer={infer_ms}", file=sys.stderr)
             if anomaly is not None:
+                terminal_reason = "dynamics_anomaly"
                 print(f"step {i}: 动力学异常 {anomaly}，提前结束", file=sys.stderr)
                 break
-            if stop_on_collision and collided:
+            if (stop_on_collision or stop_on_request) and collided:
                 stopped = True
+                terminal_reason = "collision"
                 print(f"step {i}: 碰撞，提前结束", file=sys.stderr)
                 break
             if truncate_on_collision and collided:
                 truncated = True
+                terminal_reason = "collision"
                 print(f"step {i}: 碰撞，本集到此截断（这一行留给 --drop-collision）", file=sys.stderr)
+                break
+            if stop_on_request and stop_requested:
+                stopped_by_agent = True
+                terminal_reason = "agent_stop"
+                print(f"step {i}: 智能体显式 STOP，SAFE 窗口执行后结束本集", file=sys.stderr)
                 break
             safe_streak = safe_streak + 1 if action == SAFE_NEUTRAL else 0
             if stop_after_safe is not None and safe_streak >= stop_after_safe:
                 stopped_by_agent = True
+                terminal_reason = "legacy_safe_streak"
                 print(f"step {i}: 连续 {stop_after_safe} 步 SAFE = 智能体喊停（VLN STOP），结束本集", file=sys.stderr)
                 break
-            if stop_radius is not None:
+            if not stop_on_request and stop_radius is not None:
                 at_goal = math.hypot(x0 - float(wp["x"]), y0 - float(wp["y"])) <= stop_radius
                 stop_streak = stop_streak + 1 if (action == SAFE_NEUTRAL and at_goal) else 0
                 if stop_streak >= 3:
                     stopped_on_goal = True
+                    terminal_reason = "legacy_goal_stop"
                     print(f"step {i}: goal-stop 连续 3 步 SAFE，提前结束", file=sys.stderr)
                     break
     except BaseException as e:  # noqa: BLE001 - 异常也要写 manifest
         error = f"{type(e).__name__}: {e}"
+        terminal_reason = "error"
         raise
     finally:
         _write_jsonl(os.path.join(out_dir, "actions.jsonl"), actions)
@@ -516,6 +553,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
         except (OSError, ValueError) as e:
             if error is None:
                 error = f"复制 scene.json 失败: {e}"
+                terminal_reason = "error"
         manifest = {
             "schema": "navlab.episode.v1",
             "episode_id": episode_id if episode_id is not None else seed,
@@ -601,7 +639,9 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             },
             # 与 sim/tools/collect.py 同义：跑满请求步数 或 goal-stop。碰撞截断 / 评测即停 / 动力学异常 /
             # error 的集都是 false；physics_verified 不含这层意思（AUDIT_SIM Nice 7，tools/DATASET_FORMAT.md §1.5）。
-            "completed": bool(rows_ok > 0 and error is None and (rows_ok == steps or stopped_on_goal or stopped_by_agent)),
+            "completed": bool(rows_ok > 0 and error is None and anomaly is None
+                              and not stopped and not truncated
+                              and (rows_ok == steps or stopped_on_goal or stopped_by_agent)),
             "dynamics_anomaly": anomaly,
             "num_steps": rows_ok,
             "requested_steps": steps,
@@ -622,7 +662,9 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             "stop_radius": stop_radius,            # 教师 goal-stop 半径（深度教师/forward 为 None）
             "stopped_on_goal": stopped_on_goal,
             "stop_after_safe": stop_after_safe,      # VLN 喊停约定（连续几步 SAFE）；None = 不按喊停结束
+            "stop_on_request": bool(stop_on_request),
             "stopped_by_agent": stopped_by_agent,
+            "terminal_reason": terminal_reason,
             # A* 教师 fail-closed 输出 SAFE 的步数（被围死 / waypoint 在占据里）：这些 SAFE 在画面里没有
             # 悬停依据，>0 的集不该进训练集，demo_3dgs_routes 的健康检查按它标红。非 A* 教师为 None。
             "planner_failures": getattr(policy, "n_plan_fail", None),

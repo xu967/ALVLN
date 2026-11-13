@@ -9,7 +9,7 @@
 策略：
   teacher  占据 A* 教师，直接拿航线终点当目标：等于已经听懂了指令（特权），是上界，也是以后蒸馏的老师
   forward  一直前进、从不喊停，不看指令：下界
-看图又看指令的学生接进来之前，两者之间的差就是「听懂指令」值多少。
+两者只给出特权导航与盲飞对照，差值不等于语言理解收益；还没有读取语言的学生。
 
 产物：<out>/<场景>/<航线>_<指令序号>/（run_episode 的逐步记录；前 --videos 集另有 views.mp4）、
 <out>/episodes.jsonl（每集一行）、<out>/vln_eval.json（总表，另按句式 / SAGE split / 场景分组）。
@@ -31,7 +31,7 @@ from . import vln
 from .dynamics import CfSitlParams
 from .eval_3dgs import reach_radius_of, route_shortest_path_m
 
-METRIC_VERSION = "3dgs.vln.v2"
+METRIC_VERSION = "3dgs.vln.v3"
 STEPS_HOLD_S = 0.5      # 航线 max_steps 是导入时按 hold 0.5 估的（scene_import_sage3d），别的 hold 按时长换算
 
 
@@ -86,7 +86,9 @@ def run_scene(path, args, params):
             man, err = collect_3dgs.run_episode(
                 scene, ep_dir, renderer, occ, params, policy, steps, args.hold,
                 split=identity["split"], seed=args.seed + n, episode_id=n, stop_on_collision=True,
-                identity=identity, split_policy="diag-vln-eval", dynamics="cf_sitl", stop_after_safe=vln.STOP_STREAK)
+                identity=identity, split_policy="diag-vln-eval", dynamics="cf_sitl",
+                stop_on_request=args.stop_mode == "explicit",
+                stop_after_safe=vln.STOP_STREAK if args.stop_mode == "legacy-safe" else None)
             if err or man.get("error"):
                 raise RuntimeError(err or man["error"])
             validity = man.get("validity", {})
@@ -103,7 +105,8 @@ def run_scene(path, args, params):
         except Exception as e:  # noqa: BLE001 - 一集崩了记下来接着跑，报告里单列
             failures.append({**ep, "scene": scene["name"], "dir": ep_dir, "error": f"{type(e).__name__}: {e}"})
             continue
-        row = {**ep, "scene": scene["name"], **m, "error": err, "dir": ep_dir}
+        row = {**ep, "scene": scene["name"], **m, "error": err, "dir": ep_dir,
+               "terminal_reason": man.get("terminal_reason")}
         rows.append(row)
         print(f"[{scene['name']} {n + 1}/{len(eps)}] {result_text(m):24s} {ep['type']:22s} {ep['text']}", file=sys.stderr)
         if n < args.videos:
@@ -121,6 +124,8 @@ def main(argv=None):
     p.add_argument("--policy", choices=("teacher", "forward"), required=True)
     p.add_argument("--out", required=True)
     p.add_argument("--hold", type=float, default=0.5, help="每步动作窗口（秒）")
+    p.add_argument("--stop-mode", choices=("explicit", "legacy-safe"), default="explicit",
+                   help="explicit：独立 STOP 意图，执行一个 SAFE 窗口后判分；legacy-safe：仅复现 v2 连续三步 SAFE")
     p.add_argument("--split", action="append", default=None,
                    help="只取这些 SAGE split（train / test_Instruction_Unseen / test_Trajectory_Unseen / test_Scene_Unseen）")
     p.add_argument("--all-instructions", action="store_true", help="每条航线的每句指令都跑（缺省每条航线一句）")
@@ -147,8 +152,10 @@ def main(argv=None):
     with open(os.path.join(args.out, "episodes.jsonl"), "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
-    report = {"metric_version": METRIC_VERSION, "policy": args.policy, "hold_s": args.hold,
-              "stop_streak": vln.STOP_STREAK, "dynamics": "cf_sitl", "dynamics_profile": params.profile(),
+    report = {"metric_version": METRIC_VERSION if args.stop_mode == "explicit" else "3dgs.vln.v2",
+              "policy": args.policy, "hold_s": args.hold, "stop_mode": args.stop_mode,
+              "stop_streak": vln.STOP_STREAK if args.stop_mode == "legacy-safe" else None,
+              "dynamics": "cf_sitl", "dynamics_profile": params.profile(),
               "scenes": args.scene, "split_filter": args.split, "all_instructions": args.all_instructions,
               "overall": vln.summarize(rows, failures), "by_type": vln.summarize_by(rows, "type", failures),
               "by_split": vln.summarize_by(rows, "split", failures), "by_scene": vln.summarize_by(rows, "scene", failures),

@@ -1,6 +1,14 @@
 # progress.md（新开会话先读这个）
 
-## 2026-11-13 VLN 第二次复核（本节最新）
+## 2026-11-14 VLN 卡 A 与可靠性修复（最新）
+
+- 按计划完成卡 A：显式 `stop_requested` 与安全 SAFE 分开；`run_vln` 默认用 `3dgs.vln.v3`，旧 STOP 规则可用 `--stop-mode legacy-safe` 复现 v2。
+- 修正学生入口输入错配（缺语言 token / 纯视觉模型收到无效指令）、3DGS 渲染与碰撞尺度筛选不一致、非法相机刚体变换、cf_sitl 子毫秒窗口被舍零、碰撞录像假成功及末预算步碰撞误标 `completed`。
+- 相关 86 项 unittest 通过；真实 renderer/collision GPU 回归 43/43；cf_sitl CTest 9/9、自检 33/33；两集 SAGE 特权 A* 教师冒烟通过。全量 `tools/check.sh` 仍有一个 CUDA CPU 占用阈值失败（43/44），没有放宽门槛。
+- 没有训练语言学生、grounder 或更长场景；teacher 冒烟不等于 VLN 完成。按 `docs/PLAN_2026-11-13_vln.md §10` 继续 B/C/D。
+- 过程、证据和未做事项追加在 `docs/worklog/2026-11-13-2247-vln-review.md` 与 `docs/experiments/2026-11-13-vln-review.md`。
+
+## 2026-11-13 VLN 第二次复核（历史背景）
 
 - 用户要求重新从无人机视觉语言导航检查需求，三路 agents 并行阅读语言/评测、3DGS/控制、数据/基线，主会话核架构与 Git。
 - 已执行本轮可靠性修复：VLN失败分母与诊断数据隔离、航线身份、SPL起点、录像STOP语义与真实时间轴。语言grounder/新学生尚未实现。

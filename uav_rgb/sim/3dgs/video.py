@@ -482,13 +482,13 @@ def episode_result(man, oracle=None, reach_radius_m=None, collided=False, action
         if m["collision"]:
             return "COLLISION"
         return ("WRONG STOP %.1f m" if m["stopped"] else "NO STOP %.1f m") % m["ne_m"]
-    if man.get("stopped_on_goal"):
-        return "SUCCESS reached"
     if man.get("stopped_on_collision") or man.get("truncated_on_collision") or collided:
         return "COLLISION"
     if man.get("dynamics_anomaly"):
         return "ANOMALY %s" % (man["dynamics_anomaly"].get("kind") if isinstance(man["dynamics_anomaly"], dict)
                                else man["dynamics_anomaly"])
+    if man.get("stopped_on_goal"):
+        return "SUCCESS reached"
     wp = man.get("waypoint") or {}
     if oracle and reach_radius_m is not None and "x" in wp and "y" in wp:
         dmin = min(math.hypot(float(o["pose_gt"]["x"]) - float(wp["x"]), float(o["pose_gt"]["y"]) - float(wp["y"]))
