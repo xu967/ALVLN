@@ -300,7 +300,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                 save_depth=False, stop_on_collision=False, dynamics_path=None,
                 truncate_on_collision=False,
                 spawn_jitter=0.0, identity=None, split_policy=None,
-                dynamics="cf_blackbox", agl=None, spawn_two_layer=False):
+                dynamics="cf_blackbox", agl=None, spawn_two_layer=False, stop_after_safe=None):
     """跑一集，返回 (manifest, error)。产物写 out_dir；异常也尽量落 manifest。
 
     identity：scene_identity() 的结果（gid/scene_id/task_id）；None 时现算。
@@ -317,6 +317,8 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
     manifest 记 truncated_on_collision=true，stopped_on_collision 保持 false。两者互斥。
     spawn_two_layer：出生抖动的候选点要在出生高度与巡航高度两层都不碰撞、且净空够（_spawn_two_layer_ok）；缺省 False，
     出生位姿与随机数消耗不变。开关值写进 manifest 的 spawn_two_layer。
+    stop_after_safe：VLN 语义（sim/3dgs/vln.py）：策略在任何位置连续这么多步出 SAFE_NEUTRAL 就是喊停，本集在那一步结束，
+    manifest stopped_by_agent=true；不看离目标多远，到没到由评测算。None（缺省）= 旧行为。
     """
     if stop_on_collision and truncate_on_collision:
         raise ValueError("stop_on_collision（闭环评测）与 truncate_on_collision（训练采集）互斥")
@@ -362,6 +364,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
     stop_radius = getattr(policy, "stop_radius", None)
     wp = scene.get("waypoint") or {}
     stop_streak, stopped_on_goal = 0, False
+    safe_streak, stopped_by_agent = 0, False
     anomaly, back_streak = None, 0
     n_low_quality = 0
     error = None
@@ -479,6 +482,11 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                 truncated = True
                 print(f"step {i}: 碰撞，本集到此截断（这一行留给 --drop-collision）", file=sys.stderr)
                 break
+            safe_streak = safe_streak + 1 if action == SAFE_NEUTRAL else 0
+            if stop_after_safe is not None and safe_streak >= stop_after_safe:
+                stopped_by_agent = True
+                print(f"step {i}: 连续 {stop_after_safe} 步 SAFE = 智能体喊停（VLN STOP），结束本集", file=sys.stderr)
+                break
             if stop_radius is not None:
                 at_goal = math.hypot(x0 - float(wp["x"]), y0 - float(wp["y"])) <= stop_radius
                 stop_streak = stop_streak + 1 if (action == SAFE_NEUTRAL and at_goal) else 0
@@ -524,6 +532,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             "geometry_version": identity["geometry_version"],
             "appearance_version": scene.get("appearance_version") or "3dgs.v1",
             "route": scene.get("route"),      # scene.apply_route 选的路线（index/name）；旧 scene 为 None
+            "vln": scene.get("vln"),          # VLN 集的指令与目标物体（run_vln 设，vln.episodes 的一项）；非 VLN 为 None
             "waypoint": scene.get("waypoint"),
             "scene": {"name": scene.get("name"),
                       "source": scene.get("source"),
@@ -592,7 +601,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             },
             # 与 sim/tools/collect.py 同义：跑满请求步数 或 goal-stop。碰撞截断 / 评测即停 / 动力学异常 /
             # error 的集都是 false；physics_verified 不含这层意思（AUDIT_SIM Nice 7，tools/DATASET_FORMAT.md §1.5）。
-            "completed": bool(rows_ok > 0 and error is None and (rows_ok == steps or stopped_on_goal)),
+            "completed": bool(rows_ok > 0 and error is None and (rows_ok == steps or stopped_on_goal or stopped_by_agent)),
             "dynamics_anomaly": anomaly,
             "num_steps": rows_ok,
             "requested_steps": steps,
@@ -612,6 +621,8 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             "truncated_on_collision": truncated,   # 训练采集撞后截断（不是闭环评测产物，preprocess 照收）
             "stop_radius": stop_radius,            # 教师 goal-stop 半径（深度教师/forward 为 None）
             "stopped_on_goal": stopped_on_goal,
+            "stop_after_safe": stop_after_safe,      # VLN 喊停约定（连续几步 SAFE）；None = 不按喊停结束
+            "stopped_by_agent": stopped_by_agent,
             # A* 教师 fail-closed 输出 SAFE 的步数（被围死 / waypoint 在占据里）：这些 SAFE 在画面里没有
             # 悬停依据，>0 的集不该进训练集，demo_3dgs_routes 的健康检查按它标红。非 A* 教师为 None。
             "planner_failures": getattr(policy, "n_plan_fail", None),
