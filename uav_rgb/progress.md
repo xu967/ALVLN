@@ -1,6 +1,28 @@
 # progress.md（新开会话先读这个）
 
-## 2026-11-10 19:03 起 第十二阶段：长程任务、场景复杂化、开源对比（Cursor 会话；本节最新）
+## 2026-11-13 晚 VLN 纠偏：语言指令 → 飞到目的地并停下（Cursor 会话；本节最新）
+
+先读：计划 `docs/PLAN_2026-11-13_vln.md`（§0 结论、§4 任务卡、§8 待拍板）；实验 `docs/experiments/2026-11-13-vln-m1.md`；
+过程 `docs/worklog/2026-11-13-2225-vln-m1.md`。下面第十二阶段的结论仍然成立，主线从「飞不撞」换成「听一句话、飞到那、自己停」。
+
+### 已完成的事项
+
+- 用户指出项目理解偏了：要做的是视觉语言导航。审查结论：各条线都没有语言输入；3DGS 的成功判据不要求停下，
+  等于 OSR；SAGE-3D 导入的 4429 句指令没有代码读。
+- 代码提交（分支 `cursor/vln-language-goal-5fa5`，快进合入 main 后用 `tools/git_mirror_alvln.sh` 推送）：
+  `be5237b` 视频（指令横幅、跟随镜头偏航低通、删重复的 `_read_jsonl`）；
+  `b3dfc90` VLN 任务层（`sim/3dgs/vln.py`、`sim/3dgs/run_vln.py`、`run_episode(stop_after_safe=)`、`sim/3dgs/test_vln.py`）。
+- M1 实测（6 个 SAGE-3D 室内场景、249 集、cf_sitl）：教师 SR 0.843、SPL 0.677、碰撞 0.149；盲飞 SR 0、OSR 0.241、碰撞 0.964。
+  教师 37 次碰撞里 25 次撞在前进后紧接原地转向的那一步（净空检查没算惯性）。产物 `$D/exp-vln-m1-20261113/`。
+- 整理：移除 6 个干净且已合并的 worktree（分支保留）；工作区根目录和 `code/` 下的冗余、过时文件移到
+  `$D/trash-2026-11-13-vln-cleanup/`（`MANIFEST.txt` 有每项的理由和回滚命令）；`code/README.md` 的上传流程改成现行脚本。
+
+### 下一步
+
+- M2-0 修教师净空（算上刹车距离），然后 M2-1 到 M2-5（计划 §4）。
+- 等用户：InteriorGS 权限、加盘、显卡、动作契约（计划 §8）；数据盘旧实验目录和有未提交改动的 worktree 要不要清。
+
+## 2026-11-10 19:03 起 第十二阶段：长程任务、场景复杂化、开源对比（Cursor 会话；主线已由上一节更新）
 
 先读：计划 `docs/PLAN_2026-11-10_phase12.md`（§0 结论、§8 待拍板）；任务卡 `docs/briefs/2026-11-10-phase12-task-cards.md`（给 deepseek 或 Sonnet 5.5 Max）；
 公共规则 `docs/briefs/2026-11-10-phase12-common.md`；过程 `docs/worklog/2026-11-10-1903-phase12-long-horizon.md`；报告 `docs/reviews/2026-11-10-phase12/`。

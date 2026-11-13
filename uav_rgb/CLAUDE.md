@@ -4,6 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
+**现行入口（2026-11-13 加）**：主线改为视觉语言导航（一句话 → 飞到目标并自己停下）。计划 `docs/PLAN_2026-11-13_vln.md`（§0、§4 任务卡、§8 待拍板），
+M1 实验 `docs/experiments/2026-11-13-vln-m1.md`，进度看 `progress.md` 最上面一节；下面第十二阶段的约定仍然有效。
+
 **现行入口（2026-11-12 09:35 加；第二轮审核 O-2、O-8、O-9）**：第十二阶段的通用约定在 `docs/briefs/2026-11-10-phase12-common.md`，计划在 `docs/PLAN_2026-11-10_phase12.md`（先读 §0 与 §10），任务卡在 `docs/briefs/2026-11-10-phase12-task-cards.md`，现状在 `progress.md`。
 本文件下面的状态说明、`docs/HANDOFF.md` 与 `docs/TASKS.md` 大部分写于 11-05 之前（X3 载具、L1 v4），与现行主线（E1 MINI 固件在环、带航向码的端到端学生）不一致的地方以上面四份为准。
 现行的硬约定里与下文冲突的四条：显卡只有一张 `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`（每次以 `nvidia-smi -L` 为准）；命令用 `$UAV_RGB_PYTHON`（`.venv-tools/bin/python`），不用裸 `python3`；输出一律写 `$DATA_ROOT/uav_rgb`，不写 `/tmp`；
