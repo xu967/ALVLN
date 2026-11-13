@@ -36,6 +36,8 @@ FOLLOW_BACK_M = 1.1    # 跟随机位：机体后方 1.1 m、上方 0.3 m，俯�
 FOLLOW_UP_M = 0.3      #   §6.1 要求原生 640 宽跟随格里机体 ≥ 80 px：60° HFOV 下 f = 320/tan30° ≈ 554 px，
 #                          0.172 m 宽的机体在 1.5 m 处只有 63 px（brief 建议值不够），1.1 m 处 ≈ 90 px（后保护罩斜距 1.06 m）。
 #                          Callinstrasse 是行人高度拍的重建，机位高于约 2.6 m 就被天空壳/漂浮高斯糊住，所以只抬 0.3 m
+FOLLOW_YAW_TAU_S = 0.6  # 跟随机位偏航的一阶低通：原地转向（34°/s 起停）时镜头慢半拍跟上，背景不再一顿一顿地甩；
+#                          机位始终在机体正后方（按平滑后的偏航），机体仍在画面中心；只改 FOLLOW 格，机载格是真实姿态
 TOP_MARGIN_M = 3.0     # 顶视用占据代理 2D 地图（3DGS 从上往下渲染全是漂浮物，4–20 m 高都试过）：
 #                          地图窗口 = spawn–waypoint 包围盒各向外扩 3 m，到达半径 2 m 圈和两侧建筑都在图里
 HOLD_END_S = 1.5       # 结尾定格秒数（写 SUCCESS/COLLISION 大字），与 record_views.compose 默认一致，短片里结果停得住
@@ -82,9 +84,23 @@ def compose_rgb_video(frames_dir, out_path, fps=10.0):
     return written
 
 
-def _read_jsonl(path):
-    with open(path, "r", encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
+def _banner(cv2, canvas, text, x, y, w, s=1, max_lines=4):
+    """指令横幅：贴在格子左上标签下面，半透明黑底白字，按格宽折行，超过 max_lines 行的部分不画。"""
+    font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.5 * s, s
+    lines, cur = [], ""
+    for word in text.split():
+        trial = f"{cur} {word}" if cur else word
+        if cur and cv2.getTextSize(trial, font, scale, thick)[0][0] > w - 24 * s:
+            lines.append(cur)
+            cur = word
+        else:
+            cur = trial
+    lines = (lines + [cur])[:max_lines]
+    y0, h = y + 32 * s, (20 * len(lines) + 10) * s
+    roi = canvas[y0:y0 + h, x:x + w]
+    roi[:] = (roi * 0.35).astype(np.uint8)
+    for k, line in enumerate(lines):
+        cv2.putText(canvas, line, (x + 12 * s, y0 + (20 * k + 19) * s), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
 
 
 def _draw_body(img, pos, quat, cam_view, fov_deg, n2w=None):
@@ -188,8 +204,10 @@ class _TopMap:
 
 
 def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_dir=None,
-                        title="", result="", quality=None, log=print):
+                        title="", result="", quality=None, log=print, instruction=""):
     """cf_sitl 采集集（trace.jsonl + actions.jsonl）-> 四格视频（.mp4 / .webm）+ 关键帧 PNG。
+
+    instruction：VLN 集的指令原文（可带目标物体），非空时作为横幅贴在 FOLLOW 格顶部，整段视频一直显示。
 
     左上 FOLLOW：同一 3DGS，只跟位置与偏航，机体后方 FOLLOW_BACK_M、上方 FOLLOW_UP_M，格子原生分辨率
     渲染，叠 E1 机体着色投影；右上 TOP：占据代理 2D 地图 + 轨迹 + 机体图标（occ 是 collision.from_scene 的
@@ -243,6 +261,7 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
     hit = next((a for a in actions if a.get("collision")), None)
     follow_label = "FOLLOW back %.1fm up %.1fm (E1 body %.2fm)" % (FOLLOW_BACK_M, FOLLOW_UP_M, e1_body.WIDTH_M)
     cells = None
+    cam_yaw, alpha = None, 1.0 - math.exp(-1.0 / (VIEW_FPS * FOLLOW_YAW_TAU_S))
     try:
         for i, row in enumerate(seq):
             x, y, z = (float(v) for v in row["pos"])
@@ -255,8 +274,12 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
                 # 机载：模型输入是 renderer.width×height（320×240）；high 档为显示另渲 s 倍帧，标题注明 display 2x
                 onboard = _render(renderer, renderer.width * s, renderer.height * s, ssaa=ssaa,
                                   view=scene_mod.viewmat_from_quat((x, y, z), row["quat"], mount, n2w))
-                follow_pose = (x - FOLLOW_BACK_M * math.cos(yaw), y - FOLLOW_BACK_M * math.sin(yaw),
-                               z + FOLLOW_UP_M, math.degrees(yaw), pitch_follow)
+                if cam_yaw is None:
+                    cam_yaw = yaw
+                d = yaw - cam_yaw
+                cam_yaw += alpha * math.atan2(math.sin(d), math.cos(d))      # 走最短角度差，跨 ±180° 不绕圈
+                follow_pose = (x - FOLLOW_BACK_M * math.cos(cam_yaw), y - FOLLOW_BACK_M * math.sin(cam_yaw),
+                               z + FOLLOW_UP_M, math.degrees(cam_yaw), pitch_follow)
                 follow = _render(renderer, CW, CH, pose=follow_pose, ssaa=ssaa)
                 # 机体用跟随相机同一 view 矩阵投影（以前是黄线框，更早是固定画在格子中心的 6 px 圆）
                 box = _draw_body(follow, (x, y, z), row["quat"], scene_mod.viewmat_from_pose(*follow_pose, n2w),
@@ -269,6 +292,8 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
             note = f"sim {t:.2f}s"                 # 每帧按 trace 时刻现渲，没有 Gazebo 那种帧龄
             canvas = np.zeros((H, W, 3), np.uint8)
             vl.paste(cv2, canvas, follow, *tl, CW, CH, follow_label, note, s=s)
+            if instruction:
+                _banner(cv2, canvas, instruction, *tl, CW, s=s)
             vl.paste(cv2, canvas, top, *tr, CW, CH, "TOP MAP occupancy proxy + path", note, s=s)
             vl.paste(cv2, canvas, onboard, *bl, CW, CH,
                      vl.onboard_label(onboard, renderer.fov_deg, display=s, rendered_at=s), note, s=s)
