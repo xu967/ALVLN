@@ -17,7 +17,7 @@
 - 没有完成任何新数据集下载：Hugging Face 请求超时；AirVLN Kaggle 下载地址返回 404，官方 S3 入口超时。`uav_datasets` 下对应目录为空。
 - 没有下载 AirVLN 约 35 GB 的模拟器，先等小型指令标注和许可核验通过；没有下载约 620 MB 的 MatrixCity 单个 tar，因当前 HF 网络不可达且其许可为 CC-BY-NC-4.0。
 - 没有运行新的 VLN 学生闭环或语言消融：当前没有已接通的语言 grounder / 目标条件学生，不能用教师冒充语言能力。
-- 没有迁移 `root-offload-20261107`、`scratch_audit`、UAV 场景/虚拟环境、其他项目目录或整仓备份 ZIP。`root-offload` 中存在仍在变化的临时 tar；其他项尚不能证明是冗余。只保留已核验的两份重复压缩包。
+- 没有迁移 `root-offload-20261107`、`scratch_audit`、UAV 场景/虚拟环境、其他项目目录或 `archive/idea`：这些内容仍在使用、变化或被文档引用。后续审计确认 `claude-code-backup-20261028.zip` 是冷备份，已移动到 `/root/rivermind-fs/archive/rivermind-data-archive-20261114/`，SHA256 和恢复步骤见同目录的 `claude-code-backup-20261028.move-manifest.json`。
 - 没有删除任何文件，也没有验证真机抖动、飞控标定或相机快门；本轮 SITL profile 本身未校准。
 
 ## 待确认

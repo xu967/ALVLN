@@ -8,7 +8,7 @@
 - **MatrixCity aerial_street_fusion**：本轮尝试按 `aerial_street_fusion/*` 下载未成功；单个 `street.tar` 约 620 MB，许可 CC-BY-NC-4.0，仅在接受非商业限制后用于实验。[street.tar 与许可](https://huggingface.co/datasets/BoDai/MatrixCity/blob/main/aerial_street_fusion/street.tar)
 - **AirVLN**：官方 README 说明 AerialVLN/AerialVLN-S 指令标注各小于 100 MB，模拟器约 35 GB。Kaggle API 本轮返回 404，官方 S3 超时，GitHub clone 未能取得数据。先不要下 35 GB 模拟器；小标注可达且许可确认后再评估其语言导航基准价值。[官方仓库与下载说明](https://github.com/AirVLN/AirVLN)
 
-当前已经有约 7 GB 的 3DGS 场景以及一份 Wanderland 场景。优先在现有场景上补齐路线、相机视角覆盖和 3DGS 质量测试；等网络恢复后再补公开数据，避免数据重复。
+当前已经有约 7 GB 的 3DGS 场景以及一份 Wanderland 场景。优先在现有场景上补齐路线、相机视角覆盖和 3DGS 质量测试；等网络恢复后再补公开数据，避免数据重复。已确认的冷备份 ZIP 已迁移到 `/root/rivermind-fs/archive/rivermind-data-archive-20261114/`，恢复信息在对应 `*.move-manifest.json` 中；仍被文档引用的 `archive/idea` 保留原位。
 
 ## 测试结果
 
