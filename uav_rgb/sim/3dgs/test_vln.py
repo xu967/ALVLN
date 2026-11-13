@@ -4,10 +4,15 @@
   TMPDIR=$DATA_ROOT/uav_rgb/tmp $DATA_ROOT/uav_rgb/3dgs-venv/bin/python sim/3dgs/test_vln.py
 """
 import importlib
+import copy
+import json
 import os
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
+from types import SimpleNamespace
+from unittest import mock
 
 import numpy as np
 
@@ -16,6 +21,7 @@ sys.path.insert(0, ROOT)
 vln = importlib.import_module("sim.3dgs.vln")
 collect = importlib.import_module("sim.3dgs.collect_3dgs")
 scene_mod = importlib.import_module("sim.3dgs.scene")
+runner = importlib.import_module("sim.3dgs.run_vln")
 
 _DATA_TMP = os.path.join(os.environ.get("DATA_ROOT", "/root/rivermind-data"), "uav_rgb", "tmp")
 if "TMPDIR" not in os.environ and os.path.isdir(_DATA_TMP):
@@ -94,7 +100,14 @@ class TestMetrics(unittest.TestCase):
                           ("collision_rate", 1 / 3), ("stop_rate", 2 / 3)):
             self.assertAlmostEqual(s[key], want, msg=key)
         self.assertEqual(vln.summarize_by(rows, "type")["B"]["n"], 2)
-        self.assertEqual(vln.summarize([]), {"n": 0})
+        self.assertIsNone(vln.summarize([])["sr"])
+
+    def test_all_failed_is_zero_success_without_invented_motion_metrics(self):
+        s = vln.summarize([], [{"error": "render failed"}])
+        self.assertEqual((s["n"], s["n_requested"], s["n_failed"], s["error_rate"]), (0, 1, 1, 1.0))
+        self.assertEqual((s["sr"], s["osr"]), (0.0, 0.0))
+        self.assertIsNone(s["spl"])
+        self.assertIsNone(s["collision_rate"])
 
 
 class Scripted:
@@ -131,6 +144,88 @@ class TestAgentStop(unittest.TestCase):
             m, _ = collect.run_episode(scene, os.path.join(tmp, "old"), renderer, occ, params, Scripted(seq), 10, 0.5,
                                        split=identity["split"], identity=identity)
             self.assertEqual((m["num_steps"], m["stopped_by_agent"], m["stop_after_safe"]), (10, False, None))
+
+
+class TestRunner(unittest.TestCase):
+    def run_scene(self, outcome=None, records=None):
+        scene = copy.deepcopy(SCENE)
+        scene.update(ply_path="unused.ply", reach_radius_m=1.0, max_steps=8)
+        for i, route in enumerate(scene["routes"]):
+            route.update(spawn={"x": 0.0, "y": 0.0, "z": 2.0},
+                         waypoint={"x": 4.0 + i, "y": 0.0, "z": 2.0})
+        scene_mod.apply_route(scene, 0)
+        actions, oracle = _steps([(0, 0), (1, 0), (4, 0)])
+        manifest = {"stopped_by_agent": True, "validity": {"physics_verified": True, "camera_verified": True}}
+        args = SimpleNamespace(split=None, all_instructions=False, seed=0, limit=0,
+                               out="unused", hold=0.5, policy="teacher", videos=0)
+        with ExitStack() as stack:
+            for module, attr, value in ((scene_mod, "load_scene", scene),
+                                       (scene_mod, "read_gaussian_ply", None),
+                                       (runner.collision_mod, "from_scene", None),
+                                       (runner.renderer_mod, "make_renderer", None),
+                                       (runner.planner_mod, "OccPlanner", None),
+                                       (runner, "make_policy", None)):
+                stack.enter_context(mock.patch.object(module, attr, return_value=value))
+            stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
+            run = stack.enter_context(mock.patch.object(collect, "run_episode",
+                side_effect=outcome or [(manifest, None), (manifest, None)]))
+            stack.enter_context(mock.patch.object(runner, "_read_jsonl", side_effect=records if records is not None else [actions, oracle] * 2))
+            shortest = stack.enter_context(mock.patch.object(runner, "route_shortest_path_m", return_value=3.0))
+            rows, failures = runner.run_scene("fixture.json", args, None)
+        return rows, failures, run.call_args_list, shortest.call_args_list
+
+    def test_eval_is_not_training_and_task_id_tracks_each_route(self):
+        _, _, calls, _ = self.run_scene()
+        self.assertEqual([c.kwargs.get("split_policy") for c in calls], ["diag-vln-eval"] * 2)
+        self.assertNotEqual(calls[0].kwargs["identity"]["task_id"], calls[1].kwargs["identity"]["task_id"])
+
+    def test_spl_reference_starts_before_first_action(self):
+        _, _, _, calls = self.run_scene()
+        self.assertEqual(calls[0].args[1][0]["pose_gt"]["x"], 0.0)
+
+    def test_exception_error_and_invalid_physics_are_failures(self):
+        for outcome in (RuntimeError("renderer broke"), ({"stopped_by_agent": True}, "copy failed"),
+                        ({"stopped_by_agent": True, "validity": {"physics_verified": False}}, None)):
+            with self.subTest(outcome=outcome):
+                rows, failures, _, _ = self.run_scene([outcome, outcome])
+                self.assertEqual((len(rows), len(failures)), (0, 2))
+                self.assertEqual(failures[0]["scene"], "s")
+                self.assertIn("split", failures[0])
+
+    def test_empty_or_truncated_trace_is_a_failure(self):
+        for records in ([[], []] * 2, [[{"pose_before": {}}], []] * 2):
+            rows, failures, _, _ = self.run_scene(records=records)
+            self.assertEqual((len(rows), len(failures)), (0, 2))
+            self.assertIn("长度一致", failures[0]["error"])
+
+    def test_failed_episodes_stay_in_requested_denominator_and_groups(self):
+        rows, failures, _, _ = self.run_scene()
+        failures = [dict(rows.pop(), error="renderer broke")]
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(runner, "run_scene", return_value=(rows, failures)), \
+                mock.patch.object(runner.CfSitlParams, "from_json", return_value=SimpleNamespace(profile=lambda: "test")):
+            out = os.path.join(tmp, "out")
+            self.assertEqual(runner.main(["--scene", "fixture", "--policy", "teacher", "--out", out]), 1)
+            with open(os.path.join(out, "vln_eval.json")) as f:
+                report = json.load(f)
+        self.assertEqual(report["overall"]["sr"], 0.5)
+        self.assertEqual(report["by_split"]["test_Instruction_Unseen"]["sr"], 0.0)
+
+    def test_empty_output_directory_is_allowed_but_empty_selection_fails(self):
+        rows, _, _, _ = self.run_scene()
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(runner, "run_scene", return_value=(rows, [])), \
+                mock.patch.object(runner.CfSitlParams, "from_json", return_value=SimpleNamespace(profile=lambda: "test")):
+            self.assertEqual(runner.main(["--scene", "fixture", "--policy", "teacher", "--out", tmp]), 0)
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(runner, "run_scene", return_value=([], [])), \
+                mock.patch.object(runner.CfSitlParams, "from_json", return_value=SimpleNamespace(profile=lambda: "test")):
+            with self.assertRaises(SystemExit) as caught:
+                runner.main(["--scene", "fixture", "--policy", "teacher", "--out", os.path.join(tmp, "out")])
+            self.assertEqual(caught.exception.code, 2)
+
+    def test_negative_limits_are_rejected(self):
+        for flag in ("--limit", "--videos"):
+            with self.assertRaises(SystemExit) as caught:
+                runner.main(["--scene", "fixture", "--policy", "teacher", "--out", "unused", flag, "-1"])
+            self.assertEqual(caught.exception.code, 2)
 
 
 class TestBanner(unittest.TestCase):

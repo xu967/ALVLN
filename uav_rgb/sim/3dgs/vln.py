@@ -8,7 +8,7 @@
 STOP：四个动作里没有单独的 STOP，约定连续 STOP_STREAK 步 SAFE_NEUTRAL = 「我到了」
 （与 A* 教师的 goal-stop 同口径），collect_3dgs.run_episode(stop_after_safe=STOP_STREAK) 在那一步结束本集。
 
-指标与 VLN-CE / Anderson et al. 2018 同口径，距离都在导航系 xy 平面上量：
+参考 VLN-CE / Anderson et al. 2018 的指标名称；本项目用 xy 平面、目标圆盘、无碰撞约束，不能直接比公开榜单：
   SR   自己停下时离目标 <= 半径，且全程没撞
   OSR  撞之前轨迹上任一点进过半径（停对了地方就能成功的上限）
   NE   结束时离目标的距离，米
@@ -81,25 +81,30 @@ def episode_metrics(actions, oracle, goal, radius, stopped, shortest_m=None):
             "collision": collided, "steps": len(actions)}
 
 
-def summarize(rows):
-    """rows：episode_metrics 的结果列表。SPL 只在有 l 的集上平均（n_spl 记有几集）。"""
+def summarize(rows, failures=()):
+    """SR/OSR 分母为请求集，异常集记未成功；SPL/NE/CR 只量有效集（EVAL_STANDARD §5.6）。"""
     n = len(rows)
-    if not n:
-        return {"n": 0}
+    requested = n + len(failures)
     spl = [r["spl"] for r in rows if r["spl"] is not None]
     ne = [r["ne_m"] for r in rows]
-    return {"n": n,
-            "sr": sum(r["success"] for r in rows) / n,
-            "osr": sum(r["oracle_success"] for r in rows) / n,
+    return {"n": n, "n_requested": requested, "n_failed": len(failures),
+            "error_rate": len(failures) / requested if requested else None,
+            "denominators": {"sr": requested, "osr": requested, "spl": len(spl),
+                             "ne": n, "collision_rate": n, "stop_rate": n},
+            "sr": sum(r["success"] for r in rows) / requested if requested else None,
+            "osr": sum(r["oracle_success"] for r in rows) / requested if requested else None,
             "spl": sum(spl) / len(spl) if spl else None, "n_spl": len(spl),
-            "ne_mean_m": sum(ne) / n, "ne_median_m": statistics.median(ne),
-            "collision_rate": sum(r["collision"] for r in rows) / n,
-            "stop_rate": sum(r["stopped"] for r in rows) / n}
+            "ne_mean_m": sum(ne) / n if n else None, "ne_median_m": statistics.median(ne) if n else None,
+            "collision_rate": sum(r["collision"] for r in rows) / n if n else None,
+            "stop_rate": sum(r["stopped"] for r in rows) / n if n else None}
 
 
-def summarize_by(rows, key):
+def summarize_by(rows, key, failures=()):
     """按 rows[i][key]（如句式 type、SAGE split）分组汇总。"""
-    groups = {}
+    groups, failed_groups = {}, {}
     for r in rows:
         groups.setdefault(r.get(key), []).append(r)
-    return {str(k): summarize(v) for k, v in sorted(groups.items(), key=lambda kv: str(kv[0]))}
+    for r in failures:
+        failed_groups.setdefault(r.get(key), []).append(r)
+    return {str(k): summarize(groups.get(k, []), failed_groups.get(k, []))
+            for k in sorted(groups.keys() | failed_groups.keys(), key=str)}

@@ -1,8 +1,12 @@
-# uav_rgb：单目 RGB 四动作避障
+# uav_rgb：无人机视觉语言导航研究
 
 本项目已实现自研 C++/CUDA CNN 训练器、Gazebo 专家采集、数据验收闸门、常驻推理进程和学生闭环评测。
 
 当前交付模型是单帧 RGB + 有限词表 FiLM 的四动作策略；GRU 为实验原型，尚未验证真机部署。
+**当前缺口**：3DGS 的 VLN 入口只有特权教师和盲飞对照，还没有读取自然语言的闭环学生。
+本轮已修评测失败分母、评测数据隔离、录像成功标签和时间轴；后续实现按
+[VLN 计划 §10](docs/PLAN_2026-11-13_vln.md#10-复核后的执行与交接2026-11-13) 执行。
+已有开源对比、数据选择和连续长航线证据见 [专项核验](docs/reviews/2026-11-13-vln-data-baselines.md)。
 最新状态统一见 [HANDOFF](docs/HANDOFF.md)，评测判据见 [EVAL_STANDARD](docs/EVAL_STANDARD.md)。
 校园 pilot 用 `--task campus`，使用可见彩柱前安全区域、独立任务版本和拓扑留出；操作见
 [校园基线说明](docs/CAMPUS_BASELINE.md)。旧柱阵 `base/l1` 保留独立历史口径。

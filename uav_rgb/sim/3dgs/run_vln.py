@@ -31,7 +31,7 @@ from . import vln
 from .dynamics import CfSitlParams
 from .eval_3dgs import reach_radius_of, route_shortest_path_m
 
-METRIC_VERSION = "3dgs.vln.v1"
+METRIC_VERSION = "3dgs.vln.v2"
 STEPS_HOLD_S = 0.5      # 航线 max_steps 是导入时按 hold 0.5 估的（scene_import_sage3d），别的 hold 按时长换算
 
 
@@ -77,6 +77,7 @@ def run_scene(path, args, params):
     rows, failures = [], []
     for n, ep in enumerate(eps):
         scene_mod.apply_route(scene, ep["route_index"])
+        identity = collect_3dgs.scene_identity(scene, ply_sha256=identity["ply_sha256"])
         scene["vln"] = ep
         ep_dir = os.path.join(args.out, scene["name"], f"{ep['route_name']}_{ep['instruction_index']}")
         steps = math.ceil(int(scene["max_steps"]) * STEPS_HOLD_S / args.hold)
@@ -85,14 +86,23 @@ def run_scene(path, args, params):
             man, err = collect_3dgs.run_episode(
                 scene, ep_dir, renderer, occ, params, policy, steps, args.hold,
                 split=identity["split"], seed=args.seed + n, episode_id=n, stop_on_collision=True,
-                identity=identity, dynamics="cf_sitl", stop_after_safe=vln.STOP_STREAK)
+                identity=identity, split_policy="diag-vln-eval", dynamics="cf_sitl", stop_after_safe=vln.STOP_STREAK)
+            if err or man.get("error"):
+                raise RuntimeError(err or man["error"])
+            validity = man.get("validity", {})
+            if not validity.get("physics_verified") or not validity.get("camera_verified"):
+                raise RuntimeError(f"无效仿真观测: validity={validity}, dynamics_anomaly={man.get('dynamics_anomaly')}")
+            actions = _read_jsonl(os.path.join(ep_dir, "actions.jsonl"))
+            oracle = _read_jsonl(os.path.join(ep_dir, "oracle.jsonl"))
+            if not actions or len(actions) != len(oracle):
+                raise ValueError("动作与位姿记录必须非空、长度一致")
+            # p 包含第一步运动，l 也必须从同一个动作前位姿开始。
+            start = {**actions[0]["pose_before"], "yaw_deg": actions[0].get("yaw_before", 0.0)}
+            shortest = route_shortest_path_m(occ_planner, [{"pose_gt": start}] + oracle, scene)
+            m = vln.episode_metrics(actions, oracle, scene["waypoint"], radius, man["stopped_by_agent"], shortest)
         except Exception as e:  # noqa: BLE001 - 一集崩了记下来接着跑，报告里单列
-            failures.append({"key": ep["key"], "error": f"{type(e).__name__}: {e}"})
+            failures.append({**ep, "scene": scene["name"], "dir": ep_dir, "error": f"{type(e).__name__}: {e}"})
             continue
-        actions = _read_jsonl(os.path.join(ep_dir, "actions.jsonl"))
-        oracle = _read_jsonl(os.path.join(ep_dir, "oracle.jsonl"))
-        m = vln.episode_metrics(actions, oracle, scene["waypoint"], radius, man["stopped_by_agent"],
-                                route_shortest_path_m(occ_planner, oracle, scene))
         row = {**ep, "scene": scene["name"], **m, "error": err, "dir": ep_dir}
         rows.append(row)
         print(f"[{scene['name']} {n + 1}/{len(eps)}] {result_text(m):24s} {ep['type']:22s} {ep['text']}", file=sys.stderr)
@@ -120,9 +130,11 @@ def main(argv=None):
     args = p.parse_args(argv)
     if not (math.isfinite(args.hold) and args.hold > 0):
         p.error("--hold 必须是正数")
+    if args.limit < 0 or args.videos < 0:
+        p.error("--limit / --videos 不能为负数")
     if os.path.isdir(args.out) and os.listdir(args.out):
         p.error(f"--out {args.out} 不是空目录")
-    os.makedirs(args.out)
+    os.makedirs(args.out, exist_ok=True)
     params = CfSitlParams.from_json(None)
     started = time.monotonic()
     rows, failures = [], []
@@ -130,14 +142,16 @@ def main(argv=None):
         r, f = run_scene(path, args, params)
         rows += r
         failures += f
+    if not rows and not failures:
+        p.error("没有选中任何 VLN 集，请检查场景、--split 和指令数据")
     with open(os.path.join(args.out, "episodes.jsonl"), "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     report = {"metric_version": METRIC_VERSION, "policy": args.policy, "hold_s": args.hold,
               "stop_streak": vln.STOP_STREAK, "dynamics": "cf_sitl", "dynamics_profile": params.profile(),
               "scenes": args.scene, "split_filter": args.split, "all_instructions": args.all_instructions,
-              "overall": vln.summarize(rows), "by_type": vln.summarize_by(rows, "type"),
-              "by_split": vln.summarize_by(rows, "split"), "by_scene": vln.summarize_by(rows, "scene"),
+              "overall": vln.summarize(rows, failures), "by_type": vln.summarize_by(rows, "type", failures),
+              "by_split": vln.summarize_by(rows, "split", failures), "by_scene": vln.summarize_by(rows, "scene", failures),
               "failures": failures, "wall_s": round(time.monotonic() - started, 1)}
     with open(os.path.join(args.out, "vln_eval.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)

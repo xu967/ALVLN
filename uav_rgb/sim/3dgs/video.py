@@ -31,7 +31,7 @@ import e1_body  # noqa: E402 - E1 机体部件表 + 着色投影 / 顶视图标�
 import view_layout as vl  # noqa: E402 - 与 record_views 共用的 1280×720 版式
 
 # ---------------------------------------------------------------- 三视角视频配置（改这里）
-VIEW_FPS = 10.0        # 与 CfSitlDynamics.trace_dt=0.1 s 对应：每个 trace 样本一帧，播放与仿真时间 1:1
+VIEW_FPS = 10.0        # 按 trace 时间采样，hold 不是 0.1 s 的整数倍时也保持播放速度
 FOLLOW_BACK_M = 1.1    # 跟随机位：机体后方 1.1 m、上方 0.3 m，俯角 atan(0.3/1.1)=15°，机体在画面中心偏下。
 FOLLOW_UP_M = 0.3      #   §6.1 要求原生 640 宽跟随格里机体 ≥ 80 px：60° HFOV 下 f = 320/tan30° ≈ 554 px，
 #                          0.172 m 宽的机体在 1.5 m 处只有 63 px（brief 建议值不够），1.1 m 处 ≈ 90 px（后保护罩斜距 1.06 m）。
@@ -203,6 +203,20 @@ class _TopMap:
         return img
 
 
+def _video_trace(trace):
+    """按 10 Hz 选最近的实测状态；末尾不足一帧时保留终态，不插值机体姿态。"""
+    times = np.asarray([row["t"] for row in trace], dtype=float)
+    if (not len(times) or not np.isfinite(times).all() or times[0] <= 0
+            or np.any(np.diff(times) <= 0)):
+        raise ValueError("trace 时间必须有限、为正且严格递增")
+    count = max(1, math.ceil(times[-1] * VIEW_FPS - 1e-9))
+    targets = np.minimum(np.arange(1, count + 1) / VIEW_FPS, times[-1])
+    right = np.minimum(np.searchsorted(times, targets), len(times) - 1)
+    left = np.maximum(right - 1, 0)
+    indices = np.where(targets - times[left] <= times[right] - targets, left, right)
+    return [trace[int(i)] for i in indices]
+
+
 def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_dir=None,
                         title="", result="", quality=None, log=print, instruction=""):
     """cf_sitl 采集集（trace.jsonl + actions.jsonl）-> 四格视频（.mp4 / .webm）+ 关键帧 PNG。
@@ -217,7 +231,7 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
     quality：view_layout.VIDEO_QUALITY 档名（None = 默认 / 环境变量）：high 档画布 2560×1440，FOLLOW / TOP 按
     2× 原生渲染，ONBOARD 为显示另渲一张 2× 帧（标题注明 display 2x），3DGS 超采样取档位的 ssaa，.mp4 走
     ffmpeg libx264 CRF。
-    每个 trace 样本（10 Hz）一帧；决策仍只在窗口起点。关键帧 PNG 名字跟 out_path 的主干走
+    按 trace 时间重采样 10 Hz，播放时长误差小于一帧；决策仍只在窗口起点。关键帧 PNG 名字跟 out_path 的主干走
     （views.mp4 -> views_key_00.png，views_v2.mp4 -> views_v2_key_00.png），重合成不盖旧图。
     返回 {"video", "frames", "fps", "keyframes", "quality", "backend", "body_px"}（body_px：FOLLOW 格里机体
     像素宽的中位数，§6.1 要求原生 640 宽下 ≥ 80）。
@@ -229,6 +243,7 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
     trace = _read_jsonl(os.path.join(ep_dir, "trace.jsonl"))
     if not trace:
         raise RuntimeError(f"{ep_dir} 没有 trace.jsonl（只有 --dynamics cf_sitl 的采集集才有）")
+    frames = _video_trace(trace)
     actions = _read_jsonl(os.path.join(ep_dir, "actions.jsonl"))
     steps = {a["step"]: a for a in actions}
     n2w = scene.get("_nav_to_world")
@@ -240,7 +255,7 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
     writer = vl.VideoSink(cv2, out_path, VIEW_FPS, (W, H), q["crf"], log=log)
     if not writer.isOpened():
         raise RuntimeError(f"无法创建 {out_path}（{writer.backend}）")
-    seq = trace + [trace[-1]] * int(HOLD_END_S * VIEW_FPS)        # 末尾定格：画面不变，只多 result 字
+    seq = frames + [frames[-1]] * int(HOLD_END_S * VIEW_FPS)        # 末尾定格：画面不变，只多 result 字
     key_idx = sorted({int(round(k * (len(seq) - 1) / max(1, KEYFRAMES - 1))) for k in range(KEYFRAMES)})
     keyframes, body_px = [], []
     pitch_follow = -math.degrees(math.atan2(FOLLOW_UP_M, FOLLOW_BACK_M))
@@ -269,7 +284,7 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
             yaw = math.atan2(2 * (w_ * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
             roll = math.degrees(math.atan2(2 * (w_ * qx + qy * qz), 1 - 2 * (qx * qx + qy * qy)))
             pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2 * (w_ * qy - qz * qx)))))
-            if i < len(trace):
+            if i < len(frames):
                 path_xy.append((x, y))
                 # 机载：模型输入是 renderer.width×height（320×240）；high 档为显示另渲 s 倍帧，标题注明 display 2x
                 onboard = _render(renderer, renderer.width * s, renderer.height * s, ssaa=ssaa,
@@ -308,7 +323,7 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
             flags = [(f"COLLISION @ step {hit['step'] + 1}", (0, 0, 255))] if hit and step >= hit["step"] else []
             vl.panel(cv2, canvas, *br, lines,
                      int(act) if act is not None and 0 <= int(act) < 4 else None,
-                     flags, segments, t - t0, span, result if i >= len(trace) else "", s=s)
+                     flags, segments, t - t0, span, result if i >= len(frames) else "", s=s)
             writer.write(canvas)
             if i in key_idx:
                 path = os.path.join(png_dir, "%s_key_%02d.png" % (stem, len(keyframes)))
@@ -440,13 +455,33 @@ def video_policy(man):
     return name if name in ("student", "forward") else "teacher"
 
 
-def episode_result(man, oracle=None, reach_radius_m=None, collided=False):
+def episode_result(man, oracle=None, reach_radius_m=None, collided=False, actions=None):
     """结尾大字：与 Gazebo eval_closed_loop._write_video 同一套词（SUCCESS / COLLISION / …）。
 
-    没有 goal-stop 的集（深度教师 / forward / 学生 eval）给 oracle 与 reach_radius_m 时按 eval_3dgs 同口径：
+    VLN 集复用 vln.episode_metrics，必须主动停在目标旁；旧避障集给 oracle 与 reach_radius_m 时按 eval_3dgs 同口径：
     轨迹任一点到 waypoint 的欧氏距离 <= reach_radius_m 就是 SUCCESS。碰撞（即停 / 截断 / 任一行 collision）优先于到达：
     撞后穿模飞到目标不算到。
     """
+    if man.get("vln") is not None:
+        if man.get("error"):
+            return "INVALID episode error"
+        validity = man.get("validity") or {}
+        if any(key in validity and not validity[key] for key in ("physics_verified", "camera_verified")):
+            return "INVALID observation"
+        if man.get("stopped_on_collision") or man.get("truncated_on_collision") or collided:
+            return "COLLISION"
+        if man.get("dynamics_anomaly"):
+            return "ANOMALY %s" % man["dynamics_anomaly"]
+        if not actions or not oracle or len(actions) != len(oracle) or reach_radius_m is None:
+            return "INVALID trajectory"
+        vln = importlib.import_module("sim.3dgs.vln")
+        m = vln.episode_metrics(actions, oracle, man["waypoint"], reach_radius_m,
+                                man.get("stopped_by_agent", False))
+        if m["success"]:
+            return "SUCCESS stop %.2f m" % m["ne_m"]
+        if m["collision"]:
+            return "COLLISION"
+        return ("WRONG STOP %.1f m" if m["stopped"] else "NO STOP %.1f m") % m["ne_m"]
     if man.get("stopped_on_goal"):
         return "SUCCESS reached"
     if man.get("stopped_on_collision") or man.get("truncated_on_collision") or collided:
@@ -504,11 +539,15 @@ def main():
             ep_scene["route"] = man["route"]
         dyn = man.get("dynamics_backend") or man["dynamics_params"].get("dynamics", "?")
         oracle = _read_jsonl(os.path.join(ep, "oracle.jsonl"))
-        collided = any(a.get("collision") for a in _read_jsonl(os.path.join(ep, "actions.jsonl")))
-        result = episode_result(man, oracle, float(ep_scene.get("reach_radius_m", 1.5)), collided)
+        actions = _read_jsonl(os.path.join(ep, "actions.jsonl"))
+        collided = any(a.get("collision") for a in actions)
+        result = episode_result(man, oracle, float(ep_scene.get("reach_radius_m", 1.5)), collided, actions)
+        instruction = man.get("vln") or {}
+        banner = (f'"{instruction["text"]}"   goal: {instruction.get("goal_object", "")}'
+                  if instruction.get("text") else "")
         r = compose_views_video(ep, ep_scene, renderer, mount, occ, out_path=os.path.join(ep, args.out_name),
                                 title=f"{video_policy(man)} | {dyn} | {scene_short} | seed {man.get('seed')}",   # 与 Gazebo 标题同格式
-                                result=result, quality=args.video_quality,
+                                result=result, quality=args.video_quality, instruction=banner,
                                 log=lambda m: print(m, file=sys.stderr, flush=True))
         print(json.dumps(r, ensure_ascii=False))
 
