@@ -59,3 +59,10 @@ ctest --test-dir build/check --output-on-failure
 - `"$UAV_RGB_PYTHON" experiments/2026-11-11-teacher-clearance-3dgs/measure_disp.py --out /root/rivermind-data/uav_rgb/tmp/vln-plan-followup/clearance-recheck`：rc=0，历史240集9174步，验证半前进预测误差p90：P1 0.080m / P2 0.041m。属于旧hold=1.0离线复算，不是新hold=0.5实测。
 
 未接正式G1闭环、未训练条件学生、未更改真实飞控；B/C/D均只完成增量而非整卡验收。
+
+## 正式L1语言基线训练启动
+
+命令：`setsid nohup bash experiments/2026-11-14-l1-language-formal/run.sh`。
+环境：RTX2080Ti，C++/CUDA。数据 `l1-v4-cf/ds/dataset.uavr`，SHA256 `3a1478a265f98b4a8b38accb20cf8ee53833eeb9c6af4112c8b2c66b20b4c614`。3种子×20轮，沿用旧L1配方。
+状态：运行中；首个进程实际占用GPU578MiB，尚无最终成绩。训练器报告旧数据缺split_scheme/split_salt，只验证scene_id隔离；只作为模板语言基线复训，不是3DGS开放VLN。
+输出 `/root/rivermind-data/uav_rgb/exp-l1-language-formal-20261114`，逐轮数字读取results.csv；最终结果待完成后补录。

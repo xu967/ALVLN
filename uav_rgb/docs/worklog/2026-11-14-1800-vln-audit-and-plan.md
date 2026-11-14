@@ -58,3 +58,11 @@
 
 ### 验证到哪一步
 - 改动相关 unittest 20/20，退出码 0；历史位移复算退出码 0。完整结果另记实验文档。
+
+## 用户要求正式训练：已启动
+
+做了什么：新增 `experiments/2026-11-14-l1-language-formal/run.sh`，启动 C++/CUDA L1 模板语言条件基线，三个种子1234/1235/1236顺序各20轮，text_dim=16、batch=64、lr=0.0005、drop_collision。输出 `/root/rivermind-data/uav_rgb/exp-l1-language-formal-20261114`，记录数据/指令/二进制哈希及PID身份；冻结二进制，保留真实日志。
+
+没做什么：没有用纯视觉Torch训练冒充VLN；没有启动未实现的3DGS条件学生；没有宣称训练完成或泛化提升。旧L1数据缺split_scheme/split_salt，训练器只校验scene_id隔离，不能据此宣称新场景泛化。
+
+验证：bash -n通过；训练进程809293已使用GPU 578MiB，输出config.json/metrics.jsonl/results.csv，等待正式epoch结果。停止使用 `bash tools/stop_daemon.sh /root/rivermind-data/uav_rgb/exp-l1-language-formal-20261114`。
