@@ -137,7 +137,7 @@ class CfSitlDynamics:
     reset() 在地面 reset 再起飞到场景 spawn z 并等 READY，起飞时间不计入 episode（t 从
     READY 时刻起算）。step(action, dt)：act(until_s = 当前 t + dt，observation 语义；SITL 时钟
     只在 step 里走，渲染与下发同刻，所以也等于 dispatch 语义) + round(dt/1 ms) 个 1 ms 步，
-    每 trace_dt 记一次中间状态到 self.trace（视频用，决策仍只看窗口起点那一帧）。
+    每 trace_dt 记一次中间状态与诊断遥测到 self.trace（决策仍只看窗口起点那一帧）。
     """
 
     def __init__(self, scene, params=None, params_path=None, seed=0, proc=None,
@@ -271,7 +271,11 @@ class CfSitlDynamics:
             self.trace.append({"step": self.step_index, "t": self.t, "t_sitl": self.t_sitl,
                                "pos": [self.x, self.y, self.z], "quat": list(self.quat),
                                "vel": [self.vx, self.vy, self.vz], "action": int(st.get("action", -1)),
-                               "exec_state": self.exec_state})
+                               "exec_state": self.exec_state,
+                               # 仅保留进程原始遥测；缺失写 null，不能伪造正常电压或油门。
+                               "battery_v": st.get("battery_v"), "tof_m": st.get("tof_m"),
+                               "height_est_m": st.get("height_est_m"),
+                               "sticks": st.get("sticks"), "motors": st.get("motors")})
             if self.exec_state == EXEC_FAILSAFE:
                 raise RuntimeError(f"固件进入 FAILSAFE（t={self.t:.2f}s，step {self.step_index}）")
         self.yaw_rate = ((self.yaw - yaw_prev + math.pi) % (2 * math.pi) - math.pi) / dt

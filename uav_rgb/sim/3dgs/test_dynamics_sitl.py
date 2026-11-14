@@ -6,11 +6,13 @@
   $DATA_ROOT/uav_rgb/3dgs-venv/bin/python sim/3dgs/test_dynamics_sitl.py
 """
 import importlib
+import json
 import math
 import os
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -171,6 +173,36 @@ class TestCfSitlDynamics(unittest.TestCase):
         s = self.d.step(dyn.FORWARD_SLOW, 0.1 + 0.2)
         self.assertAlmostEqual(s["t"], 0.3, places=9)
         self.assertEqual(len(self.d.trace), 3)
+
+    def test_trace_preserves_proc_telemetry(self):
+        self.d.reset(-14.0, 0.0, 0.0)
+        self.d.step(dyn.FORWARD_SLOW, 0.1)
+        row = self.d.trace[-1]
+        state = self.d._call({"cmd": "state"})["state"]
+        fields = ("battery_v", "tof_m", "height_est_m", "sticks", "motors")
+        for key in fields:
+            with self.subTest(field=key):
+                self.assertEqual(row[key], state[key])
+                values = row[key] if isinstance(row[key], list) else [row[key]]
+                self.assertTrue(all(isinstance(v, (int, float)) and math.isfinite(v) for v in values))
+        self.assertEqual(len(row["sticks"]), 4)
+        self.assertEqual(len(row["motors"]), 4)
+        self.assertEqual(json.loads(json.dumps(row, allow_nan=False)), row)
+
+        # 旧进程缺少诊断字段时仍可推进，未知值明确记成 null。
+        call = self.d._call
+
+        def without_telemetry(request):
+            response = call(request)
+            if request["cmd"] == "step":
+                for key in fields:
+                    response["state"].pop(key, None)
+            return response
+
+        with mock.patch.object(self.d, "_call", side_effect=without_telemetry):
+            self.d.step(dyn.FORWARD_SLOW, 0.1)
+        self.assertTrue(all(self.d.trace[-1][key] is None for key in fields))
+        self.assertGreater(self.d.trace[-1]["t"], row["t"])
 
     def test_yaw_left_1s(self):
         s0 = self.d.reset(-14.0, 0.0, 0.0)
