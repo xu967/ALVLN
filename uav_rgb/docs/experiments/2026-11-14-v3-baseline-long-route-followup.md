@@ -114,3 +114,12 @@ teacher 动作切换均值62.67次（1.491次/m），blind-forward为0；三集�
 ### 当前结果边界
 
 这些结果只证明数据、渲染、碰撞、SITL 动力学和显式 STOP 在满电单路线下可以复现；它们没有证明语言 grounding、视觉语言学生、未知场景泛化、真实飞行或公开榜单排名。正式 VLN 评测必须先冻结独立目标 catalog，再按 `predicted_target_control_*` 与真正 E2E success 分开记分。
+
+
+## 更新 2026-11-15 00:40：AerialVLN / OpenFly 下载与自动门禁
+
+- AerialVLN 标注（train 16,386、val_seen 1,818、val_unseen 2,310、test 4,830 episodes）大小、JSON、清单 SHA/LFS 或 Git blob 校验全部通过；审计 JSON：`/root/rivermind-data/uav_rgb/tmp/aerialvln-annotation-audit-20261115.json`。
+- OpenFly Annotation 三个 split 共 103,226 条记录，审计无 JSON 错误和数组长度不一致；另按 HF tree manifest 完成 SHA256/Git blob 校验。审计：`/root/rivermind-data/uav_rgb/tmp/openfly-annotation-audit-20261115.json`，完整性：`/root/rivermind-data/uav_rgb/tmp/openfly-annotation-integrity-20261115.json`。
+- AerialVLN simulator bundle 共 277 文件、40,541,074,951 B，持续后台下载；自动 watcher `/root/rivermind-data/uav_rgb/downloads/after_download_runner.py` 将等全部文件完整且哈希通过后，完成标注审计并触发同一 SAGE 场景的 1 集 teacher/forward smoke。此 smoke 只看控制诊断，不是 AerialVLN 或语言成绩。
+- 本机 HF 登录已验证可访问公开镜像；OpenFly_DataGen gated API 仍返回 403，账号尚未批准访问。数据清单约 115.83 GiB，README 为非商业使用；下载前等待 HF 授权，并保留 AerialVLN 完整空间。
+- AirVLN 官方 train/eval 目前不能直接启动：AirSim 场景路径、Habitat 预训练权重、AirVLN checkpoint 和兼容环境未就绪；单卡 smoke 需要先执行官方收集流程并 batch=1，不能拿缺 checkpoint 的 eval 目录模式启动。

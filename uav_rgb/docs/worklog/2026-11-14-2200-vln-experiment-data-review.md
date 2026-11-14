@@ -111,3 +111,32 @@
 - 满电配对只覆盖一条路线和一个未校准动力学 profile；不能和半电失败结果合并，也不能外推真机。
 - `execution_recipe.json` 的 paired 状态字段仍是旧生成值 `not started`，以实际结果 JSON 和退出码为准；需要后续修复生成器。
 - 当前代码仍无真正语言→视觉→控制→自主停止闭环；下一步必须先完成独立目标数据和 E0/D1/D2 门禁。
+
+## 更新 2026-11-15 00:35：公开数据下载门禁与自动触发
+
+### 做了什么
+
+- 恢复 AerialVLN `train.json` 的截断下载；文件大小 `303,722,815` B、SHA-256 和 JSON 解析均通过。`val_seen`、`val_unseen`、`test` 也完成 JSON/大小核对，四个 split 的 episode 结构可读。
+- 完成 OpenFly `Annotation` 的公开子集下载：`train/seen/unseen` 共 103,226 条记录、3 个文件均可解析；现有审计报告无 parse error、动作/位姿数组无长度不一致。
+- 保留 AerialVLN 模拟器的单个断点下载进程，不重复启动；其清单为 277 个文件、`40,541,074,951` B（约 37.76 GiB），当前仍在续传 4 个大 PAK。
+- 在数据盘挂起 `downloads/after_download_runner.py`：等待 simulator manifest 全部达到预期字节数后，逐文件校验清单 hash，写 AerialVLN/OpenFly 审计结果，再串行跑 1 集现有 SAGE-3D `teacher` 与 `forward` smoke。输出位于 `/root/rivermind-data/uav_rgb/auto-after-download-20261115/`。
+- 克隆官方 AirVLN 源码到数据盘 `vendor/AirVLN`，用于后续路径/依赖审计；未宣称官方评测已运行。
+
+### 没做什么及原因
+
+- 没有下载 OpenFly 全库约 2.97 TB；当前数据盘无法容纳。用户完成 HF 登录后，已安全验证本机 token 可用（不输出凭证）；OpenFly_DataGen 的文件请求仍返回 403，账号尚未获准访问，因此不绕过门禁。DataGen 清单为约 115.83 GiB、主要是仿真环境/地图资产，README 限非商业用途；先完成 AerialVLN 下载，再等 HF 页面审批或条款确认后按需下载。
+- 没有启动 AirVLN 官方 eval：当前缺少 AirVLN checkpoint、Habitat `gibson-2plus-resnet50.pth`、正确的 `ENVs/` sibling 路径和兼容运行环境；官方脚本默认 8 GPU，而本机只有 1 张 RTX 2080 Ti。无 checkpoint 时不能启动会持续等待的 eval。
+- 没有把现有 SAGE teacher/forward smoke 当作语言导航成绩；它只验证已有控制器，正式语言闭环仍缺独立、冻结且不泄漏的地标 catalog。
+
+### 验证与待办
+
+| 项 | 当前结果 |
+|---|---|
+| AerialVLN train SHA/JSON | 通过；train 16,386 episodes |
+| AerialVLN val/test JSON | 通过；val_seen 1,818、val_unseen 2,310、test 4,830 |
+| OpenFly Annotation audit | 通过；103,226 records，0 parse error |
+| AerialVLN simulator | 121/277 文件完整（记录时点）；4 个大 PAK 仍下载 |
+| 自动实验触发 | 已挂起，等 simulator manifest 完整后执行 |
+| OpenFly_DataGen | 未下载；等待用户在主机完成 HF login 后再评估 |
+
+自动触发完成后，再把实际 smoke 退出码和审计摘要补入本工作日志及实验文档；没有新的真实语言导航指标前，不会编造公开基准成绩。
