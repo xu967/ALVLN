@@ -66,3 +66,5 @@ ctest --test-dir build/check --output-on-failure
 环境：RTX2080Ti，C++/CUDA。数据 `l1-v4-cf/ds/dataset.uavr`，SHA256 `3a1478a265f98b4a8b38accb20cf8ee53833eeb9c6af4112c8b2c66b20b4c614`。3种子×20轮，沿用旧L1配方。
 状态：运行中；首个进程实际占用GPU578MiB，尚无最终成绩。训练器报告旧数据缺split_scheme/split_salt，只验证scene_id隔离；只作为模板语言基线复训，不是3DGS开放VLN。
 输出 `/root/rivermind-data/uav_rgb/exp-l1-language-formal-20261114`，逐轮数字读取results.csv；最终结果待完成后补录。
+
+启动后数据复核：L1共16184帧/902集，train14496、val1688、test0（scene_id划分）。本轮仅训练/验证，不存在独立test成绩；正式泛化评测必须另用冻结测试集。

@@ -66,3 +66,5 @@
 没做什么：没有用纯视觉Torch训练冒充VLN；没有启动未实现的3DGS条件学生；没有宣称训练完成或泛化提升。旧L1数据缺split_scheme/split_salt，训练器只校验scene_id隔离，不能据此宣称新场景泛化。
 
 验证：bash -n通过；训练进程809293已使用GPU 578MiB，输出config.json/metrics.jsonl/results.csv，等待正式epoch结果。停止使用 `bash tools/stop_daemon.sh /root/rivermind-data/uav_rgb/exp-l1-language-formal-20261114`。
+
+补充数据审计：L1 train14496、val1688、test0；没有独立测试集，不能将val数字报告为test。子代理最初“trunc不存在”的判断有误，另一代理实读证实存在；本轮未采用该纯视觉数据。
