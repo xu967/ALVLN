@@ -49,3 +49,13 @@ ctest --test-dir build/check --output-on-failure
 - `base_torch_v1` 只输出 `model.pt`，不导出 C++ checkpoint；多 epoch 按验证集 macro F1 保存最佳权重，test 只在最佳权重上报告。
 - 当前 `scene.json` 没有独立物体 catalog 和坐标，grounder 没有接入 `run_vln` 或飞控；需要独立地图/感知候选表后才可做正式 G1 闭环。
 - OpenFly 全量数据、权重、3DGS 资产没有下载；官方环境和本项目四动作/小步长动力学不兼容，见 `docs/OPENFLY_LOCAL_EVAL.md`。
+
+## §10 B/C/D 执行增量（2026-11-14）
+
+环境：RTX 2080 Ti，真实 GPU 探针；输出根 `/root/rivermind-data/uav_rgb/tmp/vln-plan-followup`。
+
+- `source env.sh; "$UAV_RGB_PYTHON" -m unittest tools/test_scene_probe_quality.py sim/3dgs/test_grounder.py tools/test_audit_vln_grounder.py`：20 tests OK，rc=0。
+- `/root/rivermind-data/uav_rgb/3dgs-venv/bin/python tools/scene_probe_quality.py --scene /root/rivermind-data/uav_rgb/3dgs-scenes/wanderland_1MlUucug/scene.json --route 0 --out /root/rivermind-data/uav_rgb/tmp/vln-plan-followup/wanderland-probe`：rc=0。路径12.81 m，22帧，低锐度0，lapvar最小287.9、中位632.0，最大空洞0.0161588542。仅诊断通过，不是30–40米长航线验收；阈值0.9尚未在验证集标定，不代表训练相机覆盖合格。
+- `"$UAV_RGB_PYTHON" experiments/2026-11-11-teacher-clearance-3dgs/measure_disp.py --out /root/rivermind-data/uav_rgb/tmp/vln-plan-followup/clearance-recheck`：rc=0，历史240集9174步，验证半前进预测误差p90：P1 0.080m / P2 0.041m。属于旧hold=1.0离线复算，不是新hold=0.5实测。
+
+未接正式G1闭环、未训练条件学生、未更改真实飞控；B/C/D均只完成增量而非整卡验收。

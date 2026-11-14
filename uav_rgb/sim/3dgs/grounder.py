@@ -50,6 +50,21 @@ class LexicalGrounder:
 
     def ground(self, instruction, candidates):
         """返回一个候选名；候选为空、无重叠或不够明确时拒绝。"""
+        text = str(instruction).lower().replace("’", "'")
+        # shortcut: 只支持英文单目标词法检索；复杂语义交给后续关系 grounder。
+        reason = None
+        if any(char.isalpha() and not char.isascii() for char in text):
+            reason = "unsupported_language"
+        elif re.search(r"\b(?:not|never|no|except|avoid|without)\b|n['’]t\b", text):
+            reason = "unsupported_negation"
+        elif re.search(r"\b(?:ascend|descend|climb|land|takeoff)\b|\b(?:go|fly|move)\s+(?:up|down)\b|\btake off\b", text):
+            reason = "unsupported_vertical_command"
+        elif re.search(r"\b(?:then|afterwards|both|either|or)\b|;", text):
+            reason = "unsupported_multiple_goals"
+        elif re.search(r"\b(?:to|toward|towards|into|at)\b.*\band\b", text):
+            reason = "unsupported_multiple_goals"
+        if reason:
+            return Grounding(None, 0.0, 0.0, False, reason)
         names = [str(name) for name in candidates if str(name).strip()]
         query = set(_tokens(instruction))
         goal = _goal_tokens(instruction)

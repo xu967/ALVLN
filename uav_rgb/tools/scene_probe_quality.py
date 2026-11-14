@@ -13,7 +13,8 @@ nav_to_world 差 1.6 m，整批 pilot 是三楼视角，没人看图就放量了
   python tools/scene_probe_quality.py --scene ... --candidate 'r_test:-4,0,0,5,2'   # 还没写进 scene.json 的候选：name:x,y,yaw,wx,wy[,z]
   python tools/scene_probe_quality.py --self-check                                 # mock 渲染器 + 合成走廊，不需要 GPU
 产物（默认 <scene 目录>/probe_quality/）：routes_quality.json、route<i>_<name>.png（关键帧拼图）、ladder_<name>.png。
-退出码：每条路线都有路径且 low_frac <= LOW_FRAC_MAX 为 0，否则 1。
+退出码：每条路线有路径、锐度与每帧深度有效率均过门为 0，否则 1。
+默认深度阈值仅用于诊断，正式航线验收必须先在验证集冻结；本工具尚不证明训练相机覆盖。
 """
 import argparse
 import importlib
@@ -81,15 +82,22 @@ def probe_poses(renderer, poses, z, pitch_deg=0.0):
     for (x, y, yaw) in poses:
         rgb, depth, _ms = renderer.render_pose(x, y, z, yaw, pitch_deg=pitch_deg)
         q = frame_quality(rgb, depth)
-        dv = depth[depth > 0]
+        valid = np.isfinite(depth) & (depth > 0)
+        q["depth_valid_frac"] = float(np.mean(valid)) if depth.size else 0.0
+        q["hole_frac"] = 1.0 - q["depth_valid_frac"]
+        dv = depth[valid]
         frames.append({"pose": [round(x, 3), round(y, 3), round(z, 3), round(yaw, 1)], **q,
                        "depth_med_m": round(float(np.median(dv)), 2) if dv.size else None})
         rgbs.append(rgb)
     return frames, rgbs
 
 
-def summarize(name, frames, path_m, low_frac_max=LOW_FRAC_MAX):
-    """路线级汇总：帧数、低质帧数与比例、lapvar 分位、空洞最大值、是否过线。"""
+def summarize(name, frames, path_m, low_frac_max=LOW_FRAC_MAX, min_depth_valid_frac=0.9):
+    """锐度和深度分别验收；任一采样帧深度不足，整条路线拒收。"""
+    if not math.isfinite(min_depth_valid_frac) or not 0 < min_depth_valid_frac <= 1:
+        raise ValueError("min_depth_valid_frac 必须在 (0, 1] 内")
+    depth_ok = bool(frames) and all(
+        f.get("depth_valid_frac", 0.0) >= min_depth_valid_frac for f in frames)
     laps = [f["lapvar"] for f in frames]
     n_low = sum(int(f["low"]) for f in frames)
     low_frac = n_low / len(frames) if frames else None
@@ -100,7 +108,8 @@ def summarize(name, frames, path_m, low_frac_max=LOW_FRAC_MAX):
             "lapvar_med": round(float(np.median(laps)), 1) if laps else None,
             "hole_frac_max": max(f["hole_frac"] for f in frames) if frames else None,
             "lapvar_min_threshold": FRAME_LAPVAR_MIN, "low_frac_max": low_frac_max,
-            "pass": bool(frames) and low_frac <= low_frac_max}
+            "min_depth_valid_frac": min_depth_valid_frac, "depth_pass": depth_ok,
+            "pass": bool(frames) and low_frac <= low_frac_max and depth_ok}
 
 
 def contact_sheet(rgbs, labels, cols=SHEET_COLS, max_frames=SHEET_MAX):
@@ -120,7 +129,7 @@ def contact_sheet(rgbs, labels, cols=SHEET_COLS, max_frames=SHEET_MAX):
     return np.concatenate(rows, axis=0)
 
 
-def probe_route(renderer, planner, name, spawn, waypoint, out_dir, pitch_deg=0.0):
+def probe_route(renderer, planner, name, spawn, waypoint, out_dir, pitch_deg=0.0, min_depth_valid_frac=0.9):
     """一条路线：A* 路径 -> 采样位姿 -> 渲染判质量 -> 拼图 + 高度阶梯；返回汇总 dict（含 frames）。"""
     import cv2
     sx, sy, syaw = float(spawn["x"]), float(spawn["y"]), float(spawn.get("yaw_deg", 0.0))
@@ -145,7 +154,7 @@ def probe_route(renderer, planner, name, spawn, waypoint, out_dir, pitch_deg=0.0
     ladder_rgbs.append(rgb)
     ladder_labels.append(f"z={z:g} pitch={LADDER_PITCH_DEG:g} lap={frame_quality(rgb, depth)['lapvar']:.0f}")
     cv2.imwrite(os.path.join(out_dir, f"ladder_{tag}.png"), contact_sheet(ladder_rgbs, ladder_labels, cols=2))
-    out = summarize(name, frames, path_m)
+    out = summarize(name, frames, path_m, min_depth_valid_frac=min_depth_valid_frac)
     out.update({"spawn": spawn, "waypoint": waypoint, "frames": frames,
                 "sheet": f"route_{tag}.png", "ladder": f"ladder_{tag}.png"})
     return out
@@ -161,7 +170,7 @@ def parse_candidate(text):
     return name, {"x": vals[0], "y": vals[1], "z": z, "yaw_deg": vals[2]}, {"x": vals[3], "y": vals[4], "z": z}
 
 
-def run(scene_path, routes=None, candidates=(), out_dir=None, mock=False, device="cuda"):
+def run(scene_path, routes=None, candidates=(), out_dir=None, mock=False, device="cuda", min_depth_valid_frac=0.9):
     """主流程：读场景 -> 占据/规划器/渲染器各建一次 -> 逐路线探测 -> routes_quality.json；返回 (rows, all_pass)。"""
     scene = scene_mod.load_scene(scene_path)
     out_dir = out_dir or os.path.join(scene["dir"], "probe_quality")
@@ -181,16 +190,17 @@ def run(scene_path, routes=None, candidates=(), out_dir=None, mock=False, device
         jobs.append((name, sp, wp, None))
     rows = []
     for name, sp, wp, idx in jobs:
-        row = probe_route(renderer, planner, name, sp, wp, out_dir, pitch)
+        row = probe_route(renderer, planner, name, sp, wp, out_dir, pitch, min_depth_valid_frac)
         row["route"] = idx
         rows.append(row)
         print(f"{name:28s} path {row.get('path_m')} m  frames {row['n_frames']:3d}  low {row.get('n_low', '-')} "
               f"({row.get('low_frac')})  lapvar min/p10/med {row.get('lapvar_min')}/{row.get('lapvar_p10')}/{row.get('lapvar_med')}  "
               f"hole_max {row.get('hole_frac_max')}  {'PASS' if row['pass'] else ('FAIL ' + row.get('reason', '')).strip()}", flush=True)
-    report = {"schema": "uavrgb.3dgs_routes_quality.v1", "scene": scene["path"], "scene_name": scene.get("name"),
+    report = {"schema": "uavrgb.3dgs_routes_quality.v2", "scene": scene["path"], "scene_name": scene.get("name"),
               "renderer": renderer.stats(), "step_m": STEP_M, "lookahead_m": LOOKAHEAD_M,
               "lapvar_min_threshold": FRAME_LAPVAR_MIN, "low_frac_max": LOW_FRAC_MAX, "camera_pitch_deg": pitch,
-              "routes": rows}
+              "min_depth_valid_frac": min_depth_valid_frac,
+              "threshold_status": "user_supplied_or_uncalibrated_default", "routes": rows}
     with open(os.path.join(out_dir, "routes_quality.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=1)
     return rows, all(r["pass"] for r in rows)
@@ -221,6 +231,8 @@ def main(argv=None):
     p.add_argument("--out", default=None, help="输出目录（默认 <scene 目录>/probe_quality）")
     p.add_argument("--mock", action="store_true", help="mock 渲染器（只验流程，lapvar 无意义）")
     p.add_argument("--device", default="cuda")
+    p.add_argument("--min-depth-valid-frac", type=float, default=0.9,
+                   help="每帧有效深度比例下限；默认 0.9 仅诊断，正式验收须在验证集冻结")
     p.add_argument("--self-check", action="store_true")
     args = p.parse_args(argv)
     if args.self_check:
@@ -228,7 +240,7 @@ def main(argv=None):
         return 0
     if not args.scene:
         p.error("--scene 必填（或 --self-check）")
-    _rows, ok = run(args.scene, args.route, args.candidate, args.out, args.mock, args.device)
+    _rows, ok = run(args.scene, args.route, args.candidate, args.out, args.mock, args.device, args.min_depth_valid_frac)
     return 0 if ok else 1
 
 

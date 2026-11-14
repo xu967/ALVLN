@@ -40,6 +40,23 @@ class TestLexicalGrounder(unittest.TestCase):
         result = self.g.ground("Go to door 17", ["door_1", "sofa_1"])
         self.assertEqual(result.target, "door_1")
 
+    def test_unsupported_semantics_never_select_a_target(self):
+        cases = [
+            ("飞到 door", "unsupported_language"),
+            ("Go to the door, not the sofa", "unsupported_negation"),
+            ("Don't go to the door", "unsupported_negation"),
+            ("Go to the door then the sofa", "unsupported_multiple_goals"),
+            ("Go to the door and the sofa", "unsupported_multiple_goals"),
+            ("Fly up to the door", "unsupported_vertical_command"),
+            ("Descend to the door", "unsupported_vertical_command"),
+        ]
+        for instruction, reason in cases:
+            with self.subTest(instruction=instruction):
+                result = self.g.ground(instruction, ["door_1", "sofa_1"])
+                self.assertFalse(result.accepted)
+                self.assertIsNone(result.target)
+                self.assertEqual(result.reason, reason)
+
     def test_empty_inputs_are_safe(self):
         result = self.g.ground("", [])
         self.assertFalse(result.accepted)

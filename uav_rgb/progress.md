@@ -1,5 +1,11 @@
 # progress.md（新开会话先读这个）
 
+## VLN §10 继续执行
+
+- B 深度有效率独立门禁、D unsupported 指令拒绝已落实；20 项测试通过。B/C/D 尚未整卡验收，E/F 不提前标完成。
+- GitHub 使用 `tools/git_mirror_alvln.sh`，已恢复并推送上一轮提交。
+
+
 ## 2026-11-14 VLN 计划执行增量（最新）
 
 - 新增 YAML profile：`nano_proto_v6` 继续 C++ 对拍线；`base_torch_v1` 是可运行但不导出 C++ 的 Torch-only 较大基线，入口为 `proto/train_base.py`，配置示例在 `config/vln/`。

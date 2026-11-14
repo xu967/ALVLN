@@ -27,7 +27,7 @@ if "TMPDIR" not in os.environ and os.path.isdir(_DATA_TMP):
 
 def _frame(low, lapvar=None, hole=0.0):
     return {"pose": [0, 0, 2, 0], "lapvar": lapvar if lapvar is not None else (10.0 if low else 500.0),
-            "hole_frac": hole, "low": bool(low), "depth_med_m": 3.0}
+            "hole_frac": hole, "low": bool(low), "depth_med_m": 3.0, "depth_valid_frac": 1.0 - hole}
 
 
 class SharedThreshold(unittest.TestCase):
@@ -85,6 +85,32 @@ class Summarize(unittest.TestCase):
         e = spq.summarize("empty", [], 0.0)
         self.assertFalse(e["pass"])
         self.assertIsNone(e["low_frac"])
+
+
+class DepthGate(unittest.TestCase):
+    def test_high_frequency_cannot_hide_invalid_depth(self):
+        rgb = np.repeat(((np.indices((16, 16)).sum(axis=0) % 2) * 255)[..., None], 3, axis=2).astype(np.uint8)
+        class Renderer:
+            def render_pose(self, *args, **kwargs):
+                return rgb, self.depth, 0.0
+        renderer = Renderer()
+        for value in (0.0, -1.0, float("nan"), float("inf")):
+            renderer.depth = np.full((16, 16), value)
+            frames, _ = spq.probe_poses(renderer, [(0, 0, 0)], 2)
+            self.assertFalse(frames[0]["low"])
+            self.assertEqual(frames[0]["depth_valid_frac"], 0.0)
+            self.assertIsNone(frames[0]["depth_med_m"])
+            self.assertFalse(spq.summarize("bad", frames, 1)["pass"])
+        renderer.depth = np.ones((16, 16))
+        frames, _ = spq.probe_poses(renderer, [(0, 0, 0)], 2)
+        self.assertTrue(spq.summarize("good", frames, 1)["pass"])
+
+    def test_holes_are_independent_gate(self):
+        self.assertTrue(spq.summarize("r", [_frame(False, hole=0.1)], 1)["depth_pass"])
+        self.assertFalse(spq.summarize("r", [_frame(False, hole=0.11)], 1)["depth_pass"])
+        for threshold in (0, -1, 1.1, float("nan")):
+            with self.assertRaises(ValueError):
+                spq.summarize("r", [_frame(False)], 1, min_depth_valid_frac=threshold)
 
 
 class Candidate(unittest.TestCase):

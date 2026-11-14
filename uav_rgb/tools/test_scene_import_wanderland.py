@@ -129,7 +129,7 @@ class TestProbe(unittest.TestCase):
                 imp.SCENE_JSON, imp.OUT = saved
             with open(os.path.join(tmp, "out", "probe_quality", "routes_quality.json"), encoding="utf-8") as f:
                 rep = json.load(f)
-            self.assertEqual(rep["schema"], "uavrgb.3dgs_routes_quality.v1")
+            self.assertEqual(rep["schema"], "uavrgb.3dgs_routes_quality.v2")
             self.assertEqual(rep["lapvar_min_threshold"], pq.FRAME_LAPVAR_MIN)
             r0 = rep["routes"][0]
             self.assertEqual((r0["pass"], r0["low_frac"], r0["n_low"]), (False, 1.0, r0["n_frames"]))
