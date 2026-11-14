@@ -140,3 +140,11 @@ teacher 日志显示末端显式 STOP，forward 在第 11 步碰撞。这个配�
 自动门禁脚本已固定使用数据盘的 lib31 proc，后续下载完成不会再因旧二进制在首步前失败。`sim.3dgs.test_dynamics_sitl` 13/13 通过。
 
 OpenFly_DataGen 仍未下载：本机 HF token 和 gated manifest API 可用，但实际数据文件端点继续返回 HTTP 403；后台下载器保持每 10 分钟重试。AirVLN Python 3.8 环境已创建，Gibson backbone、25 个场景和标注路径已就位，CUDA wheel/requirements 仍在数据盘临时目录安装；没有 AirVLN policy checkpoint，因此官方 eval 尚未运行。
+
+## 更新 2026-11-15 02:40：AirVLN 单路线真实采集 smoke
+
+AirVLN 依赖已在数据盘 Python 3.8 环境完成，torch `2.1.2+cu118`、AirSim `1.7.0`、Gibson 权重和 ResNet-50 缓存均通过导入/初始化检查。由于 Unreal 二进制拒绝 root，使用 `ubuntu` 用户和数据盘隔离 runtime；没有修改原始 `vendor/` 权限。
+
+无 `DISPLAY` 时，UE 虽启动并开放 RPC，第一次 `simGetImages` 会超时并触发 SIGSEGV；继承已有 `DISPLAY=:20`、`QT_X11_NO_MITSHM=1`、`SDL_HINT_CUDA_DEVICE=0` 后，RGB `224x224x3` 与深度 `256x256` 探针通过。隔离 server 保留 UE 子进程并 drain stdout，真实 collector 正常完成：场景 `env_5`，单个 trajectory `39KV3A5D2G5VV16NHAJOVU94299S7W` 的 3 条语言指令，两个 190 步 minibatch，LMDB 写入 3 条 episode feature、190 条 RGB、190 条 depth。产物在 `/root/rivermind-data/uav_rgb/airvln-runtime-ubuntu/DATA/img_features/collect/airvln-single-route-20261115-r3/`。
+
+这只是 teacher-forcing 数据采集链 smoke，不是训练后自主导航，也没有 checkpoint、eval 或公开 VLN 分数；OpenFly_DataGen 实际文件仍返回 HTTP 403，后台下载器继续等待授权。

@@ -173,3 +173,33 @@
 | AirVLN Python 3.8 env | 已创建；torch/requirements 尚未完成安装 |
 
 AirVLN 依赖安装曾把大 wheel 的临时文件写入 30GB 系统盘并报 `No space left on device`；后续安装已改用数据盘 `TMPDIR` 与 `PIP_CACHE_DIR`。当前 CUDA wheel 仍需完成后才能做官方单场景 collect smoke，不能用等待时间伪造实验结果。
+
+## 更新 2026-11-15 02:40：AirVLN 非 root 单路线采集 smoke
+
+### 做了什么
+
+- 完成 AirVLN Python 3.8 环境和官方依赖安装：torch `2.1.2+cu118`、torchvision `0.16.2+cu118`、AirSim `1.7.0`、`pytorch-transformers`，并确认 CUDA、Gibson 权重和 ResNet-50 缓存可读。模型初始化 smoke 正常，但它本身没有启动场景。
+- 发现官方 Unreal 二进制拒绝 root 启动；没有修改原始 `vendor/` 权限，而是在数据盘建立 `airvln-runtime-ubuntu/` 隔离运行目录，由 `ubuntu` 用户运行。`env_5` 完整复制到该目录，标注只保留同一 `trajectory_id=39KV3A5D2G5VV16NHAJOVU94299S7W` 的 3 条语言指令，模型/词表/其余数据只读链接。
+- 定位并记录了无显示环境下的渲染崩溃：UE 能启动并开放 RPC，但第一次 `simGetImages` 会超时后 SIGSEGV。继承已有 `DISPLAY=:20`、`QT_X11_NO_MITSHM=1`、`SDL_HINT_CUDA_DEVICE=0` 后，AirSim 直接返回 RGB `224x224x3` 和深度 `256x256`，图像尺寸契约通过。
+- 在隔离副本中保留 UE 子进程、增加 stdout drain，避免官方 server 在 readiness banner 后杀掉 shell 导致端口失效；原仓库和原始官方副本未改。
+- 真实运行官方 `collect`：场景 `env_5`，`seq2seq`、teacher forcing、batch=1、`maxAction=220`。采集完成 2 个 minibatch、每个 190 步，共写入 3 条 episode feature、190 条 RGB 和 190 条 depth LMDB 记录；日志以 `END data_it: 0` 正常收尾。
+
+### 没做什么及原因
+
+- 没有启动官方 eval 或报告 AirVLN benchmark 分数：当前只有随机初始化/未训练的 policy，没有 checkpoint；本次是数据、渲染、AirSim RPC 和 LMDB 写入 smoke。
+- 没有把 collector 的动作成功率当 VLN 成绩；采集使用 teacher forcing，结果验证的是采集链而不是自主语言导航。
+- 没有把隔离 runtime 的 server 生命周期补丁直接合并到仓库：它针对外部官方源码，改动只服务本次可回溯 smoke；后续若长期使用，应在 vendoring 方案中单独维护并加进程组清理测试。
+- 没有停止或修改其他 GPU 训练进程；AirVLN 使用剩余显存完成 smoke，结束后检查确认没有残留 UE/server 进程。
+
+### 验证与风险
+
+| 项 | 结果 |
+|---|---|
+| AirVLN imports/CUDA | 通过；torch `2.1.2+cu118`，CUDA 可见 |
+| 无 DISPLAY 的首次采集 | 失败；图像请求超时并触发 UE SIGSEGV，已定位为渲染显示环境 |
+| `DISPLAY=:20` AirSim 图像探针 | 通过；RGB 224×224×3，Depth 256×256×65536 |
+| 官方 collect smoke | 通过；3 episode LMDB、190 RGB、190 depth |
+| collector 输出 | `/root/rivermind-data/uav_rgb/airvln-runtime-ubuntu/DATA/img_features/collect/airvln-single-route-20261115-r3/` |
+| OpenFly_DataGen | 仍未下载；实际文件端点 HTTP 403，后台重试保留 |
+
+该 smoke 仍不是 E2E VLN：语言只进入官方 collector 的训练样本，policy 没有训练，且没有自主停止、公开评测或与 SAGE 指标的可比性。长期运行 AirVLN 还需固定显示/渲染启动契约、维护 server 子进程回收，并在 checkpoint 产生后单独做 eval 门禁。
