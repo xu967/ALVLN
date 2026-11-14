@@ -68,3 +68,10 @@
 验证：bash -n通过；训练进程809293已使用GPU 578MiB，输出config.json/metrics.jsonl/results.csv，等待正式epoch结果。停止使用 `bash tools/stop_daemon.sh /root/rivermind-data/uav_rgb/exp-l1-language-formal-20261114`。
 
 补充数据审计：L1 train14496、val1688、test0；没有独立测试集，不能将val数字报告为test。子代理最初“trunc不存在”的判断有误，另一代理实读证实存在；本轮未采用该纯视觉数据。
+
+## 更新 2026-11-14 15:15
+
+- 用户要求充分利用租用 GPU 后，核实 RTX 2080 Ti 22,528 MiB；原语言基线三 seed 已完成，`DONE=0`。
+- 新增 `experiments/2026-11-14-l1-language-formal/run_parallel.sh`，启动三个相同预算的 `--vision-only` 对照并发运行；当前每个进程约 572 MiB，训练仍在运行。
+- 核实公开数据：SAGE-3D VLN、Wanderland 扩展、AirVLN、MatrixCity 均未下载完成；仅有空目录/元数据。已下载可训练数据是内部 `l1-v4-cf`，其 test split 为空。
+- 本轮没有冒充完成正式闭环评测：评测若与训练抢同一张卡会显存分配失败；已有历史旧数据指标与本轮数据严格分开。
