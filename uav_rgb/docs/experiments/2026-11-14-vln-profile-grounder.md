@@ -68,3 +68,11 @@ ctest --test-dir build/check --output-on-failure
 输出 `/root/rivermind-data/uav_rgb/exp-l1-language-formal-20261114`，逐轮数字读取results.csv；最终结果待完成后补录。
 
 启动后数据复核：L1共16184帧/902集，train14496、val1688、test0（scene_id划分）。本轮仅训练/验证，不存在独立test成绩；正式泛化评测必须另用冻结测试集。
+
+## 并发视觉对照与验证评测（2026-11-14）
+
+- 并发命令：`experiments/2026-11-14-l1-language-formal/run_parallel.sh`，三个 seed 使用 `--vision-only`、20 epochs、batch 64。
+- GPU：RTX 2080 Ti；三个进程同时运行，每进程约 572 MiB；`DONE=0`。
+- 视觉对照最终一轮 results.csv：seed1234 acc 0.87095 / macro-F1 0.87530 / bal_acc 0.51481；seed1235 0.87041 / 0.87090 / 0.50770；seed1236 0.87232 / 0.86848 / 0.50652。
+- 同一 val split 的 `--eval-only`：语言 seed1234/1235/1236 accuracy 0.9005/0.8987/0.9023，macro-F1 0.8767/0.8739/0.8749；视觉 seed1234/1235/1236 accuracy 0.5071/0.5071/0.5095，macro-F1 0.5083/0.5138/0.5150。语言分支在此模板数据上明显被使用，但这不是3DGS开放语言闭环成绩。
+- SAGE 下载命令：`huggingface-cli download spatialverse/SAGE-3D_VLN_Data --repo-type dataset ...`；因当前环境连接 Hugging Face 超时中断，目录仍约4 KB，没有数据文件。
