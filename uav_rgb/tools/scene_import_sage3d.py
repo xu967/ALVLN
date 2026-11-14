@@ -297,7 +297,12 @@ def _raster(xy, x0, y0, nx, ny, res, dil_cells):
     for dy in range(-k, k + 1):
         for dx in range(-k, k + 1):
             if dx * dx + dy * dy <= k * k:
-                d |= np.roll(np.roll(r, dy, 0), dx, 1)
+                # 不能用 np.roll：它会把场景边界的墙环绕到另一侧，误拒绝合法路线。
+                sy0, sy1 = max(0, -dy), ny - max(0, dy)
+                sx0, sx1 = max(0, -dx), nx - max(0, dx)
+                ty0, ty1 = max(0, dy), ny - max(0, -dy)
+                tx0, tx1 = max(0, dx), nx - max(0, -dx)
+                d[ty0:ty1, tx0:tx1] |= r[sy0:sy1, sx0:sx1]
     return d
 
 

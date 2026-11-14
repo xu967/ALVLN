@@ -208,7 +208,8 @@ def usda_mesh_to_arrays(usda_path):
 
     只取第一个 `def Mesh`：Collider 三角网格（PhysicsCollisionAPI），点坐标在**局部系**，与同包
     3DGS / LiDAR 同一坐标系（extent 与 raw_pcd.ply 一致）；Collider Xform 的 rotateXYZ(-90,0,180)
-    只是 Isaac Sim 的舞台旋转，这里原样返回给调用方记录，不作用到点上。
+    只是 Isaac Sim 的舞台旋转，这里原样返回给调用方记录，不作用到点上；本数据集的 mesh
+    点已与 raw_pcd/LiDAR 在同一坐标系，且主碰撞源使用 raw_pcd。
     不依赖 pxr：按 `point3f[] points = [...]` / `int[] faceVertexIndices = [...]` 文本切片解析。
     """
     import re
@@ -287,9 +288,11 @@ def step_convert():
         if not os.path.isfile(usda):
             with zipfile.ZipFile(os.path.join(DOWNLOAD_DIR, "scene.usdz")) as z:
                 z.extract("scene.usda", usd_dir)
+        # Wanderland 的 mesh 顶点已和 raw_pcd 对齐；USD Collider 变换只记账，不重复应用。
         pts, faces, xform = usda_mesh_to_arrays(usda)
         write_mesh_ply(mesh_ply, pts, faces)
         info["mesh"] = {"n_vertices": int(len(pts)), "n_faces": int(len(faces)), "collider_xform": xform,
+                        "collider_xform_applied": False,
                         "extent_min": pts.min(axis=0).round(3).tolist(), "extent_max": pts.max(axis=0).round(3).tolist()}
         log(f"convert: collision_mesh.ply <- scene.usdz/scene.usda {info['mesh']}")
     write_json(os.path.join(OUT, "convert.json"), info)

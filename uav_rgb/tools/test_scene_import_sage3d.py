@@ -77,6 +77,13 @@ class TestGround(unittest.TestCase):
 class TestFrame(unittest.TestCase):
     """合成场景：24 m × 24 m 实心障碍场里挖一条 L 形走廊（世界系）。SAGE 轨迹系 = 世界系绕 z 转 180°。"""
 
+    def test_raster_dilation_does_not_wrap_at_scene_edges(self):
+        mask = imp._raster(np.array([[0.0, 0.0]]), 0.0, 0.0, 5, 5, 1.0, 1)
+        self.assertTrue(mask[0, 0])
+        self.assertTrue(mask[0, 1] and mask[1, 0])
+        self.assertFalse(mask[4].any())
+        self.assertFalse(mask[:, 4].any())
+
     @classmethod
     def setUpClass(cls):
         xs = np.arange(-12.0, 12.01, 0.1)

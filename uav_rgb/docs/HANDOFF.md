@@ -1,11 +1,23 @@
 # uav_rgb 交接文档
 
+## 本次会话增量（2026-11-14）
+
+- 修复 SAGE-3D 导入器 `_raster` 的边界环绕：边界高斯只在场景内膨胀，不会从一侧复制到另一侧。
+- Wanderland 的 USD Collider 变换只记账，不重复应用；`convert.json` 写入 `collider_xform_applied=false`，因为当前 mesh 已与 raw LiDAR 坐标对齐。
+- `run_vln.py` 新增 `--grounder lexical --catalog <JSON>`。目录 schema 为 `uavrgb.vln_landmark_catalog.v1`，必须包含 `scene`、独立来源文件与可重算的 `source_sha256`、`frame_id=scene_nav`、`units=m` 和地标 `name/x/y[/z]`。来源哈希只核对文件身份，不证明标注没有参考测试答案，正式评测还需人工审来源与划分。
+- lexical 目标坐标用于控制、录像顶视图与 target-goal 指标；scene route waypoint 只作为 `overall` 的路线代理诊断。报告同时给拒绝/覆盖率和落地准确率。语言横幅只显示原指令，不显示答案标签。
+- `vln.episode_metrics` 现在记录动作切换、反向转向和 SAFE 动作窗；TOP 视频格明确标为 `DIAGNOSTIC/ORACLE`，避免把特权可视化误认为策略输入。
+- 这只是 G1 词法落地 + 控制器的可审计闭环；没有接文本学生、视觉 grounder、真机或开放语言泛化。SAGE 现有长航线不足，Wanderland 仍无语言标注，二者要分开报告。
+- 实验盘点和下载状态见 [当日跟进记录](experiments/2026-11-14-vln-g1-goal-dataset-followup.md)：目前无活动训练/仿真；L1 有语言/视觉验证集对照但 `test=0`；Wanderland 只验证了 12–15 m 单次路线，不能作为长航线稳定性结论。
+- 数据完整性：13 个已导入场景的 `scene.json` 都引用到存在的 PLY；SAGE 是本地标注和六场景可运行子集，不是全量资产；Wanderland 缺原始图像归档；Inria treehill checkpoint 不完整。数据盘约剩 243 GB，根 overlay 仅剩 1.3 GB，所有新增产物必须写入数据盘。
+- 最近回归测试：3DGS grounder/VLN/video、SAGE/Wanderland 导入器和控制层合计 221 项通过。没有独立 catalog，因此本轮没有启动正式 G1 导航实验。
+
 ## 最新状态（2026-11-14）
 
-- 用户目标仍是无人机视觉语言导航。当前尚无能接收指令并据此改变目的地的学生或 grounder；A* 教师直接使用 waypoint，是特权上界。
+- 用户目标仍是无人机视觉语言导航。现有 lexical G1 可按独立地标目录改变目的地，但它不是视觉 grounder 或语言学生；A* 仍是直接使用目标坐标的特权控制器。
 - 计划卡 A 已完成：SAFE 不再隐式表示任务完成；`run_vln` 默认显式 STOP / `3dgs.vln.v3`，`--stop-mode legacy-safe` 复现旧 v2。文本权重缺少有效 token 时，3DGS 学生入口明确拒绝。
 - 同轮修复了 3DGS 渲染/碰撞的尺度筛选差异、导航到世界变换校验、cf_sitl 小窗口计时、视频错误成功提示和末步碰撞的 `completed` 误标。实施与测试见 [计划 §10.6](PLAN_2026-11-13_vln.md#106-2026-11-14-恢复会话更新)、[实验记录](experiments/2026-11-13-vln-review.md) 和 [过程记录](worklog/2026-11-13-2247-vln-review.md)。
-- 下一步执行计划卡 B/C/D：验证长航线视角覆盖、量化并降低动作抖动、接最小语言 grounder 并做错/空指令反事实。完成前不要训练/宣称开放语言导航；E 等 A/C/D。
+- 下一步执行计划卡 B/C/D：从现有连续参考路线验证长航线视角覆盖、量化并降低动作抖动、给 G1 建立独立候选图并做正确/错配/空指令和空间关系反事实。当前 lexical grounder 会 fail-closed 拒绝关系词，需报告覆盖率/拒绝率。完成前不要训练/宣称开放语言导航；E 等 A/C/D。
 - 验证：本轮相关 86 项 unittest 通过；真实 GPU 渲染/碰撞 43/43；cf_sitl CTest 9/9、自检 33/33；SAGE 特权教师 2 集冒烟通过。完整 C++/CUDA CTest 43/44，`test_cuda_blocking_sync` CPU 占用阈值失败，没改阈值。没有真机验收。
 - 数据和无关实验目录未清理；只在 `docs/PLAN_2026-11-13_vln.md §10.5` 已确定可以删除前清理，不按“文件夹看起来乱”批量删除。
 
@@ -17,7 +29,7 @@
 - 原 M1 `v1` 历史结果保留。测试和离线重算见 [本轮验证](experiments/2026-11-13-vln-review.md)，不要把指标修正写成算法提升。
 - 开源基线并非没跑：BL2/BL4有完整历史结果、BL3部分闭环、BL5离线；仍无语言闭环比较。分支、证据和数据建议见 [核验报告](reviews/2026-11-13-vln-data-baselines.md)。
 - 先分离安全 SAFE 与任务 STOP，再接独立地图的语言 grounder；不要把8桶方位塞进4类 prev-action，也不要从测试答案造语义地图。
-- 当前 GPU 实测22528 MiB，数据盘约47GB空闲；足够先做小规模验证。扩盘与受限数据授权是扩场景需求，不是当前工作前提。
+- （历史容量快照，已过时）当时记录 GPU 22528 MiB、数据盘约 47 GB 空闲。当前磁盘状态以本页顶部的 2026-11-14 盘点为准。
 - 全量 CUDA 检查有一项既有性能阈值失败，详见验证记录；没有真机、全量新训练或开放语言导航的完成声明。
 
 ## 2026-11-13 状态（历史记录；以上方最新状态为准）

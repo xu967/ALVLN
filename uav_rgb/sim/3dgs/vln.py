@@ -21,6 +21,7 @@ import math
 import statistics
 
 STOP_STREAK = 3     # 旧 v1/v2 兼容约定；新显式 STOP 不使用
+SAFE_NEUTRAL, YAW_LEFT, YAW_RIGHT = 0, 2, 3
 
 
 def episodes(scene, splits=None, types=None):
@@ -61,6 +62,34 @@ def trajectory(actions, oracle):
     return [(float(p0["x"]), float(p0["y"]))] + [(float(o["pose_gt"]["x"]), float(o["pose_gt"]["y"])) for o in oracle]
 
 
+def _action_diagnostics(actions, path_m):
+    """统计动作切换与 SAFE 动作窗；未知动作不跨缺口配对，也不伪造 0。
+
+    SAFE 这里只表示动作协议中的 ``SAFE_NEUTRAL`` 窗口，包含显式 STOP 被改写的
+    SAFE 窗口，不等价于物理上已经停稳或悬停了多久。
+    """
+    values = []
+    for row in actions:
+        value = row.get("action_executed", row.get("action"))
+        valid = isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= 3
+        values.append(value if valid else None)
+    observed = sum(value is not None for value in values)
+    pairs = [(a, b) for a, b in zip(values, values[1:]) if a is not None and b is not None]
+    safe_steps = sum(value == SAFE_NEUTRAL for value in values if value is not None) if observed else None
+    switches = sum(a != b for a, b in pairs) if pairs else None
+    reversals = sum({a, b} == {YAW_LEFT, YAW_RIGHT} for a, b in pairs) if pairs else None
+    return {
+        "action_steps_observed": observed,
+        "action_pairs_observed": len(pairs),
+        "action_switches": switches,
+        "action_switches_per_m": switches / path_m if switches is not None and path_m > 1e-9 else None,
+        "safe_steps": safe_steps,
+        "safe_ratio": safe_steps / observed if safe_steps is not None else None,
+        "safe_steps_per_m": safe_steps / path_m if safe_steps is not None and path_m > 1e-9 else None,
+        "turn_reversals": reversals,
+    }
+
+
 def episode_metrics(actions, oracle, goal, radius, stopped, shortest_m=None):
     """单集 VLN 指标。actions / oracle 是 run_episode 写的逐步记录；stopped = 智能体自己喊了停。"""
     pts = trajectory(actions, oracle)
@@ -74,12 +103,15 @@ def episode_metrics(actions, oracle, goal, radius, stopped, shortest_m=None):
     path = sum(math.hypot(x1 - x0, y1 - y0) for (x0, y0), (x1, y1) in zip(pts, pts[1:]))
     ne = dist[-1]
     success = bool(stopped and not collided and ne <= radius)
+    # 控制平顺性诊断不参与 SR/SPL；动作缺口保持在原位置，不能跨缺口统计切换。
+    motion = _action_diagnostics(actions, path)
+    step_count = len(actions)
     spl = None
     if shortest_m is not None:
         spl = float(success) * shortest_m / max(path, shortest_m, 1e-9)
     return {"success": success, "oracle_success": min(safe) <= radius, "ne_m": ne,
             "spl": spl, "path_m": path, "shortest_m": shortest_m, "stopped": bool(stopped),
-            "collision": collided, "steps": len(actions)}
+            "collision": collided, "steps": step_count, **motion}
 
 
 def summarize(rows, failures=()):

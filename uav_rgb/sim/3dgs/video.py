@@ -47,6 +47,7 @@ KEYFRAMES = 4          # 关键帧 PNG：首、1/3、2/3、末（末 = 定格帧
 # 顶视地图配色：中灰底 + 深灰占据，白字黑边标签在上面读得出；轨迹黄与 Gazebo 顶视 trail 同色。
 MAP_BG, MAP_GRID, MAP_OCC = (150, 150, 150), (168, 168, 168), (55, 55, 55)
 MAP_TRAIL, MAP_GOAL, MAP_SPAWN = (0, 255, 255), (0, 0, 220), (0, 160, 0)
+TOP_LABEL = "TOP MAP [DIAGNOSTIC/ORACLE] occupancy proxy + path"
 
 
 def compose_rgb_video(frames_dir, out_path, fps=10.0):
@@ -176,7 +177,7 @@ class _TopMap:
         cv2.circle(self.base, self.px(sp["x"], sp["y"]), 5 * s, MAP_SPAWN, -1)                              # spawn
         # 图例放左上、TOP 标签（paste 写在 y=22）之下，与 Gazebo 顶视图例同位置（record_views.LEGEND_TOP）。
         legend = (("trail", MAP_TRAIL), ("waypoint r=%gm" % reach, MAP_GOAL), ("spawn", MAP_SPAWN),
-                  ("occupancy proxy", MAP_OCC))
+                  ("DIAGNOSTIC/ORACLE occupancy", MAP_OCC))
         for i, (label, color) in enumerate(legend):
             cv2.putText(self.base, label, (8 * s, (44 + 15 * i) * s), font, 0.4 * s, color, s)
         # 比例尺 + 朝向：没有比例尺看不出 2 m 到达圈有多大；箭头朝右 = +x。放在 paste 的时间角标（y=CH-8）之上。
@@ -221,7 +222,7 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
                         title="", result="", quality=None, log=print, instruction=""):
     """cf_sitl 采集集（trace.jsonl + actions.jsonl）-> 四格视频（.mp4 / .webm）+ 关键帧 PNG。
 
-    instruction：VLN 集的指令原文（可带目标物体），非空时作为横幅贴在 FOLLOW 格顶部，整段视频一直显示。
+    instruction：VLN 集的指令原文，不附加目标答案，非空时作为横幅贴在 FOLLOW 格顶部。
 
     左上 FOLLOW：同一 3DGS，只跟位置与偏航，机体后方 FOLLOW_BACK_M、上方 FOLLOW_UP_M，格子原生分辨率
     渲染，叠 E1 机体着色投影；右上 TOP：占据代理 2D 地图 + 轨迹 + 机体图标（occ 是 collision.from_scene 的
@@ -309,7 +310,7 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
             vl.paste(cv2, canvas, follow, *tl, CW, CH, follow_label, note, s=s)
             if instruction:
                 _banner(cv2, canvas, instruction, *tl, CW, s=s)
-            vl.paste(cv2, canvas, top, *tr, CW, CH, "TOP MAP occupancy proxy + path", note, s=s)
+            vl.paste(cv2, canvas, top, *tr, CW, CH, TOP_LABEL, note, s=s)
             vl.paste(cv2, canvas, onboard, *bl, CW, CH,
                      vl.onboard_label(onboard, renderer.fov_deg, display=s, rendered_at=s), note, s=s)
             step = int(row["step"])
@@ -543,8 +544,7 @@ def main():
         collided = any(a.get("collision") for a in actions)
         result = episode_result(man, oracle, float(ep_scene.get("reach_radius_m", 1.5)), collided, actions)
         instruction = man.get("vln") or {}
-        banner = (f'"{instruction["text"]}"   goal: {instruction.get("goal_object", "")}'
-                  if instruction.get("text") else "")
+        banner = f'"{instruction["text"]}"' if instruction.get("text") else ""
         r = compose_views_video(ep, ep_scene, renderer, mount, occ, out_path=os.path.join(ep, args.out_name),
                                 title=f"{video_policy(man)} | {dyn} | {scene_short} | seed {man.get('seed')}",   # 与 Gazebo 标题同格式
                                 result=result, quality=args.video_quality, instruction=banner,

@@ -11,6 +11,8 @@
   reactive  目标条件局部控制，只看当前深度、位姿和目标方向，不在线查询全局占据图或调用 A*
   forward  一直前进、从不喊停，不看指令：下界
 teacher/reactive 都直接拿 waypoint，只用于验证控制层；它们都不是语言理解结果。
+`--grounder lexical --catalog <JSON>` 是最小语言闭环：从独立地标目录选目标，
+再交给 teacher/reactive 控制；它用于验证“换一句指令会换目标”，仍不等于端到端语言学生。
 真正的语言学生尚未接入。
 
 产物：<out>/<场景>/<航线>_<指令序号>/（run_episode 的逐步记录；前 --videos 集另有 views.mp4）、
@@ -31,6 +33,7 @@ from . import reactive
 from . import scene as scene_mod
 from . import video as video_mod
 from . import vln
+from . import grounder as grounder_mod
 from .dynamics import CfSitlParams
 from .eval_3dgs import reach_radius_of, route_shortest_path_m
 
@@ -62,7 +65,45 @@ def _read_jsonl(path):
         return [json.loads(line) for line in f if line.strip()]
 
 
-def run_scene(path, args, params):
+def resolve_grounding(selector, catalog, instruction):
+    """把指令落到外部目录中的目标坐标；拒绝时返回结果和 ``None``。"""
+    result = selector.ground(instruction, list(catalog or ()))
+    if not result.accepted:
+        return result, None
+    return result, dict(catalog[result.target])
+
+
+def _require_external_catalog(catalog_path, scene_path):
+    """拒绝把 scene.json 自己当作语言地标目录，避免 waypoint 走后门。"""
+    try:
+        same = os.path.samefile(catalog_path, scene_path)
+    except (FileNotFoundError, OSError):
+        same = os.path.realpath(catalog_path) == os.path.realpath(scene_path)
+    if same:
+        raise ValueError("地标目录必须是独立文件，不能复用 scene.json")
+
+
+def _grounding_summary(rows, failures):
+    """报告指令落地覆盖、接受率和准确率；仿真失败仍保留已完成的落地结果。"""
+    requested = len(rows) + len(failures)
+    records = [item["grounding"] for item in [*rows, *failures]
+               if isinstance(item.get("grounding"), dict)]
+    accepted = [item for item in records if item.get("accepted")]
+    correct = sum(bool(item.get("correct")) for item in records)
+    return {
+        "n_requested": requested,
+        "n_grounded": len(records),
+        "n_missing": requested - len(records),
+        "n_accepted": len(accepted),
+        "n_rejected": len(records) - len(accepted),
+        "n_correct": correct,
+        "coverage": len(accepted) / requested if requested else None,
+        "accuracy_including_rejects": correct / requested if requested else None,
+        "accuracy_among_accepted": correct / len(accepted) if accepted else None,
+    }
+
+
+def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_path=None):
     scene = scene_mod.load_scene(path)
     eps = vln.episodes(scene, splits=args.split)
     if not args.all_instructions:
@@ -83,10 +124,38 @@ def run_scene(path, args, params):
     for n, ep in enumerate(eps):
         scene_mod.apply_route(scene, ep["route_index"])
         identity = collect_3dgs.scene_identity(scene, ply_sha256=identity["ply_sha256"])
-        scene["vln"] = ep
+        evaluation_goal = dict(scene["waypoint"])
+        grounding = None
+        policy_goal = evaluation_goal
+        if lexical_grounder is not None:
+            try:
+                result, policy_goal = resolve_grounding(lexical_grounder, catalog, ep["text"])
+            except Exception as e:  # noqa: BLE001 - 单集输入错误要保留在请求分母
+                ep_dir = os.path.join(args.out, scene["name"], f"{ep['route_name']}_{ep['instruction_index']}")
+                failures.append({**ep, "scene": scene["name"], "dir": ep_dir,
+                                 "error": f"{type(e).__name__}: {e}"})
+                continue
+            grounding = {"target": result.target, "score": result.score, "margin": result.margin,
+                         "accepted": result.accepted, "reason": result.reason}
+            if not result.accepted:
+                ep_dir = os.path.join(args.out, scene["name"], f"{ep['route_name']}_{ep['instruction_index']}")
+                failures.append({**ep, "scene": scene["name"], "dir": ep_dir,
+                                 "grounding": grounding, "error": f"ValueError: grounder 拒绝指令: {result.reason}"})
+                continue
+        if grounding is not None:
+            grounding.update({
+                "correct": grounding["target"] == ep.get("goal_object"),
+                "policy_goal": policy_goal,
+                "catalog_sha256": collect_3dgs._sha256(catalog_path) if catalog_path else None,
+                "scene_json_sha256": collect_3dgs._sha256(scene.get("path")) if scene.get("path") else None,
+                "geometry_gid": identity["geometry_gid"],
+                "ply_sha256": identity["ply_sha256"],
+            })
+        scene["waypoint"] = dict(policy_goal)
+        scene["vln"] = {**ep, **({"grounding": grounding} if grounding is not None else {})}
         ep_dir = os.path.join(args.out, scene["name"], f"{ep['route_name']}_{ep['instruction_index']}")
         steps = math.ceil(int(scene["max_steps"]) * STEPS_HOLD_S / args.hold)
-        policy = make_policy(args.policy, occ_planner, scene["waypoint"], args.hold, stop_radius=radius)
+        policy = make_policy(args.policy, occ_planner, policy_goal, args.hold, stop_radius=radius)
         try:
             man, err = collect_3dgs.run_episode(
                 scene, ep_dir, renderer, occ, params, policy, steps, args.hold,
@@ -105,20 +174,34 @@ def run_scene(path, args, params):
                 raise ValueError("动作与位姿记录必须非空、长度一致")
             # p 包含第一步运动，l 也必须从同一个动作前位姿开始。
             start = {**actions[0]["pose_before"], "yaw_deg": actions[0].get("yaw_before", 0.0)}
-            shortest = route_shortest_path_m(occ_planner, [{"pose_gt": start}] + oracle, scene)
-            m = vln.episode_metrics(actions, oracle, scene["waypoint"], radius, man["stopped_by_agent"], shortest)
+            route_scene = dict(scene, waypoint=evaluation_goal)
+            shortest = route_shortest_path_m(occ_planner, [{"pose_gt": start}] + oracle, route_scene)
+            m = vln.episode_metrics(actions, oracle, evaluation_goal, radius, man["stopped_by_agent"], shortest)
+            target_metrics = None
+            if grounding is not None:
+                target_scene = dict(scene, waypoint=policy_goal)
+                target_shortest = route_shortest_path_m(
+                    occ_planner, [{"pose_gt": start}] + oracle, target_scene)
+                target_metrics = vln.episode_metrics(
+                    actions, oracle, policy_goal, radius, man["stopped_by_agent"], target_shortest)
         except Exception as e:  # noqa: BLE001 - 一集崩了记下来接着跑，报告里单列
-            failures.append({**ep, "scene": scene["name"], "dir": ep_dir, "error": f"{type(e).__name__}: {e}"})
+            failures.append({**ep, "scene": scene["name"], "dir": ep_dir,
+                             **({"grounding": grounding} if grounding is not None else {}),
+                             "error": f"{type(e).__name__}: {e}"})
             continue
         row = {**ep, "scene": scene["name"], **m, "error": err, "dir": ep_dir,
                "terminal_reason": man.get("terminal_reason")}
+        if grounding is not None:
+            row["grounding"] = grounding
+            row.update({f"target_{key}": value for key, value in target_metrics.items()})
         rows.append(row)
-        print(f"[{scene['name']} {n + 1}/{len(eps)}] {result_text(m):24s} {ep['type']:22s} {ep['text']}", file=sys.stderr)
+        primary_metrics = target_metrics if target_metrics is not None else m
+        print(f"[{scene['name']} {n + 1}/{len(eps)}] {result_text(primary_metrics):24s} {ep['type']:22s} {ep['text']}", file=sys.stderr)
         if n < args.videos:
             video_mod.compose_views_video(
                 ep_dir, scene, renderer, params.camera_mount, occ,
-                title=f"{args.policy} | cf_sitl | {scene['name']} | {ep['type']}", result=result_text(m),
-                instruction=f"\"{ep['text']}\"   goal: {ep['goal_object']}",
+                title=f"{args.policy} | cf_sitl | {scene['name']} | {ep['type']}", result=result_text(primary_metrics),
+                instruction=f"\"{ep['text']}\"",
                 log=lambda msg: print(msg, file=sys.stderr))
     return rows, failures
 
@@ -128,6 +211,10 @@ def main(argv=None):
     p.add_argument("--scene", action="append", required=True, help="SAGE-3D 导入的 scene.json，可给多个")
     p.add_argument("--policy", choices=("teacher", "reactive", "forward"), required=True,
                    help="teacher = A* 特权上界；reactive = 不查全局地图的目标条件局部控制；forward = 盲目前进下界")
+    p.add_argument("--grounder", choices=("none", "lexical"), default="none",
+                   help="lexical：用外部地标目录把指令落到控制目标；目录必须独立于 scene.json")
+    p.add_argument("--catalog", action="append", default=None,
+                   help="--grounder lexical 时必填，每场景一个 uavrgb.vln_landmark_catalog.v1 JSON；可重复")
     p.add_argument("--out", required=True)
     p.add_argument("--hold", type=float, default=0.5, help="每步动作窗口（秒）")
     p.add_argument("--stop-mode", choices=("explicit", "legacy-safe"), default="explicit",
@@ -139,6 +226,10 @@ def main(argv=None):
     p.add_argument("--videos", type=int, default=0, help="每个场景前几集合成带指令横幅的四格视频")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
+    if args.grounder == "lexical" and not args.catalog:
+        p.error("--grounder lexical 必须同时提供 --catalog")
+    if args.grounder == "lexical" and args.policy == "forward":
+        p.error("forward 不消费目标，不能与 --grounder lexical 一起使用")
     if not (math.isfinite(args.hold) and args.hold > 0):
         p.error("--hold 必须是正数")
     if args.limit < 0 or args.videos < 0:
@@ -149,8 +240,35 @@ def main(argv=None):
     params = CfSitlParams.from_json(None)
     started = time.monotonic()
     rows, failures = [], []
+    lexical_grounder = None
+    if args.grounder == "lexical":
+        lexical_grounder = grounder_mod.LexicalGrounder()
+    catalogs = {}
+    if lexical_grounder is not None:
+        for catalog_path in args.catalog:
+            with open(catalog_path, encoding="utf-8") as f:
+                catalog_doc = json.load(f)
+            scene_name = catalog_doc.get("scene") if isinstance(catalog_doc, dict) else None
+            if not isinstance(scene_name, str) or not scene_name.strip():
+                p.error(f"{catalog_path}: 地标目录缺少 scene")
+            if scene_name in catalogs:
+                p.error(f"重复的场景地标目录: {scene_name}")
+            catalogs[scene_name] = catalog_path
+        requested_names = {scene_mod.load_scene(path)["name"] for path in args.scene}
+        unused = sorted(set(catalogs) - requested_names)
+        if unused:
+            p.error("未被 --scene 使用的 --catalog: " + ", ".join(unused))
     for path in args.scene:
-        r, f = run_scene(path, args, params)
+        scene_catalog, catalog_path = None, None
+        if lexical_grounder is not None:
+            scene_name = scene_mod.load_scene(path)["name"]
+            catalog_path = catalogs.get(scene_name)
+            if catalog_path is None:
+                p.error(f"场景 {scene_name} 缺少对应 --catalog 文件")
+            _require_external_catalog(catalog_path, path)
+            scene_catalog = grounder_mod.load_catalog(catalog_path, scene_name=scene_name, scene_path=path)
+        r, f = run_scene(path, args, params, lexical_grounder=lexical_grounder,
+                         catalog=scene_catalog, catalog_path=catalog_path)
         rows += r
         failures += f
     if not rows and not failures:
@@ -163,8 +281,17 @@ def main(argv=None):
               "stop_streak": vln.STOP_STREAK if args.stop_mode == "legacy-safe" else None,
               "dynamics": "cf_sitl", "dynamics_profile": params.profile(),
               "scenes": args.scene, "split_filter": args.split, "all_instructions": args.all_instructions,
+              "grounder": args.grounder, "catalog": args.catalog,
+              "overall_metric_scope": ("route_waypoint_proxy" if args.grounder == "lexical"
+                                       else "scene_route_waypoint"),
               "overall": vln.summarize(rows, failures), "by_type": vln.summarize_by(rows, "type", failures),
               "by_split": vln.summarize_by(rows, "split", failures), "by_scene": vln.summarize_by(rows, "scene", failures),
+              "grounding": (_grounding_summary(rows, failures) if args.grounder == "lexical" else None),
+              "target_goal_metrics": (vln.summarize([
+                  {"success": r["target_success"], "oracle_success": r["target_oracle_success"],
+                   "spl": r["target_spl"], "ne_m": r["target_ne_m"],
+                   "collision": r["collision"], "stopped": r["stopped"]} for r in rows
+                  if "target_success" in r], failures) if args.grounder == "lexical" else None),
               "failures": failures, "wall_s": round(time.monotonic() - started, 1)}
     with open(os.path.join(args.out, "vln_eval.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)

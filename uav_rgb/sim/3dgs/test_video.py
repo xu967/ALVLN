@@ -24,6 +24,9 @@ def _oracle(*xy):
 
 
 class TestVideoPolicyName(unittest.TestCase):
+    def test_top_map_is_marked_as_oracle_diagnostic(self):
+        self.assertIn("DIAGNOSTIC/ORACLE", video.TOP_LABEL)
+
     def test_executed_by_wins(self):
         self.assertEqual(video.video_policy({"teacher": "student", "executed_by": "student"}), "student")
         self.assertEqual(video.video_policy({"teacher": "plan_action", "executed_by": "teacher"}), "teacher")
@@ -120,7 +123,7 @@ class TestVlnReplay(unittest.TestCase):
         with tempfile.TemporaryDirectory() as ep:
             scene_path = os.path.join(ep, "scene.json")
             scene = {"dir": ep, "waypoint": WP, "reach_radius_m": 1.}
-            man = {"vln": {"text": "go to chair", "goal_object": "chair"}, "waypoint": WP,
+            man = {"vln": {"text": "go to chair", "goal_object": "sofa"}, "waypoint": WP,
                    "stopped_by_agent": False, "scene": {}, "dynamics_params": {}, "seed": 0}
             for name, obj in (("scene.json", scene), ("episode_manifest.json", man)):
                 with open(os.path.join(ep, name), "w") as f:
@@ -138,7 +141,9 @@ class TestVlnReplay(unittest.TestCase):
                   mock.patch.object(video, "compose_views_video", return_value={}) as compose,
                   mock.patch("builtins.print")):
                 video.main()
-            self.assertEqual(compose.call_args.kwargs["instruction"], '"go to chair"   goal: chair')
+            banner = compose.call_args.kwargs["instruction"]
+            self.assertEqual(banner, '"go to chair"')
+            self.assertNotIn("sofa", banner)
             self.assertEqual(compose.call_args.kwargs["result"], "NO STOP 0.0 m")
 
 

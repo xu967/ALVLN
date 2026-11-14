@@ -64,6 +64,16 @@ class TestEpisodes(unittest.TestCase):
         self.assertEqual([e["key"] for e in vln.one_per_route(eps, seed=0)], ["s/r0/1", "s/r1/0"])
         self.assertEqual([e["key"] for e in vln.one_per_route(eps, seed=1)], ["s/r0/0", "s/r1/0"])
 
+    def test_external_grounder_changes_policy_goal_and_rejects_unknown(self):
+        selector = importlib.import_module("sim.3dgs.grounder").LexicalGrounder()
+        catalog = {"lamp_2": {"x": 7.0, "y": -1.0}}
+        result, goal = runner.resolve_grounding(selector, catalog, "Go to the tall lamp.")
+        self.assertTrue(result.accepted)
+        self.assertEqual(goal, catalog["lamp_2"])
+        rejected, no_goal = runner.resolve_grounding(selector, catalog, "Fly to the red plant.")
+        self.assertFalse(rejected.accepted)
+        self.assertIsNone(no_goal)
+
 
 class TestMetrics(unittest.TestCase):
     def test_stop_inside_radius_is_success(self):
@@ -85,6 +95,47 @@ class TestMetrics(unittest.TestCase):
         a, o = _steps([(0, 0), (1, 0)])
         m = vln.episode_metrics(a, o, GOAL, 1.0, stopped=True)
         self.assertEqual((m["success"], m["oracle_success"], m["spl"]), (False, False, None))
+
+    def test_motion_diagnostics_report_switches_and_safe_time(self):
+        actions = [
+            {"pose_before": {"x": 0, "y": 0}, "action_executed": 1, "collision": False},
+            {"pose_before": {"x": 1, "y": 0}, "action_executed": 2, "collision": False},
+            {"pose_before": {"x": 1, "y": 0}, "action_executed": 3, "collision": False},
+            {"pose_before": {"x": 1, "y": 0}, "action_executed": 0, "collision": False},
+        ]
+        oracle = [{"pose_gt": {"x": 1, "y": 0}}, {"pose_gt": {"x": 1, "y": 0}},
+                  {"pose_gt": {"x": 1, "y": 0}}, {"pose_gt": {"x": 1, "y": 0}}]
+        m = vln.episode_metrics(actions, oracle, GOAL, 1.0, stopped=False)
+        self.assertEqual((m["action_steps_observed"], m["action_pairs_observed"], m["action_switches"],
+                          m["safe_steps"], m["turn_reversals"]), (4, 3, 3, 1, 1))
+        self.assertAlmostEqual(m["action_switches_per_m"], 3.0)
+        self.assertAlmostEqual(m["safe_steps_per_m"], 1.0)
+
+    def test_unknown_action_does_not_bridge_or_report_zero(self):
+        actions = [
+            {"pose_before": {"x": 0, "y": 0}, "action_executed": 1, "collision": False},
+            {"pose_before": {"x": 1, "y": 0}, "action_executed": 99, "collision": False},
+            {"pose_before": {"x": 1, "y": 0}, "action_executed": 3, "collision": False},
+        ]
+        oracle = [{"pose_gt": {"x": 1, "y": 0}}] * 3
+        m = vln.episode_metrics(actions, oracle, GOAL, 1.0, stopped=False)
+        self.assertEqual((m["action_steps_observed"], m["action_pairs_observed"], m["action_switches"],
+                          m["safe_steps"], m["turn_reversals"]), (2, 0, None, 0, None))
+        self.assertIsNone(m["action_switches_per_m"])
+
+    def test_old_actions_without_action_field_do_not_claim_zero_diagnostics(self):
+        a, o = _steps([(0, 0), (1, 0)])
+        m = vln.episode_metrics(a, o, GOAL, 1.0, stopped=False)
+        self.assertEqual((m["action_steps_observed"], m["action_pairs_observed"], m["action_switches"],
+                          m["safe_steps"], m["safe_ratio"]), (0, 0, None, None, None))
+
+    def test_zero_path_does_not_report_per_meter_rate(self):
+        actions = [{"pose_before": {"x": 0, "y": 0}, "action_executed": 0, "collision": False}]
+        oracle = [{"pose_gt": {"x": 0, "y": 0}}]
+        m = vln.episode_metrics(actions, oracle, GOAL, 1.0, stopped=False)
+        self.assertEqual(m["safe_steps"], 1)
+        self.assertAlmostEqual(m["safe_ratio"], 1.0)
+        self.assertIsNone(m["safe_steps_per_m"])
 
     def test_poses_after_collision_do_not_count(self):
         # 第 1 步（0 起）撞：它的终点 (4, 0) 已在障碍里，不算进过半径
@@ -114,6 +165,15 @@ class TestReactiveGoalPolicy(unittest.TestCase):
         depth = np.full((10, 12), 4.0, dtype=np.float32)
         action, _ = policy(None, depth, self._state())
         self.assertEqual(action, dyn3dgs.YAW_LEFT)
+
+    def test_same_start_changes_action_when_grounded_goal_changes_side(self):
+        depth = np.full((10, 12), 4.0, dtype=np.float32)
+        state = self._state()
+        left, right = (reactive.ReactiveGoalPolicy({"x": 0.0, "y": y})
+                       for y in (5.0, -5.0))
+        action_left, _ = left(None, depth, state)
+        action_right, _ = right(None, depth, state)
+        self.assertEqual((action_left, action_right), (dyn3dgs.YAW_LEFT, dyn3dgs.YAW_RIGHT))
 
     def test_stops_inside_goal_radius(self):
         policy = reactive.ReactiveGoalPolicy({"x": 0.5, "y": 0.0})
@@ -338,6 +398,136 @@ class TestRunner(unittest.TestCase):
         self.assertNotEqual(calls[0].kwargs["identity"]["task_id"], calls[1].kwargs["identity"]["task_id"])
         self.assertTrue(all(c.kwargs["stop_on_request"] for c in calls))
         self.assertTrue(all(c.kwargs["stop_after_safe"] is None for c in calls))
+
+    def test_lexical_goal_changes_with_same_start_and_reports_both_targets(self):
+        scene = copy.deepcopy(SCENE)
+        scene.update(ply_path="unused.ply", reach_radius_m=1.0, max_steps=8)
+        scene["routes"] = [{"name": "r0", "spawn": {"x": 0.0, "y": 0.0, "z": 2.0},
+                             "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0},
+                             "sage": {"split": "train", "instructions": [
+                                 {"instruction_type": "A", "start": "start", "end": "lamp_2",
+                                  "text": "Go to the tall lamp."},
+                                 {"instruction_type": "B", "start": "start", "end": "tv_1",
+                                  "text": "Go to the black TV."}]}}]
+        args = SimpleNamespace(split=None, all_instructions=True, seed=0, limit=0,
+                               out="unused", hold=0.5, policy="teacher", videos=0, stop_mode="explicit")
+        goals = []
+        runs = [_steps([(0, 0), (7, -1), (7, -1)]),
+                _steps([(0, 0), (8, 2), (8, 2)])]
+        manifest = {"stopped_by_agent": True,
+                    "validity": {"physics_verified": True, "camera_verified": True}}
+        selector = importlib.import_module("sim.3dgs.grounder").LexicalGrounder()
+        catalog = {"lamp_2": {"x": 7.0, "y": -1.0}, "tv_1": {"x": 8.0, "y": 2.0}}
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(scene_mod, "load_scene", return_value=scene))
+            stack.enter_context(mock.patch.object(scene_mod, "read_gaussian_ply", return_value=None))
+            stack.enter_context(mock.patch.object(runner.collision_mod, "from_scene", return_value=None))
+            stack.enter_context(mock.patch.object(runner.renderer_mod, "make_renderer", return_value=None))
+            stack.enter_context(mock.patch.object(runner.planner_mod, "OccPlanner", return_value=None))
+            stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
+            stack.enter_context(mock.patch.object(runner, "make_policy",
+                side_effect=lambda name, planner, waypoint, hold, stop_radius=1.0:
+                    goals.append(dict(waypoint)) or SimpleNamespace(name="teacher")))
+            stack.enter_context(mock.patch.object(collect, "run_episode", side_effect=[(manifest, None), (manifest, None)]))
+            stack.enter_context(mock.patch.object(runner, "_read_jsonl", side_effect=[item for pair in runs for item in pair]))
+            stack.enter_context(mock.patch.object(runner, "route_shortest_path_m", return_value=3.0))
+            rows, failures = runner.run_scene("fixture.json", args, None,
+                                              lexical_grounder=selector, catalog=catalog)
+        self.assertEqual(goals, [catalog["lamp_2"], catalog["tv_1"]])
+        self.assertEqual(len(rows), 2)
+        self.assertFalse(failures)
+        self.assertTrue(all(row["target_success"] for row in rows))
+        self.assertTrue(all(row["grounding"]["correct"] for row in rows))
+        self.assertFalse(any(row["success"] for row in rows))  # route waypoint 与 catalog 目标不同
+
+    def test_route_waypoint_success_does_not_hide_catalog_goal_miss(self):
+        scene = copy.deepcopy(SCENE)
+        scene.update(ply_path="unused.ply", reach_radius_m=1.0, max_steps=8)
+        scene["routes"] = [{"name": "r0", "spawn": {"x": 0.0, "y": 0.0, "z": 2.0},
+                             "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0},
+                             "sage": {"split": "train", "instructions": [
+                                 {"instruction_type": "A", "start": "start", "end": "lamp_2",
+                                  "text": "Go to the tall lamp."}]}}]
+        args = SimpleNamespace(split=None, all_instructions=True, seed=0, limit=0,
+                               out="unused", hold=0.5, policy="teacher", videos=0, stop_mode="explicit")
+        actions, oracle = _steps([(0, 0), (4, 0), (4, 0)])
+        manifest = {"stopped_by_agent": True,
+                    "validity": {"physics_verified": True, "camera_verified": True}}
+        selector = importlib.import_module("sim.3dgs.grounder").LexicalGrounder()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(scene_mod, "load_scene", return_value=scene))
+            stack.enter_context(mock.patch.object(scene_mod, "read_gaussian_ply", return_value=None))
+            stack.enter_context(mock.patch.object(runner.collision_mod, "from_scene", return_value=None))
+            stack.enter_context(mock.patch.object(runner.renderer_mod, "make_renderer", return_value=None))
+            stack.enter_context(mock.patch.object(runner.planner_mod, "OccPlanner", return_value=None))
+            stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
+            stack.enter_context(mock.patch.object(runner, "make_policy", return_value=SimpleNamespace(name="teacher")))
+            stack.enter_context(mock.patch.object(collect, "run_episode", return_value=(manifest, None)))
+            stack.enter_context(mock.patch.object(runner, "_read_jsonl", side_effect=[actions, oracle]))
+            stack.enter_context(mock.patch.object(runner, "route_shortest_path_m", return_value=3.0))
+            rows, failures = runner.run_scene(
+                "fixture.json", args, None, lexical_grounder=selector,
+                catalog={"lamp_2": {"x": 8.0, "y": 0.0}})
+        self.assertEqual(len(rows), 1)
+        self.assertTrue(rows[0]["success"])
+        self.assertFalse(rows[0]["target_success"])
+        self.assertTrue(rows[0]["grounding"]["correct"])
+        self.assertEqual(len(failures), 0)
+
+    def test_accepted_grounding_survives_episode_failure(self):
+        scene = copy.deepcopy(SCENE)
+        scene.update(ply_path="unused.ply", reach_radius_m=1.0, max_steps=8)
+        scene["routes"] = [{"name": "r0", "spawn": {"x": 0.0, "y": 0.0, "z": 2.0},
+                             "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0},
+                             "sage": {"split": "train", "instructions": [
+                                 {"instruction_type": "A", "start": "start", "end": "lamp_2",
+                                  "text": "Go to the tall lamp."}]}}]
+        args = SimpleNamespace(split=None, all_instructions=True, seed=0, limit=0,
+                               out="unused", hold=0.5, policy="teacher", videos=0, stop_mode="explicit")
+        selector = importlib.import_module("sim.3dgs.grounder").LexicalGrounder()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(scene_mod, "load_scene", return_value=scene))
+            stack.enter_context(mock.patch.object(scene_mod, "read_gaussian_ply", return_value=None))
+            stack.enter_context(mock.patch.object(runner.collision_mod, "from_scene", return_value=None))
+            stack.enter_context(mock.patch.object(runner.renderer_mod, "make_renderer", return_value=None))
+            stack.enter_context(mock.patch.object(runner.planner_mod, "OccPlanner", return_value=None))
+            stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
+            stack.enter_context(mock.patch.object(collect, "run_episode", side_effect=RuntimeError("render failed")))
+            failures = runner.run_scene(
+                "fixture.json", args, None, lexical_grounder=selector,
+                catalog={"lamp_2": {"x": 8.0, "y": 0.0}})[1]
+        self.assertTrue(failures[0]["grounding"]["accepted"])
+        self.assertTrue(failures[0]["grounding"]["correct"])
+        summary = runner._grounding_summary([], failures)
+        self.assertEqual((summary["n_requested"], summary["n_grounded"], summary["n_accepted"],
+                          summary["n_correct"], summary["coverage"]), (1, 1, 1, 1, 1.0))
+
+    def test_rejected_instruction_stays_in_requested_denominator(self):
+        scene = copy.deepcopy(SCENE)
+        scene.update(ply_path="unused.ply", reach_radius_m=1.0, max_steps=8)
+        scene["routes"] = [{"name": "r0", "spawn": {"x": 0.0, "y": 0.0, "z": 2.0},
+                             "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0},
+                             "sage": {"split": "train", "instructions": [
+                                 {"instruction_type": "A", "start": "start", "end": "plant_1",
+                                  "text": "Go to the red plant."}]}}]
+        args = SimpleNamespace(split=None, all_instructions=True, seed=0, limit=0,
+                               out="unused", hold=0.5, policy="teacher", videos=0, stop_mode="explicit")
+        selector = importlib.import_module("sim.3dgs.grounder").LexicalGrounder()
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(scene_mod, "load_scene", return_value=scene))
+            stack.enter_context(mock.patch.object(scene_mod, "read_gaussian_ply", return_value=None))
+            stack.enter_context(mock.patch.object(runner.collision_mod, "from_scene", return_value=None))
+            stack.enter_context(mock.patch.object(runner.renderer_mod, "make_renderer", return_value=None))
+            stack.enter_context(mock.patch.object(runner.planner_mod, "OccPlanner", return_value=None))
+            stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
+            run = stack.enter_context(mock.patch.object(collect, "run_episode"))
+            rows, failures = runner.run_scene(
+                "fixture.json", args, None, lexical_grounder=selector,
+                catalog={"lamp_2": {"x": 8.0, "y": 0.0}})
+        self.assertEqual((len(rows), len(failures)), (0, 1))
+        self.assertEqual(failures[0]["grounding"]["reason"], "below_min_score")
+        self.assertEqual(vln.summarize(rows, failures)["n_requested"], 1)
+        run.assert_not_called()
 
     def test_spl_reference_starts_before_first_action(self):
         _, _, _, calls = self.run_scene()

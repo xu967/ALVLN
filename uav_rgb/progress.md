@@ -1,5 +1,14 @@
 # progress.md（新开会话先读这个）
 
+## 2026-11-14 VLN/3DGS 可靠性增量（本次会话）
+
+- 修复 `tools/scene_import_sage3d.py` 栅格膨胀的边界环绕 bug：不再用 `np.roll` 把边界障碍复制到对侧；新增回归测试。
+- 明确 Wanderland USD 碰撞网格与 LiDAR 已在同一坐标系，转换产物记录 `collider_xform_applied=false`，避免重复套用 Collider 旋转。
+- `run_vln` 增加受审计的最小语言闭环：`--grounder lexical --catalog` 只读取独立地标目录，拒绝把 `scene.json` 当目录；控制、录像和 target-goal 指标使用目录目标，route waypoint 只作代理诊断，错误落地保留在请求分母。来源哈希不证明标注独立。
+- `vln.episode_metrics` 增加动作切换、转向反转和 SAFE 动作窗诊断；SAFE 只表示协议动作，不等价物理停稳。视频 TOP 视图标注 `DIAGNOSTIC/ORACLE`。
+- 本轮仍未接语言学生、未把 grounder 接真机、未将 SAGE 指令全部转成可执行操作任务；结果不能称开放自然语言 VLN。
+- 实验/数据盘状态、结论边界和下一轮验收见 `docs/experiments/2026-11-14-vln-g1-goal-dataset-followup.md`；当前无活跃任务，正式 G1 因缺独立 catalog 尚未运行。
+
 ## VLN §10 继续执行
 
 - B 深度有效率独立门禁、D unsupported 指令拒绝已落实；20 项测试通过。B/C/D 尚未整卡验收，E/F 不提前标完成。
@@ -9,7 +18,7 @@
 ## 2026-11-14 VLN 计划执行增量（最新）
 
 - 新增 YAML profile：`nano_proto_v6` 继续 C++ 对拍线；`base_torch_v1` 是可运行但不导出 C++ 的 Torch-only 较大基线，入口为 `proto/train_base.py`，配置示例在 `config/vln/`。
-- 新增 G1 语言落地点 `sim/3dgs/grounder.py` 和端点词汇诊断工具；它只选外部候选地标，当前没有接 `run_vln`/飞控，因为现有 `scene.json` 没有独立物体 catalog/坐标。报告中的端点命中率受标注候选泄漏影响，不能当正式 VLN 结果。
+- 新增 G1 语言落地点 `sim/3dgs/grounder.py` 和端点词汇诊断工具；`run_vln --grounder lexical --catalog` 已接入独立地标目录，仍不接真机/学生。旧端点诊断报告受标注候选泄漏影响，不能当正式 VLN 结果。
 - 六个 SAGE 场景路线审计已固定 249 条正式路线、79 条 SAGE 路径不少于 10 m 的候选；OpenFly 已有本地标注 schema 审计，但没有下载约 2.97 TB 全量数据或运行官方远程评测。
 - 本次最终验证：CTest 34/34；`proto` 29 项通过、跳过 4；3DGS 77 项通过、跳过 2；审计工具 6 项通过；真实 UAVR 的 nano 配置与 Torch 基线单步 smoke 均退出码 0。过程记录见 `docs/worklog/2026-11-14-1413-vln-plan-implementation.md`，实验数字见 `docs/experiments/2026-11-14-vln-profile-grounder.md`。
 
@@ -18,13 +27,13 @@
 - 按计划完成卡 A：显式 `stop_requested` 与安全 SAFE 分开；`run_vln` 默认用 `3dgs.vln.v3`，旧 STOP 规则可用 `--stop-mode legacy-safe` 复现 v2。
 - 修正学生入口输入错配（缺语言 token / 纯视觉模型收到无效指令）、3DGS 渲染与碰撞尺度筛选不一致、非法相机刚体变换、cf_sitl 子毫秒窗口被舍零、碰撞录像假成功及末预算步碰撞误标 `completed`。
 - 相关 86 项 unittest 通过；真实 renderer/collision GPU 回归 43/43；cf_sitl CTest 9/9、自检 33/33；两集 SAGE 特权 A* 教师冒烟通过。全量 `tools/check.sh` 仍有一个 CUDA CPU 占用阈值失败（43/44），没有放宽门槛。
-- 没有训练语言学生、grounder 或更长场景；teacher 冒烟不等于 VLN 完成。按 `docs/PLAN_2026-11-13_vln.md §10` 继续 B/C/D。
+- 没有训练语言学生或更长场景；词法 grounder 冒烟不等于开放 VLN 完成。按 `docs/PLAN_2026-11-13_vln.md §10` 继续 B/C/D。
 - 过程、证据和未做事项追加在 `docs/worklog/2026-11-13-2247-vln-review.md` 与 `docs/experiments/2026-11-13-vln-review.md`。
 
 ## 2026-11-13 VLN 第二次复核（历史背景）
 
 - 用户要求重新从无人机视觉语言导航检查需求，三路 agents 并行阅读语言/评测、3DGS/控制、数据/基线，主会话核架构与 Git。
-- 已执行本轮可靠性修复：VLN失败分母与诊断数据隔离、航线身份、SPL起点、录像STOP语义与真实时间轴。语言grounder/新学生尚未实现。
+- 已执行本轮可靠性修复：VLN失败分母与诊断数据隔离、航线身份、SPL起点、录像STOP语义与真实时间轴；词法 grounder 仅作为独立目录的 G1 起点，语言学生尚未实现。
 - 后续详细任务卡在 `docs/PLAN_2026-11-13_vln.md §10`；先分离STOP，再并行数据覆盖/教师/语言落地，之后才重训条件学生。
 - 发现主线的“基线已派出”状态过时：BL2/BL4已有结果，BL3有部分闭环，BL5有离线。见 `docs/reviews/2026-11-13-vln-data-baselines.md`；未合并工作树保护，不能批删。
 - 本轮测试、真实GPU运行、指标修正与未通过项见 `docs/experiments/2026-11-13-vln-review.md`；过程见 `docs/worklog/2026-11-13-2247-vln-review.md`。
