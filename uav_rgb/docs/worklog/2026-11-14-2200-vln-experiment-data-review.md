@@ -140,3 +140,36 @@
 | OpenFly_DataGen | 未下载；等待用户在主机完成 HF login 后再评估 |
 
 自动触发完成后，再把实际 smoke 退出码和审计摘要补入本工作日志及实验文档；没有新的真实语言导航指标前，不会编造公开基准成绩。
+
+## 更新 2026-11-15 01:40：完整模拟器门禁、SITL 修复与单集配对
+
+### 做了什么
+
+- AerialVLN 模拟器下载完成：277/277 文件、40,541,074,951 B；逐文件内容哈希全部通过。四个标注 split 继续通过大小、JSON、SHA/Git blob 校验。
+- 自动 watcher 首轮确实被触发，但使用了旧的 `build-cf-sitl-v2-20261107/cf_sitl_proc`，其 state 没有 `lib_version`，因此 teacher/forward 在首个 episode 前退出。将 watcher 改为当前 `tmp/build-cf-sitl/cf_sitl_proc`（lib31），并单独重跑相同场景、seed、limit=1 的配对。
+- 真实 SAGE teacher 单集完成：84 个动作，显式 STOP，SR=1、OSR=1、SPL=0.775948、NE=0.321754 m、碰撞率=0、STOP率=1。
+- 真实 SAGE forward 单集完成：12 个动作后碰撞，SR=0、OSR=0、SPL=0、NE=3.075232 m、碰撞率=1、STOP率=0。两者都使用 `cf_sitl_v1:1bc8fedf:lib31`，同场景和同 seed。
+- 使用修正后的 proc 跑 `sim.3dgs.test_dynamics_sitl`，13/13 通过。产物保存在数据盘 `/root/rivermind-data/uav_rgb/auto-after-download-20261115-retry1/`。
+- 将自动 watcher 的 SITL 路径改为稳定的 lib31 构建，避免下次下载门禁完成后再次在启动前失败。
+
+### 没做什么及原因
+
+- 没有把这组 SAGE 数值写成语言导航成绩。该入口 `grounder=none`，teacher 读取特权目标/规划，forward 只是盲目前进；它们只证明渲染、动力学、碰撞和 STOP 链可运行。
+- 没有宣称 AirVLN 官方 benchmark 已运行。官方环境尚在安装依赖，且没有 AirVLN policy checkpoint；当前只准备数据、路径和 Gibson backbone。
+- 没有把 OpenFly_DataGen 记为已下载。账号 token 和 gated manifest API 可读，但实际文件 GET/HEAD 仍返回 HTTP 403；后台下载器每 10 分钟重试，没有绕过访问控制，也没有生成空的假文件。
+- 没有修改导航算法、真机 PID 或可视化代码。当前结果足以定位“控制可运行但没有语言闭环”，继续改算法前仍需独立、冻结且不泄漏的目标 catalog。
+
+### 验证与风险
+
+| 项 | 结果 |
+|---|---|
+| AerialVLN simulator | 277/277，逐文件哈希通过 |
+| AerialVLN annotations | train 16,386；val_seen 1,818；val_unseen 2,310；test 4,830，审计通过 |
+| OpenFly Annotation | 103,226 条，0 parse error，字段长度审计通过 |
+| SAGE teacher smoke | 1/1 成功；仅 controller diagnostic |
+| SAGE forward smoke | 1/1 完成但碰撞；仅盲飞下界 |
+| SITL protocol/dynamics tests | 13/13 通过 |
+| OpenFly_DataGen gated assets | 实际内容仍 403，未下载 |
+| AirVLN Python 3.8 env | 已创建；torch/requirements 尚未完成安装 |
+
+AirVLN 依赖安装曾把大 wheel 的临时文件写入 30GB 系统盘并报 `No space left on device`；后续安装已改用数据盘 `TMPDIR` 与 `PIP_CACHE_DIR`。当前 CUDA wheel 仍需完成后才能做官方单场景 collect smoke，不能用等待时间伪造实验结果。

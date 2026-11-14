@@ -123,3 +123,20 @@ teacher 动作切换均值62.67次（1.491次/m），blind-forward为0；三集�
 - AerialVLN simulator bundle 共 277 文件、40,541,074,951 B，持续后台下载；自动 watcher `/root/rivermind-data/uav_rgb/downloads/after_download_runner.py` 将等全部文件完整且哈希通过后，完成标注审计并触发同一 SAGE 场景的 1 集 teacher/forward smoke。此 smoke 只看控制诊断，不是 AerialVLN 或语言成绩。
 - 本机 HF 登录已验证可访问公开镜像；OpenFly_DataGen gated API 仍返回 403，账号尚未批准访问。数据清单约 115.83 GiB，README 为非商业使用；下载前等待 HF 授权，并保留 AerialVLN 完整空间。
 - AirVLN 官方 train/eval 目前不能直接启动：AirSim 场景路径、Habitat 预训练权重、AirVLN checkpoint 和兼容环境未就绪；单卡 smoke 需要先执行官方收集流程并 batch=1，不能拿缺 checkpoint 的 eval 目录模式启动。
+
+## 更新 2026-11-15 01:40：AerialVLN 门禁与 SAGE 单集复核
+
+AerialVLN 的 277 个模拟器文件（40,541,074,951 B）已全部下载并逐文件校验；`train/val_seen/val_unseen/test` 标注也通过大小、JSON 和 SHA/Git blob 校验。OpenFly Annotation 三个公开 split 共 103,226 条记录，通过解析、字段和数组长度审计。
+
+下载门禁触发的首轮 SAGE smoke 没有真正启动，因为自动脚本指向了旧的 lib30 以前 `cf_sitl_proc`。修正为 lib31 后，使用相同场景 `sage3d_841150`、seed `20261115`、limit=1、`cf_sitl_v1:1bc8fedf:lib31`，得到以下仅用于控制诊断的结果：
+
+| 策略 | 动作数 | SR | OSR | SPL | NE | 碰撞率 | STOP率 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| teacher（特权目标/规划） | 84 | 1.0 | 1.0 | 0.775948 | 0.321754 m | 0.0 | 1.0 |
+| forward（盲目前进） | 12 | 0.0 | 0.0 | 0.0 | 3.075232 m | 1.0 | 0.0 |
+
+teacher 日志显示末端显式 STOP，forward 在第 11 步碰撞。这个配对说明当前渲染、SITL、碰撞和停止协议能够产生可复现结果，同时也说明 forward 并没有语言目标或视觉目标估计能力。两条结果的 `grounder=none`，不能标作 VLN 成绩，也不能和 AirVLN benchmark 比较。完整 JSON 在 `/root/rivermind-data/uav_rgb/auto-after-download-20261115-retry1/{teacher,forward}/vln_eval.json`。
+
+自动门禁脚本已固定使用数据盘的 lib31 proc，后续下载完成不会再因旧二进制在首步前失败。`sim.3dgs.test_dynamics_sitl` 13/13 通过。
+
+OpenFly_DataGen 仍未下载：本机 HF token 和 gated manifest API 可用，但实际数据文件端点继续返回 HTTP 403；后台下载器保持每 10 分钟重试。AirVLN Python 3.8 环境已创建，Gibson backbone、25 个场景和标注路径已就位，CUDA wheel/requirements 仍在数据盘临时目录安装；没有 AirVLN policy checkpoint，因此官方 eval 尚未运行。
