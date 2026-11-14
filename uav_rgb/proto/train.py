@@ -43,6 +43,7 @@ import data as dataio  # noqa: E402
 import export as exporter  # noqa: E402
 import metrics as M  # noqa: E402
 import model as pm  # noqa: E402
+import config as cfgio  # noqa: E402
 
 # ───────────────────────── 配置区（每项一行，依据写在行尾）─────────────────────────
 DATA_ROOT = os.environ.get("DATA_ROOT", "/root/rivermind-data/uav_rgb")
@@ -255,10 +256,20 @@ def git_head(path):
 
 # ───────────────────────── 训练 ─────────────────────────
 class Trainer:
-    def __init__(self, ds, seed, device, epochs=EPOCHS, batch=BATCH, run_dir=None, images=None, labels=None):
+    def __init__(self, ds, seed, device, epochs=EPOCHS, batch=BATCH, run_dir=None, images=None, labels=None, config=None):
         self.ds, self.seed, self.device = ds, int(seed), torch.device(device)
         self.epochs, self.batch = int(epochs), int(batch)
         self.run_dir = run_dir
+        self.config = config or {}
+        train_cfg = self.config.get("train", {})
+        self.lr = F32(train_cfg.get("lr", LR))
+        self.beta1 = F32(train_cfg.get("beta1", BETA1))
+        self.beta2 = F32(train_cfg.get("beta2", BETA2))
+        self.eps = F32(train_cfg.get("eps", EPS))
+        self.weight_decay = F32(train_cfg.get("weight_decay", WEIGHT_DECAY))
+        self.max_grad_norm = F32(train_cfg.get("max_grad_norm", MAX_GRAD_NORM))
+        self.drop_collision = bool(train_cfg.get("drop_collision", DROP_COLLISION))
+        self.distill_alpha = F32(train_cfg.get("distill_alpha", DISTILL_ALPHA))
         pm.configure_determinism()
         torch.manual_seed(self.seed)
         self.train_idx = ds.splits["train"].astype(np.int64)
@@ -273,13 +284,15 @@ class Trainer:
         self.model.init_xavier(cpp_rng.CppXavier(self.seed))
         self.model.to(self.device)
         self.flat, self.params = flatten_params(self.model)
-        self.adam = FlatAdam(self.flat)
+        self.adam = FlatAdam(self.flat, lr=self.lr, beta1=self.beta1, beta2=self.beta2,
+                             eps=self.eps, weight_decay=self.weight_decay)
         self.rng = cpp_rng.CppMt19937(self.seed)         # 打乱用的引擎，与初值那个独立（C++ 里是 make_cnn 里的局部变量）
         self.order = self.train_idx.copy()
         self.per_epoch = (len(self.order) + self.batch - 1) // self.batch
         self.total_steps = self.per_epoch * self.epochs
         scheme_sha = hashlib.sha256(ds.split_scheme.encode()).digest() if ds.split_scheme else None   # C++：scheme 为空则契约里记全 0
-        self.contract = cio.make_contract(ds.sha256, DROP_COLLISION, F32(LR), self.seed, self.batch, scheme_sha, None, DISTILL_ALPHA)
+        self.contract = cio.make_contract(ds.sha256, self.drop_collision, self.lr, self.seed, self.batch,
+                                          scheme_sha, None, self.distill_alpha)
         self.best_f1 = F32(-1.0)
         self.step = 0
 
@@ -299,7 +312,7 @@ class Trainer:
         grads = torch.autograd.grad(logits, self.params, grad_outputs=dlogits)
         with torch.no_grad():
             g = torch.cat([t.reshape(-1) for t in grads])
-            norm = clip_global_norm(g, MAX_GRAD_NORM)
+            norm = clip_global_norm(g, self.max_grad_norm)
             self.adam.step(g)
         self.step += 1
         return loss, float(acc), plain, norm
@@ -322,13 +335,14 @@ class Trainer:
         ds = self.ds
         rec = {
             "schema": "uavrgb.train_config.v1", "backend": "proto-pytorch", "data": ds.path, "epochs": self.epochs,
-            "batch": self.batch, "lr": num(F32(LR)), "seed": self.seed, "text_dim": 0, "vision_only": False,
-            "max_grad_norm": MAX_GRAD_NORM, "drop_collision": DROP_COLLISION,
+            "batch": self.batch, "lr": num(self.lr), "seed": self.seed, "text_dim": 0, "vision_only": False,
+            "max_grad_norm": num(self.max_grad_norm), "drop_collision": self.drop_collision,
             "class_weights": [num(x) for x in self.class_weights], "class_weights_source": "auto",
-            "soft_targets": "", "distill_alpha": DISTILL_ALPHA, "dataset_sha256": ds.sha256, "split_scheme": ds.split_scheme,
+            "soft_targets": "", "distill_alpha": num(self.distill_alpha), "dataset_sha256": ds.sha256, "split_scheme": ds.split_scheme,
             "window_from": ds.meta.get("window_from", ""), "hold_s": ds.meta.get("hold_s", ""),
-            "beta1": num(F32(BETA1)), "beta2": num(F32(BETA2)), "eps": num(F32(EPS)), "augment": "", "warmup_steps": 0, "cosine_lr": False,
-            "weight_decay": WEIGHT_DECAY, "label_smoothing": 0, "two_frame": False, "prev_action": False, "depth_aux": False,
+            "beta1": num(self.beta1), "beta2": num(self.beta2), "eps": num(self.eps), "augment": "", "warmup_steps": 0, "cosine_lr": False,
+            "weight_decay": num(self.weight_decay), "label_smoothing": 0, "two_frame": False, "prev_action": False, "depth_aux": False,
+            "model_profile": self.config.get("model", {}).get("profile", "nano_proto_v6"),
             "torch": torch.__version__, "cuda": torch.version.cuda, "device": str(self.device),
             "proto_git": git_head(os.path.dirname(HERE)), "train_samples": int(len(self.train_idx)),
             "val_samples": int(len(self.val_idx)), "test_samples": int(len(self.test_idx)),
@@ -339,6 +353,7 @@ class Trainer:
     # ---- 主流程 ----
     def run(self, args=None, max_steps=0):
         os.makedirs(os.path.join(self.run_dir, "pt"), exist_ok=True)
+        self.config_hash = cfgio.write_resolved(self.run_dir, self.config)
         with open(os.path.join(self.run_dir, "config.json"), "w", encoding="utf-8") as f:
             json.dump(self.config_record(args, {}), f, ensure_ascii=False, separators=(",", ":"))
         log = RunLog(self.run_dir)
@@ -354,7 +369,7 @@ class Trainer:
                     elapsed = time.time() - t0
                     eta = elapsed / self.step * (self.total_steps - self.step)
                     log.event("train_step", step=self.step, total_steps=self.total_steps, loss=num(loss),
-                              action_accuracy=num(acc), lr=num(F32(LR)), elapsed_sec=num(elapsed), eta_sec=num(eta))
+                              action_accuracy=num(acc), lr=num(self.lr), elapsed_sec=num(elapsed), eta_sec=num(eta))
                     ce_sum += plain * len(idx)
                     seen += len(idx)
                     if max_steps and self.step >= max_steps:
@@ -398,7 +413,7 @@ class Trainer:
             with open(os.path.join(self.run_dir, "test_eval.jsonl"), "a", encoding="utf-8") as f:
                 f.write(json.dumps({"schema": "uavrgb.test_eval.v1", "utc": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
                                     "origin": "proto_train_inline", "ckpt": best_bin, "data": self.ds.path,
-                                    "dataset_sha256": self.ds.sha256, "drop_collision": DROP_COLLISION,
+                                    "dataset_sha256": self.ds.sha256, "drop_collision": self.drop_collision,
                                     "samples": int(len(self.test_idx)), "split": "test", "eval_count": 1,
                                     "macro_f1": test["macro_f1"], "balanced_accuracy": test["balanced_accuracy"],
                                     "recall": test["recall"], "accuracy": test["accuracy"], "confusion": test["confusion"]},
@@ -414,15 +429,30 @@ class Trainer:
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--seed", type=int, required=True, help="训练种子（初值与打乱共用，同 uavrgb_train --seed）")
-    ap.add_argument("--data", default=DATA)
+    ap.add_argument("--seed", type=int, default=None, help="训练种子（初值与打乱共用，同 uavrgb_train --seed）")
+    ap.add_argument("--data", default=None)
     ap.add_argument("--out", default=None, help=f"run 目录，缺省 {OUT_ROOT}/seed<种子>/run；必须是空目录或不存在")
-    ap.add_argument("--epochs", type=int, default=EPOCHS)
-    ap.add_argument("--batch", type=int, default=BATCH)
-    ap.add_argument("--device", default=DEVICE)
+    ap.add_argument("--epochs", type=int, default=None)
+    ap.add_argument("--batch", type=int, default=None)
+    ap.add_argument("--device", default=None)
     ap.add_argument("--max-steps", type=int, default=0, help="调试：跑到第 N 步就停，不做评估和落盘")
+    ap.add_argument("--config", default=None, help="YAML/JSON 配置；显式 CLI 参数覆盖配置")
     a = ap.parse_args(argv)
-    out = a.out or os.path.join(OUT_ROOT, f"seed{a.seed}", "run")
+    if not a.config and a.seed is None:
+        ap.error("旧 CLI 模式必须提供 --seed；配置模式可在 train.seed 中提供")
+    raw = cfgio.load(a.config)
+    # 旧 CLI 的默认值不能覆盖配置文件；只有显式传入的值才应覆盖。
+    cli = {"seed": a.seed, "data": a.data,
+           "out": a.out, "epochs": a.epochs,
+           "batch": a.batch, "device": a.device}
+    cfg = cfgio.resolve(raw, cli=cli)
+    if cfg["model"]["profile"] != "nano_proto_v6":
+        raise SystemExit("base_torch_v1 已注册但当前 C++ 对拍训练器不支持；请使用独立 Torch runner")
+    train_cfg = cfg["train"]
+    seed = int(train_cfg.get("seed", a.seed))
+    data_path = train_cfg.get("data") or a.data or DATA
+    device = train_cfg.get("device") or a.device or DEVICE
+    out = train_cfg.get("out") or a.out or os.path.join(OUT_ROOT, f"seed{seed}", "run")
     os.makedirs(out, exist_ok=True)
     lock = open(os.path.join(out, ".run.lock"), "a")
     try:
@@ -433,12 +463,16 @@ def main(argv=None):
     if [n for n in os.listdir(out) if n != ".run.lock"]:
         print(f"{out} 不是空目录，拒绝混写（旧结果改名挪走再训）", file=sys.stderr)
         return 2
-    ds = dataio.Uavr(a.data, drop_collision=DROP_COLLISION)
-    tr = Trainer(ds, a.seed, a.device, epochs=a.epochs, batch=a.batch, run_dir=out)
+    ds = dataio.Uavr(data_path, drop_collision=bool(train_cfg.get("drop_collision", DROP_COLLISION)))
+    input_cfg = cfg["model"]["input"]
+    if (int(input_cfg["height"]), int(input_cfg["width"])) != (ds.h, ds.w):
+        raise SystemExit(f"配置输入 {input_cfg['height']}x{input_cfg['width']} 与 UAVR {ds.h}x{ds.w} 不一致")
+    tr = Trainer(ds, seed, device, epochs=int(train_cfg.get("epochs", EPOCHS)),
+                 batch=int(train_cfg.get("batch", BATCH)), run_dir=out, config=cfg)
     res = tr.run(a, max_steps=a.max_steps)
     if not res["stopped"]:
         with open(os.path.join(out, "DONE"), "w", encoding="utf-8") as f:
-            f.write(f"rc=0 {datetime.datetime.now():%F %T} seed={a.seed} steps={res['steps']}\n")
+            f.write(f"rc=0 {datetime.datetime.now():%F %T} seed={seed} steps={res['steps']}\n")
     return 0
 
 

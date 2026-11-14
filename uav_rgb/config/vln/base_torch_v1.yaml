@@ -1,0 +1,20 @@
+# 地面站较大基线：Torch-only，不导出为机载 C++ checkpoint。
+schema_version: 1
+model:
+  profile: base_torch_v1
+  input:
+    height: 120
+    width: 160
+    channels: 3
+train:
+  data: /root/rivermind-data/uav_rgb/tmp/agent6-distill/trunc/ds/dataset.uavr
+  out: /root/rivermind-data/uav_rgb/tmp/base_torch_v1-run
+  epochs: 3
+  batch: 64
+  lr: 0.001
+  drop_collision: true
+  seed: 0
+  device: cuda
+eval:
+  split: all
+  stop_mode: explicit

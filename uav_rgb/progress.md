@@ -1,5 +1,12 @@
 # progress.md（新开会话先读这个）
 
+## 2026-11-14 VLN 计划执行增量（最新）
+
+- 新增 YAML profile：`nano_proto_v6` 继续 C++ 对拍线；`base_torch_v1` 是可运行但不导出 C++ 的 Torch-only 较大基线，入口为 `proto/train_base.py`，配置示例在 `config/vln/`。
+- 新增 G1 语言落地点 `sim/3dgs/grounder.py` 和端点词汇诊断工具；它只选外部候选地标，当前没有接 `run_vln`/飞控，因为现有 `scene.json` 没有独立物体 catalog/坐标。报告中的端点命中率受标注候选泄漏影响，不能当正式 VLN 结果。
+- 六个 SAGE 场景路线审计已固定 249 条正式路线、79 条 SAGE 路径不少于 10 m 的候选；OpenFly 已有本地标注 schema 审计，但没有下载约 2.97 TB 全量数据或运行官方远程评测。
+- 本次最终验证：CTest 34/34；`proto` 29 项通过、跳过 4；3DGS 77 项通过、跳过 2；审计工具 6 项通过；真实 UAVR 的 nano 配置与 Torch 基线单步 smoke 均退出码 0。过程记录见 `docs/worklog/2026-11-14-1413-vln-plan-implementation.md`，实验数字见 `docs/experiments/2026-11-14-vln-profile-grounder.md`。
+
 ## 2026-11-14 VLN 卡 A 与可靠性修复（最新）
 
 - 按计划完成卡 A：显式 `stop_requested` 与安全 SAFE 分开；`run_vln` 默认用 `3dgs.vln.v3`，旧 STOP 规则可用 `--stop-mode legacy-safe` 复现 v2。

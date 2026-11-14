@@ -1,0 +1,25 @@
+# 机载轻量模型：保持现有 C++ v6 checkpoint 契约。
+schema_version: 1
+model:
+  profile: nano_proto_v6
+  input:
+    height: 120
+    width: 160
+    channels: 3
+  language:
+    enabled: false
+    text_dim: 0
+    max_tokens: 9
+  history:
+    frames: 1
+    prev_action: false
+train:
+  epochs: 30
+  batch: 128
+  lr: 0.001
+  drop_collision: true
+  seed: 0
+  device: cuda
+eval:
+  split: all
+  stop_mode: explicit
