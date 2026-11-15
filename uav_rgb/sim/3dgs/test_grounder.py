@@ -52,6 +52,66 @@ class TestLexicalGrounder(unittest.TestCase):
         result = self.g.ground("Go to door 17", ["door_1", "sofa_1"])
         self.assertEqual(result.target, "door_1")
 
+    def test_goal_prepositions_do_not_promote_source_objects(self):
+        for preposition in ("to", "toward", "towards", "at", "into"):
+            with self.subTest(preposition=preposition):
+                result = self.g.ground(
+                    f"Leave the chair and proceed {preposition} the sofa",
+                    ["chair_1", "sofa_1"],
+                )
+                self.assertTrue(result.accepted)
+                self.assertEqual(result.target, "sofa_1")
+
+    def test_phrase_matches_whole_tokens_only(self):
+        for instruction, candidate in (
+                ("Fly to the outdoor sculpture", "door_1"),
+                ("Go to the cart", "art_1"),
+                ("Go to the carpet", "car_1")):
+            with self.subTest(instruction=instruction):
+                result = self.g.ground(instruction, [candidate])
+                self.assertFalse(result.accepted)
+                self.assertEqual(result.reason, "below_min_score")
+
+    def test_source_prepositions_cannot_override_movement_destination(self):
+        for instruction in (
+                "Start at the chair, fly to the sofa",
+                "Start at the chair, fly slowly to the sofa",
+                "From next to the chair, fly to the sofa"):
+            with self.subTest(instruction=instruction):
+                result = self.g.ground(instruction, ["chair_1", "sofa_1"])
+                self.assertTrue(result.accepted)
+                self.assertEqual(result.target, "sofa_1")
+                missing_goal = self.g.ground(instruction, ["chair_1"])
+                self.assertFalse(missing_goal.accepted)
+                self.assertEqual(missing_goal.reason, "below_min_score")
+
+    def test_multiple_sentences_cannot_hide_another_movement_goal(self):
+        for instruction in (
+                "Fly to the chair. Continue to the sofa",
+                "Go to the chair. Continue slowly to the sofa",
+                "Go next to the chair and fly to the sofa"):
+            for candidates in (["chair_1", "sofa_1"], ["chair_1"], ["sofa_1"]):
+                with self.subTest(instruction=instruction, candidates=candidates):
+                    result = self.g.ground(instruction, candidates)
+                    self.assertFalse(result.accepted)
+                    self.assertEqual(result.reason, "unsupported_multiple_goals")
+
+    def test_destination_keeps_relations_and_following_goals(self):
+        cases = [
+            ("Go next to the chair", "unsupported_relation"),
+            ("Go adjacent to the chair", "unsupported_relation"),
+            ("Go to the chair next to the door", "unsupported_relation"),
+            ("Go to the door next to the chair", "unsupported_relation"),
+            ("Go to the chair adjacent to the door", "unsupported_relation"),
+            ("Go to the chair and fly to the door", "unsupported_multiple_goals"),
+        ]
+        for instruction, reason in cases:
+            with self.subTest(instruction=instruction):
+                result = self.g.ground(instruction, ["chair_1", "door_1"])
+                self.assertFalse(result.accepted)
+                self.assertIsNone(result.target)
+                self.assertEqual(result.reason, reason)
+
     def test_unsupported_semantics_never_select_a_target(self):
         cases = [
             ("飞到 door", "unsupported_language"),

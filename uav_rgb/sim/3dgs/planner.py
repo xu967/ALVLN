@@ -22,9 +22,9 @@ TEACHER_VERSION = "uavrgb.teacher_occ.v1"            # 航向容差 12°：旧�
 # 航向容差不是 12°（按 hold 推导或显式给的）。实际值记在 episode manifest 的 teacher_yaw_tol_deg；旧 manifest 没有这个键 = 12°，
 # 以后离线按记录重标时取 manifest.get("teacher_yaw_tol_deg", YAW_TOL_DEG)。
 TEACHER_VERSION_HOLD_TOL = "uavrgb.teacher_occ.v2"
-# clearance="swept"（W1-12）：前向净空检查在机头线段之外再沿预测位移做扫掠。版本 v3；manifest 的 teacher_clearance 写 "swept"，
+# clearance="swept"：前向净空检查在机头线段之外再沿预测位移做扫掠；v4 不再按等待次数绕过否决。manifest 写 "swept"，
 # 旧 manifest 没有这个键 = "ray"（机头线段，v1 / v2）。
-TEACHER_VERSION_SWEPT = "uavrgb.teacher_occ.v3"
+TEACHER_VERSION_SWEPT = "uavrgb.teacher_occ.v4"
 CLEARANCE_MODES = ("ray", "swept")
 # 软余量：硬栅格 = 机体包络膨胀后的占据；再向外 MARGIN_M 这一圈可走但每米加 MARGIN_COST 倍代价，
 # 路径贴走廊中线、窄缝仍可通过。0.4 与 E1 Gazebo A* 余量同值（teacher.CLEARANCE_BY_VEHICLE）。
@@ -58,7 +58,6 @@ SWEPT_PRED_B = (0.1809, 0.0003)
 # reserve = 前进后转弯步位移模的 p90 0.1319 m + 预测误差 p90 0.0412 m。
 SWEPT_RESERVE_M = 0.1731
 SWEPT_HOLD_S = 1.0     # 系数只在 hold 1.0 下量过；别的 hold 的位移没有数据
-SWEPT_MAX_WAITS = 2    # 连续 wait_swept 的上限；第 3 步按原规则（只看机头线段）放行
 # 步数预算：每步前进 0.15 m / 偏航 17°，加速与 goal-stop 约 8 步，再留 25%。
 STEP_FORWARD_M, STEP_YAW_DEG, STEP_OVERHEAD, STEP_MARGIN = 0.15, 17.0, 8, 1.25
 _MOVES = ((1, 0, 1.0), (-1, 0, 1.0), (0, 1, 1.0), (0, -1, 1.0),
@@ -237,7 +236,7 @@ class OccAstarTeacher:
       "ray"（缺省）：航向对准后沿机头做一条 forward_check_m 的 occ.sweep，撞硬栅格就先按 err 方向转（turn_blocked）。与 W1-12 之前逐步相同。
       "swept"：机头线段通过之后，再沿本步前进的预测位移（SWEPT_PRED_A·v + SWEPT_PRED_B，机体系）延长 SWEPT_RESERVE_M 做一次 occ.sweep。
         被否决时 |err| 不小于容差的一半就按 err 的符号转（turn_swept），否则出 SAFE_NEUTRAL 等一步（wait_swept）；
-        连续 wait_swept 不超过 SWEPT_MAX_WAITS 步，再下一步按原规则（只看机头线段）放行。只否决前进，转向不否决。
+        净空未恢复就持续等待，预算耗尽由运行器记失败。只否决前进，转向不否决。
         位移系数只在 hold 1.0 下量过，构造时 hold_s 必须是 1.0。
     """
 
@@ -263,7 +262,7 @@ class OccAstarTeacher:
         self.tol = float(tol_deg) if tol_deg is not None else (YAW_TOL_DEG if hold_s is None else yaw_tol_deg(hold_s))
         self.clearance = clearance
         # 容差 = 12° 的教师与 v1 逐步相同，版本不变；不是 12° 才写 v2（与 manifest 的 teacher_yaw_tol_deg 一起区分新旧容差）；
-        # swept 一律写 v3（与 manifest 的 teacher_clearance 一起区分）
+        # swept 一律写 v4（与 manifest 的 teacher_clearance 一起区分）
         self.version = (TEACHER_VERSION_SWEPT if clearance == "swept"
                         else TEACHER_VERSION if self.tol == YAW_TOL_DEG else TEACHER_VERSION_HOLD_TOL)
         self.stop_radius, self.forward_check = float(stop_radius), float(forward_check_m)
@@ -273,12 +272,10 @@ class OccAstarTeacher:
         # （离线归因交替段用）
         self.last_branch = None
         self.n_plan_fail = 0
-        self._waits = 0           # 连续 wait_swept 的步数；run_episode 每集开头调 reset() 清零
         self.stop_requested = False
 
     def reset(self):
-        """集边界（run_episode 每集开头调用）：清连续等待计数。"""
-        self._waits = 0
+        """集边界清除任务完成意图。"""
         self.stop_requested = False
 
     def set_waypoint(self, waypoint):
@@ -301,7 +298,6 @@ class OccAstarTeacher:
 
     def __call__(self, rgb, depth, state):
         self.stop_requested = False
-        waits, self._waits = self._waits, 0     # 只有 wait_swept 分支会把计数再加一；其余分支一律清零（等待必须连续）
         x, y, z = float(state.x), float(state.y), float(getattr(state, "z", 2.0))
         yaw_deg = math.degrees(float(state.yaw))
         if math.hypot(x - self.wp[0], y - self.wp[1]) <= self.stop_radius:
@@ -334,11 +330,9 @@ class OccAstarTeacher:
             if abs(err) >= 0.5 * self.tol:
                 self.last_branch = "turn_swept"
                 return YAW_LEFT if err >= 0 else YAW_RIGHT, None
-            if waits < SWEPT_MAX_WAITS:
-                self._waits = waits + 1
-                self.last_branch = "wait_swept"
-                return SAFE_NEUTRAL, None
-            # 已连续等了 SWEPT_MAX_WAITS 步：按原规则放行，免得卡死
+            # 等待次数不能证明机体已经刹停；每次都按当前速度检查净空。
+            self.last_branch = "wait_swept"
+            return SAFE_NEUTRAL, None
         self.last_branch = "forward"
         return FORWARD_SLOW, None
 

@@ -24,6 +24,10 @@ _RELATIONS = re.compile(
     r"behind|beside|between|within|around|opposite|adjacent\s+to)\b",
     re.IGNORECASE,
 )
+_MOTION = re.compile(
+    r"\b(?:go|fly|move|head|proceed|continue|navigate|travel)\b",
+    re.IGNORECASE,
+)
 
 
 def _tokens(value):
@@ -32,10 +36,17 @@ def _tokens(value):
 
 
 def _goal_text(instruction):
-    """取最后一个明显的目的地短语，降低起点/路径描述对目标解析的干扰。"""
+    """优先明确运动目标，保留目标之后的约束，不把起点介词当目的地。"""
     text = str(instruction).lower().replace("_", " ").replace("-", " ")
-    matches = list(re.finditer(r"\b(?:to|toward|towards|into|at)\b", text))
-    return text[matches[-1].end():] if matches else text
+    motion = _MOTION.search(text)
+    if motion:
+        text = text[motion.end():]
+    match = re.search(r"\b(?:to|toward|towards|into|at)\b", text)
+    if match:
+        for relation in _RELATIONS.finditer(text):
+            if relation.start() <= match.start() < relation.end():
+                return text[relation.start():]
+    return text[match.end():] if match else text
 
 
 def _goal_tokens(instruction):
@@ -161,6 +172,8 @@ class LexicalGrounder:
             reason = "unsupported_vertical_command"
         elif re.search(r"\b(?:then|afterwards|both|either|or)\b|;", text):
             reason = "unsupported_multiple_goals"
+        elif len(_MOTION.findall(text)) > 1:
+            reason = "unsupported_multiple_goals"
         elif re.search(r"\band\b", _goal_text(text)):
             reason = "unsupported_multiple_goals"
         elif _RELATIONS.search(_goal_text(text)):
@@ -173,7 +186,7 @@ class LexicalGrounder:
         if not names or not query:
             return Grounding(None, 0.0, 0.0, False, "empty_query_or_candidates")
         scored = []
-        normalized = str(instruction).lower().replace("_", " ").replace("-", " ")
+        target_text = " ".join(_tokens(_goal_text(instruction)))
         for name in dict.fromkeys(names):
             words = set(_tokens(name))
             if not words:
@@ -185,10 +198,7 @@ class LexicalGrounder:
                     overlap = 0.25 * overlap + 0.75 * goal_overlap
                 # 完整短语命中优先于零散词命中，但仍保持可解释的上限。
                 phrase = " ".join(_tokens(name))
-                target_text = normalized
-                if goal:
-                    target_text = normalized.rsplit(" to ", 1)[-1]
-                score = 1.0 if phrase and phrase in target_text else overlap
+                score = 1.0 if phrase and f" {phrase} " in f" {target_text} " else overlap
             scored.append((score, name))
         scored.sort(key=lambda item: (-item[0], item[1]))
         best_score, best_name = scored[0]

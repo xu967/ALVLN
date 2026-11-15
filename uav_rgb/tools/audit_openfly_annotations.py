@@ -104,10 +104,11 @@ def audit(input_path: str | os.PathLike[str]) -> dict[str, Any]:
     splits: collections.Counter[str] = collections.Counter()
     field_counts: collections.Counter[str] = collections.Counter()
     length_mismatches: collections.Counter[str] = collections.Counter()
+    validation_errors: collections.Counter[str] = collections.Counter()
     lengths: list[float] = []
     instruction_lengths: list[int] = []
     errors: list[dict[str, str]] = []
-    records = valid = 0
+    records = valid = invalid = 0
     for path in files:
         try:
             iterator = _load(path)
@@ -116,15 +117,25 @@ def audit(input_path: str | os.PathLike[str]) -> dict[str, Any]:
                 for key in record:
                     field_counts[key] += 1
                 instruction = record.get("gpt_instruction")
+                record_errors = []
                 if isinstance(instruction, str):
                     instruction_lengths.append(len(instruction.split()))
+                if not isinstance(instruction, str) or not instruction.strip():
+                    record_errors.append("missing_or_empty_instruction")
                 action = record.get("action")
                 if isinstance(action, list):
                     actions.update(str(x) for x in action)
                 lists = [record.get(k) for k in REQUIRED_LIST_FIELDS]
+                for key, value in zip(REQUIRED_LIST_FIELDS, lists):
+                    if not isinstance(value, list) or not value:
+                        record_errors.append(f"missing_or_empty_{key}")
                 present = [v for v in lists if isinstance(v, list)]
                 if present and any(len(v) != len(present[0]) for v in present[1:]):
                     length_mismatches["action/index_list/pos/yaw"] += 1
+                    record_errors.append("parallel_field_length_mismatch")
+                if record_errors:
+                    invalid += 1
+                    validation_errors.update(record_errors)
                 if isinstance(action, list) and isinstance(record.get("pos"), list):
                     valid += 1
                     distance = _path_length(record["pos"])
@@ -146,6 +157,9 @@ def audit(input_path: str | os.PathLike[str]) -> dict[str, Any]:
         "input": str(root),
         "files": len(files),
         "records": records,
+        "ok": records > 0 and not errors and invalid == 0,
+        "invalid_records": invalid,
+        "validation_errors": dict(sorted(validation_errors.items())),
         "records_with_action_and_pos": valid,
         "parse_errors": errors,
         "split_counts": dict(sorted(splits.items())),
@@ -171,7 +185,7 @@ def main() -> int:
         f.write("\n")
     os.replace(tmp, output)
     print(json.dumps(report, ensure_ascii=False, indent=2))
-    return 0 if not report["parse_errors"] else 2
+    return 0 if report["ok"] else 2
 
 
 if __name__ == "__main__":

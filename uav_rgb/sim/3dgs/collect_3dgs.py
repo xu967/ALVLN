@@ -220,7 +220,7 @@ class DaggerPolicy:
         self.stop_requested = False
 
     def reset(self):
-        """集边界：清学生的帧/动作缓存与上一步执行的动作（StudentAdapter 只在构造时 reset，而本对象整轮复用）；教师有集内状态（连续等待计数）也清。"""
+        """集边界：清学生的帧/动作缓存与上一步执行的动作（StudentAdapter 只在构造时 reset，而本对象整轮复用）；教师的任务完成意图也清。"""
         self.student.reset()
         if hasattr(self.expert, "reset"):
             self.expert.reset()
@@ -602,7 +602,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             # 占据 A* 教师的航向容差（度）：只有带 tol 的策略才写这个键，其余策略与旧 manifest 一样没有；
             # 旧集没有这个键 = 12°（v1）。离线按记录重标时以这里为准。
             **({"teacher_yaw_tol_deg": policy.tol} if getattr(policy, "tol", None) is not None else {}),
-            # 占据 A* 教师前向净空检查的形状（ray = 机头线段，v1 / v2；swept = 再加预测位移扫掠，v3）：只有带 clearance 的策略才写这个键，
+            # 占据 A* 教师前向净空检查的形状（ray = 机头线段，v1 / v2；swept = 再加预测位移扫掠，版本见 teacher_version）：只有带 clearance 的策略才写这个键，
             # 旧 manifest 没有这个键 = ray。
             **({"teacher_clearance": policy.clearance} if getattr(policy, "clearance", None) is not None else {}),
             "spawn_two_layer": bool(spawn_two_layer),     # 出生判空是否用两层检查（旧 manifest 没有这个键 = False）

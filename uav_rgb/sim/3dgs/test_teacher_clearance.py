@@ -8,10 +8,10 @@
 锁定的行为：
   - clearance="ray"（缺省）与改动前逐步相同（test 里内嵌改动前 __call__ 的逐字拷贝作对照）；
   - 合成占据上机头线段通、预测位移线段不通：swept 否决（|err| 不小于容差的一半转向、否则等待），ray 放行；reserve、速度、机体系换算各有用例；
-  - 连续等待不超过 2 步、第 3 步放行；不连续的等待不累计；reset() 清零；
+  - 持续否决不因等待次数放行；净空恢复可前进；reset() 清任务完成意图；
   - goal-stop 的「连续 3 步 SAFE 提前结束」不被等待步误触发；
   - 出生两层判空开关关闭时，出生位姿与随机数消耗逐位不变；
-  - 教师版本 v3、manifest 的 teacher_clearance / spawn_two_layer、CLI 开关；
+  - 教师版本 v4、manifest 的 teacher_clearance / spawn_two_layer、CLI 开关；
   - 导引指针（第三部分）：OracleRouteGuide 的 nearest_in_lookahead 缺省关，target() 与改动前逐步相同（内嵌旧实现的逐字拷贝）；
     路径开头有凹口时旧指针停住、新参数前进；取点范围不超过 lookahead_m；并列取更靠前的顶点；指针只增不减。
 
@@ -244,13 +244,13 @@ class TestRayIsUnchanged(unittest.TestCase):
 
 # ------------------------------------------------------------------ swept：构造与版本
 class TestSweptConstruction(unittest.TestCase):
-    def test_version_is_v3(self):
-        self.assertEqual(planner.TEACHER_VERSION_SWEPT, "uavrgb.teacher_occ.v3")
+    def test_version_is_v4(self):
+        self.assertEqual(planner.TEACHER_VERSION_SWEPT, "uavrgb.teacher_occ.v4")
         t = mk(BoxWorld())
-        self.assertEqual((t.clearance, t.version), ("swept", "uavrgb.teacher_occ.v3"))
+        self.assertEqual((t.clearance, t.version), ("swept", "uavrgb.teacher_occ.v4"))
         self.assertAlmostEqual(t.tol, planner.yaw_tol_deg(1.0), places=9)
-        t2 = mk(BoxWorld(), tol_deg=12.0)                                # 显式 12° 也是 v3：版本跟着 clearance
-        self.assertEqual(t2.version, "uavrgb.teacher_occ.v3")
+        t2 = mk(BoxWorld(), tol_deg=12.0)                                # 显式 12° 也是 v4：版本跟着 clearance
+        self.assertEqual(t2.version, "uavrgb.teacher_occ.v4")
 
     def test_swept_needs_hold_one_second(self):
         for bad in (None, 0.5, 0.99, 1.5, 2.0):
@@ -269,7 +269,7 @@ class TestSweptConstruction(unittest.TestCase):
         self.assertEqual(planner.SWEPT_PRED_A, ((0.4259, 0.0065), (0.0007, 0.6662)))
         self.assertEqual(planner.SWEPT_PRED_B, (0.1809, 0.0003))
         self.assertEqual(planner.SWEPT_RESERVE_M, 0.1731)
-        self.assertEqual((planner.SWEPT_HOLD_S, planner.SWEPT_MAX_WAITS), (1.0, 2))
+        self.assertEqual(planner.SWEPT_HOLD_S, 1.0)
 
 
 # ------------------------------------------------------------------ swept：机头线段通、预测位移线段不通
@@ -380,8 +380,8 @@ class TestSweptVeto(unittest.TestCase):
         planner.OccAstarTeacher(BoxWorld(), wp_at_bearing(0.0), hold_s=HOLD)(None, None, State(0, 0, 0))
 
 
-# ------------------------------------------------------------------ swept：连续等待上限
-class TestWaitCap(unittest.TestCase):
+# ------------------------------------------------------------------ swept：持续否决与恢复
+class TestPersistentVeto(unittest.TestCase):
     def setUp(self):
         self.world = BoxWorld(boxes=[box_on_predicted_line(*V_AFTER_RIGHT, 0.25)])
         self.vx, self.vy = world_vel(*V_AFTER_RIGHT, 0.0)
@@ -393,56 +393,52 @@ class TestWaitCap(unittest.TestCase):
         a, _ = t(None, None, State(0.0, 0.0, 0.0, vx=self.vx, vy=self.vy))
         return a, t.last_branch
 
-    def test_two_waits_then_release(self):
-        """否决一直成立、|err| 小：等、等、第 3 步按原规则放行（只看机头线段，这里通），之后重新开始计数。"""
+    def test_persistent_obstacle_never_releases_forward(self):
         t = self._teacher()
-        got = [self._call(t) for _ in range(7)]
-        W, F = (SAFE_NEUTRAL, "wait_swept"), (FORWARD_SLOW, "forward")
-        self.assertEqual(got, [W, W, F, W, W, F, W])
+        self.assertEqual([self._call(t) for _ in range(20)],
+                         [(SAFE_NEUTRAL, "wait_swept")] * 20)
+        self.assertFalse(t.stop_requested)
 
-    def test_cap_constant_is_two(self):
-        self.assertEqual(planner.SWEPT_MAX_WAITS, 2)
-
-    def test_reset_clears_the_counter(self):
+    def test_velocity_recovery_allows_forward(self):
         t = self._teacher()
-        self._call(t)
-        self._call(t)
-        t.reset()
-        self.assertEqual(self._call(t), (SAFE_NEUTRAL, "wait_swept"))
-        self.assertEqual(self._call(t), (SAFE_NEUTRAL, "wait_swept"))
+        for _ in range(3):
+            self.assertEqual(self._call(t), (SAFE_NEUTRAL, "wait_swept"))
+        self.vx = self.vy = 0.0
         self.assertEqual(self._call(t), (FORWARD_SLOW, "forward"))
 
-    def test_waits_must_be_consecutive(self):
-        """两次等待之间插进任何一个不是等待的步（转向、放行），计数清零：不是累计。"""
+    def test_turn_does_not_disable_the_next_veto(self):
         t = self._teacher()
-        tol = planner.yaw_tol_deg(1.0)
-        W = (SAFE_NEUTRAL, "wait_swept")
-        self.assertEqual(self._call(t), W)
-        t.set_waypoint(wp_at_bearing(tol + 5.0))                                      # 误差超容差：turn_err，清零
+        self.assertEqual(self._call(t), (SAFE_NEUTRAL, "wait_swept"))
+        t.set_waypoint(wp_at_bearing(planner.yaw_tol_deg(1.0) + 5.0))
         self.assertEqual(self._call(t), (YAW_LEFT, "turn_err"))
         t.set_waypoint(wp_at_bearing(0.0))
-        self.assertEqual([self._call(t) for _ in range(3)], [W, W, (FORWARD_SLOW, "forward")])
+        self.assertEqual([self._call(t) for _ in range(5)],
+                         [(SAFE_NEUTRAL, "wait_swept")] * 5)
 
-    def test_blocked_ray_step_also_breaks_the_streak(self):
+    def test_reset_clears_stop_without_disabling_veto(self):
         t = self._teacher()
-        W = (SAFE_NEUTRAL, "wait_swept")
-        self.assertEqual(self._call(t), W)
-        self.world.blocked = True
-        self.assertEqual(self._call(t)[1], "turn_blocked")
-        self.world.blocked = False
-        self.assertEqual([self._call(t) for _ in range(3)], [W, W, (FORWARD_SLOW, "forward")])
+        t.stop_requested = True
+        t.reset()
+        self.assertFalse(t.stop_requested)
+        self.assertEqual([self._call(t) for _ in range(5)],
+                         [(SAFE_NEUTRAL, "wait_swept")] * 5)
 
-    def test_turn_swept_is_not_a_wait(self):
-        """|err| 不小于容差一半时否决 = 转向，不占等待额度；转向改变了几何，不是卡死。"""
-        t = self._teacher(bearing=12.0)
-        got = [self._call(t) for _ in range(5)]
-        self.assertEqual(got, [(YAW_LEFT, "turn_swept")] * 5)
-        t = self._teacher()
-        self.assertEqual(self._call(t), (SAFE_NEUTRAL, "wait_swept"))        # 转向之后等待额度仍是满的
-        t.set_waypoint(wp_at_bearing(12.0))
-        self.assertEqual(self._call(t), (YAW_LEFT, "turn_swept"))
-        t.set_waypoint(wp_at_bearing(0.0))
-        self.assertEqual([self._call(t) for _ in range(3)][-1], (FORWARD_SLOW, "forward"))
+    def test_dagger_student_cannot_expire_the_expert_veto(self):
+        class ForwardStudent:
+            def reset(self):
+                pass
+
+            def act(self, msg):
+                return FORWARD_SLOW, 1.0, [0.0, 1.0, 0.0, 0.0]
+
+        expert = self._teacher()
+        policy = collect.DaggerPolicy(ForwardStudent(), expert, 0.0, random.Random(0))
+        state = State(0.0, 0.0, 0.0, vx=self.vx, vy=self.vy)
+        for _ in range(5):
+            action, _ = policy(np.zeros((2, 2, 3), dtype=np.uint8), None, state)
+            self.assertEqual(action, FORWARD_SLOW)
+            self.assertEqual(policy.last_expert, SAFE_NEUTRAL)
+            self.assertEqual(expert.last_branch, "wait_swept")
 
 
 # ------------------------------------------------------------------ goal-stop 不被等待步误触发
@@ -473,13 +469,13 @@ class TestGoalStopNotTriggeredByWaits(unittest.TestCase):
                 self.assertEqual((a, t.last_branch), (SAFE_NEUTRAL, "wait_swept"), (r, yaw))
         self.assertGreater(min(n_in, n_out), 100, (n_in, n_out))
 
-    def _run(self, policy, spawn_x, steps, name):
+    def _run(self, policy, spawn_x, steps, name, **kwargs):
         with tempfile.TemporaryDirectory() as tmp:
             scene, renderer, occ, params, identity = _mock_env(tmp)
             scene["spawn"] = {"x": spawn_x, "y": 0.0, "z": 2.0, "yaw_deg": 0.0}
             scene["waypoint"] = {"x": 10.0, "y": 0.0, "z": 2.0}
             m, err = collect.run_episode(scene, os.path.join(tmp, name), renderer, occ, params, policy(scene, occ), steps, HOLD,
-                                         split=identity["split"], identity=identity)
+                                         split=identity["split"], identity=identity, **kwargs)
             self.assertIsNone(err)
             with open(os.path.join(tmp, name, "actions.jsonl"), encoding="utf-8") as f:
                 return m, [json.loads(x)["action_executed"] for x in f if x.strip()]
@@ -498,7 +494,7 @@ class TestGoalStopNotTriggeredByWaits(unittest.TestCase):
         self.assertEqual((len(seq), m["completed"], m.get("stopped_on_goal")), (3, True, True), seq)
 
     def test_swept_teacher_waits_in_run_episode_then_moves(self):
-        """真的 swept 教师放进 run_episode：前两步否决（等待，距 waypoint 0.6 m，半径外），第 3 步放行前进；episode 不因 SAFE 提前结束。"""
+        """真的 swept 教师放进 run_episode：前两步否决（等待，距 waypoint 0.6 m，半径外），第 3 步净空恢复才前进；episode 不因 SAFE 提前结束。"""
         def mk_t(scene, occ):
             t = planner.OccAstarTeacher(planner.OccPlanner(occ), scene["waypoint"], hold_s=HOLD, clearance="swept")
             veto = iter([True, True] + [False] * 200)
@@ -507,6 +503,15 @@ class TestGoalStopNotTriggeredByWaits(unittest.TestCase):
         m, seq = self._run(mk_t, 9.4, 3, "waits")
         self.assertEqual(seq, [SAFE_NEUTRAL, SAFE_NEUTRAL, FORWARD_SLOW])
         self.assertEqual((m["num_steps"], m.get("stopped_on_goal")), (3, False))
+
+    def test_persistent_veto_uses_budget_without_requesting_stop(self):
+        def mk_t(scene, occ):
+            t = planner.OccAstarTeacher(planner.OccPlanner(occ), scene["waypoint"], hold_s=HOLD, clearance="swept")
+            t._swept_blocked = lambda state, x, y, z: True
+            return t
+        m, seq = self._run(mk_t, 9.4, 8, "blocked", stop_on_request=True)
+        self.assertEqual(seq, [SAFE_NEUTRAL] * 8)
+        self.assertEqual((m["num_steps"], m.get("stopped_on_goal")), (8, False))
 
 
 # ------------------------------------------------------------------ manifest / DaggerPolicy / CLI
@@ -561,10 +566,10 @@ class TestManifest(unittest.TestCase):
             m = self._episode(tmp, mk_d, "dagger", dagger={"executed_by": "student", "dagger_round": 1, "beta": 0.0})
             self.assertEqual((m["teacher_clearance"], m["teacher_version"]), ("swept", planner.TEACHER_VERSION_SWEPT))
             t = made["t"]
-            t._waits = 2
+            t.stop_requested = True
             pol = collect.DaggerPolicy(FakeStudent(), t, 0.0, random.Random(0))
             pol.reset()
-            self.assertEqual(t._waits, 0)                                   # 集边界清教师的等待计数
+            self.assertFalse(t.stop_requested)                              # 集边界清教师的完成意图
 
     def test_non_astar_policies_manifest_has_no_clearance_key(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -576,14 +581,14 @@ class TestManifest(unittest.TestCase):
                 self.assertIs(m["spawn_two_layer"], False, name)
 
     def test_run_episode_resets_teacher_between_episodes(self):
-        """同一个教师对象跑两集：第一集结束时等待计数不留给第二集。"""
+        """同一个教师对象跑两集：第一集的完成意图不留给第二集。"""
         with tempfile.TemporaryDirectory() as tmp:
             scene, renderer, occ, params, identity = _mock_env(tmp)
             scene["waypoint"] = {"x": 10.0, "y": 0.0, "z": 2.0}
             t = planner.OccAstarTeacher(planner.OccPlanner(occ), scene["waypoint"], hold_s=HOLD, clearance="swept")
-            t._waits = 2
+            t.stop_requested = True
             collect.run_episode(scene, os.path.join(tmp, "e0"), renderer, occ, params, t, 1, HOLD, split=identity["split"], identity=identity)
-            self.assertEqual(t._waits, 0)
+            self.assertFalse(t.stop_requested)
 
 
 class TestCli(unittest.TestCase):

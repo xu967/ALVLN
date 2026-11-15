@@ -178,3 +178,96 @@ HF 本次 4 路短窗口比 2 路约快 92%，据此选择 4 路恢复。魔搭�
 16:57:02–16:57:32 对 `airsim/pcd_map/ue` 所有文件总字节两次采样（包含正式文件与 part，避免改名影响差值）：30.002 s 增加 198,180,864 B，约 6.606 MB/s；累计载荷 10,871,613,161 B，剩余磁盘 152,352,886,784 B。这是实际写盘证据，全量下载尚未完成。
 
 下载器的 HTTP/续传测试 12/12 通过；所有完成文件仍需最终哈希验证才计为 complete。没有解压全量、运行 OpenFly 官方 eval、得出新 VLN 成绩或估计固定完成时间。
+
+
+## 更新 2026-11-15 19:50：并行缺陷修复与额外实验
+
+时间均为 +0800。代码基线 `dc4fa8820cd0c6994d87c0e32606fa7a5b397a97` 加本轮 diff；GPU 为 RTX 2080 Ti，UUID `GPU-e9d01956-88db-b317-ea53-be3fb6cf7190`。主产物 `/root/rivermind-data/uav_rgb/exp-parallel-debug-20261115/`，CPU 响应另在 `exp-control-response-20261115/`。不使用墙钟推断速度提升；收尾时另有外部 GPU Python 进程，未动它。
+
+### A. 语言解析缺陷与反事实回归
+
+旧解析器取最后一个 `to`，会把 `Go to the chair next to the door` 错误当成去 door；裸子串还把 outdoor 匹配成 door。首轮改为首介词后，交叉审核发现起点 `Start at ...`、副词和多句动作仍可绕过；最终按运动动词边界处理单目标，多个运动子句或未支持关系拒绝。保留三轮结果，避免只展示最后一轮成功。
+
+| 检查 | 基线 | 最终修复 |
+|---|---:|---:|
+| 定向合成缺陷案例 | 15/32 通过 | 32/32 通过 |
+| SAGE 6 场景请求 | 4,429 | 4,429 |
+| 正确接受 | 575 | 558 |
+| 错误接受 | 183 | 138 |
+| 拒绝 | 3,671 | 3,733 |
+
+这不是 held-out 语言成绩：32 案例用于定向回归；SAGE 候选从端点获取，含答案泄漏。误接受少 45 的同时正确接受少 17，不能称总体导航提升。独立 reviewer 的 17 组起点/缺候选/slowly/多句/关系/词边界检查均通过。产物 `language/grounder_counterfactual_and_scene_diagnostic.json` 中 `latest_round=reviewed_motion_clause_fix`；最终日志 `language/regression-final.log`。
+
+复现回归：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /root/rivermind-data/uav_rgb/3dgs-venv/bin/python -m unittest   sim.3dgs.test_grounder tools.test_audit_vln_grounder sim.3dgs.test_vln -v
+```
+
+真实输出 61 tests / OK。词法解析仍只支持有限英文单目标，不支持开放多阶段语言任务，也不是视觉 grounder。
+
+### B. 标注与依赖门禁
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 python3 tools/audit_openfly_annotations.py   --input /root/rivermind-data/uav_rgb/downloads/OpenFly/Annotation   --output /root/rivermind-data/uav_rgb/tmp/openfly-annotation-gate-20261115-debug.json
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tools.test_audit_openfly_annotations -v
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tools.test_download_openfly_datagen -v
+```
+
+全量标注 103,226 条（train 100,226 / seen 1,800 / unseen 1,200），`ok=true`，解析错误、无效记录、并行长度错误均 0。原 CLI 对缺指令/长度不等仍 exit0，现 exit2；三个测试方法含 13 个 CLI 子场景通过，下载器 12 项通过。门禁只证明语言存在与并行字段结构，不证明动作/位姿元素数值、视觉可用或指令语义正确。
+
+首轮全仓 Python 门禁停在 `ModuleNotFoundError: No module named requests`：下载器单测此前用系统 Python，漏掉项目 `.venv-tools` 的依赖声明。本轮补 `requests>=2.32,<3`，直连 PyPI 安装到现有 venv，数据盘 TMPDIR/cache；安装实际 requests 2.34.2。完整重跑 `PYTHONDONTWRITEBYTECODE=1 DATA_ROOT=/root/rivermind-data bash tools/check.sh --python-only` 退出 0。原失败 `python-check.log`、重跑 `python-check-retry1.log/.exitcode` 均保留；日志汇总 72 个 unittest batch 共报告 1,475 项（包含跳过项，另有 assert/selfcheck），不是 1,475 个无跳过通过。GUI/可选依赖等 SKIP 不隐藏；没有重建 C++/CUDA。
+
+### C. 3DGS 长路线视角压力检查
+
+复用 `tools.scene_probe_quality.sample_poses/probe_poses/summarize/contact_sheet`，对 `wanderland_10nvb` 的 route 0/2/3（ep4/ep9/ep10）各测试中心线、偏航 −20°/+20°、横移左/右 0.3m。沿现有 A* 路径以工具默认 0.5m 采样；横移为 `x -= lateral*sin(yaw); y += lateral*cos(yaw)`，高度和相机 pitch 不变。执行入口为项目 3dgs-venv `python -u -`，由 stdin 驱动现有函数，没有新增持久 runner。完整参数/scene hash 在 `view_coverage/config.json`，逐帧和 renderer 元数据在 `view_coverage/results.json`。
+
+| 路线 | A* 路长 | 每变体帧数 | 五变体低锐度帧 | 最大深度无效率 |
+|---|---:|---:|---:|---:|
+| ep4 | 41.83m | 72 | 0 | 1.6771% |
+| ep9 | 43.33m | 74 | 0 | 1.6771% |
+| ep10 | 30.55m | 52 | 0 | 0.8945% |
+
+共 990 帧，15/15 通过当前未校准筛查阈值（lapvar≥60 的低质比例≤10%，每帧 depth_valid≥90%），全局最低 lapvar=86.2，所有采样姿态在当前占据代理中无碰撞。这里只检查离散位姿，不是全轨迹扫掠或训练视角覆盖证明。
+
+agent 目视查看 `route0_left_0p3m.png`、`route3_center.png`、`route3_yaw_plus20.png`：步道、长椅和灯柱可辨，树冠局部仍有明显浮点、重影与拉伸，尤其 ep10 第15–24抽样附近。**自动 PASS 不代表视觉质量通过独立人工验收**。不能据此宣布数据问题或渲染问题已解决。
+
+另执行真实 GPU 渲染回归：
+
+```bash
+RUN_3DGS_REAL=1 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/root/rivermind-data/uav_rgb/tmp   /root/rivermind-data/uav_rgb/3dgs-venv/bin/python -m unittest sim.3dgs.test_renderer -v
+```
+
+16/16 通过，包含默认跳过的真实 gsplat 两项；日志 `renderer-real.log`，退出码 0。
+
+### D. 54 组固件响应实验：转向/SAFE 不等于瞬间停住
+
+用现有 `CfSitlDynamics.reset/step`，每组 reset 后前进 `{0.5,2,4}s`，执行 `{SAFE_NEUTRAL,YAW_LEFT,YAW_RIGHT}` 一个 `{0.5,1.0}s` 窗口，再 SAFE 恢复 3s；seeds `{0,1,2}`，共 54 组。CPU 真实 `cf_sitl_proc` lib31、20ms trace，满电独立 profile `cf_sitl_v1:06e5f017:lib31`，`calibrated=false`；无占据/渲染/语言输入。命令为 `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /root/rivermind-data/uav_rgb/3dgs-venv/bin/python -u -` stdin 调用既有动力学，精确过程/参数/二进制哈希在 `exp-control-response-20261115/response_recipe.json`。
+
+- 54/54 完成；响应前速度 0.240–0.321m/s。SAFE/转向后最大前滑 0.15596m，各臂中位约 0.102m。
+- hold0.5 的转向窗口前滑中位约 0.101m、最大 0.133m；hold1 的偏航约 ±32°。
+- 高度范围 1.9458–1.9943m，最低电压 3.7761V。详细 `response_results.json` 和 `response_traces.jsonl` 保留全部样本。
+
+这证明当前仿真中的惯性/位置保持有延续运动，不能由 SAFE 名称认定已经刹停。不能把满电2m结果直接用于半电1.2m，更不能改真机 PID；下一步按实际配置测四动作轨迹保护。
+
+### E. 真实 GPU 净空配对与修复前后隔离
+
+安全缺陷的确定性复现：同一预测碰撞状态旧 swept 输出 `wait,wait,forward`，第三步 `_swept_blocked=True` 仍前进。修复后连续20次仍否决、净空恢复放行；DAgger beta0 专家标签保持安全，8步 SAFE 不产生显式 STOP。swept版本 v3→v4，默认 ray 和 hold 不变。
+
+真实配对入口复用 `collect_3dgs.run_episode`，固定 `sage3d_841150`/`sage3d_841980` 各 route0，seeds151101–151103，`hold_s=1.0`（swept只在此窗口有位移系数），步骤预算 `ceil(scene.max_steps*0.5/hold)`=48/62，默认半电 profile `cf_sitl_v1:1bc8fedf:lib31`，`stop_on_collision=True, stop_on_request=True, split_policy=diag-clearance-paired`。每臂用 `OccAstarTeacher(..., clearance=ray/swept)`；先前 run_vln CLI 仍默认 ray，本次没有扩 CLI。轨迹/指标来自相同 `vln.episode_metrics` 和 `route_shortest_path_m`，显式 STOP。
+
+| 臂 | 请求/异常 | 成功 | 碰撞 | 超时 | SPL | NE均值 |
+|---|---:|---:|---:|---:|---:|---:|
+| ray v2 | 6/0 | 4/6 | 1/6 | 1/6 | 0.5823 | 1.2053m |
+| swept v4 | 6/0 | 5/6 | 0/6 | 1/6 | 0.7166 | 0.9625m |
+| 修复前 swept v3 | 6/0 | 5/6 | 0/6 | 1/6 | 0.7166 | 0.9625m |
+
+共18集。六组初始位姿/yaw逐值相同；旧 v3 从 `git show dc4fa88:sim/3dgs/planner.py` 内存加载，不回写工作树。**v3/v4六组动作/碰撞/位姿逐行相同，这些请求未触发旧的第三次等待放行，ray与swept差异不是本次修复收益**。证据在 `clearance_pair/results.json`、`clearance_before/results.json`、`verification_summary.json`；实际代码补丁与 hash 在 pair config/source.patch。两场景各一条路线样本很小，只是特权控制诊断，无语言、无泛化结论。
+
+剩余 swept 超时：841980/seed151103，共62步（36转、24前进、2SAFE），NE4.001m。根据实录逐步重建61/61动作一致；step29–49左右转振荡21秒、20次相邻反转，净移0.0748m。`turn_blocked`与`turn_err`在约−44°/−71°来回冲突；静态可用角窗约[−69°,−50°]，一步反转约27°可跳过。只有两次孤立wait_swept，不是持续等待导致；最低电压3.339V、油门最大0.935，无触地/饱和证据。详细 `clearance_pair/timeout_decisions.json`。
+
+限制：当前 collision_model=v1、0.1m高斯占据代理；teacher STOP半径0.5m、场景评测半径1m；未完整保护转弯/SAFE残余运动。841980已经用于诊断，后续不能称盲测调参集。没有扩大预算覆盖失败。
+
+### 下一步执行门槛
+
+继续原计划 §10.11，先固定失败状态分离转向量化与净空冲突；匹配半电1.2m条件测四动作响应；离线比较v1/v2碰撞代理。每项同seed/预算只改一个因素，保留拒绝、碰撞和超时分母。然后落实原E0条件+独立STOP和D独立catalog；当前诊断结果不能替代真正语言导航目标。
