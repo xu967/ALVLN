@@ -271,3 +271,64 @@ RUN_3DGS_REAL=1 PYTHONDONTWRITEBYTECODE=1 TMPDIR=/root/rivermind-data/uav_rgb/tm
 ### 下一步执行门槛
 
 继续原计划 §10.11，先固定失败状态分离转向量化与净空冲突；匹配半电1.2m条件测四动作响应；离线比较v1/v2碰撞代理。每项同seed/预算只改一个因素，保留拒绝、碰撞和超时分母。然后落实原E0条件+独立STOP和D独立catalog；当前诊断结果不能替代真正语言导航目标。
+
+
+## 更新 2026-11-15 21:40：OpenFly env18 真实环境与标注位姿门禁
+
+本次不是SAGE或本项目SITL实验，而是刚下载的 **OpenFly_DataGen env_airsim_18**。基线源仓库 `c872baf2a69c1ba5e3c10db06a3c8ccdebdae04a`；没有改算法源码。GPU RTX2080Ti UUID `GPU-e9d01956-88db-b317-ea53-be3fb6cf7190`，启动时外部进程占约7.6GB显存，未停止或修改。产物统一在 `/root/rivermind-data/uav_rgb/exp-openfly-scene-20261115/`。
+
+### 下载与资源门禁
+
+21:36:52 +0800：官方manifest20文件/124,369,388,594 B；本地载荷123,544,493,857 B（约99.34%），19文件完成，最后 `ue/env_ue_smallcity_windows.zip.part` 仍未完，余约824.9MB；Supervisor PID23826活跃，日志含ChunkedEncodingError自动续传。以当前文件与status为准，不用过往下载速度承诺完成时间。
+
+本轮独立重算实际使用的 `airsim/env_airsim_18.zip`（285,821,005 B）SHA-256：`292c751e50f79f3cb4113a53e7e73d409a7bb0a97bf19a44672a8348ac7863b8`，匹配官方manifest。只解压26项、377,676,858 B，新增结果/运行目录共约384.8MB。数据盘剩约23.6GB，未全量解压。完整核对快照 `download_integrity_snapshot.json`。
+
+### 环境/短动作实验
+
+复用 `/root/rivermind-data/uav_rgb/envs/airvln/bin/python`、AirSim和已有X显示。以ubuntu隔离运行，RPC41458，RGB/DepthPlanar320×240、FOV90°、无LiDAR。不是本项目60°相机或cf_sitl；不能混合评分。
+
+成功启动命令（精确绝对路径见recipe.json）：
+
+```text
+runuser -u ubuntu -- env DISPLAY=:20 QT_X11_NO_MITSHM=1 SDL_HINT_CUDA_DEVICE=0 <runtime/env_airsim_18/LinuxNoEditor/AirVLN/Binaries/Linux/AirVLN-Linux-Shipping> -RenderOffscreen -NoSound -NoVSync -GraphicsAdapter=0 --settings <settings.json>
+```
+
+初次窗口启动4秒内Vulkan swapchain `VkResult=-13` / SIGSEGV，未到RPC；改用已有离屏参数后RPC3.003s就绪。客户端硬超时100s、整体预算180s，finally仅回收自有进程组。每次reset后依次hover1s、0.3m/s前进1s、−15°/s偏航1s，并记录碰撞/位移；3次reset重复，不声称随机seed。
+
+| 项目 | 结果 |
+|---|---|
+| 三次reset/动作 | 3/3完整，共9个动作、0碰撞 |
+| 悬停窗口位移 | 0.06061 / 0.06083 / 0.06095m |
+| 前进窗口位移 | 0.10313 / 0.10311 / 0.10310m |
+| 偏航变化 | 约−11.26649°，同时位移约0.12312m |
+| 图像 | 7组320×240 RGB与float-depth保存；目视可见楼群/道路 |
+| 客户端/退出清理 | rc0；42.902s完成；UE随后按计划TERM，rc−15并非运行失败 |
+
+`results.json`、`launch_status.json`、`recipe.json`、`summary.json`与失败尝试日志均保留。这里验证SimpleFlight/RPC/渲染动作链，官方eval采用位姿设置动作，不能把本轮物理短动作当作官方语言导航或动作重放成绩。
+
+### 参考位姿取图与时序风险
+
+取本地官方 `eval_test.json` 的env18 demo index30，前三个pos/yaw，沿官方映射 `AirSim=(x,-y,-z), yaw=-yaw`。预设位置误差门槛2cm。三种时序都实际运行：
+
+| 设置后读图方式 | 三个位置误差 | 判断 |
+|---|---|---|
+| 物理不停，等待0.2s | 0.19353 / 1.00147 / 1.30331m | 失败：SimpleFlight继续推进，z漂移 |
+| 先pause再set，不推进 | 1015.18 / 1013.89 / 1012.60m | 失败：位姿尚未在仿真tick应用 |
+| pause→set→simContinueForTime(0.02)→读pose/RGB/depth | 0.00241 / 0.00518 / 0.00961m | 3/3通过2cm诊断门槛 |
+
+不能把前两次失败归因标注损坏；它们揭示仿真更新时序。最终门禁只证明三个静态参考位姿能在有限误差下应用并取图，没有改官方bridge，也不证明整条轨迹动作对齐或指令正确。图与三种尝试JSON保留，最终 `annotation_pose_results.json`。
+
+### env18语言/动作契约审计
+
+只读检查已下载标注：train9,731条、seen203条、unseen0条；官方演示配置30条。train163/seen3条存在xyz/xyzyaw混用，四维第四项全部等于独立yaw，数值有限，属于schema差异，不能称坏数据。train1,097/seen22条含−1/−2；生成脚本定义为up/down，本地官方eval动作解码只支持0..9。不得静默把未知token改为STOP。
+
+对官方demo30条的428个相邻位姿转移，直接套本地eval运动函数：action[i]精确匹配231个，action[i+1]匹配235个。该诊断未建立完整采样/动作契约，不能推导其余都是错误标注，更不能直接生成教师训练标签。报告 `env18_annotation_contract.json`、来源与样例 `env18_annotation_examples.json`。
+
+当前官方快照的动作尺度为前进3/6/9m、偏航±30°、横移/升降3m，eval以设置位姿并忽略碰撞方式推进，20m成功半径与直线起终点SPL分子；与本机小型无人机四动作SITL不同。在线eval可从场景实时取图，不需先下全库历史PNG；仍需有效策略/processor/statistics及推理环境。训练还需图像与RLDS/TFDS字段转换。未装大模型、未开训练/正式评测。
+
+### 后续交接
+
+1. 等最后Windows归档hash/改名完成更新下载状态；不影响已完成Linux场景实验。
+2. 显式冻结action token、状态前后时序、xyz/xyzyaw、STOP和图像对应，再写转换/回归；保留原标注及未知token拒绝。
+3. 在独立桥接实现中固定仿真暂停/步进/取图契约，增加实际位姿误差检查；目前20ms只对3样本测试，不能未经验证写成全场景默认。
+4. 接入受训语言导航策略后才跑正式SR/OSR/NE/SPL；与项目SITL及本次物理smoke分报。
