@@ -416,3 +416,70 @@ RTX2080Ti 22528MiB、Py3.8/torch2.1.2+cu118、FP32、Adam默认lr0.00025，每�
 - 新增回归9/9在airvln训练环境通过；`.venv-tools`结果6通过/3因缺torch跳过。覆盖标签/STOP、来源/hash、错路线同stem图像、重复route/几何、因果prev/reset、输入白名单、语言消融hook清理、拒绝覆盖。`tools/check.sh`自动枚举tools/test_*.py，无需再改测试清单。
 - 未跑全仓构建/回归、正式seen/unseen、跨场景/三seed、闭环或官方7B。原始压缩token与动力学尚有协议缺口；本轮完整路线均来自单一场景的小子集，不能形成公开排名。
 - 22:23 DataGen仍19/20、载荷123,787,763,489/124,369,388,594 B，Windows smallcity余581,625,105 B，Supervisor仍续传；数据盘剩14,769,565,696 B。快照保存在 `exp-parallel-debug-20261115/openfly-training-download-snapshot.json`，Linux训练不依赖这个Windows包。
+
+## 更新 2026-11-15 23:00：OpenFly 实景反馈闭环与视频
+
+### 协议、相机与数值门禁
+
+- 运行环境：RTX2080Ti（UUID `GPU-e9d01956-88db-b317-ea53-be3fb6cf7190`）、airvln Python3.8 / torch2.1.2+cu118、FP32、OMP4；开始前无其他compute任务。使用前述50epoch checkpoint SHA `ae7e9f7dae16a00d290b422029be62387fe2ce3aa45602bfc9b0e5dc146a2db8` 和原16路线manifest，**无新增训练**。
+- 最终 evaluator SHA `3aceb266dab37d582a3b44694cbade2907bf81c9a5bc2e19a9c4bae4d2bafdbc`；correct_v2/swap_v2/zero_v2三组均该代码，默认30动作/300m/120s上限。此前correct是首次门禁试跑，仅缺协议错误退出计数；结果保留，不混入配对表。
+- env18实际非root、`-RenderOffscreen -NoSound -NoVSync -GraphicsAdapter=0`启动，端口41458、drone_1、front_custom；853×480/FOV90/TargetGamma1.5/相机NED Z=1。启动命令/cwd/设置/日志保存在产物根 `launch.json`、`settings.json`。新Xvfb尝试因display20已有占用退出，未影响实际offscreen渲染；未操作已有显示服务。
+- 位姿协议：OpenFly `(x,y,z,yaw)` 转AirSim `(x,-y,-z,-yaw)`；每集reset后暂停，设置请求位姿、推进0.02s仿真、等暂停状态再等0.1s取图。动作使用官方eval的3/6/9m前进、±30°转向、3m升降/平移、0 STOP；**忽略碰撞响应的位姿跳转，不是物理控制或扫掠安全验证**。
+- 当前压缩token仍有原样例歧义：首内部验证路线token8，但当前图像到下一保留图像仅3m；故不将闭环失败全归模型，不把诊断结果当正式OpenFly评分。
+- 初始相机门禁：首验证route位置误差0.001853m、yaw -59.999992°（请求-60°），真实RGB853×480。原图与实景同位姿MAE10.3296、交换RB后18.1826，目视同建筑同视角；亮度/渲染细节仍有差异，未宣称像素完全同分布。证据 `camera_gate.json`、`camera_comparison.png`。
+- 真实checkpoint首验证8帧逐帧/整段对拍：CPU最大logits差6.67572e-6，零语言4.76837e-6；GPU2.86102e-6；动作均相同。零语言 `ablate_instruction=True` 与训练encoder输出置零CPU对拍最大差0。GPU证据 `sequence_parity_gpu.json`；CPU为独立代理实际执行输出，未另存机器文件。
+
+### 固定三组12集结果
+
+产物根：`/root/rivermind-data/uav_rgb/exp-openfly-closed-loop-20261115`。策略只接当前RGB/指令，持续RNN hidden；初始位姿仅reset，终点仅作诊断度量/字幕，未用目标或参考动作指导模型。正确、路线循环换指令、语言编码清零各4集，所有集自行预测STOP；程序、协议、录像错误均0。
+
+| 语言条件 | 集数 | STOP且距目标<20m（仅诊断） | 平均终点距离 | 相比正确指令动作完全相同 |
+|---|---:|---:|---:|---:|
+| correct | 4 | 3/4 | 13.7342m | — |
+| swap | 4 | 3/4 | 15.8070m | 3/4 |
+| zero | 4 | 3/4 | 13.7342m | 4/4 |
+
+| 路线序号（固定manifest顺序） | correct终点距离 | correct动作序列 | swap/zero变化 |
+|---|---:|---|---|
+| 0 | 27.0256m | 9,9,9,9,9,9,2,0 | swap多走一个9后转向停止，距离35.3166m；zero相同 |
+| 1 | 3.1059m | 9,9,9,9,9,9,0 | 两组动作相同 |
+| 2 | 9.0000m | 9,9,9,1,0 | 两组动作相同 |
+| 3 | 15.8054m | 9,9,9,9,9,9,9,0 | 两组动作相同 |
+
+12集共85个真实决策观测，每集RGB hash不同且每个已执行动作后的时间戳严格增加；最大位置误差0.0306003m，最大yaw误差0.00002128°，小于固定0.2m/1°门禁。endpoint碰撞报告未触发，**不能据此称沿途无碰撞**。比较机器记录为 `comparison.json`、各组 `summary.json` 和逐集 `trace.jsonl`。
+
+**结论：** 反馈与停止链路已连通，模型却在零语言时保持4/4相同动作；目前行为主要是长直行后停止，尚无语义任务依赖证据。3/4的20m内停止只是宽松几何诊断，绝不能写成VLN成功率75%或公开算法提升。本轮只含同场景四条已查看路线，无泛化/多seed结论。
+
+### 视频与开关实测
+
+- `index.html` 为本地观看页面，按路线并排展示correct/swap/zero；不需额外网络服务。正确指令视频在 `correct_v2/episode_000..003/decisions.mp4`，对应另外两目录为对照。
+- 12段全部实际H264解码：85帧、固定2fps、宽1280、高758/784/862/888（随完整指令字幕增高），总7,814,587 B；逐集帧数与trace一致。完整编码/尺寸/sha验证清单 `video_validation.json`，首末图已抽看。
+- 一帧就是一个真实观测，不作平滑插帧或捏造跟随视角；顶部明确标注位姿步进/非实时物理飞行，字幕含原指令、当前动作、评估距离和终止原因。跳动来自离散pose-step，不构成硬件抖动证据。
+- 默认录像开启，显式 `--record-video`；`--no-record-video` 真实运行1集（目录 `video_off`，exit0），没有MP4但有首末PNG、预览、trace和结果。
+- `sim.3dgs.run_vln --videos N` 原默认0保留；修复编码异常丢掉评测汇总，新增失败仍继续下一回合/落盘回归。未改变collect原始onboard采样：其简拼只含动作前RGB，四格trace重渲包含终态，二者不能混说。
+
+### 可复现命令与验证记录
+
+先按产物 `launch.json` 用既有env18启动并加载同目录 `settings.json`；不要复用忙碌端口或覆盖输出。以下在仓库根运行，另外两组只改language和新输出目录：
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 TORCH_HOME=/root/rivermind-data/uav_rgb/torch-cache OMP_NUM_THREADS=4 \
+  /root/rivermind-data/uav_rgb/envs/airvln/bin/python -u tools/eval_openfly_subset.py \
+  --checkpoint /root/rivermind-data/uav_rgb/exp-parallel-debug-20261115/openfly-env18-rgb-language-bc-50ep-v1/model.pt \
+  --manifest /root/rivermind-data/uav_rgb/downloads/OpenFly/subsets/env18_offline_bc_v1/manifest.json \
+  --airvln-root /root/rivermind-data/uav_rgb/airvln-runtime-ubuntu/AirVLN \
+  --out /root/rivermind-data/uav_rgb/exp-openfly-closed-loop-20261115/correct_v2 \
+  --port 41458 --limit 4 --max-steps 30 --record-video --language correct
+
+PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='' OMP_NUM_THREADS=4 \
+  /root/rivermind-data/uav_rgb/envs/airvln/bin/python -m unittest \
+  tools.test_train_openfly_subset tools.test_eval_openfly_subset -v
+PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='' .venv-tools/bin/python -m unittest \
+  sim.3dgs.test_vln sim.3dgs.test_video -v
+```
+
+- 正式配对各自 `*_v2_launch.json` 记录准确命令、开始/结束时刻、源码hash和returncode，完整日志为对应 `.log`。上面输出已经存在，复现实验必须另取新路径。
+- OpenFly回归21/21（2.575s），3DGS回归57/57（5.483s）；测试均禁用GPU，实际闭环另用真实GPU。独立代理也跑过H264/VP8回读与训练录像包装器。
+- 初次将四个suite全部放到airvln Python3.8执行失败：既有grounder的 `str | None` 需要较新Python；保留 `regression.log`，拆到原环境后通过，未更改grounder来规避环境差异。
+- 未跑全仓构建/主线物理闭环/官方seen-unseen/公开比较；没有调整训练权重、动作大小或判定半径来改善本轮数值。
+- 23:00盘余14,522,527,744 B，整个本轮目录约49.35MB；DataGen最后Windows包仍余387,638,545 B，Supervisor仍运行。本轮env18/GPU已停止并清理，证据 `cleanup.json`、`final_snapshot.json`。

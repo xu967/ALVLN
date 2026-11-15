@@ -365,7 +365,7 @@ class TestExplicitStop(unittest.TestCase):
 
 
 class TestRunner(unittest.TestCase):
-    def run_scene(self, outcome=None, records=None):
+    def run_scene(self, outcome=None, records=None, videos=0):
         scene = copy.deepcopy(SCENE)
         scene.update(ply_path="unused.ply", reach_radius_m=1.0, max_steps=8)
         for i, route in enumerate(scene["routes"]):
@@ -375,7 +375,7 @@ class TestRunner(unittest.TestCase):
         actions, oracle = _steps([(0, 0), (1, 0), (4, 0)])
         manifest = {"stopped_by_agent": True, "validity": {"physics_verified": True, "camera_verified": True}}
         args = SimpleNamespace(split=None, all_instructions=False, seed=0, limit=0,
-                               out="unused", hold=0.5, policy="teacher", videos=0, stop_mode="explicit")
+                               out="unused", hold=0.5, policy="teacher", videos=videos, stop_mode="explicit")
         with ExitStack() as stack:
             for module, attr, value in ((scene_mod, "load_scene", scene),
                                        (scene_mod, "read_gaussian_ply", None),
@@ -389,8 +389,47 @@ class TestRunner(unittest.TestCase):
                 side_effect=outcome or [(manifest, None), (manifest, None)]))
             stack.enter_context(mock.patch.object(runner, "_read_jsonl", side_effect=records if records is not None else [actions, oracle] * 2))
             shortest = stack.enter_context(mock.patch.object(runner, "route_shortest_path_m", return_value=3.0))
-            rows, failures = runner.run_scene("fixture.json", args, None)
+            rows, failures = runner.run_scene("fixture.json", args, SimpleNamespace(camera_mount={}))
         return rows, failures, run.call_args_list, shortest.call_args_list
+
+    def test_video_defaults_off(self):
+        with mock.patch.object(runner.video_mod, "compose_views_video") as compose:
+            rows, failures, _, _ = self.run_scene()
+        compose.assert_not_called()
+        self.assertEqual((len(rows), len(failures)), (2, 0))
+        self.assertTrue(all("video" not in row and "video_error" not in row for row in rows))
+
+    def test_video_limit_and_success_metadata(self):
+        video = {"video": "unused/s/r0_1/views.mp4", "frames": 25, "fps": 10.0,
+                 "backend": "ffmpeg libx264 crf 22", "quality": "normal", "keyframes": []}
+        with mock.patch.object(runner.video_mod, "compose_views_video", return_value=video) as compose:
+            rows, failures, _, _ = self.run_scene(videos=1)
+        compose.assert_called_once()
+        self.assertEqual((len(rows), len(failures)), (2, 0))
+        self.assertEqual(rows[0]["video"], "s/r0_1/views.mp4")
+        self.assertEqual(rows[0]["video_metadata"], {k: v for k, v in video.items() if k != "video"})
+        self.assertNotIn("video", rows[1])
+
+    def test_video_failure_preserves_metrics_continues_and_writes_report(self):
+        video = {"video": "unused/s/r1_0/views.mp4", "frames": 25, "fps": 10.0}
+        with mock.patch.object(runner.video_mod, "compose_views_video",
+                               side_effect=[RuntimeError("encoder unavailable"), video]) as compose:
+            rows, failures, calls, _ = self.run_scene(videos=2)
+        self.assertEqual((len(rows), len(failures), len(calls), compose.call_count), (2, 0, 2, 2))
+        self.assertTrue(all(row["success"] for row in rows))
+        self.assertEqual(rows[0]["video_error"], "RuntimeError: encoder unavailable")
+        self.assertNotIn("video", rows[0])
+        self.assertEqual(rows[1]["video"], "s/r1_0/views.mp4")
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(runner, "run_scene", return_value=(rows, failures)), \
+                mock.patch.object(runner.CfSitlParams, "from_json", return_value=SimpleNamespace(profile=lambda: "test")):
+            self.assertEqual(runner.main(["--scene", "fixture", "--policy", "teacher", "--out", tmp,
+                                          "--videos", "2"]), 0)
+            with open(os.path.join(tmp, "episodes.jsonl")) as f:
+                saved = [json.loads(line) for line in f]
+            with open(os.path.join(tmp, "vln_eval.json")) as f:
+                report = json.load(f)
+        self.assertEqual(saved, rows)
+        self.assertEqual((report["overall"]["n"], report["overall"]["n_failed"], report["overall"]["sr"]), (2, 0, 1.0))
 
     def test_eval_is_not_training_and_task_id_tracks_each_route(self):
         _, _, calls, _ = self.run_scene()

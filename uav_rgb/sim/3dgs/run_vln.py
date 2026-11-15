@@ -198,11 +198,17 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
         primary_metrics = target_metrics if target_metrics is not None else m
         print(f"[{scene['name']} {n + 1}/{len(eps)}] {result_text(primary_metrics):24s} {ep['type']:22s} {ep['text']}", file=sys.stderr)
         if n < args.videos:
-            video_mod.compose_views_video(
-                ep_dir, scene, renderer, params.camera_mount, occ,
-                title=f"{args.policy} | cf_sitl | {scene['name']} | {ep['type']}", result=result_text(primary_metrics),
-                instruction=f"\"{ep['text']}\"",
-                log=lambda msg: print(msg, file=sys.stderr))
+            try:
+                video = video_mod.compose_views_video(
+                    ep_dir, scene, renderer, params.camera_mount, occ,
+                    title=f"{args.policy} | cf_sitl | {scene['name']} | {ep['type']}", result=result_text(primary_metrics),
+                    instruction=f"\"{ep['text']}\"",
+                    log=lambda msg: print(msg, file=sys.stderr))
+                row["video"] = os.path.relpath(video["video"], args.out)
+                row["video_metadata"] = {key: value for key, value in video.items() if key != "video"}
+            except Exception as e:  # noqa: BLE001 - 录像是诊断产物，失败不能丢掉已完成的评测
+                row["video_error"] = f"{type(e).__name__}: {e}"
+                print(f"[{scene['name']} {n + 1}/{len(eps)}] 录像失败: {row['video_error']}", file=sys.stderr)
     return rows, failures
 
 

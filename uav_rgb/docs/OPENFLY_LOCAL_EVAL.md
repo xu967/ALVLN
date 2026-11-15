@@ -8,6 +8,7 @@
 - 本地官方 evaluator 定义 0–9 十个动作 token：STOP、前进的三种距离、左右转、升降与左右平移；前进步长为3/6/9m，和本项目四个 primitive 的动力学不兼容。
 - 2026-11-15 已下载的是 DataGen 场景/点云资产（清单124.37GB，最后Windows包仍续传）和103,226条Annotation；并未下载完整轨迹图像或OpenFly-Agent权重。场景资产、训练样本和模型不是同一个下载。
 - 22:23 更新：六个 AirSim Linux 场景已解压/校验，另下载 16 条路线的 150 张官方原图，完成 RGB+语言的 5/50 轮离线 BC。它复用 AirVLN seq2seq、保留 OpenFly 十类标签，不是官方 7B 或本机四动作学生；训练集拟合改善，验证显示过拟合。
+- 23:00 更新：完成真实 env18 图像反馈的位姿闭环，正确／错配／零语言各4集，12段H264录像全部回读通过。零语言4/4动作序列不变，说明当前模型尚未证明使用语言完成任务；不是物理飞行或官方排名。
 
 参考：
 
@@ -54,7 +55,7 @@ OpenFly是户外无人机视觉语言导航研究体系，包含本地仿真/数
 
 - 已完成env18单场景：3次reset重复、9个短物理动作、0碰撞、RGB/depth正常；前三个官方参考位姿经pause/set/20ms tick后误差2.41–9.61mm。详细失败对照/命令见现有[实验文档](experiments/2026-11-14-v3-baseline-long-route-followup.md)21:40更新。
 - 在线eval用环境实时取图，**不必等TB级历史图像库**；但必须接入可用的受训策略/模型、相应processor/statistics、协议适配与验证。数据资产完成不会自动产生成功率。
-- 本地快照存在annotation −1/−2 token与eval0..9解码差异、xyz/xyzyaw混用及动作位姿不完全对齐。本轮离线BC只接受完整的0..9路线并直接学习公布的同索引标签；精确动力学转换未确认，不能直接接闭环。
+- 本地快照存在annotation −1/−2 token与eval0..9解码差异、xyz/xyzyaw混用及动作位姿不完全对齐。离线BC只接受完整的0..9路线并直接学习公布的同索引标签；23:00已接明确标记的官方eval位姿步进诊断，精确动作对齐仍未确认，不能直接转物理飞行或正式成绩。
 - 官方城市尺度的动作、20m判定半径与本机小型机SITL不同；结果分别报告，不混排名。不暂停的瞬移还会触发物理漂移，应固定取图时序后再做整条任务。
 - 六个Linux AirSim场景统一在 `/root/rivermind-data/uav_rgb/openfly-runtime-ubuntu/envs/airsim/`；env18软链接复用旧目录，其他五个新增约7.99GB。22:23数据盘余约14.77GB，最后Windows包仍差约0.582GB；不全量解压多个UE版本。
 
@@ -74,3 +75,27 @@ PYTHONDONTWRITEBYTECODE=1 TORCH_HOME=/root/rivermind-data/uav_rgb/torch-cache OM
 输入只含instruction和冻结ResNet的RGB特征，RNN逐完整轨迹reset，无未来帧、位置、终点、progress或真值前动作输入。标注、图像、词表、实现代码的hash写入checkpoint；保留原0..9分类，STOP只来自原始末尾0，不改成本机四动作。训练集12路线116帧，内部验证4路线34帧，全部来自官方train，非官方seen/unseen。
 
 50轮train正确102/116、STOP12/12；内部val正确19/34、STOP2/4，CE2.13148比5轮1.42110更差。不能只报告训练准确率。完整命令、混淆矩阵、语言消融、权重及限制见[实验记录](experiments/2026-11-14-v3-baseline-long-route-followup.md)22:23更新。
+
+## 闭环与录像开关（2026-11-15 23:00）
+
+入口 `tools/eval_openfly_subset.py` 使用当前渲染RGB和指令逐步决策，保留RNN hidden；起始位姿仅用于reset，终点仅用于评估与视频字幕。它使用OpenFly十类位姿动作，不读取下一标注位置，也不向策略传目标坐标。
+
+本次观看入口：`/root/rivermind-data/uav_rgb/exp-openfly-closed-loop-20261115/index.html`，用服务器桌面浏览器打开即可对比12段视频。`correct_v2/episode_000..003/decisions.mp4` 是正确指令组，`swap_v2`、`zero_v2` 是对照；播放器有暂停、进度条和0.5倍速按钮。原始首末图、带字幕预览、trace和结果同目录。页面使用本地相对文件，不需要启动公网服务。
+
+复现前需启动env18：现成命令、cwd、非root运行用户与853×480/FOV90/Gamma1.5/相机Z=1设置保存在同目录 `launch.json`、`settings.json`。RPC为41458，车辆drone_1，相机front_custom；先确认端口未被其他实验使用。本轮结束已关闭自己启动的仿真进程。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 TORCH_HOME=/root/rivermind-data/uav_rgb/torch-cache OMP_NUM_THREADS=4 \
+  /root/rivermind-data/uav_rgb/envs/airvln/bin/python -u tools/eval_openfly_subset.py \
+  --checkpoint /root/rivermind-data/uav_rgb/exp-parallel-debug-20261115/openfly-env18-rgb-language-bc-50ep-v1/model.pt \
+  --manifest /root/rivermind-data/uav_rgb/downloads/OpenFly/subsets/env18_offline_bc_v1/manifest.json \
+  --airvln-root /root/rivermind-data/uav_rgb/airvln-runtime-ubuntu/AirVLN \
+  --out /root/rivermind-data/uav_rgb/runs/openfly-closed-loop-new \
+  --port 41458 --limit 4 --max-steps 30 --language correct --record-video
+```
+
+- OpenFly录像默认开启；显式 `--record-video` 开启，替换成 `--no-record-video` 关闭。关闭后仍保留轻量首末PNG、trace和结果，已用真实回合验证。
+- `--language swap` 循环换成另一验证路线的指令；`zero` 将语言编码输出清零。每次使用新输出目录，拒绝覆盖旧结果。
+- `sim.3dgs.run_vln` 的既有开关是 `--videos N`（每场景前N集），`--videos 0` 关闭；Studio的“训练后保存视频（闭环1集）”仍只对应原C++学生训练入口，不能当作OpenFly开关。
+- H264视频每观测一帧、2fps，没有平滑插帧；这是位姿跳转的决策录像，不能用画面跳动判断真实机体或PID。录像异常独立记录 `video_error`，不丢已完成导航结果；OpenFly门禁/录像失败使命令非零退出。
+- 本轮3组均3/4停在20m内，但清空语言4/4动作完全不变、换语言3/4不变；该半径指标仅诊断，不是语言理解证据。详见实验记录23:00条目及计划§10.13。
