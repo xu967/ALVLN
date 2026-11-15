@@ -332,3 +332,87 @@ runuser -u ubuntu -- env DISPLAY=:20 QT_X11_NO_MITSHM=1 SDL_HINT_CUDA_DEVICE=0 <
 2. 显式冻结action token、状态前后时序、xyz/xyzyaw、STOP和图像对应，再写转换/回归；保留原标注及未知token拒绝。
 3. 在独立桥接实现中固定仿真暂停/步进/取图契约，增加实际位姿误差检查；目前20ms只对3样本测试，不能未经验证写成全场景默认。
 4. 接入受训语言导航策略后才跑正式SR/OSR/NE/SPL；与项目SITL及本次物理smoke分报。
+
+## 更新 2026-11-15 22:10：六场景解压与 AirVLN 语言反传
+
+### OpenFly Linux 资产
+
+统一路径 `/root/rivermind-data/uav_rgb/openfly-runtime-ubuntu/envs/airsim/`。env16/18/23/26/gz/sh 全部就绪；env18 为既有目录软链接，未复制第二份。六个 ZIP SHA-256 匹配官方快照，125 个普通文件 CRC 通过，六场景启动脚本及 ELF 以 ubuntu UID1000 检查可读可执行。env26/gz/sh 的原 start.sh 缺执行位，只补 `+x`。
+
+总展开 8,366,552,206 B，本轮新增 7,988,875,348 B；2026-11-15 22:03:48 +0800 完成时数据盘剩 15,288,889,344 B，最后 Windows 包仍余 671,802,641 B。解压过程每大文件前保留 12 GiB 加剩余下载空间；无 staging 残留。未解压 UE/Windows，其他五个新场景尚未实跑渲染。`extraction_manifest.json` 与 `asset_inventory.json` 位于上述 runtime 根目录。
+
+### AirVLN 真实语言训练门禁
+
+GPU RTX2080Ti 22528MiB，Py3.8 / torch2.1.2+cu118，FP32；本轮启动前无其他 compute 进程。使用已存在的 3 条语言改写、同一物理路线的 collect LMDB，每条 190 步，冻结预训练视觉特征。未将它们当作 OpenFly 数据。
+
+```bash
+cd /root/rivermind-data/uav_rgb/airvln-runtime-ubuntu/AirVLN
+PYTHONDONTWRITEBYTECODE=1 TORCH_HOME=/root/rivermind-data/uav_rgb/torch-cache OMP_NUM_THREADS=4 \
+  /root/rivermind-data/uav_rgb/envs/airvln/bin/python -u src/vlnce_src/train.py \
+  --run_type train --policy_type seq2seq --collect_type TF \
+  --name airvln-single-route-20261115-r3 --batchSize 1 --dagger_it 1 \
+  --epochs 1 --lr 0.00025 --trainer_gpu_device 0
+```
+
+真实退出码 0，1 epoch / 3 batch / 3 次优化更新；逐 batch action CE 为 2.0794103、2.0699828、2.0535865。这三次输入不同，不将它们解释成评测提升。模型总参数35,587,869，可训练2,961,429。
+
+权重 `airvln-runtime-ubuntu/DATA/output/airvln-single-route-20261115-r3/train/checkpoint/20261115-220042-118222/ckpt.LAST.pth` 为166,461,946 B，SHA-256 `c34c89018d49c1c4389397f8a234489d2cbac818db6e504903d16d133a32beb3`；严格重载 missing/unexpected 均空，15个优化器state的step均为3。相同seed初始化对照，语言embedding/LSTM权重最大变化分别7.4816e-4/7.5104e-4。
+
+固定第一帧RGB/depth与零隐藏状态，三条指令的logits最大差异为3.20e-4–4.03e-4，语言置零差异1.37e-3，但三者argmax均为FORWARD。只证明语言连接与反传有效，不证明语义理解、泛化或闭环成功。日志、命令、重载结果在 `exp-parallel-debug-20261115/airvln-language-training/`；22:03检查GPU已释放。未装包、未重新下载视觉权重。
+
+## 更新 2026-11-15 22:23：真实 OpenFly RGB+语言离线 BC
+
+### 数据、模型和监督口径
+
+数据根 `/root/rivermind-data/uav_rgb/downloads/OpenFly/subsets/env18_offline_bc_v1/`，来自 `IPEC-COMMUNITY/OpenFly` 固定revision `a12316d56a4e35a32ad626fb725ed7089937a1c4`。直连hf-mirror，复用已有下载器的fetch/断点/SHA检查；没有开梯子或重新拉整个库。166文件99,404,391 B，其中150张原始853×480 RGB及16份pose.jsonl（后者仅对账，不入模型）。
+
+选择官方train中env18/medium_short、4–20步、含转向、动作仅0..9且唯一末尾STOP的完整路线，按 `sha256(20261115:route_id)` 排序选前16个，排除重复route和完全相同pos/yaw签名；前12条训练116帧，后4条内部验证34帧。两组都来自官方train，不能称官方seen/unseen或独立场景。空间邻近/走廊重叠未排除。
+
+`manifest.json` SHA-256 `5bf8a200fd1768ea8e95346307bcc3d6ab1d603a3fa976d43c44151469661181`；原train.json SHA-256 `1a4c5a5ed1561ea5b3b79b6c25da7648ce4085b7d8489d62022a9bd1244100df`。`download_manifest.json`保留远端path/expected hash/选择原记录；`independent_data_audit.json`记录主代理独立验证。所有原图SHA、PIL解码、图片完整路线+index_list匹配、语言/动作原字段匹配均通过。目视一张原图城市建筑正常，不当作全数据语义质量验收。
+
+复用官方AirVLN的 `VLNCETrainer` / seq2seq，自然语言词表10,038、上限300tokens；本子集694词中17 OOV，无截断。冻结ResNet50在eval/no_grad下提取RGB特征，预处理PIL bilinear→224×224→float32/255，遵循该encoder原实现不另加ImageNet归一化。RNN逐路线reset，输入白名单仅instruction/rgb_features；禁用depth/progress/prev_action分支。没有输入pos、目标、参考路径或未来图像。模型35,588,895参数，其中2,962,455可训练。
+
+保持原十类输出，监督直接为 `image_path/index_list[i] → action[i]`，不重映射成四动作，不复制末帧或STOP。此处仅复现公布的同索引监督；官方压缩8/9与位姿转换还未严格对齐，不能拿离线结果声称动力学或闭环正确。全子集动作计数：0=16、1=10、2=14、3=11、8=10、9=89，4/5/6/7无样本。
+
+### 复现命令与执行
+
+以下从源repo运行；输出目录必须不存在。两次分别取 `EPOCHS=5` / `50`，对应out为 `openfly-env18-rgb-language-bc-v1` / `openfly-env18-rgb-language-bc-50ep-v1`，均在 `exp-parallel-debug-20261115/` 下。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 TORCH_HOME=/root/rivermind-data/uav_rgb/torch-cache OMP_NUM_THREADS=4 \
+  /root/rivermind-data/uav_rgb/envs/airvln/bin/python -u tools/train_openfly_subset.py \
+  --manifest /root/rivermind-data/uav_rgb/downloads/OpenFly/subsets/env18_offline_bc_v1/manifest.json \
+  --airvln-root /root/rivermind-data/uav_rgb/airvln-runtime-ubuntu/AirVLN \
+  --out /root/rivermind-data/uav_rgb/exp-parallel-debug-20261115/openfly-env18-rgb-language-bc-v1 \
+  --epochs 5 --seed 20261115
+```
+
+RTX2080Ti 22528MiB、Py3.8/torch2.1.2+cu118、FP32、Adam默认lr0.00025，每完整episode一次更新，无额外类别加权。5轮60更新在22:18完成exit0；随后固定50轮600更新也exit0，不按验证集挑选checkpoint。两次代码SHA同为 `52bdd1445591945aed9491e112fba3b251f4bcc3bd9166d5651819a29ce95245`，前5轮metrics含混淆矩阵逐字段完全一致；比较记录在50轮`-launch/comparison.json`。
+
+### 实际结果与失败结论
+
+| 固定预算 | train CE | train正确 | train STOP | 内部val CE | 内部val正确 | 内部val STOP |
+|---|---:|---:|---:|---:|---:|---:|
+| 训练前 | 2.302153 | 47/116 | 0/12 | 未记录 | 未记录 | 未记录 |
+| 5轮 | 1.303069 | 70/116 | 0/12 | 1.421098 | 19/34 | 0/4 |
+| 50轮 | 0.466842 | 102/116 | 12/12 | 2.131480 | 19/34 | 2/4 |
+
+5轮train/val所有预测均为9，即多数类前进，55.88%验证准确率等于常数多数类基线。50轮能拟合训练，但val CE恶化；val动作1/2/3/8全部0正确、9为17/19，另外2个STOP正确。训练集拟合和保存权重已验证，泛化没有成立，不部署、不报告导航成功率。
+
+50轮固定语言消融（不会重新训练）：
+
+| 语言输入 | train CE /正确率 | 内部val CE /正确率 |
+|---|---|---|
+| 原指令 | 0.466842 /87.93% | 2.131480 /55.88% |
+| 编码器输出置零 | 0.503526 /86.21% | 2.148843 /55.88% |
+| 路线间循环换指令 | 0.506535 /83.62% | 2.228877 /55.88% |
+
+语言embedding最大变化5轮0.0072407、50轮0.0416946；输出受语言影响，但不证明语义正确。后续优先扩独立路线/动作覆盖并比较训练加权，不能只增加epoch。
+
+两份 `model.pt` 均164,345,178 B，新trainer strict重载logits最大差均0。SHA-256：5轮 `b50f77595b6faff4ad0a87cfdb190de5ecff1532a4609d16eca687a8446bc5b7`；50轮 `ae7e9f7dae16a00d290b422029be62387fe2ce3aa45602bfc9b0e5dc146a2db8`。`contract.json`绑定数据/词表/实现源码hash、输入/动作与预处理；`metrics.jsonl`和`result.json`保留原始数值，各自`-launch`目录保留recipe、train.log、exit.json。训练进程退出、GPU释放。
+
+### 回归与未完成项
+
+- 新增回归9/9在airvln训练环境通过；`.venv-tools`结果6通过/3因缺torch跳过。覆盖标签/STOP、来源/hash、错路线同stem图像、重复route/几何、因果prev/reset、输入白名单、语言消融hook清理、拒绝覆盖。`tools/check.sh`自动枚举tools/test_*.py，无需再改测试清单。
+- 未跑全仓构建/回归、正式seen/unseen、跨场景/三seed、闭环或官方7B。原始压缩token与动力学尚有协议缺口；本轮完整路线均来自单一场景的小子集，不能形成公开排名。
+- 22:23 DataGen仍19/20、载荷123,787,763,489/124,369,388,594 B，Windows smallcity余581,625,105 B，Supervisor仍续传；数据盘剩14,769,565,696 B。快照保存在 `exp-parallel-debug-20261115/openfly-training-download-snapshot.json`，Linux训练不依赖这个Windows包。
