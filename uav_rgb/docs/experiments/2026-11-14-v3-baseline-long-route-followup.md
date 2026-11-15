@@ -148,3 +148,33 @@ AirVLN 依赖已在数据盘 Python 3.8 环境完成，torch `2.1.2+cu118`、Air
 无 `DISPLAY` 时，UE 虽启动并开放 RPC，第一次 `simGetImages` 会超时并触发 SIGSEGV；继承已有 `DISPLAY=:20`、`QT_X11_NO_MITSHM=1`、`SDL_HINT_CUDA_DEVICE=0` 后，RGB `224x224x3` 与深度 `256x256` 探针通过。隔离 server 保留 UE 子进程并 drain stdout，真实 collector 正常完成：场景 `env_5`，单个 trajectory `39KV3A5D2G5VV16NHAJOVU94299S7W` 的 3 条语言指令，两个 190 步 minibatch，LMDB 写入 3 条 episode feature、190 条 RGB、190 条 depth。产物在 `/root/rivermind-data/uav_rgb/airvln-runtime-ubuntu/DATA/img_features/collect/airvln-single-route-20261115-r3/`。
 
 这只是 teacher-forcing 数据采集链 smoke，不是训练后自主导航，也没有 checkpoint、eval 或公开 VLN 分数；OpenFly_DataGen 实际文件仍返回 HTTP 403，后台下载器继续等待授权。
+
+## 更新 2026-11-15 16:57：下载源和并发实测
+
+这次是 CPU 网络/文件验证，不是 VLN 算法实验。当前 `nvidia-smi -L` 能列出 RTX 2080 Ti，但没有使用 GPU；所有请求 `Session.trust_env=False`，不走代理，不记录 token 或签名 URL。
+
+### 来源与等价性
+
+- ModelScope `SimpleNav/OpenFly_env` 递归清单为 627 文件 / 50,256,260,200 B，包含 Linux 场景，无 `.pcd`、`.zip`、`.ply`。从本地已下载的 6 个 HF AirSim ZIP 流式读出主 `.pak`，SHA-256 全部匹配魔搭对应文件。UE 只核对目录、大小、魔搭侧哈希，未证明与 HF 原包内部逐文件相同。
+- HF 镜像当前的原始 DataGen 清单为 20 个资产 / 124,369,388,594 B；13 个完整文件合计 9,057,576,681 B。恢复前的断点为 bigcity PCD 1,421,869,056 B、bigcity ZIP 58,720,256 B；完整剩余字节 113,831,222,601 B，磁盘可用 152,686,338,048 B。
+
+### 短窗口测速
+
+方法：使用 `requests` 流式 Range 请求，每路最多 32 MiB；HF 并发对比每路另设 20 秒上限，读取不同区段后关闭响应，不写测试载荷。请求内容均返回 HTTP 206。样本大小和时间有限，不能用不同文件的数值推断整库加速倍数。
+
+| 测量对象 | 字节数 / 时间 | 实测吞吐 |
+| --- | --- | --- |
+| 魔搭 bigcity `.ucas` | 32 MiB / 2.69 s | 12.49 MB/s |
+| 魔搭 smallcity `.ucas` | 32 MiB / 1.87 s | 17.93 MB/s |
+| HF 同一 bigcity ZIP，2 路 | 48,234,496 B / 20.582 s | 2.344 MB/s |
+| HF 同一 bigcity ZIP，4 路 | 93,323,264 B / 20.730 s | 4.502 MB/s |
+
+HF 本次 4 路短窗口比 2 路约快 92%，据此选择 4 路恢复。魔搭虽更快，缺少本任务部分原始文件，未用不等价内容替换，不新增约 50 GB 重复下载。
+
+### 实际续传验证
+
+启动配置：`config/openfly_download.supervisor.conf`，实际命令 `/opt/conda/bin/python -u tools/download_openfly_datagen.py --workers 4`；监督进程为 `openfly-datagen`。2026-11-15 16:56:22 读取清单，16:56:35 已重新校验 13 个完整文件，随后 4 路继续写入旧目录。
+
+16:57:02–16:57:32 对 `airsim/pcd_map/ue` 所有文件总字节两次采样（包含正式文件与 part，避免改名影响差值）：30.002 s 增加 198,180,864 B，约 6.606 MB/s；累计载荷 10,871,613,161 B，剩余磁盘 152,352,886,784 B。这是实际写盘证据，全量下载尚未完成。
+
+下载器的 HTTP/续传测试 12/12 通过；所有完成文件仍需最终哈希验证才计为 complete。没有解压全量、运行 OpenFly 官方 eval、得出新 VLN 成绩或估计固定完成时间。

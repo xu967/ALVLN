@@ -4,6 +4,8 @@
 - 范围：`sim/3dgs` SAGE v3 控制对照、Wanderland 下载与长路线候选、算法/控制/渲染/数据语义审查
 - 结论：部分完成；SAGE v3 对照、四个缺失归档、新长路线核心下载/隔离导入/画质筛查、满电门禁和 3 seed 配对均完成；语言学生与独立 catalog 仍未实现
 
+最新下载状态（2026-11-15 16:57）：OpenFly_DataGen 已恢复 4 路续传；13/20 个文件重新校验通过，剩余文件正在传输。凌晨的 403 已解除，05:17 后的旧进程中断已处理；全量尚未完成，详见末尾更新。
+
 ## 做了什么
 
 - 用并行 agents 分别审查了 VLN 算法/学生接口、控制和抖动、3DGS/导入与可视化、Wanderland 指令语义/泄漏风险。完整结论和后续门禁见 `docs/PLAN_2026-11-13_vln.md §10.8` 与 `docs/experiments/2026-11-14-v3-baseline-long-route-followup.md`。
@@ -203,3 +205,32 @@ AirVLN 依赖安装曾把大 wheel 的临时文件写入 30GB 系统盘并报 `N
 | OpenFly_DataGen | 仍未下载；实际文件端点 HTTP 403，后台重试保留 |
 
 该 smoke 仍不是 E2E VLN：语言只进入官方 collector 的训练样本，policy 没有训练，且没有自主停止、公开评测或与 SAGE 指标的可比性。长期运行 AirVLN 还需固定显示/渲染启动契约、维护 server 子进程回收，并在 checkpoint 产生后单独做 eval 门禁。
+
+## 更新 2026-11-15 16:57：OpenFly 下载恢复、测速与进程管理
+
+### 做了什么
+
+- 并行核对国内源、下载恢复边界和进程管理。发现旧进程已不存在，日志停在 05:17 的 ConnectionError，原状态文件仍为 downloading；实际保留 13 个完整文件与两个断点。没有把陈旧状态当作有效下载。
+- 新增 `tools/download_openfly_datagen.py`，沿用数据盘原路径、文件名和状态 schema；加入可选 2/4 并发、独占锁、PID/时间戳、原子状态更新。完整 `.part` 先校验再改名，严格检查 HTTP 206 的偏移和总长，哈希错误保留文件并明确退出。
+- 按用户要求禁用代理；token 只从本地文件读取，跳转至异域 CDN 后不携带 HF Bearer 凭证。既有的 `download_when_authorized.py` 改为指向正式脚本的符号链接，避免两个入口使用不同的续传逻辑。
+- 新增 `config/openfly_download.supervisor.conf` 并部署到已有 Supervisor：4 路、日志和断点全部写数据盘。网络重试耗尽退出 1 可重启，完成退出 0 和永久错误退出 2 不重启，避免坏文件反复全盘校验。进程组停止保留断点，不影响其他服务。
+- 采用实测更快的 4 路；重新校验 13 个已有文件，实际续传从旧偏移增长。测速与当前盘余记录在同任务实验文档的最新更新。
+
+### 没做什么及原因
+
+- 没有把 ModelScope 的 `SimpleNav/OpenFly_env` 当成完整 DataGen 替换：它是解包 Linux 场景，没有 PCD、Windows 和低画质原包；UE 内部逐文件等价性尚未证明。也未重复下载约 50 GB 场景，占用留给原包的空间。
+- 没有下载 2.08 TB 的 `fulanya/OpenFly`，它是标注/轨迹备份而非场景原包；没有安装或升级 ModelScope、datasets 等无关依赖。
+- 没有修改 VLN 算法、真机控制器或重跑 GPU 导航实验：这次处理下载链路，完整数据和对应评测适配尚未就绪。旧 `after_download_runner.py` 等待的是 AerialVLN，不能声称它会自动运行 OpenFly 官方评测。
+- 没有解压全量或删除历史产物；还需为解包和其他任务保留空间。没有把小范围测速等同整包持续吞吐，也未承诺完成时间。
+
+### 验证到哪一步
+
+- `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest tools.test_download_openfly_datagen -v`：12/12 通过。本地真实 HTTP 服务覆盖断线续传、完整 part、哈希错误、200/206、503/403、跨域凭证、代理禁用、独占锁、完成状态和退出码分类。
+- CLI `--help`、`git diff --check` 通过。真实后台任务重新校验 13/20，4 个 `.part` 同时增长，30 秒写入增加 198,180,864 B；这只证明下载继续，不代表完整性门禁已经全部通过。
+- 本机检测到 GPU，但网络/文件测试只用 CPU；没有进行 GPU 训练或推理验证。
+
+### 交接与风险
+
+- 查看：`supervisorctl status openfly-datagen`、数据盘 `OpenFly_DataGen/download_status.json` 和 `download.log`；状态须同时核对 PID 存活、checked_at 和文件增长，不能仅看 downloading。
+- 停止/恢复：`supervisorctl stop openfly-datagen` / `supervisorctl start openfly-datagen`。Supervisor 在本实例启动时加载配置；若销毁或重建实例，需重新部署仓库中的配置，不能保证外部平台保留 `/etc`。
+- 完成判据是所有清单文件大小与哈希通过、状态 complete；永久校验错误需处理后手动恢复，不能自动覆盖坏文件。下一步在空间允许时先验证压缩包，再选择 Linux 场景做独立 smoke，不把 teacher 控制结果写成 VLN 分数。
