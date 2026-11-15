@@ -4,6 +4,8 @@
 
 ## 当前结论
 
+- 2026-11-15 23:47 +0800：完成盲基线、独立纯视觉与RGB+语言三seed对照，六训练/52闭环/52视频。平均终点误差分别30.19/16.05/13.73m；仅四条内部开发路线，语言作用仍弱，且已确认组末观测与完整宏动作的时序差异。最新观看页面在数据盘 exp-openfly-comparison-20261115/index.html。
+
 - 官方平台仓库提供 `train/eval.py` 和 `configs/eval_test.json` 的本地评测流程；没有发现官方远程提交接口或可直接上传模型的 evaluation server。
 - 本地官方 evaluator 定义 0–9 十个动作 token：STOP、前进的三种距离、左右转、升降与左右平移；前进步长为3/6/9m，和本项目四个 primitive 的动力学不兼容。
 - 2026-11-15 已下载的是 DataGen 场景/点云资产（清单124.37GB，最后Windows包仍续传）和103,226条Annotation；并未下载完整轨迹图像或OpenFly-Agent权重。场景资产、训练样本和模型不是同一个下载。
@@ -87,7 +89,7 @@ PYTHONDONTWRITEBYTECODE=1 TORCH_HOME=/root/rivermind-data/uav_rgb/torch-cache OM
 ```bash
 PYTHONDONTWRITEBYTECODE=1 TORCH_HOME=/root/rivermind-data/uav_rgb/torch-cache OMP_NUM_THREADS=4 \
   /root/rivermind-data/uav_rgb/envs/airvln/bin/python -u tools/eval_openfly_subset.py \
-  --checkpoint /root/rivermind-data/uav_rgb/exp-parallel-debug-20261115/openfly-env18-rgb-language-bc-50ep-v1/model.pt \
+  --checkpoint /root/rivermind-data/uav_rgb/exp-openfly-comparison-20261115/training/rgb_language_seed20261115/model.pt \
   --manifest /root/rivermind-data/uav_rgb/downloads/OpenFly/subsets/env18_offline_bc_v1/manifest.json \
   --airvln-root /root/rivermind-data/uav_rgb/airvln-runtime-ubuntu/AirVLN \
   --out /root/rivermind-data/uav_rgb/runs/openfly-closed-loop-new \
@@ -99,3 +101,26 @@ PYTHONDONTWRITEBYTECODE=1 TORCH_HOME=/root/rivermind-data/uav_rgb/torch-cache OM
 - `sim.3dgs.run_vln` 的既有开关是 `--videos N`（每场景前N集），`--videos 0` 关闭；Studio的“训练后保存视频（闭环1集）”仍只对应原C++学生训练入口，不能当作OpenFly开关。
 - H264视频每观测一帧、2fps，没有平滑插帧；这是位姿跳转的决策录像，不能用画面跳动判断真实机体或PID。录像异常独立记录 `video_error`，不丢已完成导航结果；OpenFly门禁/录像失败使命令非零退出。
 - 本轮3组均3/4停在20m内，但清空语言4/4动作完全不变、换语言3/4不变；该半径指标仅诊断，不是语言理解证据。详见实验记录23:00条目及计划§10.13。
+
+## 三种策略的公平对照
+
+仍使用上述训练和闭环入口，不增加启动脚本。`--training-mode rgb_language` 为默认模式；`--training-mode rgb_only` 从初始化到训练、验证、闭环都关闭语言分支，保留相同网络布局。它与训练好语言模型后使用 `--language zero` 的推理消融是两种不同实验。闭环自动读取 checkpoint 的训练模式。
+
+本轮预先固定 `20261115/20261116/20261117` 三个 seed，每个模式训练50轮、600次更新，选择最终权重，不按验证表现选择某轮。复现实验分别替换原训练命令的 `--training-mode`、`--seed`、`--out`；每次输出目录必须不存在。初始化 state hash 和50轮样本顺序 hash 应在同 seed 的两种模式之间一致。关闭语言后，实际获得梯度的参数会减少，不能只用总参数数宣称有效容量完全相同。
+
+盲前进基线不加载模型，不消费RGB或指令：只从12条训练路线统计前进动作众数和非STOP步数中位数，固定前进8次（每次9米）再STOP；若先触发碰撞或预算则提前终止。没有使用验证终点或验证路线长度设定停止时刻。与学习模型共用相机、位姿动作、反馈门禁及录像。
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 \
+  /root/rivermind-data/uav_rgb/envs/airvln/bin/python -u tools/eval_openfly_subset.py \
+  --policy blind_forward \
+  --manifest /root/rivermind-data/uav_rgb/downloads/OpenFly/subsets/env18_offline_bc_v1/manifest.json \
+  --out /root/rivermind-data/uav_rgb/runs/openfly-blind-new \
+  --port 41458 --limit 4 --max-steps 30 --max-distance 300 --timeout 120 --record-video
+```
+
+盲基线无需 `--checkpoint` 或 `--airvln-root`，也不适用 `--language swap/zero`。学习策略沿用默认 `--policy student`；分别评估正确指令、交换指令和语言置零。视频字幕与 trace 标明策略、训练模式及停止原因，固定停止记录为 `fixed_stop`，模型自主停止记录为 `predicted_stop`。
+
+所有权重仍严格校验训练源码、数据和词表hash。上轮23:00的旧权重需对应原训练源码；当前入口复现采用本轮重新训练的权重，不能绕过hash检查混用修改后的代码。历史命令和当时源码hash保留在实验记录及数据盘 launch 文件。
+
+**动作标签边界：** 本轮16份原始 `pose.jsonl` 的322次相邻转移均符合动作前置观测；连续前进压缩为1/8/9后，150条公布索引均保留动作组末端的原始观测。99个8/9观测比组首前进3或6米。从这些保留位姿直接执行完整宏动作，并不等价于原始动作重放。当前对照冻结原manifest，不改步长或标签来改善成绩；尚未找到官方压缩生成代码，不能据此宣布官方数据集有bug。后续因果观测版本应使用逐组校验的组首图像与起点、独立manifest，再重新训练全部基线。

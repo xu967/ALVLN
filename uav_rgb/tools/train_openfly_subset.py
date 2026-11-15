@@ -11,6 +11,7 @@ import sys
 SCHEMA = "uavrgb.openfly_subset.v1"
 INPUTS = ["instruction", "rgb_features"]
 ACTION_SCHEMA = "openfly_0_9_annotation_indexed_offline_bc"
+TRAINING_MODES = ("rgb_language", "rgb_only")
 
 
 def sha256(path):
@@ -24,6 +25,21 @@ def sha256(path):
 def require(condition, message):
     if not condition:
         raise ValueError(message)
+
+
+def configure_training_mode(args, mode):
+    require(mode in TRAINING_MODES, "training_mode 必须是 rgb_language/rgb_only")
+    # 保留相同架构和初始化，只使用官方开关阻断语言输入及其梯度。
+    args.ablate_instruction = mode == "rgb_only"
+
+
+def state_sha256(state):
+    digest = hashlib.sha256()
+    for name, tensor in sorted(state.items()):
+        array = tensor.detach().cpu().contiguous().numpy()
+        digest.update(f"{name}:{array.dtype}:{array.shape}\n".encode())
+        digest.update(array.tobytes())
+    return digest.hexdigest()
 
 
 def load_manifest(path):
@@ -146,7 +162,9 @@ def run(cli):
     args.DistributedDataParallel = False
     args.logger_file_name = str(cli.out / "airvln.log")
     args.ablate_depth, args.PROGRESS_MONITOR_use = True, False
-    args.ablate_instruction, args.ablate_rgb, args.tokenizer_use_bert = False, False, False
+    mode = getattr(cli, "training_mode", "rgb_language")
+    configure_training_mode(args, mode)
+    args.ablate_rgb, args.tokenizer_use_bert = False, False
     args.SEQ2SEQ_use_prev_action, args.vocab_size = False, len(vocab)
     from src.vlnce_src.util import Tokenizer
     from Model.il_trainer import VLNCETrainer
@@ -162,6 +180,7 @@ def run(cli):
                                      "depth": spaces.Box(0, 1, (256, 256, 1), dtype=np.float32)})
     trainer = VLNCETrainer(False, observation_space, spaces.Discrete(10))
     trainer.policy.eval()
+    initial_state_sha256 = state_sha256(trainer.policy.state_dict())
     batches, oov, word_count = {"train": [], "validation": []}, 0, 0
     for ep in manifest["episodes"]:
         words = tokenizer.split_sentence(ep["instruction"])
@@ -189,6 +208,13 @@ def run(cli):
     code_paths = [Path(__file__).resolve(), *sorted((root / "Model").rglob("*.py")),
                   root / "src/common/param.py", root / "src/vlnce_src/util.py"]
     contract = {"schema": "uavrgb.openfly_external_bc.v1", "action_schema": ACTION_SCHEMA,
+                "training_mode": mode, "initial_state_sha256": initial_state_sha256,
+                "parameter_count": sum(p.numel() for p in trainer.policy.parameters()),
+                "parameter_counts": {"total": sum(p.numel() for p in trainer.policy.parameters()),
+                                     "requires_grad": sum(p.numel() for p in trainer.policy.parameters() if p.requires_grad),
+                                     "received_gradient": None},
+                "parameter_count_note": "total includes frozen/unused branches; requires_grad is nominal; received_gradient counts parameters with Adam state after training",
+                "language_branch": "disabled throughout training and evaluation" if mode == "rgb_only" else "enabled",
                 "input_whitelist": INPUTS, "manifest_sha256": sha256(cli.manifest),
                 "annotation_sha256": manifest["annotation_sha256"], "vocab_sha256": sha256(vocab_path),
                 "code_sha256": {str(p): sha256(p) for p in code_paths}, "seed": cli.seed,
@@ -218,16 +244,24 @@ def run(cli):
                 losses.append(loss)
                 updates += 1
             row = {"epoch": epoch + 1, "updates": updates, "mean_train_update_loss": sum(losses) / len(losses),
+                   "train_order_sha256": hashlib.sha256(json.dumps(order).encode()).hexdigest(),
                    "train": evaluate(trainer, batches["train"]), "validation": evaluate(trainer, batches["validation"])}
             log.write(json.dumps(row) + "\n")
             log.flush()
             print(json.dumps(row), flush=True)
     changes = {k: float((trainer.policy.state_dict()[k] - initial[k]).abs().max()) for k in watched}
-    require(all(math.isfinite(v) and v > 0 for v in changes.values()), "语言或动作头没有真实更新")
+    contract["parameter_counts"]["received_gradient"] = sum(p.numel() for p, state in trainer.optimizer.state.items() if state)
+    (cli.out / "contract.json").write_text(json.dumps(contract, indent=2) + "\n")
+    require(all(math.isfinite(v) for v in changes.values()) and changes[watched[1]] > 0, "动作头没有真实更新或参数非有限")
+    require(changes[watched[0]] == 0 if mode == "rgb_only" else changes[watched[0]] > 0,
+            "语言参数变化不符合训练模态")
     require(all(bool(torch.isfinite(p).all()) for p in trainer.policy.parameters()), "训练参数出现非有限值")
     diagnostics = {split: {"correct": evaluate(trainer, data),
                           "zero_language_encoder_output": evaluate(trainer, data, zero_language=True),
                           "cyclic_instruction_swap": evaluate(trainer, data, permute=True)} for split, data in batches.items()}
+    if mode == "rgb_only":
+        require(all(d["correct"] == d["zero_language_encoder_output"] == d["cyclic_instruction_swap"]
+                    for d in diagnostics.values()), "纯视觉训练模型仍受语言输入影响")
     with torch.no_grad():
         expected = logits_for(trainer, batches["validation"][0]).cpu()
     checkpoint = cli.out / "model.pt"
@@ -235,6 +269,7 @@ def run(cli):
                 "optimizer": trainer.optimizer.state_dict(), "updates": updates}, checkpoint)
     reloaded = VLNCETrainer(False, observation_space, spaces.Discrete(10))
     saved = torch.load(checkpoint, map_location=reloaded.device)
+    require(saved["contract"].get("training_mode", "rgb_language") == mode, "checkpoint 训练模态不匹配")
     reloaded.policy.load_state_dict(saved["state_dict"], strict=True)
     reloaded.policy.eval()
     with torch.no_grad():
@@ -256,6 +291,8 @@ def main():
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--seed", type=int, default=20261115)
+    parser.add_argument("--training-mode", choices=TRAINING_MODES, default="rgb_language",
+                        help="rgb_only 从头单独训练并始终禁用语言；不是推理时消融")
     print(json.dumps(run(parser.parse_args())), flush=True)
 
 

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """OpenFly 原生动作的真实渲染反馈诊断；位姿步进，不是物理飞行或正式基准。"""
 import argparse
+from collections import Counter
 import hashlib
 import io
 import json
 import math
 from pathlib import Path
+from statistics import median
 import sys
 import textwrap
 import time
@@ -52,7 +54,44 @@ def recurrent_step(policy, observation, hidden, previous, mask):
     return logits, hidden
 
 
+def checkpoint_training_mode(contract):
+    mode = contract.get("training_mode", "rgb_language")
+    require(mode in ("rgb_language", "rgb_only"), "checkpoint training_mode 不支持")
+    return mode
+
+
+class BlindForward:
+    """只从训练标签固定前进动作和 STOP 时刻，不读取图像、指令或评估终点。"""
+    checkpoint_sha256, contract, input_whitelist = None, None, []
+
+    def __init__(self, manifest):
+        train = [ep for ep in manifest["episodes"] if ep["split"] == "train"]
+        counts = Counter(a for ep in train for a in ep["actions"] if a in (1, 8, 9))
+        require(train and counts, "盲基线必须有 train 路线与前进标签")
+        lengths = [len(ep["actions"]) - 1 for ep in train]
+        self.action = min(counts, key=lambda a: (-counts[a], a))
+        self.stop_after = math.ceil(median(lengths))
+        self.details = {"policy": "blind_forward", "training_mode": None, "active_inputs": [],
+                        "blind_baseline": {"selection_split": "train",
+                            "forward_action": self.action, "stop_after_forward_actions": self.stop_after,
+                            "action_rule": "most frequent train forward token among 1/8/9; ties choose smaller token",
+                            "stop_rule": "ceil(median(train route action counts excluding final STOP))",
+                            "train_forward_counts": {str(a): counts[a] for a in (1, 8, 9)},
+                            "train_route_lengths": [dict(route_id=ep["route_id"], nonstop_actions=n)
+                                                    for ep, n in zip(train, lengths)]}}
+
+    def reset(self, instruction):
+        self.steps = 0
+
+    def step(self, rgb):
+        action = self.action if self.steps < self.stop_after else 0
+        self.steps += 1
+        return action, None
+
+
 class Policy:
+    input_whitelist = INPUTS
+
     def __init__(self, cli, manifest):
         import numpy as np
         import torch
@@ -61,6 +100,7 @@ class Policy:
         root = cli.airvln_root.resolve()
         saved = torch.load(cli.checkpoint, map_location="cpu")
         contract = saved["contract"]
+        training_mode = checkpoint_training_mode(contract)
         require(contract["schema"] == "uavrgb.openfly_external_bc.v1"
                 and contract["action_schema"] == ACTION_SCHEMA, "checkpoint 协议错误")
         require(contract["input_whitelist"] == INPUTS and contract["previous_action_enabled"] is False
@@ -84,7 +124,8 @@ class Policy:
         args.DistributedDataParallel = False
         args.logger_file_name = str(cli.out / "airvln.log")
         args.ablate_depth, args.PROGRESS_MONITOR_use = True, False
-        args.ablate_instruction, args.ablate_rgb, args.tokenizer_use_bert = cli.language == "zero", False, False
+        args.ablate_instruction = training_mode == "rgb_only" or cli.language == "zero"
+        args.ablate_rgb, args.tokenizer_use_bert = False, False
         args.SEQ2SEQ_use_prev_action = False
         vocab = vocab_path.read_text().splitlines()
         args.vocab_size = len(vocab)
@@ -98,6 +139,8 @@ class Policy:
         self.tokenizer = Tokenizer(vocab, encoding_length=300)
         self.contract = contract
         self.checkpoint_sha256 = sha256(cli.checkpoint)
+        self.details = {"policy": "student", "training_mode": training_mode, "blind_baseline": None,
+                        "active_inputs": ["rgb_features"] if args.ablate_instruction else INPUTS}
 
     def reset(self, instruction):
         torch = self.torch
@@ -195,7 +238,7 @@ class Recorder:
         self.lines = ["Original instruction:", *textwrap.wrap(original, width=105)]
         if supplied != original:
             self.lines += ["Policy receives swapped instruction:", *textwrap.wrap(supplied, width=105)]
-        self.height = 680 + 26 * len(self.lines)
+        self.height = 706 + 26 * len(self.lines)
         self.height += self.height % 2
 
     def write(self, rgb, row):
@@ -214,9 +257,14 @@ class Recorder:
         label = ACTIONS[action] if action is not None else "NO ACTION"
         status = f"frame={row['frame']}  action={label}  goal distance={row['goal_distance_m']:.2f}m [evaluation only]"
         draw.text((16, 604), status, font=self.font)
-        draw.text((16, 634), f"language={row['language']}  end={row.get('termination') or 'running'}", font=self.font)
+        draw.text((16, 634), f"policy={row['policy']}  training={row['training_mode'] or 'not_trained'}  language={row['language']}", font=self.font)
+        status = f"end={row.get('termination') or 'running'}"
+        if row.get("blind_baseline"):
+            baseline = row["blind_baseline"]
+            status += f" | train-only rule: {ACTIONS[baseline['forward_action']]} x {baseline['stop_after_forward_actions']} then STOP"
+        draw.text((16, 660), status, font=self.font)
         for i, line in enumerate(self.lines):
-            draw.text((16, 670 + i * 26), line, font=self.font)
+            draw.text((16, 696 + i * 26), line, font=self.font)
         if self.count == 0:
             canvas.save(self.directory / "preview_first.png")
         canvas.save(self.directory / "preview_last.png")
@@ -265,10 +313,10 @@ def rollout(simulator, policy, recorder, trace, start, goal, instruction, cli):
                 action, logits = policy.step(rgb)
                 candidate = next_pose(pose, action)
                 if action == 0:
-                    reason = "predicted_stop"
+                    reason = "fixed_stop" if policy.details["policy"] == "blind_forward" else "predicted_stop"
                 elif travelled + distance(candidate, pose) > cli.max_distance:
                     reason = "distance_budget"
-            row = {"frame": frame, "timestamp": timestamp, "pose": actual, "requested_pose": pose,
+            row = {**policy.details, "frame": frame, "timestamp": timestamp, "pose": actual, "requested_pose": pose,
                    "goal_distance_m": last_distance, "pose_error_m": distance(actual, pose),
                    "yaw_error_deg": math.degrees(yaw_error(actual[3], pose[3])),
                    "action": action, "action_log_probs": logits, "collision_reported": collided,
@@ -296,11 +344,11 @@ def rollout(simulator, policy, recorder, trace, start, goal, instruction, cli):
             recorder.close()
         except Exception as exc:
             video_error = f"{video_error or ''}; finalize: {type(exc).__name__}: {exc}"
-    return {"termination": reason, "error": error, "executed_actions": steps, "frames": frame,
+    return {**policy.details, "termination": reason, "error": error, "executed_actions": steps, "frames": frame,
             "video_error": video_error or getattr(recorder, "video_error", None),
             "commanded_distance_m": travelled, "final_goal_distance_m": last_distance,
             "within_20m_diagnostic": last_distance < 20 if last_distance is not None else None,
-            "stopped_within_20m_diagnostic": reason == "predicted_stop" and last_distance < 20,
+            "stopped_within_20m_diagnostic": reason in ("predicted_stop", "fixed_stop") and last_distance < 20,
             "elapsed_s": time.monotonic() - began}
 
 
@@ -337,6 +385,11 @@ def sequence_parity(policy, episode):
 
 def run(cli):
     require(cli.limit > 0 and cli.max_steps > 0 and cli.max_distance > 0 and cli.timeout > 0, "预算必须为正")
+    if cli.policy == "blind_forward":
+        require(cli.checkpoint is None and cli.airvln_root is None, "盲基线不使用 checkpoint 或 AirVLN 模型")
+        require(cli.language == "correct", "盲基线不消费语言，不适用 swap/zero")
+    else:
+        require(cli.checkpoint is not None and cli.airvln_root is not None, "student 需要 --checkpoint 和 --airvln-root")
     require(not cli.out.exists(), "输出已存在，拒绝覆盖")
     manifest = load_manifest(cli.manifest)
     episodes = [ep for ep in manifest["episodes"] if ep["split"] == "validation"]
@@ -346,10 +399,12 @@ def run(cli):
               if r["image_path"] in wanted}
     require(all("medium_short" in ep["route_id"] for ep in episodes), "此小样本诊断只验证水平相机 medium_short")
     cli.out.mkdir(parents=True)
-    policy = Policy(cli, manifest)
-    contract = {"protocol": PROTOCOL, "checkpoint_sha256": policy.checkpoint_sha256,
+    policy = BlindForward(manifest) if cli.policy == "blind_forward" else Policy(cli, manifest)
+    contract = {**policy.details, "protocol": PROTOCOL, "checkpoint_sha256": policy.checkpoint_sha256,
                 "training_contract": policy.contract, "evaluator_sha256": sha256(__file__),
-                "input_whitelist": INPUTS, "language": cli.language, "record_video": cli.record_video,
+                "manifest_sha256": sha256(cli.manifest), "annotation_sha256": manifest["annotation_sha256"],
+                "action_schema": ACTION_SCHEMA,
+                "input_whitelist": policy.input_whitelist, "language": cli.language, "record_video": cli.record_video,
                 "max_steps": cli.max_steps, "max_distance_m": cli.max_distance, "timeout_s": cli.timeout,
                 "camera": cli.camera, "vehicle": cli.vehicle, "port": cli.port,
                 "pose_feedback_gate": {"xyz_tolerance_m": 0.2, "yaw_tolerance_deg": 1,
@@ -357,7 +412,7 @@ def run(cli):
                 "renderer_capture": "AirSim compressed PNG decoded with PIL RGB; latest feedback only",
                 "limits": ["Internal held-out routes from official train; no unseen-scene or official SR claim",
                            "Pose teleport ignores collision response; reported endpoint collision is not swept-path safety",
-                           "Compressed annotation action alignment remains unverified",
+                           "This 16-route subset matches greedy grouping of up to 3 raw forward actions into 1/8/9, retaining each group's final raw pre-action frame. This observed 150-frame pattern does not verify official compression intent; native macro execution from retained poses is not raw-action replay. Manifest and labels remain frozen for protocol-limited comparison.",
                            "Video has one frame per observation, fixed 2fps; no interpolation or synthetic frames"]}
     (cli.out / "contract.json").write_text(json.dumps(contract, indent=2) + "\n")
     simulator, results, cleanup_error = Simulator(cli), [], None
@@ -382,7 +437,7 @@ def run(cli):
             simulator.close()
         except Exception as exc:
             cleanup_error = f"{type(exc).__name__}: {exc}"
-    summary = {"protocol": PROTOCOL, "episodes": results,
+    summary = {**policy.details, "protocol": PROTOCOL, "checkpoint_sha256": policy.checkpoint_sha256, "episodes": results,
                "errors": sum(r["error"] is not None for r in results),
                "protocol_errors": sum(r["termination"] in ("pose_application_error", "stale_rgb_timestamp")
                                       for r in results),
@@ -394,8 +449,11 @@ def run(cli):
 
 def parser():
     p = argparse.ArgumentParser(description=__doc__)
-    for name in ("checkpoint", "manifest", "airvln-root", "out"):
+    for name in ("manifest", "out"):
         p.add_argument("--" + name, required=True, type=Path)
+    p.add_argument("--policy", choices=("student", "blind_forward"), default="student")
+    p.add_argument("--checkpoint", type=Path)
+    p.add_argument("--airvln-root", type=Path)
     p.add_argument("--limit", type=int, default=4)
     p.add_argument("--max-steps", type=int, default=30)
     p.add_argument("--max-distance", type=float, default=300)

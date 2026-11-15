@@ -11,6 +11,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import train_openfly_subset as adapter
 
 
+class TrainingModeTests(unittest.TestCase):
+    def test_mode_is_explicit_and_only_changes_instruction_switch(self):
+        args = SimpleNamespace(ablate_instruction=False, ablate_depth=True, SEQ2SEQ_use_prev_action=False)
+        adapter.configure_training_mode(args, "rgb_only")
+        self.assertTrue(args.ablate_instruction)
+        self.assertTrue(args.ablate_depth)
+        self.assertFalse(args.SEQ2SEQ_use_prev_action)
+        adapter.configure_training_mode(args, "rgb_language")
+        self.assertFalse(args.ablate_instruction)
+        with self.assertRaisesRegex(ValueError, "training_mode"):
+            adapter.configure_training_mode(args, "zero")
+
+
 class ManifestTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -136,6 +149,16 @@ class TensorTests(unittest.TestCase):
         self.assertEqual(weights.view(-1).tolist(), [1, 1, 1])
         with self.assertRaisesRegex(ValueError, "白名单"):
             adapter.logits_for(self.trainer, ({**obs, "pos": 1}, prev, masks, targets, weights))
+
+    def test_state_hash_identifies_values_and_is_independent_of_dict_order(self):
+        torch = self.torch
+        first = {"weight": torch.tensor([[1.0, 2.0]]), "bias": torch.tensor([3.0])}
+        reordered = {"bias": first["bias"].clone(), "weight": first["weight"].clone()}
+        self.assertEqual(adapter.state_sha256(first), adapter.state_sha256(reordered))
+        reordered["weight"][0, 0] += 1
+        self.assertNotEqual(adapter.state_sha256(first), adapter.state_sha256(reordered))
+        renamed = {"another_weight": first["weight"], "bias": first["bias"]}
+        self.assertNotEqual(adapter.state_sha256(first), adapter.state_sha256(renamed))
 
     def test_zero_language_removes_hook_and_swap_preserves_sources(self):
         original = [batch[0]["instruction"].clone() for batch in self.batches]

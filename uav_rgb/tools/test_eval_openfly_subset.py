@@ -1,4 +1,5 @@
 import importlib.util
+import copy
 import io
 import json
 import math
@@ -11,6 +12,16 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import eval_openfly_subset as evaluator
+
+STUDENT = {"policy": "student", "training_mode": "rgb_language",
+           "active_inputs": evaluator.INPUTS, "blind_baseline": None}
+
+
+def blind_manifest():
+    return {"episodes": [
+        {"split": "train", "route_id": "train_a", "actions": [9, 2, 0]},
+        {"split": "train", "route_id": "train_b", "actions": [1, 9, 9, 0]},
+        {"split": "validation", "route_id": "validation", "actions": [1, 0]}]}
 
 
 class ActionTests(unittest.TestCase):
@@ -38,6 +49,26 @@ class ActionTests(unittest.TestCase):
         args = ["--checkpoint", "c", "--manifest", "m", "--airvln-root", "a", "--out", "o"]
         self.assertTrue(evaluator.parser().parse_args(args).record_video)
         self.assertFalse(evaluator.parser().parse_args(args + ["--no-record-video"]).record_video)
+        self.assertEqual(evaluator.parser().parse_args(args).policy, "student")
+
+    def test_training_mode_defaults_for_old_checkpoints_and_rejects_unknown(self):
+        self.assertEqual(evaluator.checkpoint_training_mode({}), "rgb_language")
+        for mode in ("rgb_language", "rgb_only"):
+            self.assertEqual(evaluator.checkpoint_training_mode({"training_mode": mode}), mode)
+        with self.assertRaises(ValueError):
+            evaluator.checkpoint_training_mode({"training_mode": "unknown"})
+
+    def test_blind_cli_does_not_require_or_accept_checkpoint(self):
+        args = ["--policy", "blind_forward", "--manifest", "m", "--out", "o"]
+        cli = evaluator.parser().parse_args(args)
+        self.assertIsNone(cli.checkpoint)
+        self.assertIsNone(cli.airvln_root)
+        for extra in (["--checkpoint", "unused"], ["--airvln-root", "unused"], ["--language", "swap"]):
+            with self.subTest(extra=extra), mock.patch.object(evaluator, "load_manifest") as load, self.assertRaises(ValueError):
+                evaluator.run(evaluator.parser().parse_args(args + extra))
+            load.assert_not_called()
+        with self.assertRaisesRegex(ValueError, "student 需要"):
+            evaluator.run(evaluator.parser().parse_args(["--manifest", "m", "--out", "o"]))
 
     def test_protocol_failures_exit_nonzero_but_valid_task_terminations_do_not(self):
         cases = [("pose_application_error", 1), ("stale_rgb_timestamp", 1),
@@ -48,7 +79,7 @@ class ActionTests(unittest.TestCase):
             route = "env_airsim_18/astar_data/medium_short/fixture"
             source = root / "train.json"
             source.write_text(json.dumps([{"image_path": route, "pos": [[0, 0, 0], [3, 0, 0]], "yaw": [0, 0]}]))
-            manifest = {"annotation_source": str(source), "episodes": [
+            manifest = {"annotation_source": str(source), "annotation_sha256": "fixture", "episodes": [
                 {"split": "validation", "route_id": route, "instruction": "go forward"}]}
             for reason, expected in cases:
                 with self.subTest(reason=reason):
@@ -56,7 +87,9 @@ class ActionTests(unittest.TestCase):
                            "--airvln-root", "unused", "--out", str(root / reason)])
                     result = {"termination": reason, "error": None, "video_error": None}
                     with mock.patch.object(evaluator, "load_manifest", return_value=manifest), \
-                         mock.patch.object(evaluator, "Policy", return_value=SimpleNamespace(checkpoint_sha256="fixture", contract={})), \
+                         mock.patch.object(evaluator, "Policy", return_value=SimpleNamespace(
+                             checkpoint_sha256="fixture", contract={}, details=STUDENT, input_whitelist=evaluator.INPUTS)), \
+                         mock.patch.object(evaluator, "sha256", return_value="fixture"), \
                          mock.patch.object(evaluator, "Simulator"), mock.patch.object(evaluator, "Recorder"), \
                          mock.patch.object(evaluator, "rollout", return_value=result), mock.patch("builtins.print"):
                         self.assertEqual(evaluator.run(cli), expected)
@@ -64,6 +97,63 @@ class ActionTests(unittest.TestCase):
                     self.assertEqual(summary["protocol_errors"], expected)
                     self.assertEqual(summary["errors"], 0)
                     self.assertEqual(summary["episodes"][0]["termination"], reason)
+
+
+class BlindForwardTests(unittest.TestCase):
+    def test_run_does_not_load_checkpoint_and_records_untrained_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = blind_manifest()
+            route = "env_airsim_18/astar_data/medium_short/fixture"
+            manifest["episodes"][-1].update(route_id=route, instruction="go forward")
+            source = root / "train.json"
+            source.write_text(json.dumps([{"image_path": route, "pos": [[0, 0, 0], [3, 0, 0]], "yaw": [0, 0]}]))
+            manifest.update(annotation_source=str(source), annotation_sha256="fixture")
+            cli = evaluator.parser().parse_args(["--policy", "blind_forward", "--manifest", "unused",
+                                                "--out", str(root / "out"), "--no-record-video"])
+            with mock.patch.object(evaluator, "load_manifest", return_value=manifest), \
+                 mock.patch.object(evaluator, "Policy") as student, \
+                 mock.patch.object(evaluator, "sha256", return_value="fixture"), \
+                 mock.patch.object(evaluator, "Simulator"), mock.patch.object(evaluator, "Recorder"), \
+                 mock.patch.object(evaluator, "rollout", return_value={"termination": "fixed_stop",
+                     "error": None, "video_error": None}), mock.patch("builtins.print"):
+                self.assertEqual(evaluator.run(cli), 0)
+            student.assert_not_called()
+            contract = json.loads((cli.out / "contract.json").read_text())
+            summary = json.loads((cli.out / "summary.json").read_text())
+            self.assertIsNone(contract["training_contract"])
+            self.assertEqual(contract["input_whitelist"], [])
+            for document in (contract, summary):
+                self.assertEqual(document["policy"], "blind_forward")
+                self.assertIsNone(document["checkpoint_sha256"])
+                self.assertIsNone(document["training_mode"])
+                self.assertEqual(document["blind_baseline"]["stop_after_forward_actions"], 3)
+
+    def test_rules_use_only_train_routes_and_no_observation(self):
+        manifest = blind_manifest()
+        original = evaluator.BlindForward(manifest)
+        changed = copy.deepcopy(manifest)
+        changed["episodes"][-1].update(actions=[1] * 1000 + [0], instruction="stop now",
+                                         goal=[1, 2, 3], pos=[[0, 0, 0], [1, 2, 3]])
+        changed["episodes"].append({"split": "validation", "route_id": "extra", "actions": [8] * 999 + [0]})
+        baseline = evaluator.BlindForward(changed)
+        self.assertEqual(baseline.details, original.details)
+        self.assertEqual((baseline.action, baseline.stop_after), (9, 3))
+        self.assertIsNone(baseline.checkpoint_sha256)
+        self.assertIsNone(baseline.contract)
+        self.assertEqual(baseline.input_whitelist, [])
+        for _ in range(2):
+            baseline.reset(object())
+            self.assertEqual([baseline.step(object()) for _ in range(5)],
+                             [(9, None)] * 3 + [(0, None)] * 2)
+
+    def test_forward_token_tie_is_deterministic_and_training_required(self):
+        manifest = {"episodes": [{"split": "train", "route_id": "a", "actions": [9, 1, 0]}]}
+        self.assertEqual(evaluator.BlindForward(manifest).action, 1)
+        for episodes in ([], [{"split": "validation", "actions": [9, 0]}],
+                         [{"split": "train", "route_id": "a", "actions": [2, 0]}]):
+            with self.assertRaises(ValueError):
+                evaluator.BlindForward({"episodes": episodes})
 
 
 @unittest.skipUnless(importlib.util.find_spec("numpy"), "需要 numpy")
@@ -83,6 +173,7 @@ class RolloutTests(unittest.TestCase):
                 self.observations += 1
                 return np.full((4, 6, 3), self.observations, dtype=np.uint8), self.pose, self.collided, self.observations
         class Policy:
+            details = STUDENT
             def __init__(self):
                 self.outputs, self.observed = iter([1, 0]), []
             def reset(self, instruction):
@@ -121,6 +212,22 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(self.policy.observed, [1])
         self.assertEqual([r[0] for r in self.recorder.rows], [1, 2])
         self.assertIsNone(self.recorder.rows[-1][1]["action"])
+
+    def test_blind_fixed_stop_does_not_use_goal_and_keeps_latest_feedback(self):
+        self.policy = evaluator.BlindForward(blind_manifest())
+        result = self.run_episode()
+        self.assertEqual(result["termination"], "fixed_stop")
+        self.assertEqual((result["executed_actions"], result["frames"]), (3, 4))
+        self.assertEqual([row[1]["action"] for row in self.recorder.rows], [9, 9, 9, 0])
+        self.assertIsNone(self.recorder.rows[-1][1]["action_log_probs"])
+        self.assertEqual(result["policy"], "blind_forward")
+        self.assertIsNone(result["training_mode"])
+        self.assertFalse(result["stopped_within_20m_diagnostic"])
+        self.recorder.rows.clear()
+        close = evaluator.rollout(self.simulator, self.policy, self.recorder, io.StringIO(),
+                                  [0, 0, 0, 0], [27, 0, 0], "turn left", self.cli)
+        self.assertTrue(close["stopped_within_20m_diagnostic"])
+        self.assertEqual([row[1]["action"] for row in self.recorder.rows], [9, 9, 9, 0])
 
     def test_collision_and_distance_budget_never_execute_forbidden_move(self):
         self.simulator.collided = True
@@ -168,7 +275,7 @@ class RolloutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(evaluator, "open_video") as video:
             recorder = evaluator.Recorder(Path(tmp), "go left", "go left", False)
             recorder.write(np.zeros((4, 6, 3), dtype=np.uint8),
-                           {"frame": 0, "action": 0, "goal_distance_m": 1,
+                           {**STUDENT, "frame": 0, "action": 0, "goal_distance_m": 1,
                             "language": "correct", "termination": "predicted_stop"})
             recorder.close()
             video.assert_not_called()
@@ -181,7 +288,7 @@ class RolloutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(evaluator, "open_video",
                   side_effect=RuntimeError("ffmpeg missing")) as video:
             recorder = evaluator.Recorder(Path(tmp), "go left", "go left", True)
-            row = {"frame": 0, "action": 0, "goal_distance_m": 1, "language": "correct"}
+            row = {**STUDENT, "frame": 0, "action": 0, "goal_distance_m": 1, "language": "correct"}
             recorder.write(np.zeros((4, 6, 3), dtype=np.uint8), row)
             recorder.write(np.zeros((4, 6, 3), dtype=np.uint8), row)
             recorder.close()
