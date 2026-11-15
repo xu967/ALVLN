@@ -10,6 +10,52 @@ from audit_openfly_annotations import audit
 
 
 class TestAuditOpenFlyAnnotations(unittest.TestCase):
+    def test_element_validation_preserves_published_negative_actions_and_4d_positions(self):
+        valid = {"gpt_instruction": "fly up and down", "action": [-1, -2, 0],
+                 "index_list": ["a", "b", "c"],
+                 "pos": [[0, 0, 1, 0], [0, 0, 4, 0], [0, 0, 1, 0]], "yaw": [0, 0, 0]}
+        patches = [{"action": [True, -2, 0]}, {"action": [1.5, -2, 0]},
+                   {"index_list": [{}, "b", "c"]}, {"index_list": ["", "b", "c"]},
+                   {"pos": [[0, 0, float("nan")]] * 3}, {"pos": [[0, 0, True]] * 3},
+                   {"pos": [[0, 0]] * 3}, {"yaw": [0, float("inf"), 0]}]
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "input.json"
+            source.write_text(json.dumps([valid]))
+            self.assertTrue(audit(source)["ok"])
+            for patch in patches:
+                with self.subTest(patch=patch):
+                    source.write_text(json.dumps([{**valid, **patch}]))
+                    report = audit(source)
+                    self.assertFalse(report["ok"])
+                    self.assertEqual(report["invalid_records"], 1)
+
+    def test_cli_output_cannot_overwrite_or_enter_annotation_inputs(self):
+        valid = {"gpt_instruction": "stop", "action": [0],
+                 "index_list": ["a"], "pos": [[0, 0, 1]], "yaw": [0]}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "input.json"
+            source.write_text(json.dumps([valid]))
+            before = source.read_bytes()
+            alias = root / "alias.json"
+            alias.symlink_to(source)
+            output = root / "external_report.json"
+            output.with_name(output.name + ".tmp").symlink_to(source)
+            corpus = root / "corpus"
+            corpus.mkdir()
+            (corpus / "linked.json").symlink_to(source)
+            cases = [(source, source), (source, alias), (source, output),
+                     (root, root / "report.json"), (corpus, source), (corpus, output)]
+            for input_path, output_path in cases:
+                with self.subTest(input_path=input_path, output_path=output_path):
+                    source.write_bytes(before)
+                    result = subprocess.run(
+                        [sys.executable, str(Path(__file__).with_name("audit_openfly_annotations.py")),
+                         "--input", str(input_path), "--output", str(output_path)],
+                        capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertEqual(source.read_bytes(), before)
+
     def test_json_and_jsonl_are_counted_without_touching_inputs(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

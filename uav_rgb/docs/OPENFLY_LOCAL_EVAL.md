@@ -4,11 +4,12 @@
 
 ## 当前结论
 
+- 2026-11-16 03:11 +0800：并行审核后的代码回归 408/408 通过（44 C++/CUDA、58 OpenFly/下载、306 3DGS/SITL），另实际重训两模式并验证21闭环/20视频。**闭环不是全通过：正确语言第0路线有1次位姿/时间戳同步失败，现有门禁正确终止。** 复放又出现物理已更新而渲染滞后、或位置更新但时间戳不增；不能继续把当前适配器当稳定正式评测。诊断与视频：`/root/rivermind-data/uav_rgb/exp-code-audit-20261116/index.html`。
 - 2026-11-15 23:47 +0800：完成盲基线、独立纯视觉与RGB+语言三seed对照，六训练/52闭环/52视频。平均终点误差分别30.19/16.05/13.73m；仅四条内部开发路线，语言作用仍弱，且已确认组末观测与完整宏动作的时序差异。最新观看页面在数据盘 exp-openfly-comparison-20261115/index.html。
 
 - 官方平台仓库提供 `train/eval.py` 和 `configs/eval_test.json` 的本地评测流程；没有发现官方远程提交接口或可直接上传模型的 evaluation server。
 - 本地官方 evaluator 定义 0–9 十个动作 token：STOP、前进的三种距离、左右转、升降与左右平移；前进步长为3/6/9m，和本项目四个 primitive 的动力学不兼容。
-- 2026-11-15 已下载的是 DataGen 场景/点云资产（清单124.37GB，最后Windows包仍续传）和103,226条Annotation；并未下载完整轨迹图像或OpenFly-Agent权重。场景资产、训练样本和模型不是同一个下载。
+- 2026-11-16 核验：DataGen 在00:12:25 +0800完成20/20资产的下载器大小/哈希验证；当前20个ZIP/PCD合计124,369,388,594B，无 `.part`。另有103,226条Annotation；并未下载完整轨迹图像或OpenFly-Agent权重。场景资产、训练样本和模型不是同一个下载；本轮未重新计算全部124GB哈希。
 - 22:23 更新：六个 AirSim Linux 场景已解压/校验，另下载 16 条路线的 150 张官方原图，完成 RGB+语言的 5/50 轮离线 BC。它复用 AirVLN seq2seq、保留 OpenFly 十类标签，不是官方 7B 或本机四动作学生；训练集拟合改善，验证显示过拟合。
 - 23:00 更新：完成真实 env18 图像反馈的位姿闭环，正确／错配／零语言各4集，12段H264录像全部回读通过。零语言4/4动作序列不变，说明当前模型尚未证明使用语言完成任务；不是物理飞行或官方排名。
 
@@ -45,7 +46,7 @@ OpenFly是户外无人机视觉语言导航研究体系，包含本地仿真/数
 | 名称 | 内容 | 本项目当前状态 |
 |---|---|---|
 | OpenFly-Platform | 多渲染环境接入、点云/语义/轨迹/指令生成、训练与本地eval代码 | 有官方快照，本轮env18真实RPC/渲染/动作smoke成功 |
-| OpenFly_DataGen | AirSim/UE场景归档与PCD地图等资产 | 20资产124.37GB，21:36为19/20；不包含本轮所需模型权重，也不是全量训练图像 |
+| OpenFly_DataGen | AirSim/UE场景归档与PCD地图等资产 | 2026-11-16 00:12完成20/20，124.37GB；下载器校验日志及当前文件数/字节核对一致，不是全量训练图像 |
 | OpenFly数据集 | 语言、轨迹、动作与视觉样本，供训练和基准任务 | 已有Annotation103,226条及本轮150张原图；16路线小子集BC已完成，全库/RLDS未准备 |
 | OpenFly-Agent | 官方参考视觉语言导航模型，有独立预训练权重 | 未在本机加载或完成推理门禁；也可接自有策略，需遵循相同评测接口 |
 
@@ -89,7 +90,7 @@ PYTHONDONTWRITEBYTECODE=1 TORCH_HOME=/root/rivermind-data/uav_rgb/torch-cache OM
 ```bash
 PYTHONDONTWRITEBYTECODE=1 TORCH_HOME=/root/rivermind-data/uav_rgb/torch-cache OMP_NUM_THREADS=4 \
   /root/rivermind-data/uav_rgb/envs/airvln/bin/python -u tools/eval_openfly_subset.py \
-  --checkpoint /root/rivermind-data/uav_rgb/exp-openfly-comparison-20261115/training/rgb_language_seed20261115/model.pt \
+  --checkpoint /root/rivermind-data/uav_rgb/exp-code-audit-20261116/training/rgb_language_seed20261115/model.pt \
   --manifest /root/rivermind-data/uav_rgb/downloads/OpenFly/subsets/env18_offline_bc_v1/manifest.json \
   --airvln-root /root/rivermind-data/uav_rgb/airvln-runtime-ubuntu/AirVLN \
   --out /root/rivermind-data/uav_rgb/runs/openfly-closed-loop-new \
@@ -121,6 +122,8 @@ PYTHONDONTWRITEBYTECODE=1 \
 
 盲基线无需 `--checkpoint` 或 `--airvln-root`，也不适用 `--language swap/zero`。学习策略沿用默认 `--policy student`；分别评估正确指令、交换指令和语言置零。视频字幕与 trace 标明策略、训练模式及停止原因，固定停止记录为 `fixed_stop`，模型自主停止记录为 `predicted_stop`。
 
-所有权重仍严格校验训练源码、数据和词表hash。上轮23:00的旧权重需对应原训练源码；当前入口复现采用本轮重新训练的权重，不能绕过hash检查混用修改后的代码。历史命令和当时源码hash保留在实验记录及数据盘 launch 文件。
+所有权重仍严格校验训练源码、数据和词表hash。2026-11-16训练入口只加强数据几何校验，仍改变了源码hash；当前示例使用 `exp-code-audit-20261116/training` 新权重。两模式同seed重训各600更新后与旧模型499个张量逐项完全一致，但历史权重仍须其历史源码，不能据数值相同绕过hash门禁。
+
+本轮新增运行边界：预算必须为有限正数；非有限模型输出/hidden/位姿与非法首帧时间戳拒绝。推理或编码跨时限后不再发送移动；期限内已决定STOP时，最终编码耗时不会撤销STOP。视频字幕 `predicted` 表示模型候选动作，`action_requested` 是通过门禁的请求，不是物理完成确认。`executed_actions`/`commanded_distance_m` 统计返回的命令次数/目标位移，不应替代实际反馈路程。RPC/运行异常写 `summary.run_error`，录像初始化失败仍保留导航trace/result并非零退出，此时可能没有PNG/MP4。
 
 **动作标签边界：** 本轮16份原始 `pose.jsonl` 的322次相邻转移均符合动作前置观测；连续前进压缩为1/8/9后，150条公布索引均保留动作组末端的原始观测。99个8/9观测比组首前进3或6米。从这些保留位姿直接执行完整宏动作，并不等价于原始动作重放。当前对照冻结原manifest，不改步长或标签来改善成绩；尚未找到官方压缩生成代码，不能据此宣布官方数据集有bug。后续因果观测版本应使用逐组校验的组首图像与起点、独立manifest，再重新训练全部基线。

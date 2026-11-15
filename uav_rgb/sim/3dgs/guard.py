@@ -20,12 +20,20 @@ from .planner import YAW_LEFT, YAW_RIGHT, _wrap
 
 def bearing_error_deg(x, y, yaw_deg, target_xy):
     """目标方位减机头方位，[-180, 180)，正 = 目标在左（与 OccAstarTeacher 的 err 同号同公式）。"""
+    if not all(math.isfinite(v) for v in (x, y, yaw_deg, *target_xy)):
+        raise ValueError("方位护栏的位姿与目标必须有限")
     return _wrap(math.degrees(math.atan2(target_xy[1] - y, target_xy[0] - x)) - yaw_deg)
 
 
 def bearing_guard_action(err_deg, threshold_deg):
     """|err| >= 阈值：返回朝目标转的动作；否则 None。阈值 <= 0 表示关闭。"""
-    if threshold_deg <= 0 or abs(err_deg) < threshold_deg:
+    if not math.isfinite(threshold_deg):
+        raise ValueError("方位护栏阈值必须有限")
+    if threshold_deg <= 0:
+        return None
+    if not math.isfinite(err_deg):
+        raise ValueError("方位误差必须有限")
+    if abs(err_deg) < threshold_deg:
         return None
     return YAW_LEFT if err_deg > 0 else YAW_RIGHT
 
@@ -105,6 +113,8 @@ class OracleGuardedPolicy:
 
     def __init__(self, inner, target_fn, threshold_deg):
         self.inner, self.target_fn, self.threshold = inner, target_fn, float(threshold_deg)
+        if not math.isfinite(self.threshold):
+            raise ValueError("方位护栏阈值必须有限")
         self.name = inner.name
         self.student_cond = getattr(inner, "student_cond", None)
         self.n_steps = self.n_triggered = self.n_rewritten = 0

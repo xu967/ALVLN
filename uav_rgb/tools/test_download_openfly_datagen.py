@@ -139,12 +139,25 @@ class DownloadHTTPTests(unittest.TestCase):
 
     def test_interrupted_transfer_resumes_at_saved_offset(self):
         self.mode = "disconnect"
-        with patch.object(self.stop, "wait", return_value=False):
+        saved_offsets = []
+
+        def record_saved_offset(_seconds):
+            offset = self.partial.stat().st_size
+            self.assertGreater(offset, 0)
+            self.assertLess(offset, len(self.payload))
+            self.assertEqual(self.partial.read_bytes(), self.payload[:offset])
+            saved_offsets.append(offset)
+            return False
+
+        with patch.object(self.stop, "wait", side_effect=record_saved_offset):
             self.fetch()
         self.assertEqual(self.target.read_bytes(), self.payload)
+        self.assertEqual(downloader.digest(self.target, "sha256"), self.job[3])
+        self.assertFalse(self.partial.exists())
         content = [row for row in self.requests if row[0] == "/content"]
         self.assertEqual(len(content), 2)
-        self.assertEqual(content[1][2], "bytes=1048576-")
+        self.assertEqual(len(saved_offsets), 1)
+        self.assertEqual(content[1][2], f"bytes={saved_offsets[0]}-")
 
     def test_server_error_retries_but_denied_access_does_not(self):
         self.mode = "busy"

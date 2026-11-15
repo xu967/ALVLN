@@ -217,16 +217,23 @@ class CfSitlDynamics:
         return resp
 
     def _absorb(self, st):
+        # 先校验整条遥测，避免异常响应污染上个有效状态或被当成正常 STOP。
+        if not all(math.isfinite(float(v)) for v in
+                   (*st["pos"], *st["vel"], *st["quat"], st["t_s"], st["exec_state"])):
+            raise RuntimeError("cf_sitl_proc 返回非有限状态")
         x, y, z = (float(v) for v in st["pos"])
+        vx, vy, vz = (float(v) for v in st["vel"])
+        quat = tuple(float(v) for v in st["quat"])
+        roll_deg, pitch_deg, yaw_deg = _quat_to_euler_deg(quat)
+        exec_state, t_sitl = int(st["exec_state"]), float(st["t_s"])
         z += self.ground_z
         self.path_m += math.hypot(x - self.x, y - self.y)
         self.x, self.y, self.z = x, y, z
-        self.vx, self.vy, self.vz = (float(v) for v in st["vel"])
-        self.quat = tuple(float(v) for v in st["quat"])
-        self.roll_deg, self.pitch_deg, yaw_deg = _quat_to_euler_deg(self.quat)
+        self.vx, self.vy, self.vz = vx, vy, vz
+        self.quat = quat
+        self.roll_deg, self.pitch_deg = roll_deg, pitch_deg
         self.yaw = math.radians(yaw_deg)
-        self.exec_state = int(st["exec_state"])
-        self.t_sitl = float(st["t_s"])
+        self.exec_state, self.t_sitl = exec_state, t_sitl
         self.t = self.t_sitl - self.t0
 
     def reset(self, x, y, yaw_deg, episode=0):
@@ -238,9 +245,9 @@ class CfSitlDynamics:
         if not r.get("ready") or int(st["exec_state"]) != EXEC_READY:
             raise RuntimeError(f"起飞 {self.takeoff_max_s:g}s 内未 READY: exec_state="
                                f"{EXEC_STATES.get(int(st['exec_state']))} z={st['pos'][2]:.2f}")
-        self.t0 = float(st["t_s"])
-        self.takeoff_s = self.t0
         self._absorb(st)
+        self.t0 = self.takeoff_s = self.t_sitl
+        self.t = 0.0
         self.step_index, self.path_m, self.trace = 0, 0.0, []   # 起飞段不计入 episode
         return self._state()
 

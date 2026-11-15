@@ -286,6 +286,8 @@ class OccAstarTeacher:
         yaw = float(state.yaw)
         c, s = math.cos(yaw), math.sin(yaw)
         vx, vy = float(state.vx), float(state.vy)
+        if not (math.isfinite(vx) and math.isfinite(vy)):
+            raise ValueError("swept 速度必须有限")
         vbx, vby = c * vx + s * vy, -s * vx + c * vy                    # 世界系速度 -> 动作前机体系
         dbx = SWEPT_PRED_A[0][0] * vbx + SWEPT_PRED_A[0][1] * vby + SWEPT_PRED_B[0]
         dby = SWEPT_PRED_A[1][0] * vbx + SWEPT_PRED_A[1][1] * vby + SWEPT_PRED_B[1]
@@ -300,6 +302,8 @@ class OccAstarTeacher:
         self.stop_requested = False
         x, y, z = float(state.x), float(state.y), float(getattr(state, "z", 2.0))
         yaw_deg = math.degrees(float(state.yaw))
+        if not all(math.isfinite(v) for v in (x, y, z, yaw_deg)):
+            raise ValueError("教师位姿必须有限")
         if math.hypot(x - self.wp[0], y - self.wp[1]) <= self.stop_radius:
             self.last_branch = "stop"
             self.stop_requested = True

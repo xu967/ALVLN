@@ -92,6 +92,26 @@ class TestBearingConvention(unittest.TestCase):
             for err in (-180.0, -90.0, 0.0, 90.0, 179.0):
                 self.assertIsNone(guard.bearing_guard_action(err, thr), (thr, err))
 
+    def test_nonfinite_error_or_threshold_never_emits_turn(self):
+        for value in (float("nan"), float("inf"), -float("inf")):
+            for err, threshold in ((value, 45.0), (90.0, value)):
+                with self.subTest(error=err, threshold=threshold):
+                    with self.assertRaisesRegex(ValueError, "有限"):
+                        guard.bearing_guard_action(err, threshold)
+            self.assertIsNone(guard.bearing_guard_action(value, 0.0))
+
+    def test_nonfinite_target_is_rejected_before_atan2(self):
+        for value in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "有限"):
+                    guard.bearing_error_deg(0.0, 0.0, 0.0, (value, 1.0))
+
+    def test_nonfinite_guard_threshold_is_rejected_at_construction(self):
+        for value in (float("nan"), float("inf"), -float("inf")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "有限"):
+                    guard.OracleGuardedPolicy(collect.ForwardPolicy(), lambda x, y: (1, 1), value)
+
     def test_sign_matches_planner_teacher(self):
         """护栏的转向号与 planner.OccAstarTeacher 同一套约定：随机位姿、随机目标，教师转哪边护栏就转哪边。"""
         class StubPlanner:      # OccAstarTeacher 只用到 plan / aim_point / occ.sweep；目标点由测试直接给

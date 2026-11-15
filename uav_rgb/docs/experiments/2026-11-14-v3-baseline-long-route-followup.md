@@ -579,3 +579,72 @@ PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='' .venv-tools/bin/python -m unit
 - 语言代理核对随机可训练词嵌入、冻结视觉特征、GRU状态和 STOP：三个语言模型现有开发左右转 recall 均0。现有策略不是没有语言接口，而是尚无可靠语言任务辨别证据。CMA无条件前动作和不同空间缓存使直接切换配置不构成单因素注意力消融。
 - 控制代理核对现有52条结果：最长wall耗时约20.076s，没有time_budget终止；源码中录像写入计入wall timeout。它尚未造成这批结果的超时，但未来模型时延不能用整回合wall_s代替。2fps视频是决策序列，不是真实运动采样。
 - 根代理直接读取 `comparison.json` 断言52行与三项错误计数0；计划路径/阶段齐全，diff空白检查通过。未复跑上一轮29项测试，不把旧测试算本轮验证。
+
+### 更新 2026-11-16 03:11 +0800：并行审核、负例修复与真实回归
+
+产物根 `/root/rivermind-data/uav_rgb/exp-code-audit-20261116`；本轮从源提交 `8e04728` 开始。`scope.json` 事前限定只修可复现问题、单seed两模式重训、受控真实闭环、固定观测/重复reset；不改数据时序或网络结构。环境：RTX2080Ti UUID `GPU-e9d01956-88db-b317-ea53-be3fb6cf7190`，AirVLN Python3.8/torch2.1.2，项目工具Python3.12；原生CUDA架构sm75。三agents按训练/审计、评测/录像、3DGS/SITL划分所有权并交叉审核；根负责C++/CUDA全套和GPU/UE。
+
+#### 实际测试与失败记录
+
+| 检查 | 本轮真实结果 | 证据 |
+|---|---|---|
+| C++/CUDA重新配置、增量构建 | 当前src构建0退出，89个build步骤、33.789s | `native/0.log`、`1.log`、`results.json` |
+| 初次44项CTest | 43通过、1个CPU占用比例断言失败；隔离重跑仍失败 | `native/2.log`、`blocking_isolated.log` |
+| 修正测试口径后完整CTest | 44/44，通过47.13s | `native/ctest_final.log/json/xml` |
+| OpenFly train/audit/eval/download最终集成 | 58/58，通过10.801s，无skip；分别13+5+28+12 | `python_final_verified.log` |
+| 3DGS/SITL最终11模块 | 306/306，通过104.994s，无skip；包含真实SITL进程测试 | `scene_control_audit/final_atomic_cpu_tests.log` |
+| 官方Annotation兼容 | 3文件103,226记录通过新字段校验；原−1/−2 token、xyz+yaw仍接受 | `training_audit/real_annotation_audit.json` |
+| 当前训练manifest | 16路线/150图来源与hash通过，未改manifest | `training_audit/real_manifest_gate.json` |
+| 数据下载 | 下载器00:12:25日志全20资产verified；当前20文件合计124,369,388,594B，0个.part | 原下载器status/log；本轮只重新核文件数/大小，未重新hash全124GB |
+
+408项是44+58+306三套最终用例总数，不再把内部定向重复测试相加。测试名称、确切命令、环境和各阶段红绿日志在各audit子目录。训练/审计新增负例先在原版复现19个subcase失败，评测原版27项套件有18个subcase失败+2error；控制非有限负例先42个失败，原子更新再2fail+3error。这些失败是缺陷证据，未删日志。
+
+本轮修复集中于：Annotation审计输出和.tmp不能覆盖实际输入（包括目录内链接指向的外部文件）；非法元素/非有限pos/yaw拒绝；物理路线按实际xyz/yaw数值去重，整数/小数或冗余第四维不能绕过；策略logits/hidden/反馈有限性、首时间戳和预算校验；推理/编码超预算不派发额外移动；RPC/录像初始化失败仍记录结果；SITL完整解析遥测后才提交状态和时基，无效位姿不触发STOP或护栏转向。
+
+两个测试口径修正必须明说：
+
+- `test_cuda_blocking_sync` 原来要求全进程CPU占用 `<0.35×off`；隔离运行off0.9857核、cli0.3955核、env1 0.3869核，四训练均rc0且权重逐字节一致。短进程的CUDA初始化/I/O不是调度功能本身。最终增加独立子进程直接调用既有helper并读CUDA flags（实际12，调度mask为BlockingSync=4），保留四个真实CLI/env训练、权重一致和非法env拒绝；CPU比例仅报告，不换更宽阈值。没有在每个exec子进程读取flags，不声称那一层直接测过；生产CUDA代码未改。
+- 最终Python集成首次57/58：下载中断后Python3.8保存1,048,608B，测试硬编码要求1,048,576B；Python3.12原测试通过。不同requests/urllib3对尾块交付不同。测试改为记录真实落盘offset和前缀内容，严格断言第二次Range等于该offset，再核完整内容/SHA/无.part。两个解释器各12/12通过，最终58/58。生产下载器未改。证据 `download_retry`、`python_final.log` 与最终日志。
+
+#### 实际GPU重训与权重对拍
+
+直接调用既有 `tools/train_openfly_subset.py --epochs 50 --seed 20261115 --training-mode rgb_language|rgb_only`，原v1 manifest与模型配置不变，分别600更新。02:09:18–02:10:12两运行退出0，耗时29.935/24.323s；每个模式的499个state张量与上一轮同seed权重逐项完全相同，权重状态SHA分别 `3997fd2f282ca3c048fa5c1b57ddf239defa65147d0ed6cd273d80a491486f81`、`3841af44bbc390950ff910e3d81059ddbea097b61ed49378bc78cfca485e8ec5`。
+
+这证明新增输入校验没有改变合法数据的训练结果，**不是模型性能提升**。训练源码SHA `dcb37806e477adf5934502819e7cd99d9a712d1df45240c429f6e98550185d28`，评测源码SHA `63797a3c8745370e9d92be9d9b86467f55030dbbff6fb610a0e1ccde42eba8a4`；旧checkpoint不绕过源码hash，真实闭环使用本轮重训产物。命令/env/cwd/起止/rc在 `launches/train_*.json`，结果在 `training/`，对拍在 `training_parity.json`。
+
+#### 21个真实回合与20视频：有1次协议失败
+
+固定原相机/起点/30步/300m/120s/2fps，5臂×4路线，加正确语言关闭录像1路线。通过程序运行不等于任务成功；下面所有请求均保留：
+
+| 臂 | 回合 | 终止分布 | 命令退出码 |
+|---|---:|---|---:|
+| blind_forward | 4 | 3 fixed_stop，1 collision_reported | 0 |
+| rgb_only_correct | 4 | 3 predicted_stop，1 collision_reported | 0 |
+| rgb_language_correct | 4 | 3 predicted_stop，1 pose_application_error | **1** |
+| rgb_language_swap | 4 | 4 predicted_stop | 0 |
+| rgb_language_zero | 4 | 4 predicted_stop | 0 |
+| rgb_language_no_video | 1 | predicted_stop | 0 |
+
+正确语言episode_000第5帧实际位置仍为上一步，requested向前9m，误差9.00003053m；图像timestamp也未增。门禁在策略调用前终止，不把此帧继续喂模型。`errors=0`只表示未抛Python异常，`protocol_errors=1`和退出码1才是完整状态。不能把这个回合当有效NE样本做模型均值；4次advance返回只说明发送命令，commanded_distance36m不等于实际反馈路程（约27m）。失败未用重跑覆盖。
+
+20MP4全部独立OpenCV完整解码、共149帧、2fps；全部与逐集trace/result帧数一致。无录像回合8帧trace，合计157；21×首末PNG解码RGB哈希均精确匹配trace，off无MP4且首末图/preview完整。六个launch退出码与summary逐一一致。`video_audit.json`明确完整性通过、闭环并非全通过。根目视失败终帧，字幕`predicted=NO ACTION`、`end=pose_application_error`及完整指令清晰。新的本地 `index.html` 标红失败，链接全部21回合，不展示混合成功均值。
+
+#### 同步、渲染与历史的进一步诊断
+
+- 4起点×5reset共20次，最大两次起点差0.528336mm；各路线平均成对像素绝对差约1.221/3.319/2.367/1.112（0–255尺度），log-prob最大差0.0232/0.1349/0.7815/0.0748。所有首动作correct/swap/zero均为9，只证明这20个起始观测的动作稳定，不代表整条路线利用语言。
+- 4条验证序列共34帧，逐帧与整段argmax完全一致，最大绝对logit差1.049e-5；使用现有`atol=rtol=1e-5`组合容差通过，不能误写绝对误差都≤1e-5。相同原图下每帧清空hidden仅改变1/34动作；这是seed20261115的状态依赖诊断，未证明GRU无用或新记忆有效。
+- 冻结原失败四动作前缀，独立10次重放2次协议失败。trial1：physics已到新位置，render和camera仍落后9m，即使timestamp已增长；trial7：render/physics位置更新但timestamp不增长。逐RPC monotonic时间、pause、image camera位置、physics位置/速度/时间都在 `feedback_diagnostic/report.json` / `rpc_calls.json`。因此仅等pause、只看位置或只看新timestamp均不足。
+- 独立试验固定`simContinueForFrames(2)`、单次setPose无重发，10/10前缀出现timestamp不增，不合入生产代码；它也改变推进语义，不能拿来与原20ms分数混报。证据 `frame_step_candidate/report.json`。
+- 再做10次单次请求后的有界被动观测（最长2s，无额外tick/位姿命令），这批没有遇到初始无效观测，故不能证明等待能修好故障；同样未合入。证据 `passive_wait_diagnostic/report.json`。此次不猜UE内部根因，不删除拒绝门禁。
+
+#### 真实SITL分支与超时故障
+
+原seed151103故障前缀step28/29各SAFE/LEFT/RIGHT，共6种条件，每次重新reset并重放完整动作前缀。最终版本1710个历史采样位置/速度/四元数/时间与原记录误差0，60个分支响应与修补原子校验前逐值一致。step28 SAFE仍位移0.158650m、末速0.061530m/s；step29 SAFE位移0.016271m、末速0.040154m/s，左右转约±31.6°。均只有1s局部分支且旧v1碰撞代理无碰，不是长航线安全/停稳结论。
+
+对本次自建SITL proc注入SIGSTOP后，0.02s读超时触发回收，实际约2.021s结束（含回收等待），进程rc−9；零新增trace、状态不变，重试拒绝，不强制前进。既有pose-only到点STOP契约保持，不新增未定义速度要求。`scene_control_audit/audit.json`与commands/trace保存完整证据。
+
+#### 范围、失败和清理
+
+未实现组首因果数据版本、未下载99图、未改变模型/超参数、未修复既有控制振荡/真机PID、未做官方seen/unseen或新场景排名。新同步候选未通过，不宣称适配器稳定；数据与执行两项P0是后续优先级。没有新训练入口或长期队列。
+
+两次诊断命令因Python字符串/JS封装语法错误在执行前失败，修正后仅正式执行一次；无数据或源码误写。首次ffprobe不可用的失败保留，使用已有OpenCV解码而未安装新依赖。03:02仅停止本轮UE组686099/686100，端口41458释放；已有桌面及后出现的llama-server未动。当前系统盘约720MiB、数据盘约8.9GiB，未解压大型UE。新产物/权重/视频全部留数据盘，不进入Git。

@@ -97,6 +97,34 @@ class ManifestTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "至少两条"):
             self.load()
 
+    def test_numeric_representation_cannot_hide_duplicate_geometry(self):
+        originals = json.loads(self.source.read_text())
+        for four_dimensional in (False, True):
+            with self.subTest(four_dimensional=four_dimensional):
+                rows = copy.deepcopy(originals)
+                rows[2]["pos"] = [[float(v) for v in p] + ([0.0] if four_dimensional else [])
+                                  for p in rows[0]["pos"]]
+                rows[2]["yaw"] = [float(v) for v in rows[0]["yaw"]]
+                self.source.write_text(json.dumps(rows))
+                self.manifest["annotation_sha256"] = adapter.sha256(self.source)
+                with self.assertRaisesRegex(ValueError, "物理路线"):
+                    self.load()
+
+    def test_source_geometry_must_be_finite_and_aligned(self):
+        originals = json.loads(self.source.read_text())
+        patches = [{"pos": [[0, 0, float("nan")]] * 3},
+                   {"pos": [[0, 0, True]] * 3}, {"pos": [[0, 0]] * 3},
+                   {"pos": [[0, 0, 1]]}, {"yaw": [0]},
+                   {"yaw": [0, float("inf"), 0]}]
+        for patch in patches:
+            with self.subTest(patch=patch):
+                rows = copy.deepcopy(originals)
+                rows[0].update(patch)
+                self.source.write_text(json.dumps(rows))
+                self.manifest["annotation_sha256"] = adapter.sha256(self.source)
+                with self.assertRaisesRegex(ValueError, "pos/yaw"):
+                    self.load()
+
     def test_existing_run_is_never_overwritten(self):
         self.load()
         output = self.root / "previous_run"

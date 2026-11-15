@@ -270,8 +270,8 @@ add_executable(test_conv_dx_gradcheck tests/test_conv_dx_gradcheck.cpp)
 target_link_libraries(test_conv_dx_gradcheck PRIVATE uavrgb_core)
 add_test(NAME test_conv_dx_gradcheck COMMAND test_conv_dx_gradcheck)
 
-# 第 7 条：--cuda-blocking-sync / UAVRGB_CUDA_BLOCKING_SYNC=1 降低自旋 CPU 占用且数值逐位不变（卡 C1a）。
+# 第 7 条：阻塞同步实际 CUDA 标志与 CLI/env 训练数值一致，CPU 占用只报告（卡 C1a）。
 add_executable(test_cuda_blocking_sync tests/test_cuda_blocking_sync.cpp)
-target_link_libraries(test_cuda_blocking_sync PRIVATE uavrgb_core)
+target_link_libraries(test_cuda_blocking_sync PRIVATE uavrgb_core CUDA::cudart)
 add_dependencies(test_cuda_blocking_sync uavrgb_train)
 add_test(NAME test_cuda_blocking_sync COMMAND test_cuda_blocking_sync $<TARGET_FILE:uavrgb_train>)

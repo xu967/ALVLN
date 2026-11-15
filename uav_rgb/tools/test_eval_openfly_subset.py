@@ -58,6 +58,17 @@ class ActionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             evaluator.checkpoint_training_mode({"training_mode": "unknown"})
 
+    def test_nonfinite_budgets_fail_before_loading_data(self):
+        for name in ("max_distance", "timeout"):
+            for value in (math.inf, -math.inf, math.nan):
+                cli = evaluator.parser().parse_args(["--policy", "blind_forward",
+                                                     "--manifest", "unused", "--out", "unused"])
+                setattr(cli, name, value)
+                with self.subTest(name=name, value=value), \
+                     mock.patch.object(evaluator, "load_manifest") as load, self.assertRaises(ValueError):
+                    evaluator.run(cli)
+                load.assert_not_called()
+
     def test_blind_cli_does_not_require_or_accept_checkpoint(self):
         args = ["--policy", "blind_forward", "--manifest", "m", "--out", "o"]
         cli = evaluator.parser().parse_args(args)
@@ -100,6 +111,46 @@ class ActionTests(unittest.TestCase):
 
 
 class BlindForwardTests(unittest.TestCase):
+    def test_initialization_failures_keep_summary_and_video_failure_keeps_rollout(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest = blind_manifest()
+            route = "env_airsim_18/astar_data/medium_short/fixture"
+            manifest["episodes"][-1].update(route_id=route, instruction="go forward")
+            source = root / "train.json"
+            source.write_text(json.dumps([{"image_path": route, "pos": [[0, 0, 0], [3, 0, 0]], "yaw": [0, 0]}]))
+            manifest.update(annotation_source=str(source), annotation_sha256="fixture")
+            for stage in ("simulator", "recorder", "cleanup"):
+                cli = evaluator.parser().parse_args(["--policy", "blind_forward", "--manifest", "unused",
+                                                    "--out", str(root / stage)])
+                with self.subTest(stage=stage), \
+                     mock.patch.object(evaluator, "load_manifest", return_value=manifest), \
+                     mock.patch.object(evaluator, "sha256", return_value="fixture"), \
+                     mock.patch.object(evaluator, "Simulator") as simulator, \
+                     mock.patch.object(evaluator, "Recorder") as recorder, \
+                     mock.patch.object(evaluator, "rollout", return_value={"termination": "fixed_stop",
+                         "error": None, "video_error": None}) as rollout, mock.patch("builtins.print"):
+                    if stage == "simulator":
+                        simulator.side_effect = RuntimeError("RPC unavailable")
+                    elif stage == "recorder":
+                        recorder.side_effect = OSError("font unavailable")
+                    else:
+                        simulator.return_value.close.side_effect = RuntimeError("cleanup unavailable")
+                    self.assertEqual(evaluator.run(cli), 1)
+                    summary = json.loads((cli.out / "summary.json").read_text())
+                    if stage == "simulator":
+                        self.assertIn("RPC unavailable", summary["run_error"])
+                        rollout.assert_not_called()
+                    else:
+                        rollout.assert_called_once()
+                        self.assertEqual(summary["episodes"][0]["termination"], "fixed_stop")
+                        simulator.return_value.close.assert_called_once()
+                        if stage == "recorder":
+                            self.assertIsNone(rollout.call_args.args[2])
+                            self.assertIn("font unavailable", summary["episodes"][0]["video_error"])
+                        else:
+                            self.assertIn("cleanup unavailable", summary["cleanup_error"])
+
     def test_run_does_not_load_checkpoint_and_records_untrained_policy(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -238,6 +289,103 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(self.run_episode()["termination"], "distance_budget")
         self.assertEqual(self.simulator.actions, [])
 
+    def test_invalid_start_or_goal_never_reaches_simulator(self):
+        for field in ("start", "goal"):
+            for value in (math.nan, math.inf, -math.inf):
+                start, goal = [0, 0, 0, 0], [3, 0, 0]
+                (start if field == "start" else goal)[0] = value
+                with self.subTest(field=field, value=value), mock.patch.object(self.simulator, "begin") as begin:
+                    result = evaluator.rollout(self.simulator, self.policy, self.recorder, io.StringIO(),
+                                               start, goal, "go forward", self.cli)
+                self.assertEqual(result["termination"], "error")
+                self.assertIsNone(result["final_goal_distance_m"])
+                json.dumps(result, allow_nan=False)
+                begin.assert_not_called()
+
+    def test_expired_inference_or_recording_never_dispatches_an_action(self):
+        for stage in ("step", "write"):
+            self.setUp()
+            clock, trace = [0.0], io.StringIO()
+            target = self.policy if stage == "step" else self.recorder
+            original = getattr(target, stage)
+            def slow(*args):
+                result = original(*args)
+                clock[0] = self.cli.timeout
+                return result
+            with self.subTest(stage=stage), mock.patch.object(target, stage, side_effect=slow), \
+                 mock.patch.object(evaluator.time, "monotonic", side_effect=lambda: clock[0]):
+                result = evaluator.rollout(self.simulator, self.policy, self.recorder, trace,
+                                           [0, 0, 0, 0], [3, 0, 0], "go forward", self.cli)
+            self.assertEqual(result["termination"], "time_budget")
+            self.assertEqual(result["executed_actions"], 0)
+            self.assertEqual(self.simulator.actions, [])
+            row = json.loads(trace.getvalue().splitlines()[-1])
+            self.assertEqual(row["termination"], "time_budget")
+            self.assertFalse(row["action_requested"])
+
+    def test_first_invalid_timestamp_never_reaches_policy(self):
+        observe = self.simulator.observe
+        for stamp in (0, -1, math.nan, math.inf, True):
+            with self.subTest(stamp=stamp):
+                self.simulator.observe = lambda: (*observe()[:3], stamp)
+                result = self.run_episode()
+                self.assertEqual(result["termination"], "stale_rgb_timestamp")
+                self.assertEqual(self.policy.observed, [])
+                self.assertEqual(self.simulator.actions, [])
+
+    def test_nonfinite_feedback_never_reaches_policy(self):
+        observe = self.simulator.observe
+        for value in (math.nan, math.inf, -math.inf):
+            with self.subTest(value=value):
+                self.simulator.observe = lambda: (lambda row: (row[0], [value, 0, 0, 0], *row[2:]))(observe())
+                result = self.run_episode()
+                self.assertEqual(result["termination"], "error")
+                self.assertIn("反馈位姿", result["error"])
+                self.assertIsNone(result["final_goal_distance_m"])
+                self.assertEqual(self.policy.observed, [])
+                self.assertEqual(self.simulator.actions, [])
+                json.dumps(result, allow_nan=False)
+
+    def test_stop_at_distance_limit_is_valid_but_late_stop_is_timeout(self):
+        self.cli.max_distance = 3
+        result = self.run_episode()
+        self.assertEqual(result["termination"], "predicted_stop")
+        self.assertEqual(result["executed_actions"], 1)
+        self.setUp()
+        self.policy.outputs = iter([0])
+        clock, step = [0.0], self.policy.step
+        def late(rgb):
+            output = step(rgb)
+            clock[0] = self.cli.timeout
+            return output
+        with mock.patch.object(self.policy, "step", side_effect=late), \
+             mock.patch.object(evaluator.time, "monotonic", side_effect=lambda: clock[0]):
+            result = self.run_episode()
+        self.assertEqual(result["termination"], "time_budget")
+        self.assertFalse(result["stopped_within_20m_diagnostic"])
+        self.assertEqual(self.simulator.actions, [])
+
+    def test_timely_stop_is_not_revoked_by_final_video_encoding(self):
+        self.policy.outputs = iter([0])
+        clock, write = [0.0], self.recorder.write
+        def slow(rgb, row):
+            write(rgb, row)
+            clock[0] = self.cli.timeout
+        with mock.patch.object(self.recorder, "write", side_effect=slow), \
+             mock.patch.object(evaluator.time, "monotonic", side_effect=lambda: clock[0]):
+            result = self.run_episode()
+        self.assertEqual(result["termination"], "predicted_stop")
+        self.assertTrue(result["stopped_within_20m_diagnostic"])
+        self.assertEqual(self.simulator.actions, [])
+
+    def test_collision_precedes_timeout_and_never_calls_policy(self):
+        self.simulator.collided = True
+        with mock.patch.object(evaluator.time, "monotonic", side_effect=[0.0, 120.0]):
+            result = self.run_episode()
+        self.assertEqual(result["termination"], "collision_reported")
+        self.assertEqual(self.policy.observed, [])
+        self.assertTrue(self.recorder.closed)
+
     def test_yaw_and_stale_timestamp_stop_before_using_bad_feedback(self):
         observe = self.simulator.observe
         def wrong_yaw():
@@ -300,6 +448,18 @@ class RolloutTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "需要 torch")
 class RecurrentTests(unittest.TestCase):
+    def test_nonfinite_logits_or_hidden_are_rejected(self):
+        import torch
+        observation = {"instruction": None, "rgb_features": None}
+        for target in ("logits", "hidden"):
+            for value in (math.nan, math.inf, -math.inf):
+                logits, hidden = torch.zeros(1, 10), torch.zeros(1, 1, 2)
+                (logits if target == "logits" else hidden).view(-1)[0] = value
+                policy = SimpleNamespace(net=lambda *args: (torch.zeros(1, 2), hidden),
+                                         action_distribution=lambda features: SimpleNamespace(logits=logits))
+                with self.subTest(target=target, value=value), self.assertRaisesRegex(ValueError, "非有限"):
+                    evaluator.recurrent_step(policy, observation, None, None, None)
+
     def test_white_list_hidden_carry_and_episode_reset(self):
         import numpy as np
         import torch

@@ -72,7 +72,15 @@ def load_manifest(path):
         matched = [r for r in originals.get(route, []) if r["gpt_instruction"] == ep["instruction"]
                    and r["action"] == actions and r["index_list"] == ep["index_list"]]
         require(len(matched) == 1, "路线/语言/动作/帧序列无法唯一匹配官方 Annotation")
-        signature = json.dumps([matched[0]["pos"], matched[0]["yaw"]], sort_keys=True)
+        positions, yaws = matched[0].get("pos"), matched[0].get("yaw")
+        require(isinstance(positions, list) and isinstance(yaws, list)
+                and len(positions) == len(yaws) == len(actions), "pos/yaw 必须与动作等长")
+        require(all(isinstance(p, list) and len(p) in (3, 4)
+                    and all(type(v) in (int, float) and math.isfinite(v) for v in p) for p in positions)
+                and all(type(y) in (int, float) and math.isfinite(y) for y in yaws),
+                "pos/yaw 必须是有限数字，位置必须为 xyz 或 xyz+yaw")
+        # 物理路线按实际使用的 xyz/yaw 比较，不受 JSON 整数/小数或冗余第四维影响。
+        signature = tuple((tuple(p[:3]), y) for p, y in zip(positions, yaws))
         require(signature not in signatures, "重复物理路线，禁止改写指令后跨划分")
         signatures.add(signature)
         for image, index, digest in zip(ep["images"], ep["index_list"], ep["image_sha256"]):

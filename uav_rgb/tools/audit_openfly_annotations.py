@@ -64,7 +64,13 @@ def _load(path: Path) -> Iterable[dict[str, Any]]:
 
 
 def _number(value: Any) -> float | None:
-    return float(value) if isinstance(value, (int, float)) and math.isfinite(float(value)) else None
+    if type(value) not in (int, float):
+        return None
+    try:
+        number = float(value)
+    except OverflowError:
+        return None
+    return number if math.isfinite(number) else None
 
 
 def _path_length(pos: Any) -> float | None:
@@ -133,6 +139,17 @@ def audit(input_path: str | os.PathLike[str]) -> dict[str, Any]:
                 if present and any(len(v) != len(present[0]) for v in present[1:]):
                     length_mismatches["action/index_list/pos/yaw"] += 1
                     record_errors.append("parallel_field_length_mismatch")
+                if isinstance(action, list) and any(type(a) is not int for a in action):
+                    record_errors.append("invalid_action_element")
+                indices, positions, yaws = (record.get(k) for k in ("index_list", "pos", "yaw"))
+                if isinstance(indices, list) and any(not isinstance(i, str) or not i.strip() for i in indices):
+                    record_errors.append("invalid_index_element")
+                if isinstance(positions, list) and any(
+                        not isinstance(p, list) or len(p) not in (3, 4)
+                        or any(_number(v) is None for v in p) for p in positions):
+                    record_errors.append("invalid_position_element")
+                if isinstance(yaws, list) and any(_number(y) is None for y in yaws):
+                    record_errors.append("invalid_yaw_element")
                 if record_errors:
                     invalid += 1
                     validation_errors.update(record_errors)
@@ -176,11 +193,17 @@ def main() -> int:
     parser.add_argument("--input", required=True, help="Annotation 文件或目录")
     parser.add_argument("--output", required=True, help="输出 JSON 路径；建议放在 /root/rivermind-data")
     args = parser.parse_args()
-    report = audit(args.input)
-    output = Path(args.output).expanduser()
-    output.parent.mkdir(parents=True, exist_ok=True)
+    source = Path(args.input).expanduser().resolve()
+    output = Path(args.output).expanduser().resolve()
     tmp = output.with_name(output.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as f:
+    input_files = {path.resolve() for path in _files(source)}
+    if any(candidate.resolve() == source or candidate.resolve() in input_files
+           or source.is_dir() and source in candidate.resolve().parents
+           for candidate in (output, tmp)):
+        parser.error("输出不能覆盖输入文件，也不能放入被审计的输入目录")
+    report = audit(source)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tmp.open("x", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
         f.write("\n")
     os.replace(tmp, output)

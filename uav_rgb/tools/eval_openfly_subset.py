@@ -51,6 +51,7 @@ def recurrent_step(policy, observation, hidden, previous, mask):
     features, hidden = policy.net(observation, hidden, previous, mask)
     logits = policy.action_distribution(features).logits
     require(tuple(logits.shape) == (1, 10), "动作输出不是 [1,10]")
+    require(bool(logits.isfinite().all()) and bool(hidden.isfinite().all()), "非有限模型输出或历史状态")
     return logits, hidden
 
 
@@ -165,7 +166,6 @@ class Policy:
                 self.policy.net.rgb_encoder.cnn(tensor)
                 observation = {"instruction": self.tokens, "rgb_features": captured[0]}
                 logits, self.hidden = recurrent_step(self.policy, observation, self.hidden, self.previous, self.mask)
-                require(bool(torch.isfinite(logits).all()), "非有限模型输出")
                 action = int(logits.argmax(1).item())
                 self.previous.fill_(action)
                 self.mask.fill_(True)
@@ -255,7 +255,7 @@ class Recorder:
         draw.text((16, 8), "DECISION FRAMES | pose stepping, NOT real-time physical flight | 2 frames/s", font=self.font)
         action = row["action"]
         label = ACTIONS[action] if action is not None else "NO ACTION"
-        status = f"frame={row['frame']}  action={label}  goal distance={row['goal_distance_m']:.2f}m [evaluation only]"
+        status = f"frame={row['frame']}  predicted={label}  goal distance={row['goal_distance_m']:.2f}m [evaluation only]"
         draw.text((16, 604), status, font=self.font)
         draw.text((16, 634), f"policy={row['policy']}  training={row['training_mode'] or 'not_trained'}  language={row['language']}", font=self.font)
         status = f"end={row.get('termination') or 'running'}"
@@ -293,17 +293,21 @@ def rollout(simulator, policy, recorder, trace, start, goal, instruction, cli):
     began, pose, travelled, steps, frame = time.monotonic(), list(start), 0.0, 0, 0
     reason, last_distance, error, video_error, previous_timestamp = None, None, None, None, None
     try:
+        require(len(pose) == 4 and all(math.isfinite(v) for v in pose), "起始位姿非有限或维度错误")
+        require(len(goal) == 3 and all(math.isfinite(v) for v in goal), "评估终点非有限或维度错误")
         policy.reset(instruction)
         simulator.begin(pose)
         while True:
             rgb, actual, collided, timestamp = simulator.observe()
+            require(len(actual) == 4 and all(math.isfinite(v) for v in actual), "反馈位姿非有限或维度错误")
             last_distance = distance(actual, goal)
             action, logits, candidate = None, None, None
             if collided:
                 reason = "collision_reported"
             elif distance(actual, pose) > 0.2 or yaw_error(actual[3], pose[3]) > math.radians(1):
                 reason = "pose_application_error"
-            elif previous_timestamp is not None and timestamp <= previous_timestamp:
+            elif type(timestamp) is not int or timestamp <= 0 or (
+                    previous_timestamp is not None and timestamp <= previous_timestamp):
                 reason = "stale_rgb_timestamp"
             elif time.monotonic() - began >= cli.timeout:
                 reason = "time_budget"
@@ -312,11 +316,14 @@ def rollout(simulator, policy, recorder, trace, start, goal, instruction, cli):
             else:
                 action, logits = policy.step(rgb)
                 candidate = next_pose(pose, action)
-                if action == 0:
+                if time.monotonic() - began >= cli.timeout:
+                    reason = "time_budget"
+                elif action == 0:
                     reason = "fixed_stop" if policy.details["policy"] == "blind_forward" else "predicted_stop"
                 elif travelled + distance(candidate, pose) > cli.max_distance:
                     reason = "distance_budget"
-            row = {**policy.details, "frame": frame, "timestamp": timestamp, "pose": actual, "requested_pose": pose,
+            row = {**policy.details, "frame": frame, "timestamp": timestamp if type(timestamp) is int else None,
+                   "pose": actual, "requested_pose": pose,
                    "goal_distance_m": last_distance, "pose_error_m": distance(actual, pose),
                    "yaw_error_deg": math.degrees(yaw_error(actual[3], pose[3])),
                    "action": action, "action_log_probs": logits, "collision_reported": collided,
@@ -324,9 +331,14 @@ def rollout(simulator, policy, recorder, trace, start, goal, instruction, cli):
                    "rgb_sha256": hashlib.sha256(rgb.tobytes()).hexdigest(),
                    "rgb_shape": list(rgb.shape), "action_requested": reason is None}
             try:
-                recorder.write(rgb, row)
+                if recorder is not None:
+                    recorder.write(rgb, row)
             except Exception as exc:
                 video_error = f"{type(exc).__name__}: {exc}"
+            # 编码也计入墙钟预算；已过期的候选动作不能再发给模拟器。
+            if reason is None and time.monotonic() - began >= cli.timeout:
+                reason = row["termination"] = "time_budget"
+                row["action_requested"] = False
             row["video_error"] = video_error or getattr(recorder, "video_error", None)
             trace.write(json.dumps(row) + "\n")
             trace.flush()
@@ -341,7 +353,8 @@ def rollout(simulator, policy, recorder, trace, start, goal, instruction, cli):
         reason, error = "error", f"{type(exc).__name__}: {exc}"
     finally:
         try:
-            recorder.close()
+            if recorder is not None:
+                recorder.close()
         except Exception as exc:
             video_error = f"{video_error or ''}; finalize: {type(exc).__name__}: {exc}"
     return {**policy.details, "termination": reason, "error": error, "executed_actions": steps, "frames": frame,
@@ -384,7 +397,8 @@ def sequence_parity(policy, episode):
 
 
 def run(cli):
-    require(cli.limit > 0 and cli.max_steps > 0 and cli.max_distance > 0 and cli.timeout > 0, "预算必须为正")
+    require(all(math.isfinite(v) and v > 0 for v in
+                (cli.limit, cli.max_steps, cli.max_distance, cli.timeout)), "预算必须为有限正数")
     if cli.policy == "blind_forward":
         require(cli.checkpoint is None and cli.airvln_root is None, "盲基线不使用 checkpoint 或 AirVLN 模型")
         require(cli.language == "correct", "盲基线不消费语言，不适用 swap/zero")
@@ -406,6 +420,7 @@ def run(cli):
                 "action_schema": ACTION_SCHEMA,
                 "input_whitelist": policy.input_whitelist, "language": cli.language, "record_video": cli.record_video,
                 "max_steps": cli.max_steps, "max_distance_m": cli.max_distance, "timeout_s": cli.timeout,
+                "timeout_semantics": "wall clock checked before inference and motion dispatch; STOP must be predicted before deadline; final recording does not revoke timely termination",
                 "camera": cli.camera, "vehicle": cli.vehicle, "port": cli.port,
                 "pose_feedback_gate": {"xyz_tolerance_m": 0.2, "yaw_tolerance_deg": 1,
                                        "timestamp": "strictly increasing after each executed action"},
@@ -415,8 +430,9 @@ def run(cli):
                            "This 16-route subset matches greedy grouping of up to 3 raw forward actions into 1/8/9, retaining each group's final raw pre-action frame. This observed 150-frame pattern does not verify official compression intent; native macro execution from retained poses is not raw-action replay. Manifest and labels remain frozen for protocol-limited comparison.",
                            "Video has one frame per observation, fixed 2fps; no interpolation or synthetic frames"]}
     (cli.out / "contract.json").write_text(json.dumps(contract, indent=2) + "\n")
-    simulator, results, cleanup_error = Simulator(cli), [], None
+    simulator, results, cleanup_error, run_error = None, [], None, None
     try:
+        simulator = Simulator(cli)
         for i, ep in enumerate(episodes[:cli.limit]):
             directory = cli.out / f"episode_{i:03d}"
             directory.mkdir()
@@ -424,27 +440,36 @@ def run(cli):
             start = list(original["pos"][0][:3]) + [original["yaw"][0]]
             goal = list(original["pos"][-1][:3])
             supplied = episodes[(i + 1) % len(episodes)]["instruction"] if cli.language == "swap" else ep["instruction"]
-            recorder = Recorder(directory, ep["instruction"], supplied, cli.record_video)
+            recorder, recorder_error = None, None
+            try:
+                recorder = Recorder(directory, ep["instruction"], supplied, cli.record_video)
+            except Exception as exc:
+                recorder_error = f"{type(exc).__name__}: {exc}"
             with (directory / "trace.jsonl").open("x") as trace:
                 result = rollout(simulator, policy, recorder, trace, start, goal, supplied, cli)
+            result["video_error"] = recorder_error or result["video_error"]
             result.update(route_id=ep["route_id"], instruction=ep["instruction"], supplied_instruction=supplied,
                           start=start, goal_for_evaluation_only=goal, output=str(directory), protocol=PROTOCOL)
             (directory / "result.json").write_text(json.dumps(result, indent=2) + "\n")
             results.append(result)
             print(json.dumps(result), flush=True)
+    except Exception as exc:
+        run_error = f"{type(exc).__name__}: {exc}"
     finally:
         try:
-            simulator.close()
+            if simulator is not None:
+                simulator.close()
         except Exception as exc:
             cleanup_error = f"{type(exc).__name__}: {exc}"
     summary = {**policy.details, "protocol": PROTOCOL, "checkpoint_sha256": policy.checkpoint_sha256, "episodes": results,
                "errors": sum(r["error"] is not None for r in results),
                "protocol_errors": sum(r["termination"] in ("pose_application_error", "stale_rgb_timestamp")
                                       for r in results),
-               "video_errors": sum(r["video_error"] is not None for r in results), "cleanup_error": cleanup_error,
+               "video_errors": sum(r["video_error"] is not None for r in results),
+               "cleanup_error": cleanup_error, "run_error": run_error,
                "note": "Closed-loop rendered feedback diagnosis; not physical flight or official benchmark"}
     (cli.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n")
-    return 1 if summary["errors"] or summary["protocol_errors"] or summary["video_errors"] or cleanup_error else 0
+    return 1 if summary["errors"] or summary["protocol_errors"] or summary["video_errors"] or cleanup_error or run_error else 0
 
 
 def parser():

@@ -1,13 +1,14 @@
 // 第 7 条：训练进程 CUDA 阻塞同步开关（--cuda-blocking-sync / UAVRGB_CUDA_BLOCKING_SYNC=1，默认关）。
 //
 // 验证要点：
-//   1) 默认关闭时，CUDA 采用自旋等待 GPU，训练子进程 (utime+stime)/wall 显著占核；
-//   2) 开启 --cuda-blocking-sync 或 UAVRGB_CUDA_BLOCKING_SYNC=1 后，(utime+stime)/wall 降至默认值的 1/4 以下，
-//      且产出的 ckpt.bin 与默认模式逐字节完全一致（阻塞等待不改变任何浮点计算与参数更新）；
+//   1) 在独立子进程检查实际 CUDA schedule flags，确认已有 helper 开启阻塞等待；
+//   2) CLI / ENV 开关训练后的 ckpt.bin 与默认模式逐字节一致；
+//      全进程 CPU 占用含上下文初始化和 I/O，只报告，不作跨机器性能门禁；
 //   3) UAVRGB_CUDA_BLOCKING_SYNC 设为 "0" 等同关闭；设为非法字符串（如 "yes"）在入口 rc=2 拒绝。
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <cuda_runtime.h>
 
 #include <chrono>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include <vector>
 
 #include "synthetic_dataset.hpp"
+#include "uavrgb/trainer.hpp"
 
 namespace fs = std::filesystem;
 
@@ -32,6 +34,29 @@ void check(bool ok, const std::string& msg) {
     std::cerr << "FAIL: " << msg << "\n";
     ++g_fail;
   }
+}
+
+bool blocking_flag_is_applied() {
+  // 父进程不建 CUDA 上下文，避免影响后续 exec 的默认模式训练。
+  const pid_t pid = fork();
+  if (pid == 0) {
+    try {
+      uavrgb::enable_cuda_blocking_sync();
+      unsigned flags = 0;
+      const cudaError_t status = cudaGetDeviceFlags(&flags);
+      const bool ok = status == cudaSuccess &&
+                      (flags & cudaDeviceScheduleMask) == cudaDeviceScheduleBlockingSync;
+      std::fprintf(stderr, "CUDA schedule flags=%u status=%s blocking=%d\n",
+                   flags, cudaGetErrorString(status), ok);
+      _exit(ok ? 0 : 1);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "CUDA blocking flag probe failed: %s\n", e.what());
+      _exit(1);
+    }
+  }
+  int status = 0;
+  return pid > 0 && waitpid(pid, &status, 0) == pid &&
+         WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 struct ProcStats {
@@ -92,12 +117,13 @@ int main(int argc, char** argv) {
     return 2;
   }
   const std::string exe = argv[1];
+  check(blocking_flag_is_applied(), "enable_cuda_blocking_sync 必须设置实际 CUDA BlockingSync 标志");
   const std::string root = (fs::temp_directory_path() /
                             ("uavrgb_test_bsync_" + std::to_string(std::random_device{}())))
                                .string();
   fs::create_directories(root);
 
-  // 128 train + 16 val（120x160，batch=128）：每轮 1 个重 GPU 步，跑 12 轮使 GPU 同步等待占主体。
+  // 128 train + 16 val（120x160，batch=128），固定 12 轮比较数值并报告进程资源占用。
   const auto sd = uavrgb_test::write_synthetic_uavr(root + "/ds.uavr", 144, 120, 160, 128, 23);
   auto base_args = [&](const std::string& out_dir) {
     return std::vector<std::string>{"--data", sd.path,  "--epochs", "12",  "--batch", "128",
@@ -125,14 +151,7 @@ int main(int argc, char** argv) {
 
   check(off.rc == 0 && cli.rc == 0 && env1.rc == 0 && env0.rc == 0,
         "off / --cuda-blocking-sync / ENV=1 / ENV=0 四次训练均应 rc=0");
-  check(off.cpu_cores() > 0.4, "默认模式应体现 GPU 自旋占核（实测 cores=" +
-                                   std::to_string(off.cpu_cores()) + "）");
-  check(cli.rc == 0 && cli.cpu_cores() < 0.35 * off.cpu_cores(),
-        "--cuda-blocking-sync 应显著降低 CPU 核占用（cli=" + std::to_string(cli.cpu_cores()) +
-            " vs off=" + std::to_string(off.cpu_cores()) + "）");
-  check(env1.rc == 0 && env1.cpu_cores() < 0.35 * off.cpu_cores(),
-        "UAVRGB_CUDA_BLOCKING_SYNC=1 应显著降低 CPU 核占用（env1=" +
-            std::to_string(env1.cpu_cores()) + " vs off=" + std::to_string(off.cpu_cores()) + "）");
+  std::cout << "CPU cores 为全进程诊断，包含 CUDA 初始化和 I/O；不设固定比例门槛\n";
 
   // 2) 数值确定性：阻塞同步不改任何 GPU 计算，ckpt.bin 与默认模式逐字节相等。
   const std::string ck_off = slurp(root + "/off/ckpt.bin");

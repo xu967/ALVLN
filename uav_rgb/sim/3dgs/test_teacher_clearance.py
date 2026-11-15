@@ -244,6 +244,28 @@ class TestRayIsUnchanged(unittest.TestCase):
 
 # ------------------------------------------------------------------ swept：构造与版本
 class TestSweptConstruction(unittest.TestCase):
+    def test_nonfinite_pose_cannot_request_stop(self):
+        for field in ("x", "y", "z", "yaw"):
+            for value in (float("nan"), float("inf"), -float("inf")):
+                with self.subTest(field=field, value=value):
+                    teacher = mk(BoxWorld(), wp={"x": 0.0, "y": 0.0})
+                    state = State(0, 0, 0, vx=0, vy=0)
+                    setattr(state, field, value)
+                    with self.assertRaisesRegex(ValueError, "有限"):
+                        teacher(None, None, state)
+                    self.assertFalse(teacher.stop_requested)
+
+    def test_swept_rejects_nonfinite_velocity_before_sweep(self):
+        for field in ("vx", "vy"):
+            for value in (float("nan"), float("inf"), -float("inf")):
+                with self.subTest(field=field, value=value):
+                    teacher = mk(BoxWorld())
+                    state = State(0, 0, 0, vx=0, vy=0)
+                    setattr(state, field, value)
+                    with self.assertRaisesRegex(ValueError, "有限"):
+                        teacher(None, None, state)
+                    self.assertFalse(teacher.stop_requested)
+
     def test_version_is_v4(self):
         self.assertEqual(planner.TEACHER_VERSION_SWEPT, "uavrgb.teacher_occ.v4")
         t = mk(BoxWorld())

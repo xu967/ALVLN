@@ -221,6 +221,39 @@ class TestCfSitlDynamics(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.d.step(dyn.FORWARD_SLOW, 0.5)
 
+    def test_nonfinite_telemetry_rejected_before_mutating_state(self):
+        self.d.reset(-14.0, 0.0, 0.0)
+        state = self.d._call({"cmd": "state"})["state"]
+        before = self.d._state()
+        for field in ("pos", "vel", "quat", "t_s", "exec_state"):
+            for value in (float("nan"), float("inf"), -float("inf")):
+                with self.subTest(field=field, value=value):
+                    broken = json.loads(json.dumps(state))
+                    if field in ("t_s", "exec_state"):
+                        broken[field] = value
+                    else:
+                        broken[field][0] = value
+                    with self.assertRaisesRegex(RuntimeError, "非有限"):
+                        self.d._absorb(broken)
+                    self.assertEqual(self.d._state(), before)
+
+    def test_invalid_takeoff_response_keeps_previous_clock(self):
+        self.d.reset(-14.0, 0.0, 0.0)
+        state = self.d._call({"cmd": "state"})["state"]
+        before = self.d._state(), self.d.t0, self.d.takeoff_s
+        for field in ("t_s", "vel"):
+            with self.subTest(field=field):
+                broken = json.loads(json.dumps(state))
+                broken["t_s"] = state["t_s"] + 1.0
+                if field == "t_s":
+                    broken[field] = float("nan")
+                else:
+                    broken[field][0] = float("nan")
+                with mock.patch.object(self.d, "_call", side_effect=[{}, {"ready": True, "state": broken}]):
+                    with self.assertRaisesRegex(RuntimeError, "非有限"):
+                        self.d.reset(-14.0, 0.0, 0.0)
+                self.assertEqual((self.d._state(), self.d.t0, self.d.takeoff_s), before)
+
     def test_missing_proc_is_file_not_found(self):
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(FileNotFoundError):
