@@ -86,12 +86,21 @@ __global__ void adam_step_kernel(float* __restrict__ p, const float* __restrict_
   p[i] -= lr * ((mi / bc1) / (sqrtf(vi / bc2) + eps) + wd * p[i]);
 }
 
-// 梯度裁剪归约：double atomicAdd 累加平方和（与 CPU 的 double 累加对拍）。
+// 梯度裁剪确定性归约：单 block 网格跨步累加 + 共享内存按固定顺序折半求和，避免跨 block atomicAdd 乱序抖动。
 __global__ void sumsq_kernel(const float* __restrict__ x, double* __restrict__ out, int total) {
-  const int i = blockIdx.x * blockDim.x + threadIdx.x;
-  if (i >= total) return;
-  const double v = x[i];
-  atomicAdd(out, v * v);
+  __shared__ double buf[kThreads];
+  double acc = 0.0;
+  for (int i = threadIdx.x; i < total; i += blockDim.x) {
+    const double v = x[i];
+    acc += v * v;
+  }
+  buf[threadIdx.x] = acc;
+  __syncthreads();
+  for (int stride = kThreads / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) buf[threadIdx.x] += buf[threadIdx.x + stride];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) *out += buf[0];
 }
 
 // 梯度裁剪缩放：x *= coef。
@@ -175,7 +184,7 @@ void adam_step(float* p, const float* g, float* m, float* v, float lr, float b1,
 
 void sumsq(const float* x, double* accum, int total) {
   if (total == 0) return;
-  sumsq_kernel<<<blocks_for(total), kThreads>>>(x, accum, total);
+  sumsq_kernel<<<1, kThreads>>>(x, accum, total);
   launched("sumsq_kernel");
 }
 

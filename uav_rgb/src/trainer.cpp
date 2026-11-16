@@ -267,6 +267,12 @@ std::string carry_resume_best(const std::string& resume_path, const std::string&
   namespace fs = std::filesystem;
   if (!(state.best_macro_f1 >= 0.0f)) return {};  // 旧格式/从未评估过，无 best 可带
   const fs::path rp(resume_path);
+  const auto fname = rp.filename().string();
+  if (fname.rfind("ckpt_ep", 0) == 0) {
+    // 从中间轮次快照（ckpt_epNN.bin）分叉续训时，不能把源目录未来轮次的 ckpt_best.bin 偷渡过来。
+    state.best_macro_f1 = -1.0f;
+    return {};
+  }
   const fs::path src_dir = rp.has_parent_path() ? rp.parent_path() : fs::path(".");
   const fs::path src_best = src_dir / "ckpt_best.bin";
   const fs::path dst_best = fs::path(out_dir) / "ckpt_best.bin";
@@ -302,7 +308,10 @@ std::string carry_resume_best(const std::string& resume_path, const std::string&
     throw std::runtime_error("resume: 目标目录已有 " + dst_best.string() +
                              "；跨目录续训不会覆盖它");
   }
-  fs::copy_file(src_best, dst_best);
+  // 同步当前 run 的训练契约后再落盘，避免 --allow-resume-mismatch 跨目录续训时旧 contract 阻塞 --eval-only。
+  s.contract = state.contract;
+  s.contract_present = state.contract_present;
+  save_checkpoint(dst_best.string(), m, s);
   return warning;
 }
 
