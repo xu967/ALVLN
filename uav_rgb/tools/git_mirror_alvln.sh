@@ -28,6 +28,10 @@ if [[ -z "$last" ]]; then
 fi
 # --first-parent：合并进来的分支按一个 ALVLN 提交（合并提交的快照）镜像；逐个镜像分支内部提交会让
 # 每个快照在「分支基点」和「main 当前」之间来回跳，GitHub 上的 diff 没法看
+git -C "$SRC" merge-base --is-ancestor "$last" HEAD || {
+  echo "拒绝镜像：上次镜像提交 $last 不是当前 uav_rgb HEAD 的祖先（切错分支会把 ALVLN 回退覆盖）" >&2
+  exit 1
+}
 mapfile -t commits < <(git -C "$SRC" rev-list --reverse --first-parent "${last}..HEAD")
 [[ ${#commits[@]} -gt 0 ]] || { echo "没有新提交需要镜像（$last 已是 HEAD）"; exit 0; }
 
