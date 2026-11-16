@@ -1,20 +1,38 @@
 #!/usr/bin/env python3
-"""真实 OpenFly 小子集离线 BC：适配 AirVLN seq2seq/CMA，非原版榜单成绩。"""
+"""真实 OpenFly 子集离线 BC：适配 AirVLN seq2seq/CMA（支持 v1 基线契约与 v2 语言/STOP 增强契约）。
+
+运行方式:
+  /root/rivermind-data/uav_rgb/envs/airvln/bin/python tools/train_openfly_subset.py \
+      --manifest /root/rivermind-data/uav_rgb/downloads/OpenFly/subsets/six_scene_causal_bc_v1/manifest.json \
+      --airvln-root /root/rivermind-data/uav_rgb/airvln-runtime-ubuntu/AirVLN \
+      --out /root/rivermind-data/uav_rgb/exp-openfly-v2-20261116/training/v2_cma_rgb_language \
+      --policy-type cma --training-mode rgb_language --epochs 15 --seed 20261116 \
+      --imagenet-norm --use-bert --inflection-weight auto --stop-weight 3.0 \
+      --progress-monitor --use-prev-action --prev-action-dropout 0.2
+"""
 import argparse
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import random
 import sys
 
+# ========================= 顶部集中配置区 =========================
 SCHEMA = "uavrgb.openfly_subset.v1"
 CAUSAL_SCHEMA = "uavrgb.openfly_subset.causal.v2"
+CONTRACT_V1 = "uavrgb.openfly_external_bc.v1"
+CONTRACT_V2 = "uavrgb.openfly_external_bc.v2"
 INPUTS = ["instruction", "rgb_features"]
 ACTION_SCHEMA = "openfly_0_9_annotation_indexed_offline_bc"
 CAUSAL_ACTION_SCHEMA = "openfly_0_9_causal_group_start_macro_bc"
 TRAINING_MODES = ("rgb_language", "rgb_only")
 POLICY_TYPES = ("seq2seq", "cma")
+DEFAULT_HF_HOME = Path(os.environ.get("HF_HOME", "/root/rivermind-data/uav_rgb/hf-cache"))
+IMAGENET_MEAN = (0.485, 0.456, 0.406)  # TorchVision ResNet50 预训练通道均值
+IMAGENET_STD = (0.229, 0.224, 0.225)   # TorchVision ResNet50 预训练通道标准差
+# =================================================================
 
 
 def sha256(path):
@@ -41,20 +59,79 @@ def rgb_feature_shape(policy_type):
     return (2048, 4, 4) if policy_type == "cma" else (2048, 1, 1)
 
 
-def build_trainer(observation_space, action_space, policy_type="seq2seq"):
-    """训练、重载和在线评估共用；CMA 保留空间注意力，但禁止前一动作输入。"""
+def preprocess_rgb_uint8(arrays_u8, device, imagenet_norm=False):
+    """uint8 [B, H, W, 3] -> float32 [B, 3, H, W]；v2 开启 ImageNet mean/std 归一化。"""
+    import torch
+    x = torch.as_tensor(arrays_u8, device=device).permute(0, 3, 1, 2).float() / 255.0
+    if imagenet_norm:
+        mean = torch.tensor(IMAGENET_MEAN, dtype=x.dtype, device=device).view(1, 3, 1, 1)
+        std = torch.tensor(IMAGENET_STD, dtype=x.dtype, device=device).view(1, 3, 1, 1)
+        x = (x - mean) / std
+    return x
+
+
+def load_bert_tokenizer(hf_home=DEFAULT_HF_HOME):
+    os.environ.setdefault("HF_HOME", str(hf_home))
+    os.environ.setdefault("TRANSFORMERS_CACHE", str(Path(hf_home) / "hub"))
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    from transformers import BertTokenizer
+    return BertTokenizer.from_pretrained("bert-base-uncased", local_files_only=True)
+
+
+def encode_instruction_text(text, tokenizer, use_bert=False, max_len=300):
+    require(isinstance(text, str) and text.strip(), "指令为空")
+    if not use_bert:
+        words = tokenizer.split_sentence(text)
+        require(0 < len(words) <= max_len, "指令为空或超长；禁止静默截断")
+        tokens = tokenizer.encode_sentence(text)
+        vocab_map = getattr(tokenizer, "word_to_index", None)
+        oov = sum(w not in vocab_map for w in words) if vocab_map is not None else 0
+        return tokens, len(words), oov
+    raw_ids = tokenizer.encode(text, add_special_tokens=True, truncation=False)
+    require(2 <= len(raw_ids) <= max_len, f"BERT token 长度 {len(raw_ids)} 超出 [2, {max_len}]；禁止静默截断")
+    unk_id = tokenizer.unk_token_id
+    oov = sum(1 for tid in raw_ids if tid == unk_id)
+    padded = raw_ids + [int(tokenizer.pad_token_id)] * (max_len - len(raw_ids))
+    return padded, len(raw_ids), oov
+
+
+def build_trainer(observation_space, action_space, policy_type="seq2seq",
+                  use_prev_action=False, prev_action_dropout=0.0,
+                  progress_monitor=False, use_bert=False):
+    """训练、重载和在线评估共用；v1 禁用前一动作，v2 可选启用因果 prev_action + 训练期整步置零 dropout。"""
     import torch
     from src.common.param import args
     from Model.il_trainer import VLNCETrainer
+    require(0.0 <= float(prev_action_dropout) < 1.0, "prev_action_dropout 必须在 [0, 1) 内")
     rgb_feature_shape(policy_type)
     args.policy_type = policy_type
-    args.SEQ2SEQ_use_prev_action = False
-    args.ablate_depth, args.PROGRESS_MONITOR_use = True, False
+    args.SEQ2SEQ_use_prev_action = bool(use_prev_action)
+    args.ablate_depth = True
+    args.PROGRESS_MONITOR_use = bool(progress_monitor)
+    args.tokenizer_use_bert = bool(use_bert)
+    if use_bert:
+        os.environ.setdefault("HF_HOME", str(DEFAULT_HF_HOME))
+        os.environ.setdefault("TRANSFORMERS_CACHE", str(Path(DEFAULT_HF_HOME) / "hub"))
+        os.environ.setdefault("HF_HUB_OFFLINE", "1")
+        os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     trainer = VLNCETrainer(False, observation_space, action_space)
-    if policy_type == "cma":
-        # 官方 CMA 不读取 SEQ2SEQ 开关；将整个嵌入清零，连动作索引也不能泄漏。
-        trainer.policy.net.prev_action_embedding.register_forward_hook(
-            lambda module, inputs, output: torch.zeros_like(output))
+    if not use_prev_action:
+        if policy_type == "cma":
+            # 官方 CMA 不读取 SEQ2SEQ 开关；将整个嵌入清零，连动作索引也不能泄漏。
+            trainer.policy.net.prev_action_embedding.register_forward_hook(
+                lambda module, inputs, output: torch.zeros_like(output))
+    elif prev_action_dropout > 0.0 and hasattr(trainer.policy.net, "prev_action_embedding"):
+        drop_p = float(prev_action_dropout)
+
+        def _drop_prev_hook(module, inputs, output):
+            if not module.training:
+                return output
+            keep = (torch.rand((output.shape[0],) + (1,) * (output.ndim - 1),
+                               device=output.device) >= drop_p).to(output.dtype)
+            return output * keep
+
+        trainer.policy.net.prev_action_embedding.register_forward_hook(_drop_prev_hook)
     return trainer
 
 
@@ -102,11 +179,14 @@ def validate_causal_episode(ep, original):
             x, y = x + step * math.cos(yaw), y + step * math.sin(yaw)
         elif token in (2, 3):
             yaw += math.radians(30 if token == 2 else -30)
+        elif token in (4, 5):
+            z += 3 if token == 4 else -3
         return [x, y, z, yaw]
 
-    # 当前已逐组验证的 medium_short 子集只有水平前进、转向和 STOP。
+    # 已逐组验证的原语：水平前进 3m、左右转向 30°、升降 ±3m（Z 向上为正）与末尾 STOP。
     primitive = {("go straight", 3): 1, ("turn left", 30): 2,
-                 ("turn right", 30): 3, ("stop", 0): 0}
+                 ("turn right", 30): 3, ("go up", 3): 4,
+                 ("go down", 3): 5, ("stop", 0): 0}
     poses, tokens = [], []
     require(raw, "raw pose 无动作")
     for i, action in enumerate(raw):
@@ -215,15 +295,47 @@ def load_manifest(path):
     return manifest
 
 
-def episode_tensors(ep, features, tokens, device):
+def resolve_inflection_coef(spec, train_episodes):
+    if spec is None or str(spec) == "1" or str(spec) == "1.0":
+        return 1.0
+    if str(spec) == "auto":
+        def modal_family(a):
+            return 1 if a in (1, 8, 9) else a
+        inf_steps, total_steps = 0, 0
+        for ep in train_episodes:
+            acts = ep["actions"]
+            for t, a in enumerate(acts):
+                total_steps += 1
+                if t == 0 or modal_family(a) != modal_family(acts[t - 1]):
+                    inf_steps += 1
+        require(inf_steps > 0, "训练集无拐点样本")
+        return max(1.5, float(total_steps - inf_steps) / float(inf_steps))
+    val = float(spec)
+    require(math.isfinite(val) and val > 0.0, "inflection_weight 必须为有限正数或 auto")
+    return val
+
+
+def episode_tensors(ep, features, tokens, device, use_prev_action=False,
+                    inflection_coef=1.0, stop_weight=1.0):
     import torch
     require(features.shape[0] == len(ep["actions"]), "特征与动作不等长")
     target = torch.tensor(ep["actions"], dtype=torch.long, device=device).view(-1, 1)
     prev = torch.zeros_like(target)
+    if use_prev_action and len(target) > 1:
+        prev[1:, 0] = target[:-1, 0]
     masks = torch.ones_like(target, dtype=torch.uint8)
     masks[0] = 0
+    weights = torch.ones_like(target, dtype=torch.float32)
+    if inflection_coef != 1.0:
+        for t in range(len(ep["actions"])):
+            if t == 0 or ep["actions"][t] != ep["actions"][t - 1]:
+                weights[t, 0] = float(inflection_coef)
+    if stop_weight != 1.0:
+        for t, a in enumerate(ep["actions"]):
+            if a == 0:
+                weights[t, 0] *= float(stop_weight)
     text = torch.as_tensor(tokens, dtype=torch.long, device=device).view(1, -1).repeat(len(target), 1)
-    return {"instruction": text, "rgb_features": features.to(device)}, prev, masks, target, torch.ones_like(target, dtype=torch.float32)
+    return {"instruction": text, "rgb_features": features.to(device)}, prev, masks, target, weights
 
 
 def logits_for(trainer, batch):
@@ -242,7 +354,7 @@ def evaluate(trainer, batches, zero_language=False, permute=False):
     hook = trainer.policy.net.instruction_encoder.register_forward_hook(
         lambda module, inputs, output: torch.zeros_like(output)) if zero_language else None
     confusion = torch.zeros(10, 10, dtype=torch.long)
-    total_loss, samples = 0.0, 0
+    total_loss, samples, two_cycle_osc = 0.0, 0, 0
     try:
         with torch.no_grad():
             for i, batch in enumerate(batches):
@@ -252,17 +364,54 @@ def evaluate(trainer, batches, zero_language=False, permute=False):
                     obs["instruction"] = donor.unsqueeze(0).repeat(len(batch[3]), 1)
                     batch = (obs, *batch[1:])
                 logits, target = logits_for(trainer, batch), batch[3].view(-1)
+                preds = logits.argmax(1)
+                for t in range(1, len(preds)):
+                    pair = (int(preds[t - 1].item()), int(preds[t].item()))
+                    if pair in ((2, 3), (3, 2)):
+                        two_cycle_osc += 1
                 total_loss += float(torch.nn.functional.cross_entropy(logits, target, reduction="sum"))
                 samples += len(target)
-                confusion += torch.bincount((target * 10 + logits.argmax(1)).cpu(), minlength=100).reshape(10, 10)
+                confusion += torch.bincount((target * 10 + preds).cpu(), minlength=100).reshape(10, 10)
     finally:
         if hook is not None:
             hook.remove()
     require(samples > 0 and math.isfinite(total_loss), "评估没有有效样本或 loss 非有限")
-    return {"samples": samples, "cross_entropy": total_loss / samples,
-            "accuracy": float(confusion.diag().sum()) / samples,
-            "stop_recall": float(confusion[0, 0]) / int(confusion[0].sum()),
-            "confusion": confusion.tolist()}
+    pred_stop = int(confusion[:, 0].sum())
+    gt_stop = int(confusion[0].sum())
+    tp_stop = int(confusion[0, 0])
+    stop_prec = float(tp_stop) / pred_stop if pred_stop > 0 else 0.0
+    stop_rec = float(tp_stop) / gt_stop if gt_stop > 0 else 0.0
+    f1s = []
+    for c in range(10):
+        tp = int(confusion[c, c])
+        fp = int(confusion[:, c].sum()) - tp
+        fn = int(confusion[c, :].sum()) - tp
+        if tp + fp + fn > 0:
+            f1s.append(2.0 * tp / (2.0 * tp + fp + fn))
+    out = {"samples": samples, "cross_entropy": total_loss / samples,
+           "accuracy": float(confusion.diag().sum()) / samples,
+           "macro_f1_present": sum(f1s) / len(f1s) if f1s else 0.0,
+           "stop_precision": stop_prec,
+           "stop_recall": stop_rec,
+           "stop_f1": (2.0 * stop_prec * stop_rec / (stop_prec + stop_rec)) if (stop_prec + stop_rec) > 0 else 0.0,
+           "two_cycle_turn_oscillations": two_cycle_osc,
+           "confusion": confusion.tolist()}
+    return out
+
+
+def _is_v2_requested(cli):
+    if getattr(cli, "contract_version", "auto") == "v2":
+        return True
+    if getattr(cli, "contract_version", "auto") == "v1":
+        return False
+    return any([
+        bool(getattr(cli, "imagenet_norm", False)),
+        bool(getattr(cli, "use_bert", False)),
+        bool(getattr(cli, "use_prev_action", False)),
+        bool(getattr(cli, "progress_monitor", False)),
+        str(getattr(cli, "inflection_weight", "1.0")) not in ("1", "1.0"),
+        float(getattr(cli, "stop_weight", 1.0)) != 1.0,
+    ])
 
 
 def run(cli):
@@ -271,6 +420,20 @@ def run(cli):
     feature_shape = rgb_feature_shape(policy_type)
     manifest = load_manifest(cli.manifest)
     require(not cli.out.exists(), "输出目录已存在，拒绝覆盖")
+    use_v2 = _is_v2_requested(cli)
+    imagenet_norm = bool(getattr(cli, "imagenet_norm", False))
+    use_bert = bool(getattr(cli, "use_bert", False))
+    use_prev_action = bool(getattr(cli, "use_prev_action", False))
+    prev_dropout = float(getattr(cli, "prev_action_dropout", 0.0)) if use_prev_action else 0.0
+    progress_monitor = bool(getattr(cli, "progress_monitor", False))
+    stop_weight = float(getattr(cli, "stop_weight", 1.0))
+    require(math.isfinite(stop_weight) and stop_weight > 0.0, "stop_weight 必须为有限正数")
+    train_eps = [ep for ep in manifest["episodes"] if ep["split"] == "train"]
+    inflection_coef = resolve_inflection_coef(getattr(cli, "inflection_weight", "1.0"), train_eps)
+    if not use_v2:
+        require(not any([imagenet_norm, use_bert, use_prev_action, progress_monitor])
+                and inflection_coef == 1.0 and stop_weight == 1.0, "v1 契约不允许开启 v2 特性开关")
+
     import numpy as np
     import torch
     from PIL import Image
@@ -291,11 +454,14 @@ def run(cli):
         sys.argv = saved_argv
     args.DistributedDataParallel = False
     args.logger_file_name = str(cli.out / "airvln.log")
-    args.ablate_depth, args.PROGRESS_MONITOR_use = True, False
+    args.ablate_depth = True
+    args.PROGRESS_MONITOR_use = progress_monitor
     mode = getattr(cli, "training_mode", "rgb_language")
     configure_training_mode(args, mode)
-    args.ablate_rgb, args.tokenizer_use_bert = False, False
-    args.SEQ2SEQ_use_prev_action, args.vocab_size = False, len(vocab)
+    args.ablate_rgb = False
+    args.tokenizer_use_bert = use_bert
+    args.SEQ2SEQ_use_prev_action = use_prev_action
+    args.vocab_size = len(vocab)
     from src.vlnce_src.util import Tokenizer
     from Model.aux_losses import AuxLosses
     random.seed(cli.seed)
@@ -304,19 +470,19 @@ def run(cli):
     torch.cuda.manual_seed_all(cli.seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    tokenizer = Tokenizer(vocab, encoding_length=300)
+    tokenizer = load_bert_tokenizer() if use_bert else Tokenizer(vocab, encoding_length=300)
     observation_space = spaces.Dict({"rgb": spaces.Box(0, 255, (224, 224, 3), dtype=np.uint8),
                                      "depth": spaces.Box(0, 1, (256, 256, 1), dtype=np.float32)})
-    trainer = build_trainer(observation_space, spaces.Discrete(10), policy_type)
+    trainer = build_trainer(observation_space, spaces.Discrete(10), policy_type,
+                            use_prev_action=use_prev_action, prev_action_dropout=prev_dropout,
+                            progress_monitor=progress_monitor, use_bert=use_bert)
     trainer.policy.eval()
     initial_state_sha256 = state_sha256(trainer.policy.state_dict())
     batches, oov, word_count = {"train": [], "validation": []}, 0, 0
     for ep in manifest["episodes"]:
-        words = tokenizer.split_sentence(ep["instruction"])
-        require(0 < len(words) <= 300, "指令为空或超长；禁止静默截断")
-        tokens = tokenizer.encode_sentence(ep["instruction"])
-        oov += sum(w not in tokenizer.word_to_index for w in words)
-        word_count += len(words)
+        tokens, n_tok, n_oov = encode_instruction_text(ep["instruction"], tokenizer, use_bert=use_bert)
+        oov += n_oov
+        word_count += n_tok
         features = []
         hook = trainer.policy.net.rgb_encoder.layer_extract.register_forward_hook(
             lambda module, inputs, output: features.append(output.detach().cpu().clone()))
@@ -327,22 +493,38 @@ def run(cli):
                     for path in ep["images"][start:start + 16]:
                         with Image.open(path) as image:
                             arrays.append(np.asarray(image.convert("RGB").resize((224, 224), Image.BILINEAR)).copy())
-                    images = torch.as_tensor(np.stack(arrays), device=trainer.device).permute(0, 3, 1, 2).float() / 255.0
+                    images = preprocess_rgb_uint8(np.stack(arrays), trainer.device, imagenet_norm=imagenet_norm)
                     trainer.policy.net.rgb_encoder.cnn(images)
         finally:
             hook.remove()
         features = torch.cat(features)
         require(tuple(features.shape[1:]) == feature_shape, "RGB 特征形状错误")
-        batches[ep["split"]].append(episode_tensors(ep, features, tokens, trainer.device))
+        is_tr = ep["split"] == "train"
+        batches[ep["split"]].append(episode_tensors(
+            ep, features, tokens, trainer.device,
+            use_prev_action=use_prev_action,
+            inflection_coef=inflection_coef if is_tr else 1.0,
+            stop_weight=stop_weight if is_tr else 1.0,
+        ))
     code_paths = [Path(__file__).resolve(), *sorted((root / "Model").rglob("*.py")),
                   root / "src/common/param.py", root / "src/vlnce_src/util.py"]
-    contract = {"schema": "uavrgb.openfly_external_bc.v1", "action_schema": manifest_action_schema(manifest),
+    prev_impl = ("causal_prev_action_with_step_dropout" if use_prev_action
+                 else ("zero_embedding_output" if policy_type == "cma" else "disabled_by_config"))
+    vis_desc = ("RGB; PIL bilinear 224x224; float32 /255; ImageNet mean/std normalization; frozen ResNet50 eval"
+                if imagenet_norm
+                else "RGB; PIL bilinear 224x224; float32 /255; no ImageNet normalization; frozen ResNet50 eval")
+    contract = {"schema": CONTRACT_V2 if use_v2 else CONTRACT_V1,
+                "action_schema": manifest_action_schema(manifest),
                 "manifest_schema": manifest["schema"],
                 "supervision": manifest.get("supervision", "annotation_indexed_offline_bc"),
                 "training_mode": mode, "initial_state_sha256": initial_state_sha256,
                 "policy_type": policy_type, "rgb_feature_shape": list(feature_shape),
-                "previous_action_implementation": "zero_embedding_output" if policy_type == "cma" else "disabled_by_config",
-                "baseline_variant": f"AirVLN {policy_type}: RGB, no depth, no previous action; adapted 10-action BC",
+                "previous_action_implementation": prev_impl,
+                "baseline_variant": (
+                    f"AirVLN {policy_type} v2: imagenet_norm={imagenet_norm}, bert={use_bert}, "
+                    f"prev_action={use_prev_action}(drop={prev_dropout}), inflect={inflection_coef:.3f}, "
+                    f"stop_w={stop_weight:.2f}, prog_mon={progress_monitor}"
+                    if use_v2 else f"AirVLN {policy_type}: RGB, no depth, no previous action; adapted 10-action BC"),
                 "parameter_count": sum(p.numel() for p in trainer.policy.parameters()),
                 "parameter_counts": {"total": sum(p.numel() for p in trainer.policy.parameters()),
                                      "requires_grad": sum(p.numel() for p in trainer.policy.parameters() if p.requires_grad),
@@ -352,30 +534,52 @@ def run(cli):
                 "input_whitelist": INPUTS, "manifest_sha256": sha256(cli.manifest),
                 "annotation_sha256": manifest["annotation_sha256"], "vocab_sha256": sha256(vocab_path),
                 "code_sha256": {str(p): sha256(p) for p in code_paths}, "seed": cli.seed,
-                "epochs": cli.epochs, "precision": "float32", "previous_action_enabled": False,
+                "epochs": cli.epochs, "precision": "float32", "previous_action_enabled": use_prev_action,
                 "torch_version": torch.__version__, "gpu": torch.cuda.get_device_name(trainer.device),
-                "visual_preprocessing": "RGB; PIL bilinear 224x224; float32 /255; no ImageNet normalization; frozen ResNet50 eval",
-                "language": {"tokens": word_count, "oov": oov, "max_input": 300},
+                "visual_preprocessing": vis_desc,
+                "language": {"tokens": word_count, "oov": oov, "max_input": 300,
+                             **({"encoder": "frozen_bert_base_uncased" if use_bert else "scratch_vocab_embedding"} if use_v2 else {})},
+                **({"v2_config": {"imagenet_norm": imagenet_norm, "use_bert": use_bert,
+                                  "use_prev_action": use_prev_action, "prev_action_dropout": prev_dropout,
+                                  "inflection_weight_coef": inflection_coef, "stop_weight": stop_weight,
+                                  "progress_monitor": progress_monitor}} if use_v2 else {}),
                 "limits": ["causal group-start macro BC; raw pose transitions verified; physical flight unverified"
                            if manifest["schema"] == CAUSAL_SCHEMA
                            else "annotation-indexed offline BC; compressed token dynamics unverified",
                            "internal route validation from official train; no unseen-scene or closed-loop claim"]}
     (cli.out / "contract.json").write_text(json.dumps(contract, indent=2) + "\n")
+    AuxLosses.deactivate()
     before = evaluate(trainer, batches["train"])
-    watched = ["net.instruction_encoder.embedding_layer.weight", "action_distribution.linear.weight"]
+    lang_param = ("net.instruction_encoder.encoder_rnn.weight_ih_l0"
+                  if use_bert else "net.instruction_encoder.embedding_layer.weight")
+    watched = [lang_param, "action_distribution.linear.weight"]
     initial = {k: trainer.policy.state_dict()[k].detach().clone() for k in watched}
-    AuxLosses.activate()
+    if not progress_monitor:
+        AuxLosses.activate()
     trainer.optimizer.zero_grad()
     updates = 0
     with (cli.out / "metrics.jsonl").open("x") as log:
         for epoch in range(cli.epochs):
             trainer.policy.train()
             trainer.policy.net.rgb_encoder.cnn.eval()
+            if use_bert:
+                trainer.policy.net.instruction_encoder.embedding_layer.eval()
             order = list(range(len(batches["train"])))
             random.shuffle(order)
             losses = []
             for i in order:
-                loss, _, _ = trainer._update_agent(*batches["train"][i])
+                batch_i = batches["train"][i]
+                if progress_monitor:
+                    obs_i = dict(batch_i[0])
+                    t_len = len(batch_i[3])
+                    obs_i["progress"] = torch.linspace(0.0, 1.0, steps=t_len, dtype=torch.float32, device=trainer.device)
+                    AuxLosses.activate()
+                    try:
+                        loss, _, _ = trainer._update_agent(obs_i, *batch_i[1:])
+                    finally:
+                        AuxLosses.deactivate()
+                else:
+                    loss, _, _ = trainer._update_agent(*batch_i)
                 require(math.isfinite(loss), "训练 loss 非有限")
                 losses.append(loss)
                 updates += 1
@@ -385,6 +589,7 @@ def run(cli):
             log.write(json.dumps(row) + "\n")
             log.flush()
             print(json.dumps(row), flush=True)
+    AuxLosses.deactivate()
     changes = {k: float((trainer.policy.state_dict()[k] - initial[k]).abs().max()) for k in watched}
     contract["parameter_counts"]["received_gradient"] = sum(p.numel() for p, state in trainer.optimizer.state.items() if state)
     (cli.out / "contract.json").write_text(json.dumps(contract, indent=2) + "\n")
@@ -398,12 +603,15 @@ def run(cli):
     if mode == "rgb_only":
         require(all(d["correct"] == d["zero_language_encoder_output"] == d["cyclic_instruction_swap"]
                     for d in diagnostics.values()), "纯视觉训练模型仍受语言输入影响")
+    trainer.policy.eval()
     with torch.no_grad():
         expected = logits_for(trainer, batches["validation"][0]).cpu()
     checkpoint = cli.out / "model.pt"
     torch.save({"contract": contract, "state_dict": trainer.policy.state_dict(),
                 "optimizer": trainer.optimizer.state_dict(), "updates": updates}, checkpoint)
-    reloaded = build_trainer(observation_space, spaces.Discrete(10), policy_type)
+    reloaded = build_trainer(observation_space, spaces.Discrete(10), policy_type,
+                             use_prev_action=use_prev_action, prev_action_dropout=prev_dropout,
+                             progress_monitor=progress_monitor, use_bert=use_bert)
     saved = torch.load(checkpoint, map_location=reloaded.device)
     require(saved["contract"].get("training_mode", "rgb_language") == mode, "checkpoint 训练模态不匹配")
     require(saved["contract"].get("policy_type", "seq2seq") == policy_type, "checkpoint 策略类型不匹配")
@@ -421,18 +629,30 @@ def run(cli):
     return result
 
 
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--manifest", required=True, type=Path)
+    p.add_argument("--airvln-root", required=True, type=Path)
+    p.add_argument("--out", required=True, type=Path)
+    p.add_argument("--epochs", type=int, default=5)
+    p.add_argument("--seed", type=int, default=20261115)
+    p.add_argument("--policy-type", choices=POLICY_TYPES, default="seq2seq",
+                   help="seq2seq 池化视觉特征 2048x1x1；cma 保留空间视觉特征 2048x4x4 与跨模态注意力")
+    p.add_argument("--training-mode", choices=TRAINING_MODES, default="rgb_language",
+                   help="rgb_only 从头单独训练并始终禁用语言；不是推理时消融")
+    p.add_argument("--contract-version", choices=("auto", "v1", "v2"), default="auto")
+    p.add_argument("--imagenet-norm", action="store_true", help="开启 ResNet50 ImageNet mean/std 归一化")
+    p.add_argument("--use-bert", action="store_true", help="启用冻结 bert-base-uncased InstructionBertEncoder")
+    p.add_argument("--inflection-weight", default="1.0", help="拐点步权重系数（数字或 auto）")
+    p.add_argument("--stop-weight", type=float, default=1.0, help="末尾 STOP 步额外乘性权重")
+    p.add_argument("--progress-monitor", action="store_true", help="训练期启用归一化进度辅助损失")
+    p.add_argument("--use-prev-action", action="store_true", help="启用因果上一动作输入")
+    p.add_argument("--prev-action-dropout", type=float, default=0.2, help="训练期 prev_action 整步置零概率")
+    return p
+
+
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--manifest", required=True, type=Path)
-    parser.add_argument("--airvln-root", required=True, type=Path)
-    parser.add_argument("--out", required=True, type=Path)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--seed", type=int, default=20261115)
-    parser.add_argument("--policy-type", choices=POLICY_TYPES, default="seq2seq",
-                        help="CMA 保留空间 RGB/交叉注意力；禁用 depth 和前一动作，非官方原版配置")
-    parser.add_argument("--training-mode", choices=TRAINING_MODES, default="rgb_language",
-                        help="rgb_only 从头单独训练并始终禁用语言；不是推理时消融")
-    print(json.dumps(run(parser.parse_args())), flush=True)
+    print(json.dumps(run(parser().parse_args())), flush=True)
 
 
 if __name__ == "__main__":

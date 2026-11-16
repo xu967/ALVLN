@@ -693,6 +693,24 @@ class EvaluationTaskTests(unittest.TestCase):
             self.assertEqual(rollout.call_args.args[4:7], ([10, 20, 30, 0], [10, 20, 33], "Climb and stop."))
             self.assertEqual(json.loads((cli.out / "contract.json").read_text())["evaluation_scope"], "official_seen_subset")
 
+    def test_multi_scene_allowlist_accepts_verified_airsim_envs_and_rejects_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, manifest_path, manifest, data, row = self.fixture(Path(tmp))
+            route23 = "env_airsim_23/astar_data/medium_short/seen_route"
+            row["image_path"] = route23
+            Path(data["annotation_source"]).write_text(json.dumps([row]))
+            data["annotation_sha256"] = evaluator.sha256(data["annotation_source"])
+            data["selection"]["env"] = "env_airsim_23"
+            data["tasks"][0]["route_id"] = route23
+            data["tasks"][0]["source_record_sha256"] = evaluator.hashlib.sha256(
+                json.dumps(row, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+            path.write_text(json.dumps(data))
+            self.assertEqual(evaluator.load_evaluation_tasks(path, manifest_path, manifest)["selection"]["env"], "env_airsim_23")
+            data["selection"]["env"] = "env_unverified_99"
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, "不在已验证 AirSim 场景"):
+                evaluator.load_evaluation_tasks(path, manifest_path, manifest)
+
 
 if __name__ == "__main__":
     unittest.main()

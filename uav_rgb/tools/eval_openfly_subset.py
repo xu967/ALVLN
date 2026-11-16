@@ -13,11 +13,19 @@ import textwrap
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from train_openfly_subset import CAUSAL_SCHEMA, INPUTS, load_manifest, manifest_action_schema, require, sha256
+from train_openfly_subset import (
+    CAUSAL_SCHEMA, CONTRACT_V1, CONTRACT_V2, INPUTS,
+    encode_instruction_text, load_bert_tokenizer, load_manifest,
+    manifest_action_schema, preprocess_rgb_uint8, require, sha256,
+)
 
 LEGACY_PROTOCOL = "openfly_eval_pose_step_v1"
 PROTOCOL = "openfly_eval_pose_step_v2"
 KINEMATIC_PROTOCOL = "openfly_eval_kinematic_step_v3"
+ALLOWED_EVAL_ENVS = (
+    "env_airsim_16", "env_airsim_18", "env_airsim_23",
+    "env_airsim_26", "env_airsim_gz", "env_airsim_sh",
+)
 ACTIONS = ("STOP", "FORWARD_3M", "LEFT_30DEG", "RIGHT_30DEG", "UP_3M",
            "DOWN_3M", "LEFT_3M", "RIGHT_3M", "FORWARD_6M", "FORWARD_9M")
 
@@ -94,6 +102,11 @@ class BlindForward:
 
 class Policy:
     input_whitelist = INPUTS
+    imagenet_norm = False
+    use_bert = False
+    use_prev_action = False
+    prev_dropout = 0.0
+    progress_monitor = False
 
     def __init__(self, cli, manifest):
         import numpy as np
@@ -109,13 +122,22 @@ class Policy:
         self.feature_shape = rgb_feature_shape(policy_type)
         require(tuple(contract.get("rgb_feature_shape", (2048, 1, 1))) == self.feature_shape,
                 "checkpoint RGB 特征形状不匹配")
-        if policy_type == "cma":
+        self.use_prev_action = bool(contract.get("previous_action_enabled", False))
+        if policy_type == "cma" and not self.use_prev_action:
             require(contract.get("previous_action_implementation") == "zero_embedding_output",
                     "CMA checkpoint 未禁用前一动作输入")
-        require(contract["schema"] == "uavrgb.openfly_external_bc.v1"
+        schema = contract.get("schema")
+        require(schema in (CONTRACT_V1, CONTRACT_V2)
                 and contract["action_schema"] == manifest_action_schema(manifest), "checkpoint 协议错误")
-        require(contract["input_whitelist"] == INPUTS and contract["previous_action_enabled"] is False
-                and contract["precision"] == "float32", "checkpoint 输入/精度不兼容")
+        v2_cfg = contract.get("v2_config") or {}
+        self.imagenet_norm = bool(v2_cfg.get("imagenet_norm", False))
+        self.use_bert = bool(v2_cfg.get("use_bert", False))
+        self.prev_dropout = float(v2_cfg.get("prev_action_dropout", 0.0))
+        self.progress_monitor = bool(v2_cfg.get("progress_monitor", False))
+        if schema == CONTRACT_V1:
+            require(contract["previous_action_enabled"] is False, "checkpoint 输入/精度不兼容")
+        require(contract["input_whitelist"] == INPUTS and contract["precision"] == "float32",
+                "checkpoint 输入/精度不兼容")
         require(contract["manifest_sha256"] == sha256(cli.manifest)
                 and contract["annotation_sha256"] == manifest["annotation_sha256"], "checkpoint 数据清单不匹配")
         vocab_path = root.parent / "DATA/data/aerialvln/train_vocab.txt"
@@ -134,19 +156,25 @@ class Policy:
             sys.argv = old_argv
         args.DistributedDataParallel = False
         args.logger_file_name = str(cli.out / "airvln.log")
-        args.ablate_depth, args.PROGRESS_MONITOR_use = True, False
+        args.ablate_depth = True
+        args.PROGRESS_MONITOR_use = self.progress_monitor
         args.ablate_instruction = training_mode == "rgb_only" or cli.language == "zero"
-        args.ablate_rgb, args.tokenizer_use_bert = False, False
-        args.SEQ2SEQ_use_prev_action = False
+        args.ablate_rgb = False
+        args.tokenizer_use_bert = self.use_bert
+        args.SEQ2SEQ_use_prev_action = self.use_prev_action
         vocab = vocab_path.read_text().splitlines()
         args.vocab_size = len(vocab)
         from src.vlnce_src.util import Tokenizer
+        from Model.aux_losses import AuxLosses
+        AuxLosses.deactivate()
         observation_space = spaces.Dict({"rgb": spaces.Box(0, 255, (224, 224, 3), dtype=np.uint8),
                                          "depth": spaces.Box(0, 1, (256, 256, 1), dtype=np.float32)})
-        trainer = build_trainer(observation_space, spaces.Discrete(10), policy_type)
+        trainer = build_trainer(observation_space, spaces.Discrete(10), policy_type,
+                                use_prev_action=self.use_prev_action, prev_action_dropout=self.prev_dropout,
+                                progress_monitor=self.progress_monitor, use_bert=self.use_bert)
         trainer.policy.load_state_dict(saved["state_dict"], strict=True)
         self.policy, self.device = trainer.policy.eval(), trainer.device
-        self.tokenizer = Tokenizer(vocab, encoding_length=300)
+        self.tokenizer = load_bert_tokenizer() if self.use_bert else Tokenizer(vocab, encoding_length=300)
         self.contract = contract
         self.checkpoint_sha256 = sha256(cli.checkpoint)
         self.details = {"policy": "student", "policy_type": policy_type,
@@ -155,9 +183,8 @@ class Policy:
 
     def reset(self, instruction):
         torch = self.torch
-        words = self.tokenizer.split_sentence(instruction)
-        require(0 < len(words) <= 300, "指令空白或超长，禁止截断")
-        self.tokens = torch.as_tensor(self.tokenizer.encode_sentence(instruction), device=self.device).view(1, -1)
+        tokens, _, _ = encode_instruction_text(instruction, self.tokenizer, use_bert=self.use_bert)
+        self.tokens = torch.as_tensor(tokens, device=self.device).view(1, -1)
         net = self.policy.net
         self.hidden = torch.zeros(1, net.num_recurrent_layers, net.state_encoder.hidden_size, device=self.device)
         self.previous = torch.zeros(1, 1, dtype=torch.long, device=self.device)
@@ -168,7 +195,7 @@ class Policy:
         from PIL import Image
         torch, captured = self.torch, []
         image = np.asarray(Image.fromarray(rgb).resize((224, 224), Image.BILINEAR)).copy()
-        tensor = torch.as_tensor(image, device=self.device).permute(2, 0, 1).unsqueeze(0).float() / 255.0
+        tensor = preprocess_rgb_uint8(image[None, ...], self.device, imagenet_norm=self.imagenet_norm)
         hook = self.policy.net.rgb_encoder.layer_extract.register_forward_hook(
             lambda module, inputs, output: captured.append(output))
         try:
@@ -401,20 +428,25 @@ def sequence_parity(policy, episode):
     from PIL import Image
     from types import SimpleNamespace
     from train_openfly_subset import episode_tensors, logits_for
-    torch, online, arrays, features = policy.torch, [], [], []
+    torch, online, online_actions, arrays, features = policy.torch, [], [], [], []
     policy.reset(episode["instruction"])
     for path in episode["images"]:
         with Image.open(path) as image:
             rgb = np.asarray(image.convert("RGB")).copy()
-        online.append(policy.step(rgb)[1])
+        act, lgs = policy.step(rgb)
+        online_actions.append(act)
+        online.append(lgs)
         arrays.append(np.asarray(Image.fromarray(rgb).resize((224, 224), Image.BILINEAR)).copy())
     hook = policy.policy.net.rgb_encoder.layer_extract.register_forward_hook(
         lambda module, inputs, output: features.append(output))
     try:
         with torch.no_grad():
-            tensor = torch.as_tensor(np.stack(arrays), device=policy.device).permute(0, 3, 1, 2).float() / 255.0
+            tensor = preprocess_rgb_uint8(
+                np.stack(arrays), policy.device, imagenet_norm=getattr(policy, "imagenet_norm", False))
             policy.policy.net.rgb_encoder.cnn(tensor)
             batch = episode_tensors(episode, features[0], policy.tokens[0], policy.device)
+            if getattr(policy, "use_prev_action", False) and len(online_actions) > 1:
+                batch[1][1:, 0] = torch.tensor(online_actions[:-1], dtype=torch.long, device=policy.device)
             offline = logits_for(SimpleNamespace(policy=policy.policy, device=policy.device), batch).cpu()
     finally:
         hook.remove()
@@ -439,7 +471,7 @@ def load_evaluation_tasks(path, manifest_path, manifest):
     rows = json.loads(source.read_text())
     training_rows = json.loads(Path(manifest["annotation_source"]).read_text())
     environment = data["selection"]["env"]
-    require(environment == "env_airsim_18", "当前评测任务仅验证 env_airsim_18")
+    require(environment in ALLOWED_EVAL_ENVS, f"评测任务场景 {environment!r} 不在已验证 AirSim 场景集合内")
     training_rows = [r for r in training_rows if r["image_path"].split("/")[0] == environment]
     excluded_routes = {r["image_path"] for r in training_rows}
     excluded_routes.update(ep["route_id"] for ep in manifest["episodes"])
@@ -489,6 +521,8 @@ def run(cli):
     manifest = load_manifest(cli.manifest)
     evaluation = load_evaluation_tasks(cli.evaluation_tasks, cli.manifest, manifest) if cli.evaluation_tasks else None
     episodes = evaluation["tasks"] if evaluation else [ep for ep in manifest["episodes"] if ep["split"] == "validation"]
+    if getattr(cli, "scene", None):
+        episodes = [ep for ep in episodes if ep["route_id"].split("/", 1)[0] == cli.scene]
     require(episodes and (cli.language != "swap" or len(episodes) >= 2), "无有效验证路线或无法置换")
     wanted = {ep["route_id"] for ep in episodes}
     source = {}
@@ -586,6 +620,7 @@ def parser():
     p.add_argument("--checkpoint", type=Path)
     p.add_argument("--airvln-root", type=Path)
     p.add_argument("--evaluation-tasks", type=Path, help="独立官方 seen 任务清单；默认使用内部开发集")
+    p.add_argument("--scene", choices=ALLOWED_EVAL_ENVS, default=None, help="多场景验证时仅跑当前打开的 AirSim 场景")
     p.add_argument("--limit", type=int, default=4)
     p.add_argument("--max-steps", type=int, default=30)
     p.add_argument("--max-distance", type=float, default=300)

@@ -346,6 +346,74 @@ class TensorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "至少需要两条"):
             adapter.evaluate(self.trainer, self.batches[:1], permute=True)
 
+    def test_v2_prev_action_weights_imagenet_norm_and_vertical_primitives(self):
+        import numpy as np
+        torch = self.torch
+        ep = {"actions": [9, 9, 4, 5, 0]}
+        feat = torch.zeros(5, 2048, 4, 4)
+        obs, prev, masks, target, weights = adapter.episode_tensors(
+            ep, feat, [1, 2, 0], "cpu", use_prev_action=True, inflection_coef=2.0, stop_weight=3.0)
+        self.assertEqual(prev[:, 0].tolist(), [0, 9, 9, 4, 5])
+        self.assertEqual(masks[:, 0].tolist(), [0, 1, 1, 1, 1])
+        self.assertEqual(weights[:, 0].tolist(), [2.0, 1.0, 2.0, 2.0, 6.0])
+
+        raw_img = np.full((2, 4, 4, 3), 255, dtype=np.uint8)
+        plain = adapter.preprocess_rgb_uint8(raw_img, "cpu", imagenet_norm=False)
+        normed = adapter.preprocess_rgb_uint8(raw_img, "cpu", imagenet_norm=True)
+        self.assertTrue(torch.allclose(plain, torch.ones_like(plain)))
+        self.assertAlmostEqual(float(normed[0, 0, 0, 0]), (1.0 - 0.485) / 0.229, places=5)
+
+        args = SimpleNamespace()
+        def make_trainer(is_eval, obs_space, act_space):
+            net = torch.nn.Module()
+            net.prev_action_embedding = torch.nn.Embedding(11, 8)
+            torch.nn.init.ones_(net.prev_action_embedding.weight)
+            return SimpleNamespace(policy=SimpleNamespace(net=net))
+        modules = {"src.common.param": SimpleNamespace(args=args),
+                   "Model.il_trainer": SimpleNamespace(VLNCETrainer=make_trainer)}
+        with patch.dict(sys.modules, modules):
+            tr = adapter.build_trainer("rgb", "act", "cma", use_prev_action=True, prev_action_dropout=0.5)
+            emb = tr.policy.net.prev_action_embedding
+            emb.eval()
+            out_eval = emb(torch.tensor([1, 2, 3, 4]))
+            self.assertTrue(torch.equal(out_eval, torch.ones(4, 8)))
+            emb.train()
+            torch.manual_seed(0)
+            out_train = emb(torch.zeros(64, dtype=torch.long))
+            row_sums = out_train.abs().sum(dim=1)
+            self.assertTrue(any(v == 0 for v in row_sums.tolist()))
+            self.assertTrue(any(v == 8 for v in row_sums.tolist()))
+
+        # 验证 4/5 升降原语与空间簇无泄漏隔离
+        import prepare_openfly_expansion as prep
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "env_airsim_16/astar_data/medium_short/r0/pose.jsonl"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            records = [
+                {"action": {"imageid": 0, "pos": [0.0, 0.0, 10.0], "yaw": 0.0, "type": "go up", "value": 3}},
+                {"action": {"imageid": 1, "pos": [0.0, 0.0, 13.0], "yaw": 0.0, "type": "go down", "value": 3}},
+                {"action": {"imageid": 2, "pos": [0.0, 0.0, 10.0], "yaw": 0.0, "type": "stop", "value": 0}},
+            ]
+            p.write_text("\n".join(json.dumps(r) for r in records) + "\n")
+            ep_v = {"route_id": "env_airsim_16/astar_data/medium_short/r0",
+                    "raw_pose_path": str(p), "raw_pose_sha256": adapter.sha256(p),
+                    "actions": [4, 5, 0], "index_list": ["f_0", "f_1", "f_2"],
+                    "source_index_list": ["f_0", "f_1", "f_2"],
+                    "groups": [{"first_imageid": 0, "last_imageid": 0, "start_pose": [0.0, 0.0, 10.0, 0.0]},
+                               {"first_imageid": 1, "last_imageid": 1, "start_pose": [0.0, 0.0, 13.0, 0.0]},
+                               {"first_imageid": 2, "last_imageid": 2, "start_pose": [0.0, 0.0, 10.0, 0.0]}]}
+            orig = {"pos": [[0.0, 0.0, 10.0], [0.0, 0.0, 13.0], [0.0, 0.0, 10.0]], "yaw": [0.0, 0.0, 0.0]}
+            starts = adapter.validate_causal_episode(ep_v, orig)
+            self.assertEqual(len(starts), 3)
+
+        scene_routes = {"env_airsim_16": [
+            {"route_id": f"r{k}", "raw_xyz": [[k * 50.0, 0.0, 10.0], [k * 50.0 + 3.0, 0.0, 10.0]]}
+            for k in range(6)
+        ]}
+        splits, rep = prep.assign_spatial_splits(scene_routes, ["env_airsim_16"], corridor_distance_m=30.0, seed=1)
+        self.assertGreaterEqual(rep["env_airsim_16"]["min_cross_split_3d_distance_m"], 30.0)
+        self.assertEqual(set(splits.values()), {"train", "validation"})
+
 
 if __name__ == "__main__":
     unittest.main()
