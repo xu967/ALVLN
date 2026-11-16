@@ -7,6 +7,7 @@
 #include "cuda_check.hpp"
 #include "uavrgb/cuda_alloc.hpp"
 #include "uavrgb/ops_dev.hpp"
+#include "uavrgb/vln_head.hpp"
 
 #include <cuda_runtime.h>
 
@@ -202,8 +203,9 @@ Tensor DeviceCnn::forward(const std::uint8_t* images, int n, const std::uint8_t*
   if ((prev_dim_ > 0) != (prev != nullptr)) {
     throw std::invalid_argument("DeviceCnn::forward: 接 prev-action 的模型必须传 prev，否则不能传");
   }
+  const int prev_limit = (prev_dim_ == kVlnNavDim) ? kVlnNavCodes : prev_dim_;
   for (int i = 0; prev && i < n; ++i) {
-    if (prev[i] >= prev_dim_) throw std::invalid_argument("DeviceCnn::forward: prev-action id 越界");
+    if (prev[i] >= prev_limit) throw std::invalid_argument("DeviceCnn::forward: prev/nav_cond id 越界");
   }
   n_ = 0;
   aux_pending_ = false;

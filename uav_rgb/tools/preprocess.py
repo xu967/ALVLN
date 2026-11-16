@@ -66,7 +66,8 @@ STRICT_KEYS = ("window_from", "hold_s", "dynamics_profile", "action_latency_s")
 # 族身份键：默认同样必须一致；--allow-mixed-geometry（跨族合并实验，如柱阵+森林、Gazebo+3DGS）才放开，
 # meta 按族记录计数/salt/口径，各族仍按各自的 split_salt 复算 split（同几何同 split 的泄漏门照常）。
 FAMILY_KEYS = ("geometry_version", "appearance_version", "split_policy", "split_salt",
-               "task_version", "stop_radius", "success_criterion", "goal_radius")
+               "task_version", "stop_radius", "success_criterion", "goal_radius",
+               "teacher_version")
 # 相机口径：混包时允许「部分集缺字段」（3DGS pilot 没写），但两种不同的非空值仍不能混。
 CAMERA_KEY = "camera_profile"
 
@@ -443,6 +444,14 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
     instruction = man.get("instruction")
     if instruction is not None and not isinstance(instruction, str):
         die("%s: instruction 必须是字符串（实际 %r）" % (man_path, instruction))
+    vln_obj = man.get("vln") if isinstance(man.get("vln"), dict) else {}
+    vln_text = vln_obj.get("text")
+    if vln_text is not None:
+        if not isinstance(vln_text, str):
+            die("%s: vln.text 必须是字符串（实际 %r）" % (man_path, vln_text))
+        vln_text = vln_text.strip() or None
+    waypoint = man.get("waypoint")
+    stop_radius_m = float(man.get("stop_radius") or man.get("goal_radius") or 1.0)
     task_version = man.get("task_version")
     target_color = man.get("target_color")
     camera = man.get("camera") or {}
@@ -539,9 +548,40 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
         png = os.path.join(ep_dir, "rgb_%05d.png" % step)
         if not os.path.isfile(png):
             die("缺帧：%s（actions.jsonl 与 rgb_*.png 不同步）" % png)
+        stop_val = None
+        if "stop_expert" in row and row["stop_expert"] is not None:
+            if not isinstance(row["stop_expert"], bool):
+                die("%s 第 %d 行 (step %d): stop_expert 必须是 bool" % (actions_path, lineno, step))
+            stop_val = int(row["stop_expert"])
+        elif "stop_requested" in row and row["stop_requested"] is not None:
+            if not isinstance(row["stop_requested"], bool):
+                die("%s 第 %d 行 (step %d): stop_requested 必须是 bool" % (actions_path, lineno, step))
+            stop_val = int(row["stop_requested"])
+        bb_val = row.get("bearing_bin")
+        ng_val = row.get("near_goal")
+        if bb_val is not None:
+            if isinstance(bb_val, bool) or not isinstance(bb_val, int) or not (0 <= bb_val <= 8):
+                die("%s 第 %d 行 (step %d): bearing_bin=%r 须为 0..8 整数" % (actions_path, lineno, step, bb_val))
+        if ng_val is not None:
+            if isinstance(ng_val, bool):
+                ng_val = int(ng_val)
+            elif not isinstance(ng_val, int) or ng_val not in (0, 1):
+                die("%s 第 %d 行 (step %d): near_goal=%r 须为 0/1 或 bool" % (actions_path, lineno, step, ng_val))
+        if (bb_val is None or ng_val is None) and isinstance(waypoint, dict):
+            pb, yb = row.get("pose_before"), row.get("yaw_before")
+            if isinstance(pb, dict) and yb is not None and "x" in pb and "y" in pb and "x" in waypoint and "y" in waypoint:
+                px, py = float(pb["x"]), float(pb["y"])
+                wx, wy = float(waypoint["x"]), float(waypoint["y"])
+                if bb_val is None:
+                    bb_val = nav_cond.bearing_bin_xy(math.radians(float(yb)), (px, py), (wx, wy))
+                if ng_val is None:
+                    ng_val = int(math.hypot(px - wx, py - wy) <= stop_radius_m)
         samples.append({"png": png, "label": action, "step": step,
                         "collision": collision, "prev_action": prev_action,
                         "heading_code": heading_code,
+                        "stop_target": stop_val,
+                        "bearing_bin": bb_val,
+                        "near_goal": ng_val,
                         "depth": depth, "depth_format": depth_format,
                         # 位姿只给 --depth-source analytic 用（缺也不在这里报错：file 路径不需要）
                         "pose_before": row.get("pose_before"), "yaw_before": row.get("yaw_before")})
@@ -563,6 +603,7 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
         # 记录型 salt：冻结数据重打包必须按它复算，不能回落当前 SPLIT_SALT。
         "split_salt": man.get("split_salt"),
         "teacher": man.get("teacher"),
+        "teacher_version": man.get("teacher_version"),
         "planner": man.get("planner"),
         # A* 教师近平局口径（collect.py --tiebreak；旧 manifest 没有 = legacy）。只透传，不参与门禁：
         # visible 标签与 legacy 标签在 DISTILL 量到的 ~0.7% 帧上不同，训练数据溯源要能分开。
@@ -574,6 +615,7 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
         "scene_json": ("scene.json"
                        if os.path.isfile(os.path.join(ep_dir, "scene.json")) else None),
         "instruction": instruction,
+        "vln_text": vln_text,
         "task_version": task_version,
         "target_color": target_color,
         "waypoint": man.get("waypoint"),
@@ -888,7 +930,8 @@ def build_meta(episodes, total, size, dropped=0, split_scheme=None,
         "aux_sidecar": aux_info,
         # --cond heading-code（W1-9）：侧车里 prev_action 那一列是航向码而不是上一步动作；评测端闸门读这个键判断模型训练时的条件类型。
         # 只在 heading-code 时写键（默认 meta 逐位不变；没有这个键 = prev-action 语义）。
-        **({"cond": nav_cond.DATASET_COND_TAG} if cond == nav_cond.COND_HEADING_CODE else {}),
+        **({"cond": nav_cond.DATASET_COND_TAG} if cond == nav_cond.COND_HEADING_CODE
+           else {"cond": nav_cond.DATASET_VLN_COND_TAG} if cond == nav_cond.COND_VLN_NAV else {}),
         "splits": counts,
         # 每 split 的每类样本数：T3 的「四类 recall >0」需要先确认 val/test 有 support。
         "class_counts": class_counts,
@@ -913,6 +956,8 @@ def build_meta(episodes, total, size, dropped=0, split_scheme=None,
             "teacher_tiebreak": ep.get("teacher_tiebreak"),
             "task_version": ep.get("task_version"),
             "instruction": ep.get("instruction"),
+            **({"vln_instruction": ep["vln_text"]} if ep.get("vln_text") else {}),
+            **({"teacher_version": ep["teacher_version"]} if ep.get("teacher_version") is not None else {}),
             "target_color": ep.get("target_color"),
             # 扁平字段：C++ meta 扫描器假定 episode 项内无嵌套对象。
             "waypoint_x": (ep.get("waypoint") or {}).get("x"),
@@ -1152,11 +1197,10 @@ def depth_bands(cells):
     return bands
 
 
-def aux_payload(episodes, size, envelope_radius_m, cond=nav_cond.COND_PREV_ACTION, depth_source=DEFAULT_DEPTH_SOURCE):
-    """算 prev_index / prev_action / 深度分带；返回 (prev_index, prev_action, depth 或 None, grid)。
-
-    cond="heading-code"（W1-9）：prev_action 那一列写航向码（load_episode 按已执行动作累计的 s["heading_code"]），其余不变。
-    depth_source = "analytic"（W1-8）时深度分带由位姿与柱子真值解析算（analytic_depth_bands），不读深度文件，所有样本都有。"""
+def aux_payload(episodes, size, envelope_radius_m, cond=nav_cond.COND_PREV_ACTION,
+                depth_source=DEFAULT_DEPTH_SOURCE, vln_search_dropout=0.0):
+    """算 prev_index / prev_action / 深度分带 / 可选 stop_target & nav_cond；
+    返回 (prev_index, prev_action, depth 或 None, grid, stop_target 或 None, nav_cond_col 或 None)。"""
     if depth_source not in DEPTH_SOURCES:
         die("未知的 depth_source=%r（支持 %s）" % (depth_source, "/".join(DEPTH_SOURCES)))
     out_w, out_h = size
@@ -1165,19 +1209,34 @@ def aux_payload(episodes, size, envelope_radius_m, cond=nav_cond.COND_PREV_ACTIO
     n = len(flat)
     prev_index = np.arange(n, dtype=np.uint32)
     prev_action = np.zeros(n, dtype=np.uint8)
+    want_vln = (cond == nav_cond.COND_VLN_NAV)
+    stop_target = np.zeros(n, dtype=np.uint8) if want_vln else None
+    nav_cond_col = np.zeros(n, dtype=np.uint8) if want_vln else None
     for ep in episodes:
         by_step = {s["step"]: ep["sample_start"] + i for i, s in enumerate(ep["samples"])}
         for i, s in enumerate(ep["samples"]):
             g = ep["sample_start"] + i
-            # 上一步被 --drop-collision 或 --drop-late-and-stall 丢掉时 step-1 不在 by_step：同首帧处理（指向自身）。
-            # shortcut: 被丢步之后的下一步若用双帧加 prev-action，prev_index 指向自身而 prev_action 非 SAFE（审核 C7），待双帧线升级时按需保留被丢帧供索引。
             prev_index[g] = by_step.get(s["step"] - 1, g)
             prev_action[g] = s["heading_code"] if cond == nav_cond.COND_HEADING_CODE else s["prev_action"]
+            if want_vln:
+                if s["stop_target"] is None or s["bearing_bin"] is None or s["near_goal"] is None:
+                    die("%s (step %d): --cond vln-nav 需要 stop_requested/stop_expert 与目标方位（waypoint 或 bearing_bin/near_goal）"
+                        % (ep["dir"], s["step"]))
+                bb = s["bearing_bin"]
+                if (vln_search_dropout > 0.0 and ep.get("split") == "train"
+                        and s["stop_target"] == 0 and s["near_goal"] == 0
+                        and s["label"] == 2 and bb in (2, 3, 4)):
+                    # 目标在视野外且教师左转扫描时，按确定性哈希置为 BEARING_UNKNOWN(8)，让模型学会未知方位时单向扫描且不误停
+                    u = int(hashlib.sha256(f"{ep['scene_id']}:{ep['seed']}:{s['step']}".encode()).hexdigest()[:8], 16) / float(1 << 32)
+                    if u < vln_search_dropout:
+                        bb = nav_cond.BEARING_UNKNOWN
+                stop_target[g] = s["stop_target"]
+                nav_cond_col[g] = nav_cond.encode_vln_nav(s["prev_action"], bb, s["near_goal"])
     if depth_source == "analytic":
-        return prev_index, prev_action, analytic_depth_bands(episodes, grid, envelope_radius_m), grid
+        return prev_index, prev_action, analytic_depth_bands(episodes, grid, envelope_radius_m), grid, stop_target, nav_cond_col
     have = [s["depth"] is not None for _, s in flat]
     if not any(have):
-        return prev_index, prev_action, None, grid
+        return prev_index, prev_action, None, grid, stop_target, nav_cond_col
     if not all(have):
         die("深度文件部分缺失（%d/%d 个样本有 depth_file）：一个包要么全有深度要么全无"
             % (sum(have), n))
@@ -1192,15 +1251,13 @@ def aux_payload(episodes, size, envelope_radius_m, cond=nav_cond.COND_PREV_ACTIO
                 die("%s: 深度尺寸 %r 与相机 %dx%d 不一致"
                     % (s["depth"], d.shape, ep["src_w"], ep["src_h"]))
             cells[k] = cell_min_depth(d, grid)
-        # 焦距按每条 episode 自己的 camera.fx 取：一块里可能混着不同相机的 episode，
-        # 套第一条的焦距会让其余样本的膨胀半径按错的相机算（src_w 已在 collect 时强制一致）。
         focals = np.array([episode_focal_px(ep) for ep, _ in part], dtype=np.float64)
         for focal in np.unique(focals):
             sel = focals == focal
             cells[sel] = dilate_by_envelope(cells[sel], float(focal), part[0][0]["src_w"] / grid[1],
                                             envelope_radius_m)
         depth[start:start + len(part)] = depth_bands(cells)
-    return prev_index, prev_action, depth, grid
+    return prev_index, prev_action, depth, grid, stop_target, nav_cond_col
 
 
 def episode_focal_px(ep):
@@ -1371,16 +1428,23 @@ def analytic_depth_bands(episodes, grid, envelope_radius_m):
 
 
 def write_aux_sidecar(out_dir, uavr_path, prev_index, prev_action, depth, grid,
-                      envelope_radius_m):
+                      envelope_radius_m, stop_target=None, nav_cond_col=None):
     """写 <out>/dataset.aux（UAVRAUX1，tmp + rename）；头里绑定 dataset.uavr 的 SHA256。"""
     n = len(prev_index)
     with open(uavr_path, "rb") as f:
         uavr_sha = hashlib.sha256(f.read()).digest()
     has_depth = depth is not None
+    has_stop = stop_target is not None
+    has_nav = nav_cond_col is not None
+    flags = (1 if has_depth else 0) | (2 if has_stop else 0) | (4 if has_nav else 0)
     payload = prev_index.astype("<u4").tobytes() + prev_action.tobytes()
     if has_depth:
         payload += depth.tobytes(order="C")
-    header = AUX_HEADER.pack(AUX_MAGIC, n, 1 if has_depth else 0,
+    if has_stop:
+        payload += stop_target.astype(np.uint8).tobytes()
+    if has_nav:
+        payload += nav_cond_col.astype(np.uint8).tobytes()
+    header = AUX_HEADER.pack(AUX_MAGIC, n, flags,
                              grid[0] if has_depth else 0, grid[1] if has_depth else 0,
                              DEPTH_CLASSES, AUX_UNKNOWN, 0)
     header += uavr_sha + hashlib.sha256(payload).digest()
@@ -1453,9 +1517,9 @@ def main():
     p.add_argument("--envelope-radius", type=float, default=DEFAULT_ENVELOPE_RADIUS_M,
                    metavar="M", help="深度分带目标的包络膨胀半径（m），E1 机体 0.102；0 = 不膨胀")
     p.add_argument("--cond", choices=nav_cond.COND_CHOICES, default=nav_cond.COND_PREV_ACTION,
-                   help="侧车 dataset.aux 里 prev_action 那一列写什么：prev-action=上一步执行的动作（默认，现状）；"
-                        "heading-code=航向码（按集从头累计已执行的 YAW_LEFT−YAW_RIGHT，sim/tools/nav_cond.py，W1-9），"
-                        "meta 顶层记 cond=heading_code.v1。训练时都用 --prev-action 读这一列；只用于柱阵/长课程任务（航向设定值 H=0）")
+                   help="侧车 dataset.aux 条件列：prev-action / heading-code / vln-nav")
+    p.add_argument("--vln-search-dropout", type=float, default=0.0,
+                   help="--cond vln-nav 时将 train 分区视野外左转步按该比例映射为 BEARING_UNKNOWN(8)，训练搜索扫描行为")
     p.add_argument("--depth-source", choices=DEPTH_SOURCES, default=DEFAULT_DEPTH_SOURCE,
                    help="深度分带目标的来源。file = 读 episode 的深度文件（collect.py --save-depth；缺省，输出与以前逐字节相同）；"
                         "analytic = 不读深度文件，由 actions.jsonl 的 pose_before/yaw_before、manifest.vehicle 对应的相机安装位姿"
@@ -1513,8 +1577,9 @@ def main():
         os.remove(stale)
     # 侧车先算后写：深度文件坏了要在替换 dataset.uavr 之前报错。旧 dataset.aux 先删——
     # 它绑定的是旧 uavr 的 SHA，留着只会让读端报「SHA 不匹配」。
-    prev_index, prev_action, depth, grid = aux_payload(episodes, args.size, args.envelope_radius,
-                                                       cond=args.cond, depth_source=args.depth_source)
+    prev_index, prev_action, depth, grid, stop_target, nav_cond_col = aux_payload(
+        episodes, args.size, args.envelope_radius, cond=args.cond,
+        depth_source=args.depth_source, vln_search_dropout=args.vln_search_dropout)
     stale_aux = os.path.join(args.out, "dataset.aux")
     if os.path.exists(stale_aux):
         os.remove(stale_aux)
@@ -1522,6 +1587,10 @@ def main():
                 "depth_grid": list(grid) if depth is not None else None,
                 "band_edges_m": list(DEPTH_BAND_EDGES_M),
                 "envelope_radius_m": args.envelope_radius}
+    if stop_target is not None:
+        aux_info["stop_target"] = True
+    if nav_cond_col is not None:
+        aux_info["nav_cond"] = True
     if args.depth_source != DEFAULT_DEPTH_SOURCE:
         # 只在非缺省来源时加键：默认 file 的数据集 meta 逐字节不变。
         aux_info["depth_source"] = args.depth_source
@@ -1531,7 +1600,17 @@ def main():
                                          allow_mixed=args.allow_mixed_geometry,
                                          aux_info=aux_info, cond=args.cond)
     apath = write_aux_sidecar(args.out, out_path, prev_index, prev_action, depth, grid,
-                              args.envelope_radius)
+                              args.envelope_radius, stop_target=stop_target, nav_cond_col=nav_cond_col)
+    vln_rows = [{"episode_id": ep["episode_id"], "instruction": ep["vln_text"],
+                 "sample_start": ep["sample_start"], "sample_count": ep["num_samples"]}
+                for ep in episodes if ep.get("vln_text")]
+    vln_ipath = os.path.join(args.out, "vln_instructions.jsonl")
+    if vln_rows:
+        with open(vln_ipath, "w", encoding="utf-8") as vf:
+            for r in vln_rows:
+                vf.write(json.dumps(r, ensure_ascii=False) + "\n")
+    elif os.path.exists(vln_ipath):
+        os.remove(vln_ipath)
     first = int((prev_index == np.arange(len(prev_index), dtype=np.uint32)).sum())
     print("wrote %s (prev chain: %d first/self frames; depth bands: %s)"
           % (apath, first, ("%dx%d grid, unknown %.1f%%%s" % (

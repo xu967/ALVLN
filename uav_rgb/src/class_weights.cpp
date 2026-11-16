@@ -165,6 +165,14 @@ bool read_run_config(const std::string& run_dir, RunConfigSnapshot* out) {
   out->two_frame = str("two_frame") == "true";
   out->has_prev_action = !str("prev_action").empty();
   out->prev_action = str("prev_action") == "true";
+  out->has_vln_nav = !str("vln_nav").empty();
+  out->vln_nav = str("vln_nav") == "true";
+  out->has_stop_head = !str("stop_head").empty();
+  out->stop_head = str("stop_head") == "true";
+  out->has_stop_lambda = !str("stop_lambda").empty();
+  if (out->has_stop_lambda) out->stop_lambda = num("stop_lambda", to_f);
+  out->has_stop_pos_weight = !str("stop_pos_weight").empty();
+  if (out->has_stop_pos_weight) out->stop_pos_weight = num("stop_pos_weight", to_f);
   out->has_depth_aux = !str("depth_aux").empty();
   out->depth_aux = str("depth_aux") == "true";
   out->has_aux_lambda = !str("aux_lambda").empty();
@@ -269,6 +277,10 @@ void write_run_config(const std::string& out_dir, const TrainConfig& cfg,
      << ",\"label_smoothing\":" << cfg.label_smoothing
      << ",\"two_frame\":" << (cfg.two_frame ? "true" : "false")
      << ",\"prev_action\":" << (cfg.prev_action ? "true" : "false")
+     << ",\"vln_nav\":" << (cfg.vln_nav ? "true" : "false")
+     << ",\"stop_head\":" << (cfg.stop_head ? "true" : "false")
+     << ",\"stop_lambda\":" << cfg.stop_lambda
+     << ",\"stop_pos_weight\":" << cfg.stop_pos_weight
      << ",\"depth_aux\":" << (cfg.depth_aux ? "true" : "false")
      << ",\"aux_lambda\":" << cfg.aux_lambda;
   if (!cfg.resume.empty()) os << ",\"resume\":" << quote(cfg.resume);

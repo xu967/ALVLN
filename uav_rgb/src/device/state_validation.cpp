@@ -1,5 +1,6 @@
 // 先验证完整 host 状态；形状或数值不合法时不提交任何 CUDA 工作。
 #include "uavrgb/device/state.hpp"
+#include "uavrgb/vln_head.hpp"
 
 #include <cmath>
 #include <stdexcept>
@@ -95,7 +96,8 @@ void validate_train_state(const CnnModel& model, const TrainState& state) {
     finite_tensor(adam.v, segment.name + ".v", true);
   }
   if (!state.class_weights.empty()) {
-    if (state.class_weights.size() != static_cast<std::size_t>(model.fc.out)) {
+    if (state.class_weights.size() != static_cast<std::size_t>(model.fc.out) &&
+        !(model.fc.out == kActionStopClasses && state.class_weights.size() == kActionClasses)) {
       bad("class_weights 长度不符");
     }
     double sum = 0.0;

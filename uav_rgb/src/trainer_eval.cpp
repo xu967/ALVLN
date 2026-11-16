@@ -6,6 +6,7 @@
 #include "uavrgb/nn.hpp"
 #include "uavrgb/run_owner.hpp"
 #include "uavrgb/softmax_cuda.hpp"
+#include "uavrgb/vln_head.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -22,8 +23,9 @@
 namespace uavrgb {
 
 void Trainer::evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& idx,
-                       EvalStats* out) {
+                       EvalStats* out, bool select_stop_thresh) {
   *out = EvalStats{};
+  out->stop_threshold = state_.stop_threshold;
   if (idx.empty()) return;
   const int c = static_cast<int>(ds.num_classes);
   Confusion conf;
@@ -32,13 +34,21 @@ void Trainer::evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& 
   double sum = 0.0, depth_sum = 0.0;
   std::uint64_t seen = 0, depth_valid = 0, depth_correct = 0;
   const bool want_depth = model_.aux_classes > 0 && ds.aux.has_depth;
+  const bool want_stop = model_.fc.out == kActionStopClasses && ds.aux.has_stop;
+  std::vector<float> stop_logits;
+  std::vector<std::uint8_t> stop_y;
+  if (want_stop) {
+    stop_logits.reserve(idx.size());
+    stop_y.reserve(idx.size());
+  }
   for (std::size_t s = 0; s < idx.size(); s += b) {
     const std::size_t e = std::min(idx.size(), s + b);
     const std::vector<std::uint32_t> part = detail::slice(idx, s, e);
     const std::vector<int> y = detail::take_labels(ds, idx, s, e);
     const Tensor logits = forward_batch(ds, part);
+    const Tensor act_logits = slice_action_logits(logits);
     // dev_ce 合同为无权 Teacher CE，不能随训练权重或 batch 划分改变。
-    sum += static_cast<double>(softmax_ce_loss_cuda(logits, y)) *
+    sum += static_cast<double>(softmax_ce_loss_cuda(act_logits, y)) *
            static_cast<double>(part.size());
     if (want_depth) {
       const DeviceCnn::AuxStats a = aux_batch(ds, /*lambda=*/0.0f);  // 只评估，不反向
@@ -47,12 +57,16 @@ void Trainer::evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& 
       depth_correct += a.correct;
     }
     for (std::size_t i = 0; i < y.size(); ++i) {
-      const float* row = logits.data() + i * static_cast<std::size_t>(c);
+      const float* row = act_logits.data() + i * static_cast<std::size_t>(c);
       int best = 0;
       for (int j = 1; j < c; ++j) {
         if (row[j] > row[best]) best = j;
       }
       conf.add(y[i], best);
+      if (want_stop) {
+        stop_logits.push_back(logits[i * kActionStopClasses + kActionClasses]);
+        stop_y.push_back(ds.aux.stop_target.at(part[i]));
+      }
     }
     seen += part.size();
   }
@@ -67,6 +81,15 @@ void Trainer::evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& 
   if (want_depth && depth_valid > 0) {
     out->depth_ce = depth_sum / static_cast<double>(depth_valid);
     out->depth_acc = static_cast<double>(depth_correct) / static_cast<double>(depth_valid);
+  }
+  if (want_stop && !stop_logits.empty()) {
+    const StopEvalMetrics sm =
+        evaluate_stop_head(stop_logits, stop_y, select_stop_thresh, state_.stop_threshold);
+    out->stop_bce = sm.bce;
+    out->stop_f1 = sm.f1;
+    out->stop_precision = sm.precision;
+    out->stop_recall = sm.recall;
+    out->stop_threshold = sm.best_threshold;
   }
 }
 
@@ -89,18 +112,23 @@ void Trainer::eval_only(const std::string& ckpt_path, bool eval_val, bool eval_t
   const CheckpointMeta meta = read_checkpoint_meta(ckpt_path);
   cfg_.text_dim = meta.text_dim;
   cfg_.two_frame = meta.in_c == 2 * ds.c;
-  cfg_.prev_action = meta.prev_dim > 0;
+  cfg_.vln_nav = meta.prev_dim == kVlnNavDim;
+  cfg_.prev_action = meta.prev_dim > 0 && meta.prev_dim != kVlnNavDim;
+  cfg_.stop_head = meta.num_classes == kActionStopClasses;
   cfg_.depth_aux = meta.aux_classes > 0;
   if (cfg_.text_dim > 0 && ds.text_ids.empty()) {
     throw std::runtime_error("eval_only: checkpoint 有文本分支，但数据集没有 instructions 侧车");
   }
-  if ((cfg_.two_frame || cfg_.prev_action) && !ds.aux.present) {
-    throw std::runtime_error("eval_only: checkpoint 是双帧/prev-action 模型，但数据集没有 dataset.aux 侧车");
+  if ((cfg_.two_frame || cfg_.prev_action || cfg_.vln_nav) && !ds.aux.present) {
+    throw std::runtime_error("eval_only: checkpoint 是双帧/条件模型，但数据集没有 dataset.aux 侧车");
+  }
+  if (cfg_.vln_nav && !ds.aux.has_nav_cond) {
+    throw std::runtime_error("eval_only: checkpoint 是 vln-nav 模型，但 dataset.aux 没有 nav_cond 段");
   }
   if (cfg_.depth_aux && !ds.aux.has_depth) {
     std::fprintf(stderr, "eval_only: 数据集没有深度目标，只评估动作头（depth_ce/depth_acc 记 -1）\n");
   }
-  model_ = make_cnn(ds.h, ds.w, cfg_.seed, static_cast<int>(ds.num_classes), cfg_.text_dim,
+  model_ = make_cnn(ds.h, ds.w, cfg_.seed, meta.num_classes, cfg_.text_dim,
                     meta.in_c, meta.aux_classes, meta.prev_dim);
   state_ = make_train_state(model_, cfg_.lr);
   load_checkpoint(ckpt_path, model_, state_);
@@ -156,6 +184,10 @@ void Trainer::eval_only(const std::string& ckpt_path, bool eval_val, bool eval_t
     }
     std::printf("] n=%zu", idx.size());
     if (s.depth_ce >= 0.0) std::printf(" depth_ce=%.4f depth_acc=%.3f", s.depth_ce, s.depth_acc);
+    if (s.stop_bce >= 0.0) {
+      std::printf(" stop_bce=%.4f stop_f1=%.3f(th=%.2f)", s.stop_bce, s.stop_f1,
+                  static_cast<double>(s.stop_threshold));
+    }
     std::printf("\n");
   };
   if (eval_val) emit(ds.val_idx, Split::kVal, "val");

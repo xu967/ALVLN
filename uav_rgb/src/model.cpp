@@ -5,6 +5,7 @@
 
 #include "uavrgb/conv_cuda.hpp"
 #include "uavrgb/linear_cuda.hpp"
+#include "uavrgb/vln_head.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -167,8 +168,9 @@ Tensor forward(const CnnModel& m, const Tensor& x, CnnCache* cache,
     if (!prev || prev->size() != n) {
       throw std::invalid_argument("forward: 模型接 prev-action，必须传 N 个 prev id");
     }
+    const int prev_limit = (m.prev_dim == kVlnNavDim) ? kVlnNavCodes : m.prev_dim;
     for (std::uint8_t id : *prev) {
-      if (id >= m.prev_dim) throw std::invalid_argument("forward: prev-action id 越界");
+      if (id >= prev_limit) throw std::invalid_argument("forward: prev/nav_cond id 越界");
     }
   } else if (prev) {
     throw std::invalid_argument("forward: 模型不接 prev-action，不接受 prev id");
@@ -205,7 +207,14 @@ Tensor forward(const CnnModel& m, const Tensor& x, CnnCache* cache,
           cond[dst + d] = m.text_emb[id * m.text_dim + d];
         }
       }
-      if (m.prev_dim > 0) cond[i * cdim + tfeat + (*prev)[i]] = 1.0f;
+      if (m.prev_dim == kVlnNavDim) {
+        const std::uint8_t code = (*prev)[i];
+        cond[i * cdim + tfeat + (code % 4u)] = 1.0f;
+        cond[i * cdim + tfeat + 4u + ((code / 4u) % 9u)] = 1.0f;
+        cond[i * cdim + tfeat + 13u + (code / 36u)] = 1.0f;
+      } else if (m.prev_dim > 0) {
+        cond[i * cdim + tfeat + (*prev)[i]] = 1.0f;
+      }
     }
     film_out = linear_forward_cuda(m.film, cond);
     const int channels = m.c3.out;

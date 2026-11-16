@@ -253,6 +253,49 @@ class PreprocessCondTests(unittest.TestCase):
         self.assertEqual(self.per_episode(out_pa, col_pa)["ep1"], [0, L, 0, L, L])
         self.assertEqual(self.per_episode(out_hc, col_hc)["ep1"], [0, 0, 0, 0, 2])
 
+    def test_vln_nav_packs_stop_target_nav_cond_and_checks_teacher_version(self):
+        for name, ep_dir in self.eps.items():
+            man_path = ep_dir / "episode_manifest.json"
+            man = json.loads(man_path.read_text(encoding="utf-8"))
+            man["instruction"] = None
+            man["vln"] = {"text": f"Navigate across the living room to the sofa in {name} and stop right in front of it."}
+            man["teacher_version"] = "uavrgb.teacher_occ.v5"
+            man["waypoint"] = {"x": 4.0, "y": 0.0}
+            man["stop_radius"] = 1.0
+            man_path.write_text(json.dumps(man), encoding="utf-8")
+            act_path = ep_dir / "actions.jsonl"
+            rows = [json.loads(ln) for ln in act_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            for k, r in enumerate(rows):
+                is_last = (k == len(rows) - 1)
+                r["stop_requested"] = False
+                r["stop_expert"] = is_last
+                r["bearing_bin"] = 0 if is_last else 2
+                r["near_goal"] = int(is_last)
+            act_path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+        out, _ = self.pack("vln_ds", "--cond", "vln-nav")
+        _, meta = read_uavr(out / "dataset.uavr")
+        self.assertEqual(meta.get("cond"), "vln_nav.v1")
+        self.assertTrue((out / "vln_instructions.jsonl").is_file())
+        self.assertFalse((out / "instructions.jsonl").exists())
+        raw_aux = (out / "dataset.aux").read_bytes()
+        n = struct.unpack_from("<Q", raw_aux, 8)[0]
+        flags = struct.unpack_from("<I", raw_aux, 16)[0]
+        self.assertEqual(flags, 6)  # bit1(stop_target) | bit2(nav_cond)
+        stop_col = list(raw_aux[AUX_HEADER_SIZE + 5 * n:AUX_HEADER_SIZE + 6 * n])
+        nav_col = list(raw_aux[AUX_HEADER_SIZE + 6 * n:AUX_HEADER_SIZE + 7 * n])
+        self.assertEqual(sum(stop_col), 3)  # 每集只有末步 stop_expert=True
+        self.assertTrue(all(0 <= v < 72 for v in nav_col))
+
+        # teacher_version 混包必须被 FAMILY_KEYS 拦截
+        man2_path = self.eps["ep2"] / "episode_manifest.json"
+        man2 = json.loads(man2_path.read_text(encoding="utf-8"))
+        man2["teacher_version"] = "uavrgb.teacher_occ.v4"
+        man2_path.write_text(json.dumps(man2), encoding="utf-8")
+        _, r_mix = self.pack("vln_mix", "--cond", "vln-nav", check=False)
+        self.assertNotEqual(r_mix.returncode, 0)
+        self.assertIn("teacher_version", r_mix.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

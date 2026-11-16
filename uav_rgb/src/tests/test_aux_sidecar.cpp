@@ -120,9 +120,9 @@ int main() {
     spit(aux_path, b);
     check(load_fails(sd.path, "N"), "N 与 uavr 不符被拒");
   }
-  {  // 未知 flags 位
+  {  // 未知 flags 位（bit3 = 0x08）
     std::vector<char> b = good;
-    b[16] = static_cast<char>(b[16] | 0x02);
+    b[16] = static_cast<char>(b[16] | 0x08);
     spit(aux_path, b);
     check(load_fails(sd.path, "flags"), "未知 flags 被拒");
   }

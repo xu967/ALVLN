@@ -330,7 +330,9 @@ int main() {
     check(nw == 0, "v2 兼容用例假设 checkpoint 无类别权重");
     const std::uint32_t two = 2;
     std::memcpy(&bytes[8], &two, 4);
-    // 去掉 v6 aux_classes/prev_dim、v5 契约、v3 best_macro_f1、v4 text_dim，还原成 v2 布局。
+    // 去掉 v7 侧车SHA+stop阈值(36B)、v6 aux_classes/prev_dim(8B)、v5 契约、v3 best_macro_f1、v4 text_dim，还原成 v2 布局。
+    bytes.erase(bytes.begin() + 52 + kContractBytes + 8,
+                bytes.begin() + 52 + kContractBytes + 8 + 36);
     bytes.erase(bytes.begin() + 52 + kContractBytes, bytes.begin() + 52 + kContractBytes + 8);
     bytes.erase(bytes.begin() + 52, bytes.begin() + 52 + kContractBytes);
     bytes.erase(bytes.begin() + 44, bytes.begin() + 52);
@@ -377,7 +379,7 @@ int main() {
     std::vector<char> bytes((std::istreambuf_iterator<char>(in)),
                             std::istreambuf_iterator<char>());
     std::uint32_t ndim = 0;
-    const std::size_t tensor_off = 52 + kContractBytes + 8;  // v5 契约 + v6 两个 i32 之后的第一个参数
+    const std::size_t tensor_off = 52 + kContractBytes + 8 + 36;  // v5 契约 + v6(8B) + v7(36B) 之后的第一个参数
     std::memcpy(&ndim, &bytes[tensor_off], 4);
     const std::size_t off = tensor_off + 4 + static_cast<std::size_t>(ndim) * 8;
     check(off + 4 <= bytes.size(), "NaN 注入点超出 checkpoint 文件大小");

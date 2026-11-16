@@ -2,6 +2,7 @@
 #include "uavrgb/aux_sidecar.hpp"
 
 #include "uavrgb/sha256.hpp"
+#include "uavrgb/vln_head.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -47,8 +48,10 @@ AuxSidecar load_aux_sidecar(const std::string& uavr_path, int n, int h, int w,
   if (std::memcmp(hb, "UAVRAUX1", 8) != 0) fail("magic 不是 UAVRAUX1");
   if (le(hb + 8, 8) != static_cast<std::uint64_t>(n)) fail("N 与 dataset.uavr 不符");
   const std::uint32_t flags = static_cast<std::uint32_t>(le(hb + 16, 4));
-  if (flags > 1) fail("未知 flags（只定义了 bit0=深度目标）");
-  aux.has_depth = (flags & 1u) != 0;
+  if ((flags & ~kAuxKnownFlags) != 0) fail("未知 flags（仅支持 bit0=深度, bit1=stop, bit2=nav_cond）");
+  aux.has_depth = (flags & kAuxFlagDepth) != 0;
+  aux.has_stop = (flags & kAuxFlagStop) != 0;
+  aux.has_nav_cond = (flags & kAuxFlagNavCond) != 0;
   aux.depth_h = static_cast<int>(le(hb + 20, 2));
   aux.depth_w = static_cast<int>(le(hb + 22, 2));
   aux.depth_classes = hb[24];
@@ -76,7 +79,9 @@ AuxSidecar load_aux_sidecar(const std::string& uavr_path, int n, int h, int w,
 
   const std::uint64_t un = static_cast<std::uint64_t>(n);
   const std::uint64_t depth_bytes = aux.has_depth ? un * aux.depth_h * aux.depth_w : 0;
-  const std::uint64_t expect = kAuxHeaderBytes + 5 * un + depth_bytes;
+  const std::uint64_t stop_bytes = aux.has_stop ? un : 0;
+  const std::uint64_t nav_bytes = aux.has_nav_cond ? un : 0;
+  const std::uint64_t expect = kAuxHeaderBytes + 5 * un + depth_bytes + stop_bytes + nav_bytes;
   const std::uint64_t actual = std::filesystem::file_size(path, ec);
   if (ec) fail("取文件大小失败");
   if (actual != expect) {
@@ -85,14 +90,23 @@ AuxSidecar load_aux_sidecar(const std::string& uavr_path, int n, int h, int w,
   const Sha256 payload_sha = sha256(f);
   if (!std::equal(payload_sha.begin(), payload_sha.end(), hb + 60)) fail("payload SHA256 不匹配");
   f.clear();
+  f.seekg(0);
+  aux.file_sha256 = sha256(f);
+  f.clear();
   f.seekg(kAuxHeaderBytes);
   aux.prev_index.resize(static_cast<std::size_t>(n));
   aux.prev_action.resize(static_cast<std::size_t>(n));
   aux.depth.resize(static_cast<std::size_t>(depth_bytes));
+  aux.stop_target.resize(static_cast<std::size_t>(stop_bytes));
+  aux.nav_cond.resize(static_cast<std::size_t>(nav_bytes));
   if (!f.read(reinterpret_cast<char*>(aux.prev_index.data()), 4 * static_cast<std::streamsize>(n)) ||
       !f.read(reinterpret_cast<char*>(aux.prev_action.data()), static_cast<std::streamsize>(n)) ||
       (depth_bytes != 0 &&
-       !f.read(reinterpret_cast<char*>(aux.depth.data()), static_cast<std::streamsize>(depth_bytes)))) {
+       !f.read(reinterpret_cast<char*>(aux.depth.data()), static_cast<std::streamsize>(depth_bytes))) ||
+      (stop_bytes != 0 &&
+       !f.read(reinterpret_cast<char*>(aux.stop_target.data()), static_cast<std::streamsize>(stop_bytes))) ||
+      (nav_bytes != 0 &&
+       !f.read(reinterpret_cast<char*>(aux.nav_cond.data()), static_cast<std::streamsize>(nav_bytes)))) {
     fail("读取 payload 失败");
   }
   static_assert(sizeof(std::uint32_t) == 4, "prev_index 按小端 u32 落盘");
@@ -106,6 +120,12 @@ AuxSidecar load_aux_sidecar(const std::string& uavr_path, int n, int h, int w,
   }
   for (std::uint8_t v : aux.depth) {
     if (v != kAuxUnknown && v >= aux.depth_classes) fail("深度分带目标越界");
+  }
+  for (std::uint8_t s : aux.stop_target) {
+    if (s > 1) fail("stop_target 必须是 0 或 1");
+  }
+  for (std::uint8_t c : aux.nav_cond) {
+    if (c >= kVlnNavCodes) fail("nav_cond 越界（须 < 72）");
   }
   aux.present = true;
   return aux;

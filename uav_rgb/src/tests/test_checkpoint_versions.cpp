@@ -40,6 +40,7 @@ void spit(const std::string& p, const std::vector<char>& b) {
 // 契约(113) aux_classes(4) prev_dim(4)。class_weights 为空时 text_dim 在 48，契约在 52，v6 字段在 165。
 constexpr std::size_t kContractOff = 52;
 constexpr std::size_t kV6Off = kContractOff + 113;
+constexpr std::size_t kV7Off = kV6Off + 8;
 
 void set_version(std::vector<char>& b, std::uint32_t v) { std::memcpy(b.data() + 8, &v, 4); }
 
@@ -95,15 +96,25 @@ int main() {
     check(!loads(root + "/p2.bin", no_prev), "prev_dim 不同被拒");
   }
 
-  // 2) 纯视觉与文本 FiLM 模型：v6 文件剪成 v5 / v4 后仍可读（模拟旧 run 留下的 checkpoint）。
+  // 2) 纯视觉与文本 FiLM 模型：v7 文件剪成 v6 / v5 / v4 后仍可读（模拟旧 run 留下的 checkpoint）。
   for (int text_dim : {0, 16}) {
     CnnModel m = make_cnn(16, 24, 5, 4, text_dim);
     TrainState st = make_train_state(m, 1e-3f);
+    st.stop_threshold = 0.65f;
+    st.aux_sidecar_sha256[0] = 0xab;
     const std::string tag = text_dim ? "film" : "vision";
-    save_checkpoint(root + "/" + tag + "_v6.bin", m, st);
-    std::vector<char> b = slurp(root + "/" + tag + "_v6.bin");
+    save_checkpoint(root + "/" + tag + "_v7.bin", m, st);
+    const CheckpointMeta meta7 = read_checkpoint_meta(root + "/" + tag + "_v7.bin");
+    check(meta7.stop_threshold == 0.65f && meta7.aux_sidecar_sha256[0] == 0xab,
+          tag + " v7 meta 读回 stop_threshold 与 aux_sidecar_sha256");
+    std::vector<char> b = slurp(root + "/" + tag + "_v7.bin");
+    // v6：去掉 v7 新增的 36 B（aux_sidecar_sha256 32B + stop_threshold 4B）。
+    std::vector<char> v6 = b;
+    v6.erase(v6.begin() + kV7Off, v6.begin() + kV7Off + 36);
+    set_version(v6, 6);
+    spit(root + "/" + tag + "_v6.bin", v6);
     // v5：去掉契约之后的 8 B（aux_classes/prev_dim）。
-    std::vector<char> v5 = b;
+    std::vector<char> v5 = v6;
     v5.erase(v5.begin() + kV6Off, v5.begin() + kV6Off + 8);
     set_version(v5, 5);
     spit(root + "/" + tag + "_v5.bin", v5);
@@ -112,7 +123,7 @@ int main() {
     v4.erase(v4.begin() + kContractOff, v4.begin() + kContractOff + 113);
     set_version(v4, 4);
     spit(root + "/" + tag + "_v4.bin", v4);
-    for (const char* ver : {"v6", "v5", "v4"}) {
+    for (const char* ver : {"v7", "v6", "v5", "v4"}) {
       const std::string path = root + "/" + tag + "_" + ver + ".bin";
       CnnModel back = make_cnn(16, 24, 77, 4, text_dim);
       const bool ok = loads(path, back) && same_params(m, back);

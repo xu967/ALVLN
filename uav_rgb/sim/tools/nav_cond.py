@@ -23,10 +23,17 @@ FORWARD_SLOW, YAW_LEFT, YAW_RIGHT = 1, 2, 3
 
 COND_PREV_ACTION = "prev-action"
 COND_HEADING_CODE = "heading-code"
-COND_CHOICES = (COND_PREV_ACTION, COND_HEADING_CODE)
-# 数据集 meta 顶层 "cond" 的取值（只有 --cond heading-code 的包才有这个键；没有 = prev-action 语义）
+COND_VLN_NAV = "vln-nav"
+COND_CHOICES = (COND_PREV_ACTION, COND_HEADING_CODE, COND_VLN_NAV)
+VLN_NAV_DIM = 15
+BEARING_UNKNOWN = 8
+# 数据集 meta 顶层 "cond" 的取值（没有这个键 = prev-action 语义）
 DATASET_COND_TAG = "heading_code.v1"
-_TAG_TO_COND = {DATASET_COND_TAG: COND_HEADING_CODE}
+DATASET_VLN_COND_TAG = "vln_nav.v1"
+_TAG_TO_COND = {
+    DATASET_COND_TAG: COND_HEADING_CODE,
+    DATASET_VLN_COND_TAG: COND_VLN_NAV,
+}
 
 _UAVR_HEAD = struct.Struct("<4sHHIHHBBBBQQQI")   # 同 tools/preprocess.py 的 HEADER（48 B）：meta_off 在 36、meta_len 在 44
 _CKPT_HEAD = struct.Struct("<8sIIiiiiIII")       # 同 src/checkpoint.cpp：magic + 9×4B 定长头（共 44 B）
@@ -50,6 +57,22 @@ def heading_codes(executed, setpoint=0):
         codes.append(heading_code(n, setpoint))
         n += (action == YAW_LEFT) - (action == YAW_RIGHT)
     return codes
+
+
+def bearing_bin_xy(yaw_rad, pos_xy, aim_xy, n_bins=8):
+    """目标相对机头方向离散成逆时针 n_bins 个扇区（桶 0 以机头正前方为中心），与 sim/3dgs/vln.py 一致。"""
+    world = math.atan2(float(aim_xy[1]) - float(pos_xy[1]), float(aim_xy[0]) - float(pos_xy[0]))
+    rel = (world - float(yaw_rad) + math.pi) % (2.0 * math.pi) - math.pi
+    step = 2.0 * math.pi / n_bins
+    return int(math.floor((rel + 0.5 * step) / step)) % n_bins
+
+
+def encode_vln_nav(prev_action, bearing_bin, near_goal):
+    """打包单字节 VLN 动态导航条件：prev_action(0..3) + 4*bearing_bin(0..8) + 36*near_goal(0..1) ∈ [0, 71]。"""
+    pa, bb, ng = int(prev_action), int(bearing_bin), int(near_goal)
+    if not (0 <= pa < 4 and 0 <= bb <= 8 and ng in (0, 1)):
+        raise ValueError(f"vln_nav 条件越界: prev={pa}, bearing={bb}, near_goal={ng}")
+    return pa + 4 * bb + 36 * ng
 
 
 # ---------------------------------------------------------------- 一致性闸门
@@ -103,7 +126,7 @@ def ckpt_dataset_sha256(path):
             if len(raw) != _CKPT_HEAD.size:
                 return None
             magic, ver, _np, _h, _w, _c, _nc, _at, _ep, nw = _CKPT_HEAD.unpack(raw)
-            if magic != b"UAVRCK01" or ver < 5 or ver > 6 or nw > 64:
+            if magic != b"UAVRCK01" or ver < 5 or ver > 7 or nw > 64:
                 return None
             f.seek(4 * nw + 8, os.SEEK_CUR)      # class_weights + v3 best_macro_f1 + v4 text_dim
             contract = f.read(_CKPT_CONTRACT_BYTES)
@@ -149,15 +172,21 @@ def check_student_cond(requested, ckpt, prev_dim, explicit=False):
         return {"status": status, "requested": requested, "trained": trained, "source": source, "message": message}
 
     if prev_dim <= 0:
-        if requested == COND_HEADING_CODE:
+        if requested in (COND_HEADING_CODE, COND_VLN_NAV):
             return result("mismatch", "none", "ckpt prev_dim=0",
-                          f"--student-cond {COND_HEADING_CODE}，但 ckpt 没有条件输入（prev_dim=0），传进去的码不会生效；"
-                          "要评测航向码学生请用 --prev-action 训出的 ckpt")
+                          f"--student-cond {requested}，但 ckpt 没有条件输入（prev_dim=0），传进去的条件不会生效")
         if explicit and requested == COND_PREV_ACTION:
             return result("mismatch", "none", "ckpt prev_dim=0",
                           f"显式指定 --student-cond {COND_PREV_ACTION}，但 ckpt 没有条件输入（prev_dim=0），"
                           "传进去的上一步动作不会生效；评测纯视觉模型请不传 --student-cond，或改用 --prev-action 训出的 ckpt")
         return result("ok", "none", "ckpt prev_dim=0", "ckpt 没有条件输入")
+
+    if prev_dim == VLN_NAV_DIM and requested != COND_VLN_NAV:
+        return result("mismatch", COND_VLN_NAV, f"ckpt prev_dim={prev_dim}",
+                      f"ckpt 是 15 维 VLN 动态方位模型，但请求条件为 {requested}")
+    if prev_dim == 4 and requested == COND_VLN_NAV:
+        return result("mismatch", COND_PREV_ACTION, f"ckpt prev_dim={prev_dim}",
+                      "ckpt 是 4 维 prev-action/heading-code 模型，不能喂 vln-nav")
 
     def finish_with_tag(tag, source):
         if tag is None:

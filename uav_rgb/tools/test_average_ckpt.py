@@ -560,7 +560,7 @@ class TestAuxCond(Base):
             ("missing", None, {}, "不存在"),
             ("magic", self.cond, {"magic": b"UAVRAUX2"}, "头不合法"),
             ("n", self.cond, {"n_override": n + 1}, "头不合法"),
-            ("flags", self.cond, {"flags_override": 2}, "头不合法"),
+            ("flags", self.cond, {"flags_override": 8}, "头不合法"),
             ("unknown_code", self.cond, {"unknown": 254}, "头不合法"),
             ("uavr_sha", self.cond, {"uavr_sha": "00" * 32}, "uavr sha256"),
             ("payload_sha", self.cond, {"corrupt_payload": True}, "payload sha256"),

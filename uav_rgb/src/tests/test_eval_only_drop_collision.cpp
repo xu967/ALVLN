@@ -143,7 +143,7 @@ int main(int argc, char** argv) {
     fs::create_directories(root + "/v4_dir");
     std::string raw = slurp(root + "/run_drop/ckpt.bin");
     constexpr std::size_t kContractOff = 52;  // class_weights 为空：44 + best(4) + text_dim(4) = 52
-    raw.erase(kContractOff, 113 + 8);         // 去掉 v5 契约(113B) 与 v6 字段(8B)
+    raw.erase(kContractOff, 113 + 8 + 36);    // 去掉 v5 契约(113B)、v6 字段(8B) 与 v7 字段(36B)
     const std::uint32_t v4 = 4;
     std::memcpy(raw.data() + 8, &v4, 4);
     {

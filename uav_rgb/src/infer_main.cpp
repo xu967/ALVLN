@@ -11,6 +11,7 @@
 #include "uavrgb/checkpoint.hpp"
 #include "uavrgb/infer.hpp"
 #include "uavrgb/model.hpp"
+#include "uavrgb/vln_head.hpp"
 
 namespace {
 
@@ -66,13 +67,20 @@ int main(int argc, char** argv) {
     uavrgb::load_checkpoint(ckpt, model, st);
     // hello 只追加字段：旧 student.py 读不到 prev_action_dim 时按 0 处理，单帧模型协议不变。
     // in_c=6 的双帧模型每步要两张 HWC；prev_action_dim>0 每步末尾多 1 字节动作 id。
-    std::printf("{\"in_h\":%d,\"in_w\":%d,\"in_c\":%d,\"num_classes\":%d,\"text_dim\":%d,"
-                "\"prev_action_dim\":%d,\"aux_classes\":%d}\n",
-                meta.in_h, meta.in_w, meta.in_c, meta.num_classes, meta.text_dim, meta.prev_dim,
-                meta.aux_classes);
+    if (meta.num_classes == uavrgb::kActionStopClasses) {
+      std::printf("{\"in_h\":%d,\"in_w\":%d,\"in_c\":%d,\"num_classes\":%d,\"text_dim\":%d,"
+                  "\"prev_action_dim\":%d,\"aux_classes\":%d,\"stop_threshold\":%.6g}\n",
+                  meta.in_h, meta.in_w, meta.in_c, meta.num_classes, meta.text_dim, meta.prev_dim,
+                  meta.aux_classes, static_cast<double>(meta.stop_threshold));
+    } else {
+      std::printf("{\"in_h\":%d,\"in_w\":%d,\"in_c\":%d,\"num_classes\":%d,\"text_dim\":%d,"
+                  "\"prev_action_dim\":%d,\"aux_classes\":%d}\n",
+                  meta.in_h, meta.in_w, meta.in_c, meta.num_classes, meta.text_dim, meta.prev_dim,
+                  meta.aux_classes);
+    }
     std::fflush(stdout);
     const std::size_t frames =
-        uavrgb::run_infer_loop(model, std::cin, std::cout, text_ids);
+        uavrgb::run_infer_loop(model, std::cin, std::cout, text_ids, meta.stop_threshold);
     std::fprintf(stderr, "uavrgb_infer: %zu 帧\n", frames);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "uavrgb_infer: %s\n", e.what());

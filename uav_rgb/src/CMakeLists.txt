@@ -17,6 +17,7 @@ add_library(uavrgb_core
   ops_weighted.cpp
   ops_soft.cpp
   ops_spatial.cpp
+  vln_head.cpp
   sha256.cpp
   soft_targets.cpp
   conv_cpu.cpp
@@ -275,3 +276,9 @@ add_executable(test_cuda_blocking_sync tests/test_cuda_blocking_sync.cpp)
 target_link_libraries(test_cuda_blocking_sync PRIVATE uavrgb_core CUDA::cudart)
 add_dependencies(test_cuda_blocking_sync uavrgb_train)
 add_test(NAME test_cuda_blocking_sync COMMAND test_cuda_blocking_sync $<TARGET_FILE:uavrgb_train>)
+
+# 任务卡 S1：15 维动态导航条件 + 第 5 维独立 STOP 头的 CPU/CUDA 对拍与有限差分校验。
+add_executable(test_vln_cond_stop tests/test_vln_cond_stop.cpp)
+target_link_libraries(test_vln_cond_stop PRIVATE uavrgb_core)
+add_test(NAME test_vln_cond_stop COMMAND test_vln_cond_stop)
+

@@ -257,13 +257,19 @@ int check_aux(const std::string& uavr_path, const Header& hd, bool do_selfcheck)
   const std::uint16_t dh = le16(bytes.data() + 20), dw = le16(bytes.data() + 22);
   const std::uint8_t classes = bytes[24], unknown = bytes[25];
   if (n != hd.n) return fail("aux: N=" + std::to_string(n) + " != uavr n=" + std::to_string(hd.n));
-  if (flags > 1) return fail("aux: 未知 flags");
+  if ((flags & ~7u) != 0) return fail("aux: 未知 flags");
   if (unknown != 255) return fail("aux: unknown_code != 255");
   const bool has_depth = (flags & 1u) != 0;
+  const bool has_stop = (flags & 2u) != 0;
+  const bool has_nav = (flags & 4u) != 0;
   if (has_depth && (dh != hd.h / 8 || dw != hd.w / 8 || classes != 8)) return fail("aux: 深度网格/分带数与 H/8×W/8、8 带不符");
   if (!has_depth && (dh != 0 || dw != 0)) return fail("aux: 无深度时 depth_h/depth_w 须为 0");
   const std::uint64_t depth_bytes = has_depth ? n * dh * dw : 0;
-  if (bytes.size() != 128 + 5 * n + depth_bytes) return fail("aux: 文件长度与 N/网格不符");
+  const std::uint64_t stop_bytes = has_stop ? n : 0;
+  const std::uint64_t nav_bytes = has_nav ? n : 0;
+  if (bytes.size() != 128 + 5 * n + depth_bytes + stop_bytes + nav_bytes) {
+    return fail("aux: 文件长度与 N/网格不符");
+  }
   // 绑定：头里的 dataset.uavr SHA256 与 payload SHA256 都要对得上，防止「新数据集 + 旧侧车」。
   std::ifstream uf(uavr_path, std::ios::binary);
   std::vector<std::uint8_t> ubytes((std::istreambuf_iterator<char>(uf)), std::istreambuf_iterator<char>());
@@ -287,6 +293,14 @@ int check_aux(const std::string& uavr_path, const Header& hd, bool do_selfcheck)
   for (std::uint64_t i = 0; i < depth_bytes; ++i) {
     if (depth[i] == 255) ++unknown_cells;
     else if (depth[i] >= classes) return fail("aux: 深度分带目标越界");
+  }
+  const std::uint8_t* stop_ptr = depth + depth_bytes;
+  for (std::uint64_t i = 0; i < stop_bytes; ++i) {
+    if (stop_ptr[i] > 1) return fail("aux: stop_target 越界");
+  }
+  const std::uint8_t* nav_ptr = stop_ptr + stop_bytes;
+  for (std::uint64_t i = 0; i < nav_bytes; ++i) {
+    if (nav_ptr[i] >= 72) return fail("aux: nav_cond 越界");
   }
   std::printf("aux: %s N=%llu first/self=%llu depth=%s\n", aux_path.c_str(),
               static_cast<unsigned long long>(n), static_cast<unsigned long long>(self_count),

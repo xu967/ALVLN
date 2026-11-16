@@ -36,6 +36,10 @@ class StudentPolicy:
     # 类级默认：tools/check_input_parity.py 用 __new__ 绕过 __init__ 构造单帧实例，
     # 这些字段必须有值才能让 act() 仍只发 h*w*3 字节。
     prev_dim = 0
+    has_stop_head = False
+    stop_threshold = 0.5
+    last_stop_prob = 0.0
+    last_stop_requested = False
     _prev_rgb = None
     _last_action = 0
 
@@ -75,20 +79,22 @@ class StudentPolicy:
         self.in_c = int(hello["in_c"])
         if self.in_c not in (3, 6):
             self._abort_start(f"模型输入通道 {self.in_c} 不是 3（单帧）或 6（双帧），相机是 RGB")
-        # prev-action 维度：0 = 不接；4 = 四动作 one-hot。其它值说明模型与 collect 的动作集不符。
+        # prev-action 维度：0 = 不接；4 = 四动作/航向码 one-hot；15 = VLN 动态方位条件。
         self.prev_dim = int(hello.get("prev_action_dim", 0))
-        if self.prev_dim not in (0, 4):
-            self._abort_start(f"模型 prev_action_dim {self.prev_dim} 不是 0 或 4")
+        if self.prev_dim not in (0, 4, 15):
+            self._abort_start(f"模型 prev_action_dim {self.prev_dim} 不是 0、4 或 15")
         self.aux_classes = int(hello.get("aux_classes", 0))  # 仅记录；部署时辅助头不算
-        # 非四动作模型会让越界动作在 collect 里静默变成悬停，闭环数字看似正常但无意义。
-        # 用 get：旧 infer 没有该字段时应走 _abort_start 杀掉子进程，而不是 KeyError 泄漏。
+        # 4 = 四动作模型；5 = 四动作 + 第 5 维独立 STOP 头。
         classes = hello.get("num_classes")
-        if classes is None or int(classes) != 4:
+        if classes is None or int(classes) not in (4, 5):
             self._abort_start(
-                f"模型输出 {classes} 类 != 4（SAFE/FORWARD/LEFT/RIGHT）")
+                f"模型输出 {classes} 类不在 (4, 5)（4=机动动作，5=机动动作+独立STOP头）")
+        self.has_stop_head = int(classes) == 5
+        self.stop_threshold = float(hello.get("stop_threshold", 0.5))
         # 文本分支维度：0 表示纯视觉模型；L/I/S 消融靠它确认改文本真的会改推理。
         self.text_dim = int(hello.get("text_dim", 0))
         self.frames = 0
+        self.reset()
         self._warmup()
 
     def validate_inputs(self, requested_cond):
@@ -117,21 +123,24 @@ class StudentPolicy:
 
         否则每集第一帧的推理要多花约 0.4 s，动作基于更旧的画面。
         """
-        # 一步 payload = in_c/3 张 HWC 帧 + prev-action 1 字节（见 src/infer.cpp）。
-        zeros = bytes(self.h * self.w * self.in_c) + (bytes(1) if self.prev_dim else b"")
+        # 一步 payload = in_c/3 张 HWC 帧 + 条件字节（prev_dim=4 为 1B，prev_dim=15 为 3B）。
+        cond_pad = b"\x00\x08\x00" if self.prev_dim == 15 else (bytes(1) if self.prev_dim else b"")
+        zeros = bytes(self.h * self.w * self.in_c) + cond_pad
         if not self._exchange(zeros, "warmup"):
             self._abort_start(f"推理进程 warmup 失败：{self._stderr()}")
 
     def reset(self):
-        """集边界：清掉上一帧/上一步动作缓存，下一帧按首帧口径发（上一帧=自身、prev=SAFE）。"""
+        """集边界：清掉上一帧/上一步动作与停止意图缓存。"""
         self._prev_rgb = None
         self._last_action = 0
+        self.last_stop_prob = 0.0
+        self.last_stop_requested = False
 
-    def act(self, msg, prev_action=None):
+    def act(self, msg, prev_action=None, bearing_bin=None, near_goal=None):
         """gz.msgs.Image dict -> (action, infer_ms, probs)。解码/推理失败抛异常。
 
-        prev_action：上一步真正执行的动作（采集脚本有安全接管时与模型输出不同）；
-        None 时用模型自己上一步的输出。单帧且不接 prev-action 的模型忽略缓存。
+        prev_action：上一步真正执行的动作；prev_dim=15 时额外发送 bearing_bin(0..8) 与 near_goal(0..1)。
+        独立 STOP 头的输出写入 self.last_stop_prob / self.last_stop_requested，保持 3 元组返回值兼容。
         """
         w, h, nch, rows = save_frame.decode(msg)
         if nch not in (3, 4):
@@ -142,7 +151,14 @@ class StudentPolicy:
         payload = cur
         if self.in_c == 6:
             payload += self._prev_rgb if self._prev_rgb is not None else cur
-        if self.prev_dim:
+        if self.prev_dim == 15:
+            prev = self._last_action if prev_action is None else int(prev_action)
+            bb = 8 if bearing_bin is None else int(bearing_bin)
+            ng = 0 if near_goal is None else int(near_goal)
+            if not (0 <= prev < 4 and 0 <= bb <= 8 and ng in (0, 1)):
+                raise ValueError(f"vln_nav 条件越界: prev={prev}, bearing={bb}, near_goal={ng}")
+            payload += bytes([prev, bb, ng])
+        elif self.prev_dim:
             prev = self._last_action if prev_action is None else int(prev_action)
             if not 0 <= prev < self.prev_dim:
                 raise ValueError(f"prev_action {prev} 越界（0..{self.prev_dim - 1}）")
@@ -153,6 +169,8 @@ class StudentPolicy:
         obj = json.loads(line)
         self.frames += 1
         action = int(obj["action"])
+        self.last_stop_prob = float(obj.get("stop_prob", 0.0))
+        self.last_stop_requested = bool(obj.get("stop_requested", False))
         self._prev_rgb = cur
         self._last_action = action
         return action, float(obj["infer_ms"]), obj["probs"]

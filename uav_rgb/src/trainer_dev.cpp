@@ -5,6 +5,7 @@
 #include "uavrgb/action.hpp"
 #include "uavrgb/class_weights.hpp"
 #include "uavrgb/ops.hpp"
+#include "uavrgb/vln_head.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -44,14 +45,17 @@ void read_u8_batch(const UavrDataset& ds, const std::vector<std::uint32_t>& idx,
   }
 }
 
-// 翻转样本：prev-action 的左右互换（与标签同一条规则）、深度目标按列镜像。
-void flip_side_inputs(const std::vector<dev::AugParams>& aug, std::vector<std::uint8_t>* prev,
-                      std::vector<std::uint8_t>* depth, int dh, int dw) {
+// 翻转样本：prev-action 的左右互换（与标签同一条规则）、VLN 8 桶方位左右镜像、深度目标按列镜像。
+void flip_side_inputs(const std::vector<dev::AugParams>& aug, int prev_dim,
+                      std::vector<std::uint8_t>* prev, std::vector<std::uint8_t>* depth, int dh,
+                      int dw) {
   for (std::size_t i = 0; i < aug.size(); ++i) {
     if (!aug[i].flip) continue;
     if (prev) {
       std::uint8_t& a = (*prev)[i];
-      if (a == static_cast<std::uint8_t>(Action::YAW_LEFT)) {
+      if (prev_dim == kVlnNavDim) {
+        a = flip_vln_nav_code(a);
+      } else if (a == static_cast<std::uint8_t>(Action::YAW_LEFT)) {
         a = static_cast<std::uint8_t>(Action::YAW_RIGHT);
       } else if (a == static_cast<std::uint8_t>(Action::YAW_RIGHT)) {
         a = static_cast<std::uint8_t>(Action::YAW_LEFT);
@@ -110,7 +114,10 @@ Tensor Trainer::forward_batch(const UavrDataset& ds, const std::vector<std::uint
   std::vector<std::uint8_t> text;
   if (model_.text_dim > 0) ds.load_text(part, text);
   std::vector<std::uint8_t> prev;
-  if (model_.prev_dim > 0) {
+  if (model_.prev_dim == kVlnNavDim) {
+    if (!ds.aux.has_nav_cond) throw std::runtime_error("trainer: vln-nav 模型需要带 nav_cond 的 dataset.aux");
+    for (std::uint32_t i : part) prev.push_back(ds.aux.nav_cond.at(i));
+  } else if (model_.prev_dim > 0) {
     for (std::uint32_t i : part) prev.push_back(ds.aux.prev_action.at(i));
   }
   const bool want_depth = model_.aux_classes > 0 && ds.aux.has_depth;
@@ -131,8 +138,8 @@ Tensor Trainer::forward_batch(const UavrDataset& ds, const std::vector<std::uint
     aug = make_aug(aug_rng_, cfg_.augment, /*allow_flip=*/model_.text_dim == 0, *train_labels);
     // shortcut: shift（±4 px ≈ 半个 16 px 格）不平移深度目标，亚格错位先接受；
     // 升级点是按 dx/dy 平移目标并把移入的边缘格置 255。
-    flip_side_inputs(aug, prev.empty() ? nullptr : &prev, want_depth ? &depth_batch_ : nullptr,
-                     ds.aux.depth_h, ds.aux.depth_w);
+    flip_side_inputs(aug, model_.prev_dim, prev.empty() ? nullptr : &prev,
+                     want_depth ? &depth_batch_ : nullptr, ds.aux.depth_h, ds.aux.depth_w);
   }
   return dev_->forward(u8_batch_.data(), static_cast<int>(part.size()),
                        model_.text_dim > 0 ? text.data() : nullptr,
@@ -146,9 +153,11 @@ DeviceCnn::AuxStats Trainer::aux_batch(const UavrDataset& ds, float lambda) {
 }
 
 CnnModel Trainer::build_model(const UavrDataset& ds) const {
-  const int classes = static_cast<int>(ds.num_classes);
-  return make_cnn(ds.h, ds.w, cfg_.seed, classes, cfg_.text_dim, cfg_.two_frame ? 2 * ds.c : ds.c,
-                  cfg_.depth_aux ? ds.aux.depth_classes : 0, cfg_.prev_action ? classes : 0);
+  const int act_classes = static_cast<int>(ds.num_classes);
+  const int out_classes = cfg_.stop_head ? kActionStopClasses : act_classes;
+  const int pdim = cfg_.vln_nav ? kVlnNavDim : (cfg_.prev_action ? act_classes : 0);
+  return make_cnn(ds.h, ds.w, cfg_.seed, out_classes, cfg_.text_dim,
+                  cfg_.two_frame ? 2 * ds.c : ds.c, cfg_.depth_aux ? ds.aux.depth_classes : 0, pdim);
 }
 
 float Trainer::step_lr(std::uint32_t step, std::uint32_t total_steps) {

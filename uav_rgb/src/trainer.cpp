@@ -8,6 +8,7 @@
 #include "uavrgb/sha256.hpp"
 #include "uavrgb/softmax_cuda.hpp"
 #include "uavrgb/soft_targets.hpp"
+#include "uavrgb/vln_head.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -233,6 +234,12 @@ void merge_resume_config(TrainConfig* cfg) {
   // 结构开关不继承就建不出同形模型，load_checkpoint 会按参数个数/形状拒绝；这里先接过来。
   if (!cfg->two_frame_set && snap.has_two_frame) cfg->two_frame = snap.two_frame;
   if (!cfg->prev_action_set && snap.has_prev_action) cfg->prev_action = snap.prev_action;
+  if (!cfg->vln_nav_set && snap.has_vln_nav) cfg->vln_nav = snap.vln_nav;
+  if (!cfg->stop_head_set && snap.has_stop_head) cfg->stop_head = snap.stop_head;
+  if (!cfg->stop_lambda_set && snap.has_stop_lambda) cfg->stop_lambda = snap.stop_lambda;
+  if (!cfg->stop_pos_weight_set && snap.has_stop_pos_weight) {
+    cfg->stop_pos_weight = snap.stop_pos_weight;
+  }
   if (!cfg->depth_aux_set && snap.has_depth_aux) cfg->depth_aux = snap.depth_aux;
   if (!cfg->aux_lambda_set && snap.has_aux_lambda) cfg->aux_lambda = snap.aux_lambda;
   // 算法开关同样继承，否则续训静默换算法（AdamW 退回 Adam、余弦退火变常数 lr）而 config 看不出来。
@@ -311,6 +318,7 @@ std::string carry_resume_best(const std::string& resume_path, const std::string&
   // 同步当前 run 的训练契约后再落盘，避免 --allow-resume-mismatch 跨目录续训时旧 contract 阻塞 --eval-only。
   s.contract = state.contract;
   s.contract_present = state.contract_present;
+  s.aux_sidecar_sha256 = state.aux_sidecar_sha256;
   save_checkpoint(dst_best.string(), m, s);
   return warning;
 }
@@ -429,9 +437,22 @@ void Trainer::run() {
         "trainer: 数据集有 instructions.jsonl 但 --text-dim 缺省为 0，会静默训成纯视觉模型；"
         "要文本分支请传 --text-dim N，要纯视觉基线请显式传 --vision-only");
   }
-  if ((cfg_.two_frame || cfg_.prev_action) && !ds.aux.present) {
+  if (cfg_.prev_action && cfg_.vln_nav) {
+    throw std::invalid_argument("trainer: --prev-action 与 --vln-nav 互斥");
+  }
+  if (cfg_.text_dim > 0 &&
+      (cfg_.augment == "all" || ("," + cfg_.augment + ",").find(",flip,") != std::string::npos)) {
+    throw std::invalid_argument("trainer: 文本模型不支持 flip 翻转增强（指令左右关系词未做同步互换）");
+  }
+  if ((cfg_.two_frame || cfg_.prev_action || cfg_.vln_nav || cfg_.stop_head) && !ds.aux.present) {
     throw std::runtime_error(
-        "trainer: --two-frame/--prev-action 需要 dataset.aux 侧车（用新版 preprocess.py 重打包）");
+        "trainer: --two-frame/--prev-action/--vln-nav/--stop-head 需要 dataset.aux 侧车（用新版 preprocess.py 重打包）");
+  }
+  if (cfg_.vln_nav && !ds.aux.has_nav_cond) {
+    throw std::runtime_error("trainer: --vln-nav 需要带 nav_cond 的 dataset.aux（preprocess.py --cond vln-nav）");
+  }
+  if (cfg_.stop_head && !ds.aux.has_stop) {
+    throw std::runtime_error("trainer: --stop-head 需要带 stop_target 的 dataset.aux（preprocess.py --cond vln-nav）");
   }
   if (cfg_.depth_aux && !(ds.aux.present && ds.aux.has_depth)) {
     throw std::runtime_error(
@@ -459,6 +480,12 @@ void Trainer::run() {
   // 本次运行的事实写入之后的所有 checkpoint（含 ckpt_best.bin）。
   state_.contract = make_contract(cfg_, ds.file_sha256);
   state_.contract_present = true;
+  state_.aux_sidecar_sha256 = ds.aux.present ? ds.aux.file_sha256 : Sha256{};
+  const float stop_pos_w =
+      cfg_.stop_head ? (cfg_.stop_pos_weight > 0.0f
+                            ? cfg_.stop_pos_weight
+                            : auto_stop_pos_weight(ds.aux.stop_target, ds.train_idx))
+                     : 1.0f;
   cfg_.adam_beta1 = state_.adam[0].beta1;
   cfg_.adam_beta2 = state_.adam[0].beta2;
   cfg_.adam_eps = state_.adam[0].eps;
@@ -531,7 +558,7 @@ void Trainer::run() {
 
   for (int ep = 1; ep <= cfg_.epochs; ++ep) {
     std::shuffle(order.begin(), order.end(), rng);
-    double ce_sum = 0.0, aux_ce_sum = 0.0;
+    double ce_sum = 0.0, aux_ce_sum = 0.0, stop_bce_sum = 0.0;
     std::uint64_t seen = 0, aux_valid = 0, aux_correct = 0, grad_clipped = 0;
     std::vector<float> grad_norms;
     if (cfg_.log_grad_norm) grad_norms.reserve(per_epoch);
@@ -551,8 +578,20 @@ void Trainer::run() {
       }
 
       const Tensor logits = forward_batch(ds, part, &y);
+      const Tensor act_logits = slice_action_logits(logits);
       float loss = 0.0f;
-      const Tensor dlogits = loss_and_grad(logits, y, q, &loss);
+      Tensor dlogits = loss_and_grad(act_logits, y, q, &loss);
+      if (cfg_.stop_head) {
+        std::vector<std::uint8_t> stop_y;
+        stop_y.reserve(part.size());
+        for (std::uint32_t idx : part) stop_y.push_back(ds.aux.stop_target.at(idx));
+        std::vector<float> dstop;
+        const float sbce =
+            stop_bce_loss_and_grad(logits, stop_y, stop_pos_w, cfg_.stop_lambda, &dstop);
+        if (!std::isfinite(sbce)) throw std::runtime_error("trainer: stop_head BCE 非有限值");
+        stop_bce_sum += static_cast<double>(sbce) * static_cast<double>(part.size());
+        dlogits = merge_action_stop_grad(dlogits, dstop);
+      }
       if (!std::isfinite(loss)) {
         metrics << metrics_json(make_error(Severity::kFatal, "TRAIN_NONFINITE_METRIC", step + 1,
                                            "训练 loss 非有限值，中止"))
@@ -560,7 +599,7 @@ void Trainer::run() {
         metrics.flush();
         throw std::runtime_error("trainer: loss 非有限值（step " + std::to_string(step + 1) + "）");
       }
-      const float acc = static_cast<float>(count_correct(logits, y)) /
+      const float acc = static_cast<float>(count_correct(act_logits, y)) /
                         static_cast<float>(part.size());
       const float lr_now = step_lr(step + 1, total_steps);
       if (cfg_.depth_aux) {
@@ -592,14 +631,15 @@ void Trainer::run() {
       const float plain =
           (class_weights_.empty() && soft_targets_.empty() && cfg_.label_smoothing <= 0.0f)
               ? loss
-              : softmax_ce_loss_cuda(logits, y);
+              : softmax_ce_loss_cuda(act_logits, y);
       ce_sum += static_cast<double>(plain) * static_cast<double>(part.size());
       seen += part.size();
     }
 
     const double train_ce = ce_sum / static_cast<double>(seen);
     EvalStats dev_stats;
-    evaluate(ds, dev, &dev_stats);
+    evaluate(ds, dev, &dev_stats, /*select_stop_thresh=*/!dev_is_train);
+    if (cfg_.stop_head && !dev_is_train) state_.stop_threshold = dev_stats.stop_threshold;
     // dev 非有限值必须中止：否则 CSV 写 "null"、宏 F1 仍有限，失效模型会被选成 best。
     if (!std::isfinite(dev_stats.ce) || !std::isfinite(dev_stats.acc) ||
         !std::isfinite(dev_stats.macro_f1) || !std::isfinite(dev_stats.balanced_acc)) {
@@ -641,6 +681,17 @@ void Trainer::run() {
                      num(train_depth_ce) + " train_acc=" + num(train_depth_acc) +
                      " dev_ce=" + num(dev_stats.depth_ce) + " dev_acc=" + num(dev_stats.depth_acc) +
                      " lambda=" + num(cfg_.aux_lambda)))
+              << '\n';
+    }
+    if (cfg_.stop_head) {
+      const double train_sbce = stop_bce_sum / static_cast<double>(seen);
+      std::printf(" stop_bce=%.4f/%.4f stop_f1=%.3f(th=%.2f)", train_sbce, dev_stats.stop_bce,
+                  dev_stats.stop_f1, static_cast<double>(state_.stop_threshold));
+      metrics << metrics_json(make_status(
+                     "stop_head epoch " + std::to_string(epoch_base + ep) + ": train_bce=" +
+                     num(train_sbce) + " dev_bce=" + num(dev_stats.stop_bce) + " dev_f1=" +
+                     num(dev_stats.stop_f1) + " thresh=" + num(state_.stop_threshold) +
+                     " pos_w=" + num(stop_pos_w)))
               << '\n';
     }
     std::printf("\n");
@@ -695,6 +746,7 @@ void Trainer::run() {
   if (!ds.test_idx.empty() && !dev_is_train && std::filesystem::exists(best_ckpt_path)) {
     TrainState best_state = state_;  // 只借用模型的权重布局校验，不回写训练状态
     load_checkpoint(best_ckpt_path, model_, best_state);
+    state_.stop_threshold = best_state.stop_threshold;
     dev_->upload(model_);
   }
   if (!ds.test_idx.empty()) {

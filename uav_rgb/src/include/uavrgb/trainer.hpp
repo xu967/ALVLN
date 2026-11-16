@@ -67,9 +67,14 @@ struct TrainConfig {
   // STUDENT-P2（都需要 dataset.aux 侧车；旧数据集没有侧车时这些开关直接报错，不静默降级）：
   bool two_frame = false;    // 输入 6 通道 [I_t ; I_{t-1}]（上一帧按侧车 prev_index 读）
   bool prev_action = false;  // 上一步执行的动作 one-hot 经 FiLM 进第三层
+  bool vln_nav = false;      // 15 维动态导航条件 [prev(4)|bearing(9)|near_goal(2)]（侧车 nav_cond）
+  bool stop_head = false;    // 第 5 维独立 STOP 输出头（侧车 stop_target 二分类 BCE）
+  float stop_lambda = 1.0f;
+  float stop_pos_weight = 0.0f;  // 0 = 按训练集负正例比自动计算并截断到 [1, 20]
   bool depth_aux = false;    // 1x1 深度分带辅助头，总损失 L = L_action + aux_lambda·L_depth
   float aux_lambda = 0.5f;
-  bool two_frame_set = false, prev_action_set = false, depth_aux_set = false,
+  bool two_frame_set = false, prev_action_set = false, vln_nav_set = false, stop_head_set = false,
+       stop_lambda_set = false, stop_pos_weight_set = false, depth_aux_set = false,
        aux_lambda_set = false;
   // 每轮多写一份 <out>/ckpt_ep{NN}.bin（NN = results.csv 的 epoch 列，格式同 ckpt.bin）。
   // 选模研究要对每一轮做离线探针/闭环（DISTILL §2.4：ckpt_best 是噪声序列上的最大值），
@@ -97,10 +102,12 @@ struct RunConfigSnapshot {
   int text_dim = 0;
   bool vision_only = false;
   std::string dataset_sha256;
-  bool has_two_frame = false, has_prev_action = false, has_depth_aux = false,
+  bool has_two_frame = false, has_prev_action = false, has_vln_nav = false, has_stop_head = false,
+       has_stop_lambda = false, has_stop_pos_weight = false, has_depth_aux = false,
        has_aux_lambda = false;
-  bool two_frame = false, prev_action = false, depth_aux = false;
-  float aux_lambda = 0.0f;
+  bool two_frame = false, prev_action = false, vln_nav = false, stop_head = false,
+       depth_aux = false;
+  float stop_lambda = 1.0f, stop_pos_weight = 0.0f, aux_lambda = 0.0f;
   bool has_augment = false, has_warmup_steps = false, has_cosine_lr = false,
        has_weight_decay = false, has_label_smoothing = false, has_max_grad_norm = false;
   std::string augment;
@@ -143,6 +150,11 @@ struct EvalStats {
   // 没有时都是 -1。
   double depth_ce = -1.0;
   double depth_acc = -1.0;
+  double stop_bce = -1.0;
+  double stop_f1 = -1.0;
+  double stop_precision = -1.0;
+  double stop_recall = -1.0;
+  float stop_threshold = 0.5f;
 };
 
 class Trainer {
@@ -170,8 +182,9 @@ class Trainer {
 
  private:
   void write_csv_header_if_needed() const;
-  // 在 idx 上评估，结果写进 out。
-  void evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& idx, EvalStats* out);
+  // 在 idx 上评估，结果写进 out；select_stop_thresh=true 时在验证集上扫描最佳 STOP 阈值。
+  void evaluate(const UavrDataset& ds, const std::vector<std::uint32_t>& idx, EvalStats* out,
+                bool select_stop_thresh = false);
   // 以下在 trainer_dev.cpp。
   // 读 part 这批样本（uint8 + token + 双帧的上一帧 + prev-action）并在 dev_ 上前向，返回 host
   // logits。train_labels 非空表示训练批：cfg_.augment 非空时做增强，翻转样本的左右偏航标签

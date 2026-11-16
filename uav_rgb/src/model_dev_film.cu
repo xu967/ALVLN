@@ -5,23 +5,33 @@
 #include "cuda_check.hpp"
 #include "uavrgb/model_dev.hpp"
 #include "uavrgb/ops_dev.hpp"
+#include "uavrgb/vln_head.hpp"
 
 #include <cuda_runtime.h>
 
 namespace uavrgb {
 namespace {
 
-// FiLM 条件向量 cond[n, cdim] = [文本特征 tfeat | prev one-hot]（与 model.cpp 一致）：
-// 文本段 <pad>(0) 与越界 id 的槽位置 0；prev 段只有 prev[s] 那一位是 1。
+// FiLM 条件向量 cond[n, cdim] = [文本特征 tfeat | prev/nav_cond one-hot]（与 model.cpp 一致）：
+// 文本段 <pad>(0) 与越界 id 的槽位置 0；prev_dim==15 时解包 3 段 one-hot，其余只点亮单一槽位。
 __global__ void cond_gather_kernel(const std::uint8_t* __restrict__ ids,
                                    const std::uint8_t* __restrict__ prev,
                                    const float* __restrict__ emb, float* __restrict__ cond,
-                                   int text_dim, int tfeat, int cdim, int total) {
+                                   int text_dim, int prev_dim, int tfeat, int cdim, int total) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= total) return;
   const int s = i / cdim, j = i % cdim;
   if (j >= tfeat) {
-    cond[i] = (prev[s] == j - tfeat) ? 1.0f : 0.0f;
+    const int rel = j - tfeat;
+    const int code = prev[s];
+    if (prev_dim == kVlnNavDim) {
+      const bool on = (rel < 4 && rel == (code % 4)) ||
+                      (rel >= 4 && rel < 13 && (rel - 4) == ((code / 4) % 9)) ||
+                      (rel >= 13 && (rel - 13) == (code / 36));
+      cond[i] = on ? 1.0f : 0.0f;
+    } else {
+      cond[i] = (code == rel) ? 1.0f : 0.0f;
+    }
     return;
   }
   const int id = ids[s * kTextLen + j / text_dim];
@@ -97,7 +107,7 @@ void DeviceCnn::film_forward(int n) {
   const int total = n * cond_dim_;
   cond_gather_kernel<<<blocks_for(total), kThreads>>>(
       text_u8_, prev_u8_, text_dim_ > 0 ? params_ + seg_[seg_emb_].off : nullptr, cond_,
-      text_dim_, tfeat, cond_dim_, total);
+      text_dim_, prev_dim_, tfeat, cond_dim_, total);
   launched("cond_gather_kernel");
   dev::linear_forward(n, cond_dim_, 2 * L.c_out, cond_, params_ + seg_[seg_film_].off,
                       params_ + seg_[seg_film_ + 1].off, film_out_);

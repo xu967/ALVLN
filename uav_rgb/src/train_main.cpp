@@ -30,7 +30,8 @@ void usage() {
                "[--text-dim N | --vision-only] [--soft-targets <bin> [--distill-alpha A]] "
                "[--allow-resume-mismatch] [--strict-distill] "
                "[--augment all|photo,shift,flip] [--warmup N] [--cosine-lr] [--weight-decay W] [--label-smoothing E]\n"
-               "       [--two-frame] [--prev-action] [--depth-aux [--aux-lambda L]]  （需要 dataset.aux 侧车）\n"
+               "       [--two-frame] [--prev-action | --vln-nav] [--stop-head [--stop-lambda L] [--stop-pos-weight W]]\n"
+               "       [--depth-aux [--aux-lambda L]]  （需要 dataset.aux 侧车）\n"
                "       [--save-every-epoch] [--log-grad-norm] [--cuda-blocking-sync]\n"
                "  或: uavrgb_train --data <dataset.uavr> --eval-only <ckpt> --out "
                "<run_dir> [--batch B] [--split val|test|all] [--drop-collision]\n");
@@ -136,6 +137,24 @@ int main(int argc, char** argv) {
       } else if (a == "--prev-action") {
         cfg.prev_action = true;
         cfg.prev_action_set = true;
+      } else if (a == "--vln-nav") {
+        cfg.vln_nav = true;
+        cfg.vln_nav_set = true;
+      } else if (a == "--stop-head") {
+        cfg.stop_head = true;
+        cfg.stop_head_set = true;
+      } else if (a == "--stop-lambda") {
+        cfg.stop_lambda = std::stof(next("--stop-lambda"));
+        if (!(cfg.stop_lambda >= 0.0f) || !std::isfinite(cfg.stop_lambda)) {
+          throw std::invalid_argument("--stop-lambda 必须为非负有限数");
+        }
+        cfg.stop_lambda_set = true;
+      } else if (a == "--stop-pos-weight") {
+        cfg.stop_pos_weight = std::stof(next("--stop-pos-weight"));
+        if (!(cfg.stop_pos_weight >= 0.0f) || !std::isfinite(cfg.stop_pos_weight)) {
+          throw std::invalid_argument("--stop-pos-weight 必须为非负有限数（0=自动）");
+        }
+        cfg.stop_pos_weight_set = true;
       } else if (a == "--depth-aux") {
         cfg.depth_aux = true;
         cfg.depth_aux_set = true;

@@ -96,7 +96,10 @@ def read_aux(path):
         prev_index = np.frombuffer(f.read(4 * n), dtype="<u4").astype(np.int64)
         prev_action = np.frombuffer(f.read(n), dtype=np.uint8).copy()
         depth = np.frombuffer(f.read(n * dh * dw), dtype=np.uint8).reshape(n, dh, dw).copy() if flags & 1 else None
+        stop_target = np.frombuffer(f.read(n), dtype=np.uint8).copy() if flags & 2 else None
+        nav_cond_col = np.frombuffer(f.read(n), dtype=np.uint8).copy() if flags & 4 else None
     return {"n": n, "prev_index": prev_index, "prev_action": prev_action, "depth": depth,
+            "stop_target": stop_target, "nav_cond": nav_cond_col,
             "grid": (dh, dw), "envelope_radius_m": env_r}
 
 
@@ -265,7 +268,7 @@ def read_ckpt_drop_collision(path):
         if len(raw) != CKPT_HEAD.size:
             raise ValueError(f"{path}: checkpoint 头不足 {CKPT_HEAD.size} B")
         magic, ver, _np, _h, _w, _c, _nc, _at, _ep, nw = CKPT_HEAD.unpack(raw)
-        if magic != b"UAVRCK01" or ver < 2 or ver > 6 or nw > 64:
+        if magic != b"UAVRCK01" or ver < 2 or ver > 7 or nw > 64:
             raise ValueError(f"{path}: 非法 UAVRCK01 头（magic={magic!r} version={ver}）")
         if ver < 5:
             return False, False

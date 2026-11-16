@@ -12,11 +12,12 @@
 
 #include "uavrgb/model_dev.hpp"
 #include "uavrgb/tensor.hpp"
+#include "uavrgb/vln_head.hpp"
 
 namespace uavrgb {
 
 std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream& out,
-                           std::vector<std::uint8_t> text_ids) {
+                           std::vector<std::uint8_t> text_ids, float stop_threshold) {
   // 文本分支：--text 的 id 补齐到 kTextLen（缺的补 <pad>=0），逐帧复用同一段指令。
   // 空串 = 无指令（全部 pad），L2 的「文本置空」消融就靠它。
   std::vector<std::uint8_t> text;
@@ -48,10 +49,12 @@ std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream
   // + prev-action 1 字节（模型接 prev-action 时）。CHW 里通道 0..2 是当前帧、3..5 是上一帧。
   const int images = c / kRgbChannels;
   const std::size_t one = static_cast<std::size_t>(h) * w * kRgbChannels;
-  const std::size_t payload = one * images + (model.prev_dim > 0 ? 1 : 0);
+  const std::size_t cond_bytes = (model.prev_dim == kVlnNavDim) ? 3 : (model.prev_dim > 0 ? 1 : 0);
+  const std::size_t payload = one * images + cond_bytes;
+  const int act_cls = (ncls == kActionStopClasses) ? kActionClasses : ncls;
   std::vector<std::uint8_t> rgb(payload);
   std::vector<std::uint8_t> chw(one * images);
-  std::vector<double> probs(static_cast<std::size_t>(ncls));
+  std::vector<double> probs(static_cast<std::size_t>(act_cls));
   std::size_t frames = 0;
   // 权重常驻显存，每帧只上传 h*w*c 字节；/255 在设备侧做，与训练 DeviceCnn 同一个 kernel、
   // 同一舍入（host load_images 也写成 x/255.0f；闭环与打包两条输入路对拍见 tools/check_input_parity.py）。
@@ -77,9 +80,21 @@ std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream
         }
       }
     }
-    const std::uint8_t prev = model.prev_dim > 0 ? rgb[payload - 1] : 0;
-    if (model.prev_dim > 0 && prev >= model.prev_dim) {
-      throw std::runtime_error("infer: prev-action 字节越界: " + std::to_string(prev));
+    std::uint8_t prev = 0;
+    if (model.prev_dim == kVlnNavDim) {
+      const std::uint8_t b0 = rgb[payload - 3];
+      const std::uint8_t b1 = rgb[payload - 2];
+      const std::uint8_t b2 = rgb[payload - 1];
+      if (b0 >= kActionClasses || b1 > kBearingUnknown || b2 > 1) {
+        throw std::runtime_error("infer: vln_nav 3 字节条件越界: (" + std::to_string(b0) + "," +
+                                 std::to_string(b1) + "," + std::to_string(b2) + ")");
+      }
+      prev = encode_vln_nav(b0, b1, b2);
+    } else if (model.prev_dim > 0) {
+      prev = rgb[payload - 1];
+      if (prev >= model.prev_dim) {
+        throw std::runtime_error("infer: prev-action 字节越界: " + std::to_string(prev));
+      }
     }
 
     const auto t0 = std::chrono::steady_clock::now();
@@ -91,23 +106,32 @@ std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream
     }
 
     double max_logit = logits[0];
-    for (int k = 1; k < ncls; ++k) max_logit = std::max(max_logit, static_cast<double>(logits[k]));
+    for (int k = 1; k < act_cls; ++k) max_logit = std::max(max_logit, static_cast<double>(logits[k]));
     double sum = 0.0;
     int best = 0;
-    for (int k = 0; k < ncls; ++k) {
+    for (int k = 0; k < act_cls; ++k) {
       probs[k] = std::exp(static_cast<double>(logits[k]) - max_logit);
       sum += probs[k];
       if (logits[k] > logits[best]) best = k;
     }
-    for (int k = 0; k < ncls; ++k) probs[k] /= sum;
+    for (int k = 0; k < act_cls; ++k) probs[k] /= sum;
 
     const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     out << "{\"action\":" << best << ",\"probs\":[";
-    for (int k = 0; k < ncls; ++k) {
+    for (int k = 0; k < act_cls; ++k) {
       if (k) out << ',';
       out << probs[k];
     }
-    out << "],\"infer_ms\":" << ms << "}\n";
+    out << "],\"infer_ms\":" << ms;
+    if (ncls == kActionStopClasses) {
+      const double z = static_cast<double>(logits[kActionClasses]);
+      const double stop_prob =
+          (z >= 0.0) ? (1.0 / (1.0 + std::exp(-z))) : (std::exp(z) / (1.0 + std::exp(z)));
+      const bool stop_req = stop_prob >= static_cast<double>(stop_threshold);
+      out << ",\"stop_prob\":" << stop_prob
+          << ",\"stop_requested\":" << (stop_req ? "true" : "false");
+    }
+    out << "}\n";
     out.flush();
     if (!out) throw std::runtime_error("infer: stdout 写入失败");
     ++frames;

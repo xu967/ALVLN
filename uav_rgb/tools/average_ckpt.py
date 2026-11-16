@@ -73,14 +73,14 @@ def read_ckpt(path):
         b = f.read()
     head = CK_HEAD.unpack_from(b, 0) if len(b) >= CK_HEAD.size else (b"", 0, 0, 0, 0, 0, 0, 0, 0, 0)
     magic, ver, pc, h, w, c, ncls, _adam_t, epoch, nw = head
-    if magic != b"UAVRCK01" or ver != 6 or nw not in (0, ncls) or min(h, w, c, ncls) <= 0:
-        raise ValueError(f"{path}: 不是合法的 UAVRCK01 v6（magic={magic!r} version={ver}）")
+    if magic != b"UAVRCK01" or ver not in (6, 7) or nw not in (0, 4, ncls) or min(h, w, c, ncls) <= 0:
+        raise ValueError(f"{path}: 不是合法的 UAVRCK01 v6/v7（magic={magic!r} version={ver}）")
     off = CK_HEAD.size + 4 * nw + 4                      # class_weights、best_macro_f1
     text_dim, = struct.unpack_from("<i", b, off)
     off += 4 + 113                                       # text_dim、v5 训练契约（定长 113 B，开头 32 B 是训练数据集 sha256）
     contract = b[off - 113:off]
     aux, prev = struct.unpack_from("<2i", b, off)
-    off += 8
+    off += 8 + (36 if ver >= 7 else 0)                   # v7 追加 32B aux_sidecar_sha256 + 4B stop_threshold
     params, spans = [], []
     for _ in range(pc):
         nd, = struct.unpack_from("<I", b, off)
@@ -225,11 +225,11 @@ def read_aux_cond(data, data_sha):
     if len(raw) < AUX_HEAD_BYTES:
         raise ValueError(f"{path}: 文件头不足 {AUX_HEAD_BYTES} B")
     magic, n_aux, flags, dh, dw, _k, unknown, _res = AUX_HEAD.unpack_from(raw)
-    if magic != b"UAVRAUX1" or n_aux != n or flags > 1 or unknown != 255:
+    if magic != b"UAVRAUX1" or n_aux != n or (flags & ~7) != 0 or unknown != 255:
         raise ValueError(f"{path}: 头不合法或与数据集不符（magic={magic!r} N={n_aux}（数据集 {n}）flags={flags} unknown_code={unknown}）")
     if raw[28:60].hex() != data_sha:
         raise ValueError(f"{path}: 头里的 uavr sha256 {raw[28:40].hex()}… 与 --data 的 {data_sha[:12]}… 不同：侧车不是从这份数据集生成的，请重新 preprocess")
-    expect = AUX_HEAD_BYTES + 5 * n + (n * dh * dw if flags & 1 else 0)
+    expect = AUX_HEAD_BYTES + 5 * n + (n * dh * dw if flags & 1 else 0) + (n if flags & 2 else 0) + (n if flags & 4 else 0)
     if len(raw) != expect:
         raise ValueError(f"{path}: 文件长 {len(raw)} != 期望 {expect}")
     if hashlib.sha256(raw[AUX_HEAD_BYTES:]).digest() != raw[60:92]:

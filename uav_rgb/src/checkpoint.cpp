@@ -1,5 +1,6 @@
 // checkpoint 读写实现；格式见 include/uavrgb/checkpoint.hpp 的文件头注释。
 #include "uavrgb/checkpoint.hpp"
+#include "uavrgb/vln_head.hpp"
 
 #include <cmath>
 #include <cstdint>
@@ -13,8 +14,13 @@ namespace uavrgb {
 namespace {
 
 constexpr char kMagic[8] = {'U', 'A', 'V', 'R', 'C', 'K', '0', '1'};
-constexpr std::uint32_t kVersion = 6;     // v6 追加 aux_classes / prev_dim（STUDENT-P2）
+constexpr std::uint32_t kVersion = 7;     // v7 追加 aux_sidecar_sha256(32B) + stop_threshold(f32)
 constexpr std::uint32_t kMinVersion = 2;  // v2 没有 best_macro_f1，读回 -1
+
+bool valid_weight_count(std::size_t nw, int num_classes) {
+  return nw == 0 || nw == static_cast<std::size_t>(num_classes) ||
+         (num_classes == kActionStopClasses && nw == static_cast<std::size_t>(kActionClasses));
+}
 
 [[noreturn]] void bad(const std::string& msg) {
   throw std::invalid_argument("checkpoint: " + msg);
@@ -119,6 +125,21 @@ V6Fields read_v6(std::ifstream& f, std::uint32_t version) {
   return v;
 }
 
+struct V7Fields {
+  Sha256 aux_sidecar_sha256{};
+  float stop_threshold = kDefaultStopThreshold;
+};
+V7Fields read_v7(std::ifstream& f, std::uint32_t version) {
+  V7Fields v;
+  if (version < 7) return v;
+  get_sha(f, v.aux_sidecar_sha256, "aux_sidecar_sha256");
+  get<float>(f, v.stop_threshold, "stop_threshold");
+  if (!std::isfinite(v.stop_threshold) || v.stop_threshold <= 0.0f || v.stop_threshold >= 1.0f) {
+    bad("stop_threshold 非法（须在 (0, 1) 内）");
+  }
+  return v;
+}
+
 // v4 把 text_dim 放在 best_macro_f1 之后（新版本只追加，旧偏移不变）。
 std::int32_t read_text_dim(std::ifstream& f, std::uint32_t version) {
   if (version < 4) return 0;
@@ -171,9 +192,11 @@ void save_checkpoint(const std::string& path, const CnnModel& model, const Train
   put<std::int32_t>(f, model.fc.out);
   put<std::uint32_t>(f, static_cast<std::uint32_t>(st.adam[0].t));
   put<std::uint32_t>(f, static_cast<std::uint32_t>(st.epoch));
-  if (!st.class_weights.empty() &&
-      st.class_weights.size() != static_cast<std::size_t>(model.fc.out)) {
+  if (!valid_weight_count(st.class_weights.size(), model.fc.out)) {
     bad("class_weights 长度与 num_classes 不符");
+  }
+  if (!std::isfinite(st.stop_threshold) || st.stop_threshold <= 0.0f || st.stop_threshold >= 1.0f) {
+    bad("stop_threshold 非法（须在 (0, 1) 内）");
   }
   put<std::uint32_t>(f, static_cast<std::uint32_t>(st.class_weights.size()));
   for (float w : st.class_weights) put<float>(f, w);
@@ -190,6 +213,8 @@ void save_checkpoint(const std::string& path, const CnnModel& model, const Train
   f.write(reinterpret_cast<const char*>(st.contract.split_scheme_sha256.data()), 32);
   put<std::int32_t>(f, model.aux_classes);  // v6 追加，放在契约之后：v5 读端的偏移不变
   put<std::int32_t>(f, model.prev_dim);
+  f.write(reinterpret_cast<const char*>(st.aux_sidecar_sha256.data()), 32);  // v7 追加（36 B）
+  put<float>(f, st.stop_threshold);
 
   for (std::size_t i = 0; i < ps.size(); ++i) {
     check_finite("param[" + std::to_string(i) + "]", *ps[i]);
@@ -222,7 +247,7 @@ CheckpointMeta read_checkpoint_meta(const std::string& path) {
   get<std::uint32_t>(f, t, "adam_t");
   get<std::uint32_t>(f, epoch, "epoch");
   get<std::uint32_t>(f, nw, "class_weight_count");
-  if (nw != 0 && nw != static_cast<std::uint32_t>(h.num_classes)) bad("class_weights 数量不符");
+  if (!valid_weight_count(nw, h.num_classes)) bad("class_weights 数量不符");
   for (std::uint32_t i = 0; i < nw; ++i) {
     float w = 0.0f;
     get<float>(f, w, "class_weight");
@@ -239,8 +264,9 @@ CheckpointMeta read_checkpoint_meta(const std::string& path) {
     drop = c.drop_collision;
   }
   const V6Fields v6 = read_v6(f, h.version);
+  const V7Fields v7 = read_v7(f, h.version);
   return {h.in_h, h.in_w, h.in_c, h.num_classes, text_dim, v6.aux_classes, v6.prev_dim,
-          has_drop, drop};
+          has_drop, drop, v7.aux_sidecar_sha256, v7.stop_threshold};
 }
 
 void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
@@ -265,7 +291,7 @@ void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
 
   std::uint32_t nw = 0;
   get<std::uint32_t>(f, nw, "class_weight_count");
-  if (nw != 0 && nw != static_cast<std::uint32_t>(model.fc.out)) bad("class_weights 数量不符");
+  if (!valid_weight_count(nw, model.fc.out)) bad("class_weights 数量不符");
   st.class_weights.resize(nw);
   for (float& w : st.class_weights) {
     get<float>(f, w, "class_weight");
@@ -293,6 +319,9 @@ void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
         std::to_string(v6.prev_dim) + " vs 模型 " + std::to_string(model.aux_classes) + "/" +
         std::to_string(model.prev_dim) + "）");
   }
+  const V7Fields v7 = read_v7(f, version);
+  st.aux_sidecar_sha256 = v7.aux_sidecar_sha256;
+  st.stop_threshold = v7.stop_threshold;
 
   std::vector<std::int64_t> dims;
   for (std::size_t i = 0; i < ps.size(); ++i) {
