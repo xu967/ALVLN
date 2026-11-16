@@ -293,6 +293,8 @@ class OccAstarTeacher:
     def reset(self):
         """集边界清除任务完成意图与转向滞回状态。"""
         self.stop_requested = False
+        self.last_bearing_bin = None
+        self.last_near_goal = None
         self._turn_dir = None
         self._blocked_turn = None
 
@@ -369,6 +371,7 @@ class OccAstarTeacher:
         tx, ty = self.planner.aim_point(path, x, y, lookahead=0.65 + 0.8 * spd,
                                         los_max=3.0, hard_los_max=hard_los)
         err = _wrap(math.degrees(math.atan2(ty - y, tx - x)) - yaw_deg)
+        self.last_bearing_bin = int(math.floor(((math.radians(err) + math.pi / 8.0) / (math.pi / 4.0)))) % 8
         yaw = math.radians(yaw_deg)
         fwd_blocked = self._forward_stop_blocked(x, y, z, yaw, vx, vy)
 
@@ -422,18 +425,24 @@ class OccAstarTeacher:
         if math.hypot(x - self.wp[0], y - self.wp[1]) <= self.stop_radius:
             self.last_branch = "stop"
             self.stop_requested = True
+            err_wp = _wrap(math.degrees(math.atan2(self.wp[1] - y, self.wp[0] - x)) - yaw_deg)
+            self.last_bearing_bin = int(math.floor(((math.radians(err_wp) + math.pi / 8.0) / (math.pi / 4.0)))) % 8
+            self.last_near_goal = 1
             return SAFE_NEUTRAL, None
+        self.last_near_goal = 0
         path = self.planner.plan((x, y), self.wp)
         self.last_path = path
         if path is None:                      # 被围死 / waypoint 不可达：fail closed
             self.n_plan_fail += 1
             self.last_branch = "plan_fail"
+            self.last_bearing_bin = 8
             self._turn_dir = None
             return SAFE_NEUTRAL, None
         if self.clearance == "braking":
             return self._act_braking(path, state, x, y, z, yaw_deg)
         tx, ty = self.planner.aim_point(path, x, y, self.lookahead)
         err = _wrap(math.degrees(math.atan2(ty - y, tx - x)) - yaw_deg)
+        self.last_bearing_bin = int(math.floor(((math.radians(err) + math.pi / 8.0) / (math.pi / 4.0)))) % 8
         if err > self.tol:
             self.last_branch = "turn_err"
             return YAW_LEFT, None

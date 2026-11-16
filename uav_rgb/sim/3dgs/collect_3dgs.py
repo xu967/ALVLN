@@ -157,27 +157,33 @@ class StudentAdapter:
     """student.py 的常驻 C++ 推理；把渲染 RGB 包成 gz.msgs.Image dict。
 
     StudentPolicy 自己把 320x240 缩到模型输入（默认 160x120），与 preprocess 一致。
+    支持 4 维 prev-action/heading-code 模型与 15 维 vln-nav + 第 5 维独立 STOP 头模型。
     """
 
     name = "student"
-    stop_requested = False       # 当前四动作模型没有任务完成头，SAFE 不能代替 STOP
 
-    def __init__(self, student):
+    def __init__(self, student, goal_fn=None, rgb_transform=None):
         self.student = student
+        self.goal_fn = goal_fn
+        self.rgb_transform = rgb_transform
+        pdim = getattr(student, "prev_dim", 0)
+        req_cond = nav_cond.COND_VLN_NAV if pdim == nav_cond.VLN_NAV_DIM else nav_cond.COND_PREV_ACTION
         validate = getattr(student, "validate_inputs", None)
         if validate is not None:
-            validate(nav_cond.COND_PREV_ACTION)
-        # 学生喂的条件输入：prev-action = 上一步**实际执行**的动作（训练侧车取的就是 action_executed）；
-        # None = 纯图像模型（prev_dim = 0），没有条件输入。run_episode 把非 None 的值写进 manifest 的 student_cond。
-        self.student_cond = nav_cond.COND_PREV_ACTION if getattr(student, "prev_dim", 0) else None
+            validate(req_cond)
+        self.student_cond = req_cond if pdim else None
+        self.stop_requested = False
+        self.last_bearing_bin = None
+        self.last_near_goal = None
         self.reset()
 
     def reset(self):
-        """集边界。一个 adapter 对应一集；eval_3dgs 跨集复用同一个 StudentPolicy 进程。双帧 / prev-action 模型
-        缓存上一帧与上一步动作，不清掉的话第 k≥1 集首帧拿的是上一集末帧（REVIEW-P2 实测 max|Δp|=0.225，
-        第一步就可能错方向）；训练口径是首帧「上一帧=自身、prev=SAFE」。单帧模型 reset 是空操作。"""
+        """集边界：清掉上一帧/上一步动作与停止请求缓存。"""
         self.student.reset()
         self.last_executed = SAFE_NEUTRAL
+        self.stop_requested = False
+        self.last_bearing_bin = None
+        self.last_near_goal = None
 
     def note_executed(self, action):
         """改写动作的包装层（DaggerPolicy 的 β 混合、OracleGuardedPolicy 的护栏）调用：下一步喂给学生的上一步动作是改写之后真正执行的。"""
@@ -185,14 +191,24 @@ class StudentAdapter:
 
     def __call__(self, rgb, depth, state):
         import base64
-        h, w = rgb.shape[:2]
+        rgb_in = self.rgb_transform(rgb) if self.rgb_transform is not None else rgb
+        h, w = rgb_in.shape[:2]
         msg = {"width": w, "height": h, "step": w * 3,
                "pixelFormatType": "RGB_INT8",
-               "data": base64.b64encode(np.ascontiguousarray(rgb).tobytes()).decode()}
-        # 不传 prev_action 时 student.act 用模型自己上一步的输出，改写之后就与训练口径不同（审核 C2 / G1 / F1）；
-        # 纯图像模型照旧不传，act 的调用与改动前逐位相同。
-        kw = {"prev_action": self.last_executed} if self.student_cond == nav_cond.COND_PREV_ACTION else {}
+               "data": base64.b64encode(np.ascontiguousarray(rgb_in).tobytes()).decode()}
+        if self.student_cond == nav_cond.COND_VLN_NAV:
+            bb, ng = self.goal_fn(rgb, state) if self.goal_fn is not None else (nav_cond.BEARING_UNKNOWN, 0)
+            self.last_bearing_bin = int(bb)
+            self.last_near_goal = int(ng)
+            kw = {"prev_action": self.last_executed,
+                  "bearing_bin": self.last_bearing_bin,
+                  "near_goal": self.last_near_goal}
+        elif self.student_cond == nav_cond.COND_PREV_ACTION:
+            kw = {"prev_action": self.last_executed}
+        else:
+            kw = {}
         action, infer_ms, _probs = self.student.act(msg, **kw)
+        self.stop_requested = bool(getattr(self.student, "last_stop_requested", False))
         self.last_executed = action      # 没有人改写时，执行的就是模型自己的输出
         return action, infer_ms
 
@@ -207,8 +223,9 @@ class DaggerPolicy:
 
     name = "plan_action"
 
-    def __init__(self, student, expert, beta, rng):
-        self.student, self.expert, self.beta, self.rng = StudentAdapter(student), expert, float(beta), rng
+    def __init__(self, student, expert, beta, rng, goal_fn=None):
+        self.student = StudentAdapter(student, goal_fn=goal_fn)
+        self.expert, self.beta, self.rng = expert, float(beta), rng
         self.student_cond = self.student.student_cond     # run_episode 写进 manifest 的 student_cond（纯图像学生为 None，不写）
         self.planner_name = expert.planner_name
         self.version = getattr(expert, "version", None)
@@ -216,6 +233,7 @@ class DaggerPolicy:
         self.clearance = getattr(expert, "clearance", None)   # 教师前向净空检查的形状（ray / swept），写进 manifest 的 teacher_clearance
         self.stop_radius = expert.stop_radius
         self.last_expert = None
+        self.last_stop_expert = False
         self.n_expert_exec = 0
         self.stop_requested = False
 
@@ -225,7 +243,16 @@ class DaggerPolicy:
         if hasattr(self.expert, "reset"):
             self.expert.reset()
         self.last_expert = None
+        self.last_stop_expert = False
         self.stop_requested = False
+
+    @property
+    def last_bearing_bin(self):
+        return self.student.last_bearing_bin
+
+    @property
+    def last_near_goal(self):
+        return self.student.last_near_goal
 
     def note_executed(self, action):
         """外层护栏改写了本策略的动作：转给学生适配器，下一步的上一步动作取改写之后的。"""
@@ -241,11 +268,12 @@ class DaggerPolicy:
 
     def __call__(self, rgb, depth, state):
         self.last_expert, _ = self.expert(rgb, depth, state)
+        self.last_stop_expert = bool(getattr(self.expert, "stop_requested", False))
         action, infer_ms = self.student(rgb, depth, state)
         self.stop_requested = self.student.stop_requested
         if self.beta > 0.0 and self.rng.random() < self.beta:
             action = self.last_expert
-            self.stop_requested = getattr(self.expert, "stop_requested", False)
+            self.stop_requested = self.last_stop_expert
             self.n_expert_exec += 1
             self.student.note_executed(action)     # 学生下一步看到的上一步动作是教师动作，不是它自己的输出
         return action, infer_ms
@@ -458,12 +486,19 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                            "vx_body_mps": round(vx_body, 3), "displacement_m": round(dist, 3)}
             ts0 = int(round(t_rgb * 1e9))
             ts1 = int(round(state["t"] * 1e9))
+            stop_expert = (policy.last_stop_expert if isinstance(policy, DaggerPolicy)
+                           else stop_requested if policy.name == "plan_action" else None)
             actions.append({
                 "step": i,
                 "timestamp_ns": ts0,
                 "action_expert": expert,
                 "action_executed": action,
                 **({"stop_requested": stop_requested} if stop_on_request else {}),
+                **({"stop_expert": stop_expert} if (stop_on_request and stop_expert is not None) else {}),
+                **({"bearing_bin": policy.last_bearing_bin}
+                   if (stop_on_request and getattr(policy, "last_bearing_bin", None) is not None) else {}),
+                **({"near_goal": policy.last_near_goal}
+                   if (stop_on_request and getattr(policy, "last_near_goal", None) is not None) else {}),
                 "collision": hit_once,
                 # 与 collect.py 对齐：src 区分碰撞来源；voxel_proxy = 本步扫掠撞到，post_collision = 撞后穿模的步。
                 "src": src,
@@ -501,15 +536,15 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                 terminal_reason = "dynamics_anomaly"
                 print(f"step {i}: 动力学异常 {anomaly}，提前结束", file=sys.stderr)
                 break
+            if truncate_on_collision and not stop_on_collision and collided:
+                truncated = True
+                terminal_reason = "collision"
+                print(f"step {i}: 碰撞，本集到此截断（这一行留给 --drop-collision）", file=sys.stderr)
+                break
             if (stop_on_collision or stop_on_request) and collided:
                 stopped = True
                 terminal_reason = "collision"
                 print(f"step {i}: 碰撞，提前结束", file=sys.stderr)
-                break
-            if truncate_on_collision and collided:
-                truncated = True
-                terminal_reason = "collision"
-                print(f"step {i}: 碰撞，本集到此截断（这一行留给 --drop-collision）", file=sys.stderr)
                 break
             if stop_on_request and stop_requested:
                 stopped_by_agent = True

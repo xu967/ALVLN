@@ -281,4 +281,195 @@ class RelationPhraseGrounder(LexicalGrounder):
         return Grounding(best_name if accepted else None, best_score, margin, accepted, reason)
 
 
-__all__ = ["Grounding", "LexicalGrounder", "RelationPhraseGrounder", "load_catalog"]
+__all__ = [
+    "BEARING_SEARCH", "Grounding", "LexicalGrounder", "RelationPhraseGrounder",
+    "VisualGrounding", "VisualLanguageGrounder", "load_catalog", "parse_vlm_output",
+]
+
+BEARING_SEARCH = 8  # 当前视野未见目标，驱动机载策略原地旋转搜索
+
+_SECTOR_TO_BIN = {
+    "c": 0, "center": 0, "front": 0, "ahead": 0, "middle": 0, "0": 0,
+    "l": 1, "left": 1, "fl": 1, "front_left": 1, "front-left": 1, "1": 1,
+    "far_left": 2, "2": 2,
+    "bl": 3, "back_left": 3, "3": 3,
+    "b": 4, "back": 4, "behind": 4, "4": 4,
+    "br": 5, "back_right": 5, "5": 5,
+    "far_right": 6, "6": 6,
+    "r": 7, "right": 7, "fr": 7, "front_right": 7, "front-right": 7, "7": 7,
+    "n": 8, "none": 8, "search": 8, "unseen": 8, "not_visible": 8, "occluded": 8, "8": 8,
+}
+
+
+@dataclass(frozen=True)
+class VisualGrounding:
+    bearing_bin: int
+    near_goal: int
+    conf: float
+    reason: str
+    latency_ms: float = 0.0
+
+    def __post_init__(self):
+        if isinstance(self.bearing_bin, bool) or not (0 <= int(self.bearing_bin) <= 8):
+            raise ValueError(f"bearing_bin 必须在 0..8 内，得到 {self.bearing_bin!r}")
+        if isinstance(self.near_goal, bool) or int(self.near_goal) not in (0, 1):
+            raise ValueError(f"near_goal 必须是 0 或 1，得到 {self.near_goal!r}")
+        if not math.isfinite(float(self.conf)) or not (0.0 <= float(self.conf) <= 1.0):
+            raise ValueError(f"conf 必须在 [0, 1] 内，得到 {self.conf!r}")
+
+
+def parse_vlm_output(raw_text, default_conf=0.8):
+    """稳健解析 VLM 结构化输出（兼容紧凑数组 ["L",0,"tv"]、JSON 对象及截断回退）。"""
+    txt = str(raw_text or "").strip()
+    if "```" in txt:
+        txt = re.sub(r"^```(?:json)?|```$", "", txt, flags=re.IGNORECASE | re.MULTILINE).strip()
+    conf = max(0.0, min(1.0, float(default_conf)))
+    sector_raw, near_raw, reason = "N", 0, "fallback"
+    parsed = None
+    for candidate in (txt, txt + '"]', txt + "]"):
+        try:
+            parsed = json.loads(candidate)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        m_obj = re.search(r"\{.*\}", txt, re.DOTALL)
+        if m_obj:
+            try:
+                parsed = json.loads(m_obj.group(0))
+            except ValueError:
+                parsed = None
+    if isinstance(parsed, list) and len(parsed) >= 2:
+        sector_raw = str(parsed[0]).strip()
+        near_raw = parsed[1]
+        if len(parsed) >= 3:
+            reason = str(parsed[2]).strip() or "ok"
+    elif isinstance(parsed, dict):
+        if "bearing_bin" in parsed and isinstance(parsed["bearing_bin"], int):
+            sector_raw = str(parsed["bearing_bin"])
+        else:
+            sector_raw = str(parsed.get("sector", parsed.get("s", "N"))).strip()
+        near_raw = parsed.get("near_goal", parsed.get("near", parsed.get("g", 0)))
+        if "conf" in parsed or "c" in parsed:
+            raw_c = float(parsed.get("conf", parsed.get("c", conf)))
+            conf = raw_c / 10.0 if raw_c > 1.0 else raw_c
+            conf = max(0.0, min(1.0, conf))
+        reason = str(parsed.get("reason", parsed.get("r", parsed.get("why", "ok")))).strip() or "ok"
+    else:
+        m = re.match(r'^\[\s*"([A-Za-z_-]+)"\s*,\s*([01])', txt)
+        if m:
+            sector_raw, near_raw, reason = m.group(1), int(m.group(2)), "regex_partial"
+        else:
+            return BEARING_SEARCH, 0, 0.0, "parse_fallback"
+
+    bb = _SECTOR_TO_BIN.get(sector_raw.lower(), BEARING_SEARCH)
+    try:
+        ng = 1 if int(bool(int(near_raw))) == 1 else 0
+    except (TypeError, ValueError):
+        ng = 1 if str(near_raw).lower() in ("true", "yes") else 0
+    if bb == BEARING_SEARCH:
+        ng = 0
+    return bb, ng, conf, reason[:64]
+
+
+class VisualLanguageGrounder:
+    """零特权视觉语言 Grounder：仅根据机载 RGB 帧历史与自然语言指令输出相对方位桶与近目标标志。"""
+
+    DEFAULT_PYTHON = "/root/rivermind-data/uav_rgb/envs/vlm-venv/bin/python"
+    DEFAULT_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vlm_grounder_worker.py")
+
+    def __init__(self, model_path=None, python_bin=None, worker_cmd=None, timeout_s=180.0):
+        import subprocess
+        self.timeout_s = float(timeout_s)
+        if worker_cmd is not None:
+            cmd = list(worker_cmd)
+        else:
+            py = python_bin or os.environ.get("UAV_RGB_VLM_PYTHON", self.DEFAULT_PYTHON)
+            if not os.path.isfile(py):
+                raise FileNotFoundError(f"找不到 VLM Python 环境: {py}")
+            cmd = [py, self.DEFAULT_WORKER]
+        env = os.environ.copy()
+        if model_path:
+            env["UAV_RGB_VLM_MODEL"] = str(model_path)
+        self._proc = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, bufsize=1, env=env,
+        )
+        ready_line = self._readline(self.timeout_s, "startup")
+        doc = json.loads(ready_line)
+        if doc.get("status") != "ready":
+            self.close()
+            raise RuntimeError(f"VLM worker 未就绪: {ready_line}")
+
+    def _readline(self, timeout_s, stage):
+        import select
+        if self._proc is None or self._proc.stdout is None:
+            raise RuntimeError("VLM worker 已关闭")
+        rlist, _, _ = select.select([self._proc.stdout], [], [], timeout_s)
+        if not rlist:
+            err = ""
+            self.close()
+            raise TimeoutError(f"VLM worker {stage} 超时 ({timeout_s}s) {err}")
+        line = self._proc.stdout.readline()
+        if not line:
+            err = self._proc.stderr.read() if self._proc.stderr else ""
+            self.close()
+            raise RuntimeError(f"VLM worker {stage} 提前退出: {err.strip()}")
+        return line
+
+    def ground_step(self, rgb_history, instruction: str) -> VisualGrounding:
+        """严格零特权接口：仅接收机载 RGB 数组（单帧 HWC 或帧序列）与语言指令。"""
+        import base64
+        import io
+        import time
+        import numpy as np
+        from PIL import Image
+
+        text = str(instruction or "").strip()
+        if not text:
+            return VisualGrounding(BEARING_SEARCH, 0, 0.0, "empty_instruction", 0.0)
+        if isinstance(rgb_history, np.ndarray) and rgb_history.ndim == 3:
+            frames = [rgb_history]
+        else:
+            frames = list(rgb_history or ())
+        if not frames:
+            return VisualGrounding(BEARING_SEARCH, 0, 0.0, "empty_rgb_history", 0.0)
+
+        t0 = time.perf_counter()
+        arr = np.asarray(frames[-1], dtype=np.uint8)
+        if arr.ndim != 3 or arr.shape[2] != 3:
+            raise ValueError(f"RGB 帧必须是 HxWx3 uint8，得到 {arr.shape}")
+        buf = io.BytesIO()
+        Image.fromarray(arr).save(buf, format="JPEG", quality=85)
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+
+        req = json.dumps({"frames_b64": [b64], "instruction": text}, ensure_ascii=False)
+        self._proc.stdin.write(req + "\n")
+        self._proc.stdin.flush()
+        resp = json.loads(self._readline(min(self.timeout_s, 30.0), "ground_step"))
+        ms = (time.perf_counter() - t0) * 1000.0
+        bb, ng, conf, reason = parse_vlm_output(resp.get("raw", ""), default_conf=resp.get("conf", 0.5))
+        return VisualGrounding(bb, ng, conf, reason, round(ms, 2))
+
+    def close(self):
+        proc, self._proc = getattr(self, "_proc", None), None
+        if proc is None:
+            return
+        try:
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.write('{"cmd":"close"}\n')
+                proc.stdin.flush()
+                proc.stdin.close()
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+            proc.wait()
+        for s in (proc.stdout, proc.stderr):
+            if s:
+                s.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()

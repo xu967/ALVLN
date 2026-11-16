@@ -169,7 +169,7 @@ class TestRayIsUnchanged(unittest.TestCase):
     def test_default_is_ray(self):
         t = planner.OccAstarTeacher(BoxWorld(), {"x": 1e4, "y": 0.0})
         self.assertEqual(t.clearance, "ray")
-        self.assertEqual(planner.CLEARANCE_MODES, ("ray", "swept"))
+        self.assertEqual(planner.CLEARANCE_MODES, ("ray", "swept", "braking"))
 
     def test_ray_stepwise_identical_to_old_implementation(self):
         """随机状态 × 随机 waypoint × 前向是否被堵 × 三种容差构造；states 带随机速度属性：ray 模式不读速度，动作与分支都与旧实现相同。"""

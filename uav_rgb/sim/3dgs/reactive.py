@@ -113,3 +113,57 @@ class ReactiveGoalPolicy:
                 self.last_turn = action
                 return action, None
         return FORWARD_SLOW, None
+
+
+class ReactiveBearingPolicy:
+    """零特权目标信念局部控制：只读当前深度与视觉 Grounder 给出的 (bearing_bin, near_goal)，绝不读真值位姿。"""
+
+    name = "reactive_bearing"
+    planner_name = None
+
+    def __init__(self, goal_fn, caution_m=1.4, emergency_m=0.75, stop_depth_m=1.8):
+        self.goal_fn = goal_fn
+        self.caution_m = float(caution_m)
+        self.emergency_m = float(emergency_m)
+        self.stop_depth_m = float(stop_depth_m)
+        self.reset()
+
+    def reset(self):
+        self.stop_requested = False
+        self.last_bearing_bin = None
+        self.last_near_goal = None
+        self.avoid_turn = None
+
+    def note_executed(self, action):
+        del action
+
+    def __call__(self, rgb, depth, state):
+        del state  # 严禁读取真值位姿
+        if getattr(depth, "ndim", 0) != 2 or min(depth.shape) < 5:
+            raise ValueError(f"reactive_bearing 需要二维深度图，得到 {getattr(depth, 'shape', None)}")
+        bb, ng = self.goal_fn(rgb, None)
+        self.last_bearing_bin, self.last_near_goal = int(bb), int(ng)
+        h, w = depth.shape
+        y0, y1 = int(h * 0.4), int(h * 0.6)
+        x1, x2 = w // 3, w * 2 // 3
+        left = _sector_min(depth, 0, x1, y0, y1)
+        center = _sector_min(depth, x1, x2, y0, y1)
+        right = _sector_min(depth, x2, w, y0, y1)
+
+        if self.last_near_goal == 1 and (center <= 0.0 or center <= self.stop_depth_m):
+            self.stop_requested = True
+            return SAFE_NEUTRAL, None
+        self.stop_requested = False
+        if self.last_bearing_bin == 8:
+            return YAW_LEFT, None
+        if 1 <= self.last_bearing_bin <= 3:
+            return YAW_LEFT, None
+        if 5 <= self.last_bearing_bin <= 7:
+            return YAW_RIGHT, None
+        if center <= 0.0:
+            return SAFE_NEUTRAL, None
+        if center < self.emergency_m:
+            return (YAW_LEFT if left >= right else YAW_RIGHT), None
+        if center < self.caution_m and max(left, right) > center + 0.25:
+            return (YAW_LEFT if left >= right else YAW_RIGHT), None
+        return FORWARD_SLOW, None

@@ -43,10 +43,56 @@ STEPS_HOLD_S = 0.5      # 航线 max_steps 是导入时按 hold 0.5 估的（sce
 
 def make_policy(name, occ_planner, waypoint, hold, stop_radius=1.0, clearance="ray"):
     if name == "teacher":
-        return planner_mod.OccAstarTeacher(occ_planner, waypoint, hold_s=hold, clearance=clearance)
+        return planner_mod.OccAstarTeacher(
+            occ_planner, waypoint, stop_radius=stop_radius, hold_s=hold, clearance=clearance)
     if name == "reactive":
         return reactive.ReactiveGoalPolicy(waypoint, stop_radius=stop_radius)
     return collect_3dgs.ForwardPolicy()
+
+
+class VlmBeliefTracker:
+    """1 Hz 零特权目标信念更新器：仅喂机载 RGB 与指令给 VLM，带单步转角航位推算与跨中线防过冲。"""
+
+    def __init__(self, vlm_grounder, instruction, update_every=2):
+        self.vlm_grounder = vlm_grounder
+        self.instruction = str(instruction or "")
+        self.update_every = max(1, int(update_every))
+        self.step_idx = 0
+        self.history = []
+        self.trace = []
+        self.prev_vlm_bin = None
+        self.last_vg = grounder_mod.VisualGrounding(grounder_mod.BEARING_SEARCH, 0, 0.0, "init", 0.0)
+
+    def __call__(self, rgb, _state):
+        self.history.append(rgb)
+        if len(self.history) > 4:
+            self.history = self.history[-4:]
+        if not self.instruction.strip() or self.vlm_grounder is None:
+            self.last_vg = grounder_mod.VisualGrounding(grounder_mod.BEARING_SEARCH, 0, 0.0, "empty_instruction", 0.0)
+            self.step_idx += 1
+            return self.last_vg.bearing_bin, 0
+        if self.step_idx % self.update_every == 0:
+            vg = self.vlm_grounder.ground_step(self.history, self.instruction)
+            raw_bb = vg.bearing_bin
+            # 相邻两次 VLM 观测在左(1)与右(7)间翻转说明目标刚跨过视野中线，置 0 前进消除二周期极限环
+            eff_bb = 0 if {self.prev_vlm_bin, raw_bb} == {1, 7} else raw_bb
+            self.prev_vlm_bin = raw_bb
+            self.last_vg = grounder_mod.VisualGrounding(eff_bb, vg.near_goal, vg.conf, vg.reason, vg.latency_ms)
+            self.trace.append({
+                "step": self.step_idx,
+                "raw_bearing_bin": raw_bb,
+                "bearing_bin": eff_bb,
+                "near_goal": vg.near_goal,
+                "conf": vg.conf,
+                "reason": vg.reason,
+                "latency_ms": vg.latency_ms,
+            })
+            bb = eff_bb
+        else:
+            # 偶数步已执行一次 ~17° 转向，奇数步将 ±1 前侧扇区推算回正至 0 桶，防止盲转两步过冲
+            bb = 0 if self.last_vg.bearing_bin in (1, 7) else self.last_vg.bearing_bin
+        self.step_idx += 1
+        return bb, self.last_vg.near_goal
 
 
 def result_text(m):
@@ -103,7 +149,10 @@ def _grounding_summary(rows, failures):
     }
 
 
-def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_path=None):
+def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_path=None,
+              vlm_grounder=None, student_proc=None):
+    import numpy as np
+    import random
     scene = scene_mod.load_scene(path)
     eps = vln.episodes(scene, splits=args.split)
     if not args.all_instructions:
@@ -114,7 +163,8 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
         print(f"{path}: 没有带指令的航线（不是 SAGE-3D 导入的场景，或 --split 过滤光了）", file=sys.stderr)
         return [], []
     identity = collect_3dgs.scene_identity(scene)
-    gaussians = scene_mod.read_gaussian_ply(scene["ply_path"])
+    gaussians = (scene_mod.read_gaussian_ply(scene["ply_path"])
+                 if scene.get("collision", {}).get("source", "gaussians") == "gaussians" else None)
     occ = collision_mod.from_scene(scene, gaussians=gaussians)
     del gaussians
     renderer = renderer_mod.make_renderer(scene)
@@ -122,16 +172,37 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
     radius = reach_radius_of(scene)
     ref_paths = vln.sage_ref_paths(scene)
     clearance = getattr(args, "teacher_clearance", "ray")
+    collect_mode = bool(getattr(args, "collect", False))
+    cf_mode = getattr(args, "counterfactual", "correct")
+    blind_rgb = bool(getattr(args, "blind_rgb", False))
+    grounder_kind = getattr(args, "grounder", "none")
+    rng = random.Random(args.seed)
     rows, failures = [], []
     for n, ep in enumerate(eps):
         scene_mod.apply_route(scene, ep["route_index"])
         identity = collect_3dgs.scene_identity(scene, ply_sha256=identity["ply_sha256"])
         evaluation_goal = dict(scene["waypoint"])
+        supplied_text = ep["text"]
+        if cf_mode == "swap" and len(eps) >= 2:
+            partner = n ^ 1
+            if partner < len(eps) and eps[partner].get("goal_object") != ep.get("goal_object"):
+                supplied_text = eps[partner]["text"]
+            else:
+                for k in range(1, len(eps)):
+                    cand = eps[(n + k) % len(eps)]
+                    if cand.get("goal_object") != ep.get("goal_object") or cand["route_index"] != ep["route_index"]:
+                        supplied_text = cand["text"]
+                        break
+                else:
+                    supplied_text = eps[(n + 1) % len(eps)]["text"]
+        elif cf_mode == "zero":
+            supplied_text = ""
+
         grounding = None
         policy_goal = evaluation_goal
         if lexical_grounder is not None:
             try:
-                result, policy_goal = resolve_grounding(lexical_grounder, catalog, ep["text"])
+                result, policy_goal = resolve_grounding(lexical_grounder, catalog, supplied_text)
             except Exception as e:  # noqa: BLE001 - 单集输入错误要保留在请求分母
                 ep_dir = os.path.join(args.out, scene["name"], f"{ep['route_name']}_{ep['instruction_index']}")
                 failures.append({**ep, "scene": scene["name"], "dir": ep_dir,
@@ -155,22 +226,77 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
             })
         # 始终保留真实评估目标作为 scene["waypoint"]，防止 grounder 落错地标时把 manifest 与视频伪装成到达真目标。
         scene["waypoint"] = dict(evaluation_goal)
-        scene["vln"] = {**ep, **({"grounding": grounding} if grounding is not None else {})}
+        scene["vln"] = {**ep, "supplied_text": supplied_text, "counterfactual": cf_mode,
+                        **({"grounding": grounding} if grounding is not None else {})}
         ep_dir = os.path.join(args.out, scene["name"], f"{ep['route_name']}_{ep['instruction_index']}")
         steps = math.ceil(int(scene["max_steps"]) * STEPS_HOLD_S / args.hold)
-        try:
-            policy = make_policy(args.policy, occ_planner, policy_goal, args.hold,
-                                 stop_radius=radius, clearance=clearance)
-        except TypeError:
-            policy = make_policy(args.policy, occ_planner, policy_goal, args.hold, stop_radius=radius)
+
+        vlm_tracker = None
+        if grounder_kind == "vlm":
+            vlm_tracker = VlmBeliefTracker(vlm_grounder, supplied_text,
+                                           update_every=getattr(args, "vlm_every", 2))
+            goal_fn = vlm_tracker
+        elif grounder_kind == "blind_unknown":
+            goal_fn = lambda _rgb, _st: (grounder_mod.BEARING_SEARCH, 0)
+        else:
+            gx, gy = float(policy_goal["x"]), float(policy_goal["y"])
+
+            def _g0_subgoal(_rgb, st, _gx=gx, _gy=gy, _r=radius, _pl=occ_planner):
+                px, py = float(st.x), float(st.y)
+                if math.hypot(px - _gx, py - _gy) <= _r:
+                    return vln.bearing_bin(float(st.yaw), (px, py), (_gx, _gy)), 1
+                if _pl is not None:
+                    p = _pl.plan((px, py), (_gx, _gy))
+                    if p is not None:
+                        spd = math.hypot(float(getattr(st, "vx", 0.0)), float(getattr(st, "vy", 0.0)))
+                        tx, ty = _pl.aim_point(p, px, py, lookahead=0.65 + 0.8 * spd,
+                                               los_max=3.0, hard_los_max=min(1.0, 0.65 + 0.8 * spd))
+                        return vln.bearing_bin(float(st.yaw), (px, py), (tx, ty)), 0
+                return vln.bearing_bin(float(st.yaw), (px, py), (_gx, _gy)), 0
+
+            goal_fn = _g0_subgoal
+
+        rgb_tf = (lambda img: np.zeros_like(img)) if blind_rgb else None
+        dagger_meta = None
+        if args.policy == "student":
+            if collect_mode:
+                expert = planner_mod.OccAstarTeacher(
+                    occ_planner, policy_goal, stop_radius=radius, hold_s=args.hold, clearance=clearance)
+                beta = float(getattr(args, "dagger_beta", 0.5))
+                policy = collect_3dgs.DaggerPolicy(student_proc, expert, beta=beta, rng=rng, goal_fn=goal_fn)
+                dagger_meta = {
+                    "executed_by": "student",
+                    "dagger_round": int(getattr(args, "dagger_round", 1)),
+                    "beta": beta,
+                    "student_ckpt": os.path.abspath(args.ckpt),
+                    "student_ckpt_sha256": collect_3dgs._sha256(args.ckpt),
+                }
+            else:
+                policy = collect_3dgs.StudentAdapter(student_proc, goal_fn=goal_fn, rgb_transform=rgb_tf)
+        elif args.policy == "reactive" and grounder_kind in ("vlm", "blind_unknown"):
+            policy = reactive.ReactiveBearingPolicy(goal_fn)
+        else:
+            try:
+                policy = make_policy(args.policy, occ_planner, policy_goal, args.hold,
+                                     stop_radius=radius, clearance=clearance)
+            except TypeError:
+                policy = make_policy(args.policy, occ_planner, policy_goal, args.hold, stop_radius=radius)
         try:
             man, err = collect_3dgs.run_episode(
                 scene, ep_dir, renderer, occ, params, policy, steps, args.hold,
-                split=identity["split"], seed=args.seed + n, episode_id=n, stop_on_collision=True,
-                identity=identity, split_policy="diag-vln-eval", dynamics="cf_sitl",
+                split=identity["split"], seed=args.seed + n, episode_id=n,
+                stop_on_collision=not collect_mode,
+                truncate_on_collision=collect_mode,
+                identity=identity,
+                split_policy=None if collect_mode else "diag-vln-eval",
+                dynamics="cf_sitl",
                 dynamics_path=getattr(args, "dynamics_params", None),
+                save_depth=bool(getattr(args, "save_depth", False)),
+                dagger=dagger_meta,
                 stop_on_request=args.stop_mode == "explicit",
                 stop_after_safe=vln.STOP_STREAK if args.stop_mode == "legacy-safe" else None)
+            if vlm_tracker is not None and vlm_tracker.trace:
+                collect_3dgs._write_jsonl(os.path.join(ep_dir, "grounding_trace.jsonl"), vlm_tracker.trace)
             if err or man.get("error"):
                 raise RuntimeError(err or man["error"])
             validity = man.get("validity", {})
@@ -198,21 +324,27 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                              **({"grounding": grounding} if grounding is not None else {}),
                              "error": f"{type(e).__name__}: {e}"})
             continue
-        row = {**ep, "scene": scene["name"], **m, "error": err, "dir": ep_dir,
+        row = {**ep, "supplied_text": supplied_text, "counterfactual": cf_mode,
+               "scene": scene["name"], **m, "error": err, "dir": ep_dir,
                "terminal_reason": man.get("terminal_reason")}
+        if vlm_tracker is not None:
+            lats = [x["latency_ms"] for x in vlm_tracker.trace]
+            row["vlm_calls"] = len(lats)
+            row["vlm_latency_ms_p50"] = collect_3dgs._percentile(lats, 50) if lats else None
+            row["vlm_latency_ms_p95"] = collect_3dgs._percentile(lats, 95) if lats else None
         if grounding is not None:
             row["grounding"] = grounding
             row.update({f"target_{key}": value for key, value in target_metrics.items()})
         rows.append(row)
         wrong_goal = grounding is not None and grounding.get("correct") is False
         badge = f"WRONG GOAL {m['ne_m']:.1f} m" if wrong_goal else result_text(m)
-        print(f"[{scene['name']} {n + 1}/{len(eps)}] {badge:24s} {ep['type']:22s} {ep['text']}", file=sys.stderr)
+        print(f"[{scene['name']} {n + 1}/{len(eps)}] {badge:24s} {ep['type']:22s} {supplied_text}", file=sys.stderr)
         if n < args.videos:
             try:
                 video = video_mod.compose_views_video(
                     ep_dir, scene, renderer, params.camera_mount, occ,
-                    title=f"{args.policy} | cf_sitl | {scene['name']} | {ep['type']}", result=badge,
-                    instruction=f"\"{ep['text']}\"",
+                    title=f"{args.policy} | {grounder_kind} | {scene['name']} | {ep['type']}", result=badge,
+                    instruction=f"\"{supplied_text}\"",
                     pred_goal=policy_goal if grounding is not None else None,
                     log=lambda msg: print(msg, file=sys.stderr))
                 row["video"] = os.path.relpath(video["video"], args.out)
@@ -225,11 +357,22 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--scene", action="append", required=True, help="SAGE-3D 导入的 scene.json，可给多个")
-    p.add_argument("--policy", choices=("teacher", "reactive", "forward"), required=True,
-                   help="teacher = A* 特权上界；reactive = 不查全局地图的目标条件局部控制；forward = 盲目前进下界")
-    p.add_argument("--grounder", choices=("none", "lexical", "phrase"), default="none",
-                   help="lexical：单目标纯词法检索；phrase：提取主目标短语并兼容空间修饰从句；均需独立 --catalog")
+    p.add_argument("--scene", action="append", required=True, help="SAGE-3D / Wanderland 导入的 scene.json，可给多个")
+    p.add_argument("--policy", choices=("teacher", "reactive", "forward", "student"), required=True,
+                   help="teacher = A* 特权上界；student = 机载 C++ CNN-FiLM+STOP 学生；reactive = 局部控制；forward = 盲飞下界")
+    p.add_argument("--ckpt", default=None, help="--policy student 时的 C++ 权重文件 (.bin)")
+    p.add_argument("--infer-bin", default=None, help="uavrgb_infer 二进制路径（缺省读 build/check/uavrgb_infer）")
+    p.add_argument("--collect", action="store_true", help="采集正式训练/DAgger 数据集（split_policy=None，撞后截断不拒收）")
+    p.add_argument("--save-depth", action="store_true", help="采集时落盘渲染深度图供 --depth-aux 训练")
+    p.add_argument("--dagger-beta", type=float, default=0.5, help="--policy student --collect 时的教师接管概率 β")
+    p.add_argument("--dagger-round", type=int, default=1, help="DAgger 轮次编号")
+    p.add_argument("--grounder", choices=("none", "lexical", "phrase", "vlm", "blind_unknown"), default="none",
+                   help="lexical/phrase：目录检索；vlm：零特权视觉语言 Grounder（1 Hz）；blind_unknown：方位恒置 UNKNOWN(8) 消融")
+    p.add_argument("--vlm-model", default=None, help="--grounder vlm 的模型路径（默认 UAV-PUR-4B）")
+    p.add_argument("--vlm-every", type=int, default=2, help="VLM 更新步间隔（hold=0.5s 时 2 步 = 1 Hz）")
+    p.add_argument("--counterfactual", choices=("correct", "swap", "zero"), default="correct",
+                   help="语言反事实模式：correct=原指令，swap=同场景异目标错配指令，zero=空指令")
+    p.add_argument("--blind-rgb", action="store_true", help="将喂给 student 的图像全置黑（排除复读机/纯条件捷径）")
     p.add_argument("--catalog", action="append", default=None,
                    help="--grounder lexical/phrase 时必填，每场景一个 uavrgb.vln_landmark_catalog.v1 JSON；可重复")
     p.add_argument("--teacher-clearance", choices=planner_mod.CLEARANCE_MODES, default="ray",
@@ -248,12 +391,16 @@ def main(argv=None):
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
     use_grounder = args.grounder in ("lexical", "phrase")
+    if args.policy == "student" and (not args.ckpt or not os.path.isfile(args.ckpt)):
+        p.error("--policy student 必须提供存在的 --ckpt")
     if use_grounder and not args.catalog:
         p.error(f"--grounder {args.grounder} 必须同时提供 --catalog")
-    if use_grounder and args.policy == "forward":
+    if args.grounder in ("lexical", "phrase", "vlm", "blind_unknown") and args.policy == "forward":
         p.error(f"forward 不消费目标，不能与 --grounder {args.grounder} 一起使用")
-    if args.teacher_clearance != "ray" and args.policy != "teacher":
-        p.error(f"--teacher-clearance {args.teacher_clearance} 仅适用于 --policy teacher")
+    if args.grounder in ("vlm", "blind_unknown") and args.policy == "teacher":
+        p.error(f"teacher 读取全局特权坐标，不能与零特权 --grounder {args.grounder} 混用")
+    if args.teacher_clearance != "ray" and args.policy != "teacher" and not (args.policy == "student" and args.collect):
+        p.error(f"--teacher-clearance {args.teacher_clearance} 仅适用于 --policy teacher 或 student --collect")
     if not (math.isfinite(args.hold) and args.hold > 0):
         p.error("--hold 必须是正数")
     if args.limit < 0 or args.videos < 0:
@@ -284,31 +431,51 @@ def main(argv=None):
         unused = sorted(set(catalogs) - requested_names)
         if unused:
             p.error("未被 --scene 使用的 --catalog: " + ", ".join(unused))
-    for path in args.scene:
-        scene_catalog, catalog_path = None, None
-        if lexical_grounder is not None:
-            scene_name = scene_mod.load_scene(path)["name"]
-            catalog_path = catalogs.get(scene_name)
-            if catalog_path is None:
-                p.error(f"场景 {scene_name} 缺少对应 --catalog 文件")
-            _require_external_catalog(catalog_path, path)
-            scene_catalog = grounder_mod.load_catalog(catalog_path, scene_name=scene_name, scene_path=path)
-        r, f = run_scene(path, args, params, lexical_grounder=lexical_grounder,
-                         catalog=scene_catalog, catalog_path=catalog_path)
-        rows += r
-        failures += f
+    vlm_grounder = None
+    student_proc = None
+    try:
+        if args.grounder == "vlm" and args.counterfactual != "zero":
+            vlm_grounder = grounder_mod.VisualLanguageGrounder(model_path=args.vlm_model)
+        if args.policy == "student":
+            sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
+            import student as student_mod
+            student_proc = student_mod.StudentPolicy(args.ckpt, infer_bin=args.infer_bin)
+        for path in args.scene:
+            scene_catalog, catalog_path = None, None
+            if lexical_grounder is not None:
+                scene_name = scene_mod.load_scene(path)["name"]
+                catalog_path = catalogs.get(scene_name)
+                if catalog_path is None:
+                    p.error(f"场景 {scene_name} 缺少对应 --catalog 文件")
+                _require_external_catalog(catalog_path, path)
+                scene_catalog = grounder_mod.load_catalog(catalog_path, scene_name=scene_name, scene_path=path)
+            r, f = run_scene(path, args, params, lexical_grounder=lexical_grounder,
+                             catalog=scene_catalog, catalog_path=catalog_path,
+                             vlm_grounder=vlm_grounder, student_proc=student_proc)
+            rows += r
+            failures += f
+    finally:
+        if student_proc is not None:
+            student_proc.close()
+        if vlm_grounder is not None:
+            vlm_grounder.close()
     if not rows and not failures:
         p.error("没有选中任何 VLN 集，请检查场景、--split 和指令数据")
     with open(os.path.join(args.out, "episodes.jsonl"), "w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    vlm_lats = [r["vlm_latency_ms_p50"] for r in rows if r.get("vlm_latency_ms_p50") is not None]
     report = {"metric_version": METRIC_VERSION if args.stop_mode == "explicit" else "3dgs.vln.v2",
-              "policy": args.policy, "teacher_clearance": args.teacher_clearance,
+              "policy": args.policy, "ckpt": args.ckpt, "collect": bool(args.collect),
+              "teacher_clearance": args.teacher_clearance,
+              "counterfactual": args.counterfactual, "blind_rgb": bool(args.blind_rgb),
               "hold_s": args.hold, "stop_mode": args.stop_mode,
               "stop_streak": vln.STOP_STREAK if args.stop_mode == "legacy-safe" else None,
               "dynamics": "cf_sitl", "dynamics_profile": params.profile(),
               "scenes": args.scene, "split_filter": args.split, "all_instructions": args.all_instructions,
               "grounder": args.grounder, "catalog": args.catalog,
+              "vlm_latency_ms": ({"p50_median": collect_3dgs._percentile(vlm_lats, 50),
+                                  "p50_max": max(vlm_lats)} if vlm_lats else None),
               "overall_metric_scope": ("route_waypoint_proxy" if use_grounder
                                        else "scene_route_waypoint"),
               "overall": vln.summarize(rows, failures), "by_type": vln.summarize_by(rows, "type", failures),

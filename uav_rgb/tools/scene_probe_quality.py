@@ -39,6 +39,10 @@ FRAME_LAPVAR_MIN = collect_mod.FRAME_LAPVAR_MIN     # 与采集端同一个数�
 
 # ---------------------------------------------------------------- 配置（改这里）
 STEP_M = 0.5                            # 采样间距：cf_sitl 每 0.5 s 步前进约 0.15 m，0.5 m ≈ 3 步一帧；雾区尺度 ≥ 1 m 不会漏
+SWEEP_STEP_M = 1.0                      # 每 1.0 m 做一次 ±45°/±90° 转向扫视探针
+SWEEP_OFFSETS_DEG = (-90.0, -45.0, 45.0, 90.0)
+LOWER_ALPHA_THR = 0.50                  # 下半幅像素有效不透明度门槛 alpha >= 0.50
+LOWER_ALPHA50_MIN = 0.85                # 下半幅有效不透明度比例下限
 LOOKAHEAD_M = planner_mod.LOOKAHEAD_M   # 航向 = 朝前方 0.7 m 的路径点，与教师纯追踪一致，帧朝向和采集时一样
 LOW_FRAC_MAX = 0.10                     # 路线门槛：低质帧 > 10% 不收（DATASET_3DGS_SELF_CAPTURE.md §3 步 7）
 SHEET_COLS = 6                          # 拼图每行帧数；320×240 × 6 = 1920 宽，一屏能看
@@ -76,8 +80,47 @@ def sample_poses(path, spawn_yaw_deg, step_m=STEP_M, lookahead_m=LOOKAHEAD_M):
     return poses
 
 
+def sample_sweep_poses(path, spawn_yaw_deg=0.0, step_m=SWEEP_STEP_M,
+                       offsets_deg=SWEEP_OFFSETS_DEG, lookahead_m=LOOKAHEAD_M):
+    """沿路径每 step_m 取基点并附加 offsets_deg 转向扫视位姿 [(x, y, yaw_deg), ...]，检查转向时是否撞上未观测雾墙。"""
+    base = sample_poses(path, spawn_yaw_deg, step_m=step_m, lookahead_m=lookahead_m)
+    out = []
+    for x, y, yaw in base:
+        for off in offsets_deg:
+            ang = (yaw + float(off) + 180.0) % 360.0 - 180.0
+            out.append((x, y, ang))
+    return out
+
+
+def frustum_coverage_mask(cameras, grid_origin, grid_shape, voxel_m,
+                          hfov_deg=60.0, max_range_m=15.0, min_cams=3):
+    """计算 2D 导航栅格的训练相机视锥覆盖掩码：返回 bool[nx, ny]，True = 被 < min_cams 台相机观测到（不可通行盲区）。
+    cameras: [(x, y, yaw_deg), ...]（nav 系米与逆时针度）。"""
+    nx, ny = int(grid_shape[0]), int(grid_shape[1])
+    ox, oy = float(grid_origin[0]), float(grid_origin[1])
+    vx = float(voxel_m)
+    if not cameras:
+        return np.ones((nx, ny), dtype=bool)
+    xs = ox + (np.arange(nx, dtype=np.float64) + 0.5) * vx
+    ys = oy + (np.arange(ny, dtype=np.float64) + 0.5) * vx
+    gx, gy = np.meshgrid(xs, ys, indexing="ij")
+    counts = np.zeros((nx, ny), dtype=np.int32)
+    cos_half = math.cos(math.radians(float(hfov_deg) * 0.5))
+    r2_max = float(max_range_m) ** 2
+    for cx, cy, cyaw in cameras:
+        dx = gx - float(cx)
+        dy = gy - float(cy)
+        d2 = dx * dx + dy * dy
+        dist = np.sqrt(np.maximum(d2, 1e-12))
+        rad = math.radians(float(cyaw))
+        dot = (dx * math.cos(rad) + dy * math.sin(rad)) / dist
+        in_view = (d2 <= r2_max) & ((d2 <= 1e-6) | (dot >= cos_half))
+        counts += in_view.astype(np.int32)
+    return counts < int(min_cams)
+
+
 def probe_poses(renderer, poses, z, pitch_deg=0.0):
-    """逐位姿渲染并判质量；返回 (frames 列表, rgb 列表)。frames 每项 {pose, lapvar, hole_frac, low, depth_med_m}。"""
+    """逐位姿渲染并判质量；返回 (frames 列表, rgb 列表)。frames 每项含 lower_alpha50_frac。"""
     frames, rgbs = [], []
     for (x, y, yaw) in poses:
         rgb, depth, _ms = renderer.render_pose(x, y, z, yaw, pitch_deg=pitch_deg)
@@ -85,6 +128,13 @@ def probe_poses(renderer, poses, z, pitch_deg=0.0):
         valid = np.isfinite(depth) & (depth > 0)
         q["depth_valid_frac"] = float(np.mean(valid)) if depth.size else 0.0
         q["hole_frac"] = 1.0 - q["depth_valid_frac"]
+        alpha = getattr(renderer, "last_alpha", None)
+        if alpha is not None and alpha.shape == depth.shape and alpha.size:
+            lower = alpha[alpha.shape[0] // 2:, :]
+            q["lower_alpha50_frac"] = float(np.mean(lower >= LOWER_ALPHA_THR))
+        else:
+            lower_d = valid[valid.shape[0] // 2:, :] if valid.size else valid
+            q["lower_alpha50_frac"] = float(np.mean(lower_d)) if lower_d.size else 0.0
         dv = depth[valid]
         frames.append({"pose": [round(x, 3), round(y, 3), round(z, 3), round(yaw, 1)], **q,
                        "depth_med_m": round(float(np.median(dv)), 2) if dv.size else None})
@@ -92,12 +142,22 @@ def probe_poses(renderer, poses, z, pitch_deg=0.0):
     return frames, rgbs
 
 
-def summarize(name, frames, path_m, low_frac_max=LOW_FRAC_MAX, min_depth_valid_frac=0.9):
-    """锐度和深度分别验收；任一采样帧深度不足，整条路线拒收。"""
+def summarize(name, frames, path_m, low_frac_max=LOW_FRAC_MAX, min_depth_valid_frac=0.9,
+              min_lower_alpha50_frac=LOWER_ALPHA50_MIN, sweep_frames=None):
+    """锐度、全幅有效深度、下半幅 alpha>=0.50 与转向扫视分别验收。"""
     if not math.isfinite(min_depth_valid_frac) or not 0 < min_depth_valid_frac <= 1:
         raise ValueError("min_depth_valid_frac 必须在 (0, 1] 内")
     depth_ok = bool(frames) and all(
         f.get("depth_valid_frac", 0.0) >= min_depth_valid_frac for f in frames)
+    lower_alpha_vals = [f.get("lower_alpha50_frac", f.get("depth_valid_frac", 0.0)) for f in frames]
+    lower_alpha_ok = bool(frames) and all(v >= min_lower_alpha50_frac for v in lower_alpha_vals)
+    sweep_pass = True
+    sweep_low_frac = None
+    if sweep_frames is not None:
+        sweep_low_frac = round(sum(int(f["low"]) for f in sweep_frames) / len(sweep_frames), 4) if sweep_frames else None
+        sweep_pass = bool(sweep_frames) and (sweep_low_frac <= max(low_frac_max, 0.25)) and all(
+            f.get("lower_alpha50_frac", 1.0) >= min_lower_alpha50_frac * 0.8 for f in sweep_frames
+        )
     laps = [f["lapvar"] for f in frames]
     n_low = sum(int(f["low"]) for f in frames)
     low_frac = n_low / len(frames) if frames else None
@@ -107,9 +167,14 @@ def summarize(name, frames, path_m, low_frac_max=LOW_FRAC_MAX, min_depth_valid_f
             "lapvar_p10": round(float(np.percentile(laps, 10)), 1) if laps else None,
             "lapvar_med": round(float(np.median(laps)), 1) if laps else None,
             "hole_frac_max": max(f["hole_frac"] for f in frames) if frames else None,
+            "lower_alpha50_min": round(float(min(lower_alpha_vals)), 4) if lower_alpha_vals else None,
+            "lower_alpha_pass": lower_alpha_ok,
+            "sweep_n_frames": len(sweep_frames) if sweep_frames is not None else 0,
+            "sweep_low_frac": sweep_low_frac,
+            "sweep_pass": sweep_pass,
             "lapvar_min_threshold": FRAME_LAPVAR_MIN, "low_frac_max": low_frac_max,
             "min_depth_valid_frac": min_depth_valid_frac, "depth_pass": depth_ok,
-            "pass": bool(frames) and low_frac <= low_frac_max and depth_ok}
+            "pass": bool(frames) and low_frac <= low_frac_max and depth_ok and lower_alpha_ok and sweep_pass}
 
 
 def contact_sheet(rgbs, labels, cols=SHEET_COLS, max_frames=SHEET_MAX):
@@ -142,6 +207,8 @@ def probe_route(renderer, planner, name, spawn, waypoint, out_dir, pitch_deg=0.0
     path_m = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(path, path[1:]))
     poses = sample_poses(path, syaw)
     frames, rgbs = probe_poses(renderer, poses, z, pitch_deg)
+    sweep_poses = sample_sweep_poses(path, syaw)
+    sweep_frames, _ = probe_poses(renderer, sweep_poses, z, pitch_deg)
     labels = [f"{i:02d} ({f['pose'][0]:.1f},{f['pose'][1]:.1f},{f['pose'][3]:.0f}) lap={f['lapvar']:.0f}{' LOW' if f['low'] else ''}"
               for i, f in enumerate(frames)]
     cv2.imwrite(os.path.join(out_dir, f"route_{tag}.png"), contact_sheet(rgbs, labels))
@@ -154,7 +221,7 @@ def probe_route(renderer, planner, name, spawn, waypoint, out_dir, pitch_deg=0.0
     ladder_rgbs.append(rgb)
     ladder_labels.append(f"z={z:g} pitch={LADDER_PITCH_DEG:g} lap={frame_quality(rgb, depth)['lapvar']:.0f}")
     cv2.imwrite(os.path.join(out_dir, f"ladder_{tag}.png"), contact_sheet(ladder_rgbs, ladder_labels, cols=2))
-    out = summarize(name, frames, path_m, min_depth_valid_frac=min_depth_valid_frac)
+    out = summarize(name, frames, path_m, min_depth_valid_frac=min_depth_valid_frac, sweep_frames=sweep_frames)
     out.update({"spawn": spawn, "waypoint": waypoint, "frames": frames,
                 "sheet": f"route_{tag}.png", "ladder": f"ladder_{tag}.png"})
     return out
@@ -175,7 +242,8 @@ def run(scene_path, routes=None, candidates=(), out_dir=None, mock=False, device
     scene = scene_mod.load_scene(scene_path)
     out_dir = out_dir or os.path.join(scene["dir"], "probe_quality")
     os.makedirs(out_dir, exist_ok=True)
-    g = scene_mod.read_gaussian_ply(scene["ply_path"])
+    g = (scene_mod.read_gaussian_ply(scene["ply_path"])
+         if scene.get("collision", {}).get("source", "gaussians") == "gaussians" else None)
     occ = collision_mod.from_scene(scene, gaussians=g)
     planner = planner_mod.OccPlanner(occ)
     renderer = renderer_mod.make_renderer(scene, mock=mock, device=device)

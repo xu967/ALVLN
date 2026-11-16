@@ -140,5 +140,36 @@ class TestProbe(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(tmp, "out", "routes_quality.json")))   # 旧独立实现的产物不再写
 
 
+class TestEpisodesImport(unittest.TestCase):
+    def test_routes_from_episodes_transforms_coords_and_filters_placeholders(self):
+        vln_mod = importlib.import_module("sim.3dgs.vln")
+        nav_to_world = [
+            [-1.0, 0.0, 0.0, 10.0],
+            [0.0, -1.0, 0.0, 20.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]
+        doc = {"episodes": [
+            {"episode_id": 0, "start_position": [10.0, 20.0, 1.0],
+             "goals": [{"position": [-30.0, 20.0, 1.0]}], "geodesic_distance": 40.0,
+             "reference_path": [[10.0, 20.0, 1.0], [-10.0, 20.0, 1.0], [-30.0, 20.0, 1.0]],
+             "instruction": "Walk past the bench and stop at the red lamppost."},
+            {"episode_id": 1, "start_position": [0.0, 0.0, 0.0],
+             "goals": [{"position": [50.0, 0.0, 0.0]}], "geodesic_distance": 50.0,
+             "instruction": "Navigate from the start position to the goal."},
+        ]}
+        routes = imp.routes_from_episodes(doc, nav_to_world, fly_z=2.0)
+        self.assertEqual(len(routes), 1)
+        r = routes[0]
+        self.assertAlmostEqual(r["spawn"]["x"], 0.0)
+        self.assertAlmostEqual(r["waypoint"]["x"], 40.0)
+        self.assertAlmostEqual(r["spawn"]["yaw_deg"], 0.0)
+        self.assertEqual(len(r["ref_path"]), 3)
+        eps = vln_mod.episodes({"routes": routes})
+        self.assertEqual(len(eps), 1)
+        self.assertIn("red lamppost", eps[0]["text"])
+        self.assertEqual(imp.RENDER["eps2d"], 0.08)
+
+
 if __name__ == "__main__":
     unittest.main()

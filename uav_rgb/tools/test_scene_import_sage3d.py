@@ -445,5 +445,35 @@ class TestDownload(unittest.TestCase):
             self.assertEqual(calls, [])
 
 
+class TestMeshAndMultiStage(unittest.TestCase):
+    def test_mesh_collision_render_and_multi_stage_chaining(self):
+        r0 = {"name": "tr_1", "spawn": {"x": 0.0, "y": 0.0, "z": 1.2, "yaw_deg": 0.0},
+              "waypoint": {"x": 16.0, "y": 0.0, "z": 1.2}, "max_steps": 120,
+              "ref_path": [[0.0, 0.0], [16.0, 0.0]],
+              "sage": {"split": "train", "astar_path_m": 16.0,
+                       "instructions": [{"end": "sofa_1", "text": "Go to the sofa."}]}}
+        r1 = {"name": "tr_2", "spawn": {"x": 16.5, "y": 0.2, "z": 1.2, "yaw_deg": 90.0},
+              "waypoint": {"x": 16.5, "y": 18.2, "z": 1.2}, "max_steps": 130,
+              "ref_path": [[16.5, 0.2], [16.5, 18.2]],
+              "sage": {"split": "train", "astar_path_m": 18.0,
+                       "instructions": [{"end": "bed_2", "text": "Head to the bed."}]}}
+        r_test = {"name": "tt_3", "spawn": {"x": 16.5, "y": 18.3, "z": 1.2, "yaw_deg": 0.0},
+                  "waypoint": {"x": 30.0, "y": 18.3, "z": 1.2}, "max_steps": 100,
+                  "sage": {"split": "test_Trajectory_Unseen", "astar_path_m": 14.0,
+                           "instructions": [{"end": "tv_1", "text": "Stop at the TV."}]}}
+        chained = imp.chain_multi_stage_routes([r0, r1, r_test], planner=None)
+        self.assertEqual(len(chained), 1)
+        self.assertEqual(chained[0]["split"], "train")
+        self.assertEqual(chained[0]["n_stages"], 2)
+        self.assertGreaterEqual(chained[0]["total_path_m"], 30.0)
+        sc = imp.build_scene("840139", 0.0, [r0], collision_mesh="collision_mesh.ply", multi_stage_routes=chained)
+        self.assertEqual(sc["collision"]["source"], "mesh")
+        self.assertEqual(sc["collision"]["geometry"], "collision_mesh.ply")
+        self.assertTrue(sc["render"]["ut_eval3d"])
+        m = imp.isr_csr_metrics([True, False, True])
+        self.assertAlmostEqual(m["isr"], 2.0 / 3.0)
+        self.assertAlmostEqual(m["csr"], 1.0 / 3.0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

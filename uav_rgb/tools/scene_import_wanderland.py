@@ -44,7 +44,12 @@ RUN_STEPS = tuple(s for s in os.environ.get("IMPORT_STEPS", ",".join(STEPS)).spl
 DOWNLOAD_PARALLEL = 4             # 4 个大文件并行 curl；HF 单流约 10–30 MB/s
 FLY_Z = 2.0                       # 飞行高度（nav 系，米）：E1 ToF 量程内、与 Callinstrasse/Gazebo 一致
 CAMERA = {"width": 320, "height": 240, "fov_deg": 60.0, "pitch_deg": 0.0}   # 用户 11-07 拍板：与 Gazebo 同 60° HFOV
+RENDER = {
+    "sh_degree": 3, "supersample": 2, "eps2d": 0.08,
+    "max_scale_m": 1.2, "max_aniso": 25.0, "min_large_opacity": 0.25,
+}  # 户外低分辨率消膨胀 + 去大雾团/针状拉丝配置
 COLLISION = {"z_slice": [1.8, 2.2], "voxel_m": 0.2, "envelope": "e1_mini"}   # 与 Callinstrasse 同口径
+USE_EPISODES_JSON = os.environ.get("WANDERLAND_USE_EPISODES", "0") == "1"     # 1 = 从 episodes.json 参数化导入原生长航线
 GROUND_RADIUS_M = 1.5             # 相机脚下取地面：水平 1.5 m 内 LiDAR 点高度的 10 分位（3DGS 报告 P0 的同一方法）
 GROUND_PCT = 10                   # 10 分位：避开草丛/长椅，又不被个别噪点拉低
 LIDAR_SUBSAMPLE = 4               # raw_pcd 9 亿字节 ≈ 3,000 万点；每 4 点取 1 做对齐统计够用（0.1 m 体素）
@@ -494,86 +499,173 @@ def draw_top_view(pts_nav, cams_nav, path, px_per_m=10, margin_m=8.0):
 SCENE_JSON = os.path.join(SCENE_DIR, "scene.json")
 
 
+def routes_from_episodes(episodes_doc, nav_to_world, fly_z=FLY_Z, min_geodesic_m=10.0):
+    """将 Wanderland 原生 episodes.json（世界系米制）变换为 nav 系 VLN 候选长航线列表。"""
+    mat = np.asarray(nav_to_world, dtype=np.float64)
+    if mat.shape != (4, 4):
+        raise ValueError(f"nav_to_world 必须是 4x4 矩阵，得到 {mat.shape}")
+    r_m, t_m = mat[:3, :3], mat[:3, 3]
+    eps = episodes_doc.get("episodes") if isinstance(episodes_doc, dict) else episodes_doc
+    out = []
+    for idx, ep in enumerate(eps or ()):
+        instr = str(ep.get("instruction") or "").strip()
+        if not instr or instr.lower().startswith("navigate from the start position"):
+            continue
+        geod = float(ep.get("geodesic_distance") or 0.0)
+        if geod < float(min_geodesic_m):
+            continue
+        goals = ep.get("goals") or []
+        if not goals or "position" not in goals[0]:
+            continue
+        sp_w = np.asarray(ep["start_position"][:3], dtype=np.float64)
+        gp_w = np.asarray(goals[0]["position"][:3], dtype=np.float64)
+        sp_n = (sp_w - t_m) @ r_m
+        gp_n = (gp_w - t_m) @ r_m
+
+        ref_raw = ep.get("reference_path") or [ep["start_position"], goals[0]["position"]]
+        ref_n = ((np.asarray(ref_raw, dtype=np.float64)[:, :3] - t_m) @ r_m)[:, :2]
+        pts = [(round(float(sp_n[0]), 4), round(float(sp_n[1]), 4))]
+        for px, py in ref_n:
+            if math.hypot(float(px) - pts[-1][0], float(py) - pts[-1][1]) >= 0.25:
+                pts.append((round(float(px), 4), round(float(py), 4)))
+        end_xy = (round(float(gp_n[0]), 4), round(float(gp_n[1]), 4))
+        if math.hypot(end_xy[0] - pts[-1][0], end_xy[1] - pts[-1][1]) >= 0.05 or len(pts) < 2:
+            pts.append(end_xy)
+
+        # 初始机头朝向：取参考折线上离起点 >= 0.6 m 的首个方向点
+        look_pt = pts[-1]
+        for cand in pts[1:]:
+            if math.hypot(cand[0] - pts[0][0], cand[1] - pts[0][1]) >= 0.6:
+                look_pt = cand
+                break
+        yaw_deg = round(math.degrees(math.atan2(look_pt[1] - pts[0][1], look_pt[0] - pts[0][0])), 2)
+        eid = int(ep.get("episode_id", idx))
+        split_tag = "test_Trajectory_Unseen" if (eid % 5 == 0) else "train"
+        out.append({
+            "name": f"wl_ep{eid:02d}_{int(round(geod))}m",
+            "spawn": {"x": pts[0][0], "y": pts[0][1], "z": float(fly_z), "yaw_deg": yaw_deg},
+            "waypoint": {"x": end_xy[0], "y": end_xy[1], "z": float(fly_z)},
+            "max_steps": None,
+            "ref_path": [[p[0], p[1]] for p in pts],
+            "note": f"Wanderland 原生 episode {eid}（测地长 {geod:.2f} m）",
+            "vln": {
+                "episode_id": eid,
+                "split": split_tag,
+                "geodesic_distance_m": round(geod, 3),
+                "instructions": [{
+                    "instruction_type": "Street_Landmark_Long",
+                    "start": "START",
+                    "end": f"goal_ep{eid}",
+                    "text": instr,
+                }],
+            },
+        })
+    return out
+
+
 def step_scene():
-    """写 scene.json（nav_to_world 来自 align.json；碰撞源 = LiDAR 点云真值），用 planner.route_check 校验
-    每条路线并回填 max_steps = steps_estimate；任一路线不可行/净空不足即停。"""
+    """写 scene.json（支持手写短路线或 --use-episodes-json 原生街道长航线），并用 planner.route_check 校验筛选。"""
     import importlib
+    import shutil
     scene_mod = importlib.import_module("sim.3dgs.scene")
     collision = importlib.import_module("sim.3dgs.collision")
     planner_mod = importlib.import_module("sim.3dgs.planner")
-    align = json.load(open(os.path.join(OUT, "align.json"), encoding="utf-8"))
-    if not ROUTES:
-        raise SystemExit("ROUTES 为空：先看 OUT/map_lidar_nav.png 与 align.json 填路线（配置区）")
-    routes = []
-    for r in ROUTES:
-        sp = dict(r["spawn"]); sp.setdefault("z", FLY_Z); sp.setdefault("yaw_deg", 0.0)
-        wp = dict(r["waypoint"]); wp.setdefault("z", FLY_Z)
-        routes.append({"name": r["name"], "spawn": sp, "waypoint": wp, "max_steps": r.get("max_steps"),
-                       "note": r.get("note", "")})
-    fh = align["fly_height_above_local_ground_m"]
+    scene_json = os.path.join(SCENE_DIR, "scene.json")
+    align_path = os.path.join(OUT, "align.json")
+    if os.path.isfile(align_path):
+        align = json.load(open(align_path, encoding="utf-8"))
+        nav_to_world = align["nav_to_world"]
+    elif os.path.isfile(scene_json):
+        existing = json.load(open(scene_json, encoding="utf-8"))
+        nav_to_world = existing["nav_to_world"]
+        align = None
+    else:
+        raise SystemExit(f"缺少 {align_path} 且无现成 {scene_json}，请先跑 align 步")
+
+    if USE_EPISODES_JSON:
+        ep_file = os.path.join(DOWNLOAD_DIR, "episodes.json")
+        if not os.path.isfile(ep_file):
+            raise SystemExit(f"找不到 {ep_file}")
+        cand_routes = routes_from_episodes(json.load(open(ep_file, encoding="utf-8")), nav_to_world, fly_z=FLY_Z)
+        if not cand_routes:
+            raise SystemExit(f"{ep_file} 没有提取到有效语言长航线")
+        backup = os.path.join(SCENE_DIR, "scene.short_v1.json")
+        if os.path.isfile(scene_json) and not os.path.isfile(backup):
+            shutil.copy2(scene_json, backup)
+    else:
+        if not ROUTES:
+            raise SystemExit("ROUTES 为空：先看 OUT/map_lidar_nav.png 与 align.json 填路线（配置区）")
+        cand_routes = []
+        for r in ROUTES:
+            sp = dict(r["spawn"]); sp.setdefault("z", FLY_Z); sp.setdefault("yaw_deg", 0.0)
+            wp = dict(r["waypoint"]); wp.setdefault("z", FLY_Z)
+            cand_routes.append({"name": r["name"], "spawn": sp, "waypoint": wp,
+                                "max_steps": r.get("max_steps"), "note": r.get("note", "")})
+
+    notes = (existing.get("notes", []) if align is None else [
+        f"尺度：MetaCam LIV-SLAM 米制；验证：COLMAP {align['camera_count']} 个相机离 LiDAR 局部地面 "
+        f"p10/50/90 = {align['camera_height_above_ground_m']['10']}/{align['camera_height_above_ground_m']['50']}/"
+        f"{align['camera_height_above_ground_m']['90']} m。",
+        "碰撞源 collision.source=points：LiDAR 稠密点云在 nav 系按 0.2 m 体素计数占据。",
+    ])
     scene = {
         "schema": "uavrgb.3dgs_scene.v1",
         "name": SCENE_NAME,
-        "source": f"Wanderland (NYU ai4ce, arXiv 2511.20620) scene {SCENE_ID}, HF {HF_REPO} {TIER_PATH}; "
-                  "3dgs.ply (gsplat, INRIA layout) + raw_pcd.ply (MetaCam LIV-SLAM LiDAR) + scene.usdz collider mesh",
+        "source": f"Wanderland (NYU ai4ce, arXiv 2511.20620) scene {SCENE_ID}, HF {HF_REPO} {TIER_PATH}",
         "license": "Apache-2.0 (HF dataset card + github.com/ai4ce/wanderland LICENSE)",
         "ply": "scene.ply",
-        "nav_to_world": align["nav_to_world"],
+        "nav_to_world": nav_to_world,
         "world_up": "-y (COLMAP y-down; nav z-up 由 nav_to_world 旋转块给出)",
         "ground_z": 0.0,
-        "spawn": routes[0]["spawn"], "waypoint": routes[0]["waypoint"],
-        "reach_radius_m": 2.0,
+        "spawn": cand_routes[0]["spawn"], "waypoint": cand_routes[0]["waypoint"],
+        "reach_radius_m": 2.5 if USE_EPISODES_JSON else 2.0,
         "camera": dict(CAMERA, fov_source="用户 2026-11-07 拍板：Gazebo 与 3DGS 统一 60° HFOV / 320×240"),
+        "render": dict(RENDER),
         "collision": dict(COLLISION, source="points", geometry="lidar.ply", min_points=collision.DEFAULT_MIN_POINTS,
                           geometry_stride=1),
-        "max_steps": routes[0]["max_steps"] or 60,
+        "max_steps": cand_routes[0]["max_steps"] or 60,
         "step_s": HOLD_S,
-        "notes": [
-            f"尺度：MetaCam LIV-SLAM 米制；验证：COLMAP {align['camera_count']} 个相机离 LiDAR 局部地面 "
-            f"p10/50/90 = {align['camera_height_above_ground_m']['10']}/{align['camera_height_above_ground_m']['50']}/"
-            f"{align['camera_height_above_ground_m']['90']} m（手持扫描仪约 1.3 m，沿 52 m 轨迹一致）。",
-            f"重力/地面：相机图像上方均值指向世界 {align['up_axis_world']}（偏 {align['image_up_tilt_deg']}°），"
-            f"地面平面法向与该轴夹角 {align['ground_plane_tilt_deg']}°（未校正，按轴对齐旋转）；nav z=0 = 相机脚下 "
-            f"{GROUND_RADIUS_M} m 内 LiDAR 高度 {GROUND_PCT} 分位的轨迹中位数。nav z={FLY_Z} 沿相机轨迹离局部地面 "
-            f"p10/50/90 = {fh['p10']}/{fh['p50']}/{fh['p90']} m（地面沿路起伏 ±0.15 m，未建模）。",
-            "碰撞源 collision.source=points：LiDAR 稠密点云（lidar.ply = raw_pcd.ply 硬链接）在 nav 系按 0.2 m 体素计数占据，"
-            f"min_points={collision.DEFAULT_MIN_POINTS}；高斯代理 v2 只作对照（tools/collision_truth_compare.py）。",
-            f"collision_mesh.ply（scene.usdz 的 Collider）最高只到 nav z≈{align['mesh_top_nav_z_p99.9']} m"
-            "（Wanderland pcd2mesh 只保留相机上下 1.5 m），覆盖不到 2 m 飞行层，不能当飞行层真值。",
-            "routes[]：--route N 用 routes[N] 覆盖 spawn/waypoint/max_steps；routes[0] 与顶层相同。max_steps = "
-            "planner.route_check.steps_estimate（1.25×(航程/0.15 m + 转向/17° + 8)）。",
-        ],
-        "routes": routes,
+        "notes": notes,
+        "routes": cand_routes,
     }
     os.makedirs(SCENE_DIR, exist_ok=True)
-    scene_mod.save_scene(scene, SCENE_JSON)
-    loaded = scene_mod.load_scene(SCENE_JSON)
+    scene_mod.save_scene(scene, scene_json)
+    loaded = scene_mod.load_scene(scene_json)
     t0 = time.time()
     occ = collision.from_scene(loaded)
     log(f"scene: 占据（{occ.source}）{occ.summary()['n_occupied_cells']} 格，{time.time() - t0:.1f}s")
     planner = planner_mod.OccPlanner(occ)
-    rows, paths, bad = [], {}, []
-    for i, r in enumerate(routes):
-        chk = planner_mod.route_check(planner, r["spawn"], r["waypoint"])
-        paths[i] = chk.pop("path", None)
+    rows, paths, kept, bad = [], {}, [], []
+    for i, r in enumerate(cand_routes):
+        chk = planner_mod.route_check(planner, r["spawn"], r["waypoint"], route_name=r["name"])
+        p = chk.pop("path", None)
+        ok = bool(chk.get("feasible") and chk.get("clear_ok"))
         if r["max_steps"] is None and chk.get("steps_estimate"):
             r["max_steps"] = int(chk["steps_estimate"])
-        row = {"route": i, "name": r["name"], "max_steps": r["max_steps"], **chk}
-        rows.append(row)
-        ok = chk.get("feasible") and chk.get("clear_ok")
-        log(f"scene: route {i} {r['name']}: {'OK ' if ok else 'BAD'} path {chk.get('path_m')} m turn {chk.get('turn_deg')}° "
+        rows.append({"candidate": i, "name": r["name"], "ok": ok, "max_steps": r["max_steps"], **chk})
+        log(f"scene: cand {i} {r['name']}: {'OK ' if ok else 'SKIP'} path {chk.get('path_m')} m "
             f"min_clear {chk.get('min_clearance_m')} steps {chk.get('steps_estimate')} {chk.get('reason', '')}")
-        if not ok:
+        if ok:
+            paths[len(kept)] = p
+            kept.append(r)
+        else:
             bad.append(r["name"])
-    scene["routes"] = routes
-    scene["max_steps"] = routes[0]["max_steps"]
-    scene_mod.save_scene(scene, SCENE_JSON)
+    if not USE_EPISODES_JSON and bad:
+        raise SystemExit(f"路线不可行/净空不足：{bad}")
+    if not kept:
+        raise SystemExit(f"全部 {len(cand_routes)} 条候选航线均未通过净空检查")
+    scene["routes"] = kept
+    scene["spawn"] = kept[0]["spawn"]
+    scene["waypoint"] = kept[0]["waypoint"]
+    scene["max_steps"] = kept[0]["max_steps"]
+    scene_mod.save_scene(scene, scene_json)
+    os.makedirs(OUT, exist_ok=True)
     write_json(os.path.join(OUT, "routes_check.json"), rows)
+    write_json(os.path.join(SCENE_DIR, "routes_check.json"), rows)
     write_json(os.path.join(OUT, "routes_paths.json"), {str(k): v for k, v in paths.items()})
-    draw_occ_routes(occ, paths, os.path.join(OUT, "map_routes_truth.png"), align)
-    if bad:
-        raise SystemExit(f"路线不可行/净空不足：{bad}（看 OUT/map_routes_truth.png 调配置区 ROUTES）")
-    log(f"scene: 写 {SCENE_JSON}（{len(routes)} 条路线全部 feasible/clear_ok）")
+    if align is not None:
+        draw_occ_routes(occ, paths, os.path.join(OUT, "map_routes_truth.png"), align)
+    log(f"scene: 写 {scene_json}（通过 {len(kept)}/{len(cand_routes)} 条路线）")
 
 
 def draw_occ_routes(occ, paths, path, align, px_per_m=20, margin_m=6.0):
@@ -694,7 +786,28 @@ def step_video():
 
 
 # ---------------------------------------------------------------- 主流程
-def main():
+def main(argv=None):
+    import argparse
+    global SCENE_ID, SCENE_NAME, TIER_PATH, DOWNLOAD_DIR, SCENE_DIR, SCENE_JSON, OUT, RUN_STEPS, USE_EPISODES_JSON
+    ap = argparse.ArgumentParser(description="Wanderland 场景与原生长航线导入")
+    ap.add_argument("--scene-id", default=SCENE_ID)
+    ap.add_argument("--scene-name", default=None)
+    ap.add_argument("--tier-path", default=TIER_PATH)
+    ap.add_argument("--download-dir", default=None)
+    ap.add_argument("--scene-dir", default=None)
+    ap.add_argument("--out", default=OUT)
+    ap.add_argument("--steps", default=",".join(RUN_STEPS))
+    ap.add_argument("--use-episodes-json", action="store_true", default=USE_EPISODES_JSON)
+    args = ap.parse_args(argv)
+    SCENE_ID = args.scene_id
+    SCENE_NAME = args.scene_name or (SCENE_NAME if args.scene_id == "1MlUucugRAnrx86cpUuQt8fUtxFMddxju" else f"wanderland_{SCENE_ID[:8]}")
+    TIER_PATH = args.tier_path
+    DOWNLOAD_DIR = args.download_dir or os.path.join(DATA_ROOT, "uav_rgb", "downloads", "wanderland", SCENE_ID)
+    SCENE_DIR = args.scene_dir or os.path.join(DATA_ROOT, "uav_rgb", "3dgs-scenes", SCENE_NAME)
+    SCENE_JSON = os.path.join(SCENE_DIR, "scene.json")
+    OUT = args.out
+    RUN_STEPS = tuple(s for s in args.steps.split(",") if s)
+    USE_EPISODES_JSON = bool(args.use_episodes_json)
     os.makedirs(OUT, exist_ok=True)
     t0 = time.time()
     rc = 0

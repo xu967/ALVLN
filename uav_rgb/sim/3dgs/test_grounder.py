@@ -248,5 +248,47 @@ class TestLexicalGrounder(unittest.TestCase):
                 grounder.load_catalog(path, scene_name="s")
 
 
+class TestVisualLanguageGrounder(unittest.TestCase):
+    def test_ground_step_signature_is_strictly_zero_privilege(self):
+        import inspect
+        sig = inspect.signature(grounder.VisualLanguageGrounder.ground_step)
+        self.assertEqual(list(sig.parameters), ["self", "rgb_history", "instruction"])
+        init_sig = inspect.signature(grounder.VisualLanguageGrounder.__init__)
+        forbidden = {"scene", "waypoint", "occ", "pose", "dyn", "state"}
+        self.assertTrue(forbidden.isdisjoint(set(init_sig.parameters)))
+
+    def test_parse_vlm_output_sectors_and_fallbacks(self):
+        self.assertEqual(grounder.parse_vlm_output('["C",1,"window"]')[:3], (0, 1, 0.8))
+        self.assertEqual(grounder.parse_vlm_output('["L",0,"sofa"]')[:2], (1, 0))
+        self.assertEqual(grounder.parse_vlm_output('["R",0,"plant"]')[:2], (7, 0))
+        # 搜索态 N(8) 必须强制将 near_goal 清零，防止盲停
+        self.assertEqual(grounder.parse_vlm_output('["N",1,"occluded"]')[:2], (8, 0))
+        self.assertEqual(grounder.parse_vlm_output('{"sector":"front_left","near":1,"conf":9,"why":"lamp"}')[:3],
+                         (1, 1, 0.9))
+        self.assertEqual(grounder.parse_vlm_output("broken non-json text")[:2], (8, 0))
+
+    def test_mock_worker_subprocess_roundtrip_and_cleanup(self):
+        import sys
+        import numpy as np
+        mock_code = (
+            "import json, sys\n"
+            "sys.stdout.write(json.dumps({'status':'ready'}) + '\\n'); sys.stdout.flush()\n"
+            "for line in sys.stdin:\n"
+            "    req = json.loads(line)\n"
+            "    if req.get('cmd') == 'close': break\n"
+            "    ins = req['instruction'].lower()\n"
+            "    raw = '[\"C\",1,\"sofa\"]' if 'sofa' in ins else ('[\"R\",0,\"plant\"]' if 'plant' in ins else '[\"N\",0,\"none\"]')\n"
+            "    sys.stdout.write(json.dumps({'raw': raw, 'conf': 0.92, 'infer_ms': 5.0}) + '\\n'); sys.stdout.flush()\n"
+        )
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        with grounder.VisualLanguageGrounder(worker_cmd=[sys.executable, "-c", mock_code], timeout_s=10.0) as vg:
+            r1 = vg.ground_step([frame], "Fly to the sofa.")
+            self.assertEqual((r1.bearing_bin, r1.near_goal, r1.reason), (0, 1, "sofa"))
+            r2 = vg.ground_step(frame, "Go to the green plant.")
+            self.assertEqual((r2.bearing_bin, r2.near_goal, r2.reason), (7, 0, "plant"))
+            r_zero = vg.ground_step([frame], "")
+            self.assertEqual((r_zero.bearing_bin, r_zero.near_goal), (8, 0))
+
+
 if __name__ == "__main__":
     unittest.main()

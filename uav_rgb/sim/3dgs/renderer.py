@@ -121,6 +121,7 @@ class GsplatRenderer:
         self.scene = scene
         self.samples = 0
         self.total_ms = 0.0
+        self.last_alpha = None
         self.depth_opacity_min = None
         self._depth_pack = None
         if depth_opacity_min is not None:
@@ -239,7 +240,8 @@ class GsplatRenderer:
         rgb = (rgb_t.clamp(0.0, 1.0).cpu().numpy() * 255.0 + 0.5).astype(np.uint8)
         depth = depth_t[..., 0].cpu().numpy()
         alpha_np = alpha_d.cpu().numpy()
-        depth = np.where(alpha_np[..., 0] >= 0.05, depth, 0.0).astype(np.float32)
+        self.last_alpha = alpha_np[..., 0].astype(np.float32)
+        depth = np.where(self.last_alpha >= 0.05, depth, 0.0).astype(np.float32)
         self.samples += 1
         self.total_ms += ms
         return rgb, depth, ms
@@ -274,6 +276,7 @@ class MockRenderer:
         self.depth_m = float(depth_m)
         self.samples = 0
         self.total_ms = 0.0
+        self.last_alpha = None
         self.depth_opacity_min = None
         if depth_opacity_min is not None:
             self.set_depth_opacity_min(depth_opacity_min)
@@ -307,6 +310,7 @@ class MockRenderer:
             (yy / max(h - 1, 1) * 255 * 0.5 + z * 10) % 256,
             np.full_like(xx, 96, dtype=np.float64)], axis=-1).astype(np.uint8)
         depth = np.full((h, w), self.depth_m, dtype=np.float32)
+        self.last_alpha = np.ones((h, w), dtype=np.float32)
         ms = (time.perf_counter() - t0) * 1e3
         self.samples += 1
         self.total_ms += ms

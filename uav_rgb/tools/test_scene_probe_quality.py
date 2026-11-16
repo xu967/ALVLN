@@ -142,6 +142,16 @@ class SelfCheck(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("self-check PASS", r.stdout)
 
+    def test_frustum_mask_sweep_poses_and_lower_alpha_gate(self):
+        cams = [(0.0, 0.0, 0.0), (0.0, 0.1, 0.0), (0.0, -0.1, 0.0)]
+        unseen = spq.frustum_coverage_mask(cams, (0.0, -1.0), (10, 10), 0.5, hfov_deg=60.0, max_range_m=8.0, min_cams=3)
+        self.assertFalse(unseen[4, 2])   # (2.25, 0.25) 在 3 台相机正前方视锥内 -> 可通行 (False)
+        self.assertTrue(unseen[0, 9])    # 侧方盲区 < 3 台相机观测 -> 不可通行 (True)
+        sweeps = spq.sample_sweep_poses([(0.0, 0.0), (1.0, 0.0), (2.0, 0.0)], 0.0, step_m=1.0)
+        self.assertEqual(len(sweeps), 3 * 4)
+        bad_alpha = {**_frame(False), "lower_alpha50_frac": 0.4}
+        self.assertFalse(spq.summarize("r", [bad_alpha], 2.0)["pass"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -55,6 +55,10 @@ FLY_H_M = 1.2                       # 室内门洞高约 2.0–2.1 m、桌面 0.
 Z_SLICE_HALF_M = 0.2                # 占据切片 = 飞行高度 ± 0.2 m（机体半高 0.028 m，另留定高误差与抖动）
 VOXEL_M = 0.1                       # 室内净空只有 0.2–0.4 m：0.1 m 体素（Wanderland 室外用 0.2 m）
 CAMERA = {"width": 320, "height": 240, "fov_deg": 60.0, "pitch_deg": 0.0}   # 与 Gazebo / 其他 3DGS 场景同口径
+RENDER = {
+    "sh_degree": 3, "supersample": 2, "ut_eval3d": True, "near_plane_m": 0.20,
+    "max_scale_m": 0.8, "max_aniso": 25.0, "min_large_opacity": 0.25,
+}  # 室内原生 3DGUT + 近裁剪防贴墙雾团配置
 REACH_RADIUS_M = 1.0                # bench 试点同值；室内目标物体附近 1 m 内算到点
 HOLD_S = 0.5                        # scene.step_s；route_check 的步数估计按这个口径
 NAV_ROT_Z_DEG = 180.0               # SAGE 轨迹系 -> PLY 系：绕 z 轴 180°、零平移
@@ -65,7 +69,7 @@ GROUND_MAX_SCALE_M = 3.0
 GROUND_BAND_FRAC = 0.4
 CEILING_MIN_ABOVE_M = 1.8           # 天花板峰只在地面以上 >= 1.8 m 处找（只记录，不参与飞行）
 # 路线过滤（顶部配置区；三条是任务书定的，第四条是本脚本追加的，理由在注释里）
-ROUTE_CLEAR_MARGIN_M = 0.1          # 沿 A* 路径最小净空 >= 机体半径 + 0.1 m（route_check 默认 0.3 m 对室内走廊过严）
+ROUTE_CLEAR_MARGIN_M = 0.095        # 沿 A* 路径最小净空 >= 机体半径(0.102m) + 0.095m（避开 2×0.1m 体素整格 2mm 量化边界）
 ROUTE_ASTAR_OVER_SAGE_MAX = 1.3     # A* 长度 <= 1.3 × SAGE 轨迹长度（A* 绕远太多说明两者走的不是同一条通道）
 # A* 有路径：route_check 的 feasible 与 A* 是否找到（见 judge_route）
 ROUTE_MIN_GOAL_DIST_M = 2.0         # 追加：起终点直线距离 >= 2×REACH_RADIUS_M，否则出生即在到达半径内、SR 恒为 1
@@ -494,20 +498,144 @@ def evaluate_route(planner, cand, z, terrain_occ=None):
     return {"ok": ok, "reasons": reasons, "chk": chk, "spawn": spawn, "waypoint": waypoint, "name": name}
 
 
-def build_scene(sid, ground_z, routes, extra_notes=None):
+def chain_multi_stage_routes(routes, planner=None, target_len=(30.0, 55.0),
+                             stages=(2, 4), join_radius_m=2.5, max_per_scene=24):
+    """在同 split 内将单段合格航线首尾串联成 2~4 段跨房间长程多阶段任务（严禁跨 split 拼接防泄漏）。"""
+    min_len, max_len = float(target_len[0]), float(target_len[1])
+    min_st, max_st = int(stages[0]), int(stages[1])
+    by_split = {}
+    for idx, r in enumerate(routes):
+        sp_tag = (r.get("sage") or {}).get("split") or "train"
+        by_split.setdefault(sp_tag, []).append((idx, r))
+
+    chained = []
+    for sp_tag, items in sorted(by_split.items()):
+        adj = {i: [] for i in range(len(items))}
+        for i, (_, ra) in enumerate(items):
+            wpa = ra["waypoint"]
+            end_obj = ((ra.get("sage") or {}).get("instructions") or [{}])[0].get("end")
+            for j, (_, rb) in enumerate(items):
+                if i == j:
+                    continue
+                spb = rb["spawn"]
+                next_end = ((rb.get("sage") or {}).get("instructions") or [{}])[0].get("end")
+                if end_obj and next_end and end_obj == next_end:
+                    continue
+                gap = math.hypot(float(wpa["x"]) - float(spb["x"]), float(wpa["y"]) - float(spb["y"]))
+                if gap > float(join_radius_m):
+                    continue
+                trans_m = gap
+                if planner is not None and gap > 0.05:
+                    p = planner.plan((float(wpa["x"]), float(wpa["y"])), (float(spb["x"]), float(spb["y"])))
+                    if p is None:
+                        continue
+                    trans_m = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(p, p[1:]))
+                adj[i].append((trans_m, j))
+        for i in adj:
+            adj[i].sort()
+
+        def dfs(chain, used_goals, total_m):
+            if len(chained) >= max_per_scene:
+                return
+            if len(chain) >= min_st and min_len <= total_m <= max_len:
+                st_list = []
+                texts = []
+                full_ref = []
+                total_steps = 0
+                for step_k, idx_local in enumerate(chain):
+                    orig_idx, r = items[idx_local]
+                    ins_list = (r.get("sage") or {}).get("instructions") or [{"text": r["name"], "end": f"goal_{orig_idx}"}]
+                    ins0 = ins_list[0]
+                    prefix = "First, " if step_k == 0 else ("Finally, " if step_k + 1 == len(chain) else "Then, ")
+                    texts.append(prefix + str(ins0.get("text") or "").strip())
+                    r_ref = r.get("ref_path") or [[r["spawn"]["x"], r["spawn"]["y"]], [r["waypoint"]["x"], r["waypoint"]["y"]]]
+                    if full_ref:
+                        full_ref.extend(r_ref[1:])
+                    else:
+                        full_ref.extend(r_ref)
+                    total_steps += int(r.get("max_steps") or 60)
+                    st_list.append({
+                        "stage": step_k,
+                        "route_index": orig_idx,
+                        "route_name": r["name"],
+                        "waypoint": dict(r["waypoint"]),
+                        "reach_radius_m": REACH_RADIUS_M,
+                        "goal_object": ins0.get("end"),
+                        "instruction": ins0.get("text"),
+                        "path_m": float((r.get("sage") or {}).get("astar_path_m") or 0.0),
+                    })
+                r0 = items[chain[0]][1]
+                r_last = items[chain[-1]][1]
+                chained.append({
+                    "name": f"lh_{SPLIT_SHORT.get(sp_tag, 'xx')}_{len(chained):02d}_{int(round(total_m))}m",
+                    "split": sp_tag,
+                    "n_stages": len(st_list),
+                    "total_path_m": round(total_m, 2),
+                    "spawn": dict(r0["spawn"]),
+                    "waypoint": dict(r_last["waypoint"]),
+                    "max_steps": total_steps,
+                    "instruction": " ".join(texts),
+                    "ref_path": full_ref,
+                    "stages": st_list,
+                })
+                return
+            if len(chain) >= max_st or total_m > max_len:
+                return
+            last = chain[-1]
+            for trans_m, nxt in adj[last]:
+                if nxt in chain:
+                    continue
+                rn = items[nxt][1]
+                g_obj = ((rn.get("sage") or {}).get("instructions") or [{}])[0].get("end")
+                if g_obj and g_obj in used_goals:
+                    continue
+                seg_m = float((rn.get("sage") or {}).get("astar_path_m") or 0.0)
+                dfs(chain + [nxt], used_goals | ({g_obj} if g_obj else set()), total_m + trans_m + seg_m)
+
+        for start_i, (_, r0) in enumerate(items):
+            g0 = ((r0.get("sage") or {}).get("instructions") or [{}])[0].get("end")
+            m0 = float((r0.get("sage") or {}).get("astar_path_m") or 0.0)
+            dfs([start_i], {g0} if g0 else set(), m0)
+    return chained
+
+
+def isr_csr_metrics(stage_reached):
+    """LH-VLN 多阶段长程指标：逐段独立成功率 ISR 与前置段全成功条件下的条件成功率 CSR。"""
+    flags = [bool(x) for x in stage_reached]
+    if not flags:
+        return {"isr": 0.0, "csr": 0.0, "stages_completed": 0, "n_stages": 0}
+    isr = sum(flags) / len(flags)
+    prefix_ok = True
+    csr_sum = 0.0
+    for ok in flags:
+        if prefix_ok and ok:
+            csr_sum += 1.0
+        else:
+            prefix_ok = False
+    return {"isr": isr, "csr": csr_sum / len(flags), "stages_completed": int(csr_sum), "n_stages": len(flags)}
+
+
+def build_scene(sid, ground_z, routes, extra_notes=None, collision_mesh=None, multi_stage_routes=None):
     """scene.json 的字典。routes[0] 同时作为顶层 spawn/waypoint/max_steps（apply_route 的约定）。"""
     z_c = float(ground_z) + FLY_H_M
     first = routes[0]
+    coll_note = (f"碰撞源 collision.source=mesh（{collision_mesh}）：由 SAGE-3D_Collision_Mesh 提取并开启门洞。"
+                 if collision_mesh else
+                 "碰撞源 collision.source=gaussians：飞行层高斯在 nav 系按 0.1 m 体素占据（代理，非真值；同层 NuRec 高斯里的漂浮物会造成假障碍）。")
     notes = [
         f"飞行高度：nav z = ground_z + {FLY_H_M} m（spawn.z、占据切片中心、渲染高度三处同值，来自配置区 FLY_H_M）；"
         "cf_sitl 起飞高度 = spawn.z − ground_z，dynamics_profile 与高度无关。",
         f"nav_to_world = 绕 z 轴 {NAV_ROT_Z_DEG:g}°、零平移：SAGE 轨迹系与 PLY 世界系差这个旋转（每个场景做统计复核，结果在 align.json）。",
-        "碰撞源 collision.source=gaussians：飞行层高斯在 nav 系按 0.1 m 体素占据（代理，非真值；同层 NuRec 高斯里的漂浮物会造成假障碍）。",
+        coll_note,
         "routes[]：起点 = SAGE 轨迹第一点、终点 = 最后一点（xy），朝向朝路径 0.6 m 处；max_steps = planner.route_check.steps_estimate（hold 0.5 口径）。"
         "routes[].sage 里有轨迹号、划分、SAGE 路径长、A* 长度、最小净空、全部指令（字段 instruction_type/start/end/text）。",
         "ToF 平地模型对飞行层以下的家具不成立（route_check 的 agl_model_unverified 只打标）；室内 1.2 m 飞越桌面时真机 ToF 会读短。",
     ] + list(extra_notes or [])
-    return {
+    coll = {"z_slice": [round(z_c - Z_SLICE_HALF_M, 6), round(z_c + Z_SLICE_HALF_M, 6)], "voxel_m": VOXEL_M,
+            "envelope": "e1_mini", "source": "mesh" if collision_mesh else "gaussians"}
+    if collision_mesh:
+        coll["geometry"] = collision_mesh
+    out = {
         "schema": "uavrgb.3dgs_scene.v1",
         "name": scene_name(sid),
         "source": f"SAGE-3D_InteriorGS_usdz 场景 {sid}（HF {HF_USDZ_REPO}，NuRec usdz 经 tools/nurec_to_ply.py 转 INRIA PLY）；"
@@ -520,17 +648,22 @@ def build_scene(sid, ground_z, routes, extra_notes=None):
         "spawn": dict(first["spawn"]), "waypoint": dict(first["waypoint"]),
         "reach_radius_m": REACH_RADIUS_M,
         "camera": dict(CAMERA, fov_source="与 Gazebo 及其他 3DGS 场景统一 60° HFOV / 320×240"),
-        "collision": {"z_slice": [round(z_c - Z_SLICE_HALF_M, 6), round(z_c + Z_SLICE_HALF_M, 6)], "voxel_m": VOXEL_M,
-                      "envelope": "e1_mini", "source": "gaussians"},
+        "render": dict(RENDER),
+        "collision": coll,
         "max_steps": first["max_steps"],
         "step_s": HOLD_S,
         "fly_height_m": FLY_H_M,
         "notes": notes,
         "routes": routes,
     }
+    if multi_stage_routes is not None:
+        out["multi_stage_routes"] = multi_stage_routes
+    return out
 
 
 def step_scene(sid):
+    import shutil
+    vln_mod = importlib.import_module("sim.3dgs.vln")
     align = json.load(open(os.path.join(scene_dir(sid), "align.json"), encoding="utf-8"))
     if not align["frame_ok"]:
         raise SystemExit(f"align.json 的坐标系复核未过：{align['frame_why']}")
@@ -542,9 +675,13 @@ def step_scene(sid):
                                                       "yaw_deg": first["yaw_deg"]},
                  "waypoint": {"x": first["goal"][0], "y": first["goal"][1], "z": z}, "max_steps": 60, "note": "占位"}
     path = os.path.join(scene_dir(sid), "scene.json")
-    scene_mod.save_scene(build_scene(sid, ground, [tmp_route]), path)
+    backup = os.path.join(scene_dir(sid), "scene.gaussians_v1.json")
+    if os.path.isfile(path) and not os.path.isfile(backup):
+        shutil.copy2(path, backup)
+    mesh_file = "collision_mesh.ply" if os.path.isfile(os.path.join(scene_dir(sid), "collision_mesh.ply")) else None
+    scene_mod.save_scene(build_scene(sid, ground, [tmp_route], collision_mesh=mesh_file), path)
     loaded = scene_mod.load_scene(path)
-    g = scene_mod.read_gaussian_ply(loaded["ply_path"])
+    g = None if mesh_file else scene_mod.read_gaussian_ply(loaded["ply_path"])
     t0 = time.time()
     occ = collision.from_scene(loaded, gaussians=g)
     terrain = collision.terrain_from_scene(loaded, gaussians=g)
@@ -558,8 +695,11 @@ def step_scene(sid):
                      "n_points": c["n_points"], "n_instructions": len(c["instructions"]), "ok": r["ok"], "reasons": r["reasons"], **chk})
         if not r["ok"]:
             continue
+        thin_ref = [[round(float(px), 4), round(float(py), 4)]
+                    for px, py in vln_mod.resample_polyline(c["points_xy"].tolist(), step_m=0.25)]
         routes.append({"name": r["name"], "spawn": r["spawn"], "waypoint": r["waypoint"],
                        "max_steps": int(r["chk"]["steps_estimate"]),
+                       "ref_path": thin_ref,
                        "note": f"SAGE {c['split']} 轨迹 {c['trajectory_id']}，SAGE 路径 {c['sage_path_m']} m，A* {r['chk']['path_m']} m",
                        "sage": {"trajectory_id": c["trajectory_id"], "split": c["split"], "sage_path_m": c["sage_path_m"],
                                 "n_points": c["n_points"], "astar_path_m": r["chk"]["path_m"], "turn_deg": r["chk"]["turn_deg"],
@@ -570,7 +710,10 @@ def step_scene(sid):
     for row in rows:
         for w in row["reasons"]:
             reasons[reason_label(w)] = reasons.get(reason_label(w), 0) + 1
-    summary = {"scene": sid, "n_candidates": len(cands), "n_ok": len(routes),
+    multi_routes = chain_multi_stage_routes(routes, planner=planner)
+    summary = {"scene": sid, "collision_source": "mesh" if mesh_file else "gaussians",
+               "n_candidates": len(cands), "n_ok": len(routes),
+               "n_multi_stage_30_55m": len(multi_routes),
                "n_by_split": {s: sum(c["split"] == s for c in cands) for s in SPLIT_ORDER},
                "n_ok_by_split": {s: sum(r["sage"]["split"] == s for r in routes) for s in SPLIT_ORDER},
                "reason_counts": reasons,
@@ -578,6 +721,7 @@ def step_scene(sid):
                "min_clearance_m_all": dist(r["min_clearance_m"] for r in rows if r.get("min_clearance_m") is not None),
                "sage_path_m_ok": dist(r["sage"]["sage_path_m"] for r in routes),
                "astar_path_m_ok": dist(r["sage"]["astar_path_m"] for r in routes),
+               "multi_stage_path_m": dist(m["total_path_m"] for m in multi_routes),
                "min_clearance_m_ok": dist(r["sage"]["min_clearance_m"] for r in routes),
                "steps_estimate_ok": dist(r["max_steps"] for r in routes),
                "instructions_ok": int(sum(len(r["sage"]["instructions"]) for r in routes)),
@@ -590,9 +734,12 @@ def step_scene(sid):
     if not routes:
         raise SystemExit(f"{len(cands)} 条候选路线没有一条通过过滤（原因计数 {reasons}），看 routes_check.json")
     notes = [f"坐标系复核：{align['frame_why']}。地面：z 直方图主峰 {ground} m（天花板峰 {align['ground']['ceiling_z']} m）。",
-             f"过滤：{len(cands)} 条候选 -> {len(routes)} 条（规则见 tools/scene_import_sage3d.py 配置区 ROUTE_*）。"]
-    scene_mod.save_scene(build_scene(sid, ground, routes, extra_notes=notes), path)
-    log(f"scene: 写 {path}：{len(routes)}/{len(cands)} 条路线通过；A* 长度 {summary['astar_path_m_ok']}")
+             f"过滤：{len(cands)} 条候选 -> {len(routes)} 条单段 + {len(multi_routes)} 条 30-55m 跨房间多阶段任务。"]
+    scene_mod.save_scene(
+        build_scene(sid, ground, routes, extra_notes=notes, collision_mesh=mesh_file, multi_stage_routes=multi_routes),
+        path,
+    )
+    log(f"scene: 写 {path}：单段 {len(routes)}/{len(cands)} 条，多阶段 {len(multi_routes)} 条；A* 长度 {summary['astar_path_m_ok']}")
 
 
 # ---------------------------------------------------------------- 5 渲染起点视角
