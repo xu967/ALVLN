@@ -1,8 +1,29 @@
 # progress.md（新开会话先读这个）
 
-交接入口：[docs/HANDOFF.md 当前交接](docs/HANDOFF.md) 与 [PLAN §10.18 下一代执行卡](docs/PLAN_2026-11-13_vln.md)。
+交接入口：[docs/HANDOFF.md 当前交接](docs/HANDOFF.md) 与 [PLAN §10.18–§10.19 执行卡](docs/PLAN_2026-11-13_vln.md)。
 
-## 2026-11-16 下午 VLN 全仓审计、空间治理、核心能力升级与实测（最新）
+## 2026-11-16 晚间 PLAN §10.18 四卡落地（S1/G2/OF-E1&E2/SCENE-LONG）与数据盘二次清理（最新）
+
+### 已完成的事项
+
+- 数据盘 `/root/rivermind-data` 二次深度治理：排除跨项目依赖（`scratch_audit`、`exp-openfly-scene-20261115`、`tmp/agent6-distill` 等）后，安全清理 1,088 个废旧目录/重复物理拷贝/中间轮次权重与 75,819 张未编码历史散帧 PNG；在装入今日全部新增数据与环境后，`/root/rivermind-data` 可用容量提升至 **`101 GiB`**（`/` 可用 `6.6 GiB`；无任何遗留后台进程）。
+- 卡 S1（自研 C++/CUDA 15 维动态导航条件 + 第 5 维独立 STOP 头）：扩展 `UAVRAUX1`（`stop_target` + `nav_cond`）、`UAVRCK01 v7`（`aux_sidecar_sha256` + `stop_threshold`）、`model`/`trainer`/`infer` 与 Python 闭环；经 3 个训练公寓示范 + 1 轮 DAgger 训练后，留出测试集（`839992` 未见指令 + `841980` 完全未见公寓）自主 STOP **`SR = 0.70`**（达教师 `v5` `0.90` 的 `77.8%`）、`SPL = 0.587`、`nDTW = 0.444`；零样本迁移至户外 `wanderland_1MlUucug` 街道长航线（含 `52.86m`）达 **`3/3`（`SR = 1.00, SPL = 0.974`）**。
+- 卡 G2（零特权视觉语言 Grounder 在线闭环）：搭建 `vlm-venv` 只读加载本地 `UAV-PUR-4B`（支持共享显卡自适应显存分层），实现零特权 `VisualLanguageGrounder` 与防过冲 `VlmBeliefTracker`（消除 1Hz VLM + 10Hz 控制的 `L-L-R-R` 极限环）；未见公寓 `840865` 同起点双目标 12 集 `correct/swap/zero` 全程 `0` 碰撞，`correct` 在 `sofa_1` 纯靠画面与语言飞入目标圈（`OSR = 0.25, NE = 1.19m`），定位出未微调航拍模型在室内近景不输出 `near_goal=1` 的唯一停止瓶颈。
+- 卡 SCENE-LONG：拉取转换 6 个 SAGE-3D 二进制 USDC 碰撞网格（开启门洞），可行单段路线从 `249/676 (36.8%)` 解锁至 **`578/676 (85.5%)`**（最长 `35.68m`），生成跨房间 `30–55m` 多阶段航线 `123` 条；`scene_import_wanderland.py` 参数化导入 `1MlUucug`（`15/18`）与 `10nvb`（`13/18`）原生街道语言长航线；`scene_probe_quality.py` 补齐下半幅 `alpha>=0.50`、转向扫视与 `<3` 相机视锥掩码。
+- 卡 OF-E1/E2：拉取校验 6 个 AirSim 场景 100 条因果路线（`960` 张组首 PNG，`575 MiB`），补齐 `4/5` 升降 `±3.0m` 原语，按 `<30m` 3D 空间簇隔离划分 `80/20`（跨划分最近距离 `42.79m`）；升级 `uavrgb.openfly_external_bc.v2`（ImageNet 归一化 + 冻结 BERT + 拐点/STOP 权重 + 局部 `PROGRESS_MONITOR` + 因果 `prev_action` 20% dropout），1,200 步训练后验证集 `STOP F1` 从 `0.333` 升至 **`0.650`**（`sequence_parity` 20/20 全同）。
+- 全量门禁验证：`bash tools/check.sh` 退出码 `0`（CTest `45/45`、`cf_sitl` `9/9 + 33/33`、`sim/3dgs` 16 套件、OpenFly `76/76`、`ui` 全绿，0 SKIP）。实验与过程记录见 `docs/experiments/2026-11-16-s1-g2-openfly-v2-scenelong.md` 与 `docs/worklog/2026-11-16-2355-s1-g2-openfly-scenelong-and-cleanup.md`。
+
+### 关键决策
+
+- 禁止对刹停教师 `v5` 数据开 `--class-weights auto`：因 `SAFE` 稀少会把 `FORWARD` 权重压至 `0.36`、`YAW` 抬至 `1.72`，导致 `bearing_bin == 0` 内最优分类偏向原地转向；采用无偏置动作 CE + 深度分带辅助头 `--depth-aux` + 1 轮 DAgger 解决。
+- 1 Hz VLM 与 10 Hz 机载控制耦合必须在奇数步对前侧扇区 `1/7` 做单步转角回正推算并拦截 `1 <-> 7` 跨中线翻转，否则单步 `17°` 转向保持两步必引发 `34°` 过冲极限环。
+
+### 未完成的待办
+
+- 下一阶段算法迭代（PLAN §10.19）：① 用 SAGE 训练集近景帧微调/线性校准 `UAV-PUR-4B` 的室内 `near_goal` 判停头；② 训练并评测不依赖 A* 子目标的纯直线方位 / VLM 方位反应式避障学生（迫使 `student_blind_rgb` 跌零，证明纯机载视觉绕障）；③ 待用户另一项目的 GPU 训练结束后，在 2–3 个已解压 AirSim 场景上跑 OpenFly `v2` 在线 UE4 闭环评测。
+- 待用户确认：是否删除未解压的 4 个 Linux UE 城市场景 zip（`69.45 GiB`）；是否批准执行任务卡 `ARCH-LEAN` 精简约 6,500 行历史零调用代码。
+
+## 2026-11-16 下午 VLN 全仓审计、空间治理、核心能力升级与实测（历史记录）
 
 ### 已完成的事项
 

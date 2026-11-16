@@ -1,26 +1,33 @@
 # uav_rgb 交接文档
 
-## 当前交接：2026-11-16（13:30 更新），无人机视觉语言导航
+## 当前交接：2026-11-16（23:55 更新），无人机视觉语言导航
 
-**接手先读本节，再看[执行计划 §10.18](PLAN_2026-11-13_vln.md)。** 下面同日早些时候的 OpenFly 实验交接及 11 月 14 日更早章节完整保留供溯源。
+**接手先读本节，再看[执行计划 §10.18–§10.19](PLAN_2026-11-13_vln.md)与[最新实验报告](experiments/2026-11-16-s1-g2-openfly-v2-scenelong.md)。** 下面同日早些时候的交接与更早章节完整保留供溯源。
 
-### 0. 2026-11-16 下午最新增量与接手状态（必读）
+### 0. 2026-11-16 晚间最新状态：四张核心执行卡已落地实测（必读）
 
-1. **磁盘危机已解除 + 存储红线**：
-   - 清理 Windows 专用 UE 压缩包、已解压 AirSim zip、缓存、演练垃圾及 78 份零引用历史草稿文档后，根分区 `/` 可用从 `674 MiB` 恢复至 **`6.6 GiB`**，数据盘 `/root/rivermind-data` 可用从 `1.5 GiB` 恢复至 **`75 GiB`**。
-   - **重要预警**：`/root/rivermind-fs`（JuiceFS）虽然显示有 `68 GiB` 空间，但 `df -i` 实测 **Inode 已 100% 耗尽（`IFree = 0`）**，严禁向 `/root/rivermind-fs` 写入或解压任何新文件！所有实验输出继续写 `/root/rivermind-data/uav_rgb/`。
+1. **存储现状与红线**：
+   - 经早间救急与晚间二次深度清理（移除 1,088 个废旧目录/重复物理拷贝/中间轮次权重与 75,819 张未编码历史散帧 PNG），在装入今日新增数据与虚拟环境后，根分区 `/` 可用 **`6.6 GiB`**，数据盘 `/root/rivermind-data` 可用 **`101 GiB`**（总 `492 GiB`）。
+   - 未删除需用户确认的 4 个未解压 Linux UE 城市场景包 `downloads/OpenFly_DataGen/ue/*.zip`（`69.45 GiB`）及其他项目目录（注意 GPU 上可能有用户另一项目的 `/opt/conda/bin/python train.py` 运行，严禁终止）。
+   - **重要预警**：`/root/rivermind-fs`（JuiceFS）Inode 仍为 **100% 满载（`IFree = 0`）**，只能只读挂载其上的 `UAV-PUR-4B` 模型，严禁写入任何文件。
+2. **本轮新增落地并经真实 GPU + `cf_sitl` 验证的四大模块**：
+   - **卡 S1（自研 C++/CUDA 15 维动态导航条件 + 第 5 维独立 STOP 头，已完成）**：`UAVRAUX1` 新增 `stop_target` 与 `nav_cond`（`0..71`），`UAVRCK01` 升 `v7`（含 `aux_sidecar_sha256` 与验证集选出的 `stop_threshold`），`uavrgb_train` 支持 `--vln-nav --stop-head --depth-aux`，`uavrgb_infer` 每步读 3 字节动态条件并输出 `stop_prob / stop_requested`（CTest `45/45` 全绿）。在留出室内集（`839992` 未见指令 + `841980` 未见公寓共 10 集）上自主 STOP **`SR = 0.70`**（达教师 `v5` `0.90` 的 `77.8%`）、`SPL = 0.587`、`nDTW = 0.444`；零样本迁移至户外 `wanderland_1MlUucug` 街道长航线（最长 `52.86m`）取得 **`3/3`（`SR = 1.00, SPL = 0.974`）**。
+   - **卡 G2（零特权视觉语言 Grounder 在线闭环，基础设施已完成、室内近距判停待微调）**：`vlm-venv` 只读加载 `UAV-PUR-4B`（支持共享显卡自适应显存分层），`VisualLanguageGrounder` + `VlmBeliefTracker`（1 Hz 更新 + 单步转角推算消除 `L-L-R-R` 极限环）接入 `run_vln.py --grounder vlm`。未见公寓 `840865` 同起点双目标 12 集 `0` 碰撞，`sofa_1` 任务纯靠画面与语言进入目标圈（`OSR = 0.25, NE = 1.19m`），但未微调航拍模型在室内近景不输出 `near_goal = 1`（`SR = 0.0`）。
+   - **卡 SCENE-LONG（已完成）**：6 个 SAGE-3D 场景接入开启门洞的 `SAGE-3D_Collision_Mesh`，可行单段路线从 `249/676` 升至 **`578/676`**（最长 `35.68m`），生成跨房间 `30–55m` 多阶段航线 `123` 条；`wanderland_1MlUucug`（`15/18`）与 `10nvb`（`13/18`）导入 `episodes.json` 原生街道语言长航线；`scene_probe_quality.py` 补齐下半幅 `alpha>=0.50`、扫视与视锥掩码。
+   - **卡 OF-E1/E2（数据扩量与 `v2` 训练对拍已完成，待空闲 GPU 跑多场景 UE4 闭环）**：拉取校验 6 个 AirSim 场景 100 条因果路线（`960` 张组首 PNG），补齐 `4/5` 升降 `±3.0m` 原语，按 `<30m` 3D 空间簇隔离划分 `80/20`（跨划分最近距离 `42.79m`）；升级 `uavrgb.openfly_external_bc.v2`（ImageNet 归一化 + 冻结 BERT + 拐点/STOP 权重 + 局部 `PROGRESS_MONITOR` + 因果 `prev_action` 20% dropout），验证集 `STOP F1` 从 `0.333` 升至 **`0.650`**，20 条验证序列在线/离线 `argmax` 100% 一致（OpenFly 单测 `76/76` 全绿）。
+   - 全量门禁 `bash tools/check.sh` 实跑退出码 **`0`**（0 SKIP）。
+
+### 0.1 2026-11-16 下午基础修复交接摘要（保留对照）
+
+1. **早间磁盘救急**：`/` 从 `674 MiB` 恢复至 `6.6 GiB`，`/root/rivermind-data` 从 `1.5 GiB` 恢复至 `75 GiB`（晚间二次清理后达 `101 GiB`）。
 2. **Git 与 GitHub 状态**：
-   - 本地 `main` 已快进对齐 `cursor/vln-language-goal-5fa5`，65 个已合入旧本地分支与 12 个干净工作树已清理（4 个含未提交改动的 `wt/p12-*` 原样保留保护）；`tools/git_mirror_alvln.sh` 已加祖先防回退校验，推送至 `git@github.com:xu967/ALVLN.git` 的 `main`。
-3. **本轮已落地并经真实 GPU + `cf_sitl` 验证的代码能力**（产物 `/root/rivermind-data/uav_rgb/exp-vln-upgrade-20261116/`，`DONE rc=0`）：
-   - **公开指标补齐**：`sim/3dgs/vln.py` 已实现精确动态规划 `nDTW` / `SDTW`、`resample_polyline`、`sage_ref_paths` 与 8 桶 `bearing_bin`。已补出 SAGE 249 集（teacher `nDTW=0.610, SDTW=0.568` vs forward `0.303 / 0.0`）与 OpenFly v3 seen20 五臂的完整 `SR / OSR / SPL / nDTW / SDTW` 对照表（`public_metrics.json`）。
-   - **可视化与错误目标门禁修复**：`run_vln.py` 与 `video.py` 不再拿预测目标覆写 `scene["waypoint"]`；当 grounder 选错目标时，顶视图同时画红圈（真值目标）与橙圈（预测目标），结尾大字显示红色 `WRONG GOAL`（不再伪装成绿色 `SUCCESS`）；面板新增目标距离、方位角与 `STOP REQUESTED`；长指令横幅保留首尾关键句；`eval_3dgs --record-video` 在 `cf_sitl` 下自动输出 10 FPS 四格视频。
-   - **3DGS 渲染升级**：`renderer.py` / `scene.py` 支持原生 `3DGUT`（`ut_eval3d=True`，RGB 走 3DGUT、深度走 ED 兼容）、`near_plane_m`、`eps2d` 与针状拉丝/半透明大雾团过滤 `gaussian_keep_mask`（实测室内 `841150` 与户外 `1MlUucug` 各视角锐度提升 `11.6%–23.9%`，对比图 `render_compare.png`）。
-   - **防撞刹停教师 `v5` 与 53m 户外长航线**：`planner.py` 新增 `uavrgb.teacher_occ.v5`（`--teacher-clearance braking`），16 条室内航线同 seed 配对碰撞率 `6.25% -> 0.0%`、SR `93.75% -> 100%`、SPL `0.776 -> 0.829`；打通本地 `wanderland_1MlUucug` 官方 `52.88 m` 街道长航线满电闭环（369 步实飞 `52.36 m`，自主 `STOP`，`NE=0.267 m`，`SPL=0.942`）。
-   - **语言目的性反事实闭环**：`grounder.py` 新增 `RelationPhraseGrounder`（`run_vln --grounder phrase`），在 `sage3d_840865` 同一出生位姿下输入不同房间目标指令，`correct` 组自主停在各自真目标（GT SR `2/2`），`swapped` 组严格判 `WRONG GOAL`（GT SR `0/2`）。
-   - **C++/CUDA 核心修复**：`src/nn_cuda.cu` 的 `sumsq_kernel` 改为确定性共享内存顺序归约，CTest **44/44 全绿**（含 `test_cuda_blocking_sync`）；`src/trainer.cpp` 修复从 `ckpt_epNN.bin` 分叉续训偷渡未来最佳权重与跨目录契约失步问题；`cf_sitl` **9/9 CTest + 33/33 自检全绿**；OpenFly **74/74 单测全绿**。
-4. **下一位接手做什么（严禁混淆边界）**：
-   - 当前 3DGS 上的同起点语言闭环仍是「短语 Grounder + 外部独立目录 + 特权规划器（G1 基线）」，**机载 C++ 学生网络尚未接入动态方位与独立 STOP 头，也尚未接入零特权视觉 VLM Grounder**。
-   - 下一位请直接按 **[PLAN §10.18](PLAN_2026-11-13_vln.md)** 的五张执行卡依序推进：**卡 S1（C++ 5 维动作+STOP 头与 15 维动态方位条件） → 卡 G2（零特权 VLM 视觉语言 Grounder 紧耦合闭环） → 卡 OF-E1/E2（OpenFly 6 场景扩量 + 预训练词向量 + 拐点/STOP 加权 + 因果 `prev_action`） → 卡 SCENE-LONG（SAGE 网格碰撞释放跨房间长航线 + Wanderland 全量长航线导入）**。
+   - 本地 `main` 已快进对齐并经 `tools/git_mirror_alvln.sh`（带防回退祖先校验）同步推送至 `git@github.com:xu967/ALVLN.git` 的 `main`。
+3. **下午基础能力**（产物 `/root/rivermind-data/uav_rgb/exp-vln-upgrade-20261116/`，`DONE rc=0`）：
+   - **公开指标补齐**：`sim/3dgs/vln.py` 已实现精确动态规划 `nDTW` / `SDTW`、`resample_polyline`、`sage_ref_paths` 与 8 桶 `bearing_bin`。
+   - **可视化与错误目标门禁修复**：顶视图同时画红圈（真值目标）与橙圈（预测目标），错地标显示红色 `WRONG GOAL`；面板新增目标距离、方位角与 `STOP REQUESTED`；`eval_3dgs --record-video` 在 `cf_sitl` 下输出 10 FPS 四格视频。
+   - **3DGS 渲染升级与防撞刹停教师 `v5`**：支持原生 `3DGUT` 与雾团过滤；`planner.py` 落地 `uavrgb.teacher_occ.v5`（`--teacher-clearance braking`）。
+4. **下一位接手做什么（见 PLAN §10.19）**：
+   - ① 微调或线性校准 VLM 的室内近距 `near_goal` 判停，打通零特权端到端高 `SR`；② 去掉 `_g0_subgoal` 的 A* 中继，训练纯直线/视觉方位下的机载局部视觉绕障；③ 待显卡空闲时运行报告第 4 节命令完成 OpenFly `v2` 多场景 UE4 在线闭环；④ 待用户确认后执行 `ARCH-LEAN` 死代码清理。
 
 ---
 
