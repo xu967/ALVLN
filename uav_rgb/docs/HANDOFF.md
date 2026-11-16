@@ -1,5 +1,177 @@
 # uav_rgb 交接文档
 
+## 当前交接：2026-11-16，无人机视觉语言导航
+
+**接手先读本节，再看[执行计划 §10.17](PLAN_2026-11-13_vln.md)。下面11月14日及更早章节保留为历史，不作为当前资源、训练状态或任务优先级。** 本次交接整理只核验文档与已有产物，没有重新训练、启动仿真或下载数据。
+
+### 1. 目标与当前结论
+
+最终任务：无人机根据语言指令与截至当前的视觉观测选择路线，在指定任务完成时自主停止。飞得远、经过目标附近、视频流畅或动作分类准确，都不能单独证明完成了VLN。
+
+当前已经接通外部OpenFly的因果监督、语言/视觉策略、真实渲染反馈与录像，并完成公开架构对照。**模型仍未通过任务验收：语言版没有在本轮seen子集上超过纯视觉版，目标附近持续摆头及错误STOP尚未解决。下一步从数据覆盖和停止策略入手，不需要重建训练框架。**
+
+| 实现线 | 已有能力 | 尚未完成 / 不可混用 |
+|---|---|---|
+| OpenFly外部基线 | AirVLN Seq2Seq/CMA适配，RGB/语言/GRU历史，OpenFly原十类动作含STOP | 本机重训适配模型，不是作者预训练checkpoint；运动学步进不能作为物理飞行或机载部署成绩 |
+| 3DGS/机载主线 | C++/CUDA四动作、独立STOP契约、cf_sitl；可选lexical目录检索 | 完整视觉语言目标落地、学生任务完成能力与部署链路未验收；lexical和读取真值目标的teacher不等于视觉语言理解 |
+
+外部十类策略不直接连接四动作飞控；模型不能输出PWM。真值目标、参考轨迹、未来图像和上一条真值动作不进入在线策略。不要把本轮OpenFly运动学修复写成3DGS画质、真机PID或连续飞行抖动修复。
+
+### 2. 代码版本、目录与交付范围
+
+| 项 | 已核验位置 / 版本 |
+|---|---|
+| 工作区 | /root/claude-code-backup-20261028 |
+| 源仓库 | /root/claude-code-backup-20261028/code/uav_rgb |
+| 源分支 / 本轮实现提交 | cursor/vln-language-goal-5fa5 / ebb55038b1088ff240ae5afdcc09283f5d5a4657 |
+| GitHub镜像 | /root/claude-code-backup-20261028/code/ALVLN，main；[实现提交0086e43](https://github.com/xu967/ALVLN/commit/0086e43566dae61ac4fa6c142a0669f6a8df52af) |
+| 实验根目录，以下记作 R | /root/rivermind-data/uav_rgb/exp-openfly-optimization-20261116 |
+| 现行计划 / 操作说明 | [PLAN §10.17](PLAN_2026-11-13_vln.md) / [OPENFLY_LOCAL_EVAL](OPENFLY_LOCAL_EVAL.md) |
+| 结果 / 过程 | [实验报告末节](experiments/2026-11-14-v3-baseline-long-route-followup.md) / [worklog最新条目](worklog/2026-11-14-2200-vln-experiment-data-review.md) |
+
+上表提交号指产生实验的实现版本；本次文档整理会另有docs提交。GitHub只保存源码、正式测试和文档；数据、环境、模型、录像以及源码快照均在本机数据盘，克隆GitHub不会自动获得它们。提交/镜像映射证据为 R/git_delivery.json。只使用既有 tools/git_mirror_alvln.sh 镜像已提交内容，不强推、不改历史。
+
+已改动的核心文件：
+
+| 文件 | 接手时应理解的职责 |
+|---|---|
+| [train_openfly_subset.py](../tools/train_openfly_subset.py) | 新旧manifest校验、raw原语/宏动作对拍、共享build_trainer、固定预算BC、消融与checkpoint契约 |
+| [eval_openfly_subset.py](../tools/eval_openfly_subset.py) | 模型严格重载、独立seen任务校验、v1/v2/v3执行协议、实时RGB闭环、失败落盘与录像 |
+| [训练测试](../tools/test_train_openfly_subset.py)、[评测测试](../tools/test_eval_openfly_subset.py) | 因果图像索引/STOP/源hash、CMA前动作屏蔽、协议版本与错误反馈终止、seen与train隔离 |
+
+复用现有入口，不增加train脚本、队列或launcher。CMA使用空间RGB特征2048×4×4，Seq2Seq为2048×1×1；不能把整架构对照称为单一attention消融。两者均冻结ResNet50，禁用深度/进度辅助/前动作；CMA通过共享构造函数将整个前动作嵌入输出清零，严格重载后仍重新挂载该行为。
+
+### 3. 已完成的数据、训练与实验
+
+- DataGen场景资产20/20已于2026-11-16 00:12完成，下载器记录大小/哈希校验；约124.37GB不等于完整轨迹图像库。六个Linux AirSim场景已解压，完整OpenFly-Agent模型未在本机评测。本次文档核验没有重新读取全部124GB计算哈希。
+- 当前causal.v2：16路线、12训练/4开发、116/34帧；补99张组首原图，复用51张，当前使用150张。原指令/动作/划分保持，150组、134宏转移、322原语转移通过验证。旧v1清单与原图保留；累计249张唯一原图不是249条训练样本。
+- 12次真实GPU训练：Seq2Seq/CMA × RGB-only/RGB+语言 × seeds 20261115/20261116/20261117；每次50轮/600次更新，固定最后checkpoint，不按seen选模。同架构同seed的初始化和50轮训练顺序一致，重载差0。
+- v2：开发100回合＋官方seen子集100回合；长序列出现10次位姿协议失败，原失败全部保留。v3：相同seen20任务×五臂100回合；0协议/程序/录像/过期时间戳错误，12次碰撞。
+- 总计300段录像、6690帧已完整独立解码；74相关工具单测通过。12个真实checkpoint的48条模型—开发路线对、408帧逐帧/整段前向满足atol=rtol=1e-5，argmax差异0。最大绝对logit差2.002716e-5，不能写成所有张量逐位相等。
+
+**本地v3结果：** 固定seed20261115、同20条env18 seen任务；STOP<20要求自主STOP且实际终点距离严格小于20m，盲基线列是固定规则STOP。OSR是曾经进入20m范围，不代表完成任务。
+
+| 策略 | STOP<20 | 有效观测OSR，含起点 | 可信末NE，m（n/20） | 碰撞 |
+|---|---:|---:|---:|---:|
+| 盲前进＋固定STOP | 1/20 | 19/20 | 35.41（17/20） | 5/20 |
+| Seq2Seq RGB-only | 5/20 | 14/20 | 78.99（20/20） | 1/20 |
+| Seq2Seq RGB＋语言 | 4/20 | 15/20 | 88.27（18/20） | 2/20 |
+| CMA RGB-only | 5/20 | 17/20 | 97.60（20/20） | 1/20 |
+| CMA RGB＋语言 | 3/20 | 17/20 | 77.95（18/20） | 3/20 |
+
+12个碰撞终帧中7个同时越过位姿门槛，可信终点只有93/100；NE是带分母的条件均值，不能直接排名。所有失败都保留STOP/OSR分母。20条任务仅覆盖env18的20/203、官方seen的20/1800；3条与训练/开发空间接近，4条起点已在20m内。4开发路线和20seen任务重复运行不等于300条独立路线。
+
+开发集三seed的CMA正确/交换/零语言STOP<20为6/12、4/12、2/12，Seq2Seq为6/12、7/12、7/12；这与seen结果一起说明，不能笼统声称语言已起到稳定作用。不同reset的首图也存在渲染差异，固定同图消融与闭环证据必须分开解释。
+
+**正式全量榜单未完成。** 这里运行的是公开架构的本地适配对照；官方OpenFly原代码的SR不要求STOP，使用命令位姿，legacy SPL也不是标准SPL。本地有额外碰撞/距离/时间/反馈门禁，不能混排。官方权重、完整seen/unseen和可提交成绩的全套协议尚未复现，未向远程榜单提交。作者参考表与可运行性核查见 R/baseline_audit.json。
+
+### 4. 已修复问题与仍未解决的问题
+
+| 问题 | 本轮结论 | 后续约束 |
+|---|---|---|
+| 组末图像配完整宏动作 | causal.v2改用经raw验证的组首图，原标签保留 | 当前只验证水平前进/转向/STOP；升降/侧移必须先扩原语验证 |
+| 位姿与渲染不同步 | v2采用固定time(.02)+frames(2)，保留反馈门禁 | 不允许按失败重发位姿或重复tick直到通过 |
+| 长序列累积下落 | v2的setPose保留速度；v3每步一次simSetKinematics设位姿并清零线/角速度及加速度 | v3为运动学评测；短tick仍运行物理，没有关闭重力或清空飞控内部状态 |
+| 到达后不STOP | v3 CMA语言episode014距目标约0.00133m，仍98次原地转向直到100步预算 | 这是真实策略缺口；禁止拿真值距离替模型触发STOP |
+| 样本及语言辨别不足 | 训练仅12路线，多数类9占70/116；动作4/5/6/7没有训练支持 | 先扩真实任务/少数动作/STOP覆盖，再做单因素损失和语言实验 |
+| 3DGS长航线画质、连续飞行抖动 | 本轮未重新解决或验收 | 回到PLAN §10.11/§10.15的画质、cf_sitl固定profile/完整前缀任务，不能拿UE瞬移视频调真机PID |
+
+执行协议名称分别为 openfly_eval_pose_step_v1、openfly_eval_pose_step_v2、openfly_eval_kinematic_step_v3（默认）。v1/v2可显式复现；不同协议结果分目录、分表。反馈门槛仍为0.2m/1°/递增timestamp，碰撞优先终止；失败反馈不再进入策略。
+
+### 5. 模型、录像和证据定位
+
+以下相对路径均在 R 下；本地视频可直接打开 index.html，无需启动仿真或公网服务。
+
+| 需要找什么 | 位置 |
+|---|---|
+| 300段视频总入口 | index.html；索引viewer_data.json |
+| 当前v3视频 | evaluation_v3/official_seen/策略名/episode_000..019/decisions.mp4 |
+| 历史v2 | evaluation/development/、evaluation/official_seen/ |
+| 每回合图片、动作与结果 | 视频同目录的first_rgb.png、last_rgb.png、preview_first.png、preview_last.png、trace.jsonl、result.json |
+| 12份权重 | training/架构_模态_seed/model.pt；例如training/cma_rgb_language_20261115/model.pt |
+| 每次训练结果 | 各模型目录的contract.json、metrics.jsonl、result.json、DONE |
+| 精确已执行命令 | training_execution.json、evaluation_execution.json、evaluation_v3_execution.json里的command数组 |
+| 预注册、任务及当前汇总 | preregistered_comparison.json、official_seen_tasks.json、evaluation_v3_freeze.json、comparison_v3.json |
+| 独立审核 | data_audit/evaluation200_independent_audit.json、data_audit/evaluation_v3_independent_audit.json；baseline_audit/closedloop_v3_interpretation.json |
+| 长期漂移诊断 / 时序对拍 | sync_audit/final_protocol_failure_review.json；baseline_audit/trained_sequence_parity.json |
+| 源码快照 / 本轮测试 | source_snapshots/manifest.json及v2/v3/trainer快照；final_validation.json、tools_final.log |
+| 后续100条候选 | data_expansion_candidate.json、data_expansion_candidate.md |
+| 环境启动和清理证据 | launch_simulator.json、settings.json、runtime_cleanup.json |
+
+关键文件身份（完整SHA保留，勿取消门禁来加载旧权重）：
+
+~~~text
+causal.v2 manifest: 69ec0c13319e4eb42cbe8e457768e0152c5cebf968007e59771ef3ed9c151482
+official_seen_tasks.json: abc1418e1352623b35ef5039a7ff725b8fdf49c014423bd7811c9c57e3b6929a
+tools/train_openfly_subset.py: 6dc2471004d373c74b8962e02e4f10a40a853b4ed59ca9b75174263a48d3bf16
+tools/eval_openfly_subset.py (v3): 78fcbeea43b1b1769a02cbb09a5703a61c68ce77c946f9f89d7aa90b4eacb3c5
+~~~
+
+manifest绝对路径：/root/rivermind-data/uav_rgb/downloads/OpenFly/subsets/env18_causal_bc_v2/manifest.json。数据repo为IPEC-COMMUNITY/OpenFly，revision为a12316d56a4e35a32ad626fb725ed7089937a1c4。权重逐一绑定数据、词表与训练源码；只改文档不会影响门禁，改训练源码则需单独处理版本/重训，不能删除hash检查。
+
+### 6. 接手环境与复现顺序
+
+2026-11-16 11:55 +0800重新只读检查：RTX2080Ti仍可见，UUID为GPU-e9d01956-88db-b317-ea53-be3fb6cf7190；41458无监听。本轮12训练与35组评测已全部结束，本任务UE已关闭，没有等待接续的训练队列。其他项目进程不能按旧PID或进程名批量停止。
+
+磁盘可用约：系统674MiB、/root/rivermind-data 1.5GiB、/root/rivermind-fs 68GiB。**以前“数据盘剩5.7GiB/243GB”的记录都是历史。** 新下载前重新核对容量与目标盘，不批删日志、权重或失败样本。缓存/解压/实验输出一并核算；按既有偏好优先国内可用来源，无可用同源数据时再测试HF镜像，固定来源revision和hash，不把认证token写入聊天、命令记录或Git。
+
+~~~bash
+cd /root/claude-code-backup-20261028/code/uav_rgb
+source env.sh
+git status --short --branch
+nvidia-smi -L
+nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+df -h / /root/rivermind-data /root/rivermind-fs
+ss -ltnp 'sport = :41458'
+~~~
+
+普通数据脚本用source env.sh后的UAV_RGB_PYTHON；此外部基线训练/评测使用已有 /root/rivermind-data/uav_rgb/envs/airvln/bin/python（Py3.8/torch2.1.2/cu118），不要安装或替换全局CUDA/Python。AirVLN源码在 /root/rivermind-data/uav_rgb/airvln-runtime-ubuntu/AirVLN，TORCH_HOME为 /root/rivermind-data/uav_rgb/torch-cache。
+
+若改相关代码，先复用已存在的测试；本次文档整理未重跑以下命令：
+
+~~~bash
+PYTHONDONTWRITEBYTECODE=1 OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 CUDA_VISIBLE_DEVICES='' /root/rivermind-data/uav_rgb/envs/airvln/bin/python -m unittest discover -s tools -p 'test_*openfly*.py' -v
+~~~
+
+若需真实复现：
+
+1. 先看 R/index.html 和comparison_v3.json，确认是否已有所需证据，不为读文档重复12次训练。
+2. 用 R/launch_simulator.json 的command/cwd与settings.json启动env18；原环境为非root用户ubuntu、DISPLAY=:20、端口41458、drone_1/front_custom、853×480/FOV90/Gamma1.5/相机NED Z=1。旧display/端口必须先检查，不直接拿root启动UE。
+3. 使用[操作说明](OPENFLY_LOCAL_EVAL.md)或evaluation_v3_execution.json中的完整argv，修改为不存在的新输出目录。模型、manifest、官方任务清单必须对应；当前seen复现用v3、100步/300m/120s。不同配置重新预登记、另表保存。
+4. 录像默认开启；--record-video开启，--no-record-video关闭。2fps只是决策帧展示，不能据视频播放速度判断飞行速度；录像耗时计入wall timeout，比较组必须固定录像配置。
+5. 核对summary的errors/protocol_errors/video_errors、所有失败分母与trace，完整检查视频后再报告分数。仅关闭本次启动且已核实归属的进程，不按名称全局kill。
+
+### 7. 下一位按什么顺序执行
+
+当前默认下一项是 **E1数据准备与划分**；E0的v3执行修复已完成本轮有限验收。下面是执行卡，已有结果不重跑，未完成项不提前标PASS。
+
+| 顺序 | 具体工作与输入 | 交付 / 验收 |
+|---|---|---|
+| E1-a 文件与空间清单 | 读R/data_expansion_candidate.json的100候选及api_metadata_requests；查询固定revision文件大小/SHA，先核盘 | 明确需下载的raw/组首PNG、可复用文件、峰值字节与目标盘；当前missing_download_bytes未知，不直接开全库下载 |
+| E1-b 因果与空间划分 | 从官方train补raw并逐原语/宏转移对拍；按地理簇分train/dev，查共享走廊与近邻路径 | 独立新schema/manifest、原图hash/解码、完整唯一STOP、空间簇隔离；不能只做完整轨迹exact去重就宣称独立 |
+| E1-c 数据规模对照 | 冻结新train/dev、三seed与总更新预算；同一架构比较原小集与扩展数据，保留RGB-only及语言对照 | 数据更大时“50轮”不再等于600更新；先约定可比更新数/计算预算，不用seen选epoch/模型 |
+| E2 STOP单因素 | 固定通过E1的数据/架构/初始化/预算，原CE对一种预登记的STOP或inflection权重方案 | 只改一种损失；报告目标外误停、STOP precision/recall、OSR→STOP差距、连续转向、NE/碰撞/预算失败；若仅早停而任务不改善则不采纳 |
+| E3 语言目的性 | 使用真实相近起始视觉、不同有效目标的训练任务对；固定同图与历史做correct/swap/zero，再做闭环 | 正确指令应改善各自目标的完成，纯视觉对文字不变；改logit或任意错配导致不同动作不算理解 |
+| E4 历史/进度候选 | E1–E3形成证据后，再固定其余条件比较当前GRU与短历史/任务进度表示 | 只用因果历史；有跨路线闭环改善才保留，不能以离线accuracy或网络名字宣称原创 |
+
+100候选是六场景均衡的**元数据候选，不可直接训练**：960个公开保留帧、151转向、100 STOP；5条含未验证的升降。六场景合法标注中动作6/7侧移均缺失，禁止伪造标签补覆盖。候选尚未下载组首图、验证raw、划分地理簇；精确route/轨迹去重不代表空间独立。
+
+已查看的4开发路线继续仅作诊断；20seen任务永久固定，不能用来调权重、挑checkpoint或筛候选。新的最终泛化结论另选尚未查看的场景/路线留出并预注册。没有预训练权重和完整协议时，不把“公开架构已对照”写成“公开榜单已复现”。
+
+并行建议：一个agent负责候选/字节/raw校验，一个负责模型与STOP诊断，一个负责评测/视频与公平性审计；主代理审diff、登记实验及汇总。相同文件设单一写入者，单个UE实例/RPC只能有一个使用者，单GPU资源按实测顺序安排。
+
+### 8. 未完成项与交接纪律
+
+- 正式全量seen/unseen、官方大模型基线与远程榜单提交未完成：当前仅一个场景20任务，协议不同。
+- 稳定语言任务成功、目标绑定与自主STOP未完成：最终语言版没有超过RGB-only，摆头/错误停止仍在。
+- 3DGS长航线资产、独立画质验收、连续动力学抖动和真机安全未完成：本轮没有修改或重新验收该实现线。
+- 100新候选的下载/因果校验/空间划分未完成：文件字节未知，磁盘余量变化，不能承诺直接开训。
+- 本次只做文档整理，不修改模型/控制代码、不重复实验；验证已有JSON、hash、路径、Git状态和文档链接，结果文档和worklog继续追加原文件。
+
+提交前精确暂存本次文件并检查diff；数据、权重、视频、环境、token和日志不入Git。失败实验与旧协议证据保留；如清理，先列出归属/用途/恢复方式。接手时先读当前交接和PLAN，不根据下面旧任务板、旧GPU编号或历史成功率启动新工作。
+
+## 历史交接归档（以下按原日期保留）
+
 ## 本次会话增量（2026-11-14）
 
 - 修复 SAGE-3D 导入器 `_raster` 的边界环绕：边界高斯只在场景内膨胀，不会从一侧复制到另一侧。
