@@ -46,7 +46,7 @@ KEYFRAMES = 4          # 关键帧 PNG：首、1/3、2/3、末（末 = 定格帧
 # roll/pitch 可见；以前是黄色线框（更早是固定 6 px 圆）。顶视地图上的机体是 e1_body.draw_top_icon，与 Gazebo 顶视同一图标。
 # 顶视地图配色：中灰底 + 深灰占据，白字黑边标签在上面读得出；轨迹黄与 Gazebo 顶视 trail 同色。
 MAP_BG, MAP_GRID, MAP_OCC = (150, 150, 150), (168, 168, 168), (55, 55, 55)
-MAP_TRAIL, MAP_GOAL, MAP_SPAWN = (0, 255, 255), (0, 0, 220), (0, 160, 0)
+MAP_TRAIL, MAP_GOAL, MAP_PRED_GOAL, MAP_SPAWN = (0, 255, 255), (0, 0, 220), (0, 140, 255), (0, 160, 0)
 TOP_LABEL = "TOP MAP [DIAGNOSTIC/ORACLE] occupancy proxy + path"
 
 
@@ -96,7 +96,14 @@ def _banner(cv2, canvas, text, x, y, w, s=1, max_lines=4):
             cur = word
         else:
             cur = trial
-    lines = (lines + [cur])[:max_lines]
+    all_lines = lines + ([cur] if cur else [])
+    if len(all_lines) > max_lines and max_lines >= 2:
+        # 长指令的目标地标和停止条件通常在末尾：保留首行与最后 max_lines-1 行，避免截丢终点描述。
+        tail = list(all_lines[-(max_lines - 1):])
+        tail[0] = "... " + tail[0][-max(8, len(tail[0]) - 4):]
+        lines = [all_lines[0]] + tail
+    else:
+        lines = all_lines[:max_lines]
     y0, h = y + 32 * s, (20 * len(lines) + 10) * s
     roi = canvas[y0:y0 + h, x:x + w]
     roi[:] = (roi * 0.35).astype(np.uint8)
@@ -143,14 +150,20 @@ class _TopMap:
     拼在一起时轨迹读法相同；路线大多沿 +x，也正好用满 16:9 的宽。
     """
 
-    def __init__(self, scene, occ, extra_xy=(), s=1):
+    def __init__(self, scene, occ, extra_xy=(), s=1, pred_goal=None):
         """extra_xy：也要落在图里的点（整条轨迹）；多路线的 A* 绕行会跑出 spawn–waypoint 包围盒。
+        pred_goal：grounder 预测的目标点（与真值 waypoint 不同时以橙色圈标出，防止错目标伪装成到达真目标）。
         s：画布倍数（high 档 2）：地图按 CW·s × CH·s 原生画，字号/线宽随之放大，不靠 paste 放大。"""
         import cv2
         font = cv2.FONT_HERSHEY_SIMPLEX
         self.s, self.w, self.h = s, vl.CW * s, vl.CH * s
         sp, wp = scene["spawn"], scene["waypoint"]
         pts = [(sp["x"], sp["y"]), (wp["x"], wp["y"])] + [(float(x), float(y)) for x, y in extra_xy]
+        show_pred = (isinstance(pred_goal, dict) and "x" in pred_goal and "y" in pred_goal
+                     and math.hypot(float(pred_goal["x"]) - float(wp["x"]),
+                                    float(pred_goal["y"]) - float(wp["y"])) > 1e-3)
+        if show_pred:
+            pts.append((float(pred_goal["x"]), float(pred_goal["y"])))
         xs, ys = [p[0] for p in pts], [p[1] for p in pts]
         span_x, span_y = max(xs) - min(xs) + 2 * TOP_MARGIN_M, max(ys) - min(ys) + 2 * TOP_MARGIN_M
         self.scale = max(span_x / self.w, span_y / self.h)           # m/px，x 映射到图宽
@@ -172,12 +185,18 @@ class _TopMap:
                 if -half <= px < self.w + half and -half <= py < self.h + half:
                     cv2.rectangle(self.base, (px - half, py - half), (px + half, py + half), MAP_OCC, -1)
         reach = float(scene.get("reach_radius_m", 1.5))
+        if show_pred:
+            cv2.circle(self.base, self.px(pred_goal["x"], pred_goal["y"]),
+                       int(round(reach / self.scale)), MAP_PRED_GOAL, 2 * s)
+            cv2.circle(self.base, self.px(pred_goal["x"], pred_goal["y"]), 5 * s, MAP_PRED_GOAL, -1)
         cv2.circle(self.base, self.px(wp["x"], wp["y"]), int(round(reach / self.scale)), MAP_GOAL, 2 * s)   # 到达半径
         cv2.circle(self.base, self.px(wp["x"], wp["y"]), 5 * s, MAP_GOAL, -1)
         cv2.circle(self.base, self.px(sp["x"], sp["y"]), 5 * s, MAP_SPAWN, -1)                              # spawn
         # 图例放左上、TOP 标签（paste 写在 y=22）之下，与 Gazebo 顶视图例同位置（record_views.LEGEND_TOP）。
-        legend = (("trail", MAP_TRAIL), ("waypoint r=%gm" % reach, MAP_GOAL), ("spawn", MAP_SPAWN),
-                  ("DIAGNOSTIC/ORACLE occupancy", MAP_OCC))
+        legend = [("trail", MAP_TRAIL), ("GT goal r=%gm" % reach, MAP_GOAL)]
+        if show_pred:
+            legend.append(("predicted goal", MAP_PRED_GOAL))
+        legend += [("spawn", MAP_SPAWN), ("DIAGNOSTIC/ORACLE occupancy", MAP_OCC)]
         for i, (label, color) in enumerate(legend):
             cv2.putText(self.base, label, (8 * s, (44 + 15 * i) * s), font, 0.4 * s, color, s)
         # 比例尺 + 朝向：没有比例尺看不出 2 m 到达圈有多大；箭头朝右 = +x。放在 paste 的时间角标（y=CH-8）之上。
@@ -219,7 +238,7 @@ def _video_trace(trace):
 
 
 def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_dir=None,
-                        title="", result="", quality=None, log=print, instruction=""):
+                        title="", result="", quality=None, log=print, instruction="", pred_goal=None):
     """cf_sitl 采集集（trace.jsonl + actions.jsonl）-> 四格视频（.mp4 / .webm）+ 关键帧 PNG。
 
     instruction：VLN 集的指令原文，不附加目标答案，非空时作为横幅贴在 FOLLOW 格顶部。
@@ -260,7 +279,9 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
     key_idx = sorted({int(round(k * (len(seq) - 1) / max(1, KEYFRAMES - 1))) for k in range(KEYFRAMES)})
     keyframes, body_px = [], []
     pitch_follow = -math.degrees(math.atan2(FOLLOW_UP_M, FOLLOW_BACK_M))
-    topmap, path_xy = _TopMap(scene, occ, extra_xy=[row["pos"][:2] for row in trace], s=s), []
+    if pred_goal is None:
+        pred_goal = ((scene.get("vln") or {}).get("grounding") or {}).get("policy_goal")
+    topmap, path_xy = _TopMap(scene, occ, extra_xy=[row["pos"][:2] for row in trace], s=s, pred_goal=pred_goal), []
     route = scene.get("route") or {}
     route_tag = f"route {route['index']} {route['name']}  " if route else ""
     t0, t_end = float(trace[0]["t"]), float(trace[-1]["t"])
@@ -314,14 +335,23 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
             vl.paste(cv2, canvas, onboard, *bl, CW, CH,
                      vl.onboard_label(onboard, renderer.fov_deg, display=s, rendered_at=s), note, s=s)
             step = int(row["step"])
-            act = steps.get(step, {}).get("action_executed", row.get("action"))
+            step_row = steps.get(step, {})
+            act = step_row.get("action_executed", row.get("action"))
             speed = math.sqrt(sum(float(v) ** 2 for v in row["vel"]))
+            wp = scene.get("waypoint") or {}
+            goal_tag = ""
+            if "x" in wp and "y" in wp:
+                gd = math.hypot(float(wp["x"]) - x, float(wp["y"]) - y)
+                gbrg = (math.degrees(math.atan2(float(wp["y"]) - y, float(wp["x"]) - x) - yaw) + 180.0) % 360.0 - 180.0
+                goal_tag = f"  goal {gd:4.2f}m {gbrg:+4.0f}deg"
             lines = [title or str(scene.get("name", "")),
                      f"{route_tag}step {step + 1}/{len(actions)}",
                      f"sim t = {t:.2f} s  (video +{t - t0:.1f} s)",
-                     f"pos x={x:5.2f} y={y:5.2f} z={z:4.2f} m",
+                     f"pos ({x:5.2f},{y:5.2f},{z:4.2f})m{goal_tag}",
                      f"speed {speed:4.2f} m/s  yaw {math.degrees(yaw):6.1f} roll {roll:5.1f} pitch {pitch:5.1f} deg"]
             flags = [(f"COLLISION @ step {hit['step'] + 1}", (0, 0, 255))] if hit and step >= hit["step"] else []
+            if not flags and step_row.get("stop_requested"):
+                flags.append(("STOP REQUESTED", (80, 220, 80)))
             vl.panel(cv2, canvas, *br, lines,
                      int(act) if act is not None and 0 <= int(act) < 4 else None,
                      flags, segments, t - t0, span, result if i >= len(frames) else "", s=s)
@@ -401,7 +431,7 @@ def _selftest():
         topmap = _TopMap(scene, occ)
         assert topmap.px(0.0, 0.0)[0] < topmap.px(8.0, 0.0)[0] and topmap.px(0.0, 1.0)[1] < topmap.px(0.0, 0.0)[1]
         top = key0[:vl.CH, vl.CW:]
-        ys, xs = np.nonzero((top == 200).all(axis=2))
+        ys, xs = np.nonzero((top[30:-24] == 200).all(axis=2))   # 排除顶部标题栏与底部时间角标的抗锯齿灰像素
         assert len(xs) >= 30 and abs(xs.mean() - topmap.px(0.0, 0.0)[0]) < 12, ("顶视图标应画在当前位置", len(xs))
         # 跟随格（左上 640x360）机体着色投影：水平机体、相机后方 1.1 m / 上 0.3 m，§6.1 要求机体 ≥ 80 px、
         # 画面水平居中；红机头线在机体上半（远端）
@@ -475,9 +505,12 @@ def episode_result(man, oracle=None, reach_radius_m=None, collided=False, action
             return "ANOMALY %s" % man["dynamics_anomaly"]
         if not actions or not oracle or len(actions) != len(oracle) or reach_radius_m is None:
             return "INVALID trajectory"
+        grounding = (man.get("vln") or {}).get("grounding")
         vln = importlib.import_module("sim.3dgs.vln")
         m = vln.episode_metrics(actions, oracle, man["waypoint"], reach_radius_m,
                                 man.get("stopped_by_agent", False))
+        if isinstance(grounding, dict) and grounding.get("correct") is False:
+            return "WRONG GOAL %.1f m" % m["ne_m"]
         if m["success"]:
             return "SUCCESS stop %.2f m" % m["ne_m"]
         if m["collision"]:

@@ -6,6 +6,7 @@
 import importlib
 import copy
 import json
+import math
 import os
 import sys
 import tempfile
@@ -154,6 +155,79 @@ class TestMetrics(unittest.TestCase):
             self.assertAlmostEqual(s[key], want, msg=key)
         self.assertEqual(vln.summarize_by(rows, "type")["B"]["n"], 2)
         self.assertIsNone(vln.summarize([])["sr"])
+
+    def test_ndtw_sdtw_and_bearing_bin(self):
+        ref = [(0.0, 0.0), (2.0, 0.0), (4.0, 0.0)]
+        a, o = _steps([(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (4.0, 0.0)])
+        m_ok = vln.episode_metrics(a, o, GOAL, 1.0, stopped=True, shortest_m=4.0, ref_path=ref)
+        self.assertGreater(m_ok["ndtw"], 0.90)
+        self.assertAlmostEqual(m_ok["sdtw"], m_ok["ndtw"])
+        m_nostop = vln.episode_metrics(a, o, GOAL, 1.0, stopped=False, shortest_m=4.0, ref_path=ref)
+        self.assertAlmostEqual(m_nostop["ndtw"], m_ok["ndtw"])
+        self.assertEqual(m_nostop["sdtw"], 0.0)
+        self.assertEqual(vln.bearing_bin(0.0, (0, 0), (5, 0), 8), 0)
+        self.assertEqual(vln.bearing_bin(0.0, (0, 0), (0, 5), 8), 2)
+        self.assertEqual(vln.bearing_bin(0.0, (0, 0), (-5, 0), 8), 4)
+        self.assertEqual(vln.bearing_bin(0.0, (0, 0), (0, -5), 8), 6)
+
+    def test_phrase_grounder_and_wrong_goal_video_badge(self):
+        grounder_mod = importlib.import_module("sim.3dgs.grounder")
+        pg = grounder_mod.RelationPhraseGrounder()
+        catalog = {"track_light_1": {"x": 7.0, "y": -1.0}, "wall_art_2": {"x": 2.0, "y": 3.0}}
+        res = pg.ground("Go to the track light located directly above the decorative wall art.", catalog)
+        self.assertTrue(res.accepted)
+        self.assertEqual(res.target, "track_light_1")
+        # 若 grounder 选错目标且飞到了错误目标，视频徽标必须是 WRONG GOAL 而不能伪装成 SUCCESS
+        scene = copy.deepcopy(SCENE)
+        scene.update(ply_path="unused.ply", reach_radius_m=1.0, max_steps=8)
+        scene["routes"] = [{"name": "r0", "spawn": {"x": 0.0, "y": 0.0, "z": 2.0},
+                            "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0},
+                            "sage": {"split": "train", "instructions": [
+                                {"instruction_type": "A", "start": "start", "end": "tv_1",
+                                 "text": "Go to the tall lamp."}]}}]
+        args = SimpleNamespace(split=None, all_instructions=True, seed=0, limit=0,
+                               out="unused", hold=0.5, policy="teacher", videos=1, stop_mode="explicit")
+        actions, oracle = _steps([(0, 0), (7, -1), (7, -1)])
+        manifest = {"stopped_by_agent": True, "validity": {"physics_verified": True, "camera_verified": True}}
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(scene_mod, "load_scene", return_value=scene))
+            stack.enter_context(mock.patch.object(scene_mod, "read_gaussian_ply", return_value=None))
+            stack.enter_context(mock.patch.object(runner.collision_mod, "from_scene", return_value=None))
+            stack.enter_context(mock.patch.object(runner.renderer_mod, "make_renderer", return_value=None))
+            stack.enter_context(mock.patch.object(runner.planner_mod, "OccPlanner", return_value=None))
+            stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
+            stack.enter_context(mock.patch.object(runner, "make_policy", return_value=SimpleNamespace(name="teacher")))
+            run_ep = stack.enter_context(mock.patch.object(collect, "run_episode", return_value=(manifest, None)))
+            stack.enter_context(mock.patch.object(runner, "_read_jsonl", side_effect=[actions, oracle]))
+            stack.enter_context(mock.patch.object(runner, "route_shortest_path_m", return_value=3.0))
+            vid = stack.enter_context(mock.patch.object(runner.video_mod, "compose_views_video",
+                                                        return_value={"video": "unused/v.mp4", "frames": 10, "fps": 10.0}))
+            rows, _ = runner.run_scene("fixture.json", args, SimpleNamespace(camera_mount={}),
+                                       lexical_grounder=grounder_mod.LexicalGrounder(),
+                                       catalog={"lamp_2": {"x": 7.0, "y": -1.0}})
+        self.assertFalse(rows[0]["grounding"]["correct"])
+        self.assertTrue(rows[0]["target_success"])
+        self.assertFalse(rows[0]["success"])
+        self.assertEqual(run_ep.call_args.args[0]["waypoint"], {"x": 4.0, "y": 0.0, "z": 2.0})
+        self.assertTrue(vid.call_args.kwargs["result"].startswith("WRONG GOAL"))
+
+    def test_braking_teacher_brakes_before_high_speed_turn_and_commits_hysteresis(self):
+        planner = mock.Mock()
+        planner.plan.return_value = [(0.0, 0.0), (0.0, 4.0)]
+        planner.aim_point.return_value = (0.0, 4.0)
+        # 当前速度 0.30 m/s 沿 +x，前方滑行段撞墙 -> 先输出 SAFE_NEUTRAL 刹停再左转
+        planner.occ.sweep.side_effect = lambda a, b: (b[0] > 0.10, None)
+        teacher = runner.planner_mod.OccAstarTeacher(planner, {"x": 0.0, "y": 4.0}, hold_s=0.5, clearance="braking")
+        self.assertEqual(teacher.version, runner.planner_mod.TEACHER_VERSION_BRAKING)
+        act_brake, _ = teacher(None, None, SimpleNamespace(x=0.0, y=0.0, z=1.2, yaw=0.0, vx=0.30, vy=0.0))
+        self.assertEqual((act_brake, teacher.last_branch), (collect.SAFE_NEUTRAL, "brake_before_turn"))
+        # 速度降到 0 后正常左转，且在误差 10°（介于 tol_exit=9.0° 与 tol=12° 之间）保持转向承诺不回跳
+        planner.occ.sweep.side_effect = lambda a, b: (False, None)
+        act_turn1, _ = teacher(None, None, SimpleNamespace(x=0.0, y=0.0, z=1.2, yaw=0.0, vx=0.0, vy=0.0))
+        act_turn2, _ = teacher(None, None, SimpleNamespace(x=0.0, y=0.0, z=1.2, yaw=math.radians(80.0), vx=0.0, vy=0.0))
+        act_fwd, _ = teacher(None, None, SimpleNamespace(x=0.0, y=0.0, z=1.2, yaw=math.radians(85.0), vx=0.0, vy=0.0))
+        self.assertEqual((act_turn1, act_turn2, act_fwd),
+                         (dyn3dgs.YAW_LEFT, dyn3dgs.YAW_LEFT, collect.FORWARD_SLOW))
 
 
 class TestReactiveGoalPolicy(unittest.TestCase):

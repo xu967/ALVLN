@@ -25,7 +25,15 @@ TEACHER_VERSION_HOLD_TOL = "uavrgb.teacher_occ.v2"
 # clearance="swept"：前向净空检查在机头线段之外再沿预测位移做扫掠；v4 不再按等待次数绕过否决。manifest 写 "swept"，
 # 旧 manifest 没有这个键 = "ray"（机头线段，v1 / v2）。
 TEACHER_VERSION_SWEPT = "uavrgb.teacher_occ.v4"
-CLEARANCE_MODES = ("ray", "swept")
+# clearance="braking"：任意 hold_s 通用的速度感知刹停包络 + 转向残速保护 + 转向滞回承诺（防锯齿与左右乒乓死锁）。
+TEACHER_VERSION_BRAKING = "uavrgb.teacher_occ.v5"
+CLEARANCE_MODES = ("ray", "swept", "braking")
+V_FWD_MPS = 0.30       # e1_mini.json executor.forward_speed_mps
+TAU_UP_S = 0.35        # 前飞一阶加速时间常数（秒）
+TAU_BRAKE_S = 0.50     # 刹停滑行时间常数（秒）：0.3 m/s 下滑行 0.15m + 0.05m 安全垫 = 0.20m，包络实测 p100 (0.163m)
+BRAKE_PAD_M = 0.05     # 几何安全垫（米）
+TURN_EXIT_FRAC = 0.75        # 退出转向阈值 = 0.75 × tol（hold=0.5 为 9.0°），避免窄于半步转角引发过冲回摆
+BRAKE_TURN_SPEED_MPS = 0.08  # 前飞切原地转前若速度 >0.08 m/s 且惯性滑行段撞墙，先插一步 SAFE 刹停
 # 软余量：硬栅格 = 机体包络膨胀后的占据；再向外 MARGIN_M 这一圈可走但每米加 MARGIN_COST 倍代价，
 # 路径贴走廊中线、窄缝仍可通过。0.4 与 E1 Gazebo A* 余量同值（teacher.CLEARANCE_BY_VEHICLE）。
 MARGIN_M = 0.4
@@ -193,17 +201,20 @@ class OccPlanner:
         ok = (c >= 0).all(axis=1) & (c[:, 0] < mask.shape[0]) & (c[:, 1] < mask.shape[1])
         return bool(ok.all() and not mask[c[:, 0], c[:, 1]].any())
 
-    def aim_point(self, path, x, y, lookahead=LOOKAHEAD_M, los_max=LOS_MAX_M):
+    def aim_point(self, path, x, y, lookahead=LOOKAHEAD_M, los_max=LOS_MAX_M, hard_los_max=None):
         """纯追踪目标点：视线抽捷径（软余量 -> 硬栅格），都不通时退回 _carrot。"""
         best = min(range(len(path)), key=lambda k: (path[k][0] - x) ** 2 + (path[k][1] - y) ** 2)
-        far, acc = best, 0.0
+        far, hard_far, acc = best, best, 0.0
+        h_lim = los_max if hard_los_max is None else float(hard_los_max)
         for k in range(best + 1, len(path)):
             acc += math.hypot(path[k][0] - path[k - 1][0], path[k][1] - path[k - 1][1])
+            if acc <= h_lim:
+                hard_far = k
             if acc > los_max:
                 break
             far = k
-        for mask in (self.hard | self.soft, self.hard):
-            for k in range(far, best, -1):
+        for mask, limit_k in ((self.hard | self.soft, far), (self.hard, hard_far)):
+            for k in range(limit_k, best, -1):
                 if self.line_free(mask, (x, y), path[k]):
                     return path[k]
         return _carrot(path, x, y, lookahead)
@@ -256,27 +267,34 @@ class OccAstarTeacher:
             raise ValueError(f"clearance 必须是 {CLEARANCE_MODES} 之一，得到 {clearance!r}")
         if clearance == "swept" and (hold_s is None or abs(float(hold_s) - SWEPT_HOLD_S) > 1e-9):
             raise ValueError(f"clearance='swept' 的位移系数只在 hold {SWEPT_HOLD_S:g} s 下量过，hold_s 必须是 {SWEPT_HOLD_S:g}，得到 {hold_s!r}")
+        if clearance == "braking" and hold_s is None:
+            hold_s = 0.5
         self.planner = planner
         self.wp = (float(waypoint["x"]), float(waypoint["y"]))
         self.lookahead = float(lookahead)
+        self.hold_s = float(hold_s) if hold_s is not None else 0.5
         self.tol = float(tol_deg) if tol_deg is not None else (YAW_TOL_DEG if hold_s is None else yaw_tol_deg(hold_s))
+        self.tol_exit = TURN_EXIT_FRAC * self.tol if clearance == "braking" else self.tol
         self.clearance = clearance
         # 容差 = 12° 的教师与 v1 逐步相同，版本不变；不是 12° 才写 v2（与 manifest 的 teacher_yaw_tol_deg 一起区分新旧容差）；
-        # swept 一律写 v4（与 manifest 的 teacher_clearance 一起区分）
-        self.version = (TEACHER_VERSION_SWEPT if clearance == "swept"
+        # swept 写 v4，braking 写 v5（与 manifest 的 teacher_clearance 一起区分）
+        self.version = (TEACHER_VERSION_BRAKING if clearance == "braking"
+                        else TEACHER_VERSION_SWEPT if clearance == "swept"
                         else TEACHER_VERSION if self.tol == YAW_TOL_DEG else TEACHER_VERSION_HOLD_TOL)
         self.stop_radius, self.forward_check = float(stop_radius), float(forward_check_m)
-        self.prev = None          # collect 每集会重置（滞回接口），这里不用
+        self.prev = None          # collect 每集会重置
+        self._turn_dir = None
+        self._blocked_turn = None
         self.last_path = None
-        # 本步动作由哪条规则给出：stop / plan_fail / turn_err / turn_blocked / forward；swept 另有 turn_swept / wait_swept
-        # （离线归因交替段用）
         self.last_branch = None
         self.n_plan_fail = 0
         self.stop_requested = False
 
     def reset(self):
-        """集边界清除任务完成意图。"""
+        """集边界清除任务完成意图与转向滞回状态。"""
         self.stop_requested = False
+        self._turn_dir = None
+        self._blocked_turn = None
 
     def set_waypoint(self, waypoint):
         self.wp = (float(waypoint["x"]), float(waypoint["y"]))
@@ -298,6 +316,103 @@ class OccAstarTeacher:
             (x, y, z), (x + wx + SWEPT_RESERVE_M * ux, y + wy + SWEPT_RESERVE_M * uy, z))
         return bool(hit)
 
+    @staticmethod
+    def _brake_vec(vx, vy, scale=1.0):
+        spd = math.hypot(vx, vy)
+        if spd <= 1e-6:
+            return 0.0, 0.0
+        dist = scale * (TAU_BRAKE_S * spd + BRAKE_PAD_M)
+        return vx / spd * dist, vy / spd * dist
+
+    def _forward_stop_blocked(self, x, y, z, yaw_rad, vx, vy):
+        """检查一步 FORWARD_SLOW 加下一步完整刹停滑行轨迹是否撞硬栅格（任意 hold_s 通用）。"""
+        ux, uy = math.cos(yaw_rad), math.sin(yaw_rad)
+        vcx, vcy = V_FWD_MPS * ux, V_FWD_MPS * uy
+        t = self.hold_s
+
+        def pos_at(dt):
+            k = TAU_UP_S * (1.0 - math.exp(-dt / TAU_UP_S))
+            return (x + vcx * dt + (vx - vcx) * k, y + vcy * dt + (vy - vcy) * k, z)
+
+        e = math.exp(-t / TAU_UP_S)
+        v1x, v1y = vcx + (vx - vcx) * e, vcy + (vy - vcy) * e
+        p_mid, p_end = pos_at(0.5 * t), pos_at(t)
+        bx, by = self._brake_vec(v1x, v1y)
+        p_stop = (p_end[0] + bx, p_end[1] + by, z)
+        ray_len = max(self.forward_check, V_FWD_MPS * t + TAU_BRAKE_S * max(0.0, vx * ux + vy * uy) + BRAKE_PAD_M)
+        if self.planner.occ.sweep((x, y, z), (x + ray_len * ux, y + ray_len * uy, z))[0]:
+            return True
+        for a, b in (((x, y, z), p_mid), (p_mid, p_end), (p_end, p_stop)):
+            if self.planner.occ.sweep(a, b)[0]:
+                return True
+        return False
+
+    def _turn_with_brake_guard(self, turn_act, x, y, z, vx, vy, branch):
+        """带前向残速切原地转前先查惯性滑行段：会撞就先发一步 SAFE 刹停（消除 M1 中 25/37 的转向滑行碰撞）。"""
+        if math.hypot(vx, vy) > BRAKE_TURN_SPEED_MPS:
+            bx, by = self._brake_vec(vx, vy, scale=1.15)
+            if self.planner.occ.sweep((x, y, z), (x + bx, y + by, z))[0]:
+                self._turn_dir = None
+                self.last_branch = "brake_before_turn"
+                return SAFE_NEUTRAL, None
+        self._turn_dir = turn_act
+        self.last_branch = branch
+        return turn_act, None
+
+    def _act_braking(self, path, state, x, y, z, yaw_deg):
+        vx = float(getattr(state, "vx", 0.0))
+        vy = float(getattr(state, "vy", 0.0))
+        if not (math.isfinite(vx) and math.isfinite(vy)):
+            raise ValueError("braking 速度必须有限")
+        spd = math.hypot(vx, vy)
+        hard_los = min(1.0, 0.65 + 0.8 * spd)
+        tx, ty = self.planner.aim_point(path, x, y, lookahead=0.65 + 0.8 * spd,
+                                        los_max=3.0, hard_los_max=hard_los)
+        err = _wrap(math.degrees(math.atan2(ty - y, tx - x)) - yaw_deg)
+        yaw = math.radians(yaw_deg)
+        fwd_blocked = self._forward_stop_blocked(x, y, z, yaw, vx, vy)
+
+        # 转向滞回承诺：已开始同侧转向时，转到 |err| <= tol_exit 才退出，避免在 tol 边界锯齿切换。
+        want_turn = None
+        if self._turn_dir == YAW_LEFT and err > self.tol_exit:
+            want_turn = YAW_LEFT
+        elif self._turn_dir == YAW_RIGHT and err < -self.tol_exit:
+            want_turn = YAW_RIGHT
+        elif err > self.tol:
+            want_turn = YAW_LEFT
+        elif err < -self.tol:
+            want_turn = YAW_RIGHT
+
+        if want_turn is not None:
+            # 防 turn_err <-> turn_blocked 二周期乒乓死锁：若上一步刚因前方被堵转向，本步想反向转回被堵扇区，
+            # 而当前机头前方已畅通且偏角 <= 45°，直接沿畅通切线前进一步脱困。
+            if (self._blocked_turn is not None and want_turn != self._blocked_turn):
+                step_deg = 0.8 * math.degrees(YAW_RATE_RPS * self.hold_s)
+                back_yaw = math.radians(yaw_deg + (step_deg if want_turn == YAW_LEFT else -step_deg))
+                back_hit = self.planner.occ.sweep(
+                    (x, y, z), (x + self.forward_check * math.cos(back_yaw),
+                                y + self.forward_check * math.sin(back_yaw), z))[0]
+                if back_hit:
+                    if not fwd_blocked and abs(err) <= 45.0:
+                        self._turn_dir = None
+                        self._blocked_turn = None
+                        self.last_branch = "escape_forward"
+                        return FORWARD_SLOW, None
+                    want_turn = self._blocked_turn
+            self._blocked_turn = None
+            return self._turn_with_brake_guard(want_turn, x, y, z, vx, vy, "turn_err")
+
+        self._turn_dir = None
+        if fwd_blocked:
+            turn_act = (self._blocked_turn if self._blocked_turn is not None
+                        else (YAW_LEFT if err >= 0 else YAW_RIGHT))
+            self._blocked_turn = turn_act
+            return self._turn_with_brake_guard(turn_act, x, y, z, vx, vy, "turn_blocked")
+
+        self._blocked_turn = None
+        self.last_branch = "forward"
+        return FORWARD_SLOW, None
+
     def __call__(self, rgb, depth, state):
         self.stop_requested = False
         x, y, z = float(state.x), float(state.y), float(getattr(state, "z", 2.0))
@@ -313,7 +428,10 @@ class OccAstarTeacher:
         if path is None:                      # 被围死 / waypoint 不可达：fail closed
             self.n_plan_fail += 1
             self.last_branch = "plan_fail"
+            self._turn_dir = None
             return SAFE_NEUTRAL, None
+        if self.clearance == "braking":
+            return self._act_braking(path, state, x, y, z, yaw_deg)
         tx, ty = self.planner.aim_point(path, x, y, self.lookahead)
         err = _wrap(math.degrees(math.atan2(ty - y, tx - x)) - yaw_deg)
         if err > self.tol:

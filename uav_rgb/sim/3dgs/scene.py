@@ -21,7 +21,16 @@ C0 = 0.28209479177387814   # SH DC -> RGB 的系数
 #   supersample=2：2 倍渲染再盒滤波缩小，细结构不闪且比 antialiased 模式清楚
 #     （lapvar 83 vs 38）。
 #   sh_degree=3：读 f_rest，视角相关颜色恢复（暗通道 0.51→0.49，lapvar 36→68）。
-RENDER_DEFAULTS = {"sh_degree": 3, "max_scale_m": 3.0, "supersample": 2}
+RENDER_DEFAULTS = {
+    "sh_degree": 3,
+    "max_scale_m": 3.0,
+    "supersample": 2,
+    "ut_eval3d": False,          # True 时启用 gsplat 原生 3DGUT（with_ut+with_eval3d，NuRec/SAGE-3D 训练同款）
+    "near_plane_m": 0.05,        # 室内 NuRec 场景可设 0.20 对齐训练裁剪面，消除贴脸未监督高斯
+    "eps2d": 0.3,                # 2D 协方差低通滤波（低分辨率 320x240 可设 0.08 抑制树叶膨胀糊）
+    "max_aniso": None,           # 非 None 时剔除 smax>0.25m 且长宽比 > max_aniso 的拉丝针状高斯
+    "min_large_opacity": None,   # 非 None 时剔除 smax>0.40m 且 opacity < 该值的半透明巨型雾团
+}
 
 PLY_PROPS = ("x", "y", "z", "nx", "ny", "nz",
              "f_dc_0", "f_dc_1", "f_dc_2") + tuple(
@@ -134,6 +143,28 @@ def scale_keep_mask(scales, max_scale_m):
     if max_scale_m is None:
         return np.ones(len(scales), dtype=bool)
     return scales.max(axis=1) <= float(max_scale_m)
+
+
+def gaussian_keep_mask(scales, opacities=None, max_scale_m=None, max_aniso=None, min_large_opacity=None):
+    """联合几何过滤：尺度上限 + 大尺寸针状拉丝剔除 + 半透明大雾团剔除。缺省等价于 scale_keep_mask。"""
+    scales = np.asarray(scales)
+    keep = scale_keep_mask(scales, max_scale_m)
+    if not len(scales):
+        return keep
+    smax = scales.max(axis=1)
+    if max_aniso is not None:
+        a_lim = float(max_aniso)
+        if not (math.isfinite(a_lim) and a_lim > 1.0):
+            raise ValueError("max_aniso 必须是 > 1 的有限数或 None")
+        smin = np.maximum(scales.min(axis=1), 1e-6)
+        keep &= ~((smax > 0.25) & ((smax / smin) > a_lim))
+    if min_large_opacity is not None and opacities is not None:
+        o_lim = float(min_large_opacity)
+        if not (math.isfinite(o_lim) and 0.0 <= o_lim <= 1.0):
+            raise ValueError("min_large_opacity 必须在 [0, 1] 内或 None")
+        op = np.asarray(opacities).reshape(-1)
+        keep &= ~((smax > 0.40) & (op < o_lim))
+    return keep
 
 
 def render_options(scene):

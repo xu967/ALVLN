@@ -321,15 +321,25 @@ def main():
                 summary["actions"][k] = summary["actions"].get(k, 0) + 1
             if args.record_video:
                 from . import video as video_mod
-                video_path = os.path.join(args.out, "videos",
-                                          f"seed_{args.seed + ep}.webm")
+                has_trace = os.path.isfile(os.path.join(ep_dir, "trace.jsonl"))
+                ext = "mp4" if has_trace else "webm"
+                video_path = os.path.join(args.out, "videos", f"seed_{args.seed + ep}.{ext}")
                 try:
-                    # 每帧代表一个 hold 窗口：fps=1/hold 才是仿真时间 1:1（以前固定 5 fps，
-                    # hold=0.5 s 时播放快 2.5 倍）。.webm 为 VP8，浏览器可直接播放。
-                    n = video_mod.compose_rgb_video(ep_dir, video_path, fps=1.0 / hold)
-                    summary["video"] = os.path.relpath(video_path, args.out)
-                    summary["video_frames"] = n
-                    summary["video_fps"] = 1.0 / hold
+                    if has_trace:
+                        res = video_mod.episode_result(manifest, oracle, reach_radius_of(scene),
+                                                       summary["collision"], actions)
+                        vr = video_mod.compose_views_video(
+                            ep_dir, scene, renderer, params.camera_mount, occ, out_path=video_path,
+                            title=f"{args.policy} | {args.dynamics} | {scene.get('name', '')} | seed {args.seed + ep}",
+                            result=res, log=lambda msg: print(msg, file=sys.stderr))
+                        summary["video"] = os.path.relpath(vr["video"], args.out)
+                        summary["video_frames"] = vr["frames"]
+                        summary["video_fps"] = vr["fps"]
+                    else:
+                        n = video_mod.compose_rgb_video(ep_dir, video_path, fps=1.0 / hold)
+                        summary["video"] = os.path.relpath(video_path, args.out)
+                        summary["video_frames"] = n
+                        summary["video_fps"] = 1.0 / hold
                 except Exception as exc:  # noqa: BLE001 - 视频是诊断产物
                     summary["video_error"] = f"{type(exc).__name__}: {exc}"
             results.append(summary)

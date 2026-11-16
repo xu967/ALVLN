@@ -751,8 +751,8 @@ def main():
     if args.teacher_clearance != "ray":
         if args.policy not in ("astar", "student"):
             p.error(f"--teacher-clearance {args.teacher_clearance} 只用于 --policy astar / student（占据 A* 教师）")
-        if abs(hold - planner_mod.SWEPT_HOLD_S) > 1e-9:
-            p.error(f"--teacher-clearance {args.teacher_clearance} 的位移系数只在 hold {planner_mod.SWEPT_HOLD_S:g} s 下量过，得到 --hold {hold:g}")
+        if args.teacher_clearance == "swept" and abs(hold - planner_mod.SWEPT_HOLD_S) > 1e-9:
+            p.error(f"--teacher-clearance swept 的位移系数只在 hold {planner_mod.SWEPT_HOLD_S:g} s 下量过，得到 --hold {hold:g}")
     if args.policy == "student" and not (args.ckpt and os.path.isfile(args.ckpt)):
         p.error("--policy student 需要存在的 --ckpt")
     if not (0.0 <= args.beta <= 1.0):

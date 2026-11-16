@@ -55,7 +55,9 @@ class GsplatRenderer:
 
     def __init__(self, scene, width=None, height=None, fov_deg=None,
                  device="cuda", sh_degree=None, max_scale_m=None, supersample=None,
-                 background=(0.7, 0.75, 0.8), depth_opacity_min=None):
+                 background=(0.7, 0.75, 0.8), depth_opacity_min=None,
+                 ut_eval3d=None, near_plane_m=None, eps2d=None,
+                 max_aniso=None, min_large_opacity=None):
         try:
             import torch
             from gsplat import rasterization
@@ -71,25 +73,36 @@ class GsplatRenderer:
         self.height = int(height or cam.get("height", 240))
         self.fov_deg = float(fov_deg or cam.get("fov_deg", 60.0))
         opts = scene_mod.render_options(scene)
-        if sh_degree is not None:
-            opts["sh_degree"] = sh_degree
-        if max_scale_m is not None:
-            opts["max_scale_m"] = max_scale_m
-        if supersample is not None:
-            opts["supersample"] = supersample
+        for key, val in (("sh_degree", sh_degree), ("max_scale_m", max_scale_m),
+                         ("supersample", supersample), ("ut_eval3d", ut_eval3d),
+                         ("near_plane_m", near_plane_m), ("eps2d", eps2d),
+                         ("max_aniso", max_aniso), ("min_large_opacity", min_large_opacity)):
+            if val is not None:
+                opts[key] = val
         self.supersample = int(opts["supersample"])
         if self.supersample < 1:
             raise ValueError("supersample 必须 >= 1")
         self.max_scale_m = scene_mod.normalize_max_scale(opts["max_scale_m"])
+        self.ut_eval3d = bool(opts["ut_eval3d"])
+        self.near_plane_m = float(opts["near_plane_m"])
+        self.eps2d = float(opts["eps2d"])
+        self.max_aniso = opts["max_aniso"]
+        self.min_large_opacity = opts["min_large_opacity"]
+        if not (np.isfinite(self.near_plane_m) and 0.0 < self.near_plane_m < FAR_PLANE_M):
+            raise ValueError("near_plane_m 必须在 (0, FAR_PLANE_M) 内")
+        if not (np.isfinite(self.eps2d) and self.eps2d >= 0.0):
+            raise ValueError("eps2d 必须是非负有限数")
         self.nav_to_world = scene_mod.validate_nav_to_world(scene.get("_nav_to_world"))
         # 不用 gsplat 的 backgrounds：1.5.3 在 packed=True 时要求 (channels,)，
         # 与高层 [C,3] 的约定冲突。改为拿 alpha 后自己合成背景。
-        self._bg = torch.tensor(background, dtype=torch.float32,
+        bg = (scene.get("render") or {}).get("background", background)
+        self._bg = torch.tensor(bg, dtype=torch.float32,
                                 device=self.device).view(1, 1, 3)
 
         g = scene_mod.read_gaussian_ply(scene["ply_path"])
         self.n_loaded = int(len(g["means"]))
-        keep = scene_mod.scale_keep_mask(g["scales"], self.max_scale_m)
+        keep = scene_mod.gaussian_keep_mask(g["scales"], g["opacities"], self.max_scale_m,
+                                            self.max_aniso, self.min_large_opacity)
         self.n_removed_by_scale = int((~keep).sum())
         self.n_gaussians = int(keep.sum())
         t = torch.from_numpy
@@ -156,34 +169,61 @@ class GsplatRenderer:
         if self.device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
+        eps_kw = {"eps2d": self.eps2d} if self.eps2d != 0.3 else {}
         with torch.no_grad():
-            colors, alphas, _meta = self.rasterization(
-                self.means, self.quats, self.scales, self.opacities, self.colors,
-                vm, ks, width * s, height * s,
-                sh_degree=self.sh_degree if self.sh_degree > 0 else None,
-                near_plane=NEAR_PLANE_M, far_plane=FAR_PLANE_M,
-                render_mode="RGB+ED", backgrounds=None, packed=True)
-            out = colors[0].detach()
-            alpha = alphas[0].detach().float()              # [H*s, W*s, 1]
-            # 手动背景合成：accumulated RGB 已是预乘 alpha。
-            rgb_t = out[..., :3] + self._bg * (1.0 - alpha)
-            if self._depth_pack is not None:
-                d_means, d_quats, d_scales, d_opac, d_col = self._depth_pack
-                if len(d_opac) > 0:
+            if self.ut_eval3d:
+                # gsplat 1.5.3 的 3DGUT 核（with_ut+with_eval3d）只支持 3 通道 RGB；期望深度走标准 ED 通道。
+                colors, alphas, _meta = self.rasterization(
+                    self.means, self.quats, self.scales, self.opacities, self.colors,
+                    vm, ks, width * s, height * s,
+                    sh_degree=self.sh_degree if self.sh_degree > 0 else None,
+                    near_plane=self.near_plane_m, far_plane=FAR_PLANE_M,
+                    render_mode="RGB", backgrounds=None,
+                    with_ut=True, with_eval3d=True, packed=False, **eps_kw)
+                out = colors[0].detach()
+                alpha = alphas[0].detach().float()
+                rgb_t = out[..., :3] + self._bg * (1.0 - alpha)
+                d_src = self._depth_pack if self._depth_pack is not None else (
+                    self.means, self.quats, self.scales, self.opacities,
+                    self.colors[:, 0].contiguous() if self.sh_degree > 0 else self.colors)
+                if len(d_src[3]) > 0:
                     d_out, d_alphas, _ = self.rasterization(
-                        d_means, d_quats, d_scales, d_opac, d_col,
-                        vm, ks, width * s, height * s,
-                        sh_degree=None,
-                        near_plane=NEAR_PLANE_M, far_plane=FAR_PLANE_M,
-                        render_mode="ED", backgrounds=None, packed=True)
+                        *d_src, vm, ks, width * s, height * s, sh_degree=None,
+                        near_plane=self.near_plane_m, far_plane=FAR_PLANE_M,
+                        render_mode="ED", backgrounds=None, packed=True, **eps_kw)
                     depth_t = d_out[0, ..., 0:1].detach().float()
                     alpha_d = d_alphas[0].detach().float()
                 else:
                     depth_t = torch.zeros((height * s, width * s, 1), dtype=torch.float32, device=self.device)
                     alpha_d = depth_t
             else:
-                depth_t = out[..., 3:4].float()
-                alpha_d = alpha
+                colors, alphas, _meta = self.rasterization(
+                    self.means, self.quats, self.scales, self.opacities, self.colors,
+                    vm, ks, width * s, height * s,
+                    sh_degree=self.sh_degree if self.sh_degree > 0 else None,
+                    near_plane=self.near_plane_m, far_plane=FAR_PLANE_M,
+                    render_mode="RGB+ED", backgrounds=None, packed=True, **eps_kw)
+                out = colors[0].detach()
+                alpha = alphas[0].detach().float()              # [H*s, W*s, 1]
+                # 手动背景合成：accumulated RGB 已是预乘 alpha。
+                rgb_t = out[..., :3] + self._bg * (1.0 - alpha)
+                if self._depth_pack is not None:
+                    d_means, d_quats, d_scales, d_opac, d_col = self._depth_pack
+                    if len(d_opac) > 0:
+                        d_out, d_alphas, _ = self.rasterization(
+                            d_means, d_quats, d_scales, d_opac, d_col,
+                            vm, ks, width * s, height * s,
+                            sh_degree=None,
+                            near_plane=self.near_plane_m, far_plane=FAR_PLANE_M,
+                            render_mode="ED", backgrounds=None, packed=True, **eps_kw)
+                        depth_t = d_out[0, ..., 0:1].detach().float()
+                        alpha_d = d_alphas[0].detach().float()
+                    else:
+                        depth_t = torch.zeros((height * s, width * s, 1), dtype=torch.float32, device=self.device)
+                        alpha_d = depth_t
+                else:
+                    depth_t = out[..., 3:4].float()
+                    alpha_d = alpha
             if s > 1:
                 pool = torch.nn.functional.avg_pool2d
                 nchw = lambda im: im.permute(2, 0, 1)[None]          # noqa: E731
@@ -210,7 +250,8 @@ class GsplatRenderer:
                "max_scale_m": self.max_scale_m, "supersample": self.supersample,
                "width": self.width, "height": self.height, "fov_deg": self.fov_deg,
                "sh_degree": self.sh_degree, "device": str(self.device),
-               "near_plane_m": NEAR_PLANE_M, "far_plane_m": FAR_PLANE_M,
+               "near_plane_m": self.near_plane_m, "far_plane_m": FAR_PLANE_M,
+               "ut_eval3d": self.ut_eval3d, "eps2d": self.eps2d,
                "samples": self.samples,
                "mean_ms": self.total_ms / self.samples if self.samples else None}
         if self.depth_opacity_min is not None:

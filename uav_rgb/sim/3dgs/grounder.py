@@ -214,4 +214,71 @@ class LexicalGrounder:
         return Grounding(best_name if accepted else None, best_score, margin, accepted, reason)
 
 
-__all__ = ["Grounding", "LexicalGrounder", "load_catalog"]
+_MODIFIER_SPLIT = re.compile(
+    r"\b(?:located|situated|positioned|placed|standing|hanging|mounted|resting|sitting|"
+    r"directly|right\s+next\s+to|next\s+to|in\s+front\s+of|across\s+from|adjacent\s+to|"
+    r"to\s+the\s+(?:left|right)\s+of|on\s+the\s+(?:left|right)\s+side\s+of|"
+    r"above|below|under|beneath|over|near|beside|behind|between|around|opposite|by)\b",
+    re.IGNORECASE,
+)
+
+
+class RelationPhraseGrounder(LexicalGrounder):
+    """主目标短语提取器：把修饰从句（如 'located directly above the wall art'）拆成主目标与参照物。
+
+    保留对非英文、否定词、升降动作和多阶段顺序指令的 fail-closed 拒绝；当目录中同类候选唯一或主短语
+    能唯一定位目标时直接命中，同名多实例（如 chair_1 vs chair_2）无法单靠文本消歧时按 ambiguous 拒绝。
+    """
+
+    def ground(self, instruction, candidates):
+        text = str(instruction).lower().replace("’", "'")
+        reason = None
+        if any(char.isalpha() and not char.isascii() for char in text):
+            reason = "unsupported_language"
+        elif re.search(r"\b(?:not|never|no|except|avoid|without)\b|n['’]t\b", text):
+            reason = "unsupported_negation"
+        elif re.search(r"\b(?:ascend|descend|climb|land|takeoff)\b|\b(?:go|fly|move)\s+(?:up|down)\b|\btake off\b", text):
+            reason = "unsupported_vertical_command"
+        elif re.search(r"\b(?:then|afterwards|both|either|or)\b|;", text):
+            reason = "unsupported_multiple_goals"
+        if reason:
+            return Grounding(None, 0.0, 0.0, False, reason)
+
+        # 多子句或 "from X to Y" 句式：优先取最后一个目标介词短语（to / toward / into），避免把起点当目标
+        clauses = [c.strip() for c in re.split(r"[.;]", text) if c.strip()]
+        goal_clause = clauses[-1] if clauses else text
+        dest_matches = list(re.finditer(r"\b(?:to|toward|towards|into)\b(?!\s+the\s+(?:left|right)\s+of\b)", goal_clause))
+        raw_goal = goal_clause[dest_matches[-1].end():] if dest_matches else _goal_text(goal_clause)
+        head_phrase = _MODIFIER_SPLIT.split(raw_goal, maxsplit=1)[0].strip() or raw_goal
+        head_tokens = set(_tokens(head_phrase))
+        full_tokens = set(_tokens(raw_goal))
+        names = [str(name) for name in candidates if str(name).strip()]
+        if not names or not (head_tokens or full_tokens):
+            return Grounding(None, 0.0, 0.0, False, "empty_query_or_candidates")
+
+        head_str = " ".join(_tokens(head_phrase))
+        scored = []
+        for name in dict.fromkeys(names):
+            words = set(_tokens(name))
+            if not words:
+                scored.append((0.0, name))
+                continue
+            phrase = " ".join(_tokens(name))
+            if phrase and f" {phrase} " in f" {head_str} ":
+                score = 1.0
+            else:
+                h_cov = len(head_tokens & words) / len(words) if head_tokens else 0.0
+                f_cov = len(full_tokens & words) / len(words) if full_tokens else 0.0
+                # 主目标短语占 0.85 权重，避免把参照物（wall art）排在主目标（track light）前面
+                score = 0.85 * h_cov + 0.15 * f_cov
+            scored.append((score, name))
+        scored.sort(key=lambda item: (-item[0], item[1]))
+        best_score, best_name = scored[0]
+        second_score = scored[1][0] if len(scored) > 1 else 0.0
+        margin = best_score - second_score
+        accepted = best_score >= self.min_score and margin >= self.min_margin
+        reason = "accepted" if accepted else ("below_min_score" if best_score < self.min_score else "ambiguous")
+        return Grounding(best_name if accepted else None, best_score, margin, accepted, reason)
+
+
+__all__ = ["Grounding", "LexicalGrounder", "RelationPhraseGrounder", "load_catalog"]

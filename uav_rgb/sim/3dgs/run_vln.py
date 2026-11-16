@@ -41,9 +41,9 @@ METRIC_VERSION = "3dgs.vln.v3"
 STEPS_HOLD_S = 0.5      # 航线 max_steps 是导入时按 hold 0.5 估的（scene_import_sage3d），别的 hold 按时长换算
 
 
-def make_policy(name, occ_planner, waypoint, hold, stop_radius=1.0):
+def make_policy(name, occ_planner, waypoint, hold, stop_radius=1.0, clearance="ray"):
     if name == "teacher":
-        return planner_mod.OccAstarTeacher(occ_planner, waypoint, hold_s=hold)
+        return planner_mod.OccAstarTeacher(occ_planner, waypoint, hold_s=hold, clearance=clearance)
     if name == "reactive":
         return reactive.ReactiveGoalPolicy(waypoint, stop_radius=stop_radius)
     return collect_3dgs.ForwardPolicy()
@@ -120,6 +120,8 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
     renderer = renderer_mod.make_renderer(scene)
     occ_planner = planner_mod.OccPlanner(occ)
     radius = reach_radius_of(scene)
+    ref_paths = vln.sage_ref_paths(scene)
+    clearance = getattr(args, "teacher_clearance", "ray")
     rows, failures = [], []
     for n, ep in enumerate(eps):
         scene_mod.apply_route(scene, ep["route_index"])
@@ -151,16 +153,22 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                 "geometry_gid": identity["geometry_gid"],
                 "ply_sha256": identity["ply_sha256"],
             })
-        scene["waypoint"] = dict(policy_goal)
+        # 始终保留真实评估目标作为 scene["waypoint"]，防止 grounder 落错地标时把 manifest 与视频伪装成到达真目标。
+        scene["waypoint"] = dict(evaluation_goal)
         scene["vln"] = {**ep, **({"grounding": grounding} if grounding is not None else {})}
         ep_dir = os.path.join(args.out, scene["name"], f"{ep['route_name']}_{ep['instruction_index']}")
         steps = math.ceil(int(scene["max_steps"]) * STEPS_HOLD_S / args.hold)
-        policy = make_policy(args.policy, occ_planner, policy_goal, args.hold, stop_radius=radius)
+        try:
+            policy = make_policy(args.policy, occ_planner, policy_goal, args.hold,
+                                 stop_radius=radius, clearance=clearance)
+        except TypeError:
+            policy = make_policy(args.policy, occ_planner, policy_goal, args.hold, stop_radius=radius)
         try:
             man, err = collect_3dgs.run_episode(
                 scene, ep_dir, renderer, occ, params, policy, steps, args.hold,
                 split=identity["split"], seed=args.seed + n, episode_id=n, stop_on_collision=True,
                 identity=identity, split_policy="diag-vln-eval", dynamics="cf_sitl",
+                dynamics_path=getattr(args, "dynamics_params", None),
                 stop_on_request=args.stop_mode == "explicit",
                 stop_after_safe=vln.STOP_STREAK if args.stop_mode == "legacy-safe" else None)
             if err or man.get("error"):
@@ -176,7 +184,8 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
             start = {**actions[0]["pose_before"], "yaw_deg": actions[0].get("yaw_before", 0.0)}
             route_scene = dict(scene, waypoint=evaluation_goal)
             shortest = route_shortest_path_m(occ_planner, [{"pose_gt": start}] + oracle, route_scene)
-            m = vln.episode_metrics(actions, oracle, evaluation_goal, radius, man["stopped_by_agent"], shortest)
+            m = vln.episode_metrics(actions, oracle, evaluation_goal, radius, man["stopped_by_agent"],
+                                    shortest, ref_path=ref_paths.get(ep["route_index"]))
             target_metrics = None
             if grounding is not None:
                 target_scene = dict(scene, waypoint=policy_goal)
@@ -195,14 +204,16 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
             row["grounding"] = grounding
             row.update({f"target_{key}": value for key, value in target_metrics.items()})
         rows.append(row)
-        primary_metrics = target_metrics if target_metrics is not None else m
-        print(f"[{scene['name']} {n + 1}/{len(eps)}] {result_text(primary_metrics):24s} {ep['type']:22s} {ep['text']}", file=sys.stderr)
+        wrong_goal = grounding is not None and grounding.get("correct") is False
+        badge = f"WRONG GOAL {m['ne_m']:.1f} m" if wrong_goal else result_text(m)
+        print(f"[{scene['name']} {n + 1}/{len(eps)}] {badge:24s} {ep['type']:22s} {ep['text']}", file=sys.stderr)
         if n < args.videos:
             try:
                 video = video_mod.compose_views_video(
                     ep_dir, scene, renderer, params.camera_mount, occ,
-                    title=f"{args.policy} | cf_sitl | {scene['name']} | {ep['type']}", result=result_text(primary_metrics),
+                    title=f"{args.policy} | cf_sitl | {scene['name']} | {ep['type']}", result=badge,
                     instruction=f"\"{ep['text']}\"",
+                    pred_goal=policy_goal if grounding is not None else None,
                     log=lambda msg: print(msg, file=sys.stderr))
                 row["video"] = os.path.relpath(video["video"], args.out)
                 row["video_metadata"] = {key: value for key, value in video.items() if key != "video"}
@@ -217,10 +228,14 @@ def main(argv=None):
     p.add_argument("--scene", action="append", required=True, help="SAGE-3D 导入的 scene.json，可给多个")
     p.add_argument("--policy", choices=("teacher", "reactive", "forward"), required=True,
                    help="teacher = A* 特权上界；reactive = 不查全局地图的目标条件局部控制；forward = 盲目前进下界")
-    p.add_argument("--grounder", choices=("none", "lexical"), default="none",
-                   help="lexical：用外部地标目录把指令落到控制目标；目录必须独立于 scene.json")
+    p.add_argument("--grounder", choices=("none", "lexical", "phrase"), default="none",
+                   help="lexical：单目标纯词法检索；phrase：提取主目标短语并兼容空间修饰从句；均需独立 --catalog")
     p.add_argument("--catalog", action="append", default=None,
-                   help="--grounder lexical 时必填，每场景一个 uavrgb.vln_landmark_catalog.v1 JSON；可重复")
+                   help="--grounder lexical/phrase 时必填，每场景一个 uavrgb.vln_landmark_catalog.v1 JSON；可重复")
+    p.add_argument("--teacher-clearance", choices=planner_mod.CLEARANCE_MODES, default="ray",
+                   help="teacher 净空与防抖模式：ray（默认基线）/ swept（hold=1.0）/ braking（速度感知刹停+转向滞回 v5）")
+    p.add_argument("--dynamics-params", default=None,
+                   help="动力学参数 JSON（默认 sim/dynamics/e1_mini.json；>30m 长航线传满电 e1_mini_soc100.json）")
     p.add_argument("--out", required=True)
     p.add_argument("--hold", type=float, default=0.5, help="每步动作窗口（秒）")
     p.add_argument("--stop-mode", choices=("explicit", "legacy-safe"), default="explicit",
@@ -232,10 +247,13 @@ def main(argv=None):
     p.add_argument("--videos", type=int, default=0, help="每个场景前几集合成带指令横幅的四格视频")
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args(argv)
-    if args.grounder == "lexical" and not args.catalog:
-        p.error("--grounder lexical 必须同时提供 --catalog")
-    if args.grounder == "lexical" and args.policy == "forward":
-        p.error("forward 不消费目标，不能与 --grounder lexical 一起使用")
+    use_grounder = args.grounder in ("lexical", "phrase")
+    if use_grounder and not args.catalog:
+        p.error(f"--grounder {args.grounder} 必须同时提供 --catalog")
+    if use_grounder and args.policy == "forward":
+        p.error(f"forward 不消费目标，不能与 --grounder {args.grounder} 一起使用")
+    if args.teacher_clearance != "ray" and args.policy != "teacher":
+        p.error(f"--teacher-clearance {args.teacher_clearance} 仅适用于 --policy teacher")
     if not (math.isfinite(args.hold) and args.hold > 0):
         p.error("--hold 必须是正数")
     if args.limit < 0 or args.videos < 0:
@@ -243,12 +261,14 @@ def main(argv=None):
     if os.path.isdir(args.out) and os.listdir(args.out):
         p.error(f"--out {args.out} 不是空目录")
     os.makedirs(args.out, exist_ok=True)
-    params = CfSitlParams.from_json(None)
+    params = CfSitlParams.from_json(args.dynamics_params)
     started = time.monotonic()
     rows, failures = [], []
     lexical_grounder = None
     if args.grounder == "lexical":
         lexical_grounder = grounder_mod.LexicalGrounder()
+    elif args.grounder == "phrase":
+        lexical_grounder = grounder_mod.RelationPhraseGrounder()
     catalogs = {}
     if lexical_grounder is not None:
         for catalog_path in args.catalog:
@@ -283,21 +303,22 @@ def main(argv=None):
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     report = {"metric_version": METRIC_VERSION if args.stop_mode == "explicit" else "3dgs.vln.v2",
-              "policy": args.policy, "hold_s": args.hold, "stop_mode": args.stop_mode,
+              "policy": args.policy, "teacher_clearance": args.teacher_clearance,
+              "hold_s": args.hold, "stop_mode": args.stop_mode,
               "stop_streak": vln.STOP_STREAK if args.stop_mode == "legacy-safe" else None,
               "dynamics": "cf_sitl", "dynamics_profile": params.profile(),
               "scenes": args.scene, "split_filter": args.split, "all_instructions": args.all_instructions,
               "grounder": args.grounder, "catalog": args.catalog,
-              "overall_metric_scope": ("route_waypoint_proxy" if args.grounder == "lexical"
+              "overall_metric_scope": ("route_waypoint_proxy" if use_grounder
                                        else "scene_route_waypoint"),
               "overall": vln.summarize(rows, failures), "by_type": vln.summarize_by(rows, "type", failures),
               "by_split": vln.summarize_by(rows, "split", failures), "by_scene": vln.summarize_by(rows, "scene", failures),
-              "grounding": (_grounding_summary(rows, failures) if args.grounder == "lexical" else None),
+              "grounding": (_grounding_summary(rows, failures) if use_grounder else None),
               "target_goal_metrics": (vln.summarize([
                   {"success": r["target_success"], "oracle_success": r["target_oracle_success"],
                    "spl": r["target_spl"], "ne_m": r["target_ne_m"],
                    "collision": r["collision"], "stopped": r["stopped"]} for r in rows
-                  if "target_success" in r], failures) if args.grounder == "lexical" else None),
+                  if "target_success" in r], failures) if use_grounder else None),
               "failures": failures, "wall_s": round(time.monotonic() - started, 1)}
     with open(os.path.join(args.out, "vln_eval.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
