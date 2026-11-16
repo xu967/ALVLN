@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project state
 
-**交接更新（2026-11-16）**：先读 [docs/HANDOFF.md 顶部当前交接](docs/HANDOFF.md) 和 `docs/PLAN_2026-11-13_vln.md §10.17`。OpenFly外部Seq2Seq/CMA训练、运动学评测及对应已有Python环境已接通，主线C++/四动作边界仍分开遵守；下方“未实现语言/未安装PyTorch”、旧GPU编号和空间余量属于历史，不能覆盖当前已验证状态。
+**交接更新（2026-11-16 13:30）**：先读 [docs/HANDOFF.md 顶部当前交接](docs/HANDOFF.md) 和 `docs/PLAN_2026-11-13_vln.md §10.18`。已完成全仓审计、磁盘清理（`/` 剩 6.6GB、数据盘剩 75GB；注意 `/root/rivermind-fs` Inode 已满禁写）、公开指标 `nDTW/SDTW`、错误目标视频门禁、3DGS 原生 `3DGUT`/去浮子渲染、防撞刹停教师 `v5`、同起点语言反事实与 52.9m 户外长航线验证；下一步按 §10.18 卡 S1/G2/OF-E1 推进端到端语言学生与 OpenFly 扩量。OpenFly外部Seq2Seq/CMA训练、运动学评测及对应已有Python环境已接通，主线C++/四动作边界仍分开遵守；下方“未实现语言/未安装PyTorch”、旧GPU编号和空间余量属于历史，不能覆盖当前已验证状态。
 
 **现行入口（2026-11-13 加）**：主线改为视觉语言导航（一句话 → 飞到目标并自己停下）。计划 `docs/PLAN_2026-11-13_vln.md`（§0、§4 任务卡、§8 待拍板），
 M1 实验 `docs/experiments/2026-11-13-vln-m1.md`，进度看 `progress.md` 最上面一节；下面第十二阶段的约定仍然有效。

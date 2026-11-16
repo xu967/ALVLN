@@ -606,3 +606,50 @@ AirVLN 依赖安装曾把大 wheel 的临时文件写入 30GB 系统盘并报 `N
 ### 风险与遗留
 
 正式全量榜单、稳定语言目标/STOP、3DGS长航线画质和真机验证均未完成。100候选仍仅元数据，缺组首图/raw验证/地理簇划分且新增字节未知；当前数据盘仅约1.5GiB可用，后续不得根据历史总容量直接开训或全量下载。
+
+## 更新 2026-11-16 13:25 +0800：全仓VLN深度审计、磁盘救急清理、防撞/渲染/可视化修复与实测
+
+- 时间：2026-11-16 13:25 +0800
+- 范围：`sim/3dgs/{vln,run_vln,grounder,video,eval_3dgs,planner,scene,renderer,collect_3dgs}.py`、`src/{nn_cuda.cu,trainer.cpp}`、`tools/git_mirror_alvln.sh`、`experiments/2026-11-16-vln-upgrade/run.py`、仓库冗余文档与磁盘空间治理
+- 结论：完成全仓审计、空间清理与基础能力修复验证；端到端语言条件学生网络与OpenFly扩展集重训列为下一阶段执行计划，待用户对扩盘/权限/飞控执行器选项拍板。
+
+### 做了什么
+
+- 并行派出5个只读审计子代理核查：VLN语言目的性链路、可视化与C++/Python核心Bug、3DGS渲染画质与长航线数据集、OpenFly评测与开源基线进度、CF-Drone固件与控制律抖动、Git拓扑与全盘空间占用。
+- 解决磁盘耗尽危机与仓库杂乱：清理Windows专用UE场景包（36.5GB）、已解压AirSim压缩包（7.1GB）、`extract-airsim10k`、pip/conda缓存、演练残余及旧版非活跃IDE二进制，数据盘可用从1.5GB恢复至75GB，根分区从674MB恢复至6.6GB；移除12个干净且已保存分支的工作树及65个已合入本地分支名；`git rm` 78份经全仓扫描确认为0引用的碎片化旧文档；`tools/git_mirror_alvln.sh` 增加祖先校验防回退门禁，并将 `main` 快进同步至最新提交。
+- 修复可视化与评测契约缺陷：`sim/3dgs/run_vln.py` 与 `sim/3dgs/video.py` 不再用预测目标覆写 `scene["waypoint"]`，grounder落错目标时顶视图同时画红圈（GT）与橙圈（预测）并输出红色 `WRONG GOAL`；状态面板新增目标距离、相对方位角与 `STOP REQUESTED` 标记，长指令横幅保留首尾目标短语；`sim/3dgs/eval_3dgs.py --record-video` 在有 `trace.jsonl` 时输出10FPS四格视频。
+- 补齐公开评测指标与主目标短语解析：`sim/3dgs/vln.py` 实现无近似动态规划 `ndtw_sdtw`、`resample_polyline`、`sage_ref_paths` 及 `bearing_bin`；`sim/3dgs/grounder.py` 新增 `RelationPhraseGrounder`（`run_vln --grounder phrase`），支持带空间修饰从句的单实例目标提取并在同起点双目标反事实闭环（`sage3d_840865`）通过验证（正确2/2、互换0/2）。
+- 升级3DGS渲染与教师防撞控制律：`sim/3dgs/{scene,renderer}.py` 支持原生3DGUT（`ut_eval3d`，RGB与ED双路兼容）、可配 `near_plane_m` / `eps2d` 及针状拉丝/半透明大雾团联合剔除（`gaussian_keep_mask`），实测室内外锐度提升12%–24%；`sim/3dgs/planner.py` 新增 `uavrgb.teacher_occ.v5`（`clearance="braking"`，含任意 `hold_s` 速度感知刹停包络、转向残速 `SAFE` 保护、滞回退出带与防乒乓破锁），16条室内航线配对碰撞率 `6.25% -> 0%`、SR `93.75% -> 100%`、SPL `0.776 -> 0.829`；打通本地 `wanderland_1MlUucug` 52.88m 街道长航线满电闭环（`NE=0.267m, SPL=0.942`）。
+- 修复C++/CUDA两项核心隐患：`src/nn_cuda.cu` 的 `sumsq_kernel` 改为确定性共享内存顺序归约，消除跨block乱序 `atomicAdd`；`src/trainer.cpp` 的 `carry_resume_best` 阻断从 `ckpt_epNN.bin` 分叉续训时混入未来最佳权重，并在跨目录续训时同步更新 `ckpt_best.bin` 的 `CheckpointContract`。
+
+### 没做什么
+
+- 未修改机载C++/CUDA学生网络结构（5维动作+STOP头、15维动态方位条件）及 `preprocess.py` 侧车重打包重训：原因是要改变UAVR二进制侧车与checkpoint版本契约（v6->v7），并涉及多场景DAgger采集，留给下一位按新计划卡S-E2E执行。
+- 未部署地面站3B级视觉语言模型（如Qwen2.5-VL-3B）做在线视觉Grounder：原因是本机GPU当前有另一项目进程占用约7.8GB显存，且需新下载约7.5GB模型权重，留待下一阶段按卡G2独立环境部署。
+- 未修改 `sim/cf_sitl/exec/executor.c`（延迟 `position_hold` 锁存消除0.16m倒车回弹）及 `CF-Drone` 真机固件PID：原因是 `e1_mini.json` 仍标 `calibrated=false`，且改 `executor.c` 会升级 `dynamics_profile`（`lib31->lib32`）影响真机自动层同步，需用户先拍板。
+- 未删除4个含未提交改动的 `code/wt/p12-*` 工作树、未合并 `p12-bl2/3/4/5` 分支、未删除71.1GB Linux版UE城市场景压缩包及未大规模删除 `src/device/*`、`ui/monitor.py` 代码：原因是遵循不删未确认脏工作树与最小改动边界，相关瘦身清单已写入交接计划待用户确认。
+- 未重新训练OpenFly 100候选扩展集（预训练BERT词向量 + 拐点/STOP加权 + 因果 `prev_action`）：原因是100候选尚需从HF拉取 `pose.jsonl` 与组首PNG并完成地理空间分簇校验，且不能覆盖已冻结的 `v1` 契约12份权重。
+- 未向 `/root/rivermind-fs` 迁移碎文件：原因是实测 `df -i` 发现该JuiceFS挂载点Inode已100%耗尽（`100,000/100,000`），写入新文件会报错。
+
+### 待确认
+
+- 是否提供 HuggingFace `spatialverse/InteriorGS` 的读取权限（用于获取室内 `labels.json` 物体框语义标注与官方门洞占据图，释放被高斯封死的63%跨房间长航线）。
+- 是否扩容 `/root/rivermind-data`（建议 `+500GB` 至 `+1TB`）或授权删除暂不使用的 Linux UE 大城市场景压缩包（可再腾出 `35.5GB–71.1GB`）。
+- 是否批准修改 `sim/cf_sitl/exec/executor.c` 的 `position_hold`（速度 `<=0.05m/s` 停稳后再锁存保持点，升级为 `lib32` 消除急刹倒车回弹）。
+- 是否批准按精简清单删除零调用死代码（`src/device/*`、`ui/monitor.py`、`sim/tools/cf_sil.py` 等约6,500行）及归档4个脏工作树。
+
+### 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| C++/CUDA 全量构建与 44 项 CTest（含 `test_cuda_blocking_sync`、`test_save_every_epoch`、`test_resume_*`） | **通过（44/44 PASS，49.8s）** |
+| `sim/cf_sitl` 构建、9 项 CTest 与 33 项固件在环自检（`cf_sitl_selftest`） | **通过（9/9 CTest PASS，33/33 selftest PASS）** |
+| `sim/3dgs/test_*.py` 全套 15 个单测文件 + `video.py` / `planner.py` 自检 + `RUN_3DGS_REAL=1` 真 GPU 渲染测试 | **通过（全部 OK）** |
+| `tools/test_*openfly*.py` 外部基线 74 项单元测试 | **通过（74/74 OK，20.7s）** |
+| `sim/tools` 自检（`teacher`/`scene_gen`/`scene_course`/`gz_io`）+ `tools/test_*.py` + `ui/test_*.py` | **通过（fail=0）** |
+| 真实 GPU + `cf_sitl` 五步综合验证守护进程 `experiments/2026-11-16-vln-upgrade/run.py` | **通过（`DONE rc=0`）：产出 `public_metrics.json`、`render_compare.png`、`anti_jitter_pair.json`、`language_counterfactual.json`、`wanderland_long_route.json` 及四格 H.264 视频** |
+
+### 风险与遗留
+
+- 当前同起点双目标语言闭环使用的是 `RelationPhraseGrounder` + 独立地标目录 + `v5` 特权规划器（G1可解释基线），证明了语言改变目标与错误目标门禁生效，但**仍不是纯视觉端到端学生网络**；同名多实例空间关系（占SAGE约75%）与未知环境探索必须靠下一阶段视觉语言Grounder（G2）与方位+STOP学生（S-E2E）解决。
+- `/root/rivermind-fs` Inode 为 `0` 可用，任何后续脚本禁止往该盘写多文件数据集或日志。

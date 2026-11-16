@@ -1,8 +1,31 @@
 # progress.md（新开会话先读这个）
 
-交接入口：[docs/HANDOFF.md 当前交接](docs/HANDOFF.md)。已集中列出2026-11-16的代码版本、实验/视频路径、复现前提、未完成项及E1–E4执行卡；数据盘容量以该页最新实测和运行时df为准。
+交接入口：[docs/HANDOFF.md 当前交接](docs/HANDOFF.md) 与 [PLAN §10.18 下一代执行卡](docs/PLAN_2026-11-13_vln.md)。
 
-## 2026-11-16 OpenFly因果监督与公开架构对照（最新）
+## 2026-11-16 下午 VLN 全仓审计、空间治理、核心能力升级与实测（最新）
+
+### 已完成的事项
+
+- 五路并行子代理完成全仓代码、教学文档、Git/GitHub diff、3DGS渲染与长航线、OpenFly评测与开源基线、CF-Drone固件与抖动、磁盘占用的深度审计。
+- 磁盘救急与仓库清理：清理Windows专用UE包（36.5GB）、已解压AirSim zip（7.1GB）、`extract-airsim10k`、pip/conda缓存、演练垃圾及旧版非活跃IDE二进制，`/` 可用从674MB恢复至6.6GB，`/root/rivermind-data` 可用从1.5GB恢复至75GB；清理12个干净worktree、65个已合并本地分支与78份零引用旧文档；`main` 快进对齐最新提交，`git_mirror_alvln.sh` 增加防回退祖先校验。
+- 代码修复与能力升级：
+  - 可视化与防伪门禁：`run_vln` 落地错地标不再覆写 `scene["waypoint"]`，顶视图同时标红圈GT与橙圈预测目标并输出红色 `WRONG GOAL`；面板显示目标距离/方位角/`STOP REQUESTED`；长指令横幅保留首尾目标词；`eval_3dgs --record-video` 在 `cf_sitl` 下输出10FPS四格视频。
+  - 公开指标与语言短语落地：`vln.py` 补齐精确 `nDTW / SDTW`、`resample_polyline`、`sage_ref_paths`、`bearing_bin`；`grounder.py` 新增 `RelationPhraseGrounder`（4429句覆盖率 `15.7% -> 24.3%`）。
+  - 3DGS渲染与防撞刹停教师 `v5`：`renderer.py`/`scene.py` 支持原生3DGUT（`ut_eval3d`）、`near_plane_m`、`eps2d` 及针状拉丝/半透明大雾团剔除（实测室内外锐度 `+11.6% ~ +23.9%`）；`planner.py` 新增 `uavrgb.teacher_occ.v5`（`--teacher-clearance braking`），16集室内配对碰撞 `6.25% -> 0%`、SR `93.75% -> 100%`、SPL `0.776 -> 0.829`。
+  - C++/CUDA修复：`nn_cuda.cu` `sumsq_kernel` 改为确定性顺序归约；`trainer.cpp` 修复 `ckpt_epNN.bin` 分叉续训偷渡未来最佳权重与跨目录契约失步。
+- 真机/GPU验证：CTest `44/44 PASS`；`cf_sitl` `9/9 CTest + 33/33 selftest PASS`；`sim/3dgs` 15套件 + 真GPU渲染测试全绿；OpenFly `74/74` 全绿；守护进程 `exp-vln-upgrade-20261116`（PGID 1515438，已正常结束 `DONE rc=0`）完成公开指标补算、渲染对比图、室内防撞配对、同起点双目标语言反事实闭环（`correct` 2/2 vs `swapped` 0/2）及 Wanderland `52.88m` 户外满电长航线闭环（`NE=0.267m, SPL=0.942`）。
+
+### 关键决策
+
+- 保持飞控高层四动作硬边界，不盲改未标定真机固件PID；后续机载端到端通过「地面站1–2Hz零特权VLM Grounder输出方位桶+到达标志 → 机载10Hz双帧CNN-FiLM动态条件输入 + 第5维独立STOP输出头」实现紧耦合闭环（PLAN §10.18 卡S1 + 卡G2）。
+- `/root/rivermind-fs` Inode 已 100% 耗尽（`IFree=0`），禁止向其写入新文件。
+
+### 未完成的待办
+
+- 按 PLAN §10.18 依次执行：卡S1（C++动态方位条件与独立STOP头）→ 卡G2（零特权VLM视觉语言Grounder）→ 卡OF-E1/E2（OpenFly 6场景100候选下载校验 + 预训练词嵌入 + 拐点/STOP加权 + 因果 `prev_action`）→ 卡SCENE-LONG（SAGE网格碰撞释放跨房间长航线 + Wanderland全量长航线导入）。
+- 待用户拍板：`InteriorGS` HF读取权限、块存储扩容（`+500GB~1TB`）或清理71GB Linux UE大场景zip、`executor.c` 延迟 `position_hold`（`lib32`）、死代码精简清单（约-6,500行）。
+
+## 2026-11-16 OpenFly因果监督与公开架构对照（同日早些时候记录）
 
 - 已按PLAN §10.14–10.17完成causal.v2组首监督、99原图补齐、Seq2Seq/CMA×两模态×三seed共12训练；每组50轮/600更新，来源/公平性/重载均验证。
 - v2实跑200回合发现长序列残余下落；v3每步原子重置位姿/速度/加速度，百步门禁及统一seen100回合通过。v3不是物理飞行或官方协议；旧10协议失败保留，12次新碰撞仍计分母。

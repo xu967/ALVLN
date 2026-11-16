@@ -1,10 +1,30 @@
 # uav_rgb 交接文档
 
-## 当前交接：2026-11-16，无人机视觉语言导航
+## 当前交接：2026-11-16（13:30 更新），无人机视觉语言导航
 
-**接手先读本节，再看[执行计划 §10.17](PLAN_2026-11-13_vln.md)。下面11月14日及更早章节保留为历史，不作为当前资源、训练状态或任务优先级。** 本次交接整理只核验文档与已有产物，没有重新训练、启动仿真或下载数据。
+**接手先读本节，再看[执行计划 §10.18](PLAN_2026-11-13_vln.md)。** 下面同日早些时候的 OpenFly 实验交接及 11 月 14 日更早章节完整保留供溯源。
 
-### 1. 目标与当前结论
+### 0. 2026-11-16 下午最新增量与接手状态（必读）
+
+1. **磁盘危机已解除 + 存储红线**：
+   - 清理 Windows 专用 UE 压缩包、已解压 AirSim zip、缓存、演练垃圾及 78 份零引用历史草稿文档后，根分区 `/` 可用从 `674 MiB` 恢复至 **`6.6 GiB`**，数据盘 `/root/rivermind-data` 可用从 `1.5 GiB` 恢复至 **`75 GiB`**。
+   - **重要预警**：`/root/rivermind-fs`（JuiceFS）虽然显示有 `68 GiB` 空间，但 `df -i` 实测 **Inode 已 100% 耗尽（`IFree = 0`）**，严禁向 `/root/rivermind-fs` 写入或解压任何新文件！所有实验输出继续写 `/root/rivermind-data/uav_rgb/`。
+2. **Git 与 GitHub 状态**：
+   - 本地 `main` 已快进对齐 `cursor/vln-language-goal-5fa5`，65 个已合入旧本地分支与 12 个干净工作树已清理（4 个含未提交改动的 `wt/p12-*` 原样保留保护）；`tools/git_mirror_alvln.sh` 已加祖先防回退校验，推送至 `git@github.com:xu967/ALVLN.git` 的 `main`。
+3. **本轮已落地并经真实 GPU + `cf_sitl` 验证的代码能力**（产物 `/root/rivermind-data/uav_rgb/exp-vln-upgrade-20261116/`，`DONE rc=0`）：
+   - **公开指标补齐**：`sim/3dgs/vln.py` 已实现精确动态规划 `nDTW` / `SDTW`、`resample_polyline`、`sage_ref_paths` 与 8 桶 `bearing_bin`。已补出 SAGE 249 集（teacher `nDTW=0.610, SDTW=0.568` vs forward `0.303 / 0.0`）与 OpenFly v3 seen20 五臂的完整 `SR / OSR / SPL / nDTW / SDTW` 对照表（`public_metrics.json`）。
+   - **可视化与错误目标门禁修复**：`run_vln.py` 与 `video.py` 不再拿预测目标覆写 `scene["waypoint"]`；当 grounder 选错目标时，顶视图同时画红圈（真值目标）与橙圈（预测目标），结尾大字显示红色 `WRONG GOAL`（不再伪装成绿色 `SUCCESS`）；面板新增目标距离、方位角与 `STOP REQUESTED`；长指令横幅保留首尾关键句；`eval_3dgs --record-video` 在 `cf_sitl` 下自动输出 10 FPS 四格视频。
+   - **3DGS 渲染升级**：`renderer.py` / `scene.py` 支持原生 `3DGUT`（`ut_eval3d=True`，RGB 走 3DGUT、深度走 ED 兼容）、`near_plane_m`、`eps2d` 与针状拉丝/半透明大雾团过滤 `gaussian_keep_mask`（实测室内 `841150` 与户外 `1MlUucug` 各视角锐度提升 `11.6%–23.9%`，对比图 `render_compare.png`）。
+   - **防撞刹停教师 `v5` 与 53m 户外长航线**：`planner.py` 新增 `uavrgb.teacher_occ.v5`（`--teacher-clearance braking`），16 条室内航线同 seed 配对碰撞率 `6.25% -> 0.0%`、SR `93.75% -> 100%`、SPL `0.776 -> 0.829`；打通本地 `wanderland_1MlUucug` 官方 `52.88 m` 街道长航线满电闭环（369 步实飞 `52.36 m`，自主 `STOP`，`NE=0.267 m`，`SPL=0.942`）。
+   - **语言目的性反事实闭环**：`grounder.py` 新增 `RelationPhraseGrounder`（`run_vln --grounder phrase`），在 `sage3d_840865` 同一出生位姿下输入不同房间目标指令，`correct` 组自主停在各自真目标（GT SR `2/2`），`swapped` 组严格判 `WRONG GOAL`（GT SR `0/2`）。
+   - **C++/CUDA 核心修复**：`src/nn_cuda.cu` 的 `sumsq_kernel` 改为确定性共享内存顺序归约，CTest **44/44 全绿**（含 `test_cuda_blocking_sync`）；`src/trainer.cpp` 修复从 `ckpt_epNN.bin` 分叉续训偷渡未来最佳权重与跨目录契约失步问题；`cf_sitl` **9/9 CTest + 33/33 自检全绿**；OpenFly **74/74 单测全绿**。
+4. **下一位接手做什么（严禁混淆边界）**：
+   - 当前 3DGS 上的同起点语言闭环仍是「短语 Grounder + 外部独立目录 + 特权规划器（G1 基线）」，**机载 C++ 学生网络尚未接入动态方位与独立 STOP 头，也尚未接入零特权视觉 VLM Grounder**。
+   - 下一位请直接按 **[PLAN §10.18](PLAN_2026-11-13_vln.md)** 的五张执行卡依序推进：**卡 S1（C++ 5 维动作+STOP 头与 15 维动态方位条件） → 卡 G2（零特权 VLM 视觉语言 Grounder 紧耦合闭环） → 卡 OF-E1/E2（OpenFly 6 场景扩量 + 预训练词向量 + 拐点/STOP 加权 + 因果 `prev_action`） → 卡 SCENE-LONG（SAGE 网格碰撞释放跨房间长航线 + Wanderland 全量长航线导入）**。
+
+---
+
+### 1. 目标与早些时候 OpenFly 阶段结论（2026-11-16 12:00 记录）
 
 最终任务：无人机根据语言指令与截至当前的视觉观测选择路线，在指定任务完成时自主停止。飞得远、经过目标附近、视频流畅或动作分类准确，都不能单独证明完成了VLN。
 
