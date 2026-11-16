@@ -648,3 +648,115 @@ PYTHONDONTWRITEBYTECODE=1 CUDA_VISIBLE_DEVICES='' .venv-tools/bin/python -m unit
 未实现组首因果数据版本、未下载99图、未改变模型/超参数、未修复既有控制振荡/真机PID、未做官方seen/unseen或新场景排名。新同步候选未通过，不宣称适配器稳定；数据与执行两项P0是后续优先级。没有新训练入口或长期队列。
 
 两次诊断命令因Python字符串/JS封装语法错误在执行前失败，修正后仅正式执行一次；无数据或源码误写。首次ffprobe不可用的失败保留，使用已有OpenCV解码而未安装新依赖。03:02仅停止本轮UE组686099/686100，端口41458释放；已有桌面及后出现的llama-server未动。当前系统盘约720MiB、数据盘约8.9GiB，未解压大型UE。新产物/权重/视频全部留数据盘，不进入Git。
+
+
+## 更新 2026-11-16：因果监督与Seq2Seq/CMA固定预算对照
+
+时间：2026-11-16 +0800。本轮源基点4235d7e，未提交diff只改既有OpenFly入口/测试及文档；实际GPU为RTX2080Ti 22,528MiB（UUID e9d01956-88db-b317-ea53-be3fb6cf7190），AirVLN环境Py3.8/torch2.1.2/cu118。原始证据根目录 R=/root/rivermind-data/uav_rgb/exp-openfly-optimization-20261116。既有llama-server占约15.5GiB，不停止他人服务。
+
+### 数据、训练与公平性
+
+- 99张缺失组首PNG共67,146,546B已按固定revision从hf-mirror直连补齐。ModelScope探测返回500，不据此声称平台没有该数据；HF主站当时连接失败，镜像返回真实PNG。未用代理、未新增认证或全库下载。150图总100,125,636B全部哈希/解码/853×480 RGB检查通过。
+- 新manifest：downloads/OpenFly/subsets/env18_causal_bc_v2/manifest.json，SHA256 69ec0c13319e4eb42cbe8e457768e0152c5cebf968007e59771ef3ed9c151482；源revision a12316d56a4e35a32ad626fb725ed7089937a1c4。相对v1恰好99张图/index变，路线、12/4划分、指令和原动作不变。150组、134宏转移、322原语转移、末尾唯一STOP全部核验；旧v1/原图/raw pose保留。
+- 训练预注册：R/preregistered_comparison.json，SHA f4d24d32adf32b7b5f25059d504620e087e1d112d4ac9550b77dde0bec2e86f3。两架构 × 两输入模式 × 三seed20261115/16/17；每次50轮/600更新，固定最后checkpoint，不按结果挑epoch。十二次命令在training_execution.json，合计485.31s，退出均0。
+- 两架构共用同原PNG、224双线性缩放、/255和冻结ResNet50权重；Seq2Seq特征2048×1×1，CMA为2048×4×4并有可训练位置嵌入/交叉注意力，不能称同一特征或单模块消融。深度、previous-action、进度辅助均关闭；CMA整个前动作嵌入输出清零，batch也不再含上一GT动作。
+- 同架构/seed的初始state和全部50轮训练顺序hash一致；12模型Adam step均600，前动作参数无optimizer state；6个RGB-only的整个语言编码器无optimizer state。模型重载logits差0，全部CPU与GPU confusion一致，最大CE差9.82e-7。
+
+命令模板（输出目录须新建；本次12个精确命令见JSON）：
+
+    PYTHONDONTWRITEBYTECODE=1 TORCH_HOME=/root/rivermind-data/uav_rgb/torch-cache OMP_NUM_THREADS=2 MKL_NUM_THREADS=2 CUDA_VISIBLE_DEVICES=GPU-e9d01956-88db-b317-ea53-be3fb6cf7190       /root/rivermind-data/uav_rgb/envs/airvln/bin/python tools/train_openfly_subset.py       --manifest /root/rivermind-data/uav_rgb/downloads/OpenFly/subsets/env18_causal_bc_v2/manifest.json       --airvln-root /root/rivermind-data/uav_rgb/airvln-runtime-ubuntu/AirVLN       --out <新目录> --policy-type <seq2seq或cma> --training-mode <rgb_language或rgb_only> --epochs 50 --seed <固定seed>
+
+| 三seed均值；仅4开发路线34帧 | 准确率 | 已支持类别macro recall | STOP recall |
+|---|---:|---:|---:|
+| Seq2Seq RGB+语言 | 52.94% | 20.18% | 33.33% |
+| Seq2Seq RGB-only | 52.94% | 17.98% | 16.67% |
+| CMA RGB+语言 | 52.94% | 28.90% | 33.33% |
+| CMA RGB-only | 61.76% | 31.07% | 58.33% |
+
+开发动作9占19/34，always9描述性准确率55.88%，并不等于闭环成功率。固定同图交换指令后Seq2Seq/CMA语言模型分别4/102、19/102帧改argmax；置零分别3/102、31/102。全部纯视觉模型对换语言/置零精确不变，前动作扰动全部差0。三seed仍只有4条独立路线，不能把102帧当独立样本；CMA更敏感不等于任务更好。详见baseline_audit/paired_offline_analysis.json及data_audit/training12_*。
+
+### v2执行协议与200回合：保留的失败实验
+
+v2每动作固定一次setPose、time(.02)、frames(2)，不重试、不放宽0.2m/1°/递增stamp门禁。短前缀、10动作和碰撞门禁通过后统一运行开发100回合+官方seen100回合，30arms合计4500.61s。100开发是4路线的策略/seed重复，100seen是20任务×5臂，不能称200条路线。
+
+| 开发v2，3seed×4路线 | STOP<20 | 有效观测OSR | 可信末NE m（有效分母） |
+|---|---:|---:|---:|
+| 盲前进固定STOP | 2/4 | 4/4 | 19.96（3/4） |
+| Seq2Seq RGB-only | 6/12 | 12/12 | 46.99（12/12） |
+| Seq2Seq 正确语言 | 6/12 | 12/12 | 59.22（12/12） |
+| Seq2Seq 交换/置零语言 | 各7/12 | 各12/12 | 各50.09（12/12） |
+| CMA RGB-only | 5/12 | 12/12 | 74.09（12/12） |
+| CMA 正确语言 | 6/12 | 12/12 | 33.36（12/12） |
+| CMA 交换语言 | 4/12 | 12/12 | 50.78（12/12） |
+| CMA 置零语言 | 2/12 | 12/12 | 111.33（11/12） |
+
+开发集OSR已饱和；CMA语言对照有方向性而Seq2Seq没有。48对语言闭环起始RGB hash均不同，不能将所有轨迹变化归于文字；固定图像测试只能证实接线。缺反馈的NE是条件均值，不以不同分母比较排名。
+
+| 官方seen子集v2，仅固定seed20261115 | STOP<20 /20 | 有效OSR /20 | 原协议终止 /20 | 碰撞 /20 |
+|---|---:|---:|---:|---:|
+| 盲前进 | 1 | 19 | 0 | 5 |
+| Seq2Seq RGB-only | 5 | 14 | 0 | 2 |
+| Seq2Seq RGB+语言 | 3 | 15 | 0 | 2 |
+| CMA RGB-only | 4 | 17 | 2 | 2 |
+| CMA RGB+语言 | 4 | 17 | 8 | 3 |
+
+10个协议失败均为64–95动作后向下0.20002–0.22064m偏差；0 stale、0程序错误、0录像错误。另11个碰撞终帧也超pose门槛（seen9、dev2），代码按碰撞优先正确终止，不假改成新的protocol终止；全200共21反馈无效终帧，不能以原NE进行导航排名。所有失败都保留分母和原trace。
+
+全部200段视频经FFmpeg完整解码，3923帧逐集匹配；400首末原PNG哈希、400预览原RGB区域、动作转移/原始起终点/距离/30contract/12checkpoint全通过。审计记录data_audit/evaluation200_independent_audit.json。首次审计一次性命令的帧数解析失误已保留并完整重解码，不是实验重跑。
+
+### 官方任务和作者结果的比较范围
+
+seen任务从原seen.json冻结20条env18 medium_short，任务清单SHA abc1418e1352623b35ef5039a7ff725b8fdf49c014423bd7811c9c57e3b6929a。源seen文件SHA c768d457dd91e638e95e1d7382e3e26c60ca7b9ff099ac8d7a909e9b9697d2cb。源row/hash重建起终点，训练清单只接受train.json，二者不可混用。排除完整轨迹/ID重叠，但3条与train/dev空间接近；4条起点已在20m内。OSR含起点，另存动作后OSR。总量20/203 env18、20/1800seen，unseen未评。
+
+官方OpenFly-Platform c0750754 README场景表报告env18 NE77.4m、SR39.4%、OSR65.5%、SPL27.0%。这是作者表，未明确对应checkpoint和分母，不能与我们20条加安全门禁的结果混排。官方eval原实现最终3D距离<20即SR，不要求STOP；OSR取动作后命令位姿；legacy SPL=直线起终点距/(.001+命令累计路程)，没有标准SPL的max分母，可能大于1。它没有本地的300m/120s/碰撞终止和反馈门禁。我们只报本地诊断，未提交远程榜单。
+
+公开源码审计见R/baseline_audit.json及official_sources，访问2026-11-16：OpenFly-Agent镜像元数据权重15,082,600,824B，未本地加载；LightVLN公开pre-fix快照不含权重；AeroBrain代码/权重仍coming soon；SimpleNav需要另一套Qwen/torch/FA依赖，未复现。这些是可运行性核查，不是性能失败。AirVLN Seq2Seq/CMA已在本机重训适配，不能冒充官方预训练导航模型。
+
+主来源：[OpenFly固定README](https://github.com/SHAILAB-IPEC/OpenFly-Platform/blob/c075075497a7122bad82f5b76b9be926ad5a81b3/README.md#evaluation)、[官方eval实现](https://github.com/SHAILAB-IPEC/OpenFly-Platform/blob/c075075497a7122bad82f5b76b9be926ad5a81b3/train/eval.py)、[AirVLN](https://github.com/AirVLN/AirVLN)、[LightVLN](https://github.com/zhaoyiming/LightVLN)、[AeroBrain](https://github.com/Ideal-ljl/AeroBrain)、[SimpleNav](https://github.com/OpenBMB/SimpleNav)。本轮工具检索空响应时，以保存的官方API/原文HTTP200和SHA复核，不编造论文表或提交接口。
+
+### v3修复验证，正式模型重测单独记录
+
+四次固定v2长前缀重放有2次在51/53步超0.2m，2次走完仍偏0.1426/0.1472m；实际nav vz为-7.47至-8.18m/s，physics/render位姿几乎相同，被动等.35s全部状态不变。根因是setPose保留速度造成累积下落，不能靠继续等帧修好。
+
+v3每动作一次simSetKinematics原子设位姿并清零线/角速度和加速度；固定API time(.02)+frames(2)保留，0.2m/1°/fresh及碰撞优先不变。明确属于无惯性运动学导航诊断，不是物理飞行改进或官方原协议。候选4×100动作、10动作、3碰撞全部通过，生产接口另100动作/101帧通过，最大误差0.003177399m。38评测单测通过，旧v1/v2保留；最终相关工具74/74通过（tools_final.log）。
+
+已冻结v3 evaluator SHA78fcbeea43b1b1769a02cbb09a5703a61c68ce77c946f9f89d7aa90b4eacb3c5及R/evaluation_v3_freeze.json，五臂在evaluation_v3/official_seen完整100集统一重测。模型、任务、预算、种子不变；结果追加后不得与旧v2合并成同协议成绩。完整失败根因/原命令见sync_audit/final_protocol_failure_review.json/md。
+
+
+### 视觉复核：目的性与停止问题
+
+人工查看4个实际失败案例共8张首末preview，根代理另复看两张；图像有完整楼体细节，无黑帧，不能把这些任务失败简单归于渲染损坏。CMA语言episode014初图是与灰色砖立面/拱窗属性相符的楼体，前进12m后距目标约0.0099m，接着68个转向；xy不动，是原地摆头，不是绕楼飞行。相同任务Seq2Seq也曾经过目标，却继续飞离，在169.90m处对白色矩形窗立面STOP。另CMA错误STOP时近景主要为草地/天空，距目标208.20m。
+
+这些可见属性仍不能证明目标实例唯一，重复白楼/矩形窗需要结合指令阶段和空间关系。下一步应先扩充真实目标/STOP样本及任务辨别诊断，不以加attention命名新方法。此批为UE AirSim图像，不能拿来评价3DGS重建质量。证据baseline_audit/v2_visual_failure_review.json/.md，图片SHA及完整动作保留。
+
+
+### 最终推理对拍与下一批数据盘点
+
+12个实际checkpoint×4开发路线共48对、408帧完成逐帧carry与整段前向对拍；全部通过atol=rtol=1e-5，argmax差异0/408。全局绝对差2.002716e-5，其中CMA语言两帧超过纯绝对1e-5但符合联合相对判据，不宣称bitwise一致。每条reset后hidden/prev/mask清零，首帧logits/hidden与原首帧精确相同。8组真实PNG特征SHA与先前审计一致；证据baseline_audit/trained_sequence_parity.json。
+
+E1只读盘点六个已解压AirSim场景：官方train61,004行，其中53,712条有效0..9唯一末尾STOP、6,670条medium_short；筛前进+转向并排除已有冻结集后池5,006条。按seed20261116和场景配额给出100候选，env16/18各16，env23/26/gz/sh各17。960公开保留帧标签的0..9支持为[100,77,79,72,21,21,0,0,89,501]，5条含升降。六场景所有合法原生标注均无6/7侧移，不可宣称十类覆盖。
+
+候选不等于训练ready：未验证raw因果组首、未做地理簇train/dev划分，本地所需新图命中0，缺图字节未知；100条固定revision元数据API名单已给出，未请求/下载。不能用exact去重冒充空间独立，扩训练前应核完整raw的距离、共享走廊与连通路径，再计算压缩/解压/缓存峰值。data_expansion_candidate.json SHA176a5240cd98ec36ad0b9da5c2cf13f8045b8af370feaaf2575c951c59c14df2。
+
+### 最终 v3 seen100结果（2026-11-16 08:02 +0800完成）
+
+| 策略；同20任务/seed20261115 | STOP<20 | 有效OSR（含起点） | 可信末NE m（n/20） | 碰撞 | 协议错误 |
+|---|---:|---:|---:|---:|---:|
+| 盲前进+固定STOP | 1/20 | 19/20 | 35.41（17/20） | 5/20 | 0/20 |
+| Seq2Seq RGB-only | 5/20 | 14/20 | 78.99（20/20） | 1/20 | 0/20 |
+| Seq2Seq RGB+语言 | 4/20 | 15/20 | 88.27（18/20） | 2/20 | 0/20 |
+| CMA RGB-only | 5/20 | 17/20 | 97.60（20/20） | 1/20 | 0/20 |
+| CMA RGB+语言 | 3/20 | 17/20 | 77.95（18/20） | 3/20 | 0/20 |
+
+五臂全部退出0，共2750.78s；0协议/程序/录像/过期时间戳错误。100视频完整解码2767帧，200首末PNG和200预览原RGB区域均匹配，动作/来源/hash/预算全量独立核验通过。审计SHA a0f10c92af3bbb2860f8c82eeb298ac5544d79d2e859a7aa385ad5296e86e5b3。12碰撞全部保留，其中7终帧反馈越界，故可信NE分母合计93/100；不把条件均值作排名。非碰撞最大位姿误差0.003181912m。
+
+v3通过本轮长序列验证，解决的是残余速度累积导致的评测漂移；它没有解决任务目的/STOP。两种架构语言版STOP成功均没有超过各自纯视觉版：Seq2Seq4/20 vs5/20，CMA3/20 vs5/20。不能宣称增加语言或注意力已改善泛化，更不能按条件NE靠近作者表就声称达到官方水平。CMA语言7/20步数耗尽、4/20距离耗尽；持续摆头/走过目标是下一步失败分析重点。20任务、单seed、同一seen场景的限制不变。
+
+盲基线有效OSR19/20但仅1/20固定STOP在半径内，说明经过目标附近与完成任务差别巨大。4/20起点已在20m内；动作后OSR分别为盲19、SeqRGB13、Seq语言14、CMARGB16、CMA语言17。即使半径宽松，本轮结果仍不足完成无人机VLN要求。
+
+历史v2的200回合和新v3的100回合共300段视频、6690帧，分别保留协议；没有把一次失败静默重跑成成功，也没有把同20任务重复当100独立路线。汇总comparison_v3.json，精确命令evaluation_v3_execution.json，逐片证据data_audit/evaluation_v3_independent_audit.json。观看index.html共300条，按协议/路线/seed过滤；视频开关仍为原入口 --record-video / --no-record-video。
+
+
+最终独立重算与根代理汇总一致，closedloop_v3_interpretation.json SHA b151523696849dc416140b0c06d24ba17f43d058cc201c3b5a0e3b412c0a0c64。CMA语言同一episode014在v3中已不发生累积下落，却在距目标0.00133m处连续98次原地转向，直到100步预算终止。这将评测漂移与目标停止缺陷区分开：v3修好了本轮执行门禁，没有让模型学会任务完成。
+
+收尾只对记录的本任务UE进程组835450发送SIGTERM，已确认无残留PID、41458无监听；llama-server793082与桌面281546保持运行。最终数据盘约5.7GiB、系统盘约706MiB、另一挂载约68GiB可用；不据总盘容量自动下载大模型。独立审计与source snapshots保留全部原失败；没有其他进程清理。

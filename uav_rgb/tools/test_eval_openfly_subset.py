@@ -18,13 +18,20 @@ STUDENT = {"policy": "student", "training_mode": "rgb_language",
 
 
 def blind_manifest():
-    return {"episodes": [
+    return {"schema": "uavrgb.openfly_subset.v1", "episodes": [
         {"split": "train", "route_id": "train_a", "actions": [9, 2, 0]},
         {"split": "train", "route_id": "train_b", "actions": [1, 9, 9, 0]},
         {"split": "validation", "route_id": "validation", "actions": [1, 0]}]}
 
 
 class ActionTests(unittest.TestCase):
+    def test_execution_protocol_is_versioned_and_legacy_is_explicit(self):
+        args = ["--policy", "blind_forward", "--manifest", "m", "--out", "o"]
+        self.assertEqual(evaluator.parser().parse_args(args).execution_protocol, evaluator.KINEMATIC_PROTOCOL)
+        for protocol in (evaluator.LEGACY_PROTOCOL, evaluator.PROTOCOL):
+            self.assertEqual(evaluator.parser().parse_args(args + ["--execution-protocol",
+                protocol]).execution_protocol, protocol)
+
     def test_native_actions_and_yaw_wrap(self):
         expected = [[0, 0, 0, 0], [3, 0, 0, 0], [0, 0, 0, math.pi / 6],
                     [0, 0, 0, -math.pi / 6], [0, 0, 3, 0], [0, 0, -3, 0],
@@ -90,7 +97,7 @@ class ActionTests(unittest.TestCase):
             route = "env_airsim_18/astar_data/medium_short/fixture"
             source = root / "train.json"
             source.write_text(json.dumps([{"image_path": route, "pos": [[0, 0, 0], [3, 0, 0]], "yaw": [0, 0]}]))
-            manifest = {"annotation_source": str(source), "annotation_sha256": "fixture", "episodes": [
+            manifest = {"schema": "uavrgb.openfly_subset.v1", "annotation_source": str(source), "annotation_sha256": "fixture", "episodes": [
                 {"split": "validation", "route_id": route, "instruction": "go forward"}]}
             for reason, expected in cases:
                 with self.subTest(reason=reason):
@@ -110,7 +117,92 @@ class ActionTests(unittest.TestCase):
                     self.assertEqual(summary["episodes"][0]["termination"], reason)
 
 
+class SimulatorTests(unittest.TestCase):
+    def test_fixed_physics_then_render_phase_never_resends_pose(self):
+        for protocol in (evaluator.LEGACY_PROTOCOL, evaluator.PROTOCOL):
+            with self.subTest(protocol=protocol), mock.patch.dict(sys.modules, {"airsim": mock.Mock()}), \
+                 mock.patch.object(evaluator.time, "sleep"):
+                sim = evaluator.Simulator(SimpleNamespace(vehicle="drone_1", camera="front_custom",
+                                                         port=41458, execution_protocol=protocol))
+                sim.client.reset_mock()
+                sim.client.simIsPause.return_value = True
+                sim.advance([1, 2, 3, 0])
+                sim.client.simSetVehiclePose.assert_called_once()
+                sim.client.simSetKinematics.assert_not_called()
+                sim.client.simContinueForTime.assert_called_once_with(0.02)
+                names = [call[0] for call in sim.client.method_calls]
+                if protocol == evaluator.PROTOCOL:
+                    sim.client.simContinueForFrames.assert_called_once_with(2)
+                    self.assertLess(names.index("simContinueForTime"), names.index("simContinueForFrames"))
+                else:
+                    sim.client.simContinueForFrames.assert_not_called()
+
+    def test_kinematic_protocol_resets_dynamics_in_one_request(self):
+        api = mock.Mock()
+        api.Vector3r.side_effect = lambda x, y, z: (x, y, z)
+        api.to_quaternion.side_effect = lambda pitch, roll, yaw: (pitch, roll, yaw)
+        api.Pose.side_effect = lambda position, orientation: SimpleNamespace(position=position, orientation=orientation)
+        api.KinematicsState.side_effect = SimpleNamespace
+        with mock.patch.dict(sys.modules, {"airsim": api}), mock.patch.object(evaluator.time, "sleep"):
+            sim = evaluator.Simulator(SimpleNamespace(vehicle="drone_1", camera="front_custom", port=41458))
+            sim.client.reset_mock()
+            sim.client.simIsPause.return_value = True
+            sim.advance([1, 2, 3, 0.5])
+        sim.client.simSetVehiclePose.assert_not_called()
+        sim.client.simSetKinematics.assert_called_once()
+        state, ignore_collision = sim.client.simSetKinematics.call_args.args
+        self.assertEqual(state.position, (1, -2, -3))
+        self.assertEqual(state.orientation, (0, 0, -0.5))
+        self.assertTrue(ignore_collision)
+        for name in ("linear_velocity", "angular_velocity", "linear_acceleration", "angular_acceleration"):
+            self.assertEqual(getattr(state, name), (0, 0, 0))
+        self.assertEqual([c[0] for c in sim.client.method_calls], [
+            "simSetKinematics", "simContinueForTime", "simIsPause", "simContinueForFrames", "simIsPause"])
+
+    def test_physics_timeout_does_not_retry_or_enter_render_phase(self):
+        for protocol in (evaluator.LEGACY_PROTOCOL, evaluator.PROTOCOL, evaluator.KINEMATIC_PROTOCOL):
+            with self.subTest(protocol=protocol), mock.patch.dict(sys.modules, {"airsim": mock.Mock()}):
+                sim = evaluator.Simulator(SimpleNamespace(vehicle="drone_1", camera="front_custom",
+                                                         port=41458, execution_protocol=protocol))
+                sim.client.simIsPause.return_value = False
+                with mock.patch.object(evaluator.time, "monotonic", side_effect=[0, 11]), \
+                     self.assertRaisesRegex(ValueError, "tick 超时"):
+                    sim.advance([1, 2, 3, 0])
+                if protocol == evaluator.KINEMATIC_PROTOCOL:
+                    sim.client.simSetKinematics.assert_called_once()
+                    sim.client.simSetVehiclePose.assert_not_called()
+                else:
+                    sim.client.simSetVehiclePose.assert_called_once()
+                    sim.client.simSetKinematics.assert_not_called()
+                sim.client.simContinueForTime.assert_called_once()
+                sim.client.simContinueForFrames.assert_not_called()
+
+
 class BlindForwardTests(unittest.TestCase):
+    def test_causal_manifest_uses_group_start_and_terminal_pose(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = blind_manifest()
+            manifest.update(schema=evaluator.CAUSAL_SCHEMA, supervision="causal_group_start_macro_bc",
+                            annotation_source="must_not_read_old_group_end_poses", annotation_sha256="fixture")
+            manifest["episodes"][-1].update(route_id="env_airsim_18/astar_data/medium_short/fixture",
+                instruction="go forward", groups=[{"start_pose": [10, 20, 30, 0.5]},
+                                                  {"start_pose": [13, 25, 30, 0.5]}])
+            cli = evaluator.parser().parse_args(["--policy", "blind_forward", "--manifest", "unused",
+                                                "--out", str(Path(tmp) / "out"), "--no-record-video"])
+            with mock.patch.object(evaluator, "load_manifest", return_value=manifest), \
+                 mock.patch.object(evaluator, "sha256", return_value="fixture"), \
+                 mock.patch.object(evaluator, "Simulator"), mock.patch.object(evaluator, "Recorder"), \
+                 mock.patch.object(evaluator, "rollout", return_value={"termination": "fixed_stop",
+                    "error": None, "video_error": None}) as rollout, mock.patch("builtins.print"):
+                self.assertEqual(evaluator.run(cli), 0)
+            self.assertEqual(rollout.call_args.args[4:6], ([10, 20, 30, 0.5], [13, 25, 30]))
+            contract = json.loads((cli.out / "contract.json").read_text())
+            self.assertEqual(contract["action_schema"], evaluator.manifest_action_schema(manifest))
+            self.assertEqual(contract["manifest_schema"], evaluator.CAUSAL_SCHEMA)
+            self.assertEqual(contract["synchronization"]["render_frames"], 2)
+            self.assertIn("zero linear/angular velocity", contract["synchronization"]["state_reset"])
+            self.assertEqual(contract["protocol"], evaluator.KINEMATIC_PROTOCOL)
+
     def test_initialization_failures_keep_summary_and_video_failure_keeps_rollout(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -448,6 +540,19 @@ class RolloutTests(unittest.TestCase):
 
 @unittest.skipUnless(importlib.util.find_spec("torch"), "需要 torch")
 class RecurrentTests(unittest.TestCase):
+    def test_cma_requires_spatial_feature_and_disabled_previous_action_contract(self):
+        import torch
+        cli = SimpleNamespace(airvln_root=Path("unused"), checkpoint=Path("unused"))
+        contracts = [
+            ({"policy_type": "cma"}, "RGB 特征形状"),
+            ({"policy_type": "cma", "rgb_feature_shape": [2048, 4, 4]}, "前一动作"),
+            ({"policy_type": "unknown"}, "policy_type"),
+        ]
+        for contract, message in contracts:
+            with self.subTest(contract=contract), mock.patch.object(torch, "load",
+                    return_value={"contract": contract}), self.assertRaisesRegex(ValueError, message):
+                evaluator.Policy(cli, {})
+
     def test_nonfinite_logits_or_hidden_are_rejected(self):
         import torch
         observation = {"instruction": None, "rgb_features": None}
@@ -488,6 +593,7 @@ class RecurrentTests(unittest.TestCase):
             return SimpleNamespace(logits=logits)
         agent = evaluator.Policy.__new__(evaluator.Policy)
         agent.torch, agent.device = torch, "cpu"
+        agent.feature_shape = (3, 1, 1)
         agent.policy = SimpleNamespace(net=net, action_distribution=distribution)
         agent.tokenizer = SimpleNamespace(split_sentence=lambda s: s.split(),
                                          encode_sentence=lambda s: [2, 3, 0])
@@ -505,8 +611,87 @@ class RecurrentTests(unittest.TestCase):
         agent.step(rgb)
         self.assertEqual(net.calls[-1][0].sum().item(), 0)
         self.assertFalse(net.calls[-1][2].item())
+        agent.feature_shape = (2048, 4, 4)
+        with self.assertRaisesRegex(ValueError, "RGB 特征形状"):
+            agent.step(rgb)
+        self.assertEqual(len(net.rgb_encoder.layer_extract._forward_hooks), 0)
         with self.assertRaisesRegex(ValueError, "白名单"):
             evaluator.recurrent_step(agent.policy, {"instruction": 1, "rgb_features": 1, "goal": 2}, None, None, None)
+
+
+class EvaluationTaskTests(unittest.TestCase):
+    def fixture(self, root):
+        route = "env_airsim_18/astar_data/medium_short/seen_route"
+        row = {"image_path": route, "gpt_instruction": "Climb and stop.", "action": [4, 0],
+               "pos": [[10, 20, 30], [10, 20, 33]], "yaw": [0, 0], "index_list": ["a_0", "a_1"]}
+        source, train, path, manifest_path = [root / n for n in ("seen.json", "train.json", "tasks.json", "manifest.json")]
+        source.write_text(json.dumps([row]))
+        train.write_text("[]")
+        manifest = {"schema": evaluator.CAUSAL_SCHEMA, "annotation_source": str(train),
+                    "source_repo": "fixture", "source_revision": "revision", "episodes": []}
+        manifest_path.write_text(json.dumps(manifest))
+        digest = evaluator.hashlib.sha256(json.dumps(row, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        task = {"source_row_index": 0, "source_record_sha256": digest, "route_id": route,
+                "instruction": row["gpt_instruction"], "start_pose": [10, 20, 30, 0], "goal_position": [10, 20, 33]}
+        data = {"schema": "uavrgb.openfly_official_seen_tasks.v1", "annotation_source": str(source),
+                "annotation_sha256": evaluator.sha256(source), "training_manifest_sha256": evaluator.sha256(manifest_path),
+                "source_repo": "fixture", "source_revision": "revision",
+                "selection": {"env": "env_airsim_18"}, "tasks": [task]}
+        path.write_text(json.dumps(data))
+        return path, manifest_path, manifest, data, row
+
+    def test_official_seen_keeps_source_start_goal_and_vertical_labels(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, manifest_path, manifest, data, _ = self.fixture(Path(tmp))
+            self.assertEqual(evaluator.load_evaluation_tasks(path, manifest_path, manifest), data)
+            self.assertEqual(evaluator.parser().parse_args(["--manifest", "m", "--out", "o",
+                             "--evaluation-tasks", str(path)]).evaluation_tasks, path)
+
+    def test_changed_source_goal_instruction_or_manifest_is_rejected(self):
+        for key in ("annotation_sha256", "training_manifest_sha256", "source_revision",
+                    "source_record_sha256", "instruction", "goal_position", "start_pose", "source_row_index"):
+            with self.subTest(key=key), tempfile.TemporaryDirectory() as tmp:
+                path, manifest_path, manifest, data, _ = self.fixture(Path(tmp))
+                if key in data:
+                    data[key] = "wrong"
+                else:
+                    data["tasks"][0][key] = {"goal_position": [0, 0, 0], "start_pose": [0, 0, 0, 0],
+                                               "source_row_index": -1}.get(key, "wrong")
+                path.write_text(json.dumps(data))
+                with self.assertRaises(ValueError):
+                    evaluator.load_evaluation_tasks(path, manifest_path, manifest)
+
+    def test_duplicate_and_train_geometry_leak_are_rejected(self):
+        for mode in ("duplicate", "route", "geometry"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                path, manifest_path, manifest, data, row = self.fixture(Path(tmp))
+                if mode == "duplicate":
+                    data["tasks"].append(copy.deepcopy(data["tasks"][0]))
+                else:
+                    if mode == "geometry":
+                        row["image_path"] += "_different_instruction"
+                    Path(manifest["annotation_source"]).write_text(json.dumps([row]))
+                path.write_text(json.dumps(data))
+                with self.assertRaises(ValueError):
+                    evaluator.load_evaluation_tasks(path, manifest_path, manifest)
+
+    def test_evaluation_tasks_supply_reset_and_metrics_but_not_policy_goal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path, manifest_path, manifest, data, _ = self.fixture(root)
+            manifest.update(annotation_sha256="fixture", supervision="causal_group_start_macro_bc")
+            cli = evaluator.parser().parse_args(["--checkpoint", "unused", "--manifest", str(manifest_path),
+                "--airvln-root", "unused", "--out", str(root / "result"), "--evaluation-tasks", str(path)])
+            policy = SimpleNamespace(checkpoint_sha256="fixture", contract={}, details=STUDENT, input_whitelist=evaluator.INPUTS)
+            with mock.patch.object(evaluator, "load_manifest", return_value=manifest), \
+                 mock.patch.object(evaluator, "Policy", return_value=policy) as factory, \
+                 mock.patch.object(evaluator, "Simulator"), mock.patch.object(evaluator, "Recorder"), \
+                 mock.patch.object(evaluator, "rollout", return_value={"termination": "predicted_stop",
+                    "error": None, "video_error": None}) as rollout, mock.patch("builtins.print"):
+                self.assertEqual(evaluator.run(cli), 0)
+            self.assertIs(factory.call_args.args[1], manifest)
+            self.assertEqual(rollout.call_args.args[4:7], ([10, 20, 30, 0], [10, 20, 33], "Climb and stop."))
+            self.assertEqual(json.loads((cli.out / "contract.json").read_text())["evaluation_scope"], "official_seen_subset")
 
 
 if __name__ == "__main__":

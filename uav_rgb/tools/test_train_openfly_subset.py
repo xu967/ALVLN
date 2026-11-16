@@ -1,11 +1,13 @@
 import copy
 import importlib.util
 import json
+import math
 from pathlib import Path
 import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import train_openfly_subset as adapter
@@ -22,6 +24,12 @@ class TrainingModeTests(unittest.TestCase):
         self.assertFalse(args.ablate_instruction)
         with self.assertRaisesRegex(ValueError, "training_mode"):
             adapter.configure_training_mode(args, "zero")
+
+    def test_policy_feature_contract_keeps_cma_spatial_information(self):
+        self.assertEqual(adapter.rgb_feature_shape("seq2seq"), (2048, 1, 1))
+        self.assertEqual(adapter.rgb_feature_shape("cma"), (2048, 4, 4))
+        with self.assertRaisesRegex(ValueError, "policy_type"):
+            adapter.rgb_feature_shape("attention")
 
 
 class ManifestTests(unittest.TestCase):
@@ -142,6 +150,109 @@ class ManifestTests(unittest.TestCase):
             self.load()
 
 
+class CausalManifestTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        originals, episodes = [], []
+        for route_index in range(4):
+            route = f"env_airsim_18/route_{route_index}"
+            folder = self.root / route
+            folder.mkdir(parents=True)
+            raw, x, y, yaw = [], route_index * 100.0, 0.0, 0.0
+            for i, token in enumerate([1, 1, 1, 2, 1, 1, 3, 1, 0]):
+                kind, value = {1: ("go straight", 3), 2: ("turn left", 30),
+                               3: ("turn right", 30), 0: ("stop", 0)}[token]
+                raw.append({"action": {"imageid": i, "type": kind, "value": value,
+                                       "pos": [x, y, 1.0], "yaw": yaw}})
+                (folder / f"frame_{i}.png").write_bytes(f"image {route_index}:{i}".encode())
+                if token == 1:
+                    x, y = x + 3 * math.cos(yaw), y + 3 * math.sin(yaw)
+                elif token in (2, 3):
+                    yaw += math.radians(30 if token == 2 else -30)
+            raw_path = folder / "pose.jsonl"
+            raw_path.write_text("\n".join(json.dumps(row, indent=2) for row in raw)
+                                + '\n{"aim_landmark": {}}\n')
+            bounds = [(0, 2), (3, 3), (4, 5), (6, 6), (7, 7), (8, 8)]
+            indices = [f"frame_{first}" for first, _ in bounds]
+            source_indices = [f"frame_{last}" for _, last in bounds]
+            images = [str(folder / f"{index}.png") for index in indices]
+            instruction, actions = f"fly to building {route_index}", [9, 2, 8, 3, 1, 0]
+            originals.append({"image_path": route, "gpt_instruction": instruction, "action": actions,
+                              "index_list": source_indices,
+                              "pos": [raw[last]["action"]["pos"] for _, last in bounds],
+                              "yaw": [raw[last]["action"]["yaw"] for _, last in bounds]})
+            episodes.append({"route_id": route, "split": "train" if route_index < 2 else "validation",
+                             "instruction": instruction, "actions": actions,
+                             "index_list": indices, "source_index_list": source_indices,
+                             "images": images, "image_sha256": [adapter.sha256(p) for p in images],
+                             "raw_pose_path": str(raw_path), "raw_pose_sha256": adapter.sha256(raw_path),
+                             "groups": [{"first_imageid": first, "last_imageid": last,
+                                         "start_pose": raw[first]["action"]["pos"] + [raw[first]["action"]["yaw"]]}
+                                        for first, last in bounds]})
+        self.source = self.root / "train.json"
+        self.source.write_text(json.dumps(originals))
+        self.manifest = {"schema": adapter.CAUSAL_SCHEMA, "supervision": "causal_group_start_macro_bc",
+                         "annotation_source": str(self.source), "annotation_sha256": adapter.sha256(self.source),
+                         "episodes": episodes}
+        self.path = self.root / "manifest.json"
+
+    def load(self, manifest=None):
+        self.path.write_text(json.dumps(self.manifest if manifest is None else manifest))
+        return adapter.load_manifest(self.path)
+
+    def test_causal_groups_preserve_source_and_use_pre_action_images(self):
+        before = self.source.read_bytes()
+        loaded = self.load()
+        self.assertEqual(loaded, self.manifest)
+        self.assertEqual(adapter.manifest_action_schema(loaded), adapter.CAUSAL_ACTION_SCHEMA)
+        self.assertEqual(adapter.manifest_action_schema({"schema": adapter.SCHEMA}), adapter.ACTION_SCHEMA)
+        self.assertEqual(loaded["episodes"][0]["groups"][0]["start_pose"], [0.0, 0.0, 1.0, 0.0])
+        self.assertEqual(self.source.read_bytes(), before)
+
+    def test_rejects_changed_source_contract_or_group_boundaries(self):
+        ep = self.manifest["episodes"][0]
+        bad_groups = copy.deepcopy(ep["groups"])
+        bad_groups[0]["first_imageid"] = 1
+        bad_pose = copy.deepcopy(ep["groups"])
+        bad_pose[0]["start_pose"][0] = 6
+        bad_nan = copy.deepcopy(ep["groups"])
+        bad_nan[0]["start_pose"][0] = float("nan")
+        patches = [{"source_index_list": ep["index_list"]}, {"instruction": "changed task"},
+                   {"raw_pose_sha256": "0" * 64}, {"groups": ep["groups"][:-1]},
+                   {"groups": bad_groups}, {"groups": bad_pose}, {"groups": bad_nan},
+                   {"actions": [9, 0, 8, 3, 1, 0]}]
+        for patch in patches:
+            with self.subTest(patch=patch):
+                manifest = copy.deepcopy(self.manifest)
+                manifest["episodes"][0].update(patch)
+                with self.assertRaises(ValueError):
+                    self.load(manifest)
+
+    def test_group_end_image_cannot_be_relabelled_as_group_start(self):
+        ep = self.manifest["episodes"][0]
+        ep["index_list"][0] = ep["source_index_list"][0]
+        image = Path(ep["images"][0]).with_name(ep["index_list"][0] + ".png")
+        ep["images"][0], ep["image_sha256"][0] = str(image), adapter.sha256(image)
+        with self.assertRaisesRegex(ValueError, "图像索引"):
+            self.load()
+
+    def test_raw_internal_action_is_checked_even_with_updated_digest(self):
+        ep = self.manifest["episodes"][0]
+        raw_path = Path(ep["raw_pose_path"])
+        original_text = raw_path.read_text()
+        for before, after in [('"imageid": 1', '"imageid": 99'),
+                              ('"value": 3', '"value": 2'),
+                              ('3.0,', '4.0,')]:
+            with self.subTest(after=after):
+                self.assertIn(before, original_text)
+                raw_path.write_text(original_text.replace(before, after, 1))
+                ep["raw_pose_sha256"] = adapter.sha256(raw_path)
+                with self.assertRaises(ValueError):
+                    self.load()
+
+
 @unittest.skipUnless(importlib.util.find_spec("torch"), "需要训练环境中的 torch")
 class TensorTests(unittest.TestCase):
     def setUp(self):
@@ -168,15 +279,41 @@ class TensorTests(unittest.TestCase):
         self.batches = [adapter.episode_tensors({"actions": [9, 2, 0]},
                         torch.zeros(3, 2048, 1, 1), [i, 0, 0], "cpu") for i in (2, 5)]
 
-    def test_only_past_actions_and_reset_mask_are_available(self):
+    def test_no_teacher_actions_and_reset_mask_are_available(self):
         obs, prev, masks, targets, weights = self.batches[0]
         self.assertEqual(sorted(obs), adapter.INPUTS)
-        self.assertEqual(prev.view(-1).tolist(), [0, 9, 2])
+        self.assertEqual(prev.view(-1).tolist(), [0, 0, 0])
         self.assertEqual(masks.view(-1).tolist(), [0, 1, 1])
         self.assertEqual(targets.view(-1).tolist(), [9, 2, 0])
         self.assertEqual(weights.view(-1).tolist(), [1, 1, 1])
         with self.assertRaisesRegex(ValueError, "白名单"):
             adapter.logits_for(self.trainer, ({**obs, "pos": 1}, prev, masks, targets, weights))
+
+    def test_shared_factory_disables_cma_previous_action_embedding(self):
+        torch = self.torch
+        args = SimpleNamespace(policy_type="seq2seq", SEQ2SEQ_use_prev_action=True,
+                               ablate_depth=False, PROGRESS_MONITOR_use=True)
+        calls = []
+        def make_trainer(load, observation_space, action_space):
+            calls.append((load, observation_space, action_space, args.policy_type))
+            net = torch.nn.Module()
+            net.prev_action_embedding = torch.nn.Embedding(11, 32)
+            return SimpleNamespace(policy=SimpleNamespace(net=net))
+        modules = {"src.common.param": SimpleNamespace(args=args),
+                   "Model.il_trainer": SimpleNamespace(VLNCETrainer=make_trainer)}
+        with patch.dict(sys.modules, modules):
+            trainer = adapter.build_trainer("rgb-only-space", "ten-actions", "cma")
+            embedding = trainer.policy.net.prev_action_embedding
+            first, changed = embedding(torch.tensor([0, 1, 9])), embedding(torch.tensor([10, 7, 2]))
+            self.assertTrue(torch.equal(first, torch.zeros(3, 32)))
+            self.assertTrue(torch.equal(first, changed))
+            self.assertFalse(first.requires_grad)
+            self.assertFalse(args.SEQ2SEQ_use_prev_action)
+            self.assertTrue(args.ablate_depth)
+            self.assertFalse(args.PROGRESS_MONITOR_use)
+            default = adapter.build_trainer("rgb-only-space", "ten-actions")
+            self.assertEqual(len(default.policy.net.prev_action_embedding._forward_hooks), 0)
+        self.assertEqual([call[-1] for call in calls], ["cma", "seq2seq"])
 
     def test_state_hash_identifies_values_and_is_independent_of_dict_order(self):
         torch = self.torch
