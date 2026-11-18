@@ -5,10 +5,14 @@ collision.read_ply_vertices 回读、nav 轴推导（y-down 世界系）、局�
 运行：$DATA_ROOT/uav_rgb/3dgs-venv/bin/python -m unittest tools.test_scene_import_wanderland
 """
 import importlib
+import hashlib
+import json
 import os
+from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 import numpy as np
 
@@ -93,16 +97,14 @@ class TestAlign(unittest.TestCase):
 
 class TestTorchCacheDir(unittest.TestCase):
     def test_shared_rule_raises_without_gpu(self):
-        """规则只在 pipeline_common.torch_extensions_dir（与 demo_3dgs_routes 同一写法）；问不到算力就报错，env() 要把目录写进子进程环境。"""
         from unittest import mock
-        pc = imp.pc
-        self.assertEqual(imp.torch_extensions_dir((7, 5)), pc.torch_extensions_dir((7, 5)))
+        self.assertTrue(imp.torch_extensions_dir((7, 5)).endswith("extensions-sm75"))
         calls = []
-        with mock.patch.object(pc, "torch_extensions_dir",
+        with mock.patch.object(imp, "_probe_torch_extensions_dir",
                                lambda capability=None, python=None: calls.append((capability, python)) or "/spy/extensions-sm75"):
             self.assertEqual(imp.torch_extensions_dir(), "/spy/extensions-sm75")
         self.assertEqual(calls, [(None, imp.PY)])
-        with mock.patch.object(pc, "torch_extensions_dir", lambda capability=None, python=None: None):
+        with mock.patch.object(imp, "_probe_torch_extensions_dir", lambda capability=None, python=None: None):
             with self.assertRaises(RuntimeError):
                 imp.torch_extensions_dir()
 
@@ -169,6 +171,51 @@ class TestEpisodesImport(unittest.TestCase):
         self.assertEqual(len(eps), 1)
         self.assertIn("red lamppost", eps[0]["text"])
         self.assertEqual(imp.RENDER["eps2d"], 0.08)
+
+
+class TestSmoke(unittest.TestCase):
+    def test_second_route_uses_episode_waypoint_and_checks_scene_identity(self):
+        routes = [
+            {"name": "first", "spawn": {"x": 0.0, "y": 0.0, "z": 2.0}, "waypoint": {"x": 5.0, "y": 0.0}, "max_steps": 10},
+            {"name": "second", "spawn": {"x": 0.0, "y": 0.0, "z": 2.0}, "waypoint": {"x": 20.0, "y": 0.0}, "max_steps": 10},
+        ]
+        scene = {"name": "wanderland_test", "waypoint": routes[0]["waypoint"], "routes": routes,
+                 "reach_radius_m": 2.0, "step_s": 0.5}
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            scene_path = root / "scene.json"
+            scene_path.write_text(json.dumps(scene), encoding="utf-8")
+            ply_path = root / "scene.ply"
+            ply_path.write_bytes(b"scene")
+            scene["ply_path"] = str(ply_path)
+            for i, route in enumerate(routes):
+                episode_dir = root / "smoke" / f"route_{i}" / "ep_00000"
+                episode_dir.mkdir(parents=True)
+                (episode_dir.parent / "run.json").write_text("{}", encoding="utf-8")
+                manifest = {"route": {"index": i}, "seed": i, "waypoint": route["waypoint"],
+                            "requested_steps": route["max_steps"], "hold_s": 0.5,
+                            "scene": {"name": scene["name"], "ply_sha256": hashlib.sha256(b"scene").hexdigest(),
+                                      "waypoint": route["waypoint"]},
+                            "frame_quality": {"n_low": 3}}
+                (episode_dir / "episode_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+                action = {"pose_before": {"x": 0.0, "y": 0.0, "z": 2.0}, "clearance_m": 0.5, "collision": False}
+                (episode_dir / "actions.jsonl").write_text(json.dumps(action), encoding="utf-8")
+                (episode_dir / "oracle.jsonl").write_text(json.dumps({"pose_gt": route["waypoint"]}), encoding="utf-8")
+            scene_mod = importlib.import_module("sim.3dgs.scene")
+            with mock.patch.object(scene_mod, "load_scene", return_value=scene), \
+                 mock.patch.multiple(imp, SCENE_JSON=scene_path, OUT=root):
+                imp.step_smoke()
+                report = json.loads((root / "smoke_report.json").read_text(encoding="utf-8"))
+                self.assertTrue(report["first"][0]["reached"])
+                self.assertTrue(report["second"][0]["reached"])
+                self.assertEqual(report["second"][0]["min_clearance_m"], 0.5)
+                self.assertEqual(report["second"][0]["n_low_quality"], 3)
+                manifest_path = root / "smoke" / "route_1" / "ep_00000" / "episode_manifest.json"
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                manifest.pop("waypoint")
+                manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "场景资产不符"):
+                    imp._smoke_episode(manifest_path.parent, 1, routes[1], scene, 2.0)
 
 
 if __name__ == "__main__":

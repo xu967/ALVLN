@@ -21,6 +21,7 @@ SAGE VLN JSON 的结构（本脚本用到的字段）：
 """
 import gzip  # noqa: F401  (保持与 nurec_to_ply 同款依赖声明，下载/转换在子进程里做)
 import importlib
+from itertools import groupby
 import json
 import math
 import os
@@ -498,43 +499,76 @@ def evaluate_route(planner, cand, z, terrain_occ=None):
     return {"ok": ok, "reasons": reasons, "chk": chk, "spawn": spawn, "waypoint": waypoint, "name": name}
 
 
-def chain_multi_stage_routes(routes, planner=None, target_len=(30.0, 55.0),
+def _xy(pose):
+    return float(pose["x"]), float(pose["y"])
+
+
+def _polyline(start, points, goal):
+    return [p for p, _ in groupby([start, *(tuple(p[:2]) for p in points), goal])]
+
+
+def _path_length(points):
+    return sum(math.dist(a, b) for a, b in zip(points, points[1:]))
+
+
+def _path_is_free(planner, points, height):
+    return (all(planner.line_free(planner.hard, a, b) for a, b in zip(points, points[1:]))
+            and not planner.occ.sweep_path([(x, y, height) for x, y in points])[0])
+
+
+def _stage_connection(planner, source, destination, reference, join_radius_m):
+    start, goal = _xy(source["waypoint"]), _xy(destination["spawn"])
+    gap = math.dist(start, goal)
+    height = float(source["waypoint"]["z"])
+    if gap > join_radius_m or height != float(destination["spawn"]["z"]):
+        return None
+    if gap == 0.0:
+        return [start], 0
+    a, b = reference[-2:]
+    yaw_deg = math.degrees(math.atan2(b[1] - a[1], b[0] - a[0]))
+    check = planner_mod.route_check(planner, dict(source["waypoint"], yaw_deg=yaw_deg),
+                                    destination["spawn"], margin_m=ROUTE_CLEAR_MARGIN_M)
+    if not check["feasible"] or not check["clear_ok"]:
+        return None
+    path = _polyline(start, check["path"], goal)
+    if not _path_is_free(planner, path, height):
+        return None
+    return path, check["steps_estimate"]
+
+
+def chain_multi_stage_routes(routes, planner, target_len=(30.0, 55.0),
                              stages=(2, 4), join_radius_m=2.5, max_per_scene=24):
     """在同 split 内将单段合格航线首尾串联成 2~4 段跨房间长程多阶段任务（严禁跨 split 拼接防泄漏）。"""
     min_len, max_len = float(target_len[0]), float(target_len[1])
     min_st, max_st = int(stages[0]), int(stages[1])
     by_split = {}
     for idx, r in enumerate(routes):
-        sp_tag = (r.get("sage") or {}).get("split") or "train"
-        by_split.setdefault(sp_tag, []).append((idx, r))
+        reference = _polyline(_xy(r["spawn"]), r.get("ref_path") or [], _xy(r["waypoint"]))
+        height = float(r["spawn"]["z"])
+        if len(reference) < 2 or height != float(r["waypoint"]["z"]) or not _path_is_free(planner, reference, height):
+            continue
+        sage = r.get("sage") or {}
+        instruction = (sage.get("instructions") or [{}])[0]
+        if not str(instruction.get("text") or "").strip():
+            continue
+        by_split.setdefault(sage.get("split") or "train", []).append(
+            (idx, r, instruction, reference, _path_length(reference)))
 
     chained = []
     for sp_tag, items in sorted(by_split.items()):
         adj = {i: [] for i in range(len(items))}
-        for i, (_, ra) in enumerate(items):
-            wpa = ra["waypoint"]
-            end_obj = ((ra.get("sage") or {}).get("instructions") or [{}])[0].get("end")
-            for j, (_, rb) in enumerate(items):
-                if i == j:
+        for i, (_, source, ins, reference, _) in enumerate(items):
+            for j, (_, destination, next_ins, _, _) in enumerate(items):
+                if i == j or (ins.get("end") and ins["end"] == next_ins.get("end")):
                     continue
-                spb = rb["spawn"]
-                next_end = ((rb.get("sage") or {}).get("instructions") or [{}])[0].get("end")
-                if end_obj and next_end and end_obj == next_end:
+                connection = _stage_connection(planner, source, destination, reference, join_radius_m)
+                if connection is None:
                     continue
-                gap = math.hypot(float(wpa["x"]) - float(spb["x"]), float(wpa["y"]) - float(spb["y"]))
-                if gap > float(join_radius_m):
-                    continue
-                trans_m = gap
-                if planner is not None and gap > 0.05:
-                    p = planner.plan((float(wpa["x"]), float(wpa["y"])), (float(spb["x"]), float(spb["y"])))
-                    if p is None:
-                        continue
-                    trans_m = sum(math.hypot(b[0] - a[0], b[1] - a[1]) for a, b in zip(p, p[1:]))
-                adj[i].append((trans_m, j))
-        for i in adj:
-            adj[i].sort()
+                path, steps = connection
+                adj[i].append((_path_length(path), j, path, steps))
+            adj[i].sort(key=lambda row: (row[0], row[1]))
 
-        def dfs(chain, used_goals, total_m):
+        def dfs(chain, bridges, used_goals, total_m):
             if len(chained) >= max_per_scene:
                 return
             if len(chain) >= min_st and min_len <= total_m <= max_len:
@@ -543,16 +577,14 @@ def chain_multi_stage_routes(routes, planner=None, target_len=(30.0, 55.0),
                 full_ref = []
                 total_steps = 0
                 for step_k, idx_local in enumerate(chain):
-                    orig_idx, r = items[idx_local]
-                    ins_list = (r.get("sage") or {}).get("instructions") or [{"text": r["name"], "end": f"goal_{orig_idx}"}]
-                    ins0 = ins_list[0]
+                    orig_idx, r, ins0, ref, length = items[idx_local]
                     prefix = "First, " if step_k == 0 else ("Finally, " if step_k + 1 == len(chain) else "Then, ")
                     texts.append(prefix + str(ins0.get("text") or "").strip())
-                    r_ref = r.get("ref_path") or [[r["spawn"]["x"], r["spawn"]["y"]], [r["waypoint"]["x"], r["waypoint"]["y"]]]
                     if full_ref:
-                        full_ref.extend(r_ref[1:])
-                    else:
-                        full_ref.extend(r_ref)
+                        bridge, bridge_steps = bridges[step_k - 1]
+                        full_ref.extend(bridge[1:])
+                        total_steps += bridge_steps
+                    full_ref.extend(ref[1:] if full_ref else ref)
                     total_steps += int(r.get("max_steps") or 60)
                     st_list.append({
                         "stage": step_k,
@@ -562,11 +594,12 @@ def chain_multi_stage_routes(routes, planner=None, target_len=(30.0, 55.0),
                         "reach_radius_m": REACH_RADIUS_M,
                         "goal_object": ins0.get("end"),
                         "instruction": ins0.get("text"),
-                        "path_m": float((r.get("sage") or {}).get("astar_path_m") or 0.0),
+                        "path_m": length,
                     })
                 r0 = items[chain[0]][1]
                 r_last = items[chain[-1]][1]
                 chained.append({
+                    "route_contract": "sage.multi_stage.v2",
                     "name": f"lh_{SPLIT_SHORT.get(sp_tag, 'xx')}_{len(chained):02d}_{int(round(total_m))}m",
                     "split": sp_tag,
                     "n_stages": len(st_list),
@@ -575,27 +608,26 @@ def chain_multi_stage_routes(routes, planner=None, target_len=(30.0, 55.0),
                     "waypoint": dict(r_last["waypoint"]),
                     "max_steps": total_steps,
                     "instruction": " ".join(texts),
-                    "ref_path": full_ref,
+                    "ref_path": [list(p) for p in full_ref],
                     "stages": st_list,
                 })
                 return
             if len(chain) >= max_st or total_m > max_len:
                 return
             last = chain[-1]
-            for trans_m, nxt in adj[last]:
+            for trans_m, nxt, path, steps in adj[last]:
                 if nxt in chain:
                     continue
-                rn = items[nxt][1]
-                g_obj = ((rn.get("sage") or {}).get("instructions") or [{}])[0].get("end")
+                _, _, ins, _, seg_m = items[nxt]
+                g_obj = ins.get("end")
                 if g_obj and g_obj in used_goals:
                     continue
-                seg_m = float((rn.get("sage") or {}).get("astar_path_m") or 0.0)
-                dfs(chain + [nxt], used_goals | ({g_obj} if g_obj else set()), total_m + trans_m + seg_m)
+                dfs(chain + [nxt], bridges + [(path, steps)], used_goals | ({g_obj} if g_obj else set()),
+                    total_m + trans_m + seg_m)
 
-        for start_i, (_, r0) in enumerate(items):
-            g0 = ((r0.get("sage") or {}).get("instructions") or [{}])[0].get("end")
-            m0 = float((r0.get("sage") or {}).get("astar_path_m") or 0.0)
-            dfs([start_i], {g0} if g0 else set(), m0)
+        for start_i, (_, _, ins, _, length) in enumerate(items):
+            g0 = ins.get("end")
+            dfs([start_i], [], {g0} if g0 else set(), length)
     return chained
 
 

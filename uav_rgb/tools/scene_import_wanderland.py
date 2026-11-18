@@ -16,6 +16,7 @@
   （MetaCam LIV-SLAM 米制稠密 LiDAR 点云）、scene.usdz（由点云体素化 + marching cubes 的碰撞网格，Isaac Sim）、
   COLMAP sparse、transforms.json、episodes.json。几何与 3DGS 同一坐标系（米制）。
 """
+import importlib
 import json
 import math
 import os
@@ -76,13 +77,26 @@ ROUTES = [
 ]
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "tools"))
-import pipeline_common as pc  # noqa: E402
+
+
+def _probe_torch_extensions_dir(capability=None, python=None):
+    """按本机 GPU 算力生成 gsplat JIT 缓存目录名，避免跨卡混用 cubin。"""
+    if capability is None:
+        py = python or PY
+        try:
+            out = subprocess.check_output(
+                [py, "-c", "import torch; c=torch.cuda.get_device_capability(); print(f'{c[0]}.{c[1]}')"],
+                text=True, stderr=subprocess.DEVNULL, timeout=15,
+            ).strip()
+            maj, minr = (int(x) for x in out.split(".", 1))
+            capability = (maj, minr)
+        except Exception:
+            return None
+    return os.path.join(DATA_ROOT, "uav_rgb", "torch-cache", f"extensions-sm{capability[0]}{capability[1]}")
 
 
 def torch_extensions_dir(capability=None):
-    """gsplat JIT 缓存目录（pipeline_common.torch_extensions_dir，与 tools/demo_3dgs_routes.py 同一写法），算力缺省用 PY 问 torch；
-    问不到就报错：env() 要把目录写进子进程环境。AUDIT_SIM #5：以前写死 extensions-sm89-20261106，换卡后目录名与 cubin 对不上。"""
-    ext_dir = pc.torch_extensions_dir(capability, PY)
+    ext_dir = _probe_torch_extensions_dir(capability, PY)
     if ext_dir is None:
         raise RuntimeError(f"问不到 GPU 算力（{PY} 里 torch.cuda.get_device_capability() 失败或超时），gsplat 缓存目录没法按卡命名")
     return ext_dir
@@ -741,11 +755,57 @@ def step_probe():
 
 
 # ---------------------------------------------------------------- 6 教师冒烟 + 7 三视角视频
+def _smoke_episode(episode_dir, route_index, route, scene, reach_radius):
+    collector = importlib.import_module("sim.3dgs.collect_3dgs")
+    manifest_path = os.path.join(episode_dir, "episode_manifest.json")
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+    episode_route = manifest.get("route") or {}
+    episode_scene = manifest.get("scene") or {}
+    waypoint = manifest.get("waypoint") or {}
+    if (not isinstance(episode_route, dict)
+            or not isinstance(episode_scene, dict)
+            or not isinstance(waypoint, dict)
+            or episode_route.get("index") != route_index
+            or episode_scene.get("name") != scene.get("name")
+            or episode_scene.get("ply_sha256") != scene.get("_smoke_ply_sha256")
+            or any(axis not in waypoint
+                   or abs(float(waypoint[axis]) - float(route["waypoint"][axis])) > 1e-6
+                   for axis in ("x", "y"))
+            or manifest.get("requested_steps") != int(route["max_steps"])
+            or manifest.get("hold_s") != float(scene["step_s"])):
+        raise ValueError(f"{manifest_path} 与当前路线或场景资产不符，请使用新的 --out")
+    actions = collector._read_jsonl(os.path.join(episode_dir, "actions.jsonl"))
+    oracle = collector._read_jsonl(os.path.join(episode_dir, "oracle.jsonl"))
+    if len(actions) != len(oracle):
+        raise ValueError(f"{episode_dir} 动作与位姿条数不符")
+    if actions:
+        actual_start = actions[0]["pose_before"]
+        spawn = route["spawn"]
+        start_error = math.dist((actual_start["x"], actual_start["y"], actual_start["z"]),
+                                (spawn["x"], spawn["y"], spawn["z"]))
+        if start_error > 0.05:
+            raise ValueError(f"{episode_dir} 起点与当前路线偏差 {start_error:.3f} m")
+    positions = [actions[0]["pose_before"], *(row["pose_gt"] for row in oracle)] if actions else []
+    closest = min((math.hypot(p["x"] - waypoint["x"], p["y"] - waypoint["y"]) for p in positions),
+                  default=math.inf)
+    clearance = min((row["clearance_m"] for row in actions), default=None)
+    return {
+        "seed": manifest.get("seed"), "steps": len(oracle), "reached": closest <= reach_radius,
+        "collision": bool(manifest.get("stopped_on_collision") or any(row["collision"] for row in actions)),
+        "min_clearance_m": round(clearance, 3) if clearance is not None else None,
+        "n_low_quality": (manifest.get("frame_quality") or {}).get("n_low"),
+        "anomaly": manifest.get("dynamics_anomaly"),
+    }
+
+
 def step_smoke():
     """collect_3dgs --policy astar --dynamics cf_sitl，每路线 SMOKE_EPISODES 集，代理碰撞即停；写 smoke_report.json。"""
-    import importlib
     scene_mod = importlib.import_module("sim.3dgs.scene")
+    collector = importlib.import_module("sim.3dgs.collect_3dgs")
     scene = scene_mod.load_scene(SCENE_JSON)
+    scene["_smoke_ply_sha256"] = collector._sha256(scene["ply_path"])
+    reach_radius = float(scene.get("reach_radius_m", 2.0))
     report = {}
     for i, r in enumerate(scene["routes"]):
         out = os.path.join(OUT, "smoke", f"route_{i}")
@@ -759,10 +819,9 @@ def step_smoke():
                  "--episodes", str(SMOKE_EPISODES), "--policy", "astar", "--dynamics", "cf_sitl",
                  "--hold", str(HOLD_S), "--seed", str(SEED0 + 100 * i), "--stop-on-collision"],
                 f"smoke route {i} {r['name']}")
-        demo = importlib.import_module("demo_3dgs_routes")          # 复用 Callinstrasse demo 的单集摘要
-        rows = [demo.episode_row(os.path.join(out, ep), scene.get("reach_radius_m", 2.0))
-                for ep in sorted(d for d in os.listdir(out) if d.startswith("ep_"))
-                if os.path.isfile(os.path.join(out, ep, "episode_manifest.json"))]
+        rows = [_smoke_episode(os.path.join(out, ep), i, r, scene, reach_radius)
+                for ep in sorted(os.listdir(out))
+                if ep.startswith("ep_") and os.path.isfile(os.path.join(out, ep, "episode_manifest.json"))]
         report[r["name"]] = rows
         log(f"smoke: route {i} {r['name']}: " + "; ".join(
             f"seed {x['seed']} steps={x['steps']} reached={x['reached']} collision={x['collision']} "
