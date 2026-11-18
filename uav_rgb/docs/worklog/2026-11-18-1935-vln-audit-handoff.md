@@ -159,7 +159,7 @@
 ### 做了什么
 
 - 按功能拆成四个源仓提交：`1e2c6d0` 自由指令 3DGS 演示，`bc83430` 连通长航线校验，`619bc88` OpenFly RGB/OSR 本地评测修正，`48f3b1d` 学生模型视觉导航条件与 checkpoint 架构版本。
-- 通过 `tools/git_mirror_alvln.sh` 将四个提交逐个镜像并推送到 `xu967/ALVLN` 的 `main`。镜像标记为 `48f3b1d1ad32647afca4751498d59ecf21de8589`，远端 `main` 为 `5759c6d127ae0269ebbc080a4c78f27ce3abebe9`，已通过 `git ls-remote` 核验。
+- 通过 `tools/git_mirror_alvln.sh` 将四个功能提交逐个镜像并推送到 `xu967/ALVLN` 的 `main`，交接文档提交也已同步。收尾核验时，源仓 HEAD 与 ALVLN 的 `.mirror_src_commit` 一致，ALVLN 本地 `main` 与 GitHub `origin/main` 一致。
 - 收尾复跑 Python 编译检查、C++ `test_checkpoint_versions` 和 `git diff --check`，均通过。上文列出的定向 Python 测试结果仍是本轮测试记录。
 - 开工前工作树快照保存在 `/root/rivermind-data/uav_rgb/archive/vln-implementation-input-20261118/`，用于追溯未纳入本轮提交的已有改动。
 
