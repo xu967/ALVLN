@@ -22,6 +22,10 @@ from train_openfly_subset import (
 LEGACY_PROTOCOL = "openfly_eval_pose_step_v1"
 PROTOCOL = "openfly_eval_pose_step_v2"
 KINEMATIC_PROTOCOL = "openfly_eval_kinematic_step_v3"
+METRIC_PROTOCOL = "uavrgb.openfly_local_metrics.v2"
+SUCCESS_RADIUS_M = 20.0
+INITIAL_RGB_RETRIES = 5
+PROTOCOL_ERRORS = ("pose_application_error", "stale_rgb_timestamp", "black_rgb")
 ALLOWED_EVAL_ENVS = (
     "env_airsim_16", "env_airsim_18", "env_airsim_23",
     "env_airsim_26", "env_airsim_gz", "env_airsim_sh",
@@ -30,22 +34,31 @@ ACTIONS = ("STOP", "FORWARD_3M", "LEFT_30DEG", "RIGHT_30DEG", "UP_3M",
            "DOWN_3M", "LEFT_3M", "RIGHT_3M", "FORWARD_6M", "FORWARD_9M")
 
 
+# 10 个离散动作 -> 机体系增量 (forward_m, left_m, up_m, dyaw_deg)
+_ACTION_DELTAS = {
+    0: (0.0, 0.0, 0.0, 0.0),
+    1: (3.0, 0.0, 0.0, 0.0),
+    2: (0.0, 0.0, 0.0, 30.0),
+    3: (0.0, 0.0, 0.0, -30.0),
+    4: (0.0, 0.0, 3.0, 0.0),
+    5: (0.0, 0.0, -3.0, 0.0),
+    6: (0.0, 3.0, 0.0, 0.0),
+    7: (0.0, -3.0, 0.0, 0.0),
+    8: (6.0, 0.0, 0.0, 0.0),
+    9: (9.0, 0.0, 0.0, 0.0),
+}
+
+
 def next_pose(pose, action):
     """对应官方快照 train/eval.py::getPoseAfterMakeAction，yaw 为弧度。"""
-    require(type(action) is int and 0 <= action < 10, "非法动作，不能静默转换为 STOP")
+    require(type(action) is int and action in _ACTION_DELTAS, "非法动作，不能静默转换为 STOP")
     require(len(pose) == 4 and all(math.isfinite(v) for v in pose), "位姿非有限或维度错误")
     x, y, z, yaw = pose
-    if action in (1, 8, 9):
-        distance = {1: 3.0, 8: 6.0, 9: 9.0}[action]
-        x, y = x + distance * math.cos(yaw), y + distance * math.sin(yaw)
-    elif action in (2, 3):
-        yaw += math.radians(30 if action == 2 else -30)
-    elif action in (4, 5):
-        z += 3 if action == 4 else -3
-    elif action in (6, 7):
-        direction = 1 if action == 6 else -1
-        x, y = x - direction * 3 * math.sin(yaw), y + direction * 3 * math.cos(yaw)
-    return [x, y, z, (yaw + math.pi) % (2 * math.pi) - math.pi]
+    fwd, left, up, dyaw_deg = _ACTION_DELTAS[action]
+    c, s = math.cos(yaw), math.sin(yaw)
+    nx = x + fwd * c - left * s
+    ny = y + fwd * s + left * c
+    return [nx, ny, z + up, (yaw + math.radians(dyaw_deg) + math.pi) % (2 * math.pi) - math.pi]
 
 
 def distance(a, b):
@@ -183,7 +196,9 @@ class Policy:
 
     def reset(self, instruction):
         torch = self.torch
-        tokens, _, _ = encode_instruction_text(instruction, self.tokenizer, use_bert=self.use_bert)
+        tokens = [0] * 300
+        if instruction:
+            tokens, _, _ = encode_instruction_text(instruction, self.tokenizer, use_bert=self.use_bert)
         self.tokens = torch.as_tensor(tokens, device=self.device).view(1, -1)
         net = self.policy.net
         self.hidden = torch.zeros(1, net.num_recurrent_layers, net.state_encoder.hidden_size, device=self.device)
@@ -248,12 +263,19 @@ class Simulator:
             # physics 更新与 pawn 渲染分属两阶段；固定追加帧，不按反馈重发位姿。
             phases.append((self.client.simContinueForFrames, 2))
         for advance, duration in phases:
-            advance(duration)
-            deadline = time.monotonic() + 10
-            while not self.client.simIsPause():
-                require(time.monotonic() < deadline, "仿真 tick 超时")
-                time.sleep(0.01)
+            self._advance_tick(advance, duration)
         time.sleep(0.1)
+
+    def _advance_tick(self, advance, duration):
+        advance(duration)
+        deadline = time.monotonic() + 10
+        while not self.client.simIsPause():
+            require(time.monotonic() < deadline, "仿真 tick 超时")
+            time.sleep(0.01)
+
+    def refresh_initial_rgb(self):
+        """相机曝光需要新的仿真帧。保留当前位姿，不重发动作。"""
+        self._advance_tick(self.client.simContinueForFrames, 2)
 
     def observe(self):
         import numpy as np
@@ -293,7 +315,7 @@ class Recorder:
         self.font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 20)
         self.lines = ["Original instruction:", *textwrap.wrap(original, width=105)]
         if supplied != original:
-            self.lines += ["Policy receives swapped instruction:", *textwrap.wrap(supplied, width=105)]
+            self.lines += ["Policy instruction:", *textwrap.wrap(supplied or "[empty]", width=105)]
         self.height = 706 + 26 * len(self.lines)
         self.height += self.height % 2
 
@@ -348,6 +370,7 @@ class Recorder:
 def rollout(simulator, policy, recorder, trace, start, goal, instruction, cli):
     began, pose, travelled, steps, frame = time.monotonic(), list(start), 0.0, 0, 0
     reason, last_distance, error, video_error, previous_timestamp = None, None, None, None, None
+    closest_distance, initial_rgb_retries = None, 0
     try:
         require(len(pose) == 4 and all(math.isfinite(v) for v in pose), "起始位姿非有限或维度错误")
         require(len(goal) == 3 and all(math.isfinite(v) for v in goal), "评估终点非有限或维度错误")
@@ -357,19 +380,35 @@ def rollout(simulator, policy, recorder, trace, start, goal, instruction, cli):
             rgb, actual, collided, timestamp = simulator.observe()
             require(len(actual) == 4 and all(math.isfinite(v) for v in actual), "反馈位姿非有限或维度错误")
             last_distance = distance(actual, goal)
+            pose_error = distance(actual, pose)
+            yaw_error_deg = math.degrees(yaw_error(actual[3], pose[3]))
             action, logits, candidate = None, None, None
             if collided:
                 reason = "collision_reported"
-            elif distance(actual, pose) > 0.2 or yaw_error(actual[3], pose[3]) > math.radians(1):
+            elif pose_error > 0.2 or yaw_error_deg > 1.0:
                 reason = "pose_application_error"
+            elif not rgb.any():
+                protocol = getattr(simulator, "protocol", KINEMATIC_PROTOCOL)
+                retry_limit = 0 if protocol == LEGACY_PROTOCOL else INITIAL_RGB_RETRIES
+                if frame == 0 and initial_rgb_retries < retry_limit and time.monotonic() - began < cli.timeout:
+                    simulator.refresh_initial_rgb()
+                    if type(timestamp) is int and timestamp > 0:
+                        previous_timestamp = max(previous_timestamp or timestamp, timestamp)
+                    initial_rgb_retries += 1
+                    continue
+                reason = "black_rgb"
             elif type(timestamp) is not int or timestamp <= 0 or (
                     previous_timestamp is not None and timestamp <= previous_timestamp):
                 reason = "stale_rgb_timestamp"
-            elif time.monotonic() - began >= cli.timeout:
+
+            observation_valid = reason is None
+            if observation_valid:
+                closest_distance = last_distance if closest_distance is None else min(closest_distance, last_distance)
+            if observation_valid and time.monotonic() - began >= cli.timeout:
                 reason = "time_budget"
-            elif steps >= cli.max_steps:
+            if reason is None and steps >= cli.max_steps:
                 reason = "step_budget"
-            else:
+            if reason is None:
                 action, logits = policy.step(rgb)
                 candidate = next_pose(pose, action)
                 if time.monotonic() - began >= cli.timeout:
@@ -381,8 +420,8 @@ def rollout(simulator, policy, recorder, trace, start, goal, instruction, cli):
             row = {**policy.details, "frame": frame, "timestamp": timestamp if type(timestamp) is int else None,
                    "protocol": getattr(simulator, "protocol", KINEMATIC_PROTOCOL),
                    "pose": actual, "requested_pose": pose,
-                   "goal_distance_m": last_distance, "pose_error_m": distance(actual, pose),
-                   "yaw_error_deg": math.degrees(yaw_error(actual[3], pose[3])),
+                   "goal_distance_m": last_distance, "pose_error_m": pose_error,
+                   "yaw_error_deg": yaw_error_deg, "observation_valid": observation_valid,
                    "action": action, "action_log_probs": logits, "collision_reported": collided,
                    "language": cli.language, "termination": reason,
                    "rgb_sha256": hashlib.sha256(rgb.tobytes()).hexdigest(),
@@ -417,8 +456,10 @@ def rollout(simulator, policy, recorder, trace, start, goal, instruction, cli):
     return {**policy.details, "termination": reason, "error": error, "executed_actions": steps, "frames": frame,
             "video_error": video_error or getattr(recorder, "video_error", None),
             "commanded_distance_m": travelled, "final_goal_distance_m": last_distance,
-            "within_20m_diagnostic": last_distance < 20 if last_distance is not None else None,
-            "stopped_within_20m_diagnostic": reason in ("predicted_stop", "fixed_stop") and last_distance < 20,
+            "min_goal_distance_m": closest_distance, "initial_rgb_retries": initial_rgb_retries,
+            "within_20m_diagnostic": last_distance < SUCCESS_RADIUS_M if last_distance is not None else None,
+            "ever_within_20m_diagnostic": closest_distance is not None and closest_distance < SUCCESS_RADIUS_M,
+            "stopped_within_20m_diagnostic": reason in ("predicted_stop", "fixed_stop") and last_distance < SUCCESS_RADIUS_M,
             "elapsed_s": time.monotonic() - began}
 
 
@@ -523,7 +564,8 @@ def run(cli):
     episodes = evaluation["tasks"] if evaluation else [ep for ep in manifest["episodes"] if ep["split"] == "validation"]
     if getattr(cli, "scene", None):
         episodes = [ep for ep in episodes if ep["route_id"].split("/", 1)[0] == cli.scene]
-    require(episodes and (cli.language != "swap" or len(episodes) >= 2), "无有效验证路线或无法置换")
+    instructions = [ep["instruction"] for ep in episodes]
+    require(episodes and (cli.language != "swap" or len(set(instructions)) >= 2), "无有效验证路线或无法置换")
     wanted = {ep["route_id"] for ep in episodes}
     source = {}
     if not evaluation and manifest["schema"] != CAUSAL_SCHEMA:
@@ -535,6 +577,10 @@ def run(cli):
     protocol = cli.execution_protocol
     contract = {**policy.details, "protocol": protocol, "checkpoint_sha256": policy.checkpoint_sha256,
                 "training_contract": policy.contract, "evaluator_sha256": sha256(__file__),
+                "metric_protocol": METRIC_PROTOCOL,
+                "metrics": {"radius_m": SUCCESS_RADIUS_M,
+                            "estimated_local_osr": "closest valid observation over the episode",
+                            "invalid_observations": list(PROTOCOL_ERRORS) + ["collision_reported"]},
                 "manifest_sha256": sha256(cli.manifest), "annotation_sha256": manifest["annotation_sha256"],
                 "manifest_schema": manifest["schema"], "supervision": manifest.get("supervision"),
                 "action_schema": manifest_action_schema(manifest),
@@ -544,6 +590,11 @@ def run(cli):
                 "evaluation_start": "published pos[0]/yaw[0]" if evaluation else "training manifest observation pose",
                 "synchronization": {"pose_requests_per_action": 1, "sim_continue_for_time_argument_s": 0.02,
                     "render_frames": 0 if protocol == LEGACY_PROTOCOL else 2, "retries": 0,
+                    "initial_black_rgb_retries": INITIAL_RGB_RETRIES,
+                    "initial_black_rgb_retry_limit": 0 if protocol == LEGACY_PROTOCOL else INITIAL_RGB_RETRIES,
+                    "initial_black_rgb_sim_continue_for_time_s_per_retry": 0,
+                    "initial_black_rgb_render_frames_per_retry":
+                        0 if protocol == LEGACY_PROTOCOL else 2,
                     "state_reset": ("atomic pose + zero linear/angular velocity and acceleration"
                                     if protocol == KINEMATIC_PROTOCOL else "pose only; velocity retained")},
                 "execution_semantics": ("Kinematic reset per step; not physical flight or official OpenFly protocol"
@@ -553,7 +604,7 @@ def run(cli):
                 "timeout_semantics": "wall clock checked before inference and motion dispatch; STOP must be predicted before deadline; final recording does not revoke timely termination",
                 "camera": cli.camera, "vehicle": cli.vehicle, "port": cli.port,
                 "pose_feedback_gate": {"xyz_tolerance_m": 0.2, "yaw_tolerance_deg": 1,
-                                       "timestamp": "strictly increasing after each executed action"},
+                                       "timestamp": "strictly increasing after actions; initial black RGB may be retried"},
                 "renderer_capture": "AirSim compressed PNG decoded with PIL RGB; latest feedback only",
                 "limits": [("Official seen env18 subset only; safety gates differ from upstream; no full benchmark or leaderboard claim"
                             if evaluation else "Internal held-out routes from official train; no unseen-scene or official SR claim"),
@@ -579,7 +630,9 @@ def run(cli):
                 original = source[ep["route_id"]]
                 start = list(original["pos"][0][:3]) + [original["yaw"][0]]
                 goal = list(original["pos"][-1][:3])
-            supplied = episodes[(i + 1) % len(episodes)]["instruction"] if cli.language == "swap" else ep["instruction"]
+            supplied = "" if cli.language == "zero" else ep["instruction"]
+            if cli.language == "swap":
+                supplied = next(text for text in instructions[i + 1:] + instructions[:i] if text != supplied)
             recorder, recorder_error = None, None
             try:
                 recorder = Recorder(directory, ep["instruction"], supplied, cli.record_video)
@@ -602,9 +655,9 @@ def run(cli):
         except Exception as exc:
             cleanup_error = f"{type(exc).__name__}: {exc}"
     summary = {**policy.details, "protocol": protocol, "checkpoint_sha256": policy.checkpoint_sha256, "episodes": results,
+               "metric_protocol": METRIC_PROTOCOL, "n_requested": min(len(episodes), cli.limit),
                "errors": sum(r["error"] is not None for r in results),
-               "protocol_errors": sum(r["termination"] in ("pose_application_error", "stale_rgb_timestamp")
-                                      for r in results),
+               "protocol_errors": sum(r["termination"] in PROTOCOL_ERRORS for r in results),
                "video_errors": sum(r["video_error"] is not None for r in results),
                "cleanup_error": cleanup_error, "run_error": run_error,
                "note": "Closed-loop rendered feedback diagnosis; not physical flight or official benchmark"}

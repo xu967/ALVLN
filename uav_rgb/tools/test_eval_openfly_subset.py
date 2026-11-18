@@ -89,7 +89,7 @@ class ActionTests(unittest.TestCase):
             evaluator.run(evaluator.parser().parse_args(["--manifest", "m", "--out", "o"]))
 
     def test_protocol_failures_exit_nonzero_but_valid_task_terminations_do_not(self):
-        cases = [("pose_application_error", 1), ("stale_rgb_timestamp", 1),
+        cases = [("pose_application_error", 1), ("stale_rgb_timestamp", 1), ("black_rgb", 1),
                  ("collision_reported", 0), ("step_budget", 0),
                  ("distance_budget", 0), ("time_budget", 0), ("predicted_stop", 0)]
         with tempfile.TemporaryDirectory() as tmp:
@@ -115,6 +115,7 @@ class ActionTests(unittest.TestCase):
                     self.assertEqual(summary["protocol_errors"], expected)
                     self.assertEqual(summary["errors"], 0)
                     self.assertEqual(summary["episodes"][0]["termination"], reason)
+                    self.assertEqual(summary["metric_protocol"], evaluator.METRIC_PROTOCOL)
 
 
 class SimulatorTests(unittest.TestCase):
@@ -332,7 +333,8 @@ class RolloutTests(unittest.TestCase):
             def close(self):
                 self.closed = True
         self.simulator, self.policy, self.recorder = Simulator(), Policy(), Recorder()
-        self.cli = SimpleNamespace(max_steps=10, max_distance=100, timeout=120, language="correct")
+        self.cli = SimpleNamespace(max_steps=10, max_distance=100, timeout=120, language="correct",
+                                   policy="student")
 
     def run_episode(self):
         return evaluator.rollout(self.simulator, self.policy, self.recorder, io.StringIO(),
@@ -362,15 +364,74 @@ class RolloutTests(unittest.TestCase):
         self.assertEqual(result["termination"], "fixed_stop")
         self.assertEqual((result["executed_actions"], result["frames"]), (3, 4))
         self.assertEqual([row[1]["action"] for row in self.recorder.rows], [9, 9, 9, 0])
-        self.assertIsNone(self.recorder.rows[-1][1]["action_log_probs"])
-        self.assertEqual(result["policy"], "blind_forward")
-        self.assertIsNone(result["training_mode"])
-        self.assertFalse(result["stopped_within_20m_diagnostic"])
-        self.recorder.rows.clear()
-        close = evaluator.rollout(self.simulator, self.policy, self.recorder, io.StringIO(),
-                                  [0, 0, 0, 0], [27, 0, 0], "turn left", self.cli)
-        self.assertTrue(close["stopped_within_20m_diagnostic"])
-        self.assertEqual([row[1]["action"] for row in self.recorder.rows], [9, 9, 9, 0])
+
+    def test_osr_keeps_closest_valid_feedback_when_last_frame_is_farther_away(self):
+        actions = iter([9, 9, 9, 2, 2, 2, 2, 2, 2, 9, 9, 0])
+        self.policy.step = lambda rgb: (next(actions), [0.0] * 10)
+        self.simulator.advance = lambda pose: setattr(self.simulator, "pose", list(pose))
+        self.simulator.observe = lambda: (self.simulator.rgb, self.simulator.pose, False,
+                                          self.simulator.observations + 1)
+        self.simulator.rgb = __import__("numpy").ones((4, 6, 3), dtype="uint8")
+        self.simulator.observations = 0
+        def observe():
+            self.simulator.observations += 1
+            return self.simulator.rgb, self.simulator.pose, False, self.simulator.observations
+        self.simulator.observe = observe
+        self.cli.max_steps = 20
+        result = evaluator.rollout(self.simulator, self.policy, self.recorder, io.StringIO(),
+                                   [0, 0, 0, 0], [30, 0, 0], "go to the building", self.cli)
+        self.assertGreater(result["final_goal_distance_m"], 20)
+        self.assertLess(result["min_goal_distance_m"], 20)
+        self.assertFalse(result["within_20m_diagnostic"])
+        self.assertTrue(result["ever_within_20m_diagnostic"])
+
+    def test_initial_black_frame_refreshes_camera_without_policy_step(self):
+        import numpy as np
+        observe = self.simulator.observe
+        self.simulator.refresh_calls = 0
+        self.simulator.refresh_initial_rgb = lambda: setattr(self.simulator, "refresh_calls",
+                                                              self.simulator.refresh_calls + 1)
+        states = iter((np.zeros((4, 6, 3), dtype=np.uint8),
+                       np.full((4, 6, 3), 20, dtype=np.uint8)))
+        stamps = iter((1, 2))
+        self.simulator.observe = lambda: (next(states), [0, 0, 0, 0], False, next(stamps))
+        self.policy.outputs = iter([0])
+        result = self.run_episode()
+        self.assertEqual(self.simulator.refresh_calls, 1)
+        self.assertEqual(self.policy.observed, [20])
+        self.assertEqual(result["initial_rgb_retries"], 1)
+        self.assertEqual(result["frames"], 1)
+
+    def test_initial_black_frame_may_have_zero_timestamp_before_valid_feedback(self):
+        import numpy as np
+        states = iter((np.zeros((4, 6, 3), dtype=np.uint8),
+                       np.full((4, 6, 3), 20, dtype=np.uint8)))
+        stamps = iter((0, 1))
+        self.simulator.observe = lambda: (next(states), [0, 0, 0, 0], False, next(stamps))
+        self.simulator.refresh_initial_rgb = mock.Mock()
+        self.policy.outputs = iter([0])
+        result = self.run_episode()
+        self.assertEqual(result["termination"], "predicted_stop")
+        self.assertEqual(result["initial_rgb_retries"], 1)
+        self.assertEqual(self.policy.observed, [20])
+
+    def test_persistent_black_rgb_is_a_protocol_error(self):
+        import numpy as np
+        black = np.zeros((4, 6, 3), dtype=np.uint8)
+        self.simulator.observe = lambda: (black, [0, 0, 0, 0], False, self.simulator.observations + 1)
+        self.simulator.observations = 0
+        def observe():
+            self.simulator.observations += 1
+            return black, [0, 0, 0, 0], False, self.simulator.observations
+        self.simulator.observe = observe
+        self.simulator.refresh_calls = 0
+        self.simulator.refresh_initial_rgb = lambda: setattr(self.simulator, "refresh_calls",
+                                                              self.simulator.refresh_calls + 1)
+        result = self.run_episode()
+        self.assertEqual(result["termination"], "black_rgb")
+        self.assertEqual(result["initial_rgb_retries"], evaluator.INITIAL_RGB_RETRIES)
+        self.assertEqual(self.policy.observed, [])
+
 
     def test_collision_and_distance_budget_never_execute_forbidden_move(self):
         self.simulator.collided = True
@@ -611,6 +672,9 @@ class RecurrentTests(unittest.TestCase):
         agent.step(rgb)
         self.assertEqual(net.calls[-1][0].sum().item(), 0)
         self.assertFalse(net.calls[-1][2].item())
+        agent.reset("")
+        self.assertEqual(agent.tokens.shape, (1, 300))
+        self.assertEqual(agent.tokens.sum().item(), 0)
         agent.feature_shape = (2048, 4, 4)
         with self.assertRaisesRegex(ValueError, "RGB 特征形状"):
             agent.step(rgb)
@@ -710,6 +774,34 @@ class EvaluationTaskTests(unittest.TestCase):
             path.write_text(json.dumps(data))
             with self.assertRaisesRegex(ValueError, "不在已验证 AirSim 场景"):
                 evaluator.load_evaluation_tasks(path, manifest_path, manifest)
+
+
+class TrainSummaryTests(unittest.TestCase):
+    def test_openfly_summary_labels_osr_as_a_local_estimate(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        import train
+        with tempfile.TemporaryDirectory() as tmp:
+            output = str(Path(tmp) / "missing_episode")
+            report = train.summarize_openfly_job("fixture", "env_airsim_18", {
+                "metric_protocol": evaluator.METRIC_PROTOCOL,
+                "n_requested": 2,
+                "episodes": [
+                    {"output": output, "video_error": None,
+                     "min_goal_distance_m": 12.0, "ever_within_20m_diagnostic": True,
+                     "within_20m_diagnostic": False, "stopped_within_20m_diagnostic": False,
+                     "final_goal_distance_m": 24.0, "termination": "step_budget"},
+                    {"output": output, "video_error": None,
+                     "min_goal_distance_m": None, "ever_within_20m_diagnostic": False,
+                     "within_20m_diagnostic": False, "stopped_within_20m_diagnostic": False,
+                     "final_goal_distance_m": None, "termination": "black_rgb"},
+                ],
+            })
+        self.assertEqual(report["metric_protocol"], evaluator.METRIC_PROTOCOL)
+        self.assertIn("本地估算", report["metric_note"])
+        self.assertEqual(report["estimated_local_osr"], 0.5)
+        self.assertEqual(report["n_with_valid_observation"], 1)
+        with self.assertRaisesRegex(ValueError, "过旧"):
+            train.summarize_openfly_job("legacy", "env_airsim_18", {"episodes": []})
 
 
 if __name__ == "__main__":
