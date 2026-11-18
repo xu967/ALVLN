@@ -37,7 +37,7 @@ FOLLOW_UP_M = 0.3      #   §6.1 要求原生 640 宽跟随格里机体 ≥ 80 p
 #                          0.172 m 宽的机体在 1.5 m 处只有 63 px（brief 建议值不够），1.1 m 处 ≈ 90 px（后保护罩斜距 1.06 m）。
 #                          Callinstrasse 是行人高度拍的重建，机位高于约 2.6 m 就被天空壳/漂浮高斯糊住，所以只抬 0.3 m
 FOLLOW_YAW_TAU_S = 0.6  # 跟随机位偏航的一阶低通：原地转向（34°/s 起停）时镜头慢半拍跟上，背景不再一顿一顿地甩；
-#                          机位始终在机体正后方（按平滑后的偏航），机体仍在画面中心；只改 FOLLOW 格，机载格是真实姿态
+#                          机位始终在机体正后方（按平滑后的偏航），机体仍在画面中心；只改 FOLLOW 格。
 TOP_MARGIN_M = 3.0     # 顶视用占据代理 2D 地图（3DGS 从上往下渲染全是漂浮物，4–20 m 高都试过）：
 #                          地图窗口 = spawn–waypoint 包围盒各向外扩 3 m，到达半径 2 m 圈和两侧建筑都在图里
 HOLD_END_S = 1.5       # 结尾定格秒数（写 SUCCESS/COLLISION 大字），与 record_views.compose 默认一致，短片里结果停得住
@@ -47,7 +47,7 @@ KEYFRAMES = 4          # 关键帧 PNG：首、1/3、2/3、末（末 = 定格帧
 # 顶视地图配色：中灰底 + 深灰占据，白字黑边标签在上面读得出；轨迹黄与 Gazebo 顶视 trail 同色。
 MAP_BG, MAP_GRID, MAP_OCC = (150, 150, 150), (168, 168, 168), (55, 55, 55)
 MAP_TRAIL, MAP_GOAL, MAP_PRED_GOAL, MAP_SPAWN = (0, 255, 255), (0, 0, 220), (0, 140, 255), (0, 160, 0)
-TOP_LABEL = "TOP MAP [DIAGNOSTIC/ORACLE] occupancy proxy + path"
+TOP_LABEL = "TOP MAP [DIAGNOSTIC/ORACLE] XY occupancy projection"
 
 
 def compose_rgb_video(frames_dir, out_path, fps=10.0):
@@ -85,30 +85,45 @@ def compose_rgb_video(frames_dir, out_path, fps=10.0):
     return written
 
 
-def _banner(cv2, canvas, text, x, y, w, s=1, max_lines=4):
-    """指令横幅：贴在格子左上标签下面，半透明黑底白字，按格宽折行，超过 max_lines 行的部分不画。"""
-    font, scale, thick = cv2.FONT_HERSHEY_SIMPLEX, 0.5 * s, s
-    lines, cur = [], ""
-    for word in text.split():
-        trial = f"{cur} {word}" if cur else word
-        if cur and cv2.getTextSize(trial, font, scale, thick)[0][0] > w - 24 * s:
-            lines.append(cur)
-            cur = word
-        else:
-            cur = trial
-    all_lines = lines + ([cur] if cur else [])
-    if len(all_lines) > max_lines and max_lines >= 2:
-        # 长指令的目标地标和停止条件通常在末尾：保留首行与最后 max_lines-1 行，避免截丢终点描述。
-        tail = list(all_lines[-(max_lines - 1):])
-        tail[0] = "... " + tail[0][-max(8, len(tail[0]) - 4):]
-        lines = [all_lines[0]] + tail
+def _banner_mask(text, width, s, max_lines=5):
+    """指令每集栅格化一次，按像素宽度折行，支持没有空格的指令。"""
+    from PIL import Image, ImageDraw, ImageFont
+
+    font_path = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+    if os.path.isfile(font_path):
+        font = ImageFont.truetype(font_path, 16 * s, index=2)
     else:
-        lines = all_lines[:max_lines]
-    y0, h = y + 32 * s, (20 * len(lines) + 10) * s
-    roi = canvas[y0:y0 + h, x:x + w]
-    roi[:] = (roi * 0.35).astype(np.uint8)
-    for k, line in enumerate(lines):
-        cv2.putText(canvas, line, (x + 12 * s, y0 + (20 * k + 19) * s), font, scale, (255, 255, 255), thick, cv2.LINE_AA)
+        font = ImageFont.truetype("DejaVuSans.ttf", 16 * s)
+        if not text.isascii():
+            text = "[See episode_manifest.json for the original instruction]"
+    max_width = width - 24 * s
+    lines, cur = [], ""
+    for char in " ".join(text.split()):
+        if not cur or font.getlength(cur + char) <= max_width:
+            cur += char
+            continue
+        head, space, tail = cur.rpartition(" ")
+        lines.append(head if space else cur)
+        cur = (tail + char if space else char).lstrip()
+    lines.append(cur)
+    if len(lines) > max_lines:
+        # 保留末尾的目标条件；完整指令仍在 episode manifest。
+        head = max(1, max_lines // 2)
+        tail = max_lines - head - 1
+        lines = lines[:head] + ["[...]"] + (lines[-tail:] if tail else [])
+    image = Image.new("L", (width, (20 * len(lines) + 10) * s))
+    draw = ImageDraw.Draw(image)
+    for i, line in enumerate(lines):
+        draw.text((12 * s, (20 * i + 5) * s), line, font=font, fill=255, anchor="lt")
+    return np.asarray(image)[:, :, None]
+
+
+def _banner(cv2, canvas, text, x, y, w, s=1, max_lines=4):
+    """旧测试和调用方的兼容入口；内部用支持 Unicode 的位图字形。"""
+    banner = _banner_mask(text, w, s, max_lines)
+    y0 = y + 32 * s
+    roi = canvas[y0:y0 + len(banner), x:x + w]
+    roi[:] = np.maximum((roi * 0.35).astype(np.uint8), banner)
 
 
 def _draw_body(img, pos, quat, cam_view, fov_deg, n2w=None):
@@ -150,16 +165,20 @@ class _TopMap:
     拼在一起时轨迹读法相同；路线大多沿 +x，也正好用满 16:9 的宽。
     """
 
-    def __init__(self, scene, occ, extra_xy=(), s=1, pred_goal=None):
+    def __init__(self, scene, occ, extra_xy=(), s=1, pred_goal=None, goal_visible=True):
         """extra_xy：也要落在图里的点（整条轨迹）；多路线的 A* 绕行会跑出 spawn–waypoint 包围盒。
         pred_goal：grounder 预测的目标点（与真值 waypoint 不同时以橙色圈标出，防止错目标伪装成到达真目标）。
         s：画布倍数（high 档 2）：地图按 CW·s × CH·s 原生画，字号/线宽随之放大，不靠 paste 放大。"""
         import cv2
         font = cv2.FONT_HERSHEY_SIMPLEX
         self.s, self.w, self.h = s, vl.CW * s, vl.CH * s
-        sp, wp = scene["spawn"], scene["waypoint"]
-        pts = [(sp["x"], sp["y"]), (wp["x"], wp["y"])] + [(float(x), float(y)) for x, y in extra_xy]
+        sp, wp = scene["spawn"], scene.get("waypoint") or {}
+        pts = [(sp["x"], sp["y"])] + [(float(x), float(y)) for x, y in extra_xy]
+        goal_visible = goal_visible and "x" in wp and "y" in wp
+        if goal_visible:
+            pts.append((wp["x"], wp["y"]))
         show_pred = (isinstance(pred_goal, dict) and "x" in pred_goal and "y" in pred_goal
+                     and goal_visible
                      and math.hypot(float(pred_goal["x"]) - float(wp["x"]),
                                     float(pred_goal["y"]) - float(wp["y"])) > 1e-3)
         if show_pred:
@@ -189,11 +208,14 @@ class _TopMap:
             cv2.circle(self.base, self.px(pred_goal["x"], pred_goal["y"]),
                        int(round(reach / self.scale)), MAP_PRED_GOAL, 2 * s)
             cv2.circle(self.base, self.px(pred_goal["x"], pred_goal["y"]), 5 * s, MAP_PRED_GOAL, -1)
-        cv2.circle(self.base, self.px(wp["x"], wp["y"]), int(round(reach / self.scale)), MAP_GOAL, 2 * s)   # 到达半径
-        cv2.circle(self.base, self.px(wp["x"], wp["y"]), 5 * s, MAP_GOAL, -1)
+        if goal_visible:
+            cv2.circle(self.base, self.px(wp["x"], wp["y"]), int(round(reach / self.scale)), MAP_GOAL, 2 * s)
+            cv2.circle(self.base, self.px(wp["x"], wp["y"]), 5 * s, MAP_GOAL, -1)
         cv2.circle(self.base, self.px(sp["x"], sp["y"]), 5 * s, MAP_SPAWN, -1)                              # spawn
         # 图例放左上、TOP 标签（paste 写在 y=22）之下，与 Gazebo 顶视图例同位置（record_views.LEGEND_TOP）。
-        legend = [("trail", MAP_TRAIL), ("GT goal r=%gm" % reach, MAP_GOAL)]
+        legend = [("trail", MAP_TRAIL)]
+        if goal_visible:
+            legend.append(("GT goal r=%gm" % reach, MAP_GOAL))
         if show_pred:
             legend.append(("predicted goal", MAP_PRED_GOAL))
         legend += [("spawn", MAP_SPAWN), ("DIAGNOSTIC/ORACLE occupancy", MAP_OCC)]
@@ -237,20 +259,38 @@ def _video_trace(trace):
     return [trace[int(i)] for i in indices]
 
 
+def instruction_banner(vln):
+    """优先显示实际输入；空指令也是一次实验干预。"""
+    if not vln:
+        return ""
+    if "supplied_text" in vln:
+        supplied = vln["supplied_text"]
+        return f'"{supplied}"' if supplied else "[empty instruction]"
+    original = vln.get("text")
+    return f'"{original}"' if original else ""
+
+
+def _decision_rgb(cv2, ep_dir, action):
+    frame = action.get("frame")
+    if not isinstance(frame, str) or os.path.basename(frame) != frame or not action.get("rgb_ok", True):
+        return None
+    path = os.path.join(ep_dir, frame)
+    return cv2.imread(path) if os.path.isfile(path) else None
+
+
 def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_dir=None,
-                        title="", result="", quality=None, log=print, instruction="", pred_goal=None):
+                        title="", result="", quality=None, log=print, instruction="", pred_goal=None,
+                        goal_visible=True):
     """cf_sitl 采集集（trace.jsonl + actions.jsonl）-> 四格视频（.mp4 / .webm）+ 关键帧 PNG。
 
-    instruction：VLN 集的指令原文，不附加目标答案，非空时作为横幅贴在 FOLLOW 格顶部。
+    instruction：VLN 集实际收到的指令，非空时作为横幅贴在 FOLLOW 格顶部。
 
     左上 FOLLOW：同一 3DGS，只跟位置与偏航，机体后方 FOLLOW_BACK_M、上方 FOLLOW_UP_M，格子原生分辨率
-    渲染，叠 E1 机体着色投影；右上 TOP：占据代理 2D 地图 + 轨迹 + 机体图标（occ 是 collision.from_scene 的
-    结果，与碰撞判定同一份数据）；左下 ONBOARD：机体四元数 ⊗ camera_mount（roll/pitch 进画面），按 scene
-    相机分辨率（320×240）渲染后由 paste 放大，模型输入不变；右下：状态面板（title、路线/步数、时间、位置、
-    速度/姿态、当前动作、动作时间线，结尾定格 HOLD_END_S 写 result）。
+    渲染，叠 E1 机体着色投影；右上 TOP：占据代理的 XY 投影、轨迹和机体图标。
+    左下 ONBOARD：截取决策时保存的相机帧，在该动作窗口保持。旧档缺帧时按轨迹重渲染并标注。
+    右下：状态面板（路线/步数、位置、速度/姿态、模型建议、执行动作、动作时间线和结局）。
     quality：view_layout.VIDEO_QUALITY 档名（None = 默认 / 环境变量）：high 档画布 2560×1440，FOLLOW / TOP 按
-    2× 原生渲染，ONBOARD 为显示另渲一张 2× 帧（标题注明 display 2x），3DGS 超采样取档位的 ssaa，.mp4 走
-    ffmpeg libx264 CRF。
+    2× 原生渲染，ONBOARD 仍从原始相机帧放大，3DGS 超采样取档位的 ssaa。
     按 trace 时间重采样 10 Hz，播放时长误差小于一帧；决策仍只在窗口起点。关键帧 PNG 名字跟 out_path 的主干走
     （views.mp4 -> views_key_00.png，views_v2.mp4 -> views_v2_key_00.png），重合成不盖旧图。
     返回 {"video", "frames", "fps", "keyframes", "quality", "backend", "body_px"}（body_px：FOLLOW 格里机体
@@ -266,6 +306,16 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
     frames = _video_trace(trace)
     actions = _read_jsonl(os.path.join(ep_dir, "actions.jsonl"))
     steps = {a["step"]: a for a in actions}
+    grounding_steps = {a["step"]: a for a in _read_jsonl(os.path.join(ep_dir, "grounding_trace.jsonl"))}
+    manifest_path = os.path.join(ep_dir, "episode_manifest.json")
+    manifest = {}
+    if os.path.isfile(manifest_path):
+        with open(manifest_path, encoding="utf-8") as f:
+            manifest = json.load(f)
+    vln = manifest.get("vln") or scene.get("vln")
+    instruction = instruction_banner(vln) if vln else instruction
+    banner = _banner_mask(instruction, CW, s, max_lines=4) if instruction else None
+    blind_rgb = bool((vln or {}).get("blind_rgb"))
     n2w = scene.get("_nav_to_world")
     out_path = out_path or os.path.join(ep_dir, "views.mp4")
     png_dir = png_dir or ep_dir
@@ -276,12 +326,15 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
     if not writer.isOpened():
         raise RuntimeError(f"无法创建 {out_path}（{writer.backend}）")
     seq = frames + [frames[-1]] * int(HOLD_END_S * VIEW_FPS)        # 末尾定格：画面不变，只多 result 字
+    terminal_reason = manifest.get("terminal_reason")
+    hold_result = f"{result} | {terminal_reason}" if result and terminal_reason else (result or terminal_reason or "")
     key_idx = sorted({int(round(k * (len(seq) - 1) / max(1, KEYFRAMES - 1))) for k in range(KEYFRAMES)})
     keyframes, body_px = [], []
     pitch_follow = -math.degrees(math.atan2(FOLLOW_UP_M, FOLLOW_BACK_M))
     if pred_goal is None:
-        pred_goal = ((scene.get("vln") or {}).get("grounding") or {}).get("policy_goal")
-    topmap, path_xy = _TopMap(scene, occ, extra_xy=[row["pos"][:2] for row in trace], s=s, pred_goal=pred_goal), []
+        pred_goal = ((vln or {}).get("grounding") or {}).get("policy_goal")
+    topmap, path_xy = _TopMap(scene, occ, extra_xy=[row["pos"][:2] for row in trace], s=s,
+                              pred_goal=pred_goal, goal_visible=goal_visible), []
     route = scene.get("route") or {}
     route_tag = f"route {route['index']} {route['name']}  " if route else ""
     t0, t_end = float(trace[0]["t"]), float(trace[-1]["t"])
@@ -298,6 +351,8 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
     hit = next((a for a in actions if a.get("collision")), None)
     follow_label = "FOLLOW back %.1fm up %.1fm (E1 body %.2fm)" % (FOLLOW_BACK_M, FOLLOW_UP_M, e1_body.WIDTH_M)
     cells = None
+    last_rgb_step, decision_rgb = None, None
+    latest_grounding = {}
     cam_yaw, alpha = None, 1.0 - math.exp(-1.0 / (VIEW_FPS * FOLLOW_YAW_TAU_S))
     try:
         for i, row in enumerate(seq):
@@ -306,11 +361,18 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
             yaw = math.atan2(2 * (w_ * qz + qx * qy), 1 - 2 * (qy * qy + qz * qz))
             roll = math.degrees(math.atan2(2 * (w_ * qx + qy * qz), 1 - 2 * (qx * qx + qy * qy)))
             pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2 * (w_ * qy - qz * qx)))))
+            t, step = float(row["t"]), int(row["step"])
+            step_row = steps.get(step, {})
+            note = f"sim {t:.2f}s"
             if i < len(frames):
                 path_xy.append((x, y))
-                # 机载：模型输入是 renderer.width×height（320×240）；high 档为显示另渲 s 倍帧，标题注明 display 2x
-                onboard = _render(renderer, renderer.width * s, renderer.height * s, ssaa=ssaa,
-                                  view=scene_mod.viewmat_from_quat((x, y, z), row["quat"], mount, n2w))
+                if last_rgb_step != step:
+                    decision_rgb = _decision_rgb(cv2, ep_dir, step_row)
+                    last_rgb_step = step
+                onboard = decision_rgb
+                if onboard is None:
+                    onboard = _render(renderer, renderer.width * s, renderer.height * s, ssaa=ssaa,
+                                      view=scene_mod.viewmat_from_quat((x, y, z), row["quat"], mount, n2w))
                 if cam_yaw is None:
                     cam_yaw = yaw
                 d = yaw - cam_yaw
@@ -325,36 +387,56 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
                     body_px.append((box[2] - box[0]) / s)      # 折算到原生 640 宽
                 cells = (onboard, follow, topmap.draw(path_xy, yaw))
             onboard, follow, top = cells
-            t = float(row["t"])
-            note = f"sim {t:.2f}s"                 # 每帧按 trace 时刻现渲，没有 Gazebo 那种帧龄
+            label = "ONBOARD | RE-RENDERED"
+            onboard_note = note
+            if decision_rgb is not None:
+                h, w = decision_rgb.shape[:2]
+                label = f"ONBOARD | CAPTURED RGB {w}x{h} HFOV {renderer.fov_deg:.0f}deg"
+                rgb_ts = step_row.get("rgb_ts")
+                onboard_note = f"decision RGB {rgb_ts / 1e9:.2f}s" if rgb_ts is not None else "decision RGB"
+            if blind_rgb:
+                onboard_note += " | student RGB blanked"
             canvas = np.zeros((H, W, 3), np.uint8)
             vl.paste(cv2, canvas, follow, *tl, CW, CH, follow_label, note, s=s)
-            if instruction:
-                _banner(cv2, canvas, instruction, *tl, CW, s=s)
+            if banner is not None:
+                y0 = tl[1] + 32 * s
+                roi = canvas[y0:y0 + len(banner), tl[0]:tl[0] + CW]
+                roi[:] = np.maximum((roi * 0.35).astype(np.uint8), banner)
             vl.paste(cv2, canvas, top, *tr, CW, CH, TOP_LABEL, note, s=s)
-            vl.paste(cv2, canvas, onboard, *bl, CW, CH,
-                     vl.onboard_label(onboard, renderer.fov_deg, display=s, rendered_at=s), note, s=s)
-            step = int(row["step"])
-            step_row = steps.get(step, {})
+            vl.paste(cv2, canvas, onboard, *bl, CW, CH, label, onboard_note, s=s)
             act = step_row.get("action_executed", row.get("action"))
             speed = math.sqrt(sum(float(v) ** 2 for v in row["vel"]))
             wp = scene.get("waypoint") or {}
             goal_tag = ""
-            if "x" in wp and "y" in wp:
+            if goal_visible and "x" in wp and "y" in wp:
                 gd = math.hypot(float(wp["x"]) - x, float(wp["y"]) - y)
                 gbrg = (math.degrees(math.atan2(float(wp["y"]) - y, float(wp["x"]) - x) - yaw) + 180.0) % 360.0 - 180.0
-                goal_tag = f"  goal {gd:4.2f}m {gbrg:+4.0f}deg"
+                goal_tag = f"  GT goal {gd:4.2f}m {gbrg:+4.0f}deg"
+            latest_grounding = grounding_steps.get(step, latest_grounding)
+            mode = step_row.get("grounding_mode", latest_grounding.get("goal_mode"))
+            bearing = step_row.get("bearing_bin", latest_grounding.get("bearing_bin"))
+            confidence = step_row.get("grounding_conf", latest_grounding.get("conf"))
+            confidence = f" conf {confidence:.2f}" if confidence is not None else ""
+            grounding = f"VLM {mode or '?'} | bearing {bearing if bearing is not None else '?'}{confidence}"
             lines = [title or str(scene.get("name", "")),
                      f"{route_tag}step {step + 1}/{len(actions)}",
-                     f"sim t = {t:.2f} s  (video +{t - t0:.1f} s)",
                      f"pos ({x:5.2f},{y:5.2f},{z:4.2f})m{goal_tag}",
-                     f"speed {speed:4.2f} m/s  yaw {math.degrees(yaw):6.1f} roll {roll:5.1f} pitch {pitch:5.1f} deg"]
+                     f"speed {speed:4.2f} m/s  yaw {math.degrees(yaw):6.1f} roll {roll:5.1f} pitch {pitch:5.1f} deg",
+                     grounding if mode or latest_grounding else f"sim t = {t:.2f}s"]
             flags = [(f"COLLISION @ step {hit['step'] + 1}", (0, 0, 255))] if hit and step >= hit["step"] else []
-            if not flags and step_row.get("stop_requested"):
-                flags.append(("STOP REQUESTED", (80, 220, 80)))
+            proposed = step_row.get("action_proposed")
+            executed = vl.ACTIONS[act] if isinstance(act, int) and 0 <= act < 4 else "?"
+            proposed_name = vl.ACTIONS[proposed] if isinstance(proposed, int) and 0 <= proposed < 4 else None
+            reason = step_row.get("stop_source") or step_row.get("action_intervention")
+            status = f"Model {proposed_name} -> executed {executed}" if proposed_name else ""
+            if reason or step_row.get("stop_requested"):
+                status += f" | {reason or 'STOP REQUESTED'}"
             vl.panel(cv2, canvas, *br, lines,
                      int(act) if act is not None and 0 <= int(act) < 4 else None,
-                     flags, segments, t - t0, span, result if i >= len(frames) else "", s=s)
+                     flags, segments, t - t0, span, hold_result if i >= len(frames) else "", s=s)
+            if status:
+                cv2.putText(canvas, status, (br[0] + 16 * s, br[1] + 223 * s),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5 * s, vl.WHITE, s, cv2.LINE_AA)
             writer.write(canvas)
             if i in key_idx:
                 path = os.path.join(png_dir, "%s_key_%02d.png" % (stem, len(keyframes)))
@@ -397,8 +479,11 @@ def _selftest():
                                     "quat": [1, 0, 0, 0], "vel": [0.3, 0, 0], "action": 1,
                                     "exec_state": 3}) + "\n")
         with open(os.path.join(ep, "actions.jsonl"), "w") as f:
-            f.write(json.dumps({"step": 0, "action_executed": 1, "collision": False}) + "\n")
+            f.write(json.dumps({"step": 0, "action_executed": 1, "collision": False,
+                                "frame": "rgb_00000.png", "rgb_ts": 0}) + "\n")
             f.write(json.dumps({"step": 1, "action_executed": 2, "collision": True}) + "\n")
+        decision = np.full((240, 320, 3), (29, 89, 167), np.uint8)
+        cv2.imwrite(os.path.join(ep, "rgb_00000.png"), decision)
         scene = {"_nav_to_world": np.eye(4), "camera": {"width": 320, "height": 240, "fov_deg": 60},
                  "spawn": {"x": 0.0, "y": 0.0, "z": 2.0}, "waypoint": {"x": 8.0, "y": 0.0, "z": 2.0},
                  "reach_radius_m": 1.5, "route": {"index": 0, "name": "r0_test"}}
@@ -425,6 +510,9 @@ def _selftest():
         mid = onboard[40:-24]            # 去掉标签行（顶部）和 sim 时间角标（底部）
         assert (mid[:, 80:560].any(axis=2).all() and not mid[:, :80].any()
                 and not mid[:, 560:].any()), "机载格应居中 480x360"
+        assert np.all(mid[:, 80:560] == decision[0, 0]), "首幅机载画面应来自保存的决策帧"
+        last_onboard = cv2.imread(r["keyframes"][-1])[vl.CH:, :vl.CW]
+        assert not np.all(last_onboard[40:-24, 80:560] == decision[0, 0]), "缺帧时不能复用上一步的决策图"
         panel_bgr = key0[vl.CH:, vl.CW:]
         assert (panel_bgr == 235).all(axis=2).any(), "右下应是状态面板文字（白 235）"
         # 顶视：图右 = +x。spawn (0,0) 在 waypoint (8,0) 左侧；绿点列号 < 红点列号；机体图标（白桨盘 200 灰）在轨迹末端
@@ -481,9 +569,14 @@ def video_policy(man):
     旧 manifest 没有 executed_by 时按 teacher 字段（= 策略名）推断；以前只要有 teacher 字段就写 teacher，
     学生 eval 集（teacher=student）也被标成 teacher（FIXLIST D7）。"""
     if man.get("executed_by"):
+        if (man["executed_by"] == "teacher"
+                and man.get("teacher") in ("reactive_bearing", "reactive_goal")):
+            return "reactive"
         return str(man["executed_by"])
     name = man.get("teacher") or man.get("policy") or "student"
-    return name if name in ("student", "forward") else "teacher"
+    if name in ("student", "forward", "reactive_bearing", "reactive_goal"):
+        return "reactive" if name.startswith("reactive_") else name
+    return "teacher"
 
 
 def episode_result(man, oracle=None, reach_radius_m=None, collided=False, actions=None):
@@ -499,6 +592,15 @@ def episode_result(man, oracle=None, reach_radius_m=None, collided=False, action
         validity = man.get("validity") or {}
         if any(key in validity and not validity[key] for key in ("physics_verified", "camera_verified")):
             return "INVALID observation"
+        if (man.get("vln") or {}).get("manual_demo"):
+            if not actions or not oracle or len(actions) != len(oracle):
+                return "INVALID trajectory"
+            if man.get("stopped_on_collision") or man.get("truncated_on_collision") or collided:
+                return "COLLISION | UNSCORED MANUAL DEMO"
+            if man.get("dynamics_anomaly"):
+                return "ANOMALY | UNSCORED MANUAL DEMO"
+            return ("VLM STOP | UNSCORED MANUAL DEMO" if man.get("stopped_by_agent")
+                    else "NO STOP | UNSCORED MANUAL DEMO")
         if man.get("stopped_on_collision") or man.get("truncated_on_collision") or collided:
             return "COLLISION"
         if man.get("dynamics_anomaly"):
@@ -568,7 +670,12 @@ def main():
                      f"换回采集时的 scene.json，或确认过差异无关后加 --allow-scene-mismatch")
         mount = man["dynamics_params"].get("camera_mount")
         # 顶视的 spawn/waypoint/路线名取本集 manifest 里的（--route 选的路线），不是 scene.json 顶层那条。
-        ep_scene = dict(scene, **{k: man["scene"][k] for k in ("spawn", "waypoint") if man.get("scene", {}).get(k)})
+        scene_info = man.get("scene") or {}
+        ep_scene = dict(scene)
+        if "spawn" in scene_info:
+            ep_scene["spawn"] = scene_info["spawn"]
+        if "waypoint" in scene_info:
+            ep_scene["waypoint"] = scene_info["waypoint"]
         if isinstance(man.get("route"), dict):
             ep_scene["route"] = man["route"]
         dyn = man.get("dynamics_backend") or man["dynamics_params"].get("dynamics", "?")
@@ -576,11 +683,11 @@ def main():
         actions = _read_jsonl(os.path.join(ep, "actions.jsonl"))
         collided = any(a.get("collision") for a in actions)
         result = episode_result(man, oracle, float(ep_scene.get("reach_radius_m", 1.5)), collided, actions)
-        instruction = man.get("vln") or {}
-        banner = f'"{instruction["text"]}"' if instruction.get("text") else ""
+        manual_demo = bool((man.get("vln") or {}).get("manual_demo"))
         r = compose_views_video(ep, ep_scene, renderer, mount, occ, out_path=os.path.join(ep, args.out_name),
                                 title=f"{video_policy(man)} | {dyn} | {scene_short} | seed {man.get('seed')}",   # 与 Gazebo 标题同格式
-                                result=result, quality=args.video_quality, instruction=banner,
+                                result=result, quality=args.video_quality, instruction=instruction_banner(man.get("vln")),
+                                goal_visible=not manual_demo,
                                 log=lambda m: print(m, file=sys.stderr, flush=True))
         print(json.dumps(r, ensure_ascii=False))
 

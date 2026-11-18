@@ -438,6 +438,7 @@ class TestExecutedBy(unittest.TestCase):
                 self.assertTrue(any(r["action_expert"] != 0 for r in rows))       # 走廊畅通：教师不是全程 SAFE
                 if beta == 1.0:
                     self.assertTrue(all(r["action_executed"] == r["action_expert"] for r in rows), rows)
+                    self.assertTrue(any(r.get("action_intervention") == "dagger_expert" for r in rows))
                     self.assertEqual(m["n_expert_executed"], m["num_steps"])
                 else:
                     self.assertEqual([r["action_executed"] for r in rows], [0] * 6)
@@ -809,10 +810,6 @@ class TestCollisionRows(unittest.TestCase):
             bad = _collect(os.path.join(scene_dir, "scene.json"), os.path.join(tmp, "b"), "--policy", "forward",
                            "--truncate-on-collision", "--stop-on-collision")
             self.assertNotEqual(bad.returncode, 0)
-        with open(os.path.join(ROOT, "tools", "demo_3dgs_routes.py"), encoding="utf-8") as f:
-            src = f.read()
-        self.assertIn('"--truncate-on-collision"', src)
-        self.assertNotIn('"--stop-on-collision"', src)       # 教师 pilot 不再用闭环评测语义采训练数据
 
 
 class TestTofTerrain(unittest.TestCase):

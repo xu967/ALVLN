@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
-"""3DGS 上的视觉语言导航评测：每集一句 SAGE-3D 指令，智能体自己喊停，按 SR / OSR / NE / SPL 出报告（口径见 vln.py）。
+"""3DGS 上的视觉语言导航评测：SAGE-3D 指令或单条自由输入指令，由智能体决定停止。
 
 从仓库根、用 3dgs-venv 跑：
   python -m sim.3dgs.run_vln --policy teacher --out $D/exp-vln/teacher --videos 3 \
       --scene $D/3dgs-scenes/sage3d_839992/scene.json [--scene ...]
+  python -m sim.3dgs.run_vln --policy reactive --grounder vlm --scene <scene.json> \
+      --instruction '飞到走廊尽头并悬停' --spawn 0 0 1.5 --videos 1 --out <new-run-dir>
 每条航线缺省只取一句指令（句式按航线轮换），--all-instructions 取全部。
 
 策略：
   teacher  占据 A* 教师，直接拿航线终点当目标：等于已经听懂了指令（特权），是上界，也是以后蒸馏的老师
   reactive  目标条件局部控制，只看当前深度、位姿和目标方向，不在线查询全局占据图或调用 A*
   forward  一直前进、从不喊停，不看指令：下界
-teacher/reactive 都直接拿 waypoint，只用于验证控制层；它们都不是语言理解结果。
-`--grounder lexical --catalog <JSON>` 是最小语言闭环：从独立地标目录选目标，
-再交给 teacher/reactive 控制；它用于验证“换一句指令会换目标”，仍不等于端到端语言学生。
-真正的语言学生尚未接入。
+数据集评测里的 teacher/reactive 使用 scene waypoint 验证控制层，不能作为语言成绩。
+自由输入模式将用户指令交给 VLM Grounder 和零特权方位控制器，输出未评分演示轨迹。
+student 模式只接受 prev_dim=15 的 VLN_NAV 权重，确保它实际接收 VLM 方位条件。
+
+``--grounder lexical --catalog <JSON>`` 用独立地标目录验证指令换目标，仍不等同端到端语言学生。
+自由输入结果只记录轨迹、碰撞和停止，不把 scene waypoint 当作真值目标，也不计算 SR / SPL。
 
 产物：<out>/<场景>/<航线>_<指令序号>/（run_episode 的逐步记录；前 --videos 集另有 views.mp4）、
 <out>/episodes.jsonl（每集一行）、<out>/vln_eval.json（总表，另按句式 / SAGE split / 场景分组）。
@@ -51,55 +55,116 @@ def make_policy(name, occ_planner, waypoint, hold, stop_radius=1.0, clearance="r
 
 
 class VlmBeliefTracker:
-    """1 Hz 零特权目标信念更新器：仅喂机载 RGB 与指令给 VLM，带单步转角航位推算与跨中线防过冲。"""
+    """维护可见路标方位。任务 STOP 需要连续两次新鲜的同一近景目标证据。"""
 
-    def __init__(self, vlm_grounder, instruction, update_every=2):
+    _ACT_SHORT = {0: "SAFE", 1: "FWD", 2: "LEFT", 3: "RIGHT"}
+
+    def __init__(self, vlm_grounder, instruction, update_every=2, stage_instructions=None):
         self.vlm_grounder = vlm_grounder
         self.instruction = str(instruction or "")
+        self.stage_instructions = [str(text).strip() for text in (stage_instructions or []) if str(text).strip()]
+        self.stage_index = 0
+        self.task_complete = False
+        self.stage_confirmed = False
+        self.stage_confirmed_index = None
         self.update_every = max(1, int(update_every))
         self.step_idx = 0
         self.history = []
         self.trace = []
         self.prev_vlm_bin = None
-        self.last_vg = grounder_mod.VisualGrounding(grounder_mod.BEARING_SEARCH, 0, 0.0, "init", 0.0)
+        self.last_seen_bin = None
+        self.miss_streak = 0
+        self.last_near_target = None
+        self.confirmed_target = False
+        self.turned_toward_target = False
+        if vlm_grounder is not None and hasattr(vlm_grounder, "reset_episode"):
+            vlm_grounder.reset_episode()
+        self.last_vg = grounder_mod.VisualGrounding(grounder_mod.BEARING_SEARCH, 0, 0.0, "init", 0.0, "search")
+
+    def note_step(self, action_executed: int):
+        self.turned_toward_target |= (self.last_vg.bearing_bin, action_executed) in ((1, 2), (7, 3))
+        if self.vlm_grounder is not None and hasattr(self.vlm_grounder, "note_action"):
+            self.vlm_grounder.note_action(self._ACT_SHORT.get(int(action_executed), "ACT"))
 
     def __call__(self, rgb, _state):
+        self.confirmed_target = False
         self.history.append(rgb)
         if len(self.history) > 4:
             self.history = self.history[-4:]
         if not self.instruction.strip() or self.vlm_grounder is None:
-            self.last_vg = grounder_mod.VisualGrounding(grounder_mod.BEARING_SEARCH, 0, 0.0, "empty_instruction", 0.0)
+            self.last_vg = grounder_mod.VisualGrounding(grounder_mod.BEARING_SEARCH, 0, 0.0, "empty_instruction", 0.0, "search")
             self.step_idx += 1
             return self.last_vg.bearing_bin, 0
-        if self.step_idx % self.update_every == 0:
-            vg = self.vlm_grounder.ground_step(self.history, self.instruction)
-            raw_bb = vg.bearing_bin
-            # 相邻两次 VLM 观测在左(1)与右(7)间翻转说明目标刚跨过视野中线，置 0 前进消除二周期极限环
+        if self.step_idx % self.update_every != 0:
+            bb = 0 if self.turned_toward_target else self.last_vg.bearing_bin
+            self.step_idx += 1
+            return bb, 0
+
+        instruction = self.instruction
+        if self.stage_instructions:
+            instruction = ("Treat the current stage as the active FINAL destination until confirmed reached.\n"
+                           f"Overall instruction: {self.instruction}\n"
+                           f"Current stage {self.stage_index + 1}/{len(self.stage_instructions)}: "
+                           f"{self.stage_instructions[self.stage_index]}")
+        vg = self.vlm_grounder.ground_step(self.history, instruction)
+        self.stage_confirmed = False
+        self.stage_confirmed_index = None
+        self.turned_toward_target = False
+        raw_bb = vg.bearing_bin
+        if raw_bb in (0, 1, 7):
             eff_bb = 0 if {self.prev_vlm_bin, raw_bb} == {1, 7} else raw_bb
-            self.prev_vlm_bin = raw_bb
-            self.last_vg = grounder_mod.VisualGrounding(eff_bb, vg.near_goal, vg.conf, vg.reason, vg.latency_ms)
-            self.trace.append({
-                "step": self.step_idx,
-                "raw_bearing_bin": raw_bb,
-                "bearing_bin": eff_bb,
-                "near_goal": vg.near_goal,
-                "conf": vg.conf,
-                "reason": vg.reason,
-                "latency_ms": vg.latency_ms,
-            })
-            bb = eff_bb
+            self.miss_streak = 0
+            self.last_seen_bin = raw_bb
+        elif raw_bb == grounder_mod.BEARING_SEARCH and self.last_seen_bin is not None and self.miss_streak == 0:
+            self.miss_streak = 1
+            eff_bb = 0
+        elif raw_bb == grounder_mod.BEARING_SEARCH:
+            self.miss_streak += 1
+            eff_bb = grounder_mod.BEARING_SEARCH
         else:
-            # 偶数步已执行一次 ~17° 转向，奇数步将 ±1 前侧扇区推算回正至 0 桶，防止盲转两步过冲
-            bb = 0 if self.last_vg.bearing_bin in (1, 7) else self.last_vg.bearing_bin
+            eff_bb = raw_bb
+        self.prev_vlm_bin = raw_bb
+        near_target = raw_bb == 0 and vg.goal_mode == "final" and vg.near_goal == 1
+        target_id = vg.reason.strip().casefold() if near_target else None
+        confirmed = bool(target_id and target_id == self.last_near_target)
+        if self.stage_instructions and confirmed:
+            self.stage_confirmed = True
+            self.stage_confirmed_index = self.stage_index
+            if self.stage_index + 1 < len(self.stage_instructions):
+                self.stage_index += 1
+            else:
+                self.task_complete = True
+        eff_ng = int(near_target and confirmed and (not self.stage_instructions or self.task_complete))
+        self.confirmed_target = confirmed and (not self.stage_instructions or self.task_complete)
+        self.last_near_target = None if self.stage_instructions and confirmed and not self.task_complete else target_id
+        self.last_vg = grounder_mod.VisualGrounding(
+            eff_bb, eff_ng, vg.conf, vg.reason, vg.latency_ms, goal_mode=vg.goal_mode,
+        )
+        self.trace.append({
+            "step": self.step_idx,
+            "raw_bearing_bin": raw_bb,
+            "bearing_bin": eff_bb,
+            "goal_mode": vg.goal_mode,
+            "near_goal": eff_ng,
+            "confirmed_target": self.confirmed_target,
+            "stage_index": self.stage_index,
+            "stage_confirmed": self.stage_confirmed,
+            "stage_confirmed_index": self.stage_confirmed_index,
+            "task_complete": self.task_complete,
+            "miss_streak": self.miss_streak,
+            "conf": vg.conf,
+            "reason": vg.reason,
+            "latency_ms": vg.latency_ms,
+        })
         self.step_idx += 1
-        return bb, self.last_vg.near_goal
+        return eff_bb, eff_ng
 
 
 def result_text(m):
     """视频结尾大字；以 SUCCESS 开头画绿色，其余红色（view_layout.panel）。"""
-    if m["success"]:
+    if m.get("success"):
         return "SUCCESS stop %.2f m" % m["ne_m"]
-    if m["collision"]:
+    if m.get("collision"):
         return "COLLISION"
     if m["stopped"]:
         return "WRONG STOP %.1f m" % m["ne_m"]
@@ -149,39 +214,132 @@ def _grounding_summary(rows, failures):
     }
 
 
+def _manual_demo_metrics(actions, oracle, manifest):
+    """汇报自由指令的飞行过程，不用 scene waypoint 计算成功率。"""
+    points = vln.trajectory(actions, oracle)
+    path_m = sum(math.dist(start, end) for start, end in zip(points, points[1:]))
+    return {
+        "success": None,
+        "oracle_success": None,
+        "ne_m": None,
+        "spl": None,
+        "ndtw": None,
+        "sdtw": None,
+        "path_m": path_m,
+        "shortest_m": None,
+        "stopped": bool(manifest.get("stopped_by_agent")),
+        "collision": any(bool(action.get("collision")) for action in actions),
+        "steps": len(actions),
+        **vln._action_diagnostics(actions, path_m),
+    }
+
+
+def _spawn_within_scene_bounds(occ, spawn):
+    """只接受落在已构建碰撞代理覆盖范围内的自由演示起点。"""
+    raw = getattr(occ, "raw", None)
+    if raw is None or raw.size == 0:
+        return False
+    low = occ.origin[:2]
+    high = (low[0] + (occ.shape[0] - 1) * occ.voxel,
+            low[1] + (occ.shape[1] - 1) * occ.voxel)
+    xy = (float(spawn["x"]), float(spawn["y"]))
+    return all(float(low[i]) <= xy[i] <= float(high[i]) for i in range(2))
+
+
+def _manual_spawn_is_safe(occ, spawn):
+    x, y, z = (float(spawn[key]) for key in ("x", "y", "z"))
+    if getattr(occ, "collision_model", None) == "v2" and hasattr(occ, "spawn_ok"):
+        return bool(occ.spawn_ok(x, y, z))
+    if occ.collides(x, y, z):
+        return False
+    clearance = getattr(occ, "clearance", None)
+    if clearance is None:
+        return True
+    required = float(getattr(occ, "body_radius", 0.0)) + float(
+        getattr(occ, "spawn_drift_margin", 0.0))
+    return float(clearance(x, y, z)) >= required
+
+
 def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_path=None,
               vlm_grounder=None, student_proc=None):
     import numpy as np
     import random
     scene = scene_mod.load_scene(path)
-    eps = vln.episodes(scene, splits=args.split)
-    if not args.all_instructions:
-        eps = vln.one_per_route(eps, seed=args.seed)
-    if args.limit:
-        eps = eps[:args.limit]
+    manual_instruction = getattr(args, "instruction", None)
+    if manual_instruction is not None:
+        manual_spawn = getattr(args, "spawn", None)
+        spawn = dict(scene["spawn"])
+        if manual_spawn is not None:
+            spawn.update(dict(zip(("x", "y", "z"), manual_spawn)))
+        if getattr(args, "spawn_yaw_deg", None) is not None:
+            spawn["yaw_deg"] = float(args.spawn_yaw_deg)
+        scene["spawn"] = spawn
+        scene["waypoint"] = None
+        scene["route"] = None
+        if getattr(args, "manual_steps", None) is not None:
+            scene["max_steps"] = int(args.manual_steps)
+        eps = [{"key": f"{scene['name']}/manual", "route_index": None, "route_name": "manual",
+                "instruction_index": 0, "route_key": "manual", "split": scene.get("split"),
+                "type": "Manual instruction", "text": manual_instruction,
+                "start_object": None, "goal_object": None, "manual_demo": True}]
+    else:
+        eps = vln.episodes(scene, splits=args.split)
+        if not args.all_instructions:
+            eps = vln.one_per_route(eps, seed=args.seed)
+        if args.limit:
+            eps = eps[:args.limit]
     if not eps:
         print(f"{path}: 没有带指令的航线（不是 SAGE-3D 导入的场景，或 --split 过滤光了）", file=sys.stderr)
         return [], []
+    grounder_kind = getattr(args, "grounder", "none")
+    collect_mode = bool(getattr(args, "collect", False))
+    rows, failures = [], []
+    runnable = []
+    for ep in eps:
+        if (ep.get("route_contract") == "sage.multi_stage.v2"
+                and (grounder_kind != "vlm" or args.policy not in ("reactive", "student") or collect_mode)):
+            ep_dir = os.path.join(args.out, scene["name"], f"{ep['route_name']}_{ep['instruction_index']}")
+            failures.append({**ep, "scene": scene["name"], "dir": ep_dir,
+                             "error": "ValueError: 多阶段任务需要 --grounder vlm、reactive/student 策略且不能使用 --collect"})
+            continue
+        runnable.append(ep)
+    eps = runnable
+    if not eps:
+        return rows, failures
     identity = collect_3dgs.scene_identity(scene)
     gaussians = (scene_mod.read_gaussian_ply(scene["ply_path"])
                  if scene.get("collision", {}).get("source", "gaussians") == "gaussians" else None)
     occ = collision_mod.from_scene(scene, gaussians=gaussians)
     del gaussians
+    if manual_instruction is not None:
+        spawn = scene["spawn"]
+        within_bounds = _spawn_within_scene_bounds(occ, spawn)
+        is_safe = within_bounds and _manual_spawn_is_safe(occ, spawn)
+        if not is_safe:
+            return [], [{"key": f"{scene['name']}/manual", "scene": scene["name"],
+                         "route_name": "manual", "type": "Manual instruction",
+                         "text": manual_instruction,
+                         "error": "ValueError: 起飞点不在碰撞代理范围内或与占据代理冲突（或起飞净空不足）"}]
     renderer = renderer_mod.make_renderer(scene)
     occ_planner = planner_mod.OccPlanner(occ)
     radius = reach_radius_of(scene)
     ref_paths = vln.sage_ref_paths(scene)
     clearance = getattr(args, "teacher_clearance", "ray")
-    collect_mode = bool(getattr(args, "collect", False))
     cf_mode = getattr(args, "counterfactual", "correct")
     blind_rgb = bool(getattr(args, "blind_rgb", False))
-    grounder_kind = getattr(args, "grounder", "none")
     rng = random.Random(args.seed)
-    rows, failures = [], []
     for n, ep in enumerate(eps):
-        scene_mod.apply_route(scene, ep["route_index"])
+        is_multi_stage = ep.get("route_contract") == "sage.multi_stage.v2"
+        if is_multi_stage:
+            route = (scene.get("multi_stage_routes") or [])[ep["multi_stage_index"]]
+            scene.update({"spawn": dict(route["spawn"]), "waypoint": dict(route["waypoint"]),
+                          "max_steps": int(route["max_steps"]),
+                          "route": {"index": ep["route_index"], "name": route["name"],
+                                    "contract": ep["route_contract"]}})
+        elif not ep.get("manual_demo"):
+            scene_mod.apply_route(scene, ep["route_index"])
         identity = collect_3dgs.scene_identity(scene, ply_sha256=identity["ply_sha256"])
-        evaluation_goal = dict(scene["waypoint"])
+        evaluation_goal = None if ep.get("manual_demo") else dict(scene["waypoint"])
         supplied_text = ep["text"]
         if cf_mode == "swap" and len(eps) >= 2:
             partner = n ^ 1
@@ -200,7 +358,7 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
 
         grounding = None
         policy_goal = evaluation_goal
-        if lexical_grounder is not None:
+        if lexical_grounder is not None and not is_multi_stage:
             try:
                 result, policy_goal = resolve_grounding(lexical_grounder, catalog, supplied_text)
             except Exception as e:  # noqa: BLE001 - 单集输入错误要保留在请求分母
@@ -225,8 +383,9 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                 "ply_sha256": identity["ply_sha256"],
             })
         # 始终保留真实评估目标作为 scene["waypoint"]，防止 grounder 落错地标时把 manifest 与视频伪装成到达真目标。
-        scene["waypoint"] = dict(evaluation_goal)
-        scene["vln"] = {**ep, "supplied_text": supplied_text, "counterfactual": cf_mode,
+        if evaluation_goal is not None:
+            scene["waypoint"] = dict(evaluation_goal)
+        scene["vln"] = {**ep, "supplied_text": supplied_text, "counterfactual": cf_mode, "blind_rgb": blind_rgb,
                         **({"grounding": grounding} if grounding is not None else {})}
         ep_dir = os.path.join(args.out, scene["name"], f"{ep['route_name']}_{ep['instruction_index']}")
         steps = math.ceil(int(scene["max_steps"]) * STEPS_HOLD_S / args.hold)
@@ -234,27 +393,40 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
         vlm_tracker = None
         if grounder_kind == "vlm":
             vlm_tracker = VlmBeliefTracker(vlm_grounder, supplied_text,
-                                           update_every=getattr(args, "vlm_every", 2))
+                                           update_every=getattr(args, "vlm_every", 2),
+                                           stage_instructions=([stage.get("instruction") or ""
+                                                                for stage in ep.get("stage_waypoints", [])]
+                                                               if is_multi_stage else None))
             goal_fn = vlm_tracker
         elif grounder_kind == "blind_unknown":
             goal_fn = lambda _rgb, _st: (grounder_mod.BEARING_SEARCH, 0)
+        elif is_multi_stage:
+            goal_fn = lambda _rgb, _st: (grounder_mod.BEARING_SEARCH, 0)
         else:
             gx, gy = float(policy_goal["x"]), float(policy_goal["y"])
+            g0_mode = getattr(args, "g0_mode", "subgoal")
+            if g0_mode == "direct":
+                def _g0_direct(_rgb, st, _gx=gx, _gy=gy, _r=radius):
+                    px, py = float(st.x), float(st.y)
+                    ng = int(math.hypot(px - _gx, py - _gy) <= _r)
+                    return vln.bearing_bin(float(st.yaw), (px, py), (_gx, _gy)), ng
 
-            def _g0_subgoal(_rgb, st, _gx=gx, _gy=gy, _r=radius, _pl=occ_planner):
-                px, py = float(st.x), float(st.y)
-                if math.hypot(px - _gx, py - _gy) <= _r:
-                    return vln.bearing_bin(float(st.yaw), (px, py), (_gx, _gy)), 1
-                if _pl is not None:
-                    p = _pl.plan((px, py), (_gx, _gy))
-                    if p is not None:
-                        spd = math.hypot(float(getattr(st, "vx", 0.0)), float(getattr(st, "vy", 0.0)))
-                        tx, ty = _pl.aim_point(p, px, py, lookahead=0.65 + 0.8 * spd,
-                                               los_max=3.0, hard_los_max=min(1.0, 0.65 + 0.8 * spd))
-                        return vln.bearing_bin(float(st.yaw), (px, py), (tx, ty)), 0
-                return vln.bearing_bin(float(st.yaw), (px, py), (_gx, _gy)), 0
+                goal_fn = _g0_direct
+            else:
+                def _g0_subgoal(_rgb, st, _gx=gx, _gy=gy, _r=radius, _pl=occ_planner):
+                    px, py = float(st.x), float(st.y)
+                    if math.hypot(px - _gx, py - _gy) <= _r:
+                        return vln.bearing_bin(float(st.yaw), (px, py), (_gx, _gy)), 1
+                    if _pl is not None:
+                        p = _pl.plan((px, py), (_gx, _gy))
+                        if p is not None:
+                            spd = math.hypot(float(getattr(st, "vx", 0.0)), float(getattr(st, "vy", 0.0)))
+                            tx, ty = _pl.aim_point(p, px, py, lookahead=0.65 + 0.8 * spd,
+                                                   los_max=3.0, hard_los_max=min(1.0, 0.65 + 0.8 * spd))
+                            return vln.bearing_bin(float(st.yaw), (px, py), (tx, ty)), 0
+                    return vln.bearing_bin(float(st.yaw), (px, py), (_gx, _gy)), 0
 
-            goal_fn = _g0_subgoal
+                goal_fn = _g0_subgoal
 
         rgb_tf = (lambda img: np.zeros_like(img)) if blind_rgb else None
         dagger_meta = None
@@ -275,6 +447,8 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                 policy = collect_3dgs.StudentAdapter(student_proc, goal_fn=goal_fn, rgb_transform=rgb_tf)
         elif args.policy == "reactive" and grounder_kind in ("vlm", "blind_unknown"):
             policy = reactive.ReactiveBearingPolicy(goal_fn)
+        elif is_multi_stage:
+            policy = collect_3dgs.StudentAdapter(student_proc, goal_fn=goal_fn, rgb_transform=rgb_tf)
         else:
             try:
                 policy = make_policy(args.policy, occ_planner, policy_goal, args.hold,
@@ -307,11 +481,22 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
             if not actions or len(actions) != len(oracle):
                 raise ValueError("动作与位姿记录必须非空、长度一致")
             # p 包含第一步运动，l 也必须从同一个动作前位姿开始。
-            start = {**actions[0]["pose_before"], "yaw_deg": actions[0].get("yaw_before", 0.0)}
-            route_scene = dict(scene, waypoint=evaluation_goal)
-            shortest = route_shortest_path_m(occ_planner, [{"pose_gt": start}] + oracle, route_scene)
-            m = vln.episode_metrics(actions, oracle, evaluation_goal, radius, man["stopped_by_agent"],
-                                    shortest, ref_path=ref_paths.get(ep["route_index"]))
+            if ep.get("manual_demo"):
+                m = _manual_demo_metrics(actions, oracle, man)
+            else:
+                start = {**actions[0]["pose_before"], "yaw_deg": actions[0].get("yaw_before", 0.0)}
+                route_scene = dict(scene, waypoint=evaluation_goal)
+                shortest = (ep["total_path_m"]
+                            if is_multi_stage else
+                            route_shortest_path_m(occ_planner, [{"pose_gt": start}] + oracle, route_scene))
+                m = vln.episode_metrics(actions, oracle, evaluation_goal, radius, man["stopped_by_agent"],
+                                        shortest, ref_path=(ep.get("ref_path") or ref_paths.get(ep["route_index"])),
+                                        stage_goals=([stage["waypoint"] for stage in ep["stage_waypoints"]]
+                                                     if is_multi_stage else None))
+            if is_multi_stage:
+                m["stage_reached"] = m["stage_reached_count"]
+                m["stage_ordered_complete"] = m["stage_reached_count"] == m["stage_count"]
+                m["stage_names"] = [stage.get("goal_object") for stage in ep["stage_waypoints"]]
             target_metrics = None
             if grounding is not None:
                 target_scene = dict(scene, waypoint=policy_goal)
@@ -327,6 +512,8 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
         row = {**ep, "supplied_text": supplied_text, "counterfactual": cf_mode,
                "scene": scene["name"], **m, "error": err, "dir": ep_dir,
                "terminal_reason": man.get("terminal_reason")}
+        if ep.get("manual_demo"):
+            row.update(start_pose=dict(scene["spawn"]), step_budget=steps)
         if vlm_tracker is not None:
             lats = [x["latency_ms"] for x in vlm_tracker.trace]
             row["vlm_calls"] = len(lats)
@@ -337,7 +524,12 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
             row.update({f"target_{key}": value for key, value in target_metrics.items()})
         rows.append(row)
         wrong_goal = grounding is not None and grounding.get("correct") is False
-        badge = f"WRONG GOAL {m['ne_m']:.1f} m" if wrong_goal else result_text(m)
+        if ep.get("manual_demo"):
+            badge = ("COLLISION | unscored manual demo" if m["collision"] else
+                     "VLM STOP | unscored manual demo" if m["stopped"] else
+                     "NO STOP | unscored manual demo")
+        else:
+            badge = f"WRONG GOAL {m['ne_m']:.1f} m" if wrong_goal else result_text(m)
         print(f"[{scene['name']} {n + 1}/{len(eps)}] {badge:24s} {ep['type']:22s} {supplied_text}", file=sys.stderr)
         if n < args.videos:
             try:
@@ -346,6 +538,7 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                     title=f"{args.policy} | {grounder_kind} | {scene['name']} | {ep['type']}", result=badge,
                     instruction=f"\"{supplied_text}\"",
                     pred_goal=policy_goal if grounding is not None else None,
+                    goal_visible=not ep.get("manual_demo", False),
                     log=lambda msg: print(msg, file=sys.stderr))
                 row["video"] = os.path.relpath(video["video"], args.out)
                 row["video_metadata"] = {key: value for key, value in video.items() if key != "video"}
@@ -368,6 +561,8 @@ def main(argv=None):
     p.add_argument("--dagger-round", type=int, default=1, help="DAgger 轮次编号")
     p.add_argument("--grounder", choices=("none", "lexical", "phrase", "vlm", "blind_unknown"), default="none",
                    help="lexical/phrase：目录检索；vlm：零特权视觉语言 Grounder（1 Hz）；blind_unknown：方位恒置 UNKNOWN(8) 消融")
+    p.add_argument("--g0-mode", choices=("subgoal", "direct"), default="subgoal",
+                   help="G0 特权方位来源：subgoal=占据 A* 局部绕障子目标；direct=纯直线欧氏终点方位（S1-PureDirect 剥离机载视觉绕障）")
     p.add_argument("--vlm-model", default=None, help="--grounder vlm 的模型路径（默认 UAV-PUR-4B）")
     p.add_argument("--vlm-every", type=int, default=2, help="VLM 更新步间隔（hold=0.5s 时 2 步 = 1 Hz）")
     p.add_argument("--counterfactual", choices=("correct", "swap", "zero"), default="correct",
@@ -389,6 +584,14 @@ def main(argv=None):
     p.add_argument("--limit", type=int, default=0, help="每个场景最多跑几集（0 = 不限）")
     p.add_argument("--videos", type=int, default=0, help="每个场景前几集合成带指令横幅的四格视频")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--instruction", default=None,
+                   help="运行一条自由输入指令；需要 --grounder vlm 和 reactive/student 策略")
+    p.add_argument("--spawn", type=float, nargs=3, metavar=("X", "Y", "Z"),
+                   help="自由指令模式的起飞位置，使用 scene nav 坐标；缺省使用 scene 顶层 spawn")
+    p.add_argument("--spawn-yaw-deg", type=float,
+                   help="自由指令模式的机头朝向（nav 坐标系角度，+x 为 0°，逆时针为正）")
+    p.add_argument("--manual-steps", type=int, default=None,
+                   help="自由指令模式的飞行步数上限，缺省使用场景设置")
     args = p.parse_args(argv)
     use_grounder = args.grounder in ("lexical", "phrase")
     if args.policy == "student" and (not args.ckpt or not os.path.isfile(args.ckpt)):
@@ -405,6 +608,29 @@ def main(argv=None):
         p.error("--hold 必须是正数")
     if args.limit < 0 or args.videos < 0:
         p.error("--limit / --videos 不能为负数")
+    if args.instruction is not None:
+        if not args.instruction.strip():
+            p.error("--instruction 不能为空")
+        if len(args.scene) != 1:
+            p.error("--instruction 自由演示模式只接受一个 --scene")
+        if args.grounder != "vlm" or args.policy not in ("reactive", "student"):
+            p.error("--instruction 需要 --grounder vlm 和 --policy reactive/student")
+        if args.counterfactual != "correct" or args.collect or args.stop_mode != "explicit":
+            p.error("--instruction 需要 correct 指令、评测模式和 --stop-mode explicit")
+        if args.split or args.all_instructions or args.limit:
+            p.error("--instruction 与 --split、--all-instructions、--limit 不兼容")
+        if args.spawn is not None and not all(math.isfinite(value) for value in args.spawn):
+            p.error("--spawn 的 X/Y/Z 必须是有限数")
+        if args.spawn_yaw_deg is not None and not math.isfinite(args.spawn_yaw_deg):
+            p.error("--spawn-yaw-deg 必须是有限数")
+        if args.manual_steps is not None and args.manual_steps < 1:
+            p.error("--manual-steps 必须大于 0")
+    elif args.spawn is not None:
+        p.error("--spawn 只能与 --instruction 一起使用")
+    elif args.manual_steps is not None:
+        p.error("--manual-steps 只能与 --instruction 一起使用")
+    elif args.spawn_yaw_deg is not None:
+        p.error("--spawn-yaw-deg 只能与 --instruction 一起使用")
     if os.path.isdir(args.out) and os.listdir(args.out):
         p.error(f"--out {args.out} 不是空目录")
     os.makedirs(args.out, exist_ok=True)
@@ -434,12 +660,15 @@ def main(argv=None):
     vlm_grounder = None
     student_proc = None
     try:
-        if args.grounder == "vlm" and args.counterfactual != "zero":
-            vlm_grounder = grounder_mod.VisualLanguageGrounder(model_path=args.vlm_model)
         if args.policy == "student":
             sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
             import student as student_mod
+            import nav_cond
             student_proc = student_mod.StudentPolicy(args.ckpt, infer_bin=args.infer_bin)
+            if args.instruction is not None and student_proc.prev_dim != nav_cond.VLN_NAV_DIM:
+                p.error("自由指令 student 模式需要 prev_dim=15 的 VLN_NAV checkpoint，当前权重不会消费 VLM 方位")
+        if args.grounder == "vlm" and args.counterfactual != "zero":
+            vlm_grounder = grounder_mod.VisualLanguageGrounder(model_path=args.vlm_model)
         for path in args.scene:
             scene_catalog, catalog_path = None, None
             if lexical_grounder is not None:
@@ -465,7 +694,9 @@ def main(argv=None):
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     vlm_lats = [r["vlm_latency_ms_p50"] for r in rows if r.get("vlm_latency_ms_p50") is not None]
+    manual_demo = args.instruction is not None
     report = {"metric_version": METRIC_VERSION if args.stop_mode == "explicit" else "3dgs.vln.v2",
+              "stage_metric_version": "sage.multi_stage.v1",
               "policy": args.policy, "ckpt": args.ckpt, "collect": bool(args.collect),
               "teacher_clearance": args.teacher_clearance,
               "counterfactual": args.counterfactual, "blind_rgb": bool(args.blind_rgb),
@@ -473,19 +704,24 @@ def main(argv=None):
               "stop_streak": vln.STOP_STREAK if args.stop_mode == "legacy-safe" else None,
               "dynamics": "cf_sitl", "dynamics_profile": params.profile(),
               "scenes": args.scene, "split_filter": args.split, "all_instructions": args.all_instructions,
-              "grounder": args.grounder, "catalog": args.catalog,
+              "grounder": args.grounder, "g0_mode": args.g0_mode,
+              "catalog": args.catalog,
               "vlm_latency_ms": ({"p50_median": collect_3dgs._percentile(vlm_lats, 50),
                                   "p50_max": max(vlm_lats)} if vlm_lats else None),
-              "overall_metric_scope": ("route_waypoint_proxy" if use_grounder
-                                       else "scene_route_waypoint"),
-              "overall": vln.summarize(rows, failures), "by_type": vln.summarize_by(rows, "type", failures),
-              "by_split": vln.summarize_by(rows, "split", failures), "by_scene": vln.summarize_by(rows, "scene", failures),
-              "grounding": (_grounding_summary(rows, failures) if use_grounder else None),
+              "manual_demo": manual_demo,
+              "overall_metric_scope": ("manual_unscored" if manual_demo else
+                                       "route_waypoint_proxy" if use_grounder else "scene_route_waypoint"),
+              "overall": None if manual_demo else vln.summarize(rows, failures),
+              "stage_metrics": None if manual_demo else vln.summarize_stages(rows, failures),
+              "by_type": {} if manual_demo else vln.summarize_by(rows, "type", failures),
+              "by_split": {} if manual_demo else vln.summarize_by(rows, "split", failures),
+              "by_scene": {} if manual_demo else vln.summarize_by(rows, "scene", failures),
+              "grounding": (_grounding_summary(rows, failures) if use_grounder and not manual_demo else None),
               "target_goal_metrics": (vln.summarize([
                   {"success": r["target_success"], "oracle_success": r["target_oracle_success"],
                    "spl": r["target_spl"], "ne_m": r["target_ne_m"],
                    "collision": r["collision"], "stopped": r["stopped"]} for r in rows
-                  if "target_success" in r], failures) if use_grounder else None),
+                  if "target_success" in r], failures) if use_grounder and not manual_demo else None),
               "failures": failures, "wall_s": round(time.monotonic() - started, 1)}
     with open(os.path.join(args.out, "vln_eval.json"), "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)

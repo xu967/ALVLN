@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""常驻零特权视觉语言 Grounder 子进程服务（stdin/stdout JSONL，仅接收机载 RGB 与自然语言指令）。
+"""常驻零特权层次化视觉语言 Grounder 子进程服务（G3 阶段路标分解，stdin/stdout JSONL）。
 
-运行方式（由 sim/3dgs/grounder.py::VisualLanguageGrounder 自动拉起）:
-  /root/rivermind-data/uav_rgb/envs/vlm-venv/bin/python sim/3dgs/vlm_grounder_worker.py
+仅接收机载 RGB 与自然语言指令（及 VLM 自身历史摘要），区分 FINAL（最终目的地可见）与
+SUBGOAL（跨房间门洞/走廊过渡路标），严禁读取位姿、占据图或真值深度。
 """
 import base64
 import io
@@ -25,21 +25,25 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 MODEL_PATH = os.environ.get(
     "UAV_RGB_VLM_MODEL",
     "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B",
-)  # 只读挂载的无人机指代微调 Qwen3-VL-4B（FP16 显存约 8.5 GiB）
-INPUT_W = int(os.environ.get("UAV_RGB_VLM_W", "288"))             # 288x192 对应 27 个视觉 token，兼顾细节与 <0.5s 延迟
+)
+INPUT_W = int(os.environ.get("UAV_RGB_VLM_W", "288"))
 INPUT_H = int(os.environ.get("UAV_RGB_VLM_H", "192"))
-MAX_NEW_TOKENS = int(os.environ.get("UAV_RGB_VLM_MAX_TOKENS", "8"))  # 紧凑数组 ["L",0,"word"] 仅需 5~6 个 token
-MIN_FREE_VRAM_MIB = int(os.environ.get("UAV_RGB_VLM_MIN_VRAM_MIB", "6000"))  # 启动前最小空闲显存门禁（共享卡自动分层）
+MAX_NEW_TOKENS = int(os.environ.get("UAV_RGB_VLM_MAX_TOKENS", "12"))  # ["C","S",0,"doorway"] 约 8~10 token
+MIN_FREE_VRAM_MIB = int(os.environ.get("UAV_RGB_VLM_MIN_VRAM_MIB", "6000"))
+ALLOWED_REQ_KEYS = frozenset(("cmd", "frames_b64", "instruction", "memory"))
 # =================================================================
 
 PROMPT_TEMPLATE = (
-    'Drone front camera (HFOV 60°). Instruction: "{ins}"\n'
-    "Identify ONLY the final destination goal in the instruction (ignore starting objects).\n"
-    "Is that final goal visible in this view?\n"
-    '- 1st item: "C" if goal is roughly ahead in the middle half of the view, "L" if near left edge, "R" if near right edge, or "N" if not visible\n'
-    "- 2nd item: 1 if the goal is visible ahead and close (<=1.2m away, large in foreground, ready to stop), else 0\n"
-    "- 3rd item: 1-word label of what you see\n"
-    'Format: ["C|L|R|N",0|1,"word"]'
+    'Drone front camera (HFOV 60°).\n'
+    'Instruction: "{ins}"\n'
+    'Recent history: {mem}\n'
+    'Understand instructions in English or Chinese. In Chinese, the destination after “到/去/前往” is the final goal; “从/离开” describes the start.\n'
+    '1. Identify the FINAL destination (ignore starting "from ..." objects).\n'
+    '2. If the FINAL destination itself is visible in this view, set mode="F" and direction="C" (ahead), "L" (left), or "R" (right).\n'
+    '3. If the FINAL destination is NOT visible (in another room or behind walls), look for an open doorway, hallway, or room exit to advance, and set mode="S" (Subgoal) with direction "C", "L", or "R".\n'
+    '4. If facing a blank wall/obstacle with neither final goal nor passage visible, output ["N","N",0,"wall"].\n'
+    '5. Set close=1 ONLY when mode="F" AND the final destination fills the foreground within ~1m; else 0.\n'
+    'Format: ["C|L|R|N","F|S|N",0|1,"word"]'
 )
 
 
@@ -59,14 +63,13 @@ def main():
 
     processor = AutoProcessor.from_pretrained(MODEL_PATH, local_files_only=True)
     processor.image_processor.size = {"shortest_edge": 16384, "longest_edge": INPUT_W * INPUT_H * 2}
-    if free_mib >= 10200:
+    if free_mib >= 12000:
         model = Qwen3VLForConditionalGeneration.from_pretrained(
             MODEL_PATH, dtype=torch.float16, device_map="cuda:0",
             attn_implementation="sdpa", local_files_only=True,
         ).eval().to(torch.float16)
     else:
-        # 显卡被其他训练任务共享时，预留 1.5 GiB 给 gsplat 与 C++ 学生推理，防并发 OOM
-        gpu_cap = f"{max(4800, free_mib - 1500)}MiB"
+        gpu_cap = f"{max(4800, free_mib - 2200)}MiB"
         model = Qwen3VLForConditionalGeneration.from_pretrained(
             MODEL_PATH, dtype=torch.float16, device_map="auto",
             max_memory={0: gpu_cap, "cpu": "32GiB"},
@@ -75,12 +78,11 @@ def main():
 
     tok = processor.tokenizer
     eos_ids = list({151645, 151643, tok.encode('"]')[0], tok.encode("]")[0]})
-    cand_ids = [tok.encode(c)[0] for c in ("L", "C", "R", "N")]
+    cand_ids = [tok.encode(c, add_special_tokens=False)[0] for c in ("L", "C", "R", "N")]
 
-    # Warmup 一次把算子编译开销移出在线步
     warm_im = Image.new("RGB", (INPUT_W, INPUT_H), (128, 128, 128))
     warm_msgs = [
-        {"role": "user", "content": [{"type": "image", "image": warm_im}, {"type": "text", "text": PROMPT_TEMPLATE.format(ins="warmup")}]},
+        {"role": "user", "content": [{"type": "image", "image": warm_im}, {"type": "text", "text": PROMPT_TEMPLATE.format(ins="warmup", mem="none")}]},
         {"role": "assistant", "content": [{"type": "text", "text": '["'}]},
     ]
     warm_in = processor.apply_chat_template(
@@ -99,21 +101,30 @@ def main():
         if not line:
             continue
         req = json.loads(line)
-        if req.get("cmd") == "close":
+        if not isinstance(req, dict):
+            raise ValueError("vlm_grounder_worker 请求必须是 JSON 对象")
+        extra_keys = set(req.keys()) - ALLOWED_REQ_KEYS
+        if extra_keys:
+            raise ValueError(f"零特权边界拒绝未知或特权字段: {sorted(extra_keys)}")
+        cmd = req.get("cmd")
+        if cmd == "close":
             break
+        if cmd is not None:
+            raise ValueError(f"未知的 cmd={cmd!r}")
         ins = str(req.get("instruction") or "").strip()
         frames_b64 = req.get("frames_b64") or []
         if not ins or not frames_b64:
-            sys.stdout.write(json.dumps({"raw": '["N",0,"empty"]', "conf": 0.0, "infer_ms": 0.0}) + "\n")
+            sys.stdout.write(json.dumps({"raw": '["N","N",0,"empty"]', "conf": 0.0, "infer_ms": 0.0}) + "\n")
             sys.stdout.flush()
             continue
 
+        mem = str(req.get("memory") or "none").strip()[:160] or "none"
         t0 = time.perf_counter()
         raw_bytes = base64.b64decode(frames_b64[-1])
         with Image.open(io.BytesIO(raw_bytes)) as im:
             cur_img = im.convert("RGB").resize((INPUT_W, INPUT_H), Image.Resampling.BILINEAR)
         msgs = [
-            {"role": "user", "content": [{"type": "image", "image": cur_img}, {"type": "text", "text": PROMPT_TEMPLATE.format(ins=ins)}]},
+            {"role": "user", "content": [{"type": "image", "image": cur_img}, {"type": "text", "text": PROMPT_TEMPLATE.format(ins=ins, mem=mem)}]},
             {"role": "assistant", "content": [{"type": "text", "text": '["'}]},
         ]
         inputs = processor.apply_chat_template(
@@ -128,11 +139,10 @@ def main():
         torch.cuda.synchronize()
         ms = (time.perf_counter() - t0) * 1000.0
         gen_ids = out.sequences[:, inputs["input_ids"].shape[1]:]
-        conf = 0.5
-        if out.scores:
-            probs = out.scores[0][0, cand_ids].float().softmax(dim=-1)
-            conf = float(probs.max().item())
+        conf = float(out.scores[0][0, cand_ids].float().softmax(dim=-1).max().item()) if out.scores else 0.5
         raw_txt = '["' + processor.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
+        del out, inputs
+
         sys.stdout.write(json.dumps({"raw": raw_txt, "conf": round(conf, 4), "infer_ms": round(ms, 2)}) + "\n")
         sys.stdout.flush()
 

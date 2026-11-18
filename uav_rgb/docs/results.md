@@ -2,6 +2,67 @@
 
 本文件只记录真实跑出的命令、输出与指标，并与 `docs/worklog/` 的过程记录分开；追加不覆盖。
 
+## 2026-11-18 23:05 中文自由指令 3DGS 闭环烟测
+
+- 场景：`sage3d_840865`，真实 `cf_sitl` 动力学，RTX 2080 Ti。
+- 指令：`请飞过前方的门洞，进入下一个房间，找到沙发并在附近悬停。`
+- 命令：
+
+  ```bash
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. /root/rivermind-data/uav_rgb/3dgs-venv/bin/python -m sim.3dgs.run_vln \
+    --policy reactive --grounder vlm \
+    --scene /root/rivermind-data/uav_rgb/3dgs-scenes/sage3d_840865/scene.json \
+    --instruction '请飞过前方的门洞，进入下一个房间，找到沙发并在附近悬停。' \
+    --spawn 6.625 -0.935 1.201 --manual-steps 12 --videos 1 --hold 0.5 \
+    --out /root/rivermind-data/uav_rgb/tmp/vln-manual-demo-20261118
+  ```
+
+| 项目 | 实测 |
+| --- | ---: |
+| 退出/墙钟 | `rc=0` / `137.6 s` |
+| 指令/语言链路 | 已进入 VLM，6 次调用，p50 `752.36 ms`，p95 `1041.64 ms` |
+| 路径位移 | `0.3499 m`，12 步 |
+| 停止/碰撞 | 未停止，未碰撞，`budget_exhausted` |
+| VLN 指标 | `success/oracle_success/ne/spl/ndtw/sdtw = null`，范围 `manual_unscored` |
+| 控制抖动 | 11 次动作切换，9 次左右反转，6 次 `YAW_LEFT`、5 次 `YAW_RIGHT`、1 次 `FORWARD_SLOW` |
+| 画面质量 | 首帧 `rgb_std=14.434`、`lapvar=30.6`，低于项目阈值 60；相邻帧 LapVar 在 `0.4–296.6` 间大幅波动 |
+
+首帧是大面积近乎均匀的墙面纹理，不是黑帧。VLM trace 在第 2–10 步多次返回 `bearing_bin=7`、`goal_mode=subgoal`，置信度 `0.4911–0.5689`，但当前动作在左右偏航之间来回切换，未获得向门洞前进的稳定阶段。这个结果证明自由语言入口、VLM 调用、决策 RGB 落盘、无 waypoint 视频和未评分结果标签能够闭环运行，同时暴露出场景视角覆盖/相机对齐与控制抖动仍未解决。它不支持把失败直接归因于数据集，也不支持宣称 VLN 成功。
+
+- 原始产物：[vln_eval.json](/root/rivermind-data/uav_rgb/tmp/vln-manual-demo-20261118/vln_eval.json)、[grounding_trace.jsonl](/root/rivermind-data/uav_rgb/tmp/vln-manual-demo-20261118/sage3d_840865/manual_0/grounding_trace.jsonl)、[views.mp4](/root/rivermind-data/uav_rgb/tmp/vln-manual-demo-20261118/sage3d_840865/manual_0/views.mp4)。
+- 修复视频标签后用 mock renderer 重新合成：[views_final.mp4](/root/rivermind-data/uav_rgb/tmp/vln-manual-demo-20261118/sage3d_840865/manual_0/views_final.mp4)，75 帧、10 FPS，标题显示 `reactive`，手动模式不绘制 waypoint 真值目标。
+
+### 起点朝向与动作仲裁诊断
+
+在同一 xyz、同一 PLY、320×240/60°相机和相同渲染参数下只改变 yaw，四向静态 GPU 渲染的 LapVar 如下。
+
+| yaw | RGB 标准差 | LapVar | 观察 |
+| ---: | ---: | ---: | --- |
+| 0° | 20.1 | 1.6 | 浴室浅色面，低纹理 |
+| 90° | 16.5 | 131.5 | 浴室/淋浴间结构 |
+| 180° | 21.3 | 18.2 | 近处浅色墙面和墙角 |
+| 270° | 54.8 | 1110.0 | 沙发、窗帘、窗户纹理清晰 |
+
+姿态用 `viewmat_from_quat` 生成的 SITL 相机矩阵与 `viewmat_from_pose` 的 180°矩阵最大元素差为 0。首帧的浅色画面来自这个起点朝向的真实场景视角，未发现视频编码或全局颜色映射导致的白屏。默认 `tt_1` 起点与烟测位置相同，但该路线的原始指令是从浴室拿毛巾到沙发，与本次中文自由指令要求“前方门洞”并不对应。相机导入目前没有验证起点朝向下目标门洞可见性。
+
+随后用当前代码在同一位置跑 4 步短诊断，原始动作日志现在包含 proposed 与 intervention。
+
+| step | proposed | 实际动作 | 覆盖原因 | yaw 前深度最小值 L/C/R |
+| ---: | --- | --- | --- | --- |
+| 0 | FORWARD | YAW_LEFT | depth_avoidance | 2.779 / 0.297 / 0.222 m |
+| 1 | FORWARD | FORWARD | 无 | 3.070 / 2.799 / 0.278 m |
+| 2 | YAW_RIGHT | YAW_RIGHT | 无 | 2.905 / 2.483 / 0.228 m |
+| 3 | FORWARD | YAW_LEFT | depth_avoidance | 2.553 / 0.295 / 0.290 m |
+
+深度值按已保存 SITL 位姿和相机外参重新渲染，并按控制器相同的中央图像高度/三分区计算。现有证据表明这组短时左右反转是深度安全覆盖与墙面视角共同产生，VLM 指令方向本身没有左右交替；还没有证据显示电机或硬件独立反向。自由模式因此新增 `--spawn-yaw-deg`，方便按门洞和目标可见方向指定机头朝向。下一次测试应使用人工核准的起点与朝向，再判断避障滞回是否需要修改。
+
+- 当前代码 4 步诊断：[episodes.jsonl](/root/rivermind-data/uav_rgb/tmp/vln-manual-diagnostic-20261118/episodes.jsonl)、[actions.jsonl](/root/rivermind-data/uav_rgb/tmp/vln-manual-diagnostic-20261118/sage3d_840865/manual_0/actions.jsonl)。
+- 四向静态帧：[yaw 0°](/root/rivermind-data/uav_rgb/tmp/vln-manual-demo-20261118/yaw_probe/yaw_0.png)、[yaw 90°](/root/rivermind-data/uav_rgb/tmp/vln-manual-demo-20261118/yaw_probe/yaw_90.png)、[yaw 180°](/root/rivermind-data/uav_rgb/tmp/vln-manual-demo-20261118/yaw_probe/yaw_180.png)、[yaw 270°](/root/rivermind-data/uav_rgb/tmp/vln-manual-demo-20261118/yaw_probe/yaw_270.png)。
+
+再用 270° 运行真实短闭环时，第一步即被碰撞代理判为碰撞，终止位置 `(6.640,-0.909,1.255)`，净空 `0.139 m`。名义 spawn `(6.625,-0.935,1.201)` 本身未碰撞，但其水平净空仅 `0.167 m`；飞行器起飞漂移后进入碰撞体。自由演示原先对 v1 碰撞代理只检查名义点是否碰撞，没有应用 `body_radius + spawn_drift_margin`。现已补上净空门禁，避免先启动仿真后才在第一动作报告碰撞。该起点在 180° 和 270° 下都应重新选位，不应因静态图清晰就直接飞。
+
+- 270° 首帧更清晰但已碰撞的短跑：[episode_manifest.json](/root/rivermind-data/uav_rgb/tmp/vln-manual-yaw270-20261118/sage3d_840865/manual_0/episode_manifest.json)、[actions.jsonl](/root/rivermind-data/uav_rgb/tmp/vln-manual-yaw270-20261118/sage3d_840865/manual_0/actions.jsonl)。
+
 ## 2026-10-29 19:00 归因分析：数据集问题还是训练问题（CPU）
 
 - 环境：GPU 模式已确认；本条纯统计 + 源码审读，不占 GPU。

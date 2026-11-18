@@ -12,6 +12,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+import numpy as np
+
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
 video = importlib.import_module("sim.3dgs.video")
@@ -39,9 +41,24 @@ class TestVideoPolicyName(unittest.TestCase):
         self.assertEqual(video.video_policy({"teacher": "student"}), "student")     # 以前这种集被写成 teacher
         self.assertEqual(video.video_policy({"teacher": "forward"}), "forward")
         self.assertEqual(video.video_policy({}), "student")
+        self.assertEqual(video.video_policy({"teacher": "reactive_bearing", "executed_by": "teacher"}),
+                         "reactive")
+        self.assertEqual(video.video_policy({"teacher": "reactive_goal"}), "reactive")
 
 
 class TestEpisodeResult(unittest.TestCase):
+    def test_manual_instruction_result_stays_unscored(self):
+        man = {"vln": {"manual_demo": True}, "waypoint": None, "stopped_by_agent": True}
+        actions = [{"pose_before": {"x": 0.0, "y": 0.0}, "collision": False}]
+        self.assertEqual(video.episode_result(man, _oracle((10.0, 0.0)), 1.0, actions=actions),
+                         "VLM STOP | UNSCORED MANUAL DEMO")
+        self.assertEqual(video.episode_result(man, _oracle((10.0, 0.0)), 1.0, collided=True, actions=actions),
+                         "COLLISION | UNSCORED MANUAL DEMO")
+        self.assertEqual(video.episode_result(dict(man, error="render failure")), "INVALID episode error")
+        self.assertEqual(video.episode_result(dict(man, validity={"camera_verified": False})),
+                         "INVALID observation")
+        self.assertEqual(video.episode_result(man, [], 1.0), "INVALID trajectory")
+
     def test_vln_invalid_episode_cannot_show_success(self):
         man = {"vln": {"text": "go to chair"}, "waypoint": WP, "stopped_by_agent": True}
         actions = [{"pose_before": {"x": 0., "y": 0.}, "collision": False}]
@@ -119,15 +136,30 @@ class TestVideoTime(unittest.TestCase):
 
 
 class TestVlnReplay(unittest.TestCase):
-    def test_cli_keeps_instruction_and_stop_requirement(self):
+    def test_instruction_banner_uses_supplied_text_including_empty(self):
+        self.assertEqual(video.instruction_banner({"text": "original", "supplied_text": "swap"}), '"swap"')
+        self.assertEqual(video.instruction_banner({"text": "original", "supplied_text": ""}), "[empty instruction]")
+        self.assertEqual(video.instruction_banner({"text": "original"}), '"original"')
+
+    def test_decision_frame_rejects_path_escape_and_reads_saved_rgb(self):
+        import cv2
+
+        with tempfile.TemporaryDirectory() as ep:
+            expected = np.full((12, 16, 3), (21, 86, 143), np.uint8)
+            cv2.imwrite(os.path.join(ep, "rgb_00000.png"), expected)
+            frame = video._decision_rgb(cv2, ep, {"frame": "rgb_00000.png"})
+            self.assertTrue(np.array_equal(frame, expected))
+            self.assertIsNone(video._decision_rgb(cv2, ep, {"frame": "../outside.png"}))
+            self.assertIsNone(video._decision_rgb(cv2, ep, {"frame": "rgb_00000.png", "rgb_ok": False}))
+
+    def test_cli_keeps_supplied_instruction_and_stop_requirement(self):
         with tempfile.TemporaryDirectory() as ep:
             scene_path = os.path.join(ep, "scene.json")
             scene = {"dir": ep, "waypoint": WP, "reach_radius_m": 1.}
             man = {"vln": {"text": "go to chair", "goal_object": "sofa"}, "waypoint": WP,
                    "stopped_by_agent": False, "scene": {}, "dynamics_params": {}, "seed": 0}
-            for name, obj in (("scene.json", scene), ("episode_manifest.json", man)):
-                with open(os.path.join(ep, name), "w") as f:
-                    json.dump(obj, f)
+            with open(scene_path, "w") as f:
+                json.dump(scene, f)
             for name, rows in (("oracle.jsonl", _oracle((10., 0.))),
                                ("actions.jsonl", [{"pose_before": {"x": 0., "y": 0.}, "collision": False}])):
                 with open(os.path.join(ep, name), "w") as f:
@@ -140,11 +172,16 @@ class TestVlnReplay(unittest.TestCase):
                   mock.patch.object(collision, "from_scene"),
                   mock.patch.object(video, "compose_views_video", return_value={}) as compose,
                   mock.patch("builtins.print")):
-                video.main()
-            banner = compose.call_args.kwargs["instruction"]
-            self.assertEqual(banner, '"go to chair"')
-            self.assertNotIn("sofa", banner)
-            self.assertEqual(compose.call_args.kwargs["result"], "NO STOP 0.0 m")
+                cases = [({}, '"go to chair"'),
+                         ({"supplied_text": "go to the window"}, '"go to the window"'),
+                         ({"supplied_text": ""}, "[empty instruction]")]
+                for fields, banner in cases:
+                    with self.subTest(fields=fields):
+                        with open(os.path.join(ep, "episode_manifest.json"), "w") as f:
+                            json.dump(dict(man, vln=dict(man["vln"], **fields)), f)
+                        video.main()
+                        self.assertEqual(compose.call_args.kwargs["instruction"], banner)
+                        self.assertEqual(compose.call_args.kwargs["result"], "NO STOP 0.0 m")
 
 
 if __name__ == "__main__":

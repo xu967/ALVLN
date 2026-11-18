@@ -148,6 +148,28 @@ def load_catalog(path, scene_name=None, scene_path=None):
     return out
 
 
+_NEGATION_RE = re.compile(r"\b(?:not|never|no|except|avoid|without)\b|n['’]t\b")
+_VERTICAL_RE = re.compile(r"\b(?:ascend|descend|climb|land|takeoff)\b|\b(?:go|fly|move)\s+(?:up|down)\b|\btake off\b")
+_MULTI_SEQ_RE = re.compile(r"\b(?:then|afterwards|both|either|or)\b|;")
+_AND_RE = re.compile(r"\band\b")
+
+_BASE_GUARDS = (
+    (lambda t: any(char.isalpha() and not char.isascii() for char in t), "unsupported_language"),
+    (_NEGATION_RE.search, "unsupported_negation"),
+    (_VERTICAL_RE.search, "unsupported_vertical_command"),
+    (_MULTI_SEQ_RE.search, "unsupported_multiple_goals"),
+)
+_LEXICAL_EXTRA_GUARDS = (
+    (lambda t: len(_MOTION.findall(t)) > 1, "unsupported_multiple_goals"),
+    (lambda t: _AND_RE.search(_goal_text(t)), "unsupported_multiple_goals"),
+    (lambda t: _RELATIONS.search(_goal_text(t)), "unsupported_relation"),
+)
+
+
+def _first_guard_rejection(text, guards):
+    return next((reason for pred, reason in guards if pred(text)), None)
+
+
 class LexicalGrounder:
     """可解释的候选选择器；分数不是概率，不能替代视觉 grounder。"""
 
@@ -163,21 +185,7 @@ class LexicalGrounder:
         """返回一个候选名；候选为空、无重叠或不够明确时拒绝。"""
         text = str(instruction).lower().replace("’", "'")
         # shortcut: 只支持英文单目标词法检索；复杂语义交给后续关系 grounder。
-        reason = None
-        if any(char.isalpha() and not char.isascii() for char in text):
-            reason = "unsupported_language"
-        elif re.search(r"\b(?:not|never|no|except|avoid|without)\b|n['’]t\b", text):
-            reason = "unsupported_negation"
-        elif re.search(r"\b(?:ascend|descend|climb|land|takeoff)\b|\b(?:go|fly|move)\s+(?:up|down)\b|\btake off\b", text):
-            reason = "unsupported_vertical_command"
-        elif re.search(r"\b(?:then|afterwards|both|either|or)\b|;", text):
-            reason = "unsupported_multiple_goals"
-        elif len(_MOTION.findall(text)) > 1:
-            reason = "unsupported_multiple_goals"
-        elif re.search(r"\band\b", _goal_text(text)):
-            reason = "unsupported_multiple_goals"
-        elif _RELATIONS.search(_goal_text(text)):
-            reason = "unsupported_relation"
+        reason = _first_guard_rejection(text, _BASE_GUARDS + _LEXICAL_EXTRA_GUARDS)
         if reason:
             return Grounding(None, 0.0, 0.0, False, reason)
         names = [str(name) for name in candidates if str(name).strip()]
@@ -232,15 +240,7 @@ class RelationPhraseGrounder(LexicalGrounder):
 
     def ground(self, instruction, candidates):
         text = str(instruction).lower().replace("’", "'")
-        reason = None
-        if any(char.isalpha() and not char.isascii() for char in text):
-            reason = "unsupported_language"
-        elif re.search(r"\b(?:not|never|no|except|avoid|without)\b|n['’]t\b", text):
-            reason = "unsupported_negation"
-        elif re.search(r"\b(?:ascend|descend|climb|land|takeoff)\b|\b(?:go|fly|move)\s+(?:up|down)\b|\btake off\b", text):
-            reason = "unsupported_vertical_command"
-        elif re.search(r"\b(?:then|afterwards|both|either|or)\b|;", text):
-            reason = "unsupported_multiple_goals"
+        reason = _first_guard_rejection(text, _BASE_GUARDS)
         if reason:
             return Grounding(None, 0.0, 0.0, False, reason)
 
@@ -299,6 +299,13 @@ _SECTOR_TO_BIN = {
     "r": 7, "right": 7, "fr": 7, "front_right": 7, "front-right": 7, "7": 7,
     "n": 8, "none": 8, "search": 8, "unseen": 8, "not_visible": 8, "occluded": 8, "8": 8,
 }
+_BIN_SHORT = {0: "C", 1: "L", 2: "L", 3: "L", 4: "B", 5: "R", 6: "R", 7: "R", 8: "N"}
+_GOAL_MODES = {
+    "f": "final", "final": "final", "goal": "final", "target": "final",
+    "s": "subgoal", "subgoal": "subgoal", "waypoint": "subgoal", "door": "subgoal", "exit": "subgoal",
+    "n": "search", "none": "search", "search": "search",
+}
+VALID_GOAL_MODES = frozenset(("final", "subgoal", "search"))
 
 
 @dataclass(frozen=True)
@@ -308,6 +315,7 @@ class VisualGrounding:
     conf: float
     reason: str
     latency_ms: float = 0.0
+    goal_mode: str = "final"
 
     def __post_init__(self):
         if isinstance(self.bearing_bin, bool) or not (0 <= int(self.bearing_bin) <= 8):
@@ -316,15 +324,18 @@ class VisualGrounding:
             raise ValueError(f"near_goal 必须是 0 或 1，得到 {self.near_goal!r}")
         if not math.isfinite(float(self.conf)) or not (0.0 <= float(self.conf) <= 1.0):
             raise ValueError(f"conf 必须在 [0, 1] 内，得到 {self.conf!r}")
+        if self.goal_mode not in VALID_GOAL_MODES:
+            raise ValueError(f"goal_mode 必须在 {sorted(VALID_GOAL_MODES)} 内，得到 {self.goal_mode!r}")
 
 
 def parse_vlm_output(raw_text, default_conf=0.8):
-    """稳健解析 VLM 结构化输出（兼容紧凑数组 ["L",0,"tv"]、JSON 对象及截断回退）。"""
+    """解析 VLM 输出（支持 G3 阶段数组 ["L","S",0,"door"]、旧三元组 ["C",1,"tv"] 及 JSON 对象）。"""
     txt = str(raw_text or "").strip()
     if "```" in txt:
         txt = re.sub(r"^```(?:json)?|```$", "", txt, flags=re.IGNORECASE | re.MULTILINE).strip()
-    conf = max(0.0, min(1.0, float(default_conf)))
-    sector_raw, near_raw, reason = "N", 0, "fallback"
+    fallback = (BEARING_SEARCH, 0, 0.0, "parse_fallback", "search")
+    conf = default_conf
+    mode_raw = "f"
     parsed = None
     for candidate in (txt, txt + '"]', txt + "]"):
         try:
@@ -339,41 +350,42 @@ def parse_vlm_output(raw_text, default_conf=0.8):
                 parsed = json.loads(m_obj.group(0))
             except ValueError:
                 parsed = None
-    if isinstance(parsed, list) and len(parsed) >= 2:
+    if isinstance(parsed, list) and len(parsed) in (3, 4):
         sector_raw = str(parsed[0]).strip()
-        near_raw = parsed[1]
-        if len(parsed) >= 3:
-            reason = str(parsed[2]).strip() or "ok"
-    elif isinstance(parsed, dict):
-        if "bearing_bin" in parsed and isinstance(parsed["bearing_bin"], int):
-            sector_raw = str(parsed["bearing_bin"])
+        if len(parsed) == 4:
+            _, mode_raw, near_raw, reason = parsed
         else:
-            sector_raw = str(parsed.get("sector", parsed.get("s", "N"))).strip()
+            _, near_raw, reason = parsed
+    elif isinstance(parsed, dict):
+        sector_raw = (str(parsed["bearing_bin"])
+                      if isinstance(parsed.get("bearing_bin"), int)
+                      else str(parsed.get("sector", parsed.get("s", "N"))).strip())
+        mode_raw = str(parsed.get("mode", parsed.get("goal_mode", "f"))).strip().lower()
         near_raw = parsed.get("near_goal", parsed.get("near", parsed.get("g", 0)))
         if "conf" in parsed or "c" in parsed:
-            raw_c = float(parsed.get("conf", parsed.get("c", conf)))
-            conf = raw_c / 10.0 if raw_c > 1.0 else raw_c
-            conf = max(0.0, min(1.0, conf))
-        reason = str(parsed.get("reason", parsed.get("r", parsed.get("why", "ok")))).strip() or "ok"
+            conf = parsed.get("conf", parsed.get("c", conf))
+        reason = parsed.get("reason", parsed.get("r", parsed.get("why", "ok")))
     else:
-        m = re.match(r'^\[\s*"([A-Za-z_-]+)"\s*,\s*([01])', txt)
-        if m:
-            sector_raw, near_raw, reason = m.group(1), int(m.group(2)), "regex_partial"
-        else:
-            return BEARING_SEARCH, 0, 0.0, "parse_fallback"
+        return fallback
 
-    bb = _SECTOR_TO_BIN.get(sector_raw.lower(), BEARING_SEARCH)
     try:
-        ng = 1 if int(bool(int(near_raw))) == 1 else 0
-    except (TypeError, ValueError):
-        ng = 1 if str(near_raw).lower() in ("true", "yes") else 0
-    if bb == BEARING_SEARCH:
-        ng = 0
-    return bb, ng, conf, reason[:64]
+        conf = float(conf)
+    except (TypeError, ValueError, OverflowError):
+        return fallback
+    if not math.isfinite(conf) or not 0 <= conf <= 10:
+        return fallback
+    conf = conf / 10 if conf > 1 else conf
+    mode = _GOAL_MODES.get(str(mode_raw).strip().lower())
+    if mode is None or type(near_raw) is not int or near_raw not in (0, 1):
+        return fallback
+    bb = _SECTOR_TO_BIN.get(sector_raw.lower(), BEARING_SEARCH)
+    if bb == BEARING_SEARCH or mode == "search":
+        return BEARING_SEARCH, 0, conf, str(reason).strip()[:64], "search"
+    return bb, near_raw if mode == "final" else 0, conf, str(reason).strip()[:64], mode
 
 
 class VisualLanguageGrounder:
-    """零特权视觉语言 Grounder：仅根据机载 RGB 帧历史与自然语言指令输出相对方位桶与近目标标志。"""
+    """零特权层次化视觉语言 Grounder：仅根据机载 RGB 与自然语言指令输出相对方位、阶段模式与近目标标志。"""
 
     DEFAULT_PYTHON = "/root/rivermind-data/uav_rgb/envs/vlm-venv/bin/python"
     DEFAULT_WORKER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vlm_grounder_worker.py")
@@ -381,6 +393,7 @@ class VisualLanguageGrounder:
     def __init__(self, model_path=None, python_bin=None, worker_cmd=None, timeout_s=180.0):
         import subprocess
         self.timeout_s = float(timeout_s)
+        self._recent_notes = []
         if worker_cmd is not None:
             cmd = list(worker_cmd)
         else:
@@ -401,15 +414,24 @@ class VisualLanguageGrounder:
             self.close()
             raise RuntimeError(f"VLM worker 未就绪: {ready_line}")
 
+    def reset_episode(self):
+        self._recent_notes.clear()
+
+    def note_action(self, action_name: str):
+        if not self._recent_notes:
+            return
+        last = self._recent_notes[-1]
+        if "->" not in last:
+            self._recent_notes[-1] = f"{last}->{action_name}"
+
     def _readline(self, timeout_s, stage):
         import select
         if self._proc is None or self._proc.stdout is None:
             raise RuntimeError("VLM worker 已关闭")
         rlist, _, _ = select.select([self._proc.stdout], [], [], timeout_s)
         if not rlist:
-            err = ""
             self.close()
-            raise TimeoutError(f"VLM worker {stage} 超时 ({timeout_s}s) {err}")
+            raise TimeoutError(f"VLM worker {stage} 超时 ({timeout_s}s)")
         line = self._proc.stdout.readline()
         if not line:
             err = self._proc.stderr.read() if self._proc.stderr else ""
@@ -417,39 +439,47 @@ class VisualLanguageGrounder:
             raise RuntimeError(f"VLM worker {stage} 提前退出: {err.strip()}")
         return line
 
-    def ground_step(self, rgb_history, instruction: str) -> VisualGrounding:
-        """严格零特权接口：仅接收机载 RGB 数组（单帧 HWC 或帧序列）与语言指令。"""
+    @staticmethod
+    def _encode_latest_frame_b64(rgb_history):
         import base64
         import io
-        import time
         import numpy as np
         from PIL import Image
 
-        text = str(instruction or "").strip()
-        if not text:
-            return VisualGrounding(BEARING_SEARCH, 0, 0.0, "empty_instruction", 0.0)
-        if isinstance(rgb_history, np.ndarray) and rgb_history.ndim == 3:
-            frames = [rgb_history]
-        else:
-            frames = list(rgb_history or ())
+        frames = [rgb_history] if (isinstance(rgb_history, np.ndarray) and rgb_history.ndim == 3) else list(rgb_history or ())
         if not frames:
-            return VisualGrounding(BEARING_SEARCH, 0, 0.0, "empty_rgb_history", 0.0)
-
-        t0 = time.perf_counter()
+            return None
         arr = np.asarray(frames[-1], dtype=np.uint8)
         if arr.ndim != 3 or arr.shape[2] != 3:
             raise ValueError(f"RGB 帧必须是 HxWx3 uint8，得到 {arr.shape}")
         buf = io.BytesIO()
         Image.fromarray(arr).save(buf, format="JPEG", quality=85)
-        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
 
-        req = json.dumps({"frames_b64": [b64], "instruction": text}, ensure_ascii=False)
+    def ground_step(self, rgb_history, instruction: str) -> VisualGrounding:
+        """严格零特权接口：仅接收机载 RGB 数组（单帧 HWC 或帧序列）与语言指令。"""
+        import time
+
+        text = str(instruction or "").strip()
+        if not text:
+            return VisualGrounding(BEARING_SEARCH, 0, 0.0, "empty_instruction", 0.0, "search")
+        b64 = self._encode_latest_frame_b64(rgb_history)
+        if b64 is None:
+            return VisualGrounding(BEARING_SEARCH, 0, 0.0, "empty_rgb_history", 0.0, "search")
+
+        mem = "; ".join(self._recent_notes[-3:]) if self._recent_notes else "none"
+        t0 = time.perf_counter()
+        req = json.dumps({"frames_b64": [b64], "instruction": text, "memory": mem}, ensure_ascii=False)
         self._proc.stdin.write(req + "\n")
         self._proc.stdin.flush()
         resp = json.loads(self._readline(min(self.timeout_s, 30.0), "ground_step"))
         ms = (time.perf_counter() - t0) * 1000.0
-        bb, ng, conf, reason = parse_vlm_output(resp.get("raw", ""), default_conf=resp.get("conf", 0.5))
-        return VisualGrounding(bb, ng, conf, reason, round(ms, 2))
+        bb, ng, conf, reason, goal_mode = parse_vlm_output(resp.get("raw", ""), default_conf=resp.get("conf", 0.5))
+        tag = "F" if goal_mode == "final" else ("S" if goal_mode == "subgoal" else "N")
+        self._recent_notes.append(f"{_BIN_SHORT.get(bb, 'N')}({tag}:{reason[:18]})")
+        if len(self._recent_notes) > 6:
+            self._recent_notes = self._recent_notes[-6:]
+        return VisualGrounding(bb, ng, conf, reason, round(ms, 2), goal_mode)
 
     def close(self):
         proc, self._proc = getattr(self, "_proc", None), None

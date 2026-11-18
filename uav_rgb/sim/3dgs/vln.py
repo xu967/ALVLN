@@ -117,7 +117,7 @@ def sage_ref_paths(scene, sage_vln_root=None):
 
 
 def episodes(scene, splits=None, types=None):
-    """scene.json 里所有 (航线, 指令) 组合，按航线、指令顺序。splits / types 给了就只留 SAGE split / 句式在其中的。"""
+    """返回单段指令集和显式版本化的 SAGE 多阶段任务。"""
     out = []
     for r, route in enumerate(scene.get("routes") or []):
         sage = route.get("vln") or route.get("sage") or {}
@@ -128,8 +128,37 @@ def episodes(scene, splits=None, types=None):
                 continue
             out.append({"key": f"{scene.get('name')}/{route.get('name')}/{k}",
                         "route_index": r, "route_name": route.get("name"), "instruction_index": k,
+                        "route_key": f"route:{r}",
                         "split": sage.get("split"), "type": ins.get("instruction_type"),
                         "text": ins["text"], "start_object": ins.get("start"), "goal_object": ins.get("end")})
+    for index, route in enumerate(scene.get("multi_stage_routes") or []):
+        if route.get("route_contract") != "sage.multi_stage.v2":
+            continue
+        stages = route.get("stages") or []
+        if len(stages) < 2 or not str(route.get("instruction") or "").strip():
+            continue
+        if splits and route.get("split") not in splits:
+            continue
+        if types and "Multi-stage" not in types:
+            continue
+        stage_waypoints = [
+            {"stage": int(stage.get("stage", stage_index)),
+             "waypoint": {axis: float(stage["waypoint"][axis]) for axis in ("x", "y")},
+             "goal_object": stage.get("goal_object"), "instruction": stage.get("instruction"),
+             "path_m": float(stage.get("path_m") or 0.0)}
+            for stage_index, stage in enumerate(stages)
+        ]
+        out.append({"key": f"{scene.get('name')}/{route.get('name')}/multi_stage",
+                    "route_index": len(scene.get("routes") or []) + index,
+                    "route_name": route.get("name"), "instruction_index": 0,
+                    "route_key": f"multi_stage:{index}", "route_contract": "sage.multi_stage.v2",
+                    "multi_stage_index": index, "stage_waypoints": stage_waypoints,
+                    "total_path_m": float(route.get("total_path_m") or
+                                          sum(stage["path_m"] for stage in stage_waypoints)),
+                    "ref_path": route.get("ref_path"), "split": route.get("split"),
+                    "type": "Multi-stage", "text": route["instruction"],
+                    "start_object": (stages[0] or {}).get("start_object"),
+                    "goal_object": stages[-1].get("goal_object")})
     return out
 
 
@@ -138,9 +167,13 @@ def one_per_route(eps, seed=0):
     各航线里指令的排列顺序不一致，所以先按句式名排序再轮换。"""
     by_route = {}
     for ep in eps:
-        by_route.setdefault(ep["route_index"], []).append(ep)
+        by_route.setdefault(ep.get("route_key", f"route:{ep['route_index']}"), []).append(ep)
     picked = []
-    for n, r in enumerate(sorted(by_route)):
+    def route_order(key):
+        kind, index = str(key).split(":", 1)
+        return (0 if kind == "route" else 1, int(index))
+
+    for n, r in enumerate(sorted(by_route, key=route_order)):
         group = sorted(by_route[r], key=lambda e: (str(e["type"]), e["instruction_index"]))
         picked.append(group[(n + seed) % len(group)])
     return picked
@@ -152,6 +185,25 @@ def trajectory(actions, oracle):
         return []
     p0 = actions[0]["pose_before"]
     return [(float(p0["x"]), float(p0["y"]))] + [(float(o["pose_gt"]["x"]), float(o["pose_gt"]["y"])) for o in oracle]
+
+
+def _segment_circle_entry(start, end, goal, radius, min_fraction=0.0):
+    """返回线段上从 min_fraction 起进入目标圆的最早比例，没有进入则返回 None。"""
+    dx, dy = end[0] - start[0], end[1] - start[1]
+    length_sq = dx * dx + dy * dy
+    if length_sq <= 1e-12:
+        return min_fraction if math.dist(start, goal) <= radius else None
+    projection = ((goal[0] - start[0]) * dx + (goal[1] - start[1]) * dy) / length_sq
+    closest = max(0.0, min(1.0, projection))
+    closest_x, closest_y = start[0] + closest * dx, start[1] + closest * dy
+    offset = math.hypot(closest_x - goal[0], closest_y - goal[1])
+    if offset > radius:
+        return None
+    half_width = math.sqrt(max(0.0, radius * radius - offset * offset) / length_sq)
+    entry, exit_at = max(0.0, projection - half_width), min(1.0, projection + half_width)
+    if exit_at < min_fraction or entry > 1.0:
+        return None
+    return max(entry, min_fraction)
 
 
 def _action_diagnostics(actions, path_m):
@@ -183,7 +235,7 @@ def _action_diagnostics(actions, path_m):
 
 
 def episode_metrics(actions, oracle, goal, radius, stopped, shortest_m=None,
-                    ref_path=None, ndtw_step_m=NDTW_STEP_M):
+                    ref_path=None, ndtw_step_m=NDTW_STEP_M, stage_goals=None):
     """单集 VLN 指标。actions / oracle 是 run_episode 写的逐步记录；stopped = 智能体自己喊了停。"""
     pts = trajectory(actions, oracle)
     if not pts:
@@ -196,7 +248,35 @@ def episode_metrics(actions, oracle, goal, radius, stopped, shortest_m=None,
     safe = dist if first_hit is None else dist[:first_hit + 1]      # 撞的那一步结束时已在障碍里，不算进过
     path = sum(math.hypot(x1 - x0, y1 - y0) for (x0, y0), (x1, y1) in zip(pts, pts[1:]))
     ne = dist[-1]
-    success = bool(stopped and not collided and ne <= radius)
+    stage_goals = stage_goals or []
+    stage_count = len(stage_goals)
+    stage_goals_xy = [(float(stage["x"]), float(stage["y"])) for stage in stage_goals]
+    stage_hits = [False] * stage_count
+    stage_reached = 0
+    for start_point, end_point in zip(safe_pts, safe_pts[1:]):
+        fraction = 0.0
+        while stage_reached < stage_count:
+            for index, stage_goal in enumerate(stage_goals_xy):
+                if _segment_circle_entry(start_point, end_point, stage_goal, radius) is not None:
+                    stage_hits[index] = True
+            fraction = _segment_circle_entry(start_point, end_point, stage_goals_xy[stage_reached], radius, fraction)
+            if fraction is None:
+                break
+            stage_hits[stage_reached] = True
+            stage_reached += 1
+    if safe_pts:
+        for index, stage_goal in enumerate(stage_goals_xy):
+            if math.dist(safe_pts[-1], stage_goal) <= radius:
+                stage_hits[index] = True
+    all_stages_reached = stage_reached == stage_count
+    stage_csr = None
+    if stage_count:
+        csr_total = 0.0
+        for index, hit in enumerate(stage_hits):
+            previous_hit = stage_hits[index - 1] if index else True
+            csr_total += float(hit) * (1.0 + (stage_count - 1) * float(previous_hit))
+        stage_csr = csr_total / (stage_count * stage_count)
+    success = bool(stopped and not collided and ne <= radius and all_stages_reached)
     # 控制平顺性诊断不参与 SR/SPL；动作缺口保持在原位置，不能跨缺口统计切换。
     motion = _action_diagnostics(actions, path)
     step_count = len(actions)
@@ -206,9 +286,37 @@ def episode_metrics(actions, oracle, goal, radius, stopped, shortest_m=None,
     ndtw, sdtw = (ndtw_sdtw(resample_polyline(safe_pts, ndtw_step_m),
                             resample_polyline(ref_path, ndtw_step_m), radius, success)
                   if ref_path else (None, None))
-    return {"success": success, "oracle_success": min(safe) <= radius, "ne_m": ne,
+    metrics = {"success": success, "oracle_success": (all_stages_reached if stage_count else min(safe) <= radius), "ne_m": ne,
             "spl": spl, "ndtw": ndtw, "sdtw": sdtw, "path_m": path, "shortest_m": shortest_m,
             "stopped": bool(stopped), "collision": collided, "steps": step_count, **motion}
+    if stage_count:
+        metrics.update({"stage_count": stage_count, "stage_reached_count": stage_reached,
+                        "stage_hit_count": sum(stage_hits),
+                        "stage_hit_flags": stage_hits,
+                        "stage_sr": sum(stage_hits) / stage_count,
+                        "stage_csr": stage_csr,
+                        "stage_ordered_fraction": stage_reached / stage_count,
+                        "stage_task_success": success})
+    return metrics
+
+
+def summarize_stages(rows, failures=()):
+    """多阶段任务使用 LH-VLN ISR/CSR，并另报严格端到端 stage_task_sr。"""
+    stage_rows = [row for row in rows if row.get("route_contract") == "sage.multi_stage.v2"]
+    stage_failures = [row for row in failures if row.get("route_contract") == "sage.multi_stage.v2"]
+    requested = len(stage_rows) + len(stage_failures)
+    total_stages = sum(row.get("stage_count", len(row.get("stage_waypoints") or [])) for row in stage_rows)
+    total_stages += sum(len(row.get("stage_waypoints") or []) for row in stage_failures)
+    reached = sum(row.get("stage_hit_count", 0) for row in stage_rows)
+    complete = sum(bool(row.get("stage_task_success")) for row in stage_rows)
+    csr_values = [row.get("stage_csr") for row in stage_rows if row.get("stage_csr") is not None]
+    return {"n_requested": requested, "n_valid": len(stage_rows), "n_stages_requested": total_stages,
+            "stage_sr": reached / total_stages if total_stages else None,
+            "stage_csr": sum(csr_values) / requested if requested else None,
+            "stage_task_sr": complete / requested if requested else None,
+            "definitions": {"stage_sr": "不要求次序，各阶段命中数 / 请求阶段数",
+            "stage_csr": "LH-VLN CSR；按任务平均 Σ s_i(1+(n-1)s_(i-1))/n²，首阶段前驱取 1。失败集计 0",
+                            "stage_task_sr": "全阶段按序达成、无碰撞且显式停在末阶段的任务数 / 请求任务数"}}
 
 
 def summarize(rows, failures=()):

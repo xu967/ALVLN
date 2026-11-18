@@ -133,15 +133,26 @@ class ReactiveBearingPolicy:
         self.last_bearing_bin = None
         self.last_near_goal = None
         self.avoid_turn = None
+        self.turned_toward_target = False
+        self.last_decision = {}
 
     def note_executed(self, action):
-        del action
+        note_step = getattr(self.goal_fn, "note_step", None)
+        if note_step is not None:
+            note_step(action)
+        self.turned_toward_target |= (
+            self.last_bearing_bin in (1, 7)
+            and action == (YAW_LEFT if self.last_bearing_bin == 1 else YAW_RIGHT)
+        )
 
     def __call__(self, rgb, depth, state):
         del state  # 严禁读取真值位姿
         if getattr(depth, "ndim", 0) != 2 or min(depth.shape) < 5:
             raise ValueError(f"reactive_bearing 需要二维深度图，得到 {getattr(depth, 'shape', None)}")
         bb, ng = self.goal_fn(rgb, None)
+        if self.turned_toward_target and bb in (1, 7):
+            bb = 0
+        self.turned_toward_target = False
         self.last_bearing_bin, self.last_near_goal = int(bb), int(ng)
         h, w = depth.shape
         y0, y1 = int(h * 0.4), int(h * 0.6)
@@ -150,20 +161,43 @@ class ReactiveBearingPolicy:
         center = _sector_min(depth, x1, x2, y0, y1)
         right = _sector_min(depth, x2, w, y0, y1)
 
-        if self.last_near_goal == 1 and (center <= 0.0 or center <= self.stop_depth_m):
-            self.stop_requested = True
-            return SAFE_NEUTRAL, None
-        self.stop_requested = False
-        if self.last_bearing_bin == 8:
-            return YAW_LEFT, None
-        if 1 <= self.last_bearing_bin <= 3:
-            return YAW_LEFT, None
-        if 5 <= self.last_bearing_bin <= 7:
-            return YAW_RIGHT, None
-        if center <= 0.0:
-            return SAFE_NEUTRAL, None
-        if center < self.emergency_m:
-            return (YAW_LEFT if left >= right else YAW_RIGHT), None
-        if center < self.caution_m and max(left, right) > center + 0.25:
-            return (YAW_LEFT if left >= right else YAW_RIGHT), None
-        return FORWARD_SLOW, None
+        if self.last_bearing_bin == 8 or 1 <= self.last_bearing_bin <= 3:
+            proposed = YAW_LEFT
+        elif 5 <= self.last_bearing_bin <= 7:
+            proposed = YAW_RIGHT
+        else:
+            proposed = FORWARD_SLOW
+
+        self.stop_requested = bool(self.last_near_goal == 1
+                                   and (center <= 0.0 or center <= self.stop_depth_m))
+        if self.stop_requested:
+            action = SAFE_NEUTRAL
+        elif self.last_bearing_bin == 8 or 1 <= self.last_bearing_bin <= 3:
+            action = YAW_LEFT
+        elif 5 <= self.last_bearing_bin <= 7:
+            action = YAW_RIGHT
+        elif center <= 0.0:
+            action = SAFE_NEUTRAL
+        elif center < self.emergency_m:
+            action = YAW_LEFT if left >= right else YAW_RIGHT
+        elif center < self.caution_m and max(left, right) > center + 0.25:
+            action = YAW_LEFT if left >= right else YAW_RIGHT
+        else:
+            action = FORWARD_SLOW
+        grounding = getattr(self.goal_fn, "last_vg", None)
+        goal_mode = getattr(grounding, "goal_mode", None)
+        goal_reason = getattr(grounding, "reason", None)
+        confidence = getattr(grounding, "conf", None)
+        goal_mode = goal_mode if isinstance(goal_mode, str) else None
+        goal_reason = goal_reason if isinstance(goal_reason, str) else None
+        confidence = (float(confidence) if isinstance(confidence, (int, float))
+                      and math.isfinite(float(confidence)) else None)
+        self.last_decision = {
+            "action_proposed": proposed,
+            "action_intervention": "depth_avoidance" if action != proposed and not self.stop_requested else None,
+            "stop_source": "visual_target" if self.stop_requested else None,
+            "grounding_mode": goal_mode,
+            "grounding_reason": goal_reason,
+            "grounding_conf": confidence,
+        }
+        return action, None

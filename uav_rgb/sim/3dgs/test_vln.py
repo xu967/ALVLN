@@ -5,6 +5,8 @@
 """
 import importlib
 import copy
+import contextlib
+import io
 import json
 import math
 import os
@@ -59,6 +61,23 @@ class TestEpisodes(unittest.TestCase):
         self.assertEqual([e["key"] for e in vln.episodes(SCENE, splits=["test_Instruction_Unseen"])], ["s/r1/0"])
         self.assertEqual([e["key"] for e in vln.episodes(SCENE, types=["Area-based"])], ["s/r0/1"])
 
+    def test_only_versioned_sage_multi_stage_routes_are_included(self):
+        scene = copy.deepcopy(SCENE)
+        scene["multi_stage_routes"] = [
+            {"name": "long", "route_contract": "sage.multi_stage.v2", "split": "train",
+             "instruction": "Go past the sofa, then stop at the lamp.",
+             "ref_path": [[0, 0], [2, 0]], "stages": [
+                 {"stage": 0, "waypoint": {"x": 1, "y": 0}, "goal_object": "sofa"},
+                 {"stage": 1, "waypoint": {"x": 2, "y": 0}, "goal_object": "lamp"}]},
+            {"name": "old", "route_contract": "old", "split": "train", "instruction": "ignore",
+             "stages": [{"waypoint": {"x": 1, "y": 0}}, {"waypoint": {"x": 2, "y": 0}}]},
+        ]
+        eps = vln.episodes(scene)
+        self.assertEqual(eps[-1]["route_contract"], "sage.multi_stage.v2")
+        self.assertEqual(eps[-1]["stage_waypoints"][-1]["goal_object"], "lamp")
+        self.assertEqual([ep["type"] for ep in vln.episodes(scene, types=["Multi-stage"])], ["Multi-stage"])
+        self.assertEqual(len(vln.episodes(scene, splits=["test_Instruction_Unseen"])), 1)
+
     def test_one_per_route_rotates_by_type_name(self):
         # r0 按句式名排序是 [Area-based(1), Attribute-based(0)]，与指令在航线里的原顺序无关
         eps = vln.episodes(SCENE)
@@ -84,6 +103,46 @@ class TestMetrics(unittest.TestCase):
         self.assertAlmostEqual(m["ne_m"], 0.5)
         self.assertAlmostEqual(m["path_m"], 3.5)
         self.assertAlmostEqual(m["spl"], 3.0 / 3.5)
+
+    def test_multistage_requires_each_waypoint_in_order_and_explicit_final_stop(self):
+        goals = [{"x": 2.0, "y": 1.0}, {"x": 4.0, "y": 0.0}]
+        actions, oracle = _steps([(0, 0), (2, 0), (4, 0)])
+        complete = vln.episode_metrics(actions, oracle, GOAL, 0.2, stopped=True,
+                                       stage_goals=[{"x": 2.0, "y": 0.0}, goals[-1]])
+        self.assertTrue(complete["success"])
+        self.assertEqual((complete["stage_reached_count"], complete["stage_sr"], complete["stage_csr"]),
+                         (2, 1.0, 1.0))
+        missed = vln.episode_metrics(actions, oracle, GOAL, 0.2, stopped=True, stage_goals=goals)
+        self.assertFalse(missed["success"])
+        self.assertEqual(missed["stage_reached_count"], 0)
+        self.assertEqual((missed["stage_hit_count"], missed["stage_csr"]), (1, 0.25))
+        reverse, reverse_oracle = _steps([(0, 0), (2, 0), (4, 0)])
+        unordered = vln.episode_metrics(reverse, reverse_oracle, GOAL, 0.2,
+                                        stopped=True, stage_goals=[{"x": 4.0, "y": 0.0},
+                                                                   {"x": 2.0, "y": 0.0}])
+        self.assertEqual((unordered["stage_hit_count"], unordered["stage_reached_count"]), (2, 1))
+        no_stop = vln.episode_metrics(actions, oracle, GOAL, 0.2, stopped=False,
+                                      stage_goals=[{"x": 2.0, "y": 0.0}, goals[-1]])
+        self.assertTrue(no_stop["oracle_success"])
+        self.assertFalse(no_stop["success"])
+        self.assertEqual(no_stop["stage_csr"], 1.0)
+        self.assertFalse(no_stop["stage_task_success"])
+        skipped = vln.episode_metrics(actions, oracle, GOAL, 0.2, stopped=True,
+                                      stage_goals=[{"x": 3.0, "y": 0.0}, {"x": 2.0, "y": 0.0}])
+        self.assertEqual((skipped["stage_hit_count"], skipped["stage_reached_count"], skipped["stage_csr"]),
+                         (2, 1, 1.0))
+        self.assertFalse(skipped["success"])
+
+    def test_stage_summary_uses_local_names_and_requested_denominator(self):
+        rows = [{"route_contract": "sage.multi_stage.v2", "stage_count": 2,
+                 "stage_reached_count": 1, "stage_hit_count": 1, "stage_csr": 0.25,
+                 "stage_task_success": False}]
+        failures = [{"route_contract": "sage.multi_stage.v2", "stage_waypoints": [{}, {}]}]
+        report = vln.summarize_stages(rows, failures)
+        self.assertEqual((report["n_requested"], report["n_stages_requested"]), (2, 4))
+        self.assertEqual(report["stage_sr"], 0.25)
+        self.assertEqual(report["stage_csr"], 0.125)
+        self.assertEqual(report["stage_task_sr"], 0.0)
 
     def test_flying_through_without_stop_is_only_oracle_success(self):
         # 旧 3dgs.pilot.v2 判据会算成功；VLN 要求自己停在半径里
@@ -397,10 +456,8 @@ class TestExplicitStop(unittest.TestCase):
     def test_conflicting_or_missing_stop_contract_rejected(self):
         with self.assertRaisesRegex(ValueError, "互斥"):
             self.run_policy(Scripted([0]), stop_after_safe=3)
-        guarded = importlib.import_module("sim.3dgs.guard").OracleGuardedPolicy(
-            collect.ForwardPolicy(), lambda x, y: (x + 1, y), 0)
         with self.assertRaisesRegex(ValueError, "bool stop_requested"):
-            self.run_policy(guarded)
+            self.run_policy(lambda _rgb, _depth, _st: (collect.FORWARD_SLOW, None))
 
     def test_teacher_reset_failure_and_safety_wait_do_not_request_stop(self):
         planner = mock.Mock()
@@ -646,6 +703,230 @@ class TestRunner(unittest.TestCase):
         _, _, _, calls = self.run_scene()
         self.assertEqual(calls[0].args[1][0]["pose_gt"]["x"], 0.0)
 
+    def test_multistage_runner_uses_route_geometry_but_vlm_bearing_policy(self):
+        scene = {"name": "s", "ply_path": "unused.ply", "reach_radius_m": 0.5,
+                 "max_steps": 8, "routes": [], "collision": {"source": "mesh"},
+                 "multi_stage_routes": [{
+                     "name": "long", "route_contract": "sage.multi_stage.v2", "split": "train",
+                     "spawn": {"x": 0.0, "y": 0.0, "z": 2.0},
+                     "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0}, "max_steps": 20,
+                     "instruction": "First go to the chair, then stop at the lamp.", "path_m": 4.0,
+                     "ref_path": [[0.0, 0.0], [2.0, 0.0], [4.0, 0.0]],
+                     "stages": [
+                         {"stage": 0, "waypoint": {"x": 2.0, "y": 0.0}, "goal_object": "chair",
+                          "instruction": "Go to the chair.", "path_m": 2.0},
+                         {"stage": 1, "waypoint": {"x": 4.0, "y": 0.0}, "goal_object": "lamp",
+                          "instruction": "Then go to the lamp.", "path_m": 2.0},
+                     ]}], "step_s": 0.5}
+        actions, oracle = _steps([(0, 0), (2, 0), (4, 0)])
+        manifest = {"stopped_by_agent": True,
+                    "validity": {"physics_verified": True, "camera_verified": True}}
+        args = SimpleNamespace(split=None, all_instructions=True, seed=0, limit=0, out="unused", hold=0.5,
+                               policy="reactive", videos=0, stop_mode="explicit", grounder="vlm",
+                               counterfactual="correct", blind_rgb=False, collect=False,
+                               teacher_clearance="ray")
+
+        class Tracker:
+            trace = []
+
+            def __call__(self, _rgb, _state):
+                return 0, 0
+
+        tracker = None
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(scene_mod, "load_scene", return_value=scene))
+            stack.enter_context(mock.patch.object(scene_mod, "read_gaussian_ply", return_value=None))
+            stack.enter_context(mock.patch.object(runner.collision_mod, "from_scene", return_value=None))
+            stack.enter_context(mock.patch.object(runner.renderer_mod, "make_renderer", return_value=None))
+            stack.enter_context(mock.patch.object(runner.planner_mod, "OccPlanner", return_value=None))
+            stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
+            run = stack.enter_context(mock.patch.object(collect, "run_episode", return_value=(manifest, None)))
+            stack.enter_context(mock.patch.object(runner, "_read_jsonl", side_effect=[actions, oracle]))
+            shortest = stack.enter_context(mock.patch.object(runner, "route_shortest_path_m", return_value=4.0))
+            rows, failures = runner.run_scene("fixture.json", args, SimpleNamespace(camera_mount={}),
+                                               vlm_grounder=object())
+        self.assertEqual((len(rows), len(failures)), (1, 0), failures)
+        call = run.call_args
+        self.assertEqual((call.args[0]["spawn"]["x"], call.args[0]["waypoint"]["x"], call.args[0]["max_steps"]),
+                         (0.0, 4.0, 20))
+        policy = call.args[5]
+        self.assertIsInstance(policy, reactive.ReactiveBearingPolicy)
+        self.assertIsInstance(policy.goal_fn, runner.VlmBeliefTracker)
+        self.assertFalse(hasattr(policy, "goal_x"))
+        self.assertTrue(rows[0]["success"])
+        self.assertEqual((rows[0]["stage_reached_count"], rows[0]["stage_csr"],
+                          rows[0]["stage_task_success"]), (2, 1.0, True))
+        self.assertEqual(policy.goal_fn.stage_instructions,
+                         [stage["instruction"] for stage in scene["multi_stage_routes"][0]["stages"]])
+        self.assertEqual((rows[0]["shortest_m"], shortest.call_count), (4.0, 0))
+
+    def test_manual_instruction_uses_vlm_without_waypoint_scoring(self):
+        scene = {"name": "s", "ply_path": "unused.ply", "reach_radius_m": 0.5,
+                 "max_steps": 8, "routes": [{"name": "stored", "spawn": {"x": 0.0, "y": 0.0, "z": 2.0},
+                                             "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0}}],
+                 "collision": {"source": "mesh"}, "step_s": 0.5,
+                 "spawn": {"x": 0.0, "y": 0.0, "z": 2.0},
+                 "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0}}
+        actions, oracle = _steps([(0, 0), (1, 0), (2, 0)])
+        manifest = {"stopped_by_agent": True, "terminal_reason": "agent_stop",
+                    "validity": {"physics_verified": True, "camera_verified": True}}
+        args = SimpleNamespace(split=None, all_instructions=False, seed=0, limit=0, out="unused", hold=0.5,
+                               policy="reactive", videos=1, stop_mode="explicit", grounder="vlm",
+                               counterfactual="correct", blind_rgb=False, collect=False,
+                               teacher_clearance="ray", instruction="飞到走廊尽头，然后悬停",
+                               spawn=(1.0, 2.0, 2.0), spawn_yaw_deg=270.0)
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(scene_mod, "load_scene", return_value=scene))
+            stack.enter_context(mock.patch.object(scene_mod, "read_gaussian_ply", return_value=None))
+            apply_route = stack.enter_context(mock.patch.object(scene_mod, "apply_route"))
+            occupancy = SimpleNamespace(raw=np.zeros((50, 50, 10), dtype=bool), origin=np.zeros(3),
+                                        shape=(50, 50, 10), voxel=0.1, collision_model="mesh",
+                                        collides=mock.Mock(return_value=False))
+            stack.enter_context(mock.patch.object(runner.collision_mod, "from_scene", return_value=occupancy))
+            stack.enter_context(mock.patch.object(runner.renderer_mod, "make_renderer", return_value=None))
+            stack.enter_context(mock.patch.object(runner.planner_mod, "OccPlanner", return_value=None))
+            stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
+            run = stack.enter_context(mock.patch.object(collect, "run_episode", return_value=(manifest, None)))
+            stack.enter_context(mock.patch.object(runner, "_read_jsonl", side_effect=[actions, oracle]))
+            shortest = stack.enter_context(mock.patch.object(runner, "route_shortest_path_m"))
+            compose = stack.enter_context(mock.patch.object(
+                runner.video_mod, "compose_views_video", return_value={"video": "unused.mp4"}))
+            rows, failures = runner.run_scene("fixture.json", args, SimpleNamespace(camera_mount={}),
+                                               vlm_grounder=object())
+        self.assertEqual((len(rows), failures), (1, []))
+        apply_route.assert_not_called()
+        shortest.assert_not_called()
+        self.assertEqual(run.call_args.args[0]["spawn"],
+                         {"x": 1.0, "y": 2.0, "z": 2.0, "yaw_deg": 270.0})
+        self.assertEqual(run.call_args.args[0]["vln"]["supplied_text"], args.instruction)
+        self.assertIsInstance(run.call_args.args[5], reactive.ReactiveBearingPolicy)
+        self.assertEqual(run.call_args.args[5].goal_fn.instruction, args.instruction)
+        self.assertIsNone(rows[0]["success"])
+        self.assertIsNone(rows[0]["ne_m"])
+        self.assertEqual(rows[0]["path_m"], 2.0)
+        self.assertFalse(rows[0]["collision"])
+        self.assertEqual(compose.call_args.kwargs["goal_visible"], False)
+
+    def test_manual_spawn_collision_is_reported_before_simulator_starts(self):
+        scene = {"name": "s", "ply_path": "unused.ply", "max_steps": 8,
+                 "routes": [], "collision": {"source": "mesh"},
+                 "spawn": {"x": 0.0, "y": 0.0, "z": 2.0},
+                 "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0}}
+        args = SimpleNamespace(split=None, all_instructions=False, seed=0, limit=0, out="unused", hold=0.5,
+                               policy="reactive", videos=0, stop_mode="explicit", grounder="vlm",
+                               counterfactual="correct", blind_rgb=False, collect=False,
+                               teacher_clearance="ray", instruction="飞到走廊尽头", spawn=(1.0, 2.0, 2.0))
+        occ = SimpleNamespace(raw=np.zeros((50, 50, 10), dtype=bool), origin=np.zeros(3),
+                              shape=(50, 50, 10), voxel=0.1, collision_model="v2",
+                              spawn_ok=mock.Mock(return_value=False))
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(scene_mod, "load_scene", return_value=scene))
+            stack.enter_context(mock.patch.object(scene_mod, "read_gaussian_ply", return_value=None))
+            stack.enter_context(mock.patch.object(runner.collision_mod, "from_scene", return_value=occ))
+            renderer = stack.enter_context(mock.patch.object(runner.renderer_mod, "make_renderer"))
+            run = stack.enter_context(mock.patch.object(collect, "run_episode"))
+            stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
+            rows, failures = runner.run_scene("fixture.json", args, SimpleNamespace(camera_mount={}),
+                                               vlm_grounder=object())
+        self.assertEqual(rows, [])
+        self.assertIn("碰撞代理范围内或与占据代理冲突", failures[0]["error"])
+        renderer.assert_not_called()
+        run.assert_not_called()
+
+    def test_manual_spawn_outside_occupancy_bounds_is_rejected(self):
+        scene = {"name": "s", "ply_path": "unused.ply", "max_steps": 8,
+                 "routes": [], "collision": {"source": "mesh"},
+                 "spawn": {"x": 0.0, "y": 0.0, "z": 2.0},
+                 "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0}}
+        args = SimpleNamespace(split=None, all_instructions=False, seed=0, limit=0, out="unused", hold=0.5,
+                               policy="reactive", videos=0, stop_mode="explicit", grounder="vlm",
+                               counterfactual="correct", blind_rgb=False, collect=False,
+                               teacher_clearance="ray", instruction="Fly to the sofa.", spawn=(8.0, 8.0, 2.0))
+        occ = SimpleNamespace(raw=np.zeros((50, 50, 10), dtype=bool), origin=np.zeros(3),
+                              shape=(50, 50, 10), voxel=0.1, collision_model="v2",
+                              spawn_ok=mock.Mock(return_value=True))
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(scene_mod, "load_scene", return_value=scene))
+            stack.enter_context(mock.patch.object(scene_mod, "read_gaussian_ply", return_value=None))
+            stack.enter_context(mock.patch.object(runner.collision_mod, "from_scene", return_value=occ))
+            renderer = stack.enter_context(mock.patch.object(runner.renderer_mod, "make_renderer"))
+            run = stack.enter_context(mock.patch.object(collect, "run_episode"))
+            stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
+            rows, failures = runner.run_scene("fixture.json", args, SimpleNamespace(camera_mount={}),
+                                               vlm_grounder=object())
+        self.assertEqual(rows, [])
+        self.assertIn("碰撞代理范围内", failures[0]["error"])
+        renderer.assert_not_called()
+        run.assert_not_called()
+
+    def test_manual_spawn_rejects_insufficient_takeoff_drift_clearance(self):
+        scene = {"name": "s", "ply_path": "unused.ply", "max_steps": 8,
+                 "routes": [], "collision": {"source": "mesh"},
+                 "spawn": {"x": 0.0, "y": 0.0, "z": 2.0},
+                 "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0}}
+        args = SimpleNamespace(split=None, all_instructions=False, seed=0, limit=0,
+                               out="unused", hold=0.5, policy="reactive", videos=0,
+                               stop_mode="explicit", grounder="vlm", counterfactual="correct",
+                               blind_rgb=False, collect=False, teacher_clearance="ray",
+                               instruction="Fly through the doorway.", spawn=None)
+        occupancy = SimpleNamespace(
+            raw=np.zeros((50, 50, 10), dtype=bool), origin=np.zeros(3), shape=(50, 50, 10),
+            voxel=0.1, collision_model="v1", collides=mock.Mock(return_value=False),
+            clearance=mock.Mock(return_value=0.18), body_radius=0.102, spawn_drift_margin=0.105)
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(scene_mod, "load_scene", return_value=scene))
+            stack.enter_context(mock.patch.object(scene_mod, "read_gaussian_ply", return_value=None))
+            stack.enter_context(mock.patch.object(runner.collision_mod, "from_scene", return_value=occupancy))
+            renderer = stack.enter_context(mock.patch.object(runner.renderer_mod, "make_renderer"))
+            run = stack.enter_context(mock.patch.object(collect, "run_episode"))
+            stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
+            rows, failures = runner.run_scene("fixture.json", args, SimpleNamespace(camera_mount={}),
+                                               vlm_grounder=object())
+        self.assertEqual(rows, [])
+        self.assertIn("起飞净空不足", failures[0]["error"])
+        renderer.assert_not_called()
+        run.assert_not_called()
+
+    def test_manual_student_rejects_checkpoint_without_vln_condition_before_vlm_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ckpt = os.path.join(tmp, "student.bin")
+            with open(ckpt, "wb") as f:
+                f.write(b"fixture")
+            student = SimpleNamespace(prev_dim=4, close=mock.Mock())
+            fake_module = SimpleNamespace(StudentPolicy=mock.Mock(return_value=student))
+            vlm = mock.Mock()
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.dict(sys.modules, {"student": fake_module}))
+                stack.enter_context(mock.patch.object(runner.grounder_mod, "VisualLanguageGrounder", vlm))
+                stack.enter_context(mock.patch.object(
+                    runner.CfSitlParams, "from_json", return_value=SimpleNamespace(profile=lambda: "test")))
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr), self.assertRaises(SystemExit) as caught:
+                    runner.main(["--scene", "fixture", "--policy", "student", "--ckpt", ckpt,
+                                 "--grounder", "vlm", "--instruction", "Go to the sofa.",
+                                 "--out", os.path.join(tmp, "out")])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("prev_dim=15", stderr.getvalue())
+            vlm.assert_not_called()
+            student.close.assert_called_once_with()
+
+    def test_multistage_runner_rejects_coordinate_teacher_policy(self):
+        scene = {"name": "s", "ply_path": "unused.ply", "collision": {"source": "mesh"},
+                 "routes": [], "multi_stage_routes": [{
+            "name": "long", "route_contract": "sage.multi_stage.v2", "split": "train",
+            "instruction": "go then stop", "stages": [
+                {"stage": 0, "waypoint": {"x": 1, "y": 0}},
+                {"stage": 1, "waypoint": {"x": 2, "y": 0}}]}]}
+        args = SimpleNamespace(split=None, all_instructions=True, seed=0, limit=0,
+                               out="unused", hold=0.5, policy="teacher", videos=0,
+                               stop_mode="explicit", grounder="none")
+        with mock.patch.object(scene_mod, "load_scene", return_value=scene), \
+                mock.patch.object(collect, "_sha256", return_value="fixture-ply"):
+            rows, failures = runner.run_scene("fixture.json", args, None)
+        self.assertEqual(rows, [])
+        self.assertEqual(failures[0]["route_contract"], "sage.multi_stage.v2")
+        self.assertIn("需要 --grounder vlm", failures[0]["error"])
+
     def test_exception_error_and_invalid_physics_are_failures(self):
         for outcome in (RuntimeError("renderer broke"), ({"stopped_by_agent": True}, "copy failed"),
                         ({"stopped_by_agent": True, "validity": {"physics_verified": False}}, None)):
@@ -703,6 +984,177 @@ class TestRunner(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 runner.main(["--scene", "fixture", "--policy", "teacher", "--out", "unused", flag, "-1"])
             self.assertEqual(caught.exception.code, 2)
+
+    def test_spawn_yaw_requires_finite_value_and_manual_instruction(self):
+        with self.assertRaises(SystemExit) as caught:
+            runner.main(["--scene", "fixture", "--policy", "reactive", "--grounder", "vlm",
+                         "--instruction", "Find the sofa.", "--spawn-yaw-deg", "nan", "--out", "unused"])
+        self.assertEqual(caught.exception.code, 2)
+        with self.assertRaises(SystemExit) as caught:
+            runner.main(["--scene", "fixture", "--policy", "teacher", "--spawn-yaw-deg", "90", "--out", "unused"])
+        self.assertEqual(caught.exception.code, 2)
+
+    def test_vlm_belief_tracker_one_miss_hysteresis_prevents_7_8_limit_cycle(self):
+        grounder_mod = importlib.import_module("sim.3dgs.grounder")
+        seq = [
+            grounder_mod.VisualGrounding(8, 0, 0.90, "unseen_spawn", 4.0, "search"),    # step 0: 未见过目标 -> 立即 8 扫描
+            grounder_mod.VisualGrounding(7, 0, 0.88, "doorway_right", 4.0, "subgoal"),  # step 2: 右侧见门洞子目标 -> 7 (不锁 final)
+            grounder_mod.VisualGrounding(8, 0, 0.60, "transient_miss", 4.0, "search"),  # step 4: 首次漏检 -> 滞回置 0 推进，不回甩 8
+            grounder_mod.VisualGrounding(8, 0, 0.85, "second_miss", 4.0, "search"),     # step 6: 连续二次漏检 -> 切回 8 搜索
+            grounder_mod.VisualGrounding(0, 1, 0.94, "sofa", 4.0, "final"),             # step 8: 首次命中只记录证据
+            grounder_mod.VisualGrounding(0, 1, 0.94, "sofa", 4.0, "final"),             # step 10: 同一目标新观测确认 STOP
+        ]
+        mock_vlm = mock.Mock()
+        mock_vlm.ground_step.side_effect = seq
+        tracker = runner.VlmBeliefTracker(mock_vlm, "Fly to the sofa.", update_every=2)
+        rgb = np.zeros((32, 32, 3), dtype=np.uint8)
+        outputs = []
+        for step in range(11):
+            outputs.append(tracker(rgb, None))
+            if step == 2:
+                tracker.note_step(3)
+        self.assertEqual(outputs, [
+            (8, 0),  # step 0: 初始扫描
+            (8, 0),  # step 1: 延续扫描
+            (7, 0),  # step 2: 右转对准子目标门洞
+            (0, 0),  # step 3: 奇数步回正防过冲
+            (0, 0),  # step 4: 首次漏检保持 0 前进（消除 7<->8 极限环）
+            (0, 0),  # step 5: 延续 0 前进
+            (8, 0),  # step 6: 连续漏检 >= 2 进入搜索 8
+            (8, 0),  # step 7: 延续搜索 8
+            (0, 0),  # step 8: 首次最终目标近景只记录证据
+            (0, 0),  # step 9: VLM 更新前沿用非停止动作
+            (0, 1),  # step 10: 同一目标第二次近景证据确认 STOP
+        ])
+        self.assertEqual(tracker.trace[1]["goal_mode"], "subgoal")
+        self.assertFalse(tracker.trace[1]["confirmed_target"])
+        self.assertEqual(tracker.trace[-1]["goal_mode"], "final")
+        self.assertTrue(tracker.trace[-1]["confirmed_target"])
+        self.assertEqual([t["miss_streak"] for t in tracker.trace], [1, 0, 1, 2, 0, 0])
+
+    def test_reactive_bearing_commits_executed_turn_to_tracker(self):
+        goal_fn = mock.Mock(return_value=(1, 0))
+        policy = reactive.ReactiveBearingPolicy(goal_fn)
+        depth = np.full((10, 12), 4.0, dtype=np.float32)
+        state = SimpleNamespace(x=0.0, y=0.0, yaw=0.0)
+        first_action, _ = policy(None, depth, state)
+        self.assertEqual(first_action, dyn3dgs.YAW_LEFT)
+        policy.note_executed(dyn3dgs.YAW_LEFT)
+        goal_fn.note_step.assert_called_once_with(dyn3dgs.YAW_LEFT)
+        second_action, _ = policy(None, depth, state)
+        self.assertEqual(second_action, dyn3dgs.FORWARD_SLOW)
+
+    def test_reactive_bearing_records_depth_intervention(self):
+        grounder_mod = importlib.import_module("sim.3dgs.grounder")
+        goal_fn = mock.Mock(return_value=(0, 0))
+        goal_fn.last_vg = grounder_mod.VisualGrounding(0, 0, 0.7, "doorway", 1.0, "subgoal")
+        policy = reactive.ReactiveBearingPolicy(goal_fn)
+        depth = np.full((10, 12), 4.0, dtype=np.float32)
+        depth[4:6, 4:8] = 0.5
+        depth[4:6, 0:4] = 1.0
+        depth[4:6, 8:12] = 2.0
+        action, _ = policy(None, depth, SimpleNamespace())
+        self.assertEqual(action, dyn3dgs.YAW_RIGHT)
+        self.assertEqual(policy.last_decision, {
+            "action_proposed": dyn3dgs.FORWARD_SLOW,
+            "action_intervention": "depth_avoidance",
+            "stop_source": None,
+            "grounding_mode": "subgoal",
+            "grounding_reason": "doorway",
+            "grounding_conf": 0.7,
+        })
+
+    def test_vlm_tracker_advances_named_stages_before_final_stop(self):
+        grounder_mod = importlib.import_module("sim.3dgs.grounder")
+        mock_vlm = mock.Mock()
+        mock_vlm.ground_step.side_effect = [
+            grounder_mod.VisualGrounding(0, 1, 0.9, "chair", 1.0, "final"),
+            grounder_mod.VisualGrounding(0, 1, 0.9, "chair", 1.0, "final"),
+            grounder_mod.VisualGrounding(0, 1, 0.9, "lamp", 1.0, "final"),
+            grounder_mod.VisualGrounding(0, 1, 0.9, "lamp", 1.0, "final"),
+        ]
+        tracker = runner.VlmBeliefTracker(
+            mock_vlm, "First go to the chair, then stop at the lamp.", update_every=1,
+            stage_instructions=["Go to the chair.", "Then go to the lamp."])
+        rgb = np.zeros((8, 8, 3), dtype=np.uint8)
+        outputs = []
+        task_stop = []
+        for _ in range(4):
+            outputs.append(tracker(rgb, None))
+            task_stop.append(tracker.confirmed_target)
+        self.assertEqual(outputs, [(0, 0), (0, 0), (0, 0), (0, 1)])
+        self.assertEqual(task_stop, [False, False, False, True])
+        self.assertTrue(tracker.confirmed_target)
+        self.assertEqual(tracker.stage_index, 1)
+        self.assertEqual([row["stage_confirmed"] for row in tracker.trace], [False, True, False, True])
+        self.assertEqual([row["confirmed_target"] for row in tracker.trace], [False, False, False, True])
+        self.assertEqual([row["near_goal"] for row in tracker.trace], [0, 0, 0, 1])
+        self.assertEqual([row["stage_index"] for row in tracker.trace], [0, 1, 1, 1])
+        self.assertEqual([row["stage_confirmed_index"] for row in tracker.trace], [None, 0, None, 1])
+        self.assertEqual([row["task_complete"] for row in tracker.trace], [False, False, False, True])
+        prompts = [call.args[1] for call in mock_vlm.ground_step.call_args_list]
+        self.assertEqual(prompts[0], prompts[1])
+        self.assertIn("Current stage 1/2: Go to the chair.", prompts[0])
+        self.assertIn("Current stage 2/2: Then go to the lamp.", prompts[2])
+
+    def test_g0_mode_direct_uses_pure_euclidean_bearing_without_planner(self):
+        scene = copy.deepcopy(SCENE)
+        scene.update(ply_path="unused.ply", reach_radius_m=1.0, max_steps=4)
+        scene["routes"] = [{"name": "r0", "spawn": {"x": 0.0, "y": 0.0, "z": 1.2},
+                             "waypoint": {"x": 0.0, "y": 4.0, "z": 1.2},
+                             "sage": {"split": "train", "instructions": [
+                                 {"instruction_type": "A", "start": "s", "end": "lamp_2",
+                                  "text": "Go to the tall lamp."}]}}]
+        forbidden_planner = mock.Mock()
+        forbidden_planner.plan.side_effect = AssertionError("direct 模式严禁调用 OccPlanner.plan")
+        forbidden_planner.aim_point.side_effect = AssertionError("direct 模式严禁调用 OccPlanner.aim_point")
+
+        captured_goal_fns = []
+
+        def fake_adapter(_proc, goal_fn=None, rgb_transform=None):
+            captured_goal_fns.append(goal_fn)
+            return SimpleNamespace(name="student", stop_requested=True)
+
+        actions, oracle = _steps([(0, 0), (0, 3.5)])
+        manifest = {"stopped_by_agent": True, "validity": {"physics_verified": True, "camera_verified": True}}
+        args = SimpleNamespace(split=None, all_instructions=True, seed=0, limit=0,
+                               out="unused", hold=0.5, policy="student", ckpt="dummy.bin",
+                               videos=0, stop_mode="explicit", g0_mode="direct", grounder="none")
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(scene_mod, "load_scene", return_value=scene))
+            stack.enter_context(mock.patch.object(scene_mod, "read_gaussian_ply", return_value=None))
+            stack.enter_context(mock.patch.object(runner.collision_mod, "from_scene", return_value=None))
+            stack.enter_context(mock.patch.object(runner.renderer_mod, "make_renderer", return_value=None))
+            stack.enter_context(mock.patch.object(runner.planner_mod, "OccPlanner", return_value=forbidden_planner))
+            stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
+            stack.enter_context(mock.patch.object(collect, "StudentAdapter", side_effect=fake_adapter))
+            stack.enter_context(mock.patch.object(collect, "run_episode", return_value=(manifest, None)))
+            stack.enter_context(mock.patch.object(runner, "_read_jsonl", side_effect=[actions, oracle]))
+            stack.enter_context(mock.patch.object(runner, "route_shortest_path_m", return_value=4.0))
+            rows, failures = runner.run_scene("fixture.json", args, SimpleNamespace(camera_mount={}), student_proc=object())
+        self.assertEqual((len(rows), len(failures), len(captured_goal_fns)), (1, 0, 1))
+        gfn = captured_goal_fns[0]
+        # (0,0), yaw=0 朝 +x，终点 (0,4) 在正左 (+y) -> 纯直线欧氏方位桶 2，距终点 4.0m > 1.0m -> near_goal=0
+        self.assertEqual(gfn(None, SimpleNamespace(x=0.0, y=0.0, yaw=0.0)), (2, 0))
+        # (0,3.5), yaw=pi/2 朝 +y，距终点 0.5m <= 1.0m -> 方位桶 0，near_goal=1
+        self.assertEqual(gfn(None, SimpleNamespace(x=0.0, y=3.5, yaw=math.pi / 2)), (0, 1))
+
+        # 验证 CLI 解析 --g0-mode direct 并写入 vln_eval.json
+        with tempfile.TemporaryDirectory() as tmp:
+            dummy_ckpt = os.path.join(tmp, "ckpt.bin")
+            with open(dummy_ckpt, "wb") as f:
+                f.write(b"ckpt")
+            out_dir = os.path.join(tmp, "eval_direct")
+            fake_student_mod = SimpleNamespace(StudentPolicy=lambda *_a, **_kw: SimpleNamespace(close=lambda: None))
+            with mock.patch.dict(sys.modules, {"student": fake_student_mod}), \
+                    mock.patch.object(runner, "run_scene", return_value=(rows, [])), \
+                    mock.patch.object(runner.CfSitlParams, "from_json", return_value=SimpleNamespace(profile=lambda: "test")):
+                rc = runner.main(["--scene", "fixture", "--policy", "student", "--ckpt", dummy_ckpt,
+                                  "--g0-mode", "direct", "--out", out_dir])
+            self.assertEqual(rc, 0)
+            with open(os.path.join(out_dir, "vln_eval.json"), encoding="utf-8") as f:
+                rep = json.load(f)
+            self.assertEqual(rep["g0_mode"], "direct")
 
 
 class TestBanner(unittest.TestCase):

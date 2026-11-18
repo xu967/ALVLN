@@ -33,7 +33,7 @@ from . import planner as planner_mod
 from . import scene as scene_mod
 from . import renderer as renderer_mod
 from .dynamics import (CfBlackboxParams, CfSitlDynamics, CfSitlParams, FORWARD_SLOW,
-                       SAFE_NEUTRAL, make_blackbox)
+                       SAFE_NEUTRAL, YAW_LEFT, YAW_RIGHT, make_blackbox)
 
 TOOLS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools")
 if TOOLS not in sys.path:
@@ -178,16 +178,52 @@ class StudentAdapter:
         self.reset()
 
     def reset(self):
-        """集边界：清掉上一帧/上一步动作与停止请求缓存。"""
+        """集边界：清掉上一帧/上一步动作、避障偏航保持状态与停止请求缓存。"""
         self.student.reset()
         self.last_executed = SAFE_NEUTRAL
         self.stop_requested = False
         self.last_bearing_bin = None
         self.last_near_goal = None
+        self.last_decision = {}
+        self._avoid_steps = 0
+        self._avoid_action = YAW_LEFT
+        self._last_avoid_dir = YAW_LEFT
 
     def note_executed(self, action):
-        """改写动作的包装层（DaggerPolicy 的 β 混合、OracleGuardedPolicy 的护栏）调用：下一步喂给学生的上一步动作是改写之后真正执行的。"""
+        """记录外层实际执行的动作，供下一步条件和视觉语言记忆使用。"""
         self.last_executed = action
+        note_step = getattr(self.goal_fn, "note_step", None)
+        if note_step is not None:
+            note_step(action)
+
+    @staticmethod
+    def _has_visual_signal(rgb_in, sectors):
+        return (sectors is not None and int(rgb_in.max()) > int(rgb_in.min())
+                and all(math.isfinite(v) and v > 0 for v in sectors))
+
+    def _apply_onboard_depth_gate(self, action, rgb_in):
+        sectors = getattr(self.student, "last_depth_sectors", None)
+        if self.stop_requested or action == SAFE_NEUTRAL or not self._has_visual_signal(rgb_in, sectors):
+            self._avoid_steps = 0
+            return action
+        d_left, d_center, d_right = sectors
+        near_prob = float(getattr(self.student, "last_near_obs_prob", 0.0))
+        if self._avoid_steps > 0:
+            if d_center >= 1.30 and near_prob < 0.45:
+                self._avoid_steps = 0
+                return action
+            self._avoid_steps -= 1
+            return self._avoid_action
+        if action != FORWARD_SLOW or (d_center >= 1.05 and near_prob < 0.58):
+            return action
+        if abs(d_left - d_right) < 0.08:
+            turn = self._last_avoid_dir
+        else:
+            turn = YAW_LEFT if d_left >= d_right else YAW_RIGHT
+        self._avoid_action = turn
+        self._last_avoid_dir = turn
+        self._avoid_steps = 1
+        return turn
 
     def __call__(self, rgb, depth, state):
         import base64
@@ -197,7 +233,7 @@ class StudentAdapter:
                "pixelFormatType": "RGB_INT8",
                "data": base64.b64encode(np.ascontiguousarray(rgb_in).tobytes()).decode()}
         if self.student_cond == nav_cond.COND_VLN_NAV:
-            bb, ng = self.goal_fn(rgb, state) if self.goal_fn is not None else (nav_cond.BEARING_UNKNOWN, 0)
+            bb, ng = self.goal_fn(rgb_in, state) if self.goal_fn is not None else (nav_cond.BEARING_UNKNOWN, 0)
             self.last_bearing_bin = int(bb)
             self.last_near_goal = int(ng)
             kw = {"prev_action": self.last_executed,
@@ -207,9 +243,24 @@ class StudentAdapter:
             kw = {"prev_action": self.last_executed}
         else:
             kw = {}
-        action, infer_ms, _probs = self.student.act(msg, **kw)
-        self.stop_requested = bool(getattr(self.student, "last_stop_requested", False))
-        self.last_executed = action      # 没有人改写时，执行的就是模型自己的输出
+        proposed, infer_ms, _probs = self.student.act(msg, **kw)
+        model_stop = bool(getattr(self.student, "last_stop_requested", False))
+        grounding = getattr(self.goal_fn, "last_vg", None)
+        self.stop_requested = model_stop if grounding is None else self.goal_fn.confirmed_target
+        action = SAFE_NEUTRAL if self.stop_requested else self._apply_onboard_depth_gate(proposed, rgb_in)
+        self.last_decision = {
+            "action_proposed": proposed,
+            "action_intervention": ("task_stop" if self.stop_requested else
+                                    "depth_avoidance" if action != proposed else None),
+            "stop_source": ("student_head" if grounding is None else "visual_target") if self.stop_requested else None,
+            "model_stop_requested": model_stop,
+            "depth_sectors_pred": getattr(self.student, "last_depth_sectors", None),
+            "near_obs_prob": getattr(self.student, "last_near_obs_prob", None),
+        }
+        if grounding is not None:
+            self.last_decision.update(grounding_mode=grounding.goal_mode,
+                                      grounding_reason=grounding.reason, grounding_conf=grounding.conf)
+        self.last_executed = action
         return action, infer_ms
 
 
@@ -259,6 +310,10 @@ class DaggerPolicy:
         self.student.note_executed(action)
 
     @property
+    def last_decision(self):
+        return self.student.last_decision
+
+    @property
     def n_plan_fail(self):
         return self.expert.n_plan_fail
 
@@ -272,10 +327,13 @@ class DaggerPolicy:
         action, infer_ms = self.student(rgb, depth, state)
         self.stop_requested = self.student.stop_requested
         if self.beta > 0.0 and self.rng.random() < self.beta:
+            student_action = action
             action = self.last_expert
             self.stop_requested = self.last_stop_expert
             self.n_expert_exec += 1
-            self.student.note_executed(action)     # 学生下一步看到的上一步动作是教师动作，不是它自己的输出
+            self.student.last_executed = action
+            if action != student_action:
+                self.student.last_decision["action_intervention"] = "dagger_expert"
         return action, infer_ms
 
 
@@ -453,8 +511,6 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                     raise ValueError("策略 stop_requested 必须是 bool")
                 if stop_requested:
                     action = SAFE_NEUTRAL
-                    if hasattr(policy, "note_executed"):
-                        policy.note_executed(action)
             # DAgger：执行的是学生（或 β 抽中的教师）动作，标签始终是教师的；教师/forward 策略两者相同；
             # 非 DAgger 的学生集（eval_3dgs 的 StudentAdapter）没有教师标签，action_expert 写 None，不再把学生动作记成标签
             # （preprocess 按 teacher 门禁拒收这类集，不会读到 None）。
@@ -464,6 +520,8 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             z0 = dyn.z
             n_tr0 = len(getattr(dyn, "trace", None) or ())      # 本步开始前的 trace 长度（v2 逐段扫只取新增的点）
             state = dyn.step(action, hold_s)
+            if hasattr(policy, "note_executed"):
+                policy.note_executed(action)
             x, y, yaw = state["x"], state["y"], state["yaw_deg"]
             # 沿整段位移扫掠（AUDIT #3）：只查终点时 0.69 m 一步能穿过 0.6 m 的障碍。v2 且有 trace 时沿折线扫（B3）。
             collided, hit_pt = _step_collision(occ, (x0, y0, z0), (x, y, state["z"]), getattr(dyn, "trace", None), n_tr0)
@@ -489,6 +547,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             stop_expert = (policy.last_stop_expert if isinstance(policy, DaggerPolicy)
                            else stop_requested if policy.name == "plan_action" else None)
             actions.append({
+                **getattr(policy, "last_decision", {}),
                 "step": i,
                 "timestamp_ns": ts0,
                 "action_expert": expert,
@@ -510,6 +569,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
                 "pose_before": {"x": x0, "y": y0, "z": z0},
                 "yaw_before": math.degrees(yaw0),
                 "displacement_m": dist,
+                "speed_mps": math.hypot(state["vx"], state["vy"], state.get("vz", 0.0)),
                 "dyaw_deg": dyaw,
                 "sim_dt": hold_s,
                 "infer_ms": infer_ms,
@@ -623,7 +683,9 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             # 字典覆盖；β = 执行教师动作的概率，学生执行缺省 0。以前学生 eval 集缺省写 teacher、β 1.0，与 teacher=student
             # 自相矛盾（R2-3DGS #2）。preprocess 只认 teacher 标签，executed_by/dagger_round/beta 进 episodes 表供溯源。
             "executed_by": (dagger or {}).get("executed_by",
-                                              {"forward": "forward", "student": "student"}.get(policy.name, "teacher")),
+                                              {"forward": "forward", "student": "student",
+                                               "reactive_bearing": "reactive", "reactive_goal": "reactive"}.get(
+                                                   policy.name, "teacher")),
             "dagger_round": (dagger or {}).get("dagger_round", 0),
             "beta": (dagger or {}).get("beta", 0.0 if policy.name == "student" else 1.0),
             "student_ckpt": (dagger or {}).get("student_ckpt"),

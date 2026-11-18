@@ -266,6 +266,9 @@ class TestVisualLanguageGrounder(unittest.TestCase):
         self.assertEqual(grounder.parse_vlm_output('{"sector":"front_left","near":1,"conf":9,"why":"lamp"}')[:3],
                          (1, 1, 0.9))
         self.assertEqual(grounder.parse_vlm_output("broken non-json text")[:2], (8, 0))
+        for text in ('["C",2,"chair"]', '["C","maybe",1,"chair"]',
+                     '{"sector":"C","near":1,"conf":"invalid"}', '["C","N",1,"chair"]'):
+            self.assertEqual(grounder.parse_vlm_output(text)[:2], (8, 0))
 
     def test_mock_worker_subprocess_roundtrip_and_cleanup(self):
         import sys
@@ -288,6 +291,106 @@ class TestVisualLanguageGrounder(unittest.TestCase):
             self.assertEqual((r2.bearing_bin, r2.near_goal, r2.reason), (7, 0, "plant"))
             r_zero = vg.ground_step([frame], "")
             self.assertEqual((r_zero.bearing_bin, r_zero.near_goal), (8, 0))
+
+    def test_g3_subgoal_vs_final_parsing_and_memory_roundtrip(self):
+        import sys
+        import numpy as np
+
+        # G3 四元组：SUBGOAL 即使误写 near=1 也必须强制清零 near_goal，绝不在门洞提前停机
+        self.assertEqual(grounder.parse_vlm_output('["L","S",1,"doorway"]'), (1, 0, 0.8, "doorway", "subgoal"))
+        self.assertEqual(grounder.parse_vlm_output('["C","F",0,"sofa"]'), (0, 0, 0.8, "sofa", "final"))
+        self.assertEqual(grounder.parse_vlm_output('["C","F",1,"sofa"]'), (0, 1, 0.8, "sofa", "final"))
+        self.assertEqual(grounder.parse_vlm_output('["N","N",1,"wall"]'), (8, 0, 0.8, "wall", "search"))
+
+        mock_code = (
+            "import json, sys\n"
+            "sys.stdout.write(json.dumps({'status':'ready'}) + '\\n'); sys.stdout.flush()\n"
+            "seen_mems = []\n"
+            "for line in sys.stdin:\n"
+            "    req = json.loads(line)\n"
+            "    if req.get('cmd') == 'close': break\n"
+            "    seen_mems.append(req.get('memory', ''))\n"
+            "    raw = '[\"L\",\"S\",0,\"doorway\"]' if len(seen_mems) == 1 else '[\"C\",\"F\",0,\"mirror_cabinet\"]'\n"
+            "    sys.stdout.write(json.dumps({'raw': raw, 'conf': 0.85, 'infer_ms': 3.5}) + '\\n'); sys.stdout.flush()\n"
+        )
+        frame = np.zeros((240, 320, 3), dtype=np.uint8)
+        with grounder.VisualLanguageGrounder(worker_cmd=[sys.executable, "-c", mock_code], timeout_s=10.0) as vg:
+            s1 = vg.ground_step([frame], "Go to the mirror cabinet in the bathroom.")
+            self.assertEqual((s1.bearing_bin, s1.near_goal, s1.goal_mode, s1.reason), (1, 0, "subgoal", "doorway"))
+            vg.note_action("LEFT")
+            s2 = vg.ground_step([frame], "Go to the mirror cabinet in the bathroom.")
+            self.assertEqual((s2.bearing_bin, s2.near_goal, s2.goal_mode, s2.reason), (0, 0, "final", "mirror_cabinet"))
+
+    def test_student_stop_requires_fresh_target_and_leaves_obstacle_gate_active(self):
+        import sys
+        import numpy as np
+        root = os.path.dirname(os.path.dirname(HERE))
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        collect_3dgs = importlib.import_module("sim.3dgs.collect_3dgs")
+        run_vln = importlib.import_module("sim.3dgs.run_vln")
+        dyn_mod = importlib.import_module("sim.3dgs.dynamics")
+        FORWARD_SLOW, SAFE_NEUTRAL, YAW_LEFT, YAW_RIGHT = (
+            dyn_mod.FORWARD_SLOW, dyn_mod.SAFE_NEUTRAL, dyn_mod.YAW_LEFT, dyn_mod.YAW_RIGHT,
+        )
+
+        seq = [
+            grounder.VisualGrounding(1, 0, 0.82, "doorway", 4.0, "subgoal"),
+            grounder.VisualGrounding(0, 1, 0.78, "sofa", 4.0, "final"),
+            grounder.VisualGrounding(8, 0, 0.0, "lost", 4.0, "search"),
+            grounder.VisualGrounding(0, 1, 0.78, "sofa", 4.0, "final"),
+            grounder.VisualGrounding(0, 1, 0.78, "sofa", 4.0, "final"),
+        ]
+        idx = {"k": 0}
+
+        class _StubVlm:
+            def reset_episode(self):
+                pass
+
+            def note_action(self, _act):
+                pass
+
+            def ground_step(self, _hist, _ins):
+                out = seq[min(idx["k"], len(seq) - 1)]
+                idx["k"] += 1
+                return out
+
+        tracker = run_vln.VlmBeliefTracker(_StubVlm(), "Move to the sofa", update_every=1)
+        rgb = np.zeros((120, 160, 3), dtype=np.uint8)
+        rgb[:, :80] = 200  # 非均匀真实画面（与 --blind-rgb 区分）
+
+        class _FakeStudent:
+            prev_dim = 15
+            last_stop_requested = False
+            last_depth_sectors = (2.2, 0.85, 0.60)
+            last_near_obs_prob = 0.68
+
+            def reset(self):
+                pass
+
+            def act(self, _msg, **_kw):
+                return FORWARD_SLOW, 1.0, [0.05, 0.85, 0.05, 0.05]
+
+        # 1) 未锁定最终目标时近墙 (d_center=0.85 < 1.05, d_left=2.2 > d_right=0.60)：门控改向 YAW_LEFT 绕障，不喊停
+        ad_avoid = collect_3dgs.StudentAdapter(_FakeStudent(), goal_fn=lambda _r, _s: (0, 0))
+        act_avoid, _ = ad_avoid(rgb, None, None)
+        self.assertEqual((act_avoid, ad_avoid.stop_requested), (YAW_LEFT, False))
+
+        # 2) --blind-rgb 全黑画面：严禁门控伪造转向
+        ad_blind = collect_3dgs.StudentAdapter(_FakeStudent(), goal_fn=lambda _r, _s: (0, 0),
+                                               rgb_transform=lambda im: np.zeros_like(im))
+        act_blind, _ = ad_blind(rgb, None, None)
+        self.assertEqual((act_blind, ad_blind.stop_requested), (FORWARD_SLOW, False))
+
+        model = _FakeStudent()
+        model.last_stop_requested = True
+        model.last_depth_sectors = (0.85, 0.85, 0.85)
+        adapter = collect_3dgs.StudentAdapter(model, goal_fn=tracker)
+        for _ in range(4):
+            self.assertEqual(adapter(rgb, None, None)[0], YAW_LEFT)
+            self.assertFalse(adapter.stop_requested)
+        self.assertEqual(adapter(rgb, None, None)[0], SAFE_NEUTRAL)
+        self.assertTrue(adapter.stop_requested)
 
 
 if __name__ == "__main__":
