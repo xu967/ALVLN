@@ -276,6 +276,7 @@ class PreprocessCondTests(unittest.TestCase):
         out, _ = self.pack("vln_ds", "--cond", "vln-nav")
         _, meta = read_uavr(out / "dataset.uavr")
         self.assertEqual(meta.get("cond"), "vln_nav.v1")
+        self.assertEqual(meta.get("vln_bearing_source"), "recorded")
         self.assertTrue((out / "vln_instructions.jsonl").is_file())
         self.assertFalse((out / "instructions.jsonl").exists())
         raw_aux = (out / "dataset.aux").read_bytes()
@@ -295,6 +296,70 @@ class PreprocessCondTests(unittest.TestCase):
         _, r_mix = self.pack("vln_mix", "--cond", "vln-nav", check=False)
         self.assertNotEqual(r_mix.returncode, 0)
         self.assertIn("teacher_version", r_mix.stderr)
+
+    def test_vln_bearing_source_direct_ignores_recorded_subgoal_and_boosts_spawn_search(self):
+        # 终点在 (0, 4)，起点在 (0, 0) 且 yaw=0°：纯直线欧氏方位为正左 bearing_bin=2；
+        # 采集记录的 A* 绕障子目标故意写成 bearing_bin=0、near_goal=0。
+        for name, ep_dir in self.eps.items():
+            man_path = ep_dir / "episode_manifest.json"
+            man = json.loads(man_path.read_text(encoding="utf-8"))
+            man["instruction"] = None
+            man["vln"] = {"text": f"Fly to the table in {name}."}
+            man["teacher_version"] = "uavrgb.teacher_occ.v5"
+            man["waypoint"] = {"x": 0.0, "y": 4.0}
+            man["stop_radius"] = 1.0
+            man_path.write_text(json.dumps(man), encoding="utf-8")
+            act_path = ep_dir / "actions.jsonl"
+            rows = [json.loads(ln) for ln in act_path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            for k, r in enumerate(rows):
+                is_last = (k == len(rows) - 1)
+                r["stop_requested"] = False
+                r["stop_expert"] = is_last
+                r["bearing_bin"] = 0
+                r["near_goal"] = 0
+                r["pose_before"] = {"x": 0.0, "y": 3.5 if is_last else 0.0, "z": 1.2}
+                r["yaw_before"] = 90.0 if is_last else 0.0
+            act_path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+
+        out_rec, _ = self.pack("vln_rec", "--cond", "vln-nav", "--vln-bearing-source", "recorded")
+        out_dir, _ = self.pack("vln_dir", "--cond", "vln-nav", "--vln-bearing-source", "direct")
+        _, meta_rec = read_uavr(out_rec / "dataset.uavr")
+        _, meta_dir = read_uavr(out_dir / "dataset.uavr")
+        self.assertEqual(meta_rec.get("vln_bearing_source"), "recorded")
+        self.assertEqual(meta_dir.get("vln_bearing_source"), "direct")
+
+        raw_rec = (out_rec / "dataset.aux").read_bytes()
+        raw_dir = (out_dir / "dataset.aux").read_bytes()
+        n = struct.unpack_from("<Q", raw_dir, 8)[0]
+        nav_rec = list(raw_rec[AUX_HEADER_SIZE + 6 * n:AUX_HEADER_SIZE + 7 * n])
+        nav_dir = list(raw_dir[AUX_HEADER_SIZE + 6 * n:AUX_HEADER_SIZE + 7 * n])
+        ep_rec = self.per_episode(out_rec, nav_rec)
+        ep_dir_cols = self.per_episode(out_dir, nav_dir)
+        # recorded 首步: prev=0, bb=0, ng=0 -> 0；direct 首步: prev=0, bb=2, ng=0 -> 8
+        self.assertEqual((ep_rec["ep1"][0] // 4) % 9, 0)
+        self.assertEqual((ep_dir_cols["ep1"][0] // 4) % 9, 2)
+        # direct 末步距 (0,4) 为 0.5m <= 1.0m 且 yaw=90° 正对终点: bb=0, ng=1 -> >=36
+        self.assertEqual(ep_dir_cols["ep1"][-1] // 36, 1)
+        self.assertEqual((ep_dir_cols["ep1"][-1] // 4) % 9, 0)
+
+        # spawn 左转步 (prev_action=0, label=2, ep2 首步)：vln_search_dropout=0.6 经 1.8x 放大到 1.0，必映射为 BEARING_UNKNOWN(8)
+        out_drop, _ = self.pack("vln_drop", "--cond", "vln-nav", "--vln-bearing-source", "direct",
+                                "--vln-search-dropout", "0.6")
+        raw_drop = (out_drop / "dataset.aux").read_bytes()
+        nav_drop = list(raw_drop[AUX_HEADER_SIZE + 6 * n:AUX_HEADER_SIZE + 7 * n])
+        ep2_man = json.loads((self.eps["ep2"] / "episode_manifest.json").read_text(encoding="utf-8"))
+        if ep2_man.get("split") == "train":
+            ep2_nav = self.per_episode(out_drop, nav_drop)["ep2"]
+            self.assertEqual((ep2_nav[0] // 4) % 9, nav_cond.BEARING_UNKNOWN)
+
+        # direct 模式下缺失 pose_before 或 waypoint 必须显式报错退出
+        act1 = self.eps["ep1"] / "actions.jsonl"
+        rows1 = [json.loads(ln) for ln in act1.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        rows1[0].pop("pose_before", None)
+        act1.write_text("".join(json.dumps(r) + "\n" for r in rows1), encoding="utf-8")
+        _, r_bad_pose = self.pack("vln_bad_pose", "--cond", "vln-nav", "--vln-bearing-source", "direct", check=False)
+        self.assertNotEqual(r_bad_pose.returncode, 0)
+        self.assertIn("pose_before", r_bad_pose.stderr)
 
 
 if __name__ == "__main__":

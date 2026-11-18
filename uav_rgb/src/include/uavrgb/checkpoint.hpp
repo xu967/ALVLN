@@ -3,10 +3,11 @@
 //
 // 文件布局（偏移 B）：
 //   0    char[8]  magic "UAVRCK01"
-//   8    u32      version = 7（v2 起带类别权重；v3 追加 best_macro_f1；
+//   8    u32      version = 8（v2 起带类别权重；v3 追加 best_macro_f1；
 //                v4 追加 text_dim；v5 追加训练契约；v6 追加 aux_classes/prev_dim；
 //                v7 追加 32B aux_sidecar_sha256 与 f32 stop_threshold。
-//                读端接受 v2..v7；v1 无类别权重段，直接拒绝）
+//                v8 明确标记三带列池化和 FiLM 前深度头，字节布局同 v7。
+//                v2..v7 按原布局读取，旧全展平权重与当前结构不匹配时拒绝。）
 //   12   u32      param_count（顺序同 cnn_params：8 个 CNN/fc 参数 + 可选 text_emb
 //                + 可选 film.W, film.b + 可选 aux.W, aux.b）
 //   16   i32 in_h, i32 in_w, i32 in_c(3 单帧 / 6 双帧), i32 num_classes   ← 模型结构元信息

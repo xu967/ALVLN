@@ -35,7 +35,12 @@ _TAG_TO_COND = {
     DATASET_VLN_COND_TAG: COND_VLN_NAV,
 }
 
-_UAVR_HEAD = struct.Struct("<4sHHIHHBBBBQQQI")   # 同 tools/preprocess.py 的 HEADER（48 B）：meta_off 在 36、meta_len 在 44
+_TOOLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "tools")
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+import uavr_io  # noqa: E402
+
+_UAVR_HEAD = uavr_io.UAVR_HEADER                 # 同 tools/preprocess.py 的 HEADER（48 B）：meta_off 在 36、meta_len 在 44
 _CKPT_HEAD = struct.Struct("<8sIIiiiiIII")       # 同 src/checkpoint.cpp：magic + 9×4B 定长头（共 44 B）
 _CKPT_CONTRACT_BYTES = 113                       # v5 训练契约固定 113 B，开头 32 B 为 dataset_sha256
 
@@ -79,21 +84,7 @@ def encode_vln_nav(prev_action, bearing_bin, near_goal):
 
 def read_dataset_meta(path):
     """dataset.uavr 尾部的 meta JSON；不是 UAVR 文件抛 ValueError，读不了抛 OSError。"""
-    with open(path, "rb") as f:
-        head = f.read(_UAVR_HEAD.size)
-        if len(head) != _UAVR_HEAD.size:
-            raise ValueError(f"{path}: 不是 UAVR 数据集（文件头不足 {_UAVR_HEAD.size} 字节）")
-        magic, _ver, header_size, _n, _h, _w, _c, _dt, _ldt, _r, _io, _lo, meta_off, meta_len = _UAVR_HEAD.unpack(head)
-        if magic != b"UAVR" or header_size != _UAVR_HEAD.size:
-            raise ValueError(f"{path}: 不是 UAVR 数据集（magic/头长度不符）")
-        f.seek(meta_off)
-        raw = f.read(meta_len)
-    if len(raw) != meta_len:
-        raise ValueError(f"{path}: meta 被截断")
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except ValueError as exc:
-        raise ValueError(f"{path}: meta 不是合法 JSON：{exc}") from exc
+    return uavr_io.read_uavr_meta(path)
 
 
 def dataset_cond_tag(path):
@@ -126,7 +117,7 @@ def ckpt_dataset_sha256(path):
             if len(raw) != _CKPT_HEAD.size:
                 return None
             magic, ver, _np, _h, _w, _c, _nc, _at, _ep, nw = _CKPT_HEAD.unpack(raw)
-            if magic != b"UAVRCK01" or ver < 5 or ver > 7 or nw > 64:
+            if magic != b"UAVRCK01" or ver < 5 or ver > 8 or nw > 64:
                 return None
             f.seek(4 * nw + 8, os.SEEK_CUR)      # class_weights + v3 best_macro_f1 + v4 text_dim
             contract = f.read(_CKPT_CONTRACT_BYTES)

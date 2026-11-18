@@ -2,7 +2,7 @@
 // 读取 tools/preprocess.py 产出的 UAVR 文件；H/W/C 全从文件头读取，不假定 128x128。
 //
 // 编译：
-//   g++ -std=c++17 -O2 -Wall -Wextra tools/read_dataset.cpp -o /tmp/read_dataset
+//   g++ -std=c++17 -O2 -Wall -Wextra -Isrc/include tools/read_dataset.cpp -o /tmp/read_dataset
 // 用法：
 //   /tmp/read_dataset <dataset.uavr>                 仅校验结构并打印头/meta
 //   /tmp/read_dataset <dataset.uavr> --selfcheck     额外校验 make_synthetic_episode.py
@@ -12,6 +12,8 @@
 // 任意 --size 预处理结果都可跑 --selfcheck（尺寸取自文件头）。
 // 同目录若有 dataset.aux（UAVRAUX1 侧车，DATASET_FORMAT.md §6）一并校验：头/长度/两个 SHA256/
 // 取值范围；--selfcheck 再核对合成集的上一帧链与 prev-action（首帧指向自身、prev=SAFE）。
+#include "uavrgb/io_util.hpp"
+
 #include <array>
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +23,10 @@
 #include <vector>
 
 namespace {
+using uavrgb::le16;
+using uavrgb::le32;
+using uavrgb::le64;
+using uavrgb::read_exact_ok;
 
 // 最小 SHA-256（FIPS 180-4），只为校验侧车绑定；本工具不链接 uavrgb 库。
 std::array<std::uint8_t, 32> sha256(const std::uint8_t* data, std::uint64_t len) {
@@ -84,28 +90,6 @@ struct Header {
   std::uint32_t meta_len = 0;
 };
 
-std::uint16_t le16(const std::uint8_t* p) {
-  return static_cast<std::uint16_t>(p[0] | (p[1] << 8));
-}
-std::uint32_t le32(const std::uint8_t* p) {
-  return static_cast<std::uint32_t>(p[0]) |
-         (static_cast<std::uint32_t>(p[1]) << 8) |
-         (static_cast<std::uint32_t>(p[2]) << 16) |
-         (static_cast<std::uint32_t>(p[3]) << 24);
-}
-std::uint64_t le64(const std::uint8_t* p) {
-  return static_cast<std::uint64_t>(le32(p)) |
-         (static_cast<std::uint64_t>(le32(p + 4)) << 32);
-}
-
-bool read_at(std::ifstream& f, std::uint64_t off, void* dst, std::size_t n) {
-  f.clear();
-  f.seekg(static_cast<std::streamoff>(off), std::ios::beg);
-  if (!f) return false;
-  f.read(static_cast<char*>(dst), static_cast<std::streamsize>(n));
-  return static_cast<std::size_t>(f.gcount()) == n;
-}
-
 bool contains(const std::string& hay, const std::string& needle) {
   return hay.find(needle) != std::string::npos;
 }
@@ -140,7 +124,7 @@ int selfcheck(std::ifstream& f, const Header& hd, const std::string& meta,
                 "，期望 15");
   }
   std::vector<std::uint8_t> labels(hd.n);
-  if (!read_at(f, hd.labels_off, labels.data(), labels.size())) {
+  if (!read_exact_ok(f, hd.labels_off, labels.data(), labels.size())) {
     return fail("读取 labels 失败");
   }
   std::uint32_t label_ok = 0;
@@ -163,7 +147,7 @@ int selfcheck(std::ifstream& f, const Header& hd, const std::string& meta,
   std::uint32_t even_ok = 0, odd_ok = 0;
 
   for (std::uint32_t g = 0; g < kExpectN; ++g) {
-    if (!read_at(f, hd.images_off + g * sample_bytes, buf.data(), buf.size())) {
+    if (!read_exact_ok(f, hd.images_off + g * sample_bytes, buf.data(), buf.size())) {
       return fail("读取 sample " + std::to_string(g) + " 像素失败");
     }
     if (g % 2 == 0) {
@@ -338,7 +322,7 @@ int main(int argc, char** argv) {
   f.seekg(0, std::ios::beg);
 
   std::uint8_t raw[48];
-  if (!read_at(f, 0, raw, sizeof(raw))) return fail("文件短于 48 字节头");
+  if (!read_exact_ok(f, 0, raw, sizeof(raw))) return fail("文件短于 48 字节头");
   if (std::memcmp(raw, "UAVR", 4) != 0) return fail("magic 不是 UAVR");
 
   Header hd;
@@ -372,7 +356,7 @@ int main(int argc, char** argv) {
   }
 
   std::vector<std::uint8_t> labels(hd.n);
-  if (!read_at(f, hd.labels_off, labels.data(), labels.size())) return fail("读 labels 失败");
+  if (!read_exact_ok(f, hd.labels_off, labels.data(), labels.size())) return fail("读 labels 失败");
   std::uint32_t hist[4] = {0, 0, 0, 0};
   for (std::uint8_t v : labels) {
     if (v >= 4) return fail("标签 " + std::to_string(v) + " 超出 0..3");
@@ -380,7 +364,7 @@ int main(int argc, char** argv) {
   }
 
   std::vector<char> meta_buf(hd.meta_len);
-  if (!read_at(f, hd.meta_off, meta_buf.data(), meta_buf.size())) return fail("读 meta 失败");
+  if (!read_exact_ok(f, hd.meta_off, meta_buf.data(), meta_buf.size())) return fail("读 meta 失败");
   const std::string meta(meta_buf.begin(), meta_buf.end());
   if (meta.front() != '{' || meta.back() != '}') return fail("meta 不是 JSON 对象");
 

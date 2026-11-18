@@ -1,6 +1,7 @@
 // metrics.jsonl 单行 JSON 序列化（字段与 event.hpp 对齐）。从 trainer.cpp 拆出，
 // 保持每个 C++ 文件在行数上限内；序列化规则见 event.hpp 文件头注释。
 #include "uavrgb/trainer.hpp"
+#include "uavrgb/io_util.hpp"
 
 #include <cmath>
 #include <cstdio>
@@ -18,30 +19,7 @@ std::string num(double v) {
   return b;
 }
 
-std::string quoted(const std::string& s) {
-  std::string o = "\"";
-  for (unsigned char c : s) {
-    if (c == '"' || c == '\\') {
-      o += '\\';
-      o += static_cast<char>(c);
-    } else if (c == '\n') {
-      o += "\\n";
-    } else if (c == '\r') {
-      o += "\\r";
-    } else if (c == '\t') {
-      o += "\\t";
-    } else if (c < 0x20) {
-      // JSON 不允许裸控制字符；与 class_weights.cpp 的 quote 保持一致。
-      char b[7];
-      std::snprintf(b, sizeof b, "\\u%04x", static_cast<unsigned>(c));
-      o += b;
-    } else {
-      o += static_cast<char>(c);
-    }
-  }
-  o += '"';
-  return o;
-}
+std::string quoted(const std::string& s) { return json_quote(s); }
 
 }  // namespace
 

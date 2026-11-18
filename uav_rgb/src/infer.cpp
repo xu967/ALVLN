@@ -100,6 +100,9 @@ std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream
     const auto t0 = std::chrono::steady_clock::now();
     const Tensor logits = dev.forward(chw.data(), 1, text.empty() ? nullptr : text.data(), nullptr,
                                       model.prev_dim > 0 ? &prev : nullptr);
+    float depth_sectors[3] = {0.0f, 0.0f, 0.0f};
+    float near_obs_prob = 0.0f;
+    const bool has_depth_pred = dev.predict_depth_summary(depth_sectors, &near_obs_prob);
     const auto t1 = std::chrono::steady_clock::now();
     if (logits.numel() != static_cast<std::size_t>(ncls)) {
       throw std::runtime_error("infer: logits 维度与 num_classes 不符");
@@ -123,6 +126,10 @@ std::size_t run_infer_loop(const CnnModel& model, std::istream& in, std::ostream
       out << probs[k];
     }
     out << "],\"infer_ms\":" << ms;
+    if (has_depth_pred) {
+      out << ",\"depth_sectors\":[" << depth_sectors[0] << ',' << depth_sectors[1] << ','
+          << depth_sectors[2] << "],\"near_obs_prob\":" << near_obs_prob;
+    }
     if (ncls == kActionStopClasses) {
       const double z = static_cast<double>(logits[kActionClasses]);
       const double stop_prob =

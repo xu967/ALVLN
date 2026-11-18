@@ -1,6 +1,7 @@
 // UAVRAUX1 侧车读取（布局见 tools/DATASET_FORMAT.md §6；写端 tools/preprocess.py）。
 #include "uavrgb/aux_sidecar.hpp"
 
+#include "uavrgb/io_util.hpp"
 #include "uavrgb/sha256.hpp"
 #include "uavrgb/vln_head.hpp"
 
@@ -15,19 +16,6 @@ namespace uavrgb {
 namespace {
 
 [[noreturn]] void fail(const std::string& msg) { throw std::runtime_error("dataset.aux: " + msg); }
-
-std::uint64_t le(const unsigned char* p, int bytes) {
-  std::uint64_t v = 0;
-  for (int i = bytes - 1; i >= 0; --i) v = (v << 8) | p[i];
-  return v;
-}
-
-float le_f32(const unsigned char* p) {
-  const std::uint32_t u = static_cast<std::uint32_t>(le(p, 4));
-  float f;
-  std::memcpy(&f, &u, 4);
-  return f;
-}
 
 }  // namespace
 
@@ -46,14 +34,14 @@ AuxSidecar load_aux_sidecar(const std::string& uavr_path, int n, int h, int w,
   unsigned char hb[kAuxHeaderBytes];
   if (!f.read(reinterpret_cast<char*>(hb), sizeof hb)) fail("文件头不足 128 B");
   if (std::memcmp(hb, "UAVRAUX1", 8) != 0) fail("magic 不是 UAVRAUX1");
-  if (le(hb + 8, 8) != static_cast<std::uint64_t>(n)) fail("N 与 dataset.uavr 不符");
-  const std::uint32_t flags = static_cast<std::uint32_t>(le(hb + 16, 4));
+  if (le64(hb + 8) != static_cast<std::uint64_t>(n)) fail("N 与 dataset.uavr 不符");
+  const std::uint32_t flags = le32(hb + 16);
   if ((flags & ~kAuxKnownFlags) != 0) fail("未知 flags（仅支持 bit0=深度, bit1=stop, bit2=nav_cond）");
   aux.has_depth = (flags & kAuxFlagDepth) != 0;
   aux.has_stop = (flags & kAuxFlagStop) != 0;
   aux.has_nav_cond = (flags & kAuxFlagNavCond) != 0;
-  aux.depth_h = static_cast<int>(le(hb + 20, 2));
-  aux.depth_w = static_cast<int>(le(hb + 22, 2));
+  aux.depth_h = static_cast<int>(le16(hb + 20));
+  aux.depth_w = static_cast<int>(le16(hb + 22));
   aux.depth_classes = hb[24];
   if (hb[25] != kAuxUnknown) fail("unknown_code 必须是 255");
   if (aux.has_depth) {

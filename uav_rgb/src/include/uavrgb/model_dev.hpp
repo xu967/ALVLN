@@ -47,6 +47,8 @@ class DeviceCnn {
     std::size_t correct = 0, valid = 0;
   };
   AuxStats aux_loss(const std::uint8_t* targets, float lambda);
+  // 推理期单帧（n_==1, aux_classes_==8）从 p3_ 直接计算左/中/右扇区调和平均净空(m)与前视近障概率 P(d<1.2m)。
+  bool predict_depth_summary(float out_sectors[3], float* out_near_prob);
   int aux_h() const { return layer_[2].ph; }
   int aux_w() const { return layer_[2].pw; }
 
@@ -69,10 +71,9 @@ class DeviceCnn {
   void film_backward(int n);
   void alloc_aux(const CnnModel& model);  // model_dev_aux.cu
   void aux_backward(int n);               // 把辅助头梯度叠进 dflat_；本步没目标则梯度清 0
-  const float* fc_input() const { return has_film_ ? p3mod_ : p3_; }
 
   int max_batch_ = 0, n_ = 0;           // n_：最近一次 forward 的 batch，0 = 还不能反向
-  int in_c_ = 0, h_ = 0, w_ = 0, text_dim_ = 0, num_classes_ = 0;
+  int in_c_ = 0, h_ = 0, w_ = 0, text_dim_ = 0, num_classes_ = 0, fc_in_ = 0;
   int prev_dim_ = 0, cond_dim_ = 0, aux_classes_ = 0;
   bool has_film_ = false, aux_pending_ = false;  // aux_pending_：本步已算 aux 梯度
   // 可选分支在 seg_ 里的下标（-1 = 没有）：text_emb / film.W（film.b 紧随）/ aux.W（aux.b 紧随）。
@@ -86,13 +87,13 @@ class DeviceCnn {
   std::uint8_t* text_u8_ = nullptr;
   std::uint8_t* prev_u8_ = nullptr;
   dev::AugParams* aug_ = nullptr;
-  // 激活（r = ReLU 原地覆盖 conv 输出；p/arg = 池化输出与 argmax）。
+  // 激活（r = ReLU 原地覆盖 conv 输出；p/arg = 池化输出与 argmax；col_ = 三带列池化瓶颈）。
   float *x_ = nullptr, *c1_ = nullptr, *p1_ = nullptr, *arg1_ = nullptr;
   float *c2_ = nullptr, *p2_ = nullptr, *arg2_ = nullptr;
   float *c3_ = nullptr, *p3_ = nullptr, *arg3_ = nullptr;
-  float *cond_ = nullptr, *film_out_ = nullptr, *p3mod_ = nullptr, *logits_ = nullptr;
+  float *cond_ = nullptr, *film_out_ = nullptr, *p3mod_ = nullptr, *col_ = nullptr, *logits_ = nullptr;
   // 反向临时量。
-  float *dlogits_ = nullptr, *dflat_ = nullptr, *dfilm_ = nullptr, *dcond_ = nullptr;
+  float *dlogits_ = nullptr, *dcol_ = nullptr, *dflat_ = nullptr, *dfilm_ = nullptr, *dcond_ = nullptr;
   float *dr3_ = nullptr, *dp2_ = nullptr, *dr2_ = nullptr, *dp1_ = nullptr, *dr1_ = nullptr;
   float* ws_[3] = {nullptr, nullptr, nullptr};  // 各层 conv 反向的部分和工作区
   double* d_sumsq_ = nullptr;

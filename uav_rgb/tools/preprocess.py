@@ -92,6 +92,8 @@ DEPTH_GRID_DOWN = 8
 # analytic = 由 pose_before / yaw_before、相机安装位姿与 scene.json 的柱子真值解析算（analytic_depth_bands）。
 DEPTH_SOURCES = ("file", "analytic")
 DEFAULT_DEPTH_SOURCE = "file"
+VLN_BEARING_SOURCES = ("recorded", "direct")
+DEFAULT_VLN_BEARING_SOURCE = "recorded"
 ANALYTIC_RAYS = 3  # 每格每个方向 3 条子射线，3×3 = 9 条取最小
 # 相机相对机体中心的安装位置（前向 m，上方 m）= sim/dynamics/e1_mini.json camera_mount.xyz 的 x 与 z；
 # y = 0、pitch = 0 也由 test_preprocess_analytic_depth 锁住。只列已知相机安装的机型，其余机型 analytic 报错。
@@ -344,7 +346,8 @@ def _fill_cond_segment(seg, out):
 
 def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
                  split_salt=None, allow_frozen=False, allow_diagnostic=False,
-                 exclude_failed_teacher=False, stats=None, drop_late_and_stall=False):
+                 exclude_failed_teacher=False, stats=None, drop_late_and_stall=False,
+                 vln_bearing_source=DEFAULT_VLN_BEARING_SOURCE):
     """读 manifest + actions.jsonl，只建立样本索引，不碰像素（内存友好）。
 
     exclude_collision_episodes=True 时，只要该集有 collision=true 就返回 None
@@ -452,6 +455,22 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
         vln_text = vln_text.strip() or None
     waypoint = man.get("waypoint")
     stop_radius_m = float(man.get("stop_radius") or man.get("goal_radius") or 1.0)
+    if vln_bearing_source not in VLN_BEARING_SOURCES:
+        die("未知的 vln_bearing_source=%r（支持 %s）" % (vln_bearing_source, "/".join(VLN_BEARING_SOURCES)))
+    direct_wx = direct_wy = None
+    if vln_bearing_source == "direct":
+        if (not isinstance(waypoint, dict) or "x" not in waypoint or "y" not in waypoint
+                or isinstance(waypoint["x"], bool) or isinstance(waypoint["y"], bool)):
+            die("%s: --vln-bearing-source direct 需要 manifest.waypoint 含数值 x/y（实际 %r）"
+                % (man_path, waypoint))
+        try:
+            direct_wx, direct_wy = float(waypoint["x"]), float(waypoint["y"])
+        except (TypeError, ValueError):
+            die("%s: --vln-bearing-source direct 的 waypoint x/y 不是数值（实际 %r）"
+                % (man_path, waypoint))
+        if not (math.isfinite(direct_wx) and math.isfinite(direct_wy)):
+            die("%s: --vln-bearing-source direct 的 waypoint x/y 不是有限数值（实际 %r）"
+                % (man_path, waypoint))
     task_version = man.get("task_version")
     target_color = man.get("target_color")
     camera = man.get("camera") or {}
@@ -567,7 +586,24 @@ def load_episode(ep_dir, drop_collision=False, exclude_collision_episodes=False,
                 ng_val = int(ng_val)
             elif not isinstance(ng_val, int) or ng_val not in (0, 1):
                 die("%s 第 %d 行 (step %d): near_goal=%r 须为 0/1 或 bool" % (actions_path, lineno, step, ng_val))
-        if (bb_val is None or ng_val is None) and isinstance(waypoint, dict):
+        if vln_bearing_source == "direct":
+            pb, yb = row.get("pose_before"), row.get("yaw_before")
+            if (not isinstance(pb, dict) or "x" not in pb or "y" not in pb
+                    or isinstance(pb["x"], bool) or isinstance(pb["y"], bool)
+                    or yb is None or isinstance(yb, bool)):
+                die("%s 第 %d 行 (step %d): --vln-bearing-source direct 需要 pose_before{x,y} 与 yaw_before"
+                    "（实际 pose_before=%r, yaw_before=%r）" % (actions_path, lineno, step, pb, yb))
+            try:
+                px, py, yaw_deg = float(pb["x"]), float(pb["y"]), float(yb)
+            except (TypeError, ValueError):
+                die("%s 第 %d 行 (step %d): --vln-bearing-source direct 的位姿不是数值"
+                    "（pose_before=%r, yaw_before=%r）" % (actions_path, lineno, step, pb, yb))
+            if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(yaw_deg)):
+                die("%s 第 %d 行 (step %d): --vln-bearing-source direct 的位姿不是有限数值"
+                    "（pose_before=%r, yaw_before=%r）" % (actions_path, lineno, step, pb, yb))
+            bb_val = nav_cond.bearing_bin_xy(math.radians(yaw_deg), (px, py), (direct_wx, direct_wy))
+            ng_val = int(math.hypot(px - direct_wx, py - direct_wy) <= stop_radius_m)
+        elif (bb_val is None or ng_val is None) and isinstance(waypoint, dict):
             pb, yb = row.get("pose_before"), row.get("yaw_before")
             if isinstance(pb, dict) and yb is not None and "x" in pb and "y" in pb and "x" in waypoint and "y" in waypoint:
                 px, py = float(pb["x"]), float(pb["y"])
@@ -684,7 +720,8 @@ def _check_nonempty_splits(episodes, skip_stats, allow_empty_split):
 def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
          split_salt=None, allow_frozen=False, allow_diagnostic=False, allow_mixed=False,
          allow_mixed_dynamics=False, exclude_failed_teacher=False, skip_stats=None,
-         drop_late_and_stall=False, allow_empty_split=False):
+         drop_late_and_stall=False, allow_empty_split=False,
+         vln_bearing_source=DEFAULT_VLN_BEARING_SOURCE):
     """加载全部 episode 索引，并检查 scene_id 的 split 唯一性。
 
     返回值的 skipped 只数碰撞整集丢弃（--exclude-collision-episodes，含义不变）；--exclude-failed-teacher 的跳过数
@@ -703,7 +740,8 @@ def scan(ep_dirs, drop_collision=False, exclude_collision_episodes=False,
         seen_dirs.add(real)
         ep = load_episode(d, drop_collision, exclude_collision_episodes, split_salt,
                           allow_frozen, allow_diagnostic, exclude_failed_teacher, skip_stats,
-                          drop_late_and_stall=drop_late_and_stall)
+                          drop_late_and_stall=drop_late_and_stall,
+                          vln_bearing_source=vln_bearing_source)
         if ep == SKIP_FAILED_TEACHER:
             failed_teacher += 1
             continue
@@ -849,7 +887,8 @@ def _split_facts_one_family(episodes):
 
 
 def build_meta(episodes, total, size, dropped=0, split_scheme=None,
-               collision_filter=None, allow_mixed=False, aux_info=None, cond=None):
+               collision_filter=None, allow_mixed=False, aux_info=None, cond=None,
+               vln_bearing_source=DEFAULT_VLN_BEARING_SOURCE):
     src_w, src_h = episodes[0]["src_w"], episodes[0]["src_h"]
     families = family_facts(episodes)
     if allow_mixed and len(families) > 1:
@@ -931,7 +970,8 @@ def build_meta(episodes, total, size, dropped=0, split_scheme=None,
         # --cond heading-code（W1-9）：侧车里 prev_action 那一列是航向码而不是上一步动作；评测端闸门读这个键判断模型训练时的条件类型。
         # 只在 heading-code 时写键（默认 meta 逐位不变；没有这个键 = prev-action 语义）。
         **({"cond": nav_cond.DATASET_COND_TAG} if cond == nav_cond.COND_HEADING_CODE
-           else {"cond": nav_cond.DATASET_VLN_COND_TAG} if cond == nav_cond.COND_VLN_NAV else {}),
+           else {"cond": nav_cond.DATASET_VLN_COND_TAG,
+                 "vln_bearing_source": vln_bearing_source} if cond == nav_cond.COND_VLN_NAV else {}),
         "splits": counts,
         # 每 split 的每类样本数：T3 的「四类 recall >0」需要先确认 val/test 有 support。
         "class_counts": class_counts,
@@ -1006,13 +1046,15 @@ def load_frame(path, src_w, src_h, size, crop=None, src_expected=None):
 
 def write_dataset(out_dir, episodes, total, size, dropped=0, crop=None,
                   src_expected=None, split_scheme=None, collision_filter=None,
-                  allow_mixed=False, aux_info=None, cond=None):
+                  allow_mixed=False, aux_info=None, cond=None,
+                  vln_bearing_source=DEFAULT_VLN_BEARING_SOURCE):
     os.makedirs(out_dir, exist_ok=True)
     out_path = os.path.join(out_dir, "dataset.uavr")
     out_w, out_h = size
 
     meta_bytes = json.dumps(build_meta(episodes, total, size, dropped, split_scheme,
-                                       collision_filter, allow_mixed, aux_info, cond),
+                                       collision_filter, allow_mixed, aux_info, cond,
+                                       vln_bearing_source=vln_bearing_source),
                             ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     # C++ 读端（dataset.cpp）按子串定位 "episodes" 数组与 split_* 标量，不是完整 JSON 解析：
     # "episodes" 只能出现一次，split_*/collision_flags 的第一次出现必须是顶层（在 episodes 数组之前），
@@ -1225,10 +1267,12 @@ def aux_payload(episodes, size, envelope_radius_m, cond=nav_cond.COND_PREV_ACTIO
                 bb = s["bearing_bin"]
                 if (vln_search_dropout > 0.0 and ep.get("split") == "train"
                         and s["stop_target"] == 0 and s["near_goal"] == 0
-                        and s["label"] == 2 and bb in (2, 3, 4)):
-                    # 目标在视野外且教师左转扫描时，按确定性哈希置为 BEARING_UNKNOWN(8)，让模型学会未知方位时单向扫描且不误停
+                        and s["label"] == 2 and (bb in (1, 2, 3, 4, 5, 6) or s["prev_action"] == 0)):
+                    # 目标偏离正前（1..6）或初始悬停起转（prev_action==0）且教师左转扫描时，按确定性哈希置为 BEARING_UNKNOWN(8)；
+                    # prev_action==0 放大至 1.8 倍概率压制制动帧悬停偏置，确保 step 0 收到 SEARCH(8) 立即旋转扫描。
+                    drop_p = min(1.0, vln_search_dropout * 1.8) if s["prev_action"] == 0 else vln_search_dropout
                     u = int(hashlib.sha256(f"{ep['scene_id']}:{ep['seed']}:{s['step']}".encode()).hexdigest()[:8], 16) / float(1 << 32)
-                    if u < vln_search_dropout:
+                    if u < drop_p:
                         bb = nav_cond.BEARING_UNKNOWN
                 stop_target[g] = s["stop_target"]
                 nav_cond_col[g] = nav_cond.encode_vln_nav(s["prev_action"], bb, s["near_goal"])
@@ -1518,6 +1562,8 @@ def main():
                    metavar="M", help="深度分带目标的包络膨胀半径（m），E1 机体 0.102；0 = 不膨胀")
     p.add_argument("--cond", choices=nav_cond.COND_CHOICES, default=nav_cond.COND_PREV_ACTION,
                    help="侧车 dataset.aux 条件列：prev-action / heading-code / vln-nav")
+    p.add_argument("--vln-bearing-source", choices=VLN_BEARING_SOURCES, default=DEFAULT_VLN_BEARING_SOURCE,
+                   help="--cond vln-nav 时目标方位来源：recorded=优先读采集记录的子目标方位；direct=强制用当前位姿到终点 waypoint 的纯直线欧氏方位（剥离 A* 绕障信息）")
     p.add_argument("--vln-search-dropout", type=float, default=0.0,
                    help="--cond vln-nav 时将 train 分区视野外左转步按该比例映射为 BEARING_UNKNOWN(8)，训练搜索扫描行为")
     p.add_argument("--depth-source", choices=DEPTH_SOURCES, default=DEFAULT_DEPTH_SOURCE,
@@ -1531,6 +1577,8 @@ def main():
         p.error("--split-by-map 生成 map-hash:* 诊断划分，需显式 --allow-diagnostic-split")
     if not (0 <= args.envelope_radius < 10):
         p.error("--envelope-radius 须在 [0,10) m")
+    if args.vln_bearing_source != DEFAULT_VLN_BEARING_SOURCE and args.cond != nav_cond.COND_VLN_NAV:
+        p.error("--vln-bearing-source 仅适用于 --cond vln-nav")
 
     skip_stats = {}
     episodes, total, dropped, skipped = scan(
@@ -1539,7 +1587,8 @@ def main():
         args.allow_mixed_geometry, args.allow_mixed_dynamics,
         args.exclude_failed_teacher, skip_stats,
         drop_late_and_stall=args.drop_late_and_stall,
-        allow_empty_split=args.allow_empty_split)
+        allow_empty_split=args.allow_empty_split,
+        vln_bearing_source=args.vln_bearing_source)
     if args.cond == nav_cond.COND_HEADING_CODE:
         with_waypoint = [ep["dir"] for ep in episodes if ep.get("waypoint") is not None]
         if with_waypoint:
@@ -1598,7 +1647,8 @@ def main():
                                          split_scheme=split_scheme,
                                          collision_filter=collision_filter,
                                          allow_mixed=args.allow_mixed_geometry,
-                                         aux_info=aux_info, cond=args.cond)
+                                         aux_info=aux_info, cond=args.cond,
+                                         vln_bearing_source=args.vln_bearing_source)
     apath = write_aux_sidecar(args.out, out_path, prev_index, prev_action, depth, grid,
                               args.envelope_radius, stop_target=stop_target, nav_cond_col=nav_cond_col)
     vln_rows = [{"episode_id": ep["episode_id"], "instruction": ep["vln_text"],

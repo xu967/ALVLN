@@ -40,6 +40,8 @@ class StudentPolicy:
     stop_threshold = 0.5
     last_stop_prob = 0.0
     last_stop_requested = False
+    last_depth_sectors = None
+    last_near_obs_prob = 0.0
     _prev_rgb = None
     _last_action = 0
 
@@ -130,11 +132,13 @@ class StudentPolicy:
             self._abort_start(f"推理进程 warmup 失败：{self._stderr()}")
 
     def reset(self):
-        """集边界：清掉上一帧/上一步动作与停止意图缓存。"""
+        """集边界：清掉上一帧/上一步动作、停止意图与机载预测深度缓存。"""
         self._prev_rgb = None
         self._last_action = 0
         self.last_stop_prob = 0.0
         self.last_stop_requested = False
+        self.last_depth_sectors = None
+        self.last_near_obs_prob = 0.0
 
     def act(self, msg, prev_action=None, bearing_bin=None, near_goal=None):
         """gz.msgs.Image dict -> (action, infer_ms, probs)。解码/推理失败抛异常。
@@ -171,6 +175,9 @@ class StudentPolicy:
         action = int(obj["action"])
         self.last_stop_prob = float(obj.get("stop_prob", 0.0))
         self.last_stop_requested = bool(obj.get("stop_requested", False))
+        ds = obj.get("depth_sectors")
+        self.last_depth_sectors = tuple(float(v) for v in ds) if isinstance(ds, list) and len(ds) == 3 else None
+        self.last_near_obs_prob = float(obj.get("near_obs_prob", 0.0))
         self._prev_rgb = cur
         self._last_action = action
         return action, float(obj["infer_ms"]), obj["probs"]

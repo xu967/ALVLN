@@ -20,19 +20,55 @@ namespace {
 
 const MaxPool2d kPool(2, 2);  // 160x120 → 80x60 → 40x30 → 20x15
 
-// Tensor 没有 view/reshape，只能按元素数拷贝一份（训练每步最多几 MB，可忽略）。
-Tensor reshape_copy(const Tensor& t, std::vector<std::int64_t> dims) {
-  Tensor o(std::move(dims));
-  if (o.numel() != t.numel()) {
-    throw std::invalid_argument("reshape_copy: 元素数不一致（" + std::to_string(t.numel()) +
-                                " vs " + std::to_string(o.numel()) + "）");
-  }
-  std::copy(t.data(), t.data() + t.numel(), o.data());
-  return o;
+std::int64_t flat_dim(const CnnModel& m) {
+  return static_cast<std::int64_t>(fc_in_dim(m.c3.out, m.in_h, m.in_w));
 }
 
-std::int64_t flat_dim(const CnnModel& m) {
-  return static_cast<std::int64_t>(m.c3.out) * (m.in_h / 8) * (m.in_w / 8);
+Tensor strip_col_pool_forward(const Tensor& feat) {
+  const int n = static_cast<int>(feat.dims()[0]);
+  const int ch = static_cast<int>(feat.dims()[1]);
+  const int ph = static_cast<int>(feat.dims()[2]);
+  const int pw = static_cast<int>(feat.dims()[3]);
+  const int vb = pool_vert_strips(ph);
+  Tensor out({n, static_cast<std::int64_t>(ch) * vb * pw});
+  for (int i = 0; i < n * ch; ++i) {
+    for (int s = 0; s < vb; ++s) {
+      const int y0 = (s * ph) / vb;
+      const int y1 = ((s + 1) * ph) / vb;
+      const float inv = 1.0f / static_cast<float>(y1 - y0);
+      for (int x = 0; x < pw; ++x) {
+        float sum = 0.0f;
+        for (int y = y0; y < y1; ++y) {
+          sum += feat[(static_cast<std::size_t>(i) * ph + y) * pw + x];
+        }
+        out[(static_cast<std::size_t>(i) * vb + s) * pw + x] = sum * inv;
+      }
+    }
+  }
+  return out;
+}
+
+Tensor strip_col_pool_backward(const Tensor& dcol, const std::vector<std::int64_t>& dims) {
+  const int n = static_cast<int>(dims[0]);
+  const int ch = static_cast<int>(dims[1]);
+  const int ph = static_cast<int>(dims[2]);
+  const int pw = static_cast<int>(dims[3]);
+  const int vb = pool_vert_strips(ph);
+  Tensor dp3(dims);
+  for (int i = 0; i < n * ch; ++i) {
+    for (int s = 0; s < vb; ++s) {
+      const int y0 = (s * ph) / vb;
+      const int y1 = ((s + 1) * ph) / vb;
+      const float inv = 1.0f / static_cast<float>(y1 - y0);
+      for (int y = y0; y < y1; ++y) {
+        for (int x = 0; x < pw; ++x) {
+          dp3[(static_cast<std::size_t>(i) * ph + y) * pw + x] =
+              dcol[(static_cast<std::size_t>(i) * vb + s) * pw + x] * inv;
+        }
+      }
+    }
+  }
+  return dp3;
 }
 
 }  // namespace
@@ -233,7 +269,7 @@ Tensor forward(const CnnModel& m, const Tensor& x, CnnCache* cache,
     }
     p3y = &p3mod;
   }
-  Tensor flat = reshape_copy(*p3y, {x.dims()[0], flat_dim(m)});
+  Tensor flat = strip_col_pool_forward(*p3y);
   if (cache) {
     cache->c1 = std::move(c1);
     cache->r1 = std::move(r1);
@@ -255,8 +291,8 @@ Tensor forward(const CnnModel& m, const Tensor& x, CnnCache* cache,
 Tensor aux_forward(const CnnModel& m, const CnnCache& c) {
   if (m.aux_classes == 0) throw std::invalid_argument("aux_forward: 模型没有辅助头");
   if (c.flat.numel() == 0) throw std::invalid_argument("aux_forward: cache 为空");
-  // flat 就是 fc 的输入（FiLM 之后的特征），还原成 4 维给 1x1 卷积。
-  return conv2d_forward_cuda(m.aux, reshape_copy(c.flat, c.p3.y.dims()));
+  // 直接读取未受 FiLM 调制的 p3.y，保证物理深度预测不受导航方位角干扰。
+  return conv2d_forward_cuda(m.aux, c.p3.y);
 }
 
 CnnGrad backward(const CnnModel& m, const CnnCache& c, const Tensor& dlogits,
@@ -267,18 +303,7 @@ CnnGrad backward(const CnnModel& m, const CnnCache& c, const Tensor& dlogits,
   if (daux && m.aux_classes == 0) throw std::invalid_argument("backward: 模型没有辅助头");
   CnnGrad g;
   g.fc = linear_backward_cuda(m.fc, c.flat, dlogits);
-  // fc 的 dx 是 [N, flat]，还原成 [N,64,h',w']；有 FiLM 时先反传 FiLM。
-  Tensor dp3 = reshape_copy(g.fc.dx, c.p3.y.dims());
-  if (m.aux_classes > 0) {
-    if (daux) {
-      g.aux = conv2d_backward_cuda(m.aux, reshape_copy(c.flat, c.p3.y.dims()), *daux);
-      for (std::size_t i = 0; i < dp3.numel(); ++i) dp3[i] += g.aux.dx[i];
-    } else {
-      // 本步没有深度目标：辅助头梯度为 0，但形状要在，Adam/checkpoint 的参数表才对得上。
-      g.aux.dW = Tensor::zeros(m.aux.W.dims());
-      g.aux.db = Tensor::zeros(m.aux.b.dims());
-    }
-  }
+  Tensor dp3 = strip_col_pool_backward(g.fc.dx, c.p3.y.dims());
   if (has_film(m)) {
     const std::size_t n = static_cast<std::size_t>(c.p3.y.dims()[0]);
     if (m.text_dim > 0 && c.text_ids.size() != n * static_cast<std::size_t>(kTextLen)) {
@@ -319,6 +344,15 @@ CnnGrad backward(const CnnModel& m, const CnnCache& c, const Tensor& dlogits,
       }
     }
     dp3 = std::move(dym);  // prev one-hot 没有参数，film.dx 的 prev 段不再往下传
+  }
+  if (m.aux_classes > 0) {
+    if (daux) {
+      g.aux = conv2d_backward_cuda(m.aux, c.p3.y, *daux);
+      for (std::size_t i = 0; i < dp3.numel(); ++i) dp3[i] += g.aux.dx[i];
+    } else {
+      g.aux.dW = Tensor::zeros(m.aux.W.dims());
+      g.aux.db = Tensor::zeros(m.aux.b.dims());
+    }
   }
   // FC 的 dx（或 FiLM 调制后的梯度）还原成 [N,64,h',w'] 再散回 pool3 的 argmax。
   Tensor dr3 = maxpool2d_backward_cuda(kPool, c.r3, c.p3.argmax, dp3);

@@ -1,6 +1,8 @@
 // UAVR v1 只读实现：48 B 小端头 + N×C×H×W uint8 NCHW + N uint8 标签 + meta JSON。
 #include "uavrgb/dataset.hpp"
 
+#include "uavrgb/io_util.hpp"
+
 #include <algorithm>
 #include <cctype>
 #include <cstdio>
@@ -15,30 +17,8 @@
 namespace uavrgb {
 namespace {
 
-std::uint16_t le16(const unsigned char* p) {
-  return static_cast<std::uint16_t>(p[0] | (p[1] << 8));
-}
-std::uint32_t le32(const unsigned char* p) {
-  return static_cast<std::uint32_t>(p[0]) | (static_cast<std::uint32_t>(p[1]) << 8) |
-         (static_cast<std::uint32_t>(p[2]) << 16) | (static_cast<std::uint32_t>(p[3]) << 24);
-}
-std::uint64_t le64(const unsigned char* p) {
-  return static_cast<std::uint64_t>(le32(p)) |
-         (static_cast<std::uint64_t>(le32(p + 4)) << 32);
-}
-
 [[noreturn]] void fail(const std::string& msg) {
   throw std::runtime_error("UAVR: " + msg);
-}
-
-// 读整个区间；长度不足即报错（截断文件不允许静默当成零填充）。
-void read_exact(std::ifstream& f, std::uint64_t off, void* dst, std::size_t len,
-                const char* what) {
-  f.clear();
-  f.seekg(static_cast<std::streamoff>(off));
-  if (!f) fail(std::string("seek 失败: ") + what);
-  f.read(static_cast<char*>(dst), static_cast<std::streamsize>(len));
-  if (static_cast<std::size_t>(f.gcount()) != len) fail(std::string("读取不足: ") + what);
 }
 
 // ---- meta 最小扫描 ----

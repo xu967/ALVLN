@@ -15,10 +15,10 @@
 namespace uavrgb {
 
 struct CnnModel {
-  Conv2d c1;  // 3->16, 3x3, pad1
+  Conv2d c1;  // 3/6->16, 3x3, pad1
   Conv2d c2;  // 16->32
   Conv2d c3;  // 32->64
-  Linear fc;  // 64*(in_h/8)*(in_w/8) -> num_classes
+  Linear fc;  // 64*min(3,in_h/8)*(in_w/8) -> num_classes（三带水平列池化瓶颈，抑制 19200 维像素过拟合）
   int in_h = 0;
   int in_w = 0;
   // 文本分支（可选）：每个 token 位置各取 embedding，拼成 kTextLen*text_dim 维，
@@ -42,6 +42,13 @@ struct CnnModel {
 
 inline int cond_dim(const CnnModel& m) { return kTextLen * m.text_dim + m.prev_dim; }
 inline bool has_film(const CnnModel& m) { return cond_dim(m) > 0; }
+// 垂直三带（顶梁/平视走廊/低矮家具）× 全水平方位列池化：保留水平偏航分辨率并压缩 5 倍分类头参数。
+inline constexpr int kPoolVertStrips = 3;
+inline int pool_vert_strips(int ph) { return ph < kPoolVertStrips ? ph : kPoolVertStrips; }
+inline int fc_in_dim(int c_out, int in_h, int in_w) {
+  const int ph = in_h / 8, pw = in_w / 8;
+  return c_out * pool_vert_strips(ph) * pw;
+}
 // 输入通道 3（单帧）或 6（双帧 [I_t ; I_{t-1}]）；再大没有意义，也挡住损坏的 checkpoint 头。
 inline constexpr int kMaxInC = 6;
 inline constexpr int kMaxPrevDim = 64;
@@ -99,7 +106,7 @@ Tensor forward(const CnnModel& m, const Tensor& x, CnnCache* cache,
                const std::vector<std::uint8_t>* prev = nullptr);
 inline Tensor forward(const CnnModel& m, const Tensor& x) { return forward(m, x, nullptr); }
 
-// 辅助头前向：对 cache 里 fc 看到的同一份特征做 1x1 卷积，返回 [N, aux_classes, h/8, w/8]。
+// 辅助头前向：直接对未受 FiLM 调制的几何特征 c.p3.y 做 1x1 卷积，返回 [N, aux_classes, h/8, w/8]。
 Tensor aux_forward(const CnnModel& m, const CnnCache& cache);
 
 // 逐层反传：fc → pool3 → relu3 → conv3 → … → conv1。

@@ -28,6 +28,42 @@ dev::PoolShape pool_shape(const DeviceCnn::LayerDims& L, int n) {
   return dev::PoolShape{n, L.c_out, L.oh, L.ow, kPoolK, kPoolK, L.ph, L.pw};
 }
 
+__global__ void strip_col_pool_forward_kernel(const float* __restrict__ feat,
+                                              float* __restrict__ out, int ph, int pw, int vb,
+                                              int total) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const int x = idx % pw;
+  const int tmp = idx / pw;
+  const int s = tmp % vb;
+  const int nc = tmp / vb;
+  const int y0 = (s * ph) / vb;
+  const int y1 = ((s + 1) * ph) / vb;
+  const float inv = 1.0f / static_cast<float>(y1 - y0);
+  float sum = 0.0f;
+  for (int y = y0; y < y1; ++y) {
+    sum = __fadd_rn(sum, feat[(static_cast<std::size_t>(nc) * ph + y) * pw + x]);
+  }
+  out[idx] = __fmul_rn(sum, inv);
+}
+
+__global__ void strip_col_pool_backward_kernel(const float* __restrict__ dcol,
+                                               float* __restrict__ dp3, int ph, int pw, int vb,
+                                               int total) {
+  const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx >= total) return;
+  const int x = idx % pw;
+  const int tmp = idx / pw;
+  const int y = tmp % ph;
+  const int nc = tmp / ph;
+  int s = 0;
+  while (s + 1 < vb && y >= ((s + 1) * ph) / vb) ++s;
+  const int y0 = (s * ph) / vb;
+  const int y1 = ((s + 1) * ph) / vb;
+  const float inv = 1.0f / static_cast<float>(y1 - y0);
+  dp3[idx] = __fmul_rn(dcol[(static_cast<std::size_t>(nc) * vb + s) * pw + x], inv);
+}
+
 }  // namespace
 
 template <typename T>
@@ -51,6 +87,7 @@ DeviceCnn::DeviceCnn(const CnnModel& model, int max_batch, const TrainState* sta
       w_(model.in_w),
       text_dim_(model.text_dim),
       num_classes_(model.fc.out),
+      fc_in_(model.fc.in),
       prev_dim_(model.prev_dim),
       cond_dim_(cond_dim(model)),
       aux_classes_(model.aux_classes),
@@ -70,8 +107,8 @@ DeviceCnn::DeviceCnn(const CnnModel& model, int max_batch, const TrainState* sta
     L.pw = (L.ow - kPoolK) / kPoolK + 1;
     h = L.ph, w = L.pw, cin = c.out;
   }
-  if (model.fc.in != cin * h * w) {
-    throw std::invalid_argument("DeviceCnn: fc 输入维度与卷积输出不符");
+  if (model.fc.in != fc_in_dim(cin, h_, w_)) {
+    throw std::invalid_argument("DeviceCnn: fc 输入维度与三带列池化输出不符");
   }
   if (has_film_ && (model.film.in != cond_dim_ || model.film.out != 2 * cin)) {
     throw std::invalid_argument("DeviceCnn: film 层维度与 text_dim/prev_dim/c3.out 不符");
@@ -139,7 +176,10 @@ void DeviceCnn::allocate_and_upload(const CnnModel& model, const TrainState* sta
   dcond_ = alloc<float>(nb * cond_dim_);
   film_out_ = alloc<float>(nb * 2 * cin);
   dfilm_ = alloc<float>(nb * 2 * cin);
-  p3mod_ = alloc<float>(has_film_ ? nb * model.fc.in : 0);
+  const std::size_t p3_n = nb * cin * layer_[2].ph * layer_[2].pw;
+  p3mod_ = alloc<float>(has_film_ ? p3_n : 0);
+  col_ = alloc<float>(nb * fc_in_);
+  dcol_ = alloc<float>(nb * fc_in_);
   logits_ = alloc<float>(nb * num_classes_);
   dlogits_ = alloc<float>(nb * num_classes_);
   d_sumsq_ = alloc<double>(1);
@@ -235,8 +275,13 @@ Tensor DeviceCnn::forward(const std::uint8_t* images, int n, const std::uint8_t*
     in = p3mod_;
   }
   const LayerDims& L3 = layer_[2];
-  dev::linear_forward(n, L3.c_out * L3.ph * L3.pw, num_classes_, in, params_ + seg_[6].off,
-                      params_ + seg_[7].off, logits_);
+  const int vb = pool_vert_strips(L3.ph);
+  const int col_tot = n * fc_in_;
+  strip_col_pool_forward_kernel<<<blocks_for(col_tot), kThreads>>>(in, col_, L3.ph, L3.pw, vb,
+                                                                   col_tot);
+  launched("strip_col_pool_forward_kernel");
+  dev::linear_forward(n, fc_in_, num_classes_, col_, params_ + seg_[6].off, params_ + seg_[7].off,
+                      logits_);
   Tensor out({n, num_classes_});
   // 同步点：D2H 之前所有 kernel 的执行错误都会在这里报出来。
   CUDA_CHECK(cudaMemcpy(out.data(), logits_, out.numel() * sizeof(float), cudaMemcpyDeviceToHost));
@@ -257,11 +302,15 @@ float DeviceCnn::backward_step(const Tensor& dlogits, float max_grad_norm, Train
   CUDA_CHECK(cudaMemcpy(dlogits_, dlogits.data(), dlogits.numel() * sizeof(float),
                         cudaMemcpyHostToDevice));
   const LayerDims& L3 = layer_[2];
-  dev::linear_backward(n, L3.c_out * L3.ph * L3.pw, num_classes_, fc_input(),
-                       params_ + seg_[6].off, dlogits_, grads_ + seg_[6].off,
-                       grads_ + seg_[7].off, dflat_);
-  if (aux_classes_ > 0) aux_backward(n);  // 辅助头对同一份特征的梯度叠进 dflat_
-  if (has_film_) film_backward(n);        // dflat_ 原地变成对 p3 的梯度
+  dev::linear_backward(n, fc_in_, num_classes_, col_, params_ + seg_[6].off, dlogits_,
+                       grads_ + seg_[6].off, grads_ + seg_[7].off, dcol_);
+  const int vb = pool_vert_strips(L3.ph);
+  const int p3_tot = n * L3.c_out * L3.ph * L3.pw;
+  strip_col_pool_backward_kernel<<<blocks_for(p3_tot), kThreads>>>(dcol_, dflat_, L3.ph, L3.pw, vb,
+                                                                   p3_tot);
+  launched("strip_col_pool_backward_kernel");
+  if (has_film_) film_backward(n);        // dflat_ 原地变成对未调制 p3_ 的梯度
+  if (aux_classes_ > 0) aux_backward(n);  // 辅助头对 p3_ 的梯度叠进 dflat_
   float* d_in = dflat_;
   float* conv_out[3] = {c1_, c2_, c3_};
   float* pool_arg[3] = {arg1_, arg2_, arg3_};

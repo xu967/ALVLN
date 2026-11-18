@@ -1,5 +1,6 @@
 // checkpoint 读写实现；格式见 include/uavrgb/checkpoint.hpp 的文件头注释。
 #include "uavrgb/checkpoint.hpp"
+#include "uavrgb/io_util.hpp"
 #include "uavrgb/vln_head.hpp"
 
 #include <cmath>
@@ -14,7 +15,7 @@ namespace uavrgb {
 namespace {
 
 constexpr char kMagic[8] = {'U', 'A', 'V', 'R', 'C', 'K', '0', '1'};
-constexpr std::uint32_t kVersion = 7;     // v7 追加 aux_sidecar_sha256(32B) + stop_threshold(f32)
+constexpr std::uint32_t kVersion = 8;     // v8 固定三带列池化 + FiLM 前深度头，字节布局沿用 v7
 constexpr std::uint32_t kMinVersion = 2;  // v2 没有 best_macro_f1，读回 -1
 
 bool valid_weight_count(std::size_t nw, int num_classes) {
@@ -26,21 +27,9 @@ bool valid_weight_count(std::size_t nw, int num_classes) {
   throw std::invalid_argument("checkpoint: " + msg);
 }
 
-template <typename T>
-void put(std::ofstream& f, const T& v) {
-  f.write(reinterpret_cast<const char*>(&v), sizeof(T));
-}
-
-// 读定长标量；文件提前结束即报错。
-template <typename T>
-void get(std::ifstream& f, T& v, const char* what) {
-  f.read(reinterpret_cast<char*>(&v), sizeof(T));
-  if (f.gcount() != static_cast<std::streamsize>(sizeof(T))) bad(std::string("读取不足: ") + what);
-}
-
 void put_tensor(std::ofstream& f, const Tensor& t) {
-  put<std::uint32_t>(f, static_cast<std::uint32_t>(t.ndim()));
-  for (std::int64_t d : t.dims()) put<std::int64_t>(f, d);
+  put_le<std::uint32_t>(f, static_cast<std::uint32_t>(t.ndim()));
+  for (std::int64_t d : t.dims()) put_le<std::int64_t>(f, d);
   f.write(reinterpret_cast<const char*>(t.data()),
           static_cast<std::streamsize>(t.numel() * sizeof(float)));
 }
@@ -48,10 +37,10 @@ void put_tensor(std::ofstream& f, const Tensor& t) {
 // 读形状；与已有张量形状不一致时按 expect 报具体冲突（不覆盖、不重分配）。
 void get_dims(std::ifstream& f, const std::string& name, std::vector<std::int64_t>& out_dims) {
   std::uint32_t nd = 0;
-  get<std::uint32_t>(f, nd, "ndim");
+  get_le<std::uint32_t>(f, nd, "ndim");
   if (nd > 8) bad(name + ": ndim 异常 " + std::to_string(nd));
   out_dims.assign(nd, 0);
-  for (std::uint32_t i = 0; i < nd; ++i) get<std::int64_t>(f, out_dims[i], "dims");
+  for (std::uint32_t i = 0; i < nd; ++i) get_le<std::int64_t>(f, out_dims[i], "dims");
 }
 void get_floats(std::ifstream& f, Tensor& t, const std::string& name) {
   f.read(reinterpret_cast<char*>(t.data()),
@@ -93,15 +82,15 @@ Header read_header(std::ifstream& f) {
     bad("magic 不符（不是 UAVRCK01）");
   }
   Header h;
-  get<std::uint32_t>(f, h.version, "version");
+  get_le<std::uint32_t>(f, h.version, "version");
   if (h.version < kMinVersion || h.version > kVersion) {
     bad("version 不支持: " + std::to_string(h.version));
   }
-  get<std::uint32_t>(f, h.param_count, "param_count");
-  get<std::int32_t>(f, h.in_h, "in_h");
-  get<std::int32_t>(f, h.in_w, "in_w");
-  get<std::int32_t>(f, h.in_c, "in_c");
-  get<std::int32_t>(f, h.num_classes, "num_classes");
+  get_le<std::uint32_t>(f, h.param_count, "param_count");
+  get_le<std::int32_t>(f, h.in_h, "in_h");
+  get_le<std::int32_t>(f, h.in_w, "in_w");
+  get_le<std::int32_t>(f, h.in_c, "in_c");
+  get_le<std::int32_t>(f, h.num_classes, "num_classes");
   if (h.in_h <= 0 || h.in_w <= 0 || h.in_c <= 0 || h.num_classes <= 0) {
     bad("结构元信息非正数");
   }
@@ -116,8 +105,8 @@ struct V6Fields {
 V6Fields read_v6(std::ifstream& f, std::uint32_t version) {
   V6Fields v;
   if (version < 6) return v;
-  get<std::int32_t>(f, v.aux_classes, "aux_classes");
-  get<std::int32_t>(f, v.prev_dim, "prev_dim");
+  get_le<std::int32_t>(f, v.aux_classes, "aux_classes");
+  get_le<std::int32_t>(f, v.prev_dim, "prev_dim");
   if (v.aux_classes < 0 || v.aux_classes > kMaxAuxClasses || v.prev_dim < 0 ||
       v.prev_dim > kMaxPrevDim) {
     bad("aux_classes/prev_dim 非法");
@@ -133,7 +122,7 @@ V7Fields read_v7(std::ifstream& f, std::uint32_t version) {
   V7Fields v;
   if (version < 7) return v;
   get_sha(f, v.aux_sidecar_sha256, "aux_sidecar_sha256");
-  get<float>(f, v.stop_threshold, "stop_threshold");
+  get_le<float>(f, v.stop_threshold, "stop_threshold");
   if (!std::isfinite(v.stop_threshold) || v.stop_threshold <= 0.0f || v.stop_threshold >= 1.0f) {
     bad("stop_threshold 非法（须在 (0, 1) 内）");
   }
@@ -144,7 +133,7 @@ V7Fields read_v7(std::ifstream& f, std::uint32_t version) {
 std::int32_t read_text_dim(std::ifstream& f, std::uint32_t version) {
   if (version < 4) return 0;
   std::int32_t text_dim = 0;
-  get<std::int32_t>(f, text_dim, "text_dim");
+  get_le<std::int32_t>(f, text_dim, "text_dim");
   if (text_dim < 0 || text_dim > kMaxTextDim) bad("text_dim 非法");
   return text_dim;
 }
@@ -153,15 +142,15 @@ std::int32_t read_text_dim(std::ifstream& f, std::uint32_t version) {
 bool read_v5_contract(std::ifstream& f, CheckpointContract& c) {
   get_sha(f, c.dataset_sha256, "dataset_sha256");
   std::uint8_t flags = 0;
-  get<std::uint8_t>(f, flags, "contract_flags");
+  get_le<std::uint8_t>(f, flags, "contract_flags");
   c.drop_collision = (flags & 1u) != 0;
   get_sha(f, c.soft_targets_sha256, "soft_targets_sha256");
-  get<float>(f, c.distill_alpha, "distill_alpha");
-  get<float>(f, c.lr, "contract_lr");
+  get_le<float>(f, c.distill_alpha, "distill_alpha");
+  get_le<float>(f, c.lr, "contract_lr");
   std::uint32_t seed = 0;
-  get<std::uint32_t>(f, seed, "contract_seed");
+  get_le<std::uint32_t>(f, seed, "contract_seed");
   c.seed = static_cast<unsigned>(seed);
-  get<std::int32_t>(f, c.batch, "contract_batch");
+  get_le<std::int32_t>(f, c.batch, "contract_batch");
   get_sha(f, c.split_scheme_sha256, "split_scheme_sha256");
   if (!std::isfinite(c.distill_alpha) || !std::isfinite(c.lr)) bad("训练契约含非有限值");
   return !(c.lr == 0.0f && c.batch == 0 && c.dataset_sha256 == Sha256{});
@@ -184,37 +173,37 @@ void save_checkpoint(const std::string& path, const CnnModel& model, const Train
   std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
   if (!f) throw std::runtime_error("checkpoint: 无法写 " + tmp);
   f.write(kMagic, sizeof kMagic);
-  put<std::uint32_t>(f, kVersion);
-  put<std::uint32_t>(f, static_cast<std::uint32_t>(ps.size()));
-  put<std::int32_t>(f, model.in_h);
-  put<std::int32_t>(f, model.in_w);
-  put<std::int32_t>(f, model.c1.in);
-  put<std::int32_t>(f, model.fc.out);
-  put<std::uint32_t>(f, static_cast<std::uint32_t>(st.adam[0].t));
-  put<std::uint32_t>(f, static_cast<std::uint32_t>(st.epoch));
+  put_le<std::uint32_t>(f, kVersion);
+  put_le<std::uint32_t>(f, static_cast<std::uint32_t>(ps.size()));
+  put_le<std::int32_t>(f, model.in_h);
+  put_le<std::int32_t>(f, model.in_w);
+  put_le<std::int32_t>(f, model.c1.in);
+  put_le<std::int32_t>(f, model.fc.out);
+  put_le<std::uint32_t>(f, static_cast<std::uint32_t>(st.adam[0].t));
+  put_le<std::uint32_t>(f, static_cast<std::uint32_t>(st.epoch));
   if (!valid_weight_count(st.class_weights.size(), model.fc.out)) {
     bad("class_weights 长度与 num_classes 不符");
   }
   if (!std::isfinite(st.stop_threshold) || st.stop_threshold <= 0.0f || st.stop_threshold >= 1.0f) {
     bad("stop_threshold 非法（须在 (0, 1) 内）");
   }
-  put<std::uint32_t>(f, static_cast<std::uint32_t>(st.class_weights.size()));
-  for (float w : st.class_weights) put<float>(f, w);
-  put<float>(f, st.best_macro_f1);
-  put<std::int32_t>(f, model.text_dim);  // v4 追加，放在 best 之后：旧版本读端不受影响
+  put_le<std::uint32_t>(f, static_cast<std::uint32_t>(st.class_weights.size()));
+  for (float w : st.class_weights) put_le<float>(f, w);
+  put_le<float>(f, st.best_macro_f1);
+  put_le<std::int32_t>(f, model.text_dim);  // v4 追加，放在 best 之后：旧版本读端不受影响
   // v5 训练契约（固定 113 B）：全部定长，续训比较不需要解析字符串。
   f.write(reinterpret_cast<const char*>(st.contract.dataset_sha256.data()), 32);
-  put<std::uint8_t>(f, st.contract.drop_collision ? 1 : 0);
+  put_le<std::uint8_t>(f, st.contract.drop_collision ? 1 : 0);
   f.write(reinterpret_cast<const char*>(st.contract.soft_targets_sha256.data()), 32);
-  put<float>(f, st.contract.distill_alpha);
-  put<float>(f, st.contract.lr);
-  put<std::uint32_t>(f, static_cast<std::uint32_t>(st.contract.seed));
-  put<std::int32_t>(f, st.contract.batch);
+  put_le<float>(f, st.contract.distill_alpha);
+  put_le<float>(f, st.contract.lr);
+  put_le<std::uint32_t>(f, static_cast<std::uint32_t>(st.contract.seed));
+  put_le<std::int32_t>(f, st.contract.batch);
   f.write(reinterpret_cast<const char*>(st.contract.split_scheme_sha256.data()), 32);
-  put<std::int32_t>(f, model.aux_classes);  // v6 追加，放在契约之后：v5 读端的偏移不变
-  put<std::int32_t>(f, model.prev_dim);
+  put_le<std::int32_t>(f, model.aux_classes);  // v6 追加，放在契约之后：v5 读端的偏移不变
+  put_le<std::int32_t>(f, model.prev_dim);
   f.write(reinterpret_cast<const char*>(st.aux_sidecar_sha256.data()), 32);  // v7 追加（36 B）
-  put<float>(f, st.stop_threshold);
+  put_le<float>(f, st.stop_threshold);
 
   for (std::size_t i = 0; i < ps.size(); ++i) {
     check_finite("param[" + std::to_string(i) + "]", *ps[i]);
@@ -244,17 +233,17 @@ CheckpointMeta read_checkpoint_meta(const std::string& path) {
   const Header h = read_header(f);
   // 跳过 adam_t/epoch/class_weights/best_macro_f1 才到 text_dim。
   std::uint32_t t = 0, epoch = 0, nw = 0;
-  get<std::uint32_t>(f, t, "adam_t");
-  get<std::uint32_t>(f, epoch, "epoch");
-  get<std::uint32_t>(f, nw, "class_weight_count");
+  get_le<std::uint32_t>(f, t, "adam_t");
+  get_le<std::uint32_t>(f, epoch, "epoch");
+  get_le<std::uint32_t>(f, nw, "class_weight_count");
   if (!valid_weight_count(nw, h.num_classes)) bad("class_weights 数量不符");
   for (std::uint32_t i = 0; i < nw; ++i) {
     float w = 0.0f;
-    get<float>(f, w, "class_weight");
+    get_le<float>(f, w, "class_weight");
   }
   if (h.version >= 3) {
     float best = -1.0f;
-    get<float>(f, best, "best_macro_f1");
+    get_le<float>(f, best, "best_macro_f1");
   }
   const std::int32_t text_dim = read_text_dim(f, h.version);
   bool has_drop = false, drop = false;
@@ -285,21 +274,21 @@ void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
 
   std::uint32_t t = 0;
   std::uint32_t epoch = 0;
-  get<std::uint32_t>(f, t, "adam_t");
-  get<std::uint32_t>(f, epoch, "epoch");
+  get_le<std::uint32_t>(f, t, "adam_t");
+  get_le<std::uint32_t>(f, epoch, "epoch");
   st.epoch = static_cast<int>(epoch);
 
   std::uint32_t nw = 0;
-  get<std::uint32_t>(f, nw, "class_weight_count");
+  get_le<std::uint32_t>(f, nw, "class_weight_count");
   if (!valid_weight_count(nw, model.fc.out)) bad("class_weights 数量不符");
   st.class_weights.resize(nw);
   for (float& w : st.class_weights) {
-    get<float>(f, w, "class_weight");
+    get_le<float>(f, w, "class_weight");
     if (!(w >= 0.0f) || !std::isfinite(w)) bad("class_weights 含非有限/负值");
   }
   st.best_macro_f1 = -1.0f;
   if (version >= 3) {
-    get<float>(f, st.best_macro_f1, "best_macro_f1");
+    get_le<float>(f, st.best_macro_f1, "best_macro_f1");
     if (!std::isfinite(st.best_macro_f1) || st.best_macro_f1 < -1.0f) {
       bad("best_macro_f1 非法");
     }
@@ -326,6 +315,9 @@ void load_checkpoint(const std::string& path, CnnModel& model, TrainState& st) {
   std::vector<std::int64_t> dims;
   for (std::size_t i = 0; i < ps.size(); ++i) {
     get_dims(f, "param", dims);
+    if (ps[i] == &model.fc.W && dims != ps[i]->dims() && version <= 7) {
+      bad("旧版全展平权重需使用对应版本的推理/训练程序（当前为三带列池化）");
+    }
     check_shape("param[" + std::to_string(i) + "]", *ps[i], dims);
     get_floats(f, *ps[i], "param");
     check_finite("param[" + std::to_string(i) + "]", *ps[i]);

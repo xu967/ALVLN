@@ -30,35 +30,21 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+TOOLS_DIR = Path(__file__).resolve().parent
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
+import uavr_io  # noqa: E402
+
+REPO_ROOT = TOOLS_DIR.parent
 EVAL = REPO_ROOT / "sim" / "tools" / "eval_closed_loop.py"
-UAVR_HEADER = struct.Struct("<4sHHIHHBBBBQQQI")
-UAVR_MAGIC = b"UAVR"
-UAVR_VERSION = 1
+UAVR_HEADER = uavr_io.UAVR_HEADER
+UAVR_MAGIC = uavr_io.UAVR_MAGIC
+UAVR_VERSION = uavr_io.UAVR_VERSION
 
 
 def read_uavr_meta(path):
     """只读 UAVR 文件尾部的 meta JSON；格式不对抛 ValueError/OSError。"""
-    path = Path(path)
-    with path.open("rb") as f:
-        head = f.read(UAVR_HEADER.size)
-        if len(head) != UAVR_HEADER.size:
-            raise ValueError("文件太短，不是 UAVR")
-        (magic, version, header_size, _n, _h, _w, _c, _idt, _ldt, _reserved,
-         _images, _labels, meta_offset, meta_len) = UAVR_HEADER.unpack(head)
-        if magic != UAVR_MAGIC or version != UAVR_VERSION or header_size != UAVR_HEADER.size:
-            raise ValueError(f"UAVR 头不匹配（magic={magic!r} version={version}）")
-        f.seek(0, os.SEEK_END)
-        if meta_offset + meta_len > f.tell():
-            raise ValueError("meta 偏移超出文件长度（文件被截断？）")
-        f.seek(meta_offset)
-        raw = f.read(meta_len)
-    if len(raw) != meta_len:
-        raise ValueError("meta 读取不完整")
-    meta = json.loads(raw.decode("utf-8"))
-    if not isinstance(meta, dict):
-        raise ValueError("UAVR meta 顶层必须是对象")
-    return meta
+    return uavr_io.read_uavr_meta(Path(path))
 
 
 def infer_task(meta):

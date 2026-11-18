@@ -50,7 +50,7 @@ DeviceCnn::AuxStats DeviceCnn::aux_loss(const std::uint8_t* targets, float lambd
     ++st.valid;
   }
   CUDA_CHECK(cudaMemcpy(aux_tgt_, targets, cells, cudaMemcpyHostToDevice));
-  dev::conv2d_forward(aux_shape(L3, n, aux_classes_), fc_input(), params_ + seg_[seg_aux_].off,
+  dev::conv2d_forward(aux_shape(L3, n, aux_classes_), p3_, params_ + seg_[seg_aux_].off,
                       params_ + seg_[seg_aux_ + 1].off, aux_logits_);
   CUDA_CHECK(cudaMemsetAsync(d_aux_loss_, 0, sizeof(double)));
   CUDA_CHECK(cudaMemsetAsync(d_aux_correct_, 0, sizeof(unsigned long long)));
@@ -68,6 +68,73 @@ DeviceCnn::AuxStats DeviceCnn::aux_loss(const std::uint8_t* targets, float lambd
   return st;
 }
 
+bool DeviceCnn::predict_depth_summary(float out_sectors[3], float* out_near_prob) {
+  if (aux_classes_ != 8 || n_ != 1) return false;
+  const LayerDims& L3 = layer_[2];
+  const int ph = L3.ph, pw = L3.pw, hw = ph * pw;
+  dev::conv2d_forward(aux_shape(L3, 1, 8), p3_, params_ + seg_[seg_aux_].off,
+                      params_ + seg_[seg_aux_ + 1].off, aux_logits_);
+  std::vector<float> lg(static_cast<std::size_t>(8 * hw));
+  CUDA_CHECK(cudaMemcpy(lg.data(), aux_logits_, lg.size() * sizeof(float), cudaMemcpyDeviceToHost));
+
+  constexpr double kBandCenters[8] = {0.20, 0.40, 0.65, 1.00, 1.50, 2.15, 3.25, 4.50};
+  const int y0 = (ph >= 4) ? (ph / 4) : 0;
+  const int y1 = (ph >= 4) ? (ph - ph / 4) : ph;
+  const int x1 = (pw >= 3) ? (pw / 3) : pw;
+  const int x2 = (pw >= 3) ? ((2 * pw) / 3) : pw;
+
+  double inv_sum[3] = {0.0, 0.0, 0.0};
+  int cnt[3] = {0, 0, 0};
+  double near_sum = 0.0;
+  int near_cnt = 0;
+
+  for (int y = y0; y < y1; ++y) {
+    for (int x = 0; x < pw; ++x) {
+      const int cell = y * pw + x;
+      double mlg = lg[cell];
+      for (int k = 1; k < 8; ++k) {
+        const double v = lg[k * hw + cell];
+        if (v > mlg) mlg = v;
+      }
+      double p[8], psum = 0.0;
+      for (int k = 0; k < 8; ++k) {
+        p[k] = std::exp(static_cast<double>(lg[k * hw + cell]) - mlg);
+        psum += p[k];
+      }
+      double ed = 0.0, pnear = 0.0;
+      for (int k = 0; k < 8; ++k) {
+        const double pk = p[k] / psum;
+        ed += pk * kBandCenters[k];
+        if (k <= 3) pnear += pk;
+      }
+      const double inv_d = 1.0 / (ed > 0.15 ? ed : 0.15);
+      if (pw < 3) {
+        for (int s = 0; s < 3; ++s) {
+          inv_sum[s] += inv_d;
+          ++cnt[s];
+        }
+        near_sum += pnear;
+        ++near_cnt;
+        continue;
+      }
+      const int s = (x < x1) ? 0 : ((x < x2) ? 1 : 2);
+      inv_sum[s] += inv_d;
+      ++cnt[s];
+      if (s == 1) {
+        near_sum += pnear;
+        ++near_cnt;
+      }
+    }
+  }
+  for (int s = 0; s < 3; ++s) {
+    out_sectors[s] = cnt[s] > 0 ? static_cast<float>(cnt[s] / inv_sum[s]) : 2.0f;
+  }
+  if (out_near_prob) {
+    *out_near_prob = near_cnt > 0 ? static_cast<float>(near_sum / near_cnt) : 0.0f;
+  }
+  return true;
+}
+
 void DeviceCnn::aux_backward(int n) {
   const std::size_t w_len = seg_[seg_aux_].len, b_len = seg_[seg_aux_ + 1].len;
   if (!aux_pending_) {
@@ -76,7 +143,7 @@ void DeviceCnn::aux_backward(int n) {
     return;
   }
   const LayerDims& L3 = layer_[2];
-  dev::conv2d_backward(aux_shape(L3, n, aux_classes_), fc_input(), params_ + seg_[seg_aux_].off,
+  dev::conv2d_backward(aux_shape(L3, n, aux_classes_), p3_, params_ + seg_[seg_aux_].off,
                        daux_, grads_ + seg_[seg_aux_].off, grads_ + seg_[seg_aux_ + 1].off,
                        dp3aux_, ws_aux_);
   dev::add_inplace(dflat_, dp3aux_, n * L3.c_out * L3.ph * L3.pw);

@@ -109,6 +109,9 @@ int main() {
     check(a.first == 1 && b.first == 1, "双帧+prev 一步应处理 1 帧");
     const std::size_t ca = a.second.find(key), cb = b.second.find(key);
     check(ca != std::string::npos && a.second.substr(0, ca) == b.second.substr(0, cb), "双帧同输入两次输出一致");
+    check(a.second.find("\"depth_sectors\":[") != std::string::npos &&
+              a.second.find("\"near_obs_prob\":") != std::string::npos,
+          "带 8 类深度头的模型推理输出包含 depth_sectors 与 near_obs_prob");
     // 上一帧或 prev-action 变化必须影响输出（否则第二帧/条件根本没接进网络）。
     const auto other_prev = run_p2(frame + frame + std::string(1, '\x02'));
     const auto other_act = run_p2(frame + prev_frame + std::string(1, '\x00'));

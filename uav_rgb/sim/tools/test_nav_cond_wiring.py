@@ -155,7 +155,7 @@ class CollectMainLoopTests(unittest.TestCase):
 
 
 def args_ns(**over):
-    base = dict(steps=40, hold=1.0, policy="teacher", teacher_planner="astar", rl_checkpoint="",
+    base = dict(steps=40, hold=1.0, policy="teacher", teacher_planner="astar",
                 window_from="observation", dynamics="cf_sitl", save_depth=False, vehicle="e1_mini",
                 student_ckpt=None, infer_bin=None, beta=0.0, dagger_round=0,
                 stop_at_goal=False, tiebreak="legacy")

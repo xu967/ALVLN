@@ -8,6 +8,7 @@
 #include "uavrgb/class_weights.hpp"
 
 #include "uavrgb/dataset.hpp"
+#include "uavrgb/io_util.hpp"
 #include "uavrgb/softmax_cuda.hpp"
 #include "uavrgb/trainer.hpp"
 
@@ -77,29 +78,7 @@ std::vector<float> auto_weights(const UavrDataset& ds) {
   return w;
 }
 
-std::string quote(const std::string& s) {
-  std::string o = "\"";
-  for (unsigned char ch : s) {
-    if (ch == '"' || ch == '\\') {
-      o += '\\';
-      o += static_cast<char>(ch);
-    } else if (ch == '\n') {
-      o += "\\n";
-    } else if (ch == '\r') {
-      o += "\\r";
-    } else if (ch == '\t') {
-      o += "\\t";
-    } else if (ch < 0x20) {
-      // JSON 不允许裸控制字符；与 metrics_json.cpp 的 quoted 保持一致。
-      char b[7];
-      std::snprintf(b, sizeof b, "\\u%04x", static_cast<unsigned>(ch));
-      o += b;
-    } else {
-      o += static_cast<char>(ch);
-    }
-  }
-  return o + '"';
-}
+std::string quote(const std::string& s) { return json_quote(s); }
 
 // config.json 是扁平对象：取 "key": 后的标量 token（字符串去掉引号）。
 // 找不到返回空串；调用方用空串表示「旧 run 没记录该字段」。

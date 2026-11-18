@@ -3,6 +3,7 @@
 
 #include "trainer_internal.hpp"
 #include "uavrgb/class_weights.hpp"
+#include "uavrgb/io_util.hpp"
 #include "uavrgb/linear_cuda.hpp"
 #include "uavrgb/nn.hpp"
 #include "uavrgb/sha256.hpp"
@@ -42,24 +43,7 @@ std::string num(double v) {
   return b;
 }
 
-std::string quote(const std::string& s) {
-  std::string o = "\"";
-  for (unsigned char ch : s) {
-    if (ch == '"' || ch == '\\') {
-      o += '\\';
-      o += static_cast<char>(ch);
-    } else if (ch == '\n') {
-      o += "\\n";
-    } else if (ch < 0x20) {
-      char b[7];
-      std::snprintf(b, sizeof b, "\\u%04x", static_cast<unsigned>(ch));
-      o += b;
-    } else {
-      o += static_cast<char>(ch);
-    }
-  }
-  return o + '"';
-}
+std::string quote(const std::string& s) { return json_quote(s); }
 
 std::string hex_sha(const Sha256& h) { return sha256_hex(h); }
 

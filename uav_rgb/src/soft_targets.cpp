@@ -1,4 +1,5 @@
 #include "uavrgb/soft_targets.hpp"
+#include "uavrgb/io_util.hpp"
 #include "uavrgb/sha256.hpp"
 
 #include <algorithm>
@@ -11,11 +12,6 @@
 
 namespace uavrgb {
 namespace {
-std::uint64_t le(const unsigned char* p, int n) {
-  std::uint64_t v = 0;
-  for (int i = 0; i < n; ++i) v |= std::uint64_t(p[i]) << (8*i);
-  return v;
-}
 void require(bool ok, const char* msg) {
   if (!ok) throw std::runtime_error(std::string("soft targets: ") + msg);
 }
@@ -32,9 +28,9 @@ std::vector<float> load_soft_targets(const TrainConfig& cfg, const UavrDataset& 
   unsigned char header[120]{};
   require(bool(f.read(reinterpret_cast<char*>(header), sizeof header)), "缺少 UAVSOFT1 头，请重新导出");
   require(std::memcmp(header, "UAVSOFT1", 8) == 0, "未知格式；旧裸数组须重新导出");
-  require(le(header+8, 8) == static_cast<std::uint64_t>(ds.n) &&
-          le(header+16, 4) == ds.num_classes, "N/C 与数据集不符");
-  const auto flags = le(header+20, 4);
+  require(le64(header + 8) == static_cast<std::uint64_t>(ds.n) &&
+          le32(header + 16) == ds.num_classes, "N/C 与数据集不符");
+  const auto flags = le32(header + 20);
   require(flags <= 1, "未知 flags");
   const auto count = static_cast<std::uint64_t>(ds.n) * ds.num_classes;
   require(count <= (std::numeric_limits<std::size_t>::max()-120)/4, "大小溢出");

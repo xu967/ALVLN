@@ -13,6 +13,7 @@
 #include <utility>
 #include <vector>
 
+#include "uavrgb/io_util.hpp"
 #include "uavrgb/sha256.hpp"
 
 namespace uavrgb_test {
@@ -26,16 +27,9 @@ struct SynthDataset {
   std::vector<std::uint8_t> labels;  // 写入的标签（侧车夹具据此推 prev_action）
 };
 
-inline void put_u16(std::ostream& f, std::uint16_t v) {
-  const char b[2] = {static_cast<char>(v & 0xff), static_cast<char>((v >> 8) & 0xff)};
-  f.write(b, 2);
-}
-inline void put_u32(std::ostream& f, std::uint32_t v) {
-  for (int i = 0; i < 4; ++i) f.put(static_cast<char>((v >> (8 * i)) & 0xff));
-}
-inline void put_u64(std::ostream& f, std::uint64_t v) {
-  for (int i = 0; i < 8; ++i) f.put(static_cast<char>((v >> (8 * i)) & 0xff));
-}
+inline void put_u16(std::ostream& f, std::uint16_t v) { uavrgb::put_le<std::uint16_t>(f, v); }
+inline void put_u32(std::ostream& f, std::uint32_t v) { uavrgb::put_le<std::uint32_t>(f, v); }
+inline void put_u64(std::ostream& f, std::uint64_t v) { uavrgb::put_le<std::uint64_t>(f, v); }
 
 // n 个样本，前 train_n 个归 train episode，接着 test_n 个归 test episode，
 // 其余归 val episode（val_n/test_n 为 0 时不写对应 episode）。

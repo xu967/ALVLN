@@ -2,6 +2,7 @@
 // 模型（旧 run 的权重不作废）；v6 的 aux/prev 字段写回一致；结构不符（单帧 ckpt 读进双帧模型、
 // 辅助头有无不同）必须被拒绝而不是错位读参数。字节布局见 checkpoint.hpp 文件头注释。
 #include <cstdint>
+#include <cstddef>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -36,8 +37,8 @@ void spit(const std::string& p, const std::vector<char>& b) {
   f.write(b.data(), static_cast<std::streamsize>(b.size()));
 }
 
-// 固定头 8+4+4+4*4 = 32 B；之后 adam_t(4) epoch(4) nw(4) [nw 个 float] best(4) text_dim(4)
-// 契约(113) aux_classes(4) prev_dim(4)。class_weights 为空时 text_dim 在 48，契约在 52，v6 字段在 165。
+// 固定头 8+4+4+4*4 = 32 B；之后 adam_t(4) epoch(4) nw(4) best(4) text_dim(4)
+// 契约(113) aux_classes(4) prev_dim(4)。class_weights 为空时契约在 52，v6 字段在 165。
 constexpr std::size_t kContractOff = 52;
 constexpr std::size_t kV6Off = kContractOff + 113;
 constexpr std::size_t kV7Off = kV6Off + 8;
@@ -65,6 +66,33 @@ bool same_params(const CnnModel& a, const CnnModel& b) {
     }
   }
   return true;
+}
+
+std::vector<char> with_legacy_flat_fc(std::vector<char> bytes, std::size_t params_off,
+                                      std::int64_t legacy_fc_in) {
+  std::size_t offset = params_off;
+  for (int parameter = 0; parameter <= 6; ++parameter) {
+    std::uint32_t ndim = 0;
+    std::memcpy(&ndim, bytes.data() + offset, sizeof(ndim));
+    offset += sizeof(ndim);
+    const std::size_t shape_offset = offset;
+    std::vector<std::int64_t> dims(ndim);
+    std::memcpy(dims.data(), bytes.data() + offset, dims.size() * sizeof(dims[0]));
+    offset += dims.size() * sizeof(dims[0]);
+    std::size_t elements = 1;
+    for (const auto dim : dims) elements *= static_cast<std::size_t>(dim);
+    const std::size_t data_end = offset + elements * sizeof(float);
+    if (parameter != 6) {
+      offset = data_end;
+      continue;
+    }
+    const std::size_t legacy_elements = static_cast<std::size_t>(dims[0] * legacy_fc_in);
+    const std::size_t extra_bytes = (legacy_elements - elements) * sizeof(float);
+    bytes.insert(bytes.begin() + static_cast<std::ptrdiff_t>(data_end), extra_bytes, 0);
+    std::memcpy(bytes.data() + shape_offset + sizeof(dims[0]), &legacy_fc_in, sizeof(legacy_fc_in));
+    return bytes;
+  }
+  throw std::runtime_error("legacy checkpoint fixture: fc.W 未找到");
 }
 
 }  // namespace
@@ -96,18 +124,22 @@ int main() {
     check(!loads(root + "/p2.bin", no_prev), "prev_dim 不同被拒");
   }
 
-  // 2) 纯视觉与文本 FiLM 模型：v7 文件剪成 v6 / v5 / v4 后仍可读（模拟旧 run 留下的 checkpoint）。
+  // 2) 在池化后高度 <=3 的模型上，测试旧头的字节布局。
   for (int text_dim : {0, 16}) {
     CnnModel m = make_cnn(16, 24, 5, 4, text_dim);
     TrainState st = make_train_state(m, 1e-3f);
     st.stop_threshold = 0.65f;
     st.aux_sidecar_sha256[0] = 0xab;
     const std::string tag = text_dim ? "film" : "vision";
-    save_checkpoint(root + "/" + tag + "_v7.bin", m, st);
-    const CheckpointMeta meta7 = read_checkpoint_meta(root + "/" + tag + "_v7.bin");
-    check(meta7.stop_threshold == 0.65f && meta7.aux_sidecar_sha256[0] == 0xab,
-          tag + " v7 meta 读回 stop_threshold 与 aux_sidecar_sha256");
-    std::vector<char> b = slurp(root + "/" + tag + "_v7.bin");
+    const auto current_path = root + "/" + tag + "_v8.bin";
+    save_checkpoint(current_path, m, st);
+    const CheckpointMeta meta = read_checkpoint_meta(current_path);
+    check(meta.stop_threshold == 0.65f && meta.aux_sidecar_sha256[0] == 0xab,
+          tag + " v8 meta 读回 stop_threshold 与 aux_sidecar_sha256");
+    std::vector<char> b = slurp(current_path);
+    check(b[8] == 8, "新权重版本为 v8");
+    set_version(b, 7);
+    spit(root + "/" + tag + "_v7.bin", b);
     // v6：去掉 v7 新增的 36 B（aux_sidecar_sha256 32B + stop_threshold 4B）。
     std::vector<char> v6 = b;
     v6.erase(v6.begin() + kV7Off, v6.begin() + kV7Off + 36);
@@ -123,7 +155,7 @@ int main() {
     v4.erase(v4.begin() + kContractOff, v4.begin() + kContractOff + 113);
     set_version(v4, 4);
     spit(root + "/" + tag + "_v4.bin", v4);
-    for (const char* ver : {"v7", "v6", "v5", "v4"}) {
+    for (const char* ver : {"v8", "v7", "v6", "v5", "v4"}) {
       const std::string path = root + "/" + tag + "_" + ver + ".bin";
       CnnModel back = make_cnn(16, 24, 77, 4, text_dim);
       const bool ok = loads(path, back) && same_params(m, back);
@@ -137,7 +169,27 @@ int main() {
     }
   }
 
-  // 3) v6 字段非法值被拒（aux_classes 超上限）。
+// 4) 同标为 v7 的旧全展平 fc.W 必须给出架构迁移提示，而不是含糊的参数形状错误。
+  {
+    CnnModel current = make_cnn(120, 160, 3, 4);
+    TrainState st = make_train_state(current, 1e-3f);
+    const std::string current_path = root + "/current_large.bin";
+    save_checkpoint(current_path, current, st);
+    auto legacy = with_legacy_flat_fc(slurp(current_path), 209, 64 * 15 * 20);
+    set_version(legacy, 7);
+    spit(root + "/legacy_v7_flat.bin", legacy);
+    CnnModel back = make_cnn(120, 160, 3, 4);
+    TrainState back_state = make_train_state(back, 1e-3f);
+    bool gave_migration_hint = false;
+    try {
+      load_checkpoint(root + "/legacy_v7_flat.bin", back, back_state);
+    } catch (const std::invalid_argument& error) {
+      gave_migration_hint = std::string(error.what()).find("旧版全展平权重") != std::string::npos;
+    }
+    check(gave_migration_hint, "v7 全展平权重给出清晰架构迁移提示");
+  }
+
+  // 5) v6 字段非法值被拒（aux_classes 超上限）。
   {
     std::vector<char> b = slurp(root + "/vision_v6.bin");
     const std::int32_t bad = kMaxAuxClasses + 1;
