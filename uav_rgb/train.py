@@ -1304,5 +1304,86 @@ def stop_head():
     return 0
 
 
-if __name__ == "__main__":
-    raise SystemExit(stop_head() if sys.argv[1:]==["stop_head"] else main())
+def semantic_stop():
+    """Recognize a crop before comparing its name with the requested object."""
+    import math
+
+    import torch
+    from PIL import Image
+    from transformers import AutoProcessor, Qwen3VLForConditionalGeneration
+
+    out = Path(__file__).resolve().parent
+    reg = json.loads((out / 'registration.json').read_text())
+    previous = Path(reg['previous'])
+    assert hashlib.sha256(previous.read_bytes()).hexdigest() == reg['previous_sha']
+    rows = json.loads(previous.read_text())['rows']
+    checkpoint = reg['checkpoint']
+    processor = AutoProcessor.from_pretrained(checkpoint, local_files_only=True)
+    processor.image_processor.size = {'shortest_edge': 16384, 'longest_edge': 288 * 192 * 2}
+    model = Qwen3VLForConditionalGeneration.from_pretrained(
+        checkpoint, dtype=torch.float16, device_map='cuda:0', attn_implementation='sdpa', local_files_only=True,
+    ).eval()
+    token_ids = [processor.tokenizer.encode(word, add_special_tokens=False) for word in ('Yes', 'No')]
+    assert all(len(ids) == 1 for ids in token_ids)
+    yes_id, no_id = [ids[0] for ids in token_ids]
+    captions = {}
+    decisions = {}
+
+    def prepare(content):
+        inputs = processor.apply_chat_template([{'role': 'user', 'content': content}], tokenize=True,
+                                              add_generation_prompt=True, return_dict=True, return_tensors='pt').to('cuda:0')
+        if 'pixel_values' in inputs:
+            inputs['pixel_values'] = inputs['pixel_values'].to(torch.float16)
+        return inputs
+
+    def verify(observation):
+        observation['semantic_yes'] = False
+        if not observation['box']:
+            return
+        with Image.open(observation['path']) as image:
+            x1, y1, x2, y2 = observation['box']
+            box = (max(0, math.floor(x1)), max(0, math.floor(y1)), min(image.width, math.ceil(x2)), min(image.height, math.ceil(y2)))
+            if box[2] <= box[0] or box[3] <= box[1]:
+                return
+            image_crop = image.convert('RGB').crop(box)
+        key = (observation['path'], box)
+        if key not in captions:
+            inputs = prepare([{'type': 'image', 'image': image_crop}, {'type': 'text', 'text': reg['caption_prompt']}])
+            output = model.generate(**inputs, max_new_tokens=20, do_sample=False)
+            tokens = output[:, inputs['input_ids'].shape[1]:]
+            captions[key] = processor.batch_decode(tokens, skip_special_tokens=True)[0].strip()
+        caption = captions[key]
+        phrase = observation['phrase']
+        if (phrase, caption) not in decisions:
+            prompt = reg['judge_template'].format(target=phrase, caption=caption)
+            inputs = prepare([{'type': 'text', 'text': prompt}])
+            logits = model(**inputs, logits_to_keep=1).logits[0, -1, [yes_id, no_id]].float()
+            decisions[phrase, caption] = float(logits.softmax(-1)[0])
+        probability = decisions[phrase, caption]
+        observation.update(crop_box=box, free_name=caption, yes_probability=probability, semantic_yes=probability > 0.5)
+
+    with torch.inference_mode():
+        for row in rows:
+            for observation in row['predictions']:
+                verify(observation)
+            row['verified_stop'] = row['candidate_stop'] and all(obs['semantic_yes'] for obs in row['predictions'])
+    groups = {}
+    for split in ('train', 'development'):
+        groups[split] = {}
+        for cond in ('near_correct', 'near_wrong', 'far_correct'):
+            group = [r for r in rows if r['split'] == split and r['condition'] == cond]
+            assert len(group) == len({r['group'] for r in group}) == 5
+            groups[split][cond] = {'n': len(group), **{m: sum(r[m] for r in group) for m in ('baseline_stop', 'candidate_stop', 'verified_stop')}}
+    dev = groups['development']
+    passed = (dev['near_correct']['verified_stop'] >= max(3, dev['near_correct']['baseline_stop']) and
+              dev['near_wrong']['verified_stop'] == 0 and dev['far_correct']['verified_stop'] == 0)
+    (out / 'results.json').write_text(json.dumps(dict(passed=passed, groups=groups, rows=rows, unique_crops=len(captions),
+            unique_phrase_caption_comparisons=len(decisions), yes_no_ids=[yes_id, no_id]), ensure_ascii=False, indent=2) + '\n')
+    print(json.dumps(dict(passed=passed, groups=groups)), flush=True)
+    return 0
+
+
+if __name__ == '__main__':
+    if sys.argv[1:] == ['semantic_stop']:
+        raise SystemExit(semantic_stop())
+    raise SystemExit(stop_head() if sys.argv[1:] == ['stop_head'] else main())

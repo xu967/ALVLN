@@ -1,0 +1,21 @@
+{
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-semantic-20261124/train.py": "80884da296c4d44ed2120971430f205d97907f8be8e9929bd8e40d155f131714",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-semantic-20261124/candidate.diff": "51c1c5182bd07945b70bdd43137b42447d9f1bb1c0e816cefc415f50c1b412e5",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-semantic-20261124/registration.json": "565d7bb57bbd6ac35ca33dfb32ed56ddb43b48bd850dd936081f419514963c0a",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-semantic-20261124/results.json": "8d4808fc8d25895df59fb1ab13f29cfdef6656487ae449de51635b8dbec5b4fe",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-head-20261124/results.json": "dcd6de25ae455d026815300f74340e111cb0f7bb9c3f2cfa61ca916f17131dfa",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/added_tokens.json": "c0284b582e14987fbd3d5a2cb2bd139084371ed9acbae488829a1c900833c680",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/config.json": "4665a867c8b66fa796eb0f76450a2796d3728a76efe0e6ecddbfdb0851a1ed15",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/generation_config.json": "7940a14042d126a31694c75bd8a020b668745a11867a394f19e9d26b5eccf2de",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/model.safetensors.index.json": "5386bd6dc670124b6b71c79a61826cb0998eb8fa7f7f1ed361c45a3e859f7bd6",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/preprocessor_config.json": "f9276329c2bbefae00f65aafc634eb448f1e6a21c353dbfa9297fc50160e6d72",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/special_tokens_map.json": "76862e765266b85aa9459767e33cbaf13970f327a0e88d1c65846c2ddd3a1ecd",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/tokenizer.json": "f54b55fa0c3aba0c91ce09ea79ae4e62da24e2a1a630f96c4bae34aba25e234a",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/tokenizer_config.json": "1e859619337d6e52759cdba57fcc44e34f365648585a46e1d44f900109f1f56e",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/video_preprocessor_config.json": "59c5c9eb52182eb14c06ffb10ca9effd29adce5f238a95de23ca14a38dbd2cb1",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/vocab.json": "ca10d7e9fb3ed18575dd1e277a2579c16d108e32f27439684afa0e10b1440910",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/chat_template.jinja": "3636d0f0bd6bef02654cdffdc447b79cb2cef8ab02cc75267345946291a489e4",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/model-00001-of-00003.safetensors": "83d8710c83162257a47c3dc1c50a14f9d442d2122e2e8d51f8e3ca441f1bff93",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/model-00002-of-00003.safetensors": "6797b81b84dcaabe7be5d13d1a713fd4abefc53dcc318b4a32afcda70ce8232e",
+  "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B/model-00003-of-00003.safetensors": "4acb767ae7aa75e1a3f366cdabeea595d8d199e61ce9c720eddba923bd371c5e"
+}

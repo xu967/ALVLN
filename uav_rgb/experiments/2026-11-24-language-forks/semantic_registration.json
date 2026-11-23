@@ -1,0 +1,12 @@
+{
+  "timestamp": "2026-11-24T03:05:18.525245+08:00",
+  "method": "Freeze the entire previous DINO range head. Add one independent object-recognition veto on each of both real RGB frames. DINO proposes a box from the automatic goal phrase. No detector label or goal text goes to visual captioning. On precisely the tight box (floor min, ceil max, clamp, no context), greedy frozen local public UAV-PUR-4B names the central object, max 20 new tokens. An independent text-only forward of the same frozen model judges compatibility between the automatically extracted goal phrase and that free object name. Compare first next-token logits for single English Yes and No, strict Yes>No; no threshold adjustment. Raw crop captions, yes/no relative probabilities and prior head scores retained, abstain if no box. Candidate stops when both proposed boxes pass frozen range and semantic verdict. No extra camera acquisitions or changed episode limit.",
+  "caption_prompt": "Name the principal object visible at the center of this cropped image. Use a short, specific English noun phrase naming what you actually see. If the object is unclear, output unknown. Output the noun phrase only.",
+  "judge_template": "Requested destination object: {target}\nObject independently recognized in the image: {caption}\nDoes the recognized object identify the requested kind of object? Allow ordinary synonyms. Require compatible object identity, not proximity or association. Unknown or too general means No. Reply with exactly Yes or No.",
+  "checkpoint": "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B",
+  "previous": "/root/rivermind-data/uav_rgb/exp-vln-stop-head-20261124/results.json",
+  "previous_sha": "dcd6de25ae455d026815300f74340e111cb0f7bb9c3f2cfa61ca916f17131dfa",
+  "source_data_sha": "5670a410f90a84d498d1f67d2c40963bd81cc702d9c508497371d6c9ae6d5082",
+  "gate": "Use the existing 30 windows, training (3 rooms,5 independent targets) and reused development (839992,5 targets), three conditions per group. Report all denominators. At least three complete groups, preserve >= previous baseline 3/5 near recall and at least half of positives, zero wrong-language and far false positives. Passing triggers 839934 2x2 plus original correct/swap. Failed gate stops this candidate. 840818 held aside. Known failure from previous experiment motivated this rule. This is a reused development set.",
+  "hardware": "Physical GPU 0 only, fp16 SDPA and deterministic greedy generation. Image token cap same as G3 288x192x2, native aspect ratio."
+}
