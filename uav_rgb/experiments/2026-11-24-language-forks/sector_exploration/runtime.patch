@@ -1,0 +1,31 @@
+--- a/sim/3dgs/collect_3dgs.py
++++ b/sim/3dgs/collect_3dgs.py
+@@ -185,6 +185,8 @@
+         self.last_bearing_bin = None
+         self.last_near_goal = None
+         self.last_decision = {}
++        from .visual_exploration import VisualExploration
++        self.exploration = VisualExploration()
+         self._avoid_steps = 0
+         self._avoid_action = YAW_LEFT
+         self._last_avoid_dir = YAW_LEFT
+@@ -247,9 +249,19 @@
+         model_stop = bool(getattr(self.student, "last_stop_requested", False))
+         grounding = getattr(self.goal_fn, "last_vg", None)
+         self.stop_requested = model_stop if grounding is None else self.goal_fn.confirmed_target
++        from .grounder import instruction_target_matches
++        following = grounding is not None and grounding.goal_mode == "final" and instruction_target_matches(
++            self.goal_fn.instruction, grounding.reason)
++        native_proposal = proposed
++        explore_proposal = self.exploration.observe(self.last_executed, self.student.last_depth_sectors, following)
++        if explore_proposal is not None:
++            proposed = explore_proposal
+         action = SAFE_NEUTRAL if self.stop_requested else self._apply_onboard_depth_gate(proposed, rgb_in)
+         self.last_decision = {
+             "action_proposed": proposed,
++            "explore_proposal": explore_proposal,
++            "r2_proposal": native_proposal,
++            "following_claim": following,
+             "action_intervention": ("task_stop" if self.stop_requested else
+                                     "depth_avoidance" if action != proposed else None),
+             "stop_source": ("student_head" if grounding is None else "visual_target") if self.stop_requested else None,
