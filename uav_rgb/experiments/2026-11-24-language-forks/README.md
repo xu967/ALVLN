@@ -9,3 +9,5 @@
 区域语义复核将候选框裁图送给冻结模型自由命名，再按指令核验，使用上一轮固定的 30 条双帧样本。对应原实验目录 `exp-vln-stop-semantic-20261124`，登记和依赖见 `semantic_registration.json`、`semantic_dependencies.json`。
 
 示教回放实验对应 `exp-vln-gallery-replay-20261124`。运行 `python train.py gallery_replay`。固定图库排除了八组查询路线及对应起点，图文和仅图像均答对 7/16 个动作，整对正确均为 0/8。逐集数据和图库开销见实验机的 `results.json`。
+
+图文停机复核采用固定 CLIP ViT-B/32 与训练房间的 104 类词表，两张图中目标均列前五才保留原停机决策。开发五个目标上正确停机 0/5。入口的固定版本、输入与输出对应数据盘上的 exp-vln-stop-clip-20261124。

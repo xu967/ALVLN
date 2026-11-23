@@ -1,0 +1,19 @@
+{
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-clip-20261124/registration.json": "b71cd85de40d81d22488cb2da31aa0a7d111930922f7a8e6f4e53cb6f47a4980",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-clip-20261124/results.json": "82fd2b8ddac30cc47097f01c8f5c44d6dbfe5c1a29a0e36aab11cae76643ea4d",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-clip-20261124/train.py": "591c86363be195ce9a0eea1db97acbc29ffe35666b8464ba9b2d168ff875fc49",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-clip-20261124/candidate.diff": "e558be664d2b3443cb3d5512a85d8cfe3532108c5ed3fccd1cb57a4116bf46e8",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-clip-20261124/HANDOFF.md": "b0d20d0dcd3dd92c1734af7168c158311e2cbf0ca6671b4418e225a02279a47e",
+  "/root/rivermind-data/uav_rgb/baselines/clip-vit-base-patch32/3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268/tokenizer.json": "b556ac8c99757ffb677208af34bc8c6721572114111a6e0aaf5fa69ff0b8d842",
+  "/root/rivermind-data/uav_rgb/baselines/clip-vit-base-patch32/3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268/tokenizer_config.json": "34b7336e4bee12e0a9730eaf5189f582ef3c3eea5027f65730e5717256755aad",
+  "/root/rivermind-data/uav_rgb/baselines/clip-vit-base-patch32/3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268/preprocessor_config.json": "910e70b3956ac9879ebc90b22fb3bc8a75b6a0677814500101a4c072bd7857bd",
+  "/root/rivermind-data/uav_rgb/baselines/clip-vit-base-patch32/3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268/vocab.json": "5047b556ce86ccaf6aa22b3ffccfc52d391ea4accdab9c2f2407da5b742d4363",
+  "/root/rivermind-data/uav_rgb/baselines/clip-vit-base-patch32/3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268/special_tokens_map.json": "f8c0d6c39aee3f8431078ef6646567b0aba7f2246e9c54b8b99d55c22b707cbf",
+  "/root/rivermind-data/uav_rgb/baselines/clip-vit-base-patch32/3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268/merges.txt": "f526393189112391ce6f9795d4695f704121ce452c3aad1f5335cc41337eba85",
+  "/root/rivermind-data/uav_rgb/baselines/clip-vit-base-patch32/3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268/config.json": "b575ef3c36f2a057fa19e221650105052d61cc9c1a972ec15019c6261ec98770",
+  "/root/rivermind-data/uav_rgb/baselines/clip-vit-base-patch32/3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268/pytorch_model.bin": "a63082132ba4f97a80bea76823f544493bffa8082296d62d71581a4feff1576f",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-head-20261124/results.json": "dcd6de25ae455d026815300f74340e111cb0f7bb9c3f2cfa61ca916f17131dfa",
+  "/root/rivermind-data/uav_rgb/pubdata/sage3d/vln/840139/train/train_trajectories_overall_0199_840139.json": "9c554c7d03e382fe74382ef6ed898a2cf4d0ecb78a21eea94724407892b06974",
+  "/root/rivermind-data/uav_rgb/pubdata/sage3d/vln/841012/train/train_trajectories_overall_0247_841012.json": "7e822900044dfb0bfd7eb56706598530ff7e93332e8cf26cccd237b5c4e69c40",
+  "/root/rivermind-data/uav_rgb/pubdata/sage3d/vln/841150/train/train_trajectories_overall_0590_841150.json": "ee77decacdddcba12d3ba5e9e6aba6a97d4fb906d63111d8ef2611a2699d739a"
+}

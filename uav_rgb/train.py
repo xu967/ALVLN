@@ -1183,153 +1183,227 @@ def _execute_run(mode, run_dir, contract):
     return 0
 
 
-def gallery_replay():
-    from collections import Counter
+def stop_head():
+    """目标检测特征上的固定正则二分类停车头。"""
+    import collections
     import importlib
+    import numpy as np
+    import torch
+    from PIL import Image
+    from scipy.optimize import minimize
+    from scipy.special import expit
+    from scipy.stats import beta
+    from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+    out=Path(__file__).resolve().parent
+    data=out.parent/"exp-vln-instructed-stop-data-20261124"
+    assert (data/"DONE").read_text().startswith("rc=0")
+    assert os.environ["CUDA_VISIBLE_DEVICES"]=="GPU-e9d01956-88db-b317-ea53-be3fb6cf7190" and torch.cuda.device_count()==1
+    samples=[json.loads(v) for v in (data/"samples.jsonl").read_text().splitlines() if v]
+    model_dir=out.parent/"baselines/grounding-dino-tiny/2e311b914779978895827276d44f59285fc49f95"
+    parser_dir=out.parent/"exp-vln-box-control-839934-20261124/default_runtime"
+    sys.path.insert(0,str(parser_dir))
+    parser=importlib.import_module("sim.3dgs.grounder")
+    proc=AutoProcessor.from_pretrained(model_dir,local_files_only=True)
+    model=AutoModelForZeroShotObjectDetection.from_pretrained(model_dir,local_files_only=True).eval().cuda()
+    cache={}
+
+    def measure(path,text):
+        key=(path,text)
+        if key in cache:
+            return cache[key]
+        phrase=parser._english_destination(text.lower().strip(" .")).strip(" .")
+        features=[0.]*7
+        record=dict(path=path,text=text,phrase=phrase,box=None,features=features,centered=False)
+        if phrase:
+            im=Image.open(path).convert("RGB");w,h=im.size
+            inp=proc(images=im,text=phrase+".",return_tensors="pt").to("cuda")
+            with torch.inference_mode():
+                predictions=model(**inp)
+            result=proc.post_process_grounded_object_detection(predictions,inp.input_ids,
+                        threshold=.4,text_threshold=.3,target_sizes=[(h,w)])[0]
+            expected=parser._tokens(phrase)
+            detections=sorted(zip(result["scores"].tolist(),result["boxes"].tolist(),result["text_labels"]),reverse=True)
+            for score,bbox,label in detections:
+                tokens=parser._tokens(label)
+                if not tokens or tokens!=expected[-len(tokens):]:
+                    continue
+                x,y,X,Y=np.clip(bbox,0,[w,h,w,h])
+                cx,cy=(x+X)/(2*w),(y+Y)/(2*h)
+                touches=sum([x<=1,y<=1,X>=w-1,Y>=h-1])/4
+                features[:]=[1.,score,(X-x)/w,(Y-y)/h,abs(cx-.5),abs(cy-.5),touches]
+                record.update(box=bbox,match=label,centered=bool(1/3<=cx<2/3))
+                break
+        cache[key]=record
+        return record
+
+    rows=[]
+    for x in samples:
+        is_train=x["split"]=="train"
+        assert str(x["scene"]) in ({"840139","841012","841150"} if is_train else {"839992"})
+        pair=[measure(p,x["instruction"]) for p in x["rgb_pair"]]
+        assert len(pair)==2 and x["rgb_pair"][0]!=x["rgb_pair"][1]
+        assert int(x["label"])==int(x["condition"]=="near_correct")
+        rows.append(dict(x,predictions=pair))
+
+    train=[(q,v) for q in rows if q["split"]=="train" for v in q["predictions"]]
+    counts=collections.Counter((q["condition"],q["group"]) for q,_ in train)
+    unique=collections.Counter(c for c,_ in counts)
+    assert len(unique)==3 and len(train)>0
+    weight=np.array([1/(unique[q["condition"]]*counts[(q["condition"],q["group"])]) for q,v in train])
+    weight*=len(weight)/weight.sum()
+    X=np.array([v["features"] for q,v in train]);y=np.array([q["label"] for q,v in train],dtype=float)
+    mean=X.mean(0); sd=X.std(0);sd[sd<1e-12]=1
+    Z=(X-mean)/sd
+    def loss(par):
+        logits=Z@par[:-1]+par[-1]
+        data_loss=np.dot(weight,np.logaddexp(0,logits)-y*logits)
+        residual=(expit(logits)-y)*weight
+        grad=np.r_[Z.T@residual+par[:-1],residual.sum()]
+        return data_loss+0.5*float(par[:-1]@par[:-1]),grad
+
+    opt=minimize(loss,np.zeros(8),jac=True,method="L-BFGS-B",options={"maxiter":500})
+    assert opt.success,opt.message
+    for row in rows:
+        for v in row["predictions"]:
+            v["score"]=float(expit((np.asarray(v["features"])-mean)/sd@opt.x[:-1]+opt.x[-1]))
+        row["baseline_stop"]=all(v["centered"] for v in row["predictions"])
+        row["candidate_stop"]=all(v["centered"] and v["score"]>=.5 for v in row["predictions"])
+
+    def interval(k,n):
+        if not n: return None
+        return [float(beta.ppf(.025,k,n-k+1)) if k else 0.,float(beta.ppf(.975,k+1,n-k)) if k<n else 1.]
+
+    groups={}
+    for split in ("train","development"):
+        split_rows=[r for r in rows if r["split"]==split]
+        complete={r["group"] for r in split_rows if {q["condition"] for q in split_rows if q["group"]==r["group"]}=={"near_correct","far_correct","near_wrong"}}
+        summary={"complete_groups":sorted(complete)}
+        for cond in ("near_correct","far_correct","near_wrong"):
+            cases=[r for r in split_rows if r["condition"]==cond]
+            vals={}
+            for m in ("baseline_stop","candidate_stop"):
+                grouped={k:[r[m] for r in cases if r["group"]==k] for k in {r["group"] for r in cases}}
+                status={k:all(v) if cond=="near_correct" else any(v) for k,v in grouped.items()}
+                k=sum(status.values());n=len(status)
+                vals[m]={"n":n,"confirmed":k,"interval":interval(k,n),"by_group":status}
+            summary[cond]=vals
+        groups[split]=summary
+    dev=groups["development"]
+    complete=dev["complete_groups"]
+    near=dev["near_correct"]["candidate_stop"]["by_group"]
+    baseline=dev["near_correct"]["baseline_stop"]["by_group"]
+    k=sum(near[q] for q in complete)
+    gate=(len(complete)>=3 and 2*k>=len(complete) and k>=sum(baseline[q] for q in complete)
+          and all(dev[c]["candidate_stop"]["confirmed"]==0 for c in ("near_wrong","far_correct")))
+    result={"groups":groups,"passed":bool(gate),"rows":rows,"mean":mean.tolist(),"stdev":sd.tolist(),
+            "classifier":opt.x.tolist(),"sample_sha256":hashlib.sha256((data/"samples.jsonl").read_bytes()).hexdigest(),
+            "source_sha256":hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+    (out/"results.json").write_text(json.dumps(result,indent=2,ensure_ascii=False)+"\n")
+    print("gate",gate,"dev complete",len(complete),"near confirmed",k,flush=True)
+    return 0
+
+
+def clip_stop(config_path):
+    import math
+    import re
 
     import numpy as np
+    import torch
     from PIL import Image
+    from transformers import CLIPModel, CLIPProcessor
 
-    out = Path(__file__).resolve().parent
-    root = out.parent
-    old = root / 'exp-vln-language-forks-20261124/fork_mask.json'
-    new = root / 'exp-vln-language-forks-expanded-20261124/fork_mask.json'
-    sources = [old, new]
-    frozen = root / 'exp-vln-box-control-839934-20261124/default_runtime'
-    sys.path.insert(0, str(frozen))
-    grounder = importlib.import_module('sim.3dgs.grounder')
+    cfg = json.loads(config_path.read_text())
+    result_path = config_path.parent / 'results.json'
+    previous = Path(cfg['data'])
+    checkpoint = Path(cfg['model_path'])
+    def sha(path):
+        with path.open('rb') as content:
+            return hashlib.file_digest(content, 'sha256').hexdigest()
+    assert sha(previous) == cfg['data_sha']
+    assert sha(checkpoint / 'pytorch_model.bin') == cfg['weight_sha']
+    assert all(sha(Path(p)) == digest for p, digest in cfg['training_vocabulary_sources'].items())
+    assert os.environ.get('CUDA_VISIBLE_DEVICES') == ''
+    torch.set_num_threads(4)
+    model = CLIPModel.from_pretrained(checkpoint, local_files_only=True).eval()
+    processor = CLIPProcessor.from_pretrained(checkpoint, local_files_only=True)
+    categories = cfg['training_categories']
+    rows = json.loads(previous.read_text())['rows']
+    pad = tuple(round(channel*255) for channel in processor.image_processor.image_mean)
+    def positive_terms(phrase):
+        words = re.findall(r'[a-z]+', phrase.lower())
+        if words and words[0] in ('a', 'an', 'the', 'this', 'that', 'my'):
+            words = words[1:]
+        if not words:
+            return ()
+        return tuple(dict.fromkeys([' '.join(words), words[-1]]))
 
-    def read(path):
-        return json.loads(path.read_text())
+    text_cache = {}
+    def encode_words(terms):
+        # The single cache stores a per-string embedding, independently of the candidate list or query.
+        missing = sorted(set(terms) - text_cache.keys())
+        if missing:
+            texts = ['a photo of a ' + item + '.' for item in missing]
+            tokenized = processor.tokenizer(texts, padding=True, return_tensors='pt')
+            text_states = model.text_model(**tokenized)
+            vectors = torch.nn.functional.normalize(model.text_projection(text_states.pooler_output))
+            text_cache.update(zip(missing,vectors))
 
-    def entries(path):
-        return [json.loads(line) for line in path.read_text().splitlines()]
-
-    def words(text):
-        command = text.lower().strip(' .')
-        return set(grounder._tokens(grounder._english_destination(command) or grounder._goal_text(command)))
-
-    def descriptor(path):
-        with Image.open(path) as image:
-            small = image.convert('RGB').resize((16, 12), Image.Resampling.BILINEAR)
-            return np.asarray(small, dtype=np.float32).flatten() / 255
-
-    corpus = {}
-    relabel = root / 'exp-vln-search-data-20261124/supervision/offline_relabel/registration.json'
-    rewrites = {(r['scene'], r['route']): r['text'] for r in read(relabel)['rows']}
-    sources.append(relabel)
-    for split in ('train', 'development'):
-        path = root / f'exp-vln-search-data-20261124/{split}_episodes.jsonl'
-        sources.append(path)
-        for r in entries(path):
-            key = r['scene'], r['route']
-            if r['success'] and key in rewrites:
-                corpus.setdefault(key, (r['dir'], rewrites[key], r['ins_id']))
-    for index in (old, new):
-        for q in read(index)['pairs']:
-            for arm, instance in zip(q['arms'], q['ids']):
-                if arm['waypoint_success']:
-                    corpus.setdefault((q['scene'], arm['route']), (arm['dir'], arm['instruction'], instance))
-
-    rooms = {}
-    for scene in sorted({s for s, _ in corpus}):
-        path = root / f'3dgs-scenes/sage3d_{scene}/scene.json'
-        sources.append(path)
-        rooms[scene] = {r['name']: (r['spawn']['x'], r['spawn']['y']) for r in read(path)['routes']}
-    queries = [q for q in read(new)['pairs'] if q['split'] == 'development']
-    records = []
-    memory = []
-    for (scene, route), (directory, text, instance) in corpus.items():
-        base = Path(directory)
-        actions = entries(base / 'actions.jsonl')
-        steps = sorted(set(range(0, len(actions), 4)) | {len(actions)-1})
-        chosen = [actions[i] for i in steps]
-        paths = [base / a['frame'] for a in chosen]
-        features = np.stack([descriptor(p) for p in paths])
-        memory.append((words(text), features, [a['action_executed'] for a in chosen]))
-        records.append(dict(scene=scene, route=route, instance=str(instance), text=text, directory=directory,
-                            steps=steps, rgb_hashes=[hashlib.sha256(p.read_bytes()).hexdigest() for p in paths],
-                            frames=len(steps), windows=len(actions), meters=sum(a['displacement_m'] for a in actions),
-                            flight_s=len(actions) * read(base/'episode_manifest.json')['hold_s'],
-                            rgb_bytes=sum(p.stat().st_size for p in paths), feature_bytes=features.nbytes))
-
-    # Only image descriptors, demo text tokens and executed actions enter inference.
-    def infer(observed, instruction, support, mode):
-        if not support:
-            return None, None
-        token_set = words(instruction)
-        best = None
-        result = None
-        for idx, (caption, descriptors, actions) in enumerate(support):
-            if mode == 'image_only':
-                caption = set()
-            if mode == 'shifted':
-                caption = support[(idx + 1) % len(support)][0]
-            union = caption | token_set
-            overlap = len(caption & token_set)/len(union) if union else 0.
-            dist = ((descriptors-observed)**2).mean(axis=1)
-            step = 0 if mode == 'text_only' else int(dist.argmin())
-            rank = (-overlap, 0. if mode == 'text_only' else float(dist[step]), idx)
-            if best is None or rank < best:
-                best = rank
-                result = idx, actions[step]
+    def verify(obs):
+        terms = positive_terms(obs['phrase'])
+        result = dict(terms=terms, rank=None, accepted=False, top5=[])
+        if not obs['box'] or not terms:
+            return result
+        with Image.open(obs['path']) as raw:
+            rgb = raw.convert('RGB')
+        w, h = rgb.size
+        assert (w, h) == (320, 240)
+        x, y, X, Y = np.clip(obs['box'], 0, [w,h,w,h])
+        archived_geometry = obs['features'][2:6]
+        cx,cy = (x+X)/2, (y+Y)/2
+        assert np.allclose(archived_geometry, [(X-x)/w,(Y-y)/h,abs(cx/w-.5),abs(cy/h-.5)], atol=1e-6)
+        size = math.ceil(2*max(X-x,Y-y))
+        left,top = math.floor(cx-size/2),math.floor(cy-size/2)
+        bounds = (max(0,left),max(0,top),min(w,left+size),min(h,top+size))
+        canvas = Image.new('RGB', (size,size), pad)
+        canvas.paste(rgb.crop(bounds), (bounds[0]-left,bounds[1]-top))
+        px = processor(images=canvas,return_tensors='pt').pixel_values
+        features = model.visual_projection(model.vision_model(pixel_values=px).pooler_output)
+        image = torch.nn.functional.normalize(features)[0]
+        encode_words(terms)
+        positive = torch.nn.functional.normalize(torch.stack([text_cache[t] for t in terms]).mean(0),dim=0)
+        names = [c for c in categories if c not in terms]
+        scores = (torch.stack([text_cache[c] for c in names]) @ image).tolist()
+        requested_score = float(image @ positive)
+        rank = 1 + sum(val>=requested_score for val in scores)
+        ordered = sorted(zip(names + ['REQUESTED'], scores + [requested_score]),key=lambda item:-item[1])
+        result.update(rank=rank, accepted=rank<=5, requested_score=requested_score, top5=ordered[:5],
+                      classes=len(ordered), crop_square_xyxy=[left,top,left+size,top+size], observed_xyxy=bounds)
         return result
 
-    rows = []
-    datacost = {}
-    def cost(indices):
-        return {'routes':len(indices), **{field:sum(records[i][field] for i in indices)
-                for field in ('frames', 'windows', 'meters', 'flight_s', 'rgb_bytes', 'feature_bytes')}}
-    for q in queries:
-        imgs = [Path(a['fork_frame']) for a in q['arms']]
-        assert imgs[0].read_bytes() == imgs[1].read_bytes()
-        observed = descriptor(imgs[0])
-        for protocol in ('fixed','leave_pair_out','cross_scene'):
-            withheld = queries if protocol == 'fixed' else [q]
-            excluded = {a['route'] for g in withheld for a in g['arms']}
-            starts = {rooms[q['scene']][r] for r in excluded}
-            if protocol == 'cross_scene':
-                indices = [i for i,g in enumerate(records) if g['scene'] != q['scene']]
-            else:
-                indices = [i for i,g in enumerate(records) if g['scene']==q['scene'] and g['route'] not in excluded
-                           and rooms[g['scene']][g['route']] not in starts]
-            if indices:
-                assert all(hashlib.sha256(imgs[0].read_bytes()).hexdigest() not in records[i]['rgb_hashes'] for i in indices)
-            datacost.setdefault(protocol, {})[q['pair']] = {'support_indices':indices,**cost(indices)}
-            support = [memory[i] for i in indices]
-            prior = Counter(a for _,_,actions in support for a in actions).most_common(1)[0][0] if indices else None
-            for mode in ('full','image_only','text_only','shifted') + (('no_gallery',) if protocol=='cross_scene' else ()):
-                predictions = []
-                retrieved = []
-                coverage = []
-                oracle = []
-                for a, target in zip(q['arms'], q['ids']):
-                    sel, action = (None,prior) if mode=='no_gallery' else infer(observed, a['instruction'], support, mode)
-                    rec = records[indices[sel]] if sel is not None else None
-                    retrieved.append(None if rec is None else [rec['scene'],rec['route'],rec['instance']])
-                    predictions.append(action)
-                    coverage.append(any(records[i]['scene']==q['scene'] and records[i]['instance']==str(target) for i in indices))
-                    oracle.append(a['fork_action'])
-                exact = [v is not None and v[0]==q['scene'] and v[2]==str(t) for v,t in zip(retrieved,q['ids'])]
-                rows.append(dict(pair=q['pair'],protocol=protocol,mode=mode,labels=oracle,predictions=predictions,
-                                 retrieved=retrieved,requested=q['ids'],instance_hit=exact,covered=coverage,
-                                 instructions=[a['instruction'] for a in q['arms']],rgb_sha=hashlib.sha256(imgs[0].read_bytes()).hexdigest()))
-    summary = {}
-    for key in sorted({(r['protocol'],r['mode']) for r in rows}):
-        rs = [r for r in rows if (r['protocol'],r['mode']) == key]
-        summary['/'.join(key)] = dict(n_pairs=len(rs), actions_correct=sum(x==y for r in rs for x,y in zip(r['predictions'],r['labels'])),
-          both=sum(r['predictions']==r['labels'] for r in rs), flipped=sum(x!=y for x,y in (r['predictions'] for r in rs)),
-          swapped_correct=sum(x==y for r in rs for x,y in zip(reversed(r['predictions']),r['labels'])),
-          instance_hits=sum(sum(r['instance_hit']) for r in rs),in_gallery=sum(sum(r['covered']) for r in rs),both_covered=sum(all(r['covered']) for r in rs))
-    (out/'memory_manifest.json').write_text(json.dumps(records,ensure_ascii=False,indent=2)+'\n')
-    (out/'results.json').write_text(json.dumps(dict(summary=summary,rows=rows,cost=datacost),ensure_ascii=False,indent=2)+'\n')
-    deps = [*sources,Path(grounder.__file__),out/'registration.json',Path(__file__),out/'memory_manifest.json',out/'results.json']
-    (out/'dependency_hashes.json').write_text(json.dumps({str(f):hashlib.sha256(f.read_bytes()).hexdigest() for f in deps},indent=2)+'\n')
-    print(json.dumps(summary),flush=True)
+    with torch.inference_mode():
+        encode_words(categories)
+        for row in rows:
+            assert len(row['predictions']) == 2
+            row['clip_frames'] = [verify(obs) for obs in row['predictions']]
+            row['clip_stop'] = row['candidate_stop'] and all(f['accepted'] for f in row['clip_frames'])
+    metrics = {}
+    for split in ('train','development'):
+        metrics[split] = {}
+        for condition in ('near_correct','near_wrong','far_correct'):
+            subset = [row for row in rows if row['split']==split and row['condition']==condition]
+            assert len(subset) == len({r['group'] for r in subset}) == 5
+            metrics[split][condition] = {'n':len(subset),**{field:sum(row[field] for row in subset)
+                                   for field in ('baseline_stop','candidate_stop','clip_stop')}}
+    dev = metrics['development']
+    passed = dev['near_correct']['clip_stop']>=3 and dev['near_wrong']['clip_stop']==0 and dev['far_correct']['clip_stop']==0
+    result_path.write_text(json.dumps(dict(metrics=metrics,passed=passed,rows=rows,training_classes=len(categories),cpu_threads=4,
+                                           registration_sha=sha(config_path),code_sha=sha(Path(__file__))),ensure_ascii=False,indent=2)+'\n')
+    print(json.dumps(dict(metrics=metrics,passed=passed)),flush=True)
     return 0
 
 
 if __name__ == '__main__':
-    if sys.argv[1:] == ['gallery_replay']:
-        raise SystemExit(gallery_replay())
-    raise SystemExit(main())
+    if len(sys.argv)==3 and sys.argv[1]=='clip_stop':
+        raise SystemExit(clip_stop(Path(sys.argv[2])))
+    raise SystemExit(stop_head() if sys.argv[1:]==['stop_head'] else main())
