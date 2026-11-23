@@ -720,15 +720,31 @@ class TestRunner(unittest.TestCase):
             videos = stack.enter_context(mock.patch.object(
                 runner.video_mod, "compose_views_video",
                 return_value={"video": "unused.mp4", "frames": 10, "fps": 10.0}))
-            stack.enter_context(mock.patch.object(runner, "_read_jsonl", side_effect=[actions, oracle] * 2))
+            read = stack.enter_context(mock.patch.object(runner, "_read_jsonl", side_effect=[actions, oracle] * 2))
             stack.enter_context(mock.patch.object(runner, "route_shortest_path_m", return_value=4.0))
             rows, failures = runner.run_scene(
+                "fixture.json", args, SimpleNamespace(camera_mount={}),
+                lexical_grounder=selector, catalog=catalog)
+            # 同一对目标盘外切；停在交点应同时满足两条指令的终点判据。
+            scene["routes"][0]["waypoint"]["x"] = 6.0
+            touch_actions, touch_oracle = _steps([(0, 0), (7, 0), (7, 0)])
+            read.side_effect = [touch_actions, touch_oracle] * 2
+            args.videos = 0
+            touching, touch_failures = runner.run_scene(
                 "fixture.json", args, SimpleNamespace(camera_mount={}),
                 lexical_grounder=selector, catalog=catalog)
 
         self.assertFalse(failures)
         self.assertEqual(len(rows), 2)
+        self.assertFalse(touch_failures)
+        self.assertEqual(len(touching), 2)
+        for row in touching:
+            self.assertTrue(row["swap_goal_disks_overlap"])
+            self.assertEqual(row["swap_goal_separation_m"], 2.0)
+            self.assertTrue(row["success"] and row["supplied_goal_success"])
         first, second = rows
+        self.assertFalse(first["swap_goal_disks_overlap"])
+        self.assertEqual(first["swap_goal_separation_m"], 4.0)
         self.assertEqual((first["success"], first["supplied_goal_success"]), (False, True))
         self.assertEqual((second["success"], second["supplied_goal_success"]), (True, False))
         self.assertEqual(first["supplied_goal_object"], "tv_1")
@@ -740,7 +756,7 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(runner._grounding_summary(rows, failures)["n_correct"], 2)
         self.assertEqual(videos.call_args_list[0].kwargs["result"], "SUCCESS stop 0.00 m")
         self.assertEqual(videos.call_args_list[1].kwargs["result"], "WRONG STOP 4.0 m")
-        self.assertEqual(episode_waypoints, [4.0, 8.0])
+        self.assertEqual(episode_waypoints, [4.0, 8.0, 6.0, 8.0])
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(runner, "run_scene", return_value=(rows, failures)), \
                 mock.patch.object(runner.CfSitlParams, "from_json",

@@ -592,6 +592,12 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                "terminal_reason": man.get("terminal_reason")}
         if supplied_metrics is not None:
             row.update({f"supplied_goal_{key}": value for key, value in supplied_metrics.items()})
+            if cf_mode == "swap" and not is_multi_stage:
+                # 两套单阶段评分都使用同一场景的水平成功半径；双目标实际成功可读两套 success。
+                separation = math.hypot(evaluation_goal["x"] - supplied_goal_waypoint["x"],
+                                        evaluation_goal["y"] - supplied_goal_waypoint["y"])
+                row["swap_goal_separation_m"] = separation
+                row["swap_goal_disks_overlap"] = separation <= 2 * radius
         if ep.get("manual_demo"):
             row.update(start_pose=dict(scene["spawn"]), step_budget=steps)
         if vlm_tracker is not None:
