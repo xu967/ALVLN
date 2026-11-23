@@ -1264,7 +1264,8 @@ def fork_probe():
                     continue
                 assert (q["actions"][0]!=q["actions"][1])==(category=="different") and q["split"]==split
                 img=Path(q["rgb"])
-                assert hashlib.sha256(img.read_bytes()).hexdigest()==q["rgb_sha256"]
+                with Image.open(img) as original:
+                    assert hashlib.sha256(original.convert("RGB").tobytes()).hexdigest()==q["rgb_sha256"]
                 if img not in frames:
                     frames[img]=len(frames)
                 for i in range(2):
@@ -1298,8 +1299,8 @@ def fork_probe():
             batch=sentences[j:j+16]
             tokens=tokenizer(batch,padding=True,return_tensors="pt").to("cuda")
             states=encoder(**tokens).last_hidden_state
-            mask=tokens.attention_mask.unsqueeze(-1)
-            features=F.normalize((states*mask).sum(1)/mask.sum(1))
+            token_mask=tokens.attention_mask.unsqueeze(-1)
+            features=F.normalize((states*token_mask).sum(1)/token_mask.sum(1))
             texts.update({s:e.cpu() for s,e in zip(batch,features)})
     del encoder
     torch.cuda.empty_cache()

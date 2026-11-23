@@ -14,14 +14,20 @@
     "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/registration.json": "562aa2e4513116fbc4c0d68d6862a0d54825eb229834735fe4f166017549cbd5",
     "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/train.py": "ae4334030d14eabceef0d51273f36b13ce7fb0cceff5b7bbfee78c7ac13d2f3b",
     "/root/rivermind-data/uav_rgb/exp-vln-dense-fork-search-20261124/registration.json": "0e62eff9b37aa795a4f9f118435ed6528796632b8e25761755b95aba7f6a8d7f",
-    "/root/rivermind-data/uav_rgb/exp-vln-dense-fork-search-20261124/train.py": "e79371f5eff1bc10048b99bec1dc743efcb6d92377d06168710c33c36cb06456",
+    "/root/rivermind-data/uav_rgb/exp-vln-dense-fork-search-20261124/train.py": "cce8e903b21bddcbe1c51c926c67120b7d1412b9b6735ec1bb6e467d295aa1ed",
     "/root/rivermind-data/uav_rgb/exp-vln-search-train-20261124/inputs.json": "3645c5281d66988d2a6b9ac734380743a3756e0665f2679fe541089fe7de2bb5",
     "/root/rivermind-data/uav_rgb/exp-vln-search-data-20261124/supervision/offline_relabel/train.jsonl": "f43250d367fb8a6d179bc4804df921f24caeac85e99abd75d301adf85ac42d06",
     "/root/rivermind-data/uav_rgb/exp-vln-search-data-20261124/supervision/offline_relabel/development.jsonl": "8662a76a32157997107b08060dd2a35eeeb3e646f49036b075845046f354248f",
     "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/combined/registration.json": "49fc276b8375b426c5d257415aa19dab1899eea8ad0a16cc8097dd02b808e436",
     "/root/rivermind-data/uav_rgb/exp-vln-language-forks-20261124/fork_mask.json": "9e9ed0e06862bfedd7423dbb922fd1401d33dea2441eab435f4dbc042c22f468",
     "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/fork_mask.json": "25c3b1485f11700d751f3c3d25638324a581cda84c9a675969076873025fe922",
-    "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/combined/fork_mask.json": "ebefed0712146475af08ebd808cb8218cf5ad91702c774e0c4a7169829d39494"
+    "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/combined/fork_mask.json": "ebefed0712146475af08ebd808cb8218cf5ad91702c774e0c4a7169829d39494",
+    "/root/rivermind-data/uav_rgb/exp-vln-dense-fork-search-20261124/input_preflight.json": "90561f6758d142c3f38d017c831367d6fc9485daf2d4a81e6bfd9aa595d048c5",
+    "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/weights_imitation.pt": "ab9591f03ba60b604128c21e3949e52e3ce14f420dc080e94fec57159e7bcd5f",
+    "/root/rivermind-data/uav_rgb/exp-vln-fork-counterfactual-states-20261124/train.jsonl": "3a32d19211443e483b8efffacf0453772f608bafee186ef890a99556a37c7fd9",
+    "/root/rivermind-data/uav_rgb/exp-vln-fork-counterfactual-states-20261124/equal_train.jsonl": "b3f88303e08ab798842fa0bb493cd5802b937d81987ac82acb8127ba08b3a00e",
+    "/root/rivermind-data/uav_rgb/exp-vln-fork-counterfactual-states-20261124/equal_development.jsonl": "55d9b16b2671ca70ef73759685be08f31758029fb11473dcab9896fc42bad0aa",
+    "/root/rivermind-data/uav_rgb/exp-vln-fork-counterfactual-states-20261124/development.jsonl": "0f7ddd8e66ffa9439aee91155d1aab7c86acce76367eb59763baa1dd1cd90e80"
   },
   "raw_files": "Effective records enumerate exact RGB current paths. Previous RGB = sibling rgb_{max(step-1,0):05d}.png, executed previous action from sibling actions.jsonl. Original R2 diagnostic parser loads baseline registration to resolve checkpoint at import time. Every online student feature uses R2 frozen tensors. train.py loads neighboring registration(s) with path-dependent filenames. Dense authoritative source four JSONL files from exp-vln-fork-counterfactual-states-20261124 after complete 40-pair CPU audit. Exact input hashes written to dense results.json; logical dependencies referenced here prior to completion.",
   "runtime": "/root/rivermind-data/uav_rgb/envs/vlm-venv/bin/python torch2.7.1+cu128 transformers5.23.0; GPU UUID fixed for identity."

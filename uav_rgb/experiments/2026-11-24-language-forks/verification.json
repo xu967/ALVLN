@@ -1,0 +1,17 @@
+{
+  "same_weights_as_pre_reporting_fix": {
+    "weights_dense_correct.pt": true,
+    "weights_dense_blank.pt": true
+  },
+  "artifacts": {
+    "train.py": "cce8e903b21bddcbe1c51c926c67120b7d1412b9b6735ec1bb6e467d295aa1ed",
+    "weights_dense_correct.pt": "9ba99f13f9268a726ecab4bf46ff6a94b76f847b4e0ecd689abac6690098c6d7",
+    "weights_dense_blank.pt": "bacaa27e1729409dde5a39ae6c1afb83e92765b5517f50b3d750bcdfa23bd0af",
+    "summary.json": "baaf9ddb7e8362ee22d8e5d47f7b1e99f0578ff77e3aa84bcbc09ce470568a15",
+    "results.json": "048cbae65ec5c3e5fafc41ecafe69bb4830394f67ed29efce1baade818f61d51",
+    "direct_dependencies.json": "e7c25baded839b2e760f2c95b7ac8baf6530e63982f715960c36551885ac7a09",
+    "candidate.diff": "9c0288cda4816bbecc10351f49c2f2f08fc6b4ca95cad7768a4933f5e32d30e8"
+  },
+  "first_attempt": "incorrect PNG byte hash vs original decoded-pixel contract",
+  "second_attempt": "text masking shadowed cohort mask only in report after weights saved"
+}
