@@ -1,8 +1,149 @@
 # progress.md（新开会话先读这个）
 
-交接入口：[docs/HANDOFF.md 当前交接](docs/HANDOFF.md) 与 [PLAN §10.18–§10.19 执行卡](docs/PLAN_2026-11-13_vln.md)。
+当前研究与实验顺序见 [论文实验计划](docs/experiments/2026-11-21-vln-paper-plan.md)。早期实现和数据记录见 [交接文档](docs/HANDOFF.md)。
 
-## 2026-11-16 晚间 PLAN §10.18 四卡落地（S1/G2/OF-E1&E2/SCENE-LONG）与数据盘二次清理（最新）
+## 2026-11-23 最新状态
+
+- subgoal-bearing 诊断训练已于 15:00 CST 以 `rc=0` 完成，固定 8,375 updates。新旧 R2 配置只在数据包路径与 SHA 不同；best validation macro-F1 为 `0.787543`，checkpoint SHA256 为 `513e95a7a26709ab38a0157453138ea28ef0dac663e8f267919c2c64e397e667`。
+- 同一 checkpoint 的 `direct/subgoal` 训练标签 × `direct/subgoal` 在线 bearing 2x2 为 `0/10, 3碰撞`、`0/10, 5碰撞`、`0/10, 10碰撞`、`7/10, 1碰撞+2超时`。7/10 是复用开发路线上的特权局控信号，不是语言导航结果。学生 `text_dim=0`，闭环 `grounder=none`，没有读取英文指令。
+- 修复了 VLM 解析器接受截断 STOP JSON、tracker 将任意重复 `reason` 视为同一目标的问题。解析器要求完整 JSON，STOP 还要求标签与当前英文或中文指令的目标短语匹配；目标区域和同类实例区分仍未解决。
+- 新版冻结帧探针中 8 个非空输出均为可解析 JSON。near-door 帧的 correct 输出为 `final / near=1 / entrance door`，swap 输出 `subgoal / near=0 / none`。同一帧 bearing 是 `R`，还没有触发 STOP。
+- branch 帧经路线参考路径核对仍在共享前缀，correct/swap 都输出 `R` 不能作为语言失败证据。没有启动 G3 闭环或新训练，阶段门禁保持关闭。
+- `test_grounder.py` 在系统 Python 和 VLM 环境均为 27/27 通过，`test_vln.py` 在 VLM 环境为 70/70 通过，`py_compile` 和 `git diff --check` 通过。探针只用物理 GPU0，GPU1 未使用。
+- 最新实测及后续步骤见 [冻结帧探针](docs/experiments/2026-11-23-vln-grounding-frame-probe.md)、[论文实验计划](docs/experiments/2026-11-21-vln-paper-plan.md) 和 [代码审查过程记录](docs/worklog/2026-11-23-vln-code-audit-and-next-plan.md)。阶段 1 尚未正式通过。
+
+## 2026-11-22 GPU 回归验证
+
+- RTX 2080 Ti 当前可用。`ctest --test-dir build/check --output-on-failure` 全部 `42/42` 通过，耗时 `41.94` 秒；使用现有构建产物，未重编译。
+- 没有启动新训练或重复闭环。阶段 1 仍被学生上一动作自回馈导致的持续右转阻塞；修复并通过 CPU 回放前不放行训练和论文正式对照。
+- 完整过程见 [GPU 验证记录](docs/worklog/2026-11-22-2147-gpu-validation.md)。
+
+## 2026-11-21 局控闭环与 VLM 冻结帧验证
+
+- 21:09 启动，21:17 完成，PID/PGID 为 `195199`，`DONE rc=0`。同两条开发路线的刹停教师 2/2 成功，三组同权重学生均 0/2，合计 420 步无前进。真值 A* 局部子目标组的实图和黑屏逐步同为右转。
+- 固定教师帧改方位的 70 步中只有 1 步改变最高分动作。首帧将上一动作设为右转后，两个首帧的 9 个方位桶均继续右转。局控先解决自回馈转向循环。
+- VLM 原始响应里的 `0.0` 触发了旧解析回退。已修复并复放实测响应，恢复沙发方位，近距仍判 0。真实输出、配置和八段对照视频见 [实验记录](docs/results.md#2026-11-21-单目局控配对闭环与-vlm-冻结帧验证)。
+
+## 2026-11-21 论文实验与复现审查
+
+- 11 月 17 日已有两次完整 G3 运行。两次共约 108 分钟，种子和最终参数相同。室内 G0-direct 为 0/10，教师 9/10。G3 在 840865 的 correct/swap 均 0/4，在 841980 为 0/5。后续先用现有权重定位门洞局控与视觉目标确认。
+- 当前 G3 由连续两次同名居中的近景观测触发 STOP。预测深度用于避障。下方 11 月 17 日的“几何语义联合判停”是历史方案描述。
+- 调整 `train.py` 续跑契约和阶段完成判定，修复多阶段错配指令泄漏。默认批量套件供历史诊断。OpenFly 本地资产已迁出或清理，当前预检会报告缺项。
+
+## 2026-11-17 11:15 三带列池化、深度扇区避障和 G3 阶段路标（历史记录）
+
+### 已完成的事项
+
+- 按用户选定的主推路线完成全部三项核心架构升级，并清理已证伪的 `G2-StopCalib` 死代码（删除 `sim/3dgs/calibrate_vlm_stop.py` 及 `--vlm-stop-probe` 相关分支）：
+  1. **C++/CUDA 机载网络解耦与三带列池化瓶颈（`src/include/uavrgb/model*.hpp`、`src/model*.cpp/cu`、`src/infer.cpp`）**：
+     - 将分类头前 `64×15×20 = 19,200` 全展平替换为垂直三带（顶梁/平视走廊/低矮家具）× 20 水平方位列均值池化（`3,840 -> 5`），总参数量从 `122,589` 压减至 **`45,789`**（实测 `ds_r0` 首轮验证集 `CE` 从 `0.827` 降至 `0.691`，`Acc` 升至 `73.8%`）。
+     - 将 8 带物理深度辅助头 `m.aux` 解耦至 **FiLM 调制前的 `p3`**（实测首两轮验证集深度命中率即从旧版 30 轮的 `31.1%` 升至 `35.3%`），并在 `uavrgb_infer` 在线推理输出 `depth_sectors=[d_left, d_center, d_right]` 与 `near_obs_prob`。
+  2. **纯机载预测深度扇区避障门控与短时偏航保持（`sim/tools/student.py`、`sim/3dgs/collect_3dgs.py`）**：
+     - `StudentAdapter` 严格只读 RGB 推理返回的预测深度扇区（不读真值深度；`--blind-rgb` 全黑画面自动旁路不伪造转向），当前视预测净空 `< 1.05m` 或 `near_obs_prob >= 0.58` 且未到终点时，覆盖直冲指令转向更开阔侧并保持 2 步偏航滞回。
+  3. **G3 层次化阶段路标分解 VLM + 几何语义联合判停（`sim/3dgs/vlm_grounder_worker.py`、`grounder.py`、`run_vln.py`）**：
+     - Prompt 升级为 `["C|L|R|N","F|S|N",0|1,"word"]` 并附带零特权历史摘要，跨房间看不见终点时自动寻找门洞/走廊出口（`S=subgoal`，强制禁止停机）；当 `VlmBeliefTracker` 锁定最终目标（`F=final`）且机载预测前视深度 `<= 1.15m` 时联合触发 `STOP`；同时移除 `output_hidden_states=True` 节省约 `1.2 GiB` 显存。
+- 更新唯一训练入口 `train.py` 默认预设为 `vln_3dgs`（默认开启 `--augment all --weight-decay 0.0001 --aux-lambda 1.5 --class-weights 1.0,0.75,1.35,1.35`，默认复用已校验的 90 集教师示范加速重训，并新增未见公寓 `841980` 5 集 G3 VLM 闭环录像）。
+- 全量门禁真跑通过：CTest `42/42`、`tools/check.sh --python-only` 全绿、真实 `ds_r0` GPU 2 轮冒烟训练 + `uavrgb_infer` 在线 `depth_sectors` 验证全部通过。
+
+### 关键决策
+
+- 训练启动交由用户自行执行（当前另一终端 `YOLOVO` 仍在跑 `train.py p50k`，代码已内置共享显卡自动分层防 OOM，独享或共享均可一键运行）。
+
+### 未完成的待办
+
+- 等用户自跑 `train.py`（默认输出 `/root/rivermind-data/uav_rgb/exp-vln-3dgs-g3-20261117`）完成后，检查新版 `S1-PureDirect` 与 `G3` 在未见公寓 `840865` / `841980` 及户外长航线上的闭环指标与 `52` 段四格视频。
+
+## 2026-11-17 10:25 自跑守护实验 `exp-full_1019-1117-0828` 全套验收、视觉逐帧诊断与下一阶段方向规划（历史记录）
+
+### 已完成的事项
+
+- 核验用户自跑守护实验 `/root/rivermind-data/uav_rgb/exp-full_1019-1117-0828` 已于 `10:12:47 +0800` 正常跑完（`DONE`: `rc=0 elapsed_s=6271.54`；在与 `YOLOVO` 共享单张 RTX 2080 Ti 下全程 `0` OOM、`0` 协议错误、`0` 视频错误，完整产出 `108` 段闭环 MP4 与 `index.html`）。
+- 修正 `train.py` 中 OpenFly 碰撞统计对 `"collision_reported"` 的匹配并同步刷新 `summary.json`；抽帧生成三组并排视觉诊断图（`exp-full_1019-1117-0828/diagnostic_snapshots/`）及交互式分析面板 `/root/.cursor/projects/root/canvases/vln-1019-eval-and-roadmap.canvas.tsx`。
+- 三大模块实测结论完全闭环：
+  1. **`S1-PureDirect`**：去 A* 子目标后 `student_blind_rgb_direct` 从 `0.80` 归零（`80%` 碰撞），真双帧 `student_g0_direct` 室内留出集仅 `SR=0.10`（未见公寓 `841980` `0/5` 全撞）、户外长航线 `0/3` 全撞；`metrics.jsonl` 证实 `Linear(19200->5)` 在第 3 轮后验证损失从 `0.689` 恶化至 `1.703+`，避障左/右转帧有 `44%~51%` 被预测为直飞撞墙。
+  2. **`G2-StopCalib`**：冻结 `UAV-PUR-4B` 2566 维线性判停探针验证集 `AUROC=0.4973`（`TP=0, FN=22`），未见公寓 `840865` 同房间可见目标（`tr_86`）能飞至 `1.58m`（`OSR=0.25`）但不停，跨房间目标（`tr_23`、`tr_81`）因缺门洞阶段子目标而失败。
+  3. **`OpenFly v2`**：`env18 seen20` 语言模型达 `7/20 (35%), OSR=11/20`（优于 v1 `3/20` 与纯视觉 `5/20`），但全集 `158` 步中有 `110` 步直飞 `9m`、左转仅 `1` 步，且 `env23` 上 `correct` 与 `swap` 均为 `4/4 (100%)`（`ep001` 停在同一坐标 `9.7045m`；另抓出 `env23 ep000` 首帧 `mean=0.0` 未曝光就绪问题）。
+
+### 关键决策
+
+- 不再在冻结航拍 VLM 隐藏层线性探针或无记忆浅层 Flatten CNN 上做无效调参；整理出「3DGS 层次化阶段路标 + 机载深度门控绕障与几何判停」「OpenFly 轻量化语言头 + 扩充转向分叉数据」等明确技术方向，交由用户拍板下一步主攻路线。
+
+### 未完成的待办
+
+- 等用户选定下一阶段主攻方向（3DGS 架构升级 / OpenFly 数据与语言头改造 / 清理遗留 Gazebo 与 UE5 压缩包）后立即编码落地。
+
+## 2026-11-17 08:15 全套实验守护完成（108 段 MP4 落盘）、OpenFly 统计字段修正与自跑指令交付（历史记录）
+
+### 已完成的事项
+
+- 守护进程 `PGID 2645007` 已于 `2026-11-17 08:05:58 +0800` 正常结束（`DONE`: `rc=0 elapsed_s=811.86`，后台已无残留 UE4/训练进程，端口 `41458` 已释放）。
+- 全部 **`108` 段闭环 MP4 视频**（`47` 段 3DGS 四格视频 + `61` 段 OpenFly UE4 AirSim `decisions.mp4`）已汇总至 `/root/rivermind-data/uav_rgb/exp-1019-direct-g2calib-openfly-20261117/videos/` 与可点播总览页 `.../index.html`。
+- 修正 `train.py` 汇总 OpenFly `eval_openfly_subset.py` 输出 JSON 的字段对齐（`final_goal_distance_m`、`stopped_within_20m_diagnostic`、`within_20m_diagnostic`、`executed_actions`），补充单测 `test_video_gallery_parses_openfly_episode_fields` 并刷新已完成目录的 `summary.json` 与 `index.html`：
+  - `env_airsim_18` `seen20`：`v2_cma_rgb_language` 达 `stop<20m = 7/20 (0.35), OSR = 10/20 (0.50), NE = 24.10m`（较 v1 `3/20` 提升）；`v2_cma_rgb_only` 达 `5/20 (0.25), OSR = 9/20 (0.45), NE = 23.54m`。
+  - `env_airsim_23` 验证集：`v2_cma_rgb_language` 的 `correct` 与 `swap` 均为 `stop<20m = 4/4 (1.00), NE = 10.36m`（印证 STOP 损失加权改善了停靠率，但错配指令与正确指令得分一致，语言分支仍未产生因果区分）；`v2_cma_rgb_only` 为 `2/4 (0.50)`。
+  - `env_airsim_16` 验证集：三臂 `stop<20m = 0/3`，`NE = 34.23~39.77m`。
+- 二次深度死代码清理与马尾辫 Skill 升级保持全绿：累计删除 `389` 个死文件（净减 `91,225` 行），唯一入口 `train.py` 支持一键前台或守护运行全部预设模式。
+
+### 关键决策
+
+- 默认实验目录 `exp-1019-direct-g2calib-openfly-20261117` 已写入 `DONE(rc=0)` 防覆盖锁；用户手动重跑时通过传入新的 `UAVRGB_NAME` 隔离每次运行产物，不覆盖既有基线与视频。
+- 维持对 VLN 语言模块的实证判断：下一步算法改造聚焦 3DGS 多帧阶段子目标分解 + 机载列池化深度门控避障，以及 OpenFly 扩大分叉路口样本规模并去除随机投影层。
+
+### 未完成的待办
+
+- 用户已于 `08:28` 自跑启动守护实验 `/root/rivermind-data/uav_rgb/exp-full_1019-1117-0828`（真实守护 `PID / PGID = 17087`，停止命令 `kill -- -17087`；已修正 `run.pid` 并在 `train.py` 内置启动自写 `os.getpid()`，同时将 `vlm_grounder_worker.py` 共享显卡分层阈值从 `10200 MiB` 上调至 `12000 MiB` 避免与并发 `YOLOVO` 争抢显存 OOM）；考虑共享 GPU 吞吐折损，预计约 `09:25–09:35` 完成。
+- 待用户决定：是否删除未使用的 UE5 CitySample 压缩包释放 `69.45 GiB` 空间，以及是否启动下一代 VLN 模型结构改造。
+
+## 2026-11-17 07:53 二次死代码清零（净减 9.1 万行）、马尾辫 Skill 升级、VLN 语言因果审计与 OpenFly 录像续跑（历史记录）
+
+### 已完成的事项
+
+- 二次深度死代码清理：在早间 `ARCH-LEAN` 基础上继续清除 `tools/`、`sim/3dgs/`、`sim/tools/`、`experiments/`、`config/`、`src/build/` 下全部零调用历史脚本与测试，累计删除 **`389` 个已跟踪死文件、净减少 `91,225` 行代码**（全仓核心 Python/C++ 从 `~15.2 万行` 压至 `6.06 万行`），释放根分区 `31.6 MiB`。
+- 升级马尾辫（`ponytail`）Skill 并同步至 `.codex` / `.claude` / `.cc-switch` / `.cursor`（含 `ponytail-audit`、`ponytail-review`）：确立「卫语句早返回、缩进 <=2 层、>=3 分支字典/规则表驱动、替换旧逻辑当场删净死代码」四条铁律，并同步重构 `src/train_main.cpp`（消除 34 连 `else if`）、`io_util.hpp::json_quote`、`sim/3dgs/grounder.py`、`tools/eval_openfly_subset.py` 与 `ui/studio.py`；全量 CTest `42/42`、`cf_sitl` `9/9 + 33/33`、Python/3DGS/OpenFly/UI 单测全绿。
+- 完成 `S1-PureDirect` 与 `G2-StopCalib` 实测并产出 **`47` 段 3DGS 四格 MP4 视频**（已生成 `/root/rivermind-data/uav_rgb/exp-1019-direct-g2calib-openfly-20261117/index.html`）：
+  - `S1-PureDirect`：剥离 A* 子目标改喂纯直线终点方位后，`student_blind_rgb_direct` 从 `0.80` 归零至 **`SR=0.00`（撞墙率 `80%`）**，真图像 `student_g0_direct` 室内留出集仅 `SR=0.10`（撞墙率 `90%`）、户外长线 `SR=0.00`，确证现有 3 层无记忆小 CNN 不能独立完成复杂跨房间绕障。
+  - `G2-StopCalib`：冻结航拍模型 `UAV-PUR-4B` 在室内近/远景上的隐藏层线性探针验证集 `AUROC=0.4851`（无室内尺度线性可分性），出生扫描增强已消除 `zero` 悬停死锁。
+- 修复 `train.py` 中 UE4 `--settings` 分词问题并以守护进程续跑最后阶段 OpenFly UE4 三场景闭环录像：
+  - `PID / PGID`：`2645007`（停止命令：`kill -- -2645007`）
+  - 状态：单次核实已拉起 `env_airsim_16` 并进入 `eval_openfly_subset.py` 录制 `decisions.mp4`，预计 **`08:06` 左右**完成并自动并入 `index.html`。
+
+### 关键决策
+
+- 诚实面对 VLN 语言模块诊断结论：机载 C++ CNN 无语言参数（`text_dim=0`），OpenFly `CMA v2` 在 80 条短路线（788 帧）上 619 万可训参数过拟合（置零语言 `Val Acc 0.605 >` 真语言 `0.570`），`G2` 零样本航拍 VLM 仅在同房间可见目标有效且缺子目标分解与室内距离感知；下一步算法重构须对准这三处真病灶。
+
+### 未完成的待办
+
+- 约 `08:06` 后等用户通知核查 `PGID 2645007` 完成标记 `DONE`，查看合并后的 `105` 段 3DGS + OpenFly 闭环视频并决定下一代 VLN 模型改造方案。
+
+## 2026-11-17 06:38 PLAN §10.19 落地（S1-PureDirect / G2-StopCalib）、全仓死代码清理、唯一 train.py 与全录像守护启动（历史记录）
+
+### 已完成的事项
+
+- 注册专属 Skill `experiment-daemon-eta`（同步写入 `/root/.cursor/skills/`、`/root/.claude/skills/`、`/root/.codex/skills/` 及 `personal-skill` §6.9）：守护进程启动后仅核实一次 `ps` 存活，直接算准预计完成时刻告知用户，严禁反复调用工具轮询检查。
+- 任务卡 `ARCH-LEAN` 与全仓死代码大清理：移除 `src/device/*`、`batch_reader*`、`episode.hpp`、`ui/monitor.py`、`ui/trainer_demo.py`、`sim/tools/cf_sil.py`、`rl_teacher/*`、`teacher/*`、`proto/*`、`config/vln/*`、退役教师及 `experiments/` 下全部 22 个历史 `run*` 包装目录，共删除 `292` 个文件、净减少约 `62,228` 行代码；收敛 `src/include/uavrgb/io_util.hpp`、`ui/tail_io.py`、`tools/uavr_io.py`。
+- 收敛唯一实验/训练/闭环录像入口 `train.py`（配单测 `tools/test_train_entry.py`）：顶部 `ENV_REGISTRY` 集中管理超参、防拼写错误与防覆盖守卫，统一调度 3DGS 训练/DAgger/闭环、VLM 近距探针校准、多场景 UE4 AirSim 闭环与 `videos/` + `index.html` 全视频展厅。
+- 实现 `S1-PureDirect`（`--vln-bearing-source direct` / `--g0-mode direct` + 出生首步扫描增强）与 `G2-StopCalib`（`sim/3dgs/calibrate_vlm_stop.py` 2566 维零特权多模态逻辑回归近距判停探针，硬件级隔离 `840865` / `841980` 及 `test*` split；`VlmBeliefTracker` 增加单次漏检防翻转滞回）。
+- 解压验证 UE5 城市场景包：已完整解压 `env_ue_smallcity_default_low_quality.zip` 至 `/root/rivermind-data/uav_rgb/openfly-runtime-ubuntu/envs/ue/smallcity_default_low_quality`（`19 GiB`），核实其余 3 个 UE5 UnrealCV 包受磁盘余量（`82 GiB`）与容器 cgroup 内存上限（`58 GiB`）制约。
+- 全量门禁：`bash tools/check.sh` 退出码 `0`（CTest `42/42`、`cf_sitl` `9/9 + 33/33`、`sim/tools`、`tools`、`sim/3dgs`、`ui` 全绿）+ OpenFly `76/76` 全绿。过程记录：`docs/worklog/2026-11-17-0638-s1direct-g2calib-lean-trainpy.md`。
+- 已启动全套实验与全量 MP4 录像守护进程：
+  - 启动时刻：`2026-11-17 06:36 +0800`
+  - 命令：`cd /root/claude-code-backup-20261028/code/uav_rgb && source env.sh && setsid nohup .venv-tools/bin/python train.py >> /root/rivermind-data/uav_rgb/exp-1019-direct-g2calib-openfly-20261117/run.log 2>&1 < /dev/null &`
+  - `PID / PGID`：`2562163`（停止命令：`kill -- -2562163`）
+  - 日志 / 状态：`/root/rivermind-data/uav_rgb/exp-1019-direct-g2calib-openfly-20261117/run.log`、完成标记 `.../DONE`、视频总览 `.../index.html` 与 `.../videos/`
+  - 预计总耗时与完成时刻：约 **50–55 分钟**，预计 **`07:28–07:33`** 完成。
+
+### 关键决策
+
+- 所有训练与闭环实验统一收口至仓库根 `train.py`，禁止再在 `experiments/` 下新建 `run_*.py` 或 `.sh` 包装脚本。
+- 默认 `UAVRGB_VIDEOS_PER_SCENE=999`、OpenFly `--record-video` 常开，评测集每集均保存 MP4 视频并汇总到 `<out>/videos/` 与 `<out>/index.html`。
+- 守护进程启动后不再轮询日志或阻塞等待，按实测吞吐算好预计完成时间交由用户到点触发进度检查。
+
+### 未完成的待办
+
+- 等用户于 `07:30` 左右通知检查守护进程 `2562163` 进度：读取 `<out>/DONE` 与 `summary.json`，核验全部 MP4 视频，汇总 `S1-PureDirect`、`G2-StopCalib` 与 `OpenFly v2` 多场景闭环结果。
+- 待用户决定：OpenFly 6 场景闭环仅使用已解压的 UE4 AirSim 场景（端口 `41458`），是否删除用不到的 UE5 CitySample 压缩包释放 `69.45 GiB` 空间，或扩容容器 cgroup 内存上限（`58 GiB -> 96~128 GiB`）以运行 UE5 大城市场景。
+
+## 2026-11-16 晚间 PLAN §10.18 四卡落地（S1/G2/OF-E1&E2/SCENE-LONG）与数据盘二次清理（历史记录）
 
 ### 已完成的事项
 

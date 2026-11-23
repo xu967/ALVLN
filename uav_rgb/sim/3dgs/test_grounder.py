@@ -112,6 +112,14 @@ class TestLexicalGrounder(unittest.TestCase):
                 self.assertIsNone(result.target)
                 self.assertEqual(result.reason, reason)
 
+    def test_relation_grounder_drops_attributes_and_room_location(self):
+        result = grounder.RelationPhraseGrounder().ground(
+            "Go to the decorative painting with artistic elements in the recreation room.",
+            ["decorative_painting_1", "recreation_room_1"],
+        )
+        self.assertEqual(result.target, "decorative_painting_1")
+        self.assertTrue(result.accepted)
+
     def test_unsupported_semantics_never_select_a_target(self):
         cases = [
             ("飞到 door", "unsupported_language"),
@@ -267,8 +275,55 @@ class TestVisualLanguageGrounder(unittest.TestCase):
                          (1, 1, 0.9))
         self.assertEqual(grounder.parse_vlm_output("broken non-json text")[:2], (8, 0))
         for text in ('["C",2,"chair"]', '["C","maybe",1,"chair"]',
-                     '{"sector":"C","near":1,"conf":"invalid"}', '["C","N",1,"chair"]'):
+                     '{"sector":"C","near":1,"conf":"invalid"}', '["C","N",1,"chair"]',
+                     '["C","F",true,"sofa"]', '["C","F",0.5,"sofa"]',
+                     '["C","F",0.8,"sofa"]', '["C","F",0.8055,"sofa"]',
+                     '["C","S",0.8055,"bed', '["C","S",0',
+                     '["C","F",1,"sofa', '["C","F",1,"sofa"',
+                     '["C","F","1","sofa"]', '["C","F",1,0]'):
             self.assertEqual(grounder.parse_vlm_output(text)[:2], (8, 0))
+
+    def test_parse_vlm_output_accepts_decimal_binary_near_goal(self):
+        self.assertEqual(grounder.parse_vlm_output('["L","F",0.0,"sofa"]'),
+                         (1, 0, 0.8, "sofa", "final"))
+        near_goal = grounder.parse_vlm_output('["C","F",1.0,"sofa"]')[1]
+        self.assertIs(type(near_goal), int)
+        self.assertEqual(near_goal, 1)
+        self.assertEqual(grounder.parse_vlm_output('["L","S",1.0,"doorway"]')[:2], (1, 0))
+
+    def test_instruction_target_match_ignores_source_and_location_words(self):
+        cases = (
+            ("Please bring something from the bedroom bed to the bathroom tuyere.", "tuyere", True),
+            ("Please bring something from the bedroom bed to the bathroom tuyere.", "bathroom", False),
+            ("Take an ornament from the display cabinet and showcase it near the decorative wall.",
+             "wall", True),
+            ("Transfer a cleaning cloth from the entrance area for polishing the ornament.",
+             "ornament", True),
+            ("Set up for bedtime reading by adjusting the chandelier light in the master bedroom after your bath.",
+             "chandelier light", True),
+            ("Go to the decorative painting with artistic elements in the recreation room.",
+             "painting", True),
+            ("Go to the decorative painting with artistic elements in the recreation room.",
+             "recreation room", False),
+            ("Go to the sofa next to the chair.", "sofa", True),
+            ("Go to the sofa next to the chair.", "chair", False),
+            ("Go from the downlight close by to the pendant hanging along the perimeter.",
+             "pendant", True),
+            ("Go from the northwest bedroom to the central living room area.",
+             "central living room area", True),
+            ("Take a spare towel from the bathroom and hang it near the painting in the recreation area.",
+             "painting", True),
+            ("Go from the decorative painting area to the lighting fixtures zone.",
+             "lighting fixtures zone", True),
+            ("Fly to the sofa.", "door", False),
+            ("Fly to the sofa.", "it", False),
+            ("请从卧室床边飞到卫生间的排气口。", "排气口", True),
+            ("请从卧室床边飞到卫生间的排气口。", "卧室床", False),
+            ("请前往客厅茶几上的水果盘。", "水果盘", True),
+        )
+        for instruction, label, expected in cases:
+            with self.subTest(instruction=instruction, label=label):
+                self.assertEqual(grounder.instruction_target_matches(instruction, label), expected)
 
     def test_mock_worker_subprocess_roundtrip_and_cleanup(self):
         import sys
@@ -391,6 +446,18 @@ class TestVisualLanguageGrounder(unittest.TestCase):
             self.assertFalse(adapter.stop_requested)
         self.assertEqual(adapter(rgb, None, None)[0], SAFE_NEUTRAL)
         self.assertTrue(adapter.stop_requested)
+
+        class _WrongTargetVlm:
+            def reset_episode(self):
+                pass
+
+            def ground_step(self, _hist, _ins):
+                return grounder.VisualGrounding(0, 1, 0.9, "door", 4.0, "final")
+
+        wrong_target = run_vln.VlmBeliefTracker(_WrongTargetVlm(), "Move to the sofa", update_every=1)
+        self.assertEqual(wrong_target(rgb, None), (0, 0))
+        self.assertEqual(wrong_target(rgb, None), (0, 0))
+        self.assertFalse(wrong_target.confirmed_target)
 
 
 if __name__ == "__main__":

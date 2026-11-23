@@ -28,7 +28,7 @@ MODEL_PATH = os.environ.get(
 )
 INPUT_W = int(os.environ.get("UAV_RGB_VLM_W", "288"))
 INPUT_H = int(os.environ.get("UAV_RGB_VLM_H", "192"))
-MAX_NEW_TOKENS = int(os.environ.get("UAV_RGB_VLM_MAX_TOKENS", "12"))  # ["C","S",0,"doorway"] 约 8~10 token
+MAX_NEW_TOKENS = int(os.environ.get("UAV_RGB_VLM_MAX_TOKENS", "20"))
 MIN_FREE_VRAM_MIB = int(os.environ.get("UAV_RGB_VLM_MIN_VRAM_MIB", "6000"))
 ALLOWED_REQ_KEYS = frozenset(("cmd", "frames_b64", "instruction", "memory"))
 # =================================================================
@@ -42,8 +42,11 @@ PROMPT_TEMPLATE = (
     '2. If the FINAL destination itself is visible in this view, set mode="F" and direction="C" (ahead), "L" (left), or "R" (right).\n'
     '3. If the FINAL destination is NOT visible (in another room or behind walls), look for an open doorway, hallway, or room exit to advance, and set mode="S" (Subgoal) with direction "C", "L", or "R".\n'
     '4. If facing a blank wall/obstacle with neither final goal nor passage visible, output ["N","N",0,"wall"].\n'
-    '5. Set close=1 ONLY when mode="F" AND the final destination fills the foreground within ~1m; else 0.\n'
-    'Format: ["C|L|R|N","F|S|N",0|1,"word"]'
+    '5. The array has four fields: direction string, mode string, integer close flag, quoted string label.\n'
+    '6. The third field is exactly integer 0 or 1. The fourth field is always a quoted string, never a number.\n'
+    '7. In mode F, the last field names the requested destination object using its words from the instruction. Never name a room, doorway, route, or generic word as the final target. In mode S, name the visible passage or use "none".\n'
+    '8. Set close=1 ONLY when mode="F" AND the final destination fills the foreground within ~1m; otherwise use 0.\n'
+    'Output only this JSON array: ["C|L|R|N","F|S|N",0|1,"word"]'
 )
 
 

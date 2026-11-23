@@ -226,9 +226,57 @@ _MODIFIER_SPLIT = re.compile(
     r"\b(?:located|situated|positioned|placed|standing|hanging|mounted|resting|sitting|"
     r"directly|right\s+next\s+to|next\s+to|in\s+front\s+of|across\s+from|adjacent\s+to|"
     r"to\s+the\s+(?:left|right)\s+of|on\s+the\s+(?:left|right)\s+side\s+of|"
-    r"above|below|under|beneath|over|near|beside|behind|between|around|opposite|by)\b",
+    r"that\s+(?:is|has|contains)|which\s+(?:is|has|contains)|containing|with|"
+    r"above|below|under|beneath|over|near|beside|behind|between|around|opposite|by|in|on|"
+    r"after|along|inside|within)\b",
     re.IGNORECASE,
 )
+_TARGET_RELATION = re.compile(r"\b(?:near|next\s+to|beside)\b", re.IGNORECASE)
+_TARGET_ACTION = re.compile(
+    r"\b(?:polish(?:ing)?|adjust(?:ing)?|place|placing|showcase|showcasing|"
+    r"display|displaying|hang|hanging)\s+(?:the|a|an)\s+",
+    re.IGNORECASE,
+)
+
+
+def _cjk_instruction_target_matches(instruction, visible_target):
+    destinations = list(re.finditer(r"(?:前往|到|去)", instruction))
+    label = str(visible_target or "").strip(" \t\r\n，。！？；、")
+    if not destinations or not label or label in ("它", "东西", "物品", "目标", "none", "unknown"):
+        return False
+    target_phrase = instruction[destinations[-1].end():].strip(" \t\r\n，。！？；、")
+    target_phrase = re.sub(r"(?:附近|旁边|周围|周边|区域|里面|内部)$", "", target_phrase)
+    return bool(target_phrase) and target_phrase.endswith(label)
+
+
+def instruction_target_matches(instruction, visible_target):
+    """Accept only a visible label matching the final destination phrase."""
+    text = str(instruction or "").lower().replace("’", "'")
+    if re.search(r"[\u4e00-\u9fff]", text):
+        return _cjk_instruction_target_matches(text, visible_target)
+    clauses = [clause.strip() for clause in re.split(r"[.;]", text) if clause.strip()]
+    goal_clause = clauses[-1] if clauses else text
+    destinations = list(re.finditer(
+        r"(?<!next )\b(?:to|toward|towards|into|at)\b(?!\s+the\s+(?:left|right)\s+of)",
+        goal_clause,
+    ))
+    relations = list(_TARGET_RELATION.finditer(goal_clause))
+    actions = list(_TARGET_ACTION.finditer(goal_clause))
+    if destinations:
+        raw_goal = goal_clause[destinations[-1].end():]
+    elif relations:
+        raw_goal = goal_clause[relations[-1].end():]
+    elif actions:
+        raw_goal = goal_clause[actions[-1].end():]
+    else:
+        return False
+    target_tokens = _tokens(_MODIFIER_SPLIT.split(raw_goal, maxsplit=1)[0])
+    visible_tokens = _tokens(visible_target)
+    if (not target_tokens or not visible_tokens
+            or visible_tokens[0] in ("it", "thing", "object", "target", "word", "none", "unknown")
+            or len(visible_tokens) > len(target_tokens)):
+        return False
+    return target_tokens[-len(visible_tokens):] == visible_tokens
 
 
 class RelationPhraseGrounder(LexicalGrounder):
@@ -336,20 +384,10 @@ def parse_vlm_output(raw_text, default_conf=0.8):
     fallback = (BEARING_SEARCH, 0, 0.0, "parse_fallback", "search")
     conf = default_conf
     mode_raw = "f"
-    parsed = None
-    for candidate in (txt, txt + '"]', txt + "]"):
-        try:
-            parsed = json.loads(candidate)
-            break
-        except ValueError:
-            continue
-    if parsed is None:
-        m_obj = re.search(r"\{.*\}", txt, re.DOTALL)
-        if m_obj:
-            try:
-                parsed = json.loads(m_obj.group(0))
-            except ValueError:
-                parsed = None
+    try:
+        parsed = json.loads(txt)
+    except ValueError:
+        return fallback
     if isinstance(parsed, list) and len(parsed) in (3, 4):
         sector_raw = str(parsed[0]).strip()
         if len(parsed) == 4:
@@ -367,6 +405,8 @@ def parse_vlm_output(raw_text, default_conf=0.8):
         reason = parsed.get("reason", parsed.get("r", parsed.get("why", "ok")))
     else:
         return fallback
+    if not isinstance(reason, str) or not reason.strip():
+        return fallback
 
     try:
         conf = float(conf)
@@ -376,12 +416,12 @@ def parse_vlm_output(raw_text, default_conf=0.8):
         return fallback
     conf = conf / 10 if conf > 1 else conf
     mode = _GOAL_MODES.get(str(mode_raw).strip().lower())
-    if mode is None or type(near_raw) is not int or near_raw not in (0, 1):
+    if mode is None or type(near_raw) not in (int, float) or near_raw not in (0, 1):
         return fallback
     bb = _SECTOR_TO_BIN.get(sector_raw.lower(), BEARING_SEARCH)
     if bb == BEARING_SEARCH or mode == "search":
         return BEARING_SEARCH, 0, conf, str(reason).strip()[:64], "search"
-    return bb, near_raw if mode == "final" else 0, conf, str(reason).strip()[:64], mode
+    return bb, int(near_raw) if mode == "final" else 0, conf, str(reason).strip()[:64], mode
 
 
 class VisualLanguageGrounder:
