@@ -84,6 +84,36 @@ class TestEpisodes(unittest.TestCase):
         self.assertEqual([e["key"] for e in vln.one_per_route(eps, seed=0)], ["s/r0/1", "s/r1/0"])
         self.assertEqual([e["key"] for e in vln.one_per_route(eps, seed=1)], ["s/r0/0", "s/r1/0"])
 
+    def test_swapped_instruction_requires_matching_split_type_and_budget(self):
+        spawn = {"x": 0.0, "y": 1.0, "z": 2.0, "yaw_deg": 90.0}
+        scene = {"routes": [
+            {"spawn": spawn, "max_steps": 20},
+            {"spawn": {**spawn, "x": 4.0}, "max_steps": 20},
+            {"spawn": dict(spawn), "max_steps": 20},
+            {"spawn": dict(spawn), "max_steps": 20},
+            {"spawn": dict(spawn), "max_steps": 30},
+            {"spawn": dict(spawn), "max_steps": 20},
+        ]}
+        episodes = [
+            {"route_index": 0, "goal_object": "lamp", "text": "Find the lamp.",
+             "split": "train", "type": "A"},
+            {"route_index": 1, "goal_object": "chair", "text": "Find the chair.",
+             "split": "train", "type": "A"},
+            {"route_index": 2, "goal_object": "chair", "text": "Go to the chair.",
+             "split": "train", "type": "B"},
+            {"route_index": 3, "goal_object": "chair", "text": "Fly to the chair.",
+             "split": "test", "type": "A"},
+            {"route_index": 4, "goal_object": "chair", "text": "Navigate to the chair.",
+             "split": "train", "type": "A"},
+            {"route_index": 5, "goal_object": "chair", "text": "Go to that chair.",
+             "split": "train", "type": "A"},
+        ]
+
+        swapped = runner._swapped_instruction(episodes, 0, scene)
+
+        self.assertIs(swapped, episodes[5])
+        self.assertIsNone(runner._swapped_instruction(episodes[:2], 0, scene))
+
     def test_external_grounder_changes_policy_goal_and_rejects_unknown(self):
         selector = importlib.import_module("sim.3dgs.grounder").LexicalGrounder()
         catalog = {"lamp_2": {"x": 7.0, "y": -1.0}}
@@ -617,18 +647,21 @@ class TestRunner(unittest.TestCase):
         scene["routes"] = [
             {"name": "lamp_route", "spawn": shared_spawn, "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0},
              "max_steps": 8, "sage": {"split": "train", "instructions": [
-                 {"instruction_type": "A", "start": "start", "end": "lamp_1", "text": "Go to the lamp."}]}},
+                 {"instruction_type": "A", "start": "start", "end": "lamp_1", "text": "Go to lamp_1."}]}},
             {"name": "tv_route", "spawn": dict(shared_spawn), "waypoint": {"x": 8.0, "y": 0.0, "z": 2.0},
-             "max_steps": 12, "sage": {"split": "train", "instructions": [
-                 {"instruction_type": "A", "start": "start", "end": "tv_1", "text": "Go to the television."}]}},
+             "max_steps": 8, "sage": {"split": "train", "instructions": [
+                 {"instruction_type": "A", "start": "start", "end": "tv_1", "text": "Go to tv_1."}]}},
         ]
         actions, oracle = _steps([(0, 0), (4, 0), (8, 0), (8, 0)])
         manifest = {"stopped_by_agent": True,
                     "validity": {"physics_verified": True, "camera_verified": True}}
         args = SimpleNamespace(split=None, all_instructions=True, seed=0, limit=0,
-                               out="unused", hold=0.5, policy="teacher", videos=0,
+                               out="unused", hold=0.5, policy="teacher", videos=2,
                                stop_mode="explicit", counterfactual="swap")
         episode_waypoints = []
+        grounder_mod = importlib.import_module("sim.3dgs.grounder")
+        selector = grounder_mod.LexicalGrounder()
+        catalog = {"lamp_1": {"x": 4.0, "y": 0.0}, "tv_1": {"x": 8.0, "y": 0.0}}
 
         def run_episode(scene_arg, *_args, **_kwargs):
             episode_waypoints.append(scene_arg["waypoint"]["x"])
@@ -643,9 +676,14 @@ class TestRunner(unittest.TestCase):
             stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
             stack.enter_context(mock.patch.object(runner, "make_policy", return_value=SimpleNamespace(name="teacher")))
             stack.enter_context(mock.patch.object(collect, "run_episode", side_effect=run_episode))
+            videos = stack.enter_context(mock.patch.object(
+                runner.video_mod, "compose_views_video",
+                return_value={"video": "unused.mp4", "frames": 10, "fps": 10.0}))
             stack.enter_context(mock.patch.object(runner, "_read_jsonl", side_effect=[actions, oracle] * 2))
             stack.enter_context(mock.patch.object(runner, "route_shortest_path_m", return_value=4.0))
-            rows, failures = runner.run_scene("fixture.json", args, None)
+            rows, failures = runner.run_scene(
+                "fixture.json", args, SimpleNamespace(camera_mount={}),
+                lexical_grounder=selector, catalog=catalog)
 
         self.assertFalse(failures)
         self.assertEqual(len(rows), 2)
@@ -656,6 +694,11 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(first["supplied_goal_waypoint"]["x"], 8.0)
         self.assertEqual(second["supplied_goal_object"], "lamp_1")
         self.assertEqual(second["supplied_goal_waypoint"]["x"], 4.0)
+        self.assertTrue(first["grounding"]["correct"])
+        self.assertTrue(second["grounding"]["correct"])
+        self.assertEqual(runner._grounding_summary(rows, failures)["n_correct"], 2)
+        self.assertEqual(videos.call_args_list[0].kwargs["result"], "SUCCESS stop 0.00 m")
+        self.assertEqual(videos.call_args_list[1].kwargs["result"], "WRONG STOP 4.0 m")
         self.assertEqual(episode_waypoints, [4.0, 8.0])
         with tempfile.TemporaryDirectory() as tmp, \
                 mock.patch.object(runner, "run_scene", return_value=(rows, failures)), \

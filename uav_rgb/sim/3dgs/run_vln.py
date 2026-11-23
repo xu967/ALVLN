@@ -262,23 +262,35 @@ def _manual_spawn_is_safe(occ, spawn):
     return float(clearance(x, y, z)) >= required
 
 
-def _episode_spawn(scene, episode):
+def _episode_route(scene, episode):
     route_index = episode.get("route_index")
     if not isinstance(route_index, int) or route_index < 0:
         return None
     routes = scene.get("routes") or []
     if route_index < len(routes):
-        route = routes[route_index]
-    else:
-        multi_index = route_index - len(routes)
-        multi_routes = scene.get("multi_stage_routes") or []
-        if multi_index >= len(multi_routes):
-            return None
-        route = multi_routes[multi_index]
+        return routes[route_index]
+    multi_index = route_index - len(routes)
+    multi_routes = scene.get("multi_stage_routes") or []
+    if multi_index >= len(multi_routes):
+        return None
+    return multi_routes[multi_index]
+
+
+def _episode_spawn(scene, episode):
+    route = _episode_route(scene, episode)
+    if route is None:
+        return None
     spawn = route.get("spawn") or {}
     if not all(axis in spawn for axis in ("x", "y", "z")):
         return None
     return tuple(float(spawn.get(axis, 0.0)) for axis in ("x", "y", "z", "yaw_deg"))
+
+
+def _episode_budget(scene, episode):
+    route = _episode_route(scene, episode)
+    if route is None:
+        return None
+    return int(route.get("max_steps", scene.get("max_steps", 0)))
 
 
 def _swapped_instruction(episodes, index, scene):
@@ -287,12 +299,17 @@ def _swapped_instruction(episodes, index, scene):
     candidates = episodes[partner:partner + 1] + episodes[index + 1:] + episodes[:index]
     goal = episode.get("goal_object")
     spawn = _episode_spawn(scene, episode)
-    if not goal or spawn is None:
+    budget = _episode_budget(scene, episode)
+    if not goal or spawn is None or budget is None:
         return None
     for candidate in candidates:
         if (candidate.get("goal_object") and candidate["goal_object"] != goal
                 and candidate["text"] != episode["text"]
                 and candidate.get("route_contract") == episode.get("route_contract")
+                and candidate.get("split") == episode.get("split")
+                and candidate.get("type") == episode.get("type")
+                and len(candidate.get("stage_waypoints") or []) == len(episode.get("stage_waypoints") or [])
+                and _episode_budget(scene, candidate) == budget
                 and _episode_spawn(scene, candidate) == spawn):
             return candidate
     return None
@@ -396,7 +413,7 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
         instruction_ep = _swapped_instruction(eps, n, scene) if cf_mode == "swap" else ep
         if instruction_ep is None:
             failures.append({**ep, "scene": scene["name"], "dir": ep_dir,
-                             "error": "ValueError: swap 缺少同起点、同任务类型的异目标指令"})
+                             "error": "ValueError: swap 缺少同 split、同句式/阶段数/预算、同起点的异目标指令"})
             continue
         is_multi_stage = ep.get("route_contract") == "sage.multi_stage.v2"
         if is_multi_stage:
@@ -437,7 +454,7 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                 continue
         if grounding is not None:
             grounding.update({
-                "correct": grounding["target"] == ep.get("goal_object"),
+                "correct": grounding["target"] == supplied_goal_object,
                 "policy_goal": policy_goal,
                 "catalog_sha256": collect_3dgs._sha256(catalog_path) if catalog_path else None,
                 "scene_json_sha256": collect_3dgs._sha256(scene.get("path")) if scene.get("path") else None,
@@ -598,12 +615,14 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
             row.update({f"target_{key}": value for key, value in target_metrics.items()})
         rows.append(row)
         wrong_goal = grounding is not None and grounding.get("correct") is False
+        result_metrics = supplied_metrics if cf_mode == "swap" and supplied_metrics is not None else m
         if ep.get("manual_demo"):
             badge = ("COLLISION | unscored manual demo" if m["collision"] else
                      "VLM STOP | unscored manual demo" if m["stopped"] else
                      "NO STOP | unscored manual demo")
         else:
-            badge = f"WRONG GOAL {m['ne_m']:.1f} m" if wrong_goal else result_text(m)
+            badge = (f"WRONG GOAL {result_metrics['ne_m']:.1f} m" if wrong_goal else
+                     result_text(result_metrics))
         print(f"[{scene['name']} {n + 1}/{len(eps)}] {badge:24s} {ep['type']:22s} {supplied_text}", file=sys.stderr)
         if n < args.videos:
             try:
