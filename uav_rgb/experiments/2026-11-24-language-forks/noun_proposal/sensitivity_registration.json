@@ -1,0 +1,28 @@
+{
+  "registered": "2026-11-24T07:11:39.212682+08:00",
+  "old": "/root/rivermind-data/uav_rgb/exp-vln-instructed-stop-data-20261124/samples.jsonl",
+  "new": "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-20261124/all_samples.jsonl",
+  "cache": [
+    "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/parity.json",
+    "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/all_results.json",
+    "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/parser_fix/results.json",
+    "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/noun_guard/prior_predictions.json"
+  ],
+  "clip_vocab": "/root/rivermind-data/uav_rgb/exp-vln-stop-clip-20261124/registration.json",
+  "parser": "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/parser_fix/runtime/sim/3dgs/grounder.py",
+  "detector": "/root/rivermind-data/uav_rgb/baselines/grounding-dino-tiny/2e311b914779978895827276d44f59285fc49f95",
+  "coefficients": "/root/rivermind-data/uav_rgb/exp-vln-stop-head-20261124/results.json",
+  "dependencies": {
+    "/root/rivermind-data/uav_rgb/exp-vln-instructed-stop-data-20261124/samples.jsonl": "5670a410f90a84d498d1f67d2c40963bd81cc702d9c508497371d6c9ae6d5082",
+    "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-20261124/all_samples.jsonl": "6cf019398e08c1f5848bcc7ae18f4b28119ad54b7ff465c2e28e949d0a9d21f8",
+    "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/parity.json": "5ad13b7d687c494d42066cba04ea0ce0ec123fcdb1d9759f4af0c0fb5281c7b3",
+    "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/all_results.json": "0c546bba7fb6551cbe075a70aab38c58ff3531b87020682ce9b4e61b9385bfd1",
+    "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/parser_fix/results.json": "ebe966c56733ccad1ae05d1a4b7f5607b4df08a3a3ea391364aabb63788f57f0",
+    "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/parser_fix/runtime/sim/3dgs/grounder.py": "ab54ba9e841a8162e6701566aa5ef668bd7a0886a51c7647cd84cb7c2c9dd6cf",
+    "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/noun_guard/prior_predictions.json": "7ee8fd90ffa7c74d5250c8bb71461a5feeaf4ed25ef02a205301f4051059c8c7"
+  },
+  "checkpoint_sha": "1a2412ef99bd74bcd3c2a246fa1e48581f8889a1300c9051974741314fc042f3",
+  "rule": "Compare the current full target phrase with a short object proposal. Always start from the same frozen destination parser snapshot (actual SHA in dependencies). Strip English determiners, quantify and spatial adjectives only by retaining a head; remove trailing relative/prepositional clauses and participial V-ing modification when it occurs after an initial noun and before more words. Drop leading collective set/pair/group of. Keep longest terminal compound listed by the existing THREE training-room SAGE vocabulary (104 classes); if unavailable, keep the grammatical head approximated by the last remaining word. No synonym rewriting or new stop calibration. No noun fallback on parser abstention. Both prompts retain the original instruction in log; short cue only proposes boxes. Category-only geometry cannot verify ordinal/attribute relations. Both arms share existing highest qualifying DINO suffix-matched box, public .4/.3 thresholds, same crop-free original RGB, seven frozen head coefficients, all centered and two-frame policies. Reuse identical (image hash, literal text prompt) if already independently reevaluated on CPU. Do not reuse across different query strings.",
+  "scope": "Report separately original three-room 5 training triples, 5 development triples 839992, and 4 transfer triples 840865 for exact 42 two-frame windows. For newly recovered positive frames check source-matched projected center and supplied ray depth, and visually examine new boxes. For wrong/far track class versus instance, mark unresolved instead of inferring identity. Do not use annotated position/target words for inference. Metric asks whether target is near and correct (not absence). For original/full DINO and short DINO both output detection presence, centered, distance STOP. No online deployment or new fit.",
+  "adaptation": "Post-result implementation sensitivity only, preserve primary run unchanged. Do not treat degree/size modifiers alone (small/large/big/little, all in standard morphology) as evidence of a preceding noun before a participle. Existing outputs are cached per identical image+literal prompt. The sole affected input phrase in the whole 42 rows is the large seating sofa (large -> sofa for BOTH near and far, and for any borrowed wrong instruction). No changed decisions or detector results seen before computing the new sofa cue. Original protocol remains the primary measurement."
+}

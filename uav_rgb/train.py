@@ -1619,7 +1619,7 @@ def noun_proposals(config_path):
             if word in ('that','which','where','with','near','at','beside','behind','under','above','on','in','among'):
                 tokens = tokens[:i]
                 break
-            if i>=1 and word.endswith('ing') and i<len(tokens)-1 and any(t not in ('the','a','an','only','nearest','closest') for t in tokens[:i]):
+            if i>=1 and word.endswith('ing') and i<len(tokens)-1 and any(t not in ('the','a','an','only','nearest','closest','large','small','little','big') for t in tokens[:i]):
                 tokens = tokens[:i]
                 break
         if not tokens:
