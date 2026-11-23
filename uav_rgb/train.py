@@ -1403,7 +1403,183 @@ def clip_stop(config_path):
     return 0
 
 
+def transfer_stop(config_path, parity=False):
+    import hashlib
+    import importlib
+    import math
+    import re
+    import numpy as np
+    import torch
+    from scipy.special import expit
+    from PIL import Image
+    from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor, CLIPModel, CLIPProcessor
+
+    out = config_path.parent
+    cfg = json.loads(config_path.read_text())
+    def digest(path):
+        with Path(path).open('rb') as fp:
+            return hashlib.file_digest(fp, 'sha256').hexdigest()
+    assert os.environ.get('CUDA_VISIBLE_DEVICES') == ''
+    assert all(digest(p) == h for p,h in cfg['dependencies'].items())
+    torch.set_num_threads(4)
+    head = json.loads(Path(cfg['range_model']).read_text())
+    params = np.asarray(head['classifier'])
+    mean, sd = np.asarray(head['mean']), np.asarray(head['stdev'])
+    data = Path(cfg['original_samples'] if parity else cfg['data'])
+    assert (data.parent/'DONE').read_text().startswith('rc=0')
+    rows = [json.loads(line) for line in data.read_text().splitlines() if line.strip()]
+    old_rows = json.loads(Path(cfg['original_clip_results']).read_text())['rows'] if parity else []
+    assert set(r['scene'] for r in rows) <= ({'840139','841012','841150','839992'} if parity else {cfg['scene']})
+    groups = {(r['scene'],r['group']) for r in rows}
+    for scene, group in groups:
+        conditions = sorted(r['condition'] for r in rows if (r['scene'],r['group'])==(scene,group))
+        assert conditions == ['far_correct','near_correct','near_wrong']
+    parser_root = Path(cfg['parser']).parents[2]
+    sys.path.insert(0, str(parser_root))
+    parser = importlib.import_module('sim.3dgs.grounder')
+    assert Path(parser.__file__).resolve()==Path(cfg['parser']).resolve()
+    proc = AutoProcessor.from_pretrained(cfg['model'],local_files_only=True)
+    detector = AutoModelForZeroShotObjectDetection.from_pretrained(cfg['model'],local_files_only=True).eval()
+    cache={}
+
+    def measure(path,text):
+        key=(path,text)
+        if key in cache:
+            return cache[key]
+        phrase=parser._english_destination(text.lower().strip(" .")).strip(" .")
+        features=[0.]*7
+        record=dict(path=path,text=text,phrase=phrase,box=None,features=features,centered=False)
+        if phrase:
+            im=Image.open(path).convert("RGB");w,h=im.size
+            inp=proc(images=im,text=phrase+".",return_tensors="pt")
+            with torch.inference_mode():
+                predictions=detector(**inp)
+            result=proc.post_process_grounded_object_detection(predictions,inp.input_ids,
+                        threshold=.4,text_threshold=.3,target_sizes=[(h,w)])[0]
+            expected=parser._tokens(phrase)
+            detections=sorted(zip(result["scores"].tolist(),result["boxes"].tolist(),result["text_labels"]),reverse=True)
+            for score,bbox,label in detections:
+                tokens=parser._tokens(label)
+                if not tokens or tokens!=expected[-len(tokens):]:
+                    continue
+                x,y,X,Y=np.clip(bbox,0,[w,h,w,h])
+                cx,cy=(x+X)/(2*w),(y+Y)/(2*h)
+                touches=sum([x<=1,y<=1,X>=w-1,Y>=h-1])/4
+                features[:]=[1.,score,(X-x)/w,(Y-y)/h,abs(cx-.5),abs(cy-.5),touches]
+                record.update(box=bbox,match=label,centered=bool(1/3<=cx<2/3))
+                break
+        cache[key]=record
+        return record
+
+    clip_cfg = json.loads(Path(cfg['clip_config']).read_text())
+    model = CLIPModel.from_pretrained(clip_cfg['model_path'],local_files_only=True).eval()
+    processor = CLIPProcessor.from_pretrained(clip_cfg['model_path'],local_files_only=True)
+    categories = clip_cfg['training_categories']
+    pad = tuple(round(channel*255) for channel in processor.image_processor.image_mean)
+    def positive_terms(phrase):
+        words = re.findall(r'[a-z]+', phrase.lower())
+        if words and words[0] in ('a', 'an', 'the', 'this', 'that', 'my'):
+            words = words[1:]
+        if not words:
+            return ()
+        return tuple(dict.fromkeys([' '.join(words), words[-1]]))
+
+    text_cache = {}
+    def encode_words(terms):
+        # The single cache stores a per-string embedding, independently of the candidate list or query.
+        missing = sorted(set(terms) - text_cache.keys())
+        if missing:
+            texts = ['a photo of a ' + item + '.' for item in missing]
+            tokenized = processor.tokenizer(texts, padding=True, return_tensors='pt')
+            text_states = model.text_model(**tokenized)
+            vectors = torch.nn.functional.normalize(model.text_projection(text_states.pooler_output))
+            text_cache.update(zip(missing,vectors))
+
+    def verify(obs):
+        terms = positive_terms(obs['phrase'])
+        result = dict(terms=terms, rank=None, accepted=False, top5=[])
+        if not obs['box'] or not terms:
+            return result
+        with Image.open(obs['path']) as raw:
+            rgb = raw.convert('RGB')
+        w, h = rgb.size
+        assert (w, h) == (320, 240)
+        x, y, X, Y = np.clip(obs['box'], 0, [w,h,w,h])
+        archived_geometry = obs['features'][2:6]
+        cx,cy = (x+X)/2, (y+Y)/2
+        assert np.allclose(archived_geometry, [(X-x)/w,(Y-y)/h,abs(cx/w-.5),abs(cy/h-.5)], atol=1e-6)
+        size = math.ceil(2*max(X-x,Y-y))
+        left,top = math.floor(cx-size/2),math.floor(cy-size/2)
+        bounds = (max(0,left),max(0,top),min(w,left+size),min(h,top+size))
+        canvas = Image.new('RGB', (size,size), pad)
+        canvas.paste(rgb.crop(bounds), (bounds[0]-left,bounds[1]-top))
+        px = processor(images=canvas,return_tensors='pt').pixel_values
+        features = model.visual_projection(model.vision_model(pixel_values=px).pooler_output)
+        image = torch.nn.functional.normalize(features)[0]
+        encode_words(terms)
+        positive = torch.nn.functional.normalize(torch.stack([text_cache[t] for t in terms]).mean(0),dim=0)
+        names = [c for c in categories if c not in terms]
+        scores = (torch.stack([text_cache[c] for c in names]) @ image).tolist()
+        requested_score = float(image @ positive)
+        rank = 1 + sum(val>=requested_score for val in scores)
+        ordered = sorted(zip(names + ['REQUESTED'], scores + [requested_score]),key=lambda item:-item[1])
+        result.update(rank=rank, accepted=rank<=5, requested_score=requested_score, top5=ordered[:5],
+                      classes=len(ordered), crop_square_xyxy=[left,top,left+size,top+size], observed_xyxy=bounds)
+        return result
+
+    with torch.inference_mode():
+        encode_words(categories)
+        for r in rows:
+            assert len(r['rgb_pair']) == 2 and r['rgb_pair'][0] != r['rgb_pair'][1]
+            if r.get('sha256'):
+                assert [digest(p) for p in r['rgb_pair']] == r['sha256']
+            # Model inputs are decoded RGB and the supplied text. Path only identifies image bytes.
+            obs = [measure(p,r['instruction']) for p in r['rgb_pair']]
+            for v in obs:
+                v['score'] = float(expit((np.asarray(v['features'])-mean)/sd@params[:-1]+params[-1]))
+            clips = [verify(v) for v in obs]
+            detector_stop = all(v['centered'] for v in obs)
+            learned_stop = detector_stop and all(v['score'] >= .5 for v in obs)
+            r.update(predictions=obs,clip_frames=clips,baseline_stop=detector_stop,candidate_stop=learned_stop,
+                     clip_stop=learned_stop and all(v['accepted'] for v in clips))
+    splits = sorted({r['split'] for r in rows}) or ['transfer']
+    metrics = {}
+    for split in splits:
+        metrics[split] = {}
+        for cond in ('near_correct','near_wrong','far_correct'):
+            cases = [r for r in rows if r['split']==split and r['condition']==cond]
+            metrics[split][cond] = dict(n=len(cases), groups=len(set(r['group'] for r in cases)),
+                frames_with_box=sum(v['box'] is not None for r in cases for v in r['predictions']),
+                **{f:sum(r[f] for r in cases) for f in ('baseline_stop','candidate_stop','clip_stop')})
+    result = dict(metrics=metrics,rows=rows,code_sha=digest(__file__),manifest_sha=digest(data),scene_groups=sorted(groups))
+    if parity:
+        assert [(r['group'],r['condition'],r['instruction'],r['rgb_pair']) for r in rows] == [(r['group'],r['condition'],r['instruction'],r['rgb_pair']) for r in old_rows]
+        diffs={'box_presence':0,'centered':0,'range_decision':0,'clip_rank':0,'window_detector':0,'window_range':0,'window_clip':0}
+        box_px = head_probability = confidence = 0.
+        for old, r in zip(old_rows,rows):
+            for key,metric in [('baseline_stop','window_detector'),('candidate_stop','window_range'),('clip_stop','window_clip')]:
+                diffs[metric] += r[key]!=old[key]
+            for a,b,ca,cb in zip(old['predictions'],r['predictions'],old['clip_frames'],r['clip_frames']):
+                assert a['phrase']==b['phrase']
+                diffs['box_presence'] += bool(a['box'])!=bool(b['box'])
+                diffs['centered'] += a['centered']!=b['centered']
+                diffs['range_decision'] += (a['score']>=.5)!=(b['score']>=.5)
+                diffs['clip_rank'] += ca['rank']!=cb['rank']
+                if a['box'] and b['box']:
+                    box_px=max(box_px,float(np.max(abs(np.asarray(a['box'])-b['box']))))
+                    confidence=max(confidence,abs(a['features'][1]-b['features'][1]))
+                head_probability=max(head_probability,abs(a['score']-b['score']))
+        result['parity']={'differences':diffs,'max_box_error_px':box_px,'max_score_error':head_probability,
+                          'max_detector_confidence_error':confidence,'frames':len(rows)*2,'windows':len(rows)}
+    path = out/('parity.json' if parity else 'results.json')
+    tmp = path.with_suffix('.tmp'); tmp.write_text(json.dumps(result,indent=2,ensure_ascii=False)+'\n');tmp.replace(path)
+    print(json.dumps(result.get('parity') or metrics),flush=True)
+    return 0
+
+
 if __name__ == '__main__':
+    if len(sys.argv)==3 and sys.argv[1] in ('transfer','parity'):
+        raise SystemExit(transfer_stop(Path(sys.argv[2]),sys.argv[1]=='parity'))
     if len(sys.argv)==3 and sys.argv[1]=='clip_stop':
         raise SystemExit(clip_stop(Path(sys.argv[2])))
     raise SystemExit(stop_head() if sys.argv[1:]==['stop_head'] else main())
