@@ -1,0 +1,63 @@
+{
+  "registered": {
+    "cwd": "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124",
+    "argv": [
+      "/root/rivermind-data/uav_rgb/envs/vlm-venv/bin/python",
+      "train.py",
+      "noun_proposals",
+      "registration.json"
+    ],
+    "env": {
+      "CUDA_VISIBLE_DEVICES": "",
+      "OMP_NUM_THREADS": "4",
+      "OPENBLAS_NUM_THREADS": "1",
+      "HF_HUB_OFFLINE": "1"
+    },
+    "detector_path": "/root/rivermind-data/uav_rgb/baselines/grounding-dino-tiny/2e311b914779978895827276d44f59285fc49f95",
+    "detector_sha256": "1a2412ef99bd74bcd3c2a246fa1e48581f8889a1300c9051974741314fc042f3",
+    "dependencies": {
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/train.py": "298496d32641cf441368fa6c433fc984182b612070eff4c7b9248f1d065a1d67",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/registration.json": "7f37d1a3ea7661685c903323bc1de4e0bdf76013f057cbec8823811afba28c80",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/results.json": "d0e592cffeb9686ebdaf62364e2ee9e96c069761e32b485b4eee9ea0acf562e3",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-head-20261124/results.json": "dcd6de25ae455d026815300f74340e111cb0f7bb9c3f2cfa61ca916f17131dfa",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-clip-20261124/registration.json": "b71cd85de40d81d22488cb2da31aa0a7d111930922f7a8e6f4e53cb6f47a4980",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/parity.json": "5ad13b7d687c494d42066cba04ea0ce0ec123fcdb1d9759f4af0c0fb5281c7b3",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/all_results.json": "0c546bba7fb6551cbe075a70aab38c58ff3531b87020682ce9b4e61b9385bfd1",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/parser_fix/results.json": "ebe966c56733ccad1ae05d1a4b7f5607b4df08a3a3ea391364aabb63788f57f0",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/parser_fix/runtime/sim/3dgs/grounder.py": "ab54ba9e841a8162e6701566aa5ef668bd7a0886a51c7647cd84cb7c2c9dd6cf",
+      "/root/rivermind-data/uav_rgb/exp-vln-instructed-stop-data-20261124/samples.jsonl": "5670a410f90a84d498d1f67d2c40963bd81cc702d9c508497371d6c9ae6d5082",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-20261124/all_samples.jsonl": "6cf019398e08c1f5848bcc7ae18f4b28119ad54b7ff465c2e28e949d0a9d21f8"
+    }
+  },
+  "post_hoc": {
+    "cwd": "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/noun_guard",
+    "argv": [
+      "/root/rivermind-data/uav_rgb/envs/vlm-venv/bin/python",
+      "train.py",
+      "noun_proposals",
+      "registration.json"
+    ],
+    "env": {
+      "CUDA_VISIBLE_DEVICES": "",
+      "OMP_NUM_THREADS": "4",
+      "OPENBLAS_NUM_THREADS": "1",
+      "HF_HUB_OFFLINE": "1"
+    },
+    "detector_path": "/root/rivermind-data/uav_rgb/baselines/grounding-dino-tiny/2e311b914779978895827276d44f59285fc49f95",
+    "detector_sha256": "1a2412ef99bd74bcd3c2a246fa1e48581f8889a1300c9051974741314fc042f3",
+    "dependencies": {
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/noun_guard/train.py": "6fad6a6942c9e73b1b992853eb36107b21c52d3bcdd4eee62950db8415557ec9",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/noun_guard/registration.json": "892f3ce9727bf907d184758532d5802068b1aa90b0ce9294289fd550a7f804ef",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/noun_guard/results.json": "a1f9111bfe1c6fcd4976a0566952dc1afdc47693ed10232d419fdf379135bea0",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-head-20261124/results.json": "dcd6de25ae455d026815300f74340e111cb0f7bb9c3f2cfa61ca916f17131dfa",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-clip-20261124/registration.json": "b71cd85de40d81d22488cb2da31aa0a7d111930922f7a8e6f4e53cb6f47a4980",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/parity.json": "5ad13b7d687c494d42066cba04ea0ce0ec123fcdb1d9759f4af0c0fb5281c7b3",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/all_results.json": "0c546bba7fb6551cbe075a70aab38c58ff3531b87020682ce9b4e61b9385bfd1",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/parser_fix/results.json": "ebe966c56733ccad1ae05d1a4b7f5607b4df08a3a3ea391364aabb63788f57f0",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/noun_guard/prior_predictions.json": "7ee8fd90ffa7c74d5250c8bb71461a5feeaf4ed25ef02a205301f4051059c8c7",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-score-20261124/parser_fix/runtime/sim/3dgs/grounder.py": "ab54ba9e841a8162e6701566aa5ef668bd7a0886a51c7647cd84cb7c2c9dd6cf",
+      "/root/rivermind-data/uav_rgb/exp-vln-instructed-stop-data-20261124/samples.jsonl": "5670a410f90a84d498d1f67d2c40963bd81cc702d9c508497371d6c9ae6d5082",
+      "/root/rivermind-data/uav_rgb/exp-vln-stop-transfer-20261124/all_samples.jsonl": "6cf019398e08c1f5848bcc7ae18f4b28119ad54b7ff465c2e28e949d0a9d21f8"
+    }
+  }
+}

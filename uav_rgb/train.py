@@ -1577,7 +1577,120 @@ def transfer_stop(config_path, parity=False):
     return 0
 
 
+def noun_proposals(config_path):
+    import re
+    import runpy
+    from collections import defaultdict
+
+    import numpy as np
+    import torch
+    from PIL import Image
+    from scipy.special import expit
+    from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+
+    out = config_path.parent
+    cfg = json.loads(config_path.read_text())
+    def digest(p):
+        with Path(p).open('rb') as stream:
+            return hashlib.file_digest(stream,'sha256').hexdigest()
+    def load(p):
+        return json.loads(Path(p).read_text())
+    assert os.environ.get('CUDA_VISIBLE_DEVICES') == ''
+    assert all(digest(p)==h for p,h in cfg['dependencies'].items())
+    assert digest(Path(cfg['detector'])/'model.safetensors')==cfg['checkpoint_sha']
+    torch.set_num_threads(4)
+    parser = runpy.run_path(cfg['parser'])
+    categories = sorted(load(cfg['clip_vocab'])['training_categories'],key=lambda s:-len(s.split()))
+    head = load(cfg['coefficients'])
+    pars,mean,sd = map(np.asarray,(head['classifier'],head['mean'],head['stdev']))
+    proc = AutoProcessor.from_pretrained(cfg['detector'],local_files_only=True)
+    detector = AutoModelForZeroShotObjectDetection.from_pretrained(cfg['detector'],local_files_only=True).eval()
+    cache = {}
+    for source in cfg['cache']:
+        for row in load(source)['rows']:
+            for view,sha in zip(row['predictions'],row['sha256']):
+                cache[sha,view['phrase']] = view
+    cache_hits = 0
+    def noun(phrase):
+        tokens = re.findall(r"[a-z]+(?:-[a-z]+)*",phrase.lower())
+        if not tokens:
+            return ''
+        for i,word in enumerate(tokens):
+            if word in ('that','which','where','with','near','at','beside','behind','under','above','on','in','among'):
+                tokens = tokens[:i]
+                break
+            if i>=1 and word.endswith('ing') and i<len(tokens)-1 and any(t not in ('the','a','an','only','nearest','closest') for t in tokens[:i]):
+                tokens = tokens[:i]
+                break
+        if not tokens:
+            return ''
+        phrase = ' '.join(tokens)
+        for category in categories:
+            if phrase == category or phrase.endswith(' '+category):
+                return category
+        return tokens[-1]
+
+    def measure(path,sha,phrase):
+        nonlocal cache_hits
+        assert digest(path)==sha
+        if (sha,phrase) in cache:
+            cache_hits += 1
+            return {k:v for k,v in cache[sha,phrase].items() if k in ('phrase','box','features','centered','score','match')}
+        features = [0.]*7
+        record = dict(phrase=phrase,box=None,features=features,centered=False)
+        if phrase:
+            with Image.open(path) as im:
+                im = im.convert('RGB')
+                w,h = im.size
+                inp = proc(images=im,text=phrase+'.',return_tensors='pt')
+            predictions = detector(**inp)
+            result = proc.post_process_grounded_object_detection(predictions,inp.input_ids,threshold=.4,text_threshold=.3,target_sizes=[(h,w)])[0]
+            expected = parser['_tokens'](phrase)
+            for confidence,bbox,label in sorted(zip(result['scores'].tolist(),result['boxes'].tolist(),result['text_labels']),reverse=True):
+                words = parser['_tokens'](label)
+                if not words or words!=expected[-len(words):]:
+                    continue
+                x,y,X,Y = np.clip(bbox,0,[w,h,w,h])
+                cx,cy = (x+X)/(2*w),(y+Y)/(2*h)
+                touches = sum([x<=1,y<=1,X>=w-1,Y>=h-1])/4
+                features[:] = [1., confidence,(X-x)/w,(Y-y)/h,abs(cx-.5),abs(cy-.5),touches]
+                record.update(box=bbox,match=label,centered=bool(1/3<=cx<2/3))
+                break
+        record['score']=float(expit((np.asarray(features)-mean)/sd@pars[:-1]+pars[-1]))
+        cache[sha,phrase]=record
+        return record
+
+    samples = [json.loads(line) for s in ('old','new') for line in Path(cfg[s]).read_text().splitlines() if line.strip()]
+    def evaluate(sample):
+        instruction = sample['instruction']
+        phrase = parser['_english_destination'](instruction.lower().strip(' .')).strip()
+        short = noun(phrase)
+        row = dict(sample)
+        for key,query in [('full',phrase),('noun',short)]:
+            views=[measure(path,sha,query) for path,sha in zip(sample['rgb_pair'],sample['sha256'])]
+            centered=all(v['centered'] for v in views)
+            row[key]=dict(prompt=query,views=views,has_pair=all(v['box'] is not None for v in views),centered=centered,
+                          stop=centered and all(v['score']>=.5 for v in views))
+        return row
+    with torch.inference_mode():
+        rows=[]
+        for sample in samples:
+            rows.append(evaluate(sample))
+            print(sample['group'],sample['condition'],flush=True)
+    groups=defaultdict(dict)
+    for scene in sorted({r['scene'] for r in rows}):
+        for cond in ('near_correct','near_wrong','far_correct'):
+            cases=[r for r in rows if r['scene']==scene and r['condition']==cond]
+            groups[scene][cond]={'n':len(cases),**{key:{metric:sum(r[key][metric] for r in cases) for metric in ('has_pair','centered','stop')} for key in ('full','noun')}}
+    assert len(rows)==42
+    result=dict(rows=rows,groups=groups,requests=len(rows)*4,cache_hits=cache_hits,registration_sha=digest(config_path),source_sha=digest(__file__))
+    (out/'results.json').write_text(json.dumps(result,indent=2,ensure_ascii=False)+'\n')
+    return 0
+
+
 if __name__ == '__main__':
+    if len(sys.argv)==3 and sys.argv[1]=='noun_proposals':
+        raise SystemExit(noun_proposals(Path(sys.argv[2])))
     if len(sys.argv)==3 and sys.argv[1] in ('transfer','parity'):
         raise SystemExit(transfer_stop(Path(sys.argv[2]),sys.argv[1]=='parity'))
     if len(sys.argv)==3 and sys.argv[1]=='clip_stop':

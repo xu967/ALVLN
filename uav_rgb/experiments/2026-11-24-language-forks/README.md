@@ -19,3 +19,5 @@
 重建飞行基线时，先取 GitHub 主线 4b376c3 的 uav_rgb 目录，从该目录应用 flight_base.patch，即可得到原 default_runtime 的 sim 下所有非测试 Python 与 JSON 源文件，逐个校验 flight_base_hashes.json。两个搜索方案的 runtime.patch 都以此版本为起点。固件、渲染资产、视觉模型和推理二进制依赖数据盘，整图方案的哈希见 metric_frontier/dependencies.json。
 
 840865 跨房间的冻结距离与图文复核在 exp-vln-stop-transfer-score-20261124 的入口运行，两份注册资料见 transfer/。按原数据盘目录布局运行，近、错、远组各 4 个实例，冻结距离头的停机计数为 1、0、0。
+
+目标短词对照有预先冻结和事后修正两个提交，训练入口分别与数据盘两个目录逐字节一致。命令、哈希与注册表见 noun_proposal/run_entries.json；原始指令及图像由实验机提供。

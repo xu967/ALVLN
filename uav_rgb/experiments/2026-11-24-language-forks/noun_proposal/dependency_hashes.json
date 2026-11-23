@@ -1,0 +1,13 @@
+{
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/train.py": "298496d32641cf441368fa6c433fc984182b612070eff4c7b9248f1d065a1d67",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/candidate.diff": "20ede0a9d3440b4374c790c7dbbd5b5fdee4a1aa07121648a6b25ccd7dc0f915",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/registration.json": "7f37d1a3ea7661685c903323bc1de4e0bdf76013f057cbec8823811afba28c80",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/results.json": "d0e592cffeb9686ebdaf62364e2ee9e96c069761e32b485b4eee9ea0acf562e3",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/new_boxes.json": "518e1f9f5706c35cd5d1d1be26a2974562538b31b614e8de0ed4b7dcc85fee65",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/offline_projection.json": "23dd77182984b418f936ed267a07897ced368bcddd21557fcf8dbcc5a46a6d32",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/HANDOFF.md": "73c143c00e372e9728260a8f3e22185cba7e7fa077ff439e759857841819cd73",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/noun_guard/train.py": "6fad6a6942c9e73b1b992853eb36107b21c52d3bcdd4eee62950db8415557ec9",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/noun_guard/registration.json": "892f3ce9727bf907d184758532d5802068b1aa90b0ce9294289fd550a7f804ef",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/noun_guard/results.json": "a1f9111bfe1c6fcd4976a0566952dc1afdc47693ed10232d419fdf379135bea0",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-proposal-noun-20261124/new_box_review.json": "1ee4c16ed75f47e0ff5452d7b62aed940288c8f34382c8c18cb5c5ec8ba5bac4"
+}
