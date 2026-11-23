@@ -99,6 +99,61 @@
 - 没有实测公开 VLN 基线；算法新颖性尚未成立，需在控制与语言因果门禁通过后做同口径适配比较。
 - 没有提交或推送 Git；下一轮若按用户要求修复代码，应先基于本地差异审查修复，再提交单独、可回溯的 commit 并同步远端。
 
+## 更新 2026-11-23 17:15 CST
+
+### 做了什么
+
+- 并行 subagent 复核路线配对、近目标图像和运行时评分。确认 `sage3d_841980/ts_2` / `ts_3` 共用起点，参考路段在 `(-4.9064,-0.505)` 分叉；此前帧样本不在该处分叉。
+- 修复 `sim/3dgs/run_vln.py` 的 counterfactual swap 评测：保留原 episode 目标评分，新增供给指令 episode waypoint 的 `supplied_goal_*` 行级指标、manifest 元数据和报告汇总。补充 `sim/3dgs/test_vln.py` 的同起点双目标回归用例。
+- 用物理 GPU0 对 6 张已缓存 RGB 运行 12 次非空 VLM 查询，耗时 `22.6s`。真实分叉帧上 fruit-plate 方向匹配 1m route lookahead，tuyere 指令输出错误方向并把起点区域作为 reason。门目标远/中/近三帧中，仅近景输出 final/near=1；近景画作正确命名但 near 假阴性。每个结果含原始响应、帧哈希、推理结果的文件位于数据盘 `language-grounding-probe-r2-subgoal-20261123/probe_after_branch_and_stop_v5.json`。
+- `test_vln.py` 71/71、`test_grounder.py` 27/27 通过；`py_compile` 与 `git diff --check` 通过。GPU0 推理结束后显存回到 1 MiB、使用率 0%。
+
+### 没做什么
+
+- 没启动闭环或训练。阶段 1 仍未通过，冻结帧只提供小样本开发证据；语言和 STOP 门禁均保持关闭。
+- 没改 worker 提示词，没有据单一样本调模型；没有实现检测框、视觉跟踪或同类实例区分。worker 仍只使用最新图像帧。
+- 没新增脚本，12 次 VLM 查询通过 stdin 一次性运行。没删除已有日志/实验文件，没碰 GPU1。
+- 当前 `uav_rgb` 源仓库没有配置 remote，但同级 `../ALVLN` 有 `origin/main`，并有仓库内 `tools/git_mirror_alvln.sh` 用于镜像已提交快照。源 worktree 有大量既有修改和删除；`test_vln.py` 含本次前的未提交变更，只会纳入本轮新增回归测试 hunk。
+- 全量路线只读筛选遍历了 6 个 `sage3d_*` 场景、578 条路线，得到 591 对满足同起点、目标间距、同 split 与路线分叉条件的候选。候选路线 `tr_38/tr_95` 有约 2-bin 的清晰缓存帧，但缓存帧来自同起点的另一条任务轨迹，当前没有把它计为配对探针。
+
+### 待确认
+
+- `supplied_goal_*` 使用 SAGE instruction episode 的 route waypoint 作为目标评分代理，不等同物体实例的精确几何位置。扩展闭环前要审核被选配对的 waypoint 与 `goal_object` 语义关系，并固定同一动作预算。
+- 近门框架虽然近，但目标在右侧且 bearing 不是中心桶。当前 tracker 仅在中心方位接受 near=1；需要后续评估这项保守门控在多视角正负样本中的漏停率。
+
+### 验证到哪一步
+
+| 项 | 结果 |
+| --- | --- |
+| `/root/rivermind-data/uav_rgb/envs/vlm-venv/bin/python sim/3dgs/test_vln.py` | 通过，71 项 |
+| `/root/rivermind-data/uav_rgb/envs/vlm-venv/bin/python sim/3dgs/test_grounder.py` | 通过，27 项 |
+| `python3 -m py_compile sim/3dgs/run_vln.py sim/3dgs/test_vln.py` | 通过 |
+| `git diff --check -- sim/3dgs/run_vln.py sim/3dgs/test_vln.py` | 通过 |
+| GPU0 frozen-frame probe | 12 次非空 VLM query，22.6 秒，输出已落数据盘；GPU1 未使用 |
+
+### 风险与遗留
+
+- 指令确实改变这帧输出，但有一条正确目的地预测错误。停止样本中出现 near 假阴性，仍不足以证明目标定位和自主停靠可靠。
+- 当前 `uav_rgb` 源仓库未配置 remote，推送需要走同级 `../ALVLN` 的既有镜像仓库和同步脚本。测试文件含先前未提交变更，不能整文件提交。
+
+## 更新 2026-11-23 17:47 CST
+
+### 做了什么
+
+- 并行筛查 6 个本地 `sage3d_*` 场景的 578 条路线，按出生位姿、split、目标 waypoint 距离和分叉后剩余长度筛出 591 对不同目标候选。核对最大方位差候选后发现对应图像被黑墙遮挡。
+- 核对 `sage3d_840865/tr_38/0` 与 `tr_95/0` 的来源和原始语言指令。现有清晰帧来自另一条 `same_spawn_to_cup/0` 任务，虽然同 GS 几何且接近两条参考路径，但不属于该路线 pair 的 rollout，未将它当作语言反事实样本。
+- 检查源仓库和 GitHub 镜像的提交关系。`1a6f19c` 尚未被镜像标记覆盖，镜像目录存在与源快照不同的交接文本；提交前确认了仓库自带同步脚本使用源仓库提交快照。
+
+### 没做什么
+
+- 没有为这组候选额外调用 GPU，也没启动闭环或训练。帧与路线绑定未确认前，不增加推理预算。
+- 没有清理工作区里其他日志、实验目录或文件；现有大量未提交改动不在本次提交范围内。
+- 没有使用 GPU1；此前执行的 `test_vln.py` 71/71、`test_grounder.py` 27/27 在 GPU 屏蔽环境完成。
+
+### 风险与遗留
+
+- 源仓库当前无 Git remote，发布入口是同级 `../ALVLN` 的 `origin/main` 和 `tools/git_mirror_alvln.sh`。后续必须核验提交标记与远端 head，避免仅凭本地 commit 宣称上传完成。
+
 ## 更新 2026-11-23 07:31 CST
 
 按上述门禁继续执行后，已经修复可确定的问题，并用既有失败轨迹做了单帧推理诊断。以下结果不改变“阶段 1 未放行”的结论。

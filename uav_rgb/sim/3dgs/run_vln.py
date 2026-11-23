@@ -298,6 +298,23 @@ def _swapped_instruction(episodes, index, scene):
     return None
 
 
+def _episode_goal_waypoint(scene, episode):
+    if episode is None or episode.get("manual_demo"):
+        return None
+    if episode.get("route_contract") == "sage.multi_stage.v2":
+        routes = scene.get("multi_stage_routes") or []
+        route_index = episode.get("multi_stage_index")
+    else:
+        routes = scene.get("routes") or []
+        route_index = episode.get("route_index")
+    if not routes:
+        return dict(scene["waypoint"]) if route_index in (None, 0) and scene.get("waypoint") else None
+    if not isinstance(route_index, int) or not 0 <= route_index < len(routes):
+        return None
+    waypoint = routes[route_index].get("waypoint")
+    return dict(waypoint) if isinstance(waypoint, dict) else None
+
+
 def _active_bearing_source(args):
     if args.grounder == "vlm":
         return "vlm_grounder"
@@ -392,6 +409,14 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
             scene_mod.apply_route(scene, ep["route_index"])
         identity = collect_3dgs.scene_identity(scene, ply_sha256=identity["ply_sha256"])
         evaluation_goal = None if ep.get("manual_demo") else dict(scene["waypoint"])
+        supplied_goal_waypoint = (None if cf_mode == "zero" else
+                                  _episode_goal_waypoint(scene, instruction_ep))
+        supplied_goal_object = instruction_ep.get("goal_object") if supplied_goal_waypoint else None
+        if (supplied_goal_waypoint and instruction_ep.get("route_contract") == "sage.multi_stage.v2"
+                and instruction_ep.get("stage_waypoints")):
+            supplied_goal_object = instruction_ep["stage_waypoints"][-1].get("goal_object")
+        supplied_goal_record = {"supplied_goal_object": supplied_goal_object,
+                                "supplied_goal_waypoint": supplied_goal_waypoint}
         supplied_text = "" if cf_mode == "zero" else instruction_ep["text"]
         supplied_key = None if cf_mode == "zero" else instruction_ep["key"]
 
@@ -401,13 +426,13 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
             try:
                 result, policy_goal = resolve_grounding(lexical_grounder, catalog, supplied_text)
             except Exception as e:  # noqa: BLE001 - 单集输入错误要保留在请求分母
-                failures.append({**ep, "scene": scene["name"], "dir": ep_dir,
+                failures.append({**ep, **supplied_goal_record, "scene": scene["name"], "dir": ep_dir,
                                  "error": f"{type(e).__name__}: {e}"})
                 continue
             grounding = {"target": result.target, "score": result.score, "margin": result.margin,
                          "accepted": result.accepted, "reason": result.reason}
             if not result.accepted:
-                failures.append({**ep, "scene": scene["name"], "dir": ep_dir,
+                failures.append({**ep, **supplied_goal_record, "scene": scene["name"], "dir": ep_dir,
                                  "grounding": grounding, "error": f"ValueError: grounder 拒绝指令: {result.reason}"})
                 continue
         if grounding is not None:
@@ -422,7 +447,8 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
         # 始终保留真实评估目标作为 scene["waypoint"]，防止 grounder 落错地标时把 manifest 与视频伪装成到达真目标。
         if evaluation_goal is not None:
             scene["waypoint"] = dict(evaluation_goal)
-        scene["vln"] = {**ep, "supplied_text": supplied_text, "supplied_instruction_key": supplied_key,
+        scene["vln"] = {**ep, **supplied_goal_record,
+                        "supplied_text": supplied_text, "supplied_instruction_key": supplied_key,
                         "counterfactual": cf_mode, "blind_rgb": blind_rgb,
                         **({"grounding": grounding} if grounding is not None else {})}
         steps = math.ceil(int(scene["max_steps"]) * STEPS_HOLD_S / args.hold)
@@ -526,6 +552,21 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                 m["stage_reached"] = m["stage_reached_count"]
                 m["stage_ordered_complete"] = m["stage_reached_count"] == m["stage_count"]
                 m["stage_names"] = [stage.get("goal_object") for stage in ep["stage_waypoints"]]
+            supplied_metrics = None
+            if supplied_goal_waypoint is not None:
+                supplied_scene = dict(scene, waypoint=supplied_goal_waypoint)
+                supplied_stages = instruction_ep.get("stage_waypoints") if is_multi_stage else None
+                supplied_shortest = (instruction_ep["total_path_m"]
+                                     if is_multi_stage else
+                                     route_shortest_path_m(occ_planner, [{"pose_gt": start}] + oracle,
+                                                           supplied_scene))
+                supplied_metrics = vln.episode_metrics(
+                    actions, oracle, supplied_goal_waypoint, radius, man["stopped_by_agent"],
+                    supplied_shortest,
+                    ref_path=(instruction_ep.get("ref_path") or
+                              ref_paths.get(instruction_ep["route_index"])),
+                    stage_goals=([stage["waypoint"] for stage in supplied_stages]
+                                 if supplied_stages else None))
             target_metrics = None
             if grounding is not None:
                 target_scene = dict(scene, waypoint=policy_goal)
@@ -534,14 +575,17 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                 target_metrics = vln.episode_metrics(
                     actions, oracle, policy_goal, radius, man["stopped_by_agent"], target_shortest)
         except Exception as e:  # noqa: BLE001 - 一集崩了记下来接着跑，报告里单列
-            failures.append({**ep, "scene": scene["name"], "dir": ep_dir,
+            failures.append({**ep, **supplied_goal_record, "scene": scene["name"], "dir": ep_dir,
                              **({"grounding": grounding} if grounding is not None else {}),
                              "error": f"{type(e).__name__}: {e}"})
             continue
         row = {**ep, "seed": args.seed + n, "supplied_text": supplied_text,
                "supplied_instruction_key": supplied_key, "counterfactual": cf_mode,
+               **supplied_goal_record,
                "scene": scene["name"], **m, "error": err, "dir": ep_dir,
                "terminal_reason": man.get("terminal_reason")}
+        if supplied_metrics is not None:
+            row.update({f"supplied_goal_{key}": value for key, value in supplied_metrics.items()})
         if ep.get("manual_demo"):
             row.update(start_pose=dict(scene["spawn"]), step_budget=steps)
         if vlm_tracker is not None:
@@ -746,12 +790,22 @@ def main(argv=None):
               "manual_demo": manual_demo,
               "overall_metric_scope": ("manual_unscored" if manual_demo else
                                        "route_waypoint_proxy" if use_grounder else "scene_route_waypoint"),
+              "overall_goal_scope": "original_episode_goal",
               "overall": None if manual_demo else vln.summarize(rows, failures),
               "stage_metrics": None if manual_demo else vln.summarize_stages(rows, failures),
               "by_type": {} if manual_demo else vln.summarize_by(rows, "type", failures),
               "by_split": {} if manual_demo else vln.summarize_by(rows, "split", failures),
               "by_scene": {} if manual_demo else vln.summarize_by(rows, "scene", failures),
               "grounding": (_grounding_summary(rows, failures) if use_grounder and not manual_demo else None),
+              "supplied_goal_metric_scope": "instruction_episode_waypoint",
+              "supplied_goal_metrics": (None if manual_demo or args.counterfactual == "zero" else vln.summarize([
+                  {"success": r["supplied_goal_success"],
+                   "oracle_success": r["supplied_goal_oracle_success"],
+                   "spl": r["supplied_goal_spl"], "ndtw": r["supplied_goal_ndtw"],
+                   "sdtw": r["supplied_goal_sdtw"], "ne_m": r["supplied_goal_ne_m"],
+                   "collision": r["collision"], "stopped": r["stopped"]} for r in rows
+                  if "supplied_goal_success" in r],
+                  [failure for failure in failures if failure.get("supplied_goal_waypoint") is not None])),
               "target_goal_metrics": (vln.summarize([
                   {"success": r["target_success"], "oracle_success": r["target_oracle_success"],
                    "spl": r["target_spl"], "ne_m": r["target_ne_m"],

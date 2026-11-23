@@ -82,3 +82,21 @@ Artifacts:
 
 - Target-label prompt probe: `/root/rivermind-data/uav_rgb/exp-s1-dagger-r2-cleanaug-20261123/language-grounding-probe-r2-subgoal-20261123/probe_after_target_gate_v3.json`
 - Strict four-field prompt probe: `/root/rivermind-data/uav_rgb/exp-s1-dagger-r2-cleanaug-20261123/language-grounding-probe-r2-subgoal-20261123/probe_after_target_gate_v4.json`
+
+## Follow-up 2026-11-23 17:15 CST
+
+The earlier branch frames were replaced with a frame at the first reference-route divergence. In `sage3d_841980`, `ts_2` and `ts_3` share spawn `(-5.775, 3.845, -74.74 deg)` and reference points 0-19, then separate at `(-4.9064, -0.505)`. The selected `ts_2_3/rgb_00094.png` is about 0.22 m from that fork. Its SHA256 is `f4a8802fd59fbbf59acec8bb525b70bb2c195c200516e8238ebd063cc88937f8`. A 1 m reference-path lookahead maps `tuyere_2` to bearing bin 0 and `fruit_plate_1` to bin 1.
+
+The correct and swapped instructions changed the VLM output on this same frame, but only the fruit-plate direction matched the expected bin. The tuyere instruction returned right / subgoal / near 0 with reason `bedroom`, while the fruit-plate instruction returned left / final / near 0 with reason `fruit plate`. This is evidence that the instruction affects the answer, but not that both requested destinations are grounded correctly.
+
+The STOP set added far, intermediate, and near entrance-door frames from one route, plus a near decorative-painting frame. For the door route, the far (8.9 m) and intermediate (4.0 m) frames returned `subgoal / near=0`; the near (0.87 m) frame returned `final / near=1 / entrance door`. The swapped lighting instruction returned `subgoal / near=0` on all three. On the painting frame (0.82 m from the route waypoint), the VLM named `decorative painting` and returned `final / near=0`, a near-goal false negative. These distances are pose-to-waypoint proxies, not object-box distances. The door near frame is still right of center, so the current tracker would not issue STOP from this single observation.
+
+The stdin-only command used `/root/rivermind-data/uav_rgb/envs/vlm-venv/bin/python` with `CUDA_VISIBLE_DEVICES=0`. It ran at `2026-11-23 17:12:43 CST` on one NVIDIA GeForce RTX 2080 Ti and made 12 nonempty VLM calls in `22.6s`; empty instructions used the local SEARCH path. No script file was created. The complete per-query record is `/root/rivermind-data/uav_rgb/exp-s1-dagger-r2-cleanaug-20261123/language-grounding-probe-r2-subgoal-20261123/probe_after_branch_and_stop_v5.json`. The language and STOP gates remain closed. No closed-loop run or training followed.
+
+## Follow-up 2026-11-23 17:15 CST
+
+An independent runtime audit found that `--counterfactual swap` changed the supplied instruction while the main VLN success metric continued scoring only the original episode waypoint. The evaluator now records the supplied instruction episode's waypoint in the row and manifest and adds `supplied_goal_*` metrics alongside the unchanged original-task metrics. The report names both metric scopes. This is an instruction-episode waypoint proxy, not object-instance geometry.
+
+Regression coverage constructs two same-start, different-goal routes and a trajectory that stops at the supplied goal. It verifies that original-goal and supplied-goal success differ as expected. The full `test_vln.py` suite passes 71 tests, and `test_grounder.py` passes 27 tests in the VLM environment. Python compilation and `git diff --check` pass.
+
+The swap-score correction does not reopen closed-loop evaluation. The input is the latest frame only despite the four-frame history buffer, and target identity still uses text labels without regions or instance tracking. More matched route forks and independent stop positives/negatives are still needed before a G3 closed-loop comparison.

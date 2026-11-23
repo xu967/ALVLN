@@ -129,3 +129,19 @@ subgoal bearing 标签合同已在 CPU 侧实现并完成全包验证。现有 R
 新版冻结帧探针使用相同 4 帧 correct/swap/zero，物理 GPU0 实测 18.86 秒；8/8 非空输出符合解析格式。near-door 正指令输出 `R/F/1/entrance door`，错误 lighting 指令输出 `R/S/0/none`。该帧仍为右侧方位，当前 tracker 不会据此直接 STOP；单正样本不足以估算停止性能。
 
 阶段 1 和语言门禁仍未放行，没有启动 G3 闭环或训练。下一步先基于参考路线挑选或生成处于目标相关分岔的同位姿 RGB，并补足独立的正确目标、错目标、近景、遮挡和同类干扰帧，再决定闭环评测。详细结果见 [冻结帧探针](2026-11-23-vln-grounding-frame-probe.md)。
+
+## 执行更新 2026-11-23 17:15 CST
+
+并行路线审查找到了有效的同起点双目标开发配对。`sage3d_841980/ts_2` 与 `ts_3` 出生位姿相同，目标点相距约 `4.09m`，1m 目标圆不重叠。参考路径在前 20 点相同，并从 `(-4.9064,-0.505)` 分叉。冻结帧 `ts_2_3/rgb_00094.png` 距分叉约 `0.22m`，图像质量有效。它只用于开发探针，不能当独立测试。
+
+在这同一 RGB 上，VLM 对果盘指令输出左方位，符合 1m 参考路径 lookahead；对 tuyere 指令输出右方位，且将 `bedroom` 写成原因，未符合目标路线。交换指令会改变输出，但目标路线并未都选对。因此语言只显示有影响的初步证据，门禁仍未通过。
+
+新增的 STOP 冻结帧中，门目标从距离 waypoint 约 `8.9m`、`4.0m` 到 `0.87m`，正确指令在前两帧保持 `subgoal/near=0`，近景输出 `final/near=1`；换成 lighting 指令时三帧均为 `subgoal/near=0`。另一张约 `0.82m` 的画作近景正确命名了 `decorative painting`，但 `near=0`，是假阴性。距离只代表无人机到路线 waypoint 的代理距离。近门目标位于画面右侧，tracker 仍要求中心方位后才接受 STOP。
+
+CPU 代码审查发现 `counterfactual=swap` 只替换了语言，成功率一直按原任务目标计算。现已保留原任务指标，并增加实际提示指令对应路线 waypoint 的 `supplied_goal_*` 行级与汇总指标，报告分别标注两种口径。新增同起点双目标回归测试验证飞到提示目标时两套 SR 给出不同结果。`test_vln.py` 71 项、`test_grounder.py` 27 项、`py_compile` 与 `git diff --check` 通过。
+
+12 次非空冻结帧推理在物理 GPU0 耗时 `22.6s`，GPU1 未使用。结果文件位于数据盘 `language-grounding-probe-r2-subgoal-20261123/probe_after_branch_and_stop_v5.json`，逐帧记录和限制见 [冻结帧语言探针](2026-11-23-vln-grounding-frame-probe.md)。没有启动训练或 G3 闭环。阶段 1 和语言门禁仍未通过；下一步先扩充多条同起点分岔配对及不同物体的近/远、遮挡和同类实例负例，并用 CPU 校验 supplied-goal routewaypoint 与实际任务对象映射，再预登记闭环动作预算和双目标评分。
+
+### 同起点路线候选筛查（17:47 CST）
+
+2026-11-23 的只读筛查遍历 6 个 `sage3d_*` 场景、578 条路线。以出生位置差不超过 `0.05m`、yaw 差不超过 `1°`、同 split、不同目标点至少相距 `2m`、分叉后各保留至少 `1.2m` 为条件，得到 591 对候选。最大理论方位间隔的候选帧被黑墙遮挡，不适合视觉探针。第二候选 `sage3d_840865/tr_38/0` 与 `tr_95/0` 约差 2 个实际帧 bearing bin，指令分别是 “Take a warmed towel from the bathroom and place it beside the pillow in storage.” 和 “Please transfer a wet towel from the bathroom to the laundry area for heating.” 现有清晰帧 `same_spawn_to_cup/0/rgb_00022.png` 实际来自“去门口”的另一任务；虽然同 GS 几何且位姿接近两条路线，它不属于这两条 ref_path 的 rollout，scene JSON 哈希也不同。没有将其当作路线配对结果，也没有追加 GPU 查询。该候选只有在取得与目标路线合同匹配的帧后，才可用于开发探针；不能替代独立闭环测试。

@@ -12,6 +12,11 @@
 - `test_grounder.py` 在系统 Python 和 VLM 环境均为 27/27，通过；`test_vln.py` 在 VLM 环境 70/70 通过。`py_compile` 和 `git diff --check` 通过。近期 GPU 工作只暴露物理 GPU0，GPU1 未使用。
 - VLN 评测报告新增 `active_bearing_source`，用来区分实际 VLM 方位与未生效的 `g0_mode` 配置。仓库没有 Git remote，工作区有大量既有修改和删除，没有提交或推送。
 - 仓库没有配置 Git remote，当前工作区有大量既有修改和删除。本轮没有提交或推送。
+- 17:15 CST 继续按门禁执行：`ts_2/ts_3` 真实路径分叉帧上，交换指令会改变 VLM 方位，但 fruit-plate 方向正确、tuyere 方向错误；画作近景存在 near 假阴性。12 次非空推理只用 GPU0，未跑训练或闭环。完整输出见冻结帧探针文档及数据盘 `probe_after_branch_and_stop_v5.json`。
+- 修复 `counterfactual=swap` 的计分缺口：评测现在同时输出原任务目标指标与实际输入指令所关联的路线 waypoint 指标，避免将 prompt swap 成功率按错目标解释。这个映射是 route-waypoint proxy。回归后 `test_vln.py` 为 71/71，`test_grounder.py` 为 27/27。
+- 语言/STOP 门禁和局部控制阶段 1 仍未放行。下一步补足多组独立分岔与近目标负例，再登记同预算双目标闭环；不要启动训练或论文级对比。worker 当前只处理最新 RGB，跨帧视觉目标跟踪尚未实现。
+- 全量路线筛选覆盖 6 个 `sage3d_*` 场景、578 条路线，筛出 591 对同起点、不同目标路线。最佳可复用候选尚未 GPU 探测，缓存帧与候选原始路线的绑定需要进一步确认；目前只作为开发帧候选，不进入正式评测。
+- 17:47 CST 核对 `tr_38/0` 与 `tr_95/0` 的原始指令后，确认现有 `rgb_00022.png` 属于另一条 `same_spawn_to_cup` 轨迹，不是这对路线的 rollout。本轮不追加探针或闭环，避免把同位姿帧误记为同路线配对。
 
 ## 交接快照：2026-11-22（GPU 回归验证）
 

@@ -610,6 +610,66 @@ class TestRunner(unittest.TestCase):
         self.assertTrue(all(row["grounding"]["correct"] for row in rows))
         self.assertFalse(any(row["success"] for row in rows))  # route waypoint 与 catalog 目标不同
 
+    def test_swapped_instruction_reports_original_and_supplied_goal_scores(self):
+        scene = copy.deepcopy(SCENE)
+        scene.update(ply_path="unused.ply", reach_radius_m=1.0, max_steps=8)
+        shared_spawn = {"x": 0.0, "y": 0.0, "z": 2.0, "yaw_deg": 0.0}
+        scene["routes"] = [
+            {"name": "lamp_route", "spawn": shared_spawn, "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0},
+             "max_steps": 8, "sage": {"split": "train", "instructions": [
+                 {"instruction_type": "A", "start": "start", "end": "lamp_1", "text": "Go to the lamp."}]}},
+            {"name": "tv_route", "spawn": dict(shared_spawn), "waypoint": {"x": 8.0, "y": 0.0, "z": 2.0},
+             "max_steps": 12, "sage": {"split": "train", "instructions": [
+                 {"instruction_type": "A", "start": "start", "end": "tv_1", "text": "Go to the television."}]}},
+        ]
+        actions, oracle = _steps([(0, 0), (4, 0), (8, 0), (8, 0)])
+        manifest = {"stopped_by_agent": True,
+                    "validity": {"physics_verified": True, "camera_verified": True}}
+        args = SimpleNamespace(split=None, all_instructions=True, seed=0, limit=0,
+                               out="unused", hold=0.5, policy="teacher", videos=0,
+                               stop_mode="explicit", counterfactual="swap")
+        episode_waypoints = []
+
+        def run_episode(scene_arg, *_args, **_kwargs):
+            episode_waypoints.append(scene_arg["waypoint"]["x"])
+            return manifest, None
+
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.object(scene_mod, "load_scene", return_value=scene))
+            stack.enter_context(mock.patch.object(scene_mod, "read_gaussian_ply", return_value=None))
+            stack.enter_context(mock.patch.object(runner.collision_mod, "from_scene", return_value=None))
+            stack.enter_context(mock.patch.object(runner.renderer_mod, "make_renderer", return_value=None))
+            stack.enter_context(mock.patch.object(runner.planner_mod, "OccPlanner", return_value=None))
+            stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
+            stack.enter_context(mock.patch.object(runner, "make_policy", return_value=SimpleNamespace(name="teacher")))
+            stack.enter_context(mock.patch.object(collect, "run_episode", side_effect=run_episode))
+            stack.enter_context(mock.patch.object(runner, "_read_jsonl", side_effect=[actions, oracle] * 2))
+            stack.enter_context(mock.patch.object(runner, "route_shortest_path_m", return_value=4.0))
+            rows, failures = runner.run_scene("fixture.json", args, None)
+
+        self.assertFalse(failures)
+        self.assertEqual(len(rows), 2)
+        first, second = rows
+        self.assertEqual((first["success"], first["supplied_goal_success"]), (False, True))
+        self.assertEqual((second["success"], second["supplied_goal_success"]), (True, False))
+        self.assertEqual(first["supplied_goal_object"], "tv_1")
+        self.assertEqual(first["supplied_goal_waypoint"]["x"], 8.0)
+        self.assertEqual(second["supplied_goal_object"], "lamp_1")
+        self.assertEqual(second["supplied_goal_waypoint"]["x"], 4.0)
+        self.assertEqual(episode_waypoints, [4.0, 8.0])
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(runner, "run_scene", return_value=(rows, failures)), \
+                mock.patch.object(runner.CfSitlParams, "from_json",
+                                  return_value=SimpleNamespace(profile=lambda: "test")):
+            self.assertEqual(runner.main(["--scene", "fixture", "--policy", "teacher",
+                                          "--counterfactual", "swap", "--out", tmp]), 0)
+            with open(os.path.join(tmp, "vln_eval.json"), encoding="utf-8") as report_file:
+                report = json.load(report_file)
+        self.assertEqual(report["overall_goal_scope"], "original_episode_goal")
+        self.assertEqual(report["supplied_goal_metric_scope"], "instruction_episode_waypoint")
+        self.assertEqual(report["supplied_goal_metrics"]["n_requested"], 2)
+        self.assertEqual(report["supplied_goal_metrics"]["sr"], 0.5)
+
     def test_route_waypoint_success_does_not_hide_catalog_goal_miss(self):
         scene = copy.deepcopy(SCENE)
         scene.update(ply_path="unused.ply", reach_radius_m=1.0, max_steps=8)
