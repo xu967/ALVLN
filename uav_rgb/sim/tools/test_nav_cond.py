@@ -246,16 +246,25 @@ class ConditionGateTests(unittest.TestCase):
         self.assertEqual(nav_cond.check_student_cond("heading-code", cal_hc, 4)["status"], "mismatch")
 
     @staticmethod
-    def _write_v6_ckpt_header(path, dataset_sha_hex, nw=4, lr=1e-3, batch=128):
-        """构造足够读出 v5 训练契约的 UAVRCK01 v6 头（对齐 src/checkpoint.cpp:save_checkpoint）。"""
-        head = struct.pack("<8sIIiiiiIII", b"UAVRCK01", 6, 1, 120, 160, 3, 4, 10, 5, nw)
+    def _write_ckpt_header(path, dataset_sha_hex, nw=4, lr=1e-3, batch=128, version=6):
+        """构造足够读出数据集签名的 UAVRCK01 权重头（对齐 src/checkpoint.cpp:save_checkpoint）。"""
+        head = struct.pack("<8sIIiiiiIII", b"UAVRCK01", version, 1, 120, 160, 3, 4, 10, 5, nw)
         weights = struct.pack(f"<{nw}f", *([1.0] * nw))
         v3_v4 = struct.pack("<fi", 0.5, 0)
         contract = (bytes.fromhex(dataset_sha_hex) + struct.pack("<B", 1) + b"\x00" * 32
                     + struct.pack("<ffIi", 0.0, lr, 42, batch) + b"\x00" * 32)
         v6 = struct.pack("<ii", 0, 4)
         with open(path, "wb") as f:
-            f.write(head + weights + v3_v4 + contract + v6)
+            f.write(head + weights + v3_v4 + contract)
+            if version == 9:
+                f.write(struct.pack("<f", 0.25))
+            f.write(v6)
+
+    def test_v9_dataset_contract_rejects_mismatched_config(self):
+        ckpt, _ = self.make_run("v9", {"cond": "heading_code.v1"})
+        self._write_ckpt_header(ckpt, "ab" * 32, version=9)
+        self.assertEqual(nav_cond.ckpt_dataset_sha256(ckpt), "ab" * 32)
+        self.assertEqual(nav_cond.check_student_cond("heading-code", ckpt, 4)["status"], "mismatch")
 
     def test_resume_config_takes_precedence_over_initial_config(self):
         """I1-6 第 1 点：同目录续训时先看 config.resume.json 再看 config.json（直接同目录与经 sidecar run 目录均如此）。"""
@@ -298,11 +307,11 @@ class ConditionGateTests(unittest.TestCase):
         other_sha = "ab" * 32
 
         # 契约 sha256 与 config.json 一致 -> ok
-        self._write_v6_ckpt_header(ckpt, sha_hc)
+        self._write_ckpt_header(ckpt, sha_hc)
         self.assertEqual(nav_cond.check_student_cond("heading-code", ckpt, 4)["status"], "ok")
 
         # 把别的运行训出的 ckpt 拷进 hc_dir（契约记 other_sha != config.json 的 sha_hc）-> mismatch
-        self._write_v6_ckpt_header(ckpt, other_sha)
+        self._write_ckpt_header(ckpt, other_sha)
         got = nav_cond.check_student_cond("heading-code", ckpt, 4)
         self.assertEqual((got["status"], got["trained"]), ("mismatch", None))
         self.assertIn("dataset_sha256", got["message"])
@@ -314,7 +323,7 @@ class ConditionGateTests(unittest.TestCase):
 
         # <ckpt>.json 侧车记的 data_sha256 与 ckpt 契约不符 -> mismatch
         cal = self.path("cal_mismatch.bin")
-        self._write_v6_ckpt_header(cal, other_sha)
+        self._write_ckpt_header(cal, other_sha)
         with open(cal + ".json", "w", encoding="utf-8") as f:
             json.dump({"tool": "tools/average_ckpt.py", "dataset_cond": "heading_code.v1",
                        "data": ds_hc, "data_sha256": sha_hc}, f)
@@ -322,7 +331,7 @@ class ConditionGateTests(unittest.TestCase):
 
         # 全零占位契约（测试假权重）按无契约处理，不误拒
         ckpt_zero, _ = self.make_run("zero_dir", {"schema": "uavrgb.dataset.v1", "cond": "heading_code.v1"})
-        self._write_v6_ckpt_header(ckpt_zero, "00" * 32, lr=0.0, batch=0)
+        self._write_ckpt_header(ckpt_zero, "00" * 32, lr=0.0, batch=0)
         self.assertEqual(nav_cond.check_student_cond("heading-code", ckpt_zero, 4)["status"], "ok")
 
     def test_explicit_prev_action_on_pure_image_model_is_mismatch(self):

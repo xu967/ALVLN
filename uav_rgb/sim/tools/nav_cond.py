@@ -117,7 +117,7 @@ def ckpt_dataset_sha256(path):
             if len(raw) != _CKPT_HEAD.size:
                 return None
             magic, ver, _np, _h, _w, _c, _nc, _at, _ep, nw = _CKPT_HEAD.unpack(raw)
-            if magic != b"UAVRCK01" or ver < 5 or ver > 8 or nw > 64:
+            if magic != b"UAVRCK01" or ver < 5 or ver > 9 or nw > 64:
                 return None
             f.seek(4 * nw + 8, os.SEEK_CUR)      # class_weights + v3 best_macro_f1 + v4 text_dim
             contract = f.read(_CKPT_CONTRACT_BYTES)
