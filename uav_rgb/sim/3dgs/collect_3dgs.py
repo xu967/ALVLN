@@ -434,6 +434,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
         os.makedirs(os.path.join(out_dir, "depth"), exist_ok=True)
     rng = np.random.default_rng(seed)
     x, y, yaw = _spawn_for_episode(scene, occ, spawn_jitter, rng, two_layer=spawn_two_layer)
+    initial_quat = None
     if dynamics == "cf_sitl":
         dyn = CfSitlDynamics(scene, params, dynamics_path, seed=seed)
         try:
@@ -443,6 +444,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             dyn.close()
             raise
         x, y, yaw = s["x"], s["y"], s["yaw_deg"]   # 起飞段有漂移，episode 从实际位姿开始
+        initial_quat = s.get("quat")  # trace 从动作执行后开始，首张 RGB 的机体姿态需单独保留（wxyz）
     elif dynamics == "cf_blackbox":
         dyn = make_blackbox(scene, dynamics_path, params)
         dyn.x, dyn.y = x, y
@@ -676,6 +678,7 @@ def run_episode(scene, out_dir, renderer, occ, params, policy, steps, hold_s, da
             "dynamics_backend": dynamics,
             "dynamics_profile": dyn.profile(),
             "dynamics_params": dyn.manifest(),
+            **({"initial_body_quat_wxyz": initial_quat} if initial_quat is not None else {}),
             "trace_ref": "trace.jsonl" if getattr(dyn, "trace", None) is not None else None,
             "teacher": policy.name,
             "planner": getattr(policy, "planner_name", None),

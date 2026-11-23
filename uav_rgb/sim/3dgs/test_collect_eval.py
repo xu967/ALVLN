@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -78,6 +79,7 @@ class TestCollect3dgs(unittest.TestCase):
             self.assertEqual(m["num_steps"], 3)
             self.assertEqual(m["dynamics_params"]["z_target_m"], 2.0)
             self.assertEqual(m["dynamics_profile"], m["dynamics_params"]["profile"])
+            self.assertNotIn("initial_body_quat_wxyz", m)
             self.assertTrue(m["validity"]["episode_executed"])
             with open(os.path.join(out, "ep_00000", "actions.jsonl")) as f:
                 rows = [json.loads(x) for x in f]
@@ -101,6 +103,23 @@ class TestCollect3dgs(unittest.TestCase):
             self.assertEqual(run["scene"]["geometry_gid"], m["geometry_gid"])
             self.assertEqual(run["split"], m["split"])
             self.assertEqual(m["collision_proxy"]["proxy_version"], "3dgs.occ.v2")
+
+    def test_first_sitl_image_pose(self):
+        dynamics = importlib.import_module("sim.3dgs.dynamics")
+        if not os.path.isfile(dynamics.CF_SITL_PROC):
+            self.skipTest("需要 cf_sitl_proc")
+        with tempfile.TemporaryDirectory() as tmp:
+            scene, renderer, occ, _, identity = _mock_env(tmp)
+            out = os.path.join(tmp, "ep")
+            with patch.object(renderer, "render_view", wraps=renderer.render_view) as render:
+                collect.run_episode(scene, out, renderer, occ, dynamics.CfSitlParams.from_json(),
+                                    collect.ForwardPolicy(), 1, 0.5, split=identity["split"], dynamics="cf_sitl")
+            frame = _rows(out)[0]
+            manifest = _load(os.path.join(out, "episode_manifest.json"))
+            pos = [frame["pose_before"][k] for k in "xyz"]
+            view = scene_mod.viewmat_from_quat(pos, manifest["initial_body_quat_wxyz"],
+                                               manifest["camera"]["mount"], scene["_nav_to_world"])
+            np.testing.assert_allclose(view, render.call_args.args[0], rtol=0, atol=1e-12)
 
     def test_route_select_and_astar_teacher(self):
         """--route N 覆盖 spawn/waypoint/max_steps；astar 教师朝 +y 出生、目标在 +x 时先右转；越界报错。"""
