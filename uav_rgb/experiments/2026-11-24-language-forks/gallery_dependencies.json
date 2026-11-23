@@ -1,0 +1,16 @@
+{
+  "/root/rivermind-data/uav_rgb/exp-vln-language-forks-20261124/fork_mask.json": "9e9ed0e06862bfedd7423dbb922fd1401d33dea2441eab435f4dbc042c22f468",
+  "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/fork_mask.json": "25c3b1485f11700d751f3c3d25638324a581cda84c9a675969076873025fe922",
+  "/root/rivermind-data/uav_rgb/exp-vln-search-data-20261124/supervision/offline_relabel/registration.json": "1ca6be0217007b3150e49517742e47191351d5c3090e2d7bc0e4d295160bd08a",
+  "/root/rivermind-data/uav_rgb/exp-vln-search-data-20261124/train_episodes.jsonl": "d7ff12baf63f946fcd45bf87749b9daa01e955b18b22059afdf3d5675a2b8526",
+  "/root/rivermind-data/uav_rgb/exp-vln-search-data-20261124/development_episodes.jsonl": "603bfe830f208f6512d48849222e8a919aef21756e3fd63d2cd207652360afcf",
+  "/root/rivermind-data/uav_rgb/3dgs-scenes/sage3d_839992/scene.json": "ce2e6791c53998b88b77fad7ff2020cfba7cca3783ce8cfd30147c276e78364e",
+  "/root/rivermind-data/uav_rgb/3dgs-scenes/sage3d_840139/scene.json": "4fbc16040f366dbf48c11dab4eee0779804f5c13f9bc8a01ba26363e6d1c299b",
+  "/root/rivermind-data/uav_rgb/3dgs-scenes/sage3d_841012/scene.json": "6b885d73f6178cb0a84c176a5de3bb24f1261405687c3d0759aabc92570a25f9",
+  "/root/rivermind-data/uav_rgb/3dgs-scenes/sage3d_841150/scene.json": "65cde0020238577b3b71c1a7c89a6ede72ef2645ee9bc2918abd435eaa2fb237",
+  "/root/rivermind-data/uav_rgb/exp-vln-box-control-839934-20261124/default_runtime/sim/3dgs/grounder.py": "9248fdf3f73e92b9d0475143f3cb33ac11ecaa67debde58edc526ec11e5dedce",
+  "/root/rivermind-data/uav_rgb/exp-vln-gallery-replay-20261124/registration.json": "af5360cf672403faadcbcf7110deac0827dc28a051485ef02b9f8b4898bfdfa5",
+  "/root/rivermind-data/uav_rgb/exp-vln-gallery-replay-20261124/train.py": "d0023fc83c046ac1df6b809bc40b56f1f2b8a8515622620eb3a0c14cc6711d51",
+  "/root/rivermind-data/uav_rgb/exp-vln-gallery-replay-20261124/memory_manifest.json": "4d2a2355c14229fa347d689613b4816c743fc649b659a573563f5eb050aae2b4",
+  "/root/rivermind-data/uav_rgb/exp-vln-gallery-replay-20261124/results.json": "d02f9f50aa7bc1ba722c4c6b4d452e1ff57c52cfd3937e92534e7eeb180cfeef"
+}
