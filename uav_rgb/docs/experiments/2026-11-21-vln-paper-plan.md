@@ -47,6 +47,34 @@ CPU 用真实双帧和权重复现了 332/332 个学生提议。四个语言请�
 
 同一地图教师、语言基线和保持方位候选，在两条正确指令上的真实飞行轨迹与累计绝对偏航已按 0.5 秒动作窗对齐。壁灯与橱柜各列的十字为该次实际起点，圆圈为指令目标的 1 m 区域，点、叉、方块分别代表教师自主停下、基线碰撞、保持方位超时。绝对偏航衡量总转量，不能据此推断真机振动。[查看两目标轨迹与转向图](/root/rivermind-data/uav_rgb/exp-vln-new-scenes-20261124/controls/trajectories_and_yaw.png)
 
+### 同画面换指令训练与真实飞行结果
+
+40 对同起点双目标示范各自记录同物理前缀、同相机的首次动作分歧。小批 8 对之外新增 32 对，64 集飞行共 5,847 个窗，教师 59 次成功、1 次碰撞。合并后 30 对训练、10 对开发。新开发 8 对里有 1 对为 SAFE 与前进，三类搜索头只输出前、左、右，该对保留在登记分母。教师使用地图和位姿生成离线标签，学生只用当前和上一机载帧、指令及上一真实执行动作。[物理分歧与数据登记](/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/fork_mask.json)
+
+稀疏训练只学每对的首次分歧。沿轨迹训练在同一画面分别指定两个物体，让教师重新决定动作，并加入两条指令都应执行相同动作的对照。事后重放全部 80 条事实轨迹，6,686 个实际动作和同数停止标记均一致。去重后训练使用 324 个分歧画面和 508 个同动作画面，开发使用 72 个分歧画面和 214 个同动作画面。按路线对抽样、双帧视觉特征与文本编码冻结、学习率 0.001、种子 20261117、250 次更新、每批 32 对。保留实际采集分岔和离线替代目标的标签来源。合并后 9 个可评分开发首分岔中，两目标都能确认在画外的样本数为零。[逐状态分母与校验](/root/rivermind-data/uav_rgb/exp-vln-fork-counterfactual-states-20261124/index.json) · [可见性](/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/visibility_and_predictions.json)
+
+| 新开发数据，两条指令同时预测正确 | 稀疏模仿 | 沿轨迹模仿 | 沿轨迹空语言 |
+| --- | ---: | ---: | ---: |
+| 首次实飞分歧 | 0/7 | 1/7 | 0/7 |
+| 8 对路线上的分歧窗，逐路线等权 | 8.45% | 9.40% | 0% |
+| 8 对路线上的同动作窗，逐路线等权 | 18.67% | 28.04% | 64.26% |
+
+额外配对损失与稀疏模仿均答对 30/30 训练对、新开发 0/7 对。只看整句 BERT 最近邻的基线同样答对新开发 1/7 对。14 条新增可评指令中，9 条的物体类别在这批训练分岔中未出现。三个训练物体类别在不同起点分别要求过左转和右转。[稀疏学习对照](/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/cohort_results.json) · [密集学习对照](/root/rivermind-data/uav_rgb/exp-vln-dense-fork-search-20261124/summary.json) · [无图像基线](/root/rivermind-data/uav_rgb/exp-vln-fork-counterfactual-states-20261124/no_image_priors.json)
+
+**实际飞行。** 使用 839934 的壁灯、橱柜两条路线，分别执行原指令与交换指令。每组 4 集，逐路匹配种子、首帧、起点、125 步预算、固件、0.5 秒动作窗、R2 及显式 STOP。搜索模型只在未确认最终目标的状态提出动作。分数按实际输入指令对应的目标计算，目标圈取路线航点为中心、水平 1 m 半径。
+
+| 839934 方法 | 正确停靠 | 碰撞 | 超时 | 平均目标终距 |
+| --- | ---: | ---: | ---: | ---: |
+| G3＋R2 | 0/4 | 4/4 | 0/4 | 7.341 m |
+| 加首次分岔监督 | 0/4 | 4/4 | 0/4 | 7.442 m |
+| 加沿轨迹监督 | 0/4 | 3/4 | 1/4 | 7.498 m |
+
+稀疏头在 51 个窗提议动作，其中 47 次改变原提议。沿轨迹头触发 95 个窗，58 次改变提议；原句找柜子的一集用满 125 步，终距 7.802 m。搜索头未通过成功停靠门槛。下一轮优先定位失败前是否取得指定实例的图像证据，并用预先冻结的两个真实可见近景检验从看见目标到主动停止。近景初始位姿是诊断条件。所有正式未见房间继续留作最后一次评测。[稀疏闭环](/root/rivermind-data/uav_rgb/exp-vln-ce-search-839934-20261124/comparison.json) · [沿轨迹闭环](/root/rivermind-data/uav_rgb/exp-vln-dense-search-839934-20261124/comparison.json) · [实际训练源码](https://github.com/xu967/ALVLN/tree/experiment/20261124-language-forks)
+
+**哪里失败。** 从原始起点飞行的 12 集、385 个学生决策帧中，349 帧指定实例完全在画外，24 帧穿过目标框的射线均被更近的场景网格遮挡，12 个首帧姿态未核实。独立近景 RGB 核对过两件物体的网格对应关系。对地图教师的 197 帧采用同一可见性判据，壁灯和橱柜有 21 和 16 个阳性帧，两集均在看到目标后主动停止。网格代理不等同于实测传感器深度。[逐帧目标获取审计](/root/rivermind-data/uav_rgb/exp-vln-new-scenes-20261124/acquisition_audit/summary.json)
+
+在壁灯前 0.790 m、橱柜前 0.866 m 两处预先选定的位置分别输入两句原指令。每处两次实际首帧字节和起飞位姿均一致，两个目标清晰可辨，两个匹配臂均已在任务成功圆盘内。壁灯臂第 17 步碰撞、橱柜臂第 23 步碰撞，均未停机。这两个匹配臂的 VLM 分别有 9/9 和 10/12 次输出 final，均无一次原始方位为中心。两次交换指令也都碰撞，四次无 STOP。此实验检验目标可见后的对准和停机。训练中跨实例、可见且已进入 1 m 圆盘的有效监督很少；下一批使用独立训练房间与换指令、远距离两类反例。[近景四臂](/root/rivermind-data/uav_rgb/exp-vln-near-start-839934-20261124/scores.json) · [仿真机载首帧](/root/rivermind-data/uav_rgb/exp-vln-near-start-839934-20261124/registered_starts.png) · [独立停机监督](/root/rivermind-data/uav_rgb/exp-vln-near-start-839934-20261124/independent_stop_evidence.json)
+
 ### 开源对照的比较条件
 
 本项目在室内 1 m 水平目标圈内要求自主停机，同时报告按实际输入指令计算的 SR、OSR、SPL、NE、碰撞与错停。AerialVLN 原论文使用城市空中场景，OpenFlyV2 的官方闭环条件为距目标 25 m 内显式停止。它们提供了指标与评测协议的参照。要比较方法排名，需将公开策略接入相同的室内相机、动作窗、停止合同和路线，再执行配对飞行。已经完成的公开模型实测限于目标定位和采用该模型的闭环候选。[AerialVLN 原论文](https://openaccess.thecvf.com/content/ICCV2023/html/Liu_AerialVLN_Vision-and-Language_Navigation_for_UAVs_ICCV_2023_paper.html) · [OpenFlyV2 官方协议](https://ideal-ljl.github.io/AeroBrain/) · [SAGE-3D 官方指标](https://sage-3d.github.io/)
