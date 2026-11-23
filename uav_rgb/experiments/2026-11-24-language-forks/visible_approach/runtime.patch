@@ -1,0 +1,51 @@
+--- a/sim/3dgs/collect_3dgs.py
++++ b/sim/3dgs/collect_3dgs.py
+@@ -226,42 +226,13 @@
+         return turn
+ 
+     def __call__(self, rgb, depth, state):
+-        import base64
+-        rgb_in = self.rgb_transform(rgb) if self.rgb_transform is not None else rgb
+-        h, w = rgb_in.shape[:2]
+-        msg = {"width": w, "height": h, "step": w * 3,
+-               "pixelFormatType": "RGB_INT8",
+-               "data": base64.b64encode(np.ascontiguousarray(rgb_in).tobytes()).decode()}
+-        if self.student_cond == nav_cond.COND_VLN_NAV:
+-            bb, ng = self.goal_fn(rgb_in, state) if self.goal_fn is not None else (nav_cond.BEARING_UNKNOWN, 0)
+-            self.last_bearing_bin = int(bb)
+-            self.last_near_goal = int(ng)
+-            kw = {"prev_action": self.last_executed,
+-                  "bearing_bin": self.last_bearing_bin,
+-                  "near_goal": self.last_near_goal}
+-        elif self.student_cond == nav_cond.COND_PREV_ACTION:
+-            kw = {"prev_action": self.last_executed}
+-        else:
+-            kw = {}
+-        proposed, infer_ms, _probs = self.student.act(msg, **kw)
+-        model_stop = bool(getattr(self.student, "last_stop_requested", False))
+-        grounding = getattr(self.goal_fn, "last_vg", None)
+-        self.stop_requested = model_stop if grounding is None else self.goal_fn.confirmed_target
+-        action = SAFE_NEUTRAL if self.stop_requested else self._apply_onboard_depth_gate(proposed, rgb_in)
+-        self.last_decision = {
+-            "action_proposed": proposed,
+-            "action_intervention": ("task_stop" if self.stop_requested else
+-                                    "depth_avoidance" if action != proposed else None),
+-            "stop_source": ("student_head" if grounding is None else "visual_target") if self.stop_requested else None,
+-            "model_stop_requested": model_stop,
+-            "depth_sectors_pred": getattr(self.student, "last_depth_sectors", None),
+-            "near_obs_prob": getattr(self.student, "last_near_obs_prob", None),
+-        }
+-        if grounding is not None:
+-            self.last_decision.update(grounding_mode=grounding.goal_mode,
+-                                      grounding_reason=grounding.reason, grounding_conf=grounding.conf)
++        from approach import VisualApproach
++        if not hasattr(self, 'visual_approach'):
++            self.visual_approach = VisualApproach()
++        action, self.stop_requested, self.last_decision, elapsed_ms = self.visual_approach.decide(
++            rgb, self.goal_fn.instruction)
+         self.last_executed = action
+-        return action, infer_ms
++        return action, elapsed_ms
+ 
+ 
+ class DaggerPolicy:

@@ -1,0 +1,154 @@
+{
+  "cabinet_prim": "/Root/Cabinet_A6955fb737cd711ef9df84200964981bc",
+  "mesh_triangles": 397832,
+  "cabinet": {
+    "before_stop": {
+      "body_xyz_nav_m": [
+        2.093209099433844,
+        -0.8127371263779626,
+        1.1921903565569016
+      ],
+      "distance_3d_to_verified_cabinet_mesh_m": 1.6348056003507316,
+      "distance_to_interiorgs_3d_obb_m": 1.5950884748004672,
+      "official_horizontal_waypoint_m": 1.4016429391155052,
+      "outside_1m_disk_m": 0.4016429391155052
+    },
+    "after_stop": {
+      "body_xyz_nav_m": [
+        2.186080698168216,
+        -0.7939978853501439,
+        1.18276649466235
+      ],
+      "distance_3d_to_verified_cabinet_mesh_m": 1.5404573110989062,
+      "distance_to_interiorgs_3d_obb_m": 1.500592270472162,
+      "official_horizontal_waypoint_m": 1.3069026141686098,
+      "outside_1m_disk_m": 0.30690261416860976
+    }
+  },
+  "body_origin_reference": true,
+  "source_positives_1s": [
+    {
+      "group": "840139/tr_105",
+      "present": 2,
+      "area_fraction": [
+        0.27821638347768046,
+        0.2902595895047216
+      ],
+      "inner_depth_region_fraction": [
+        0.06955409586942012,
+        0.0725648973761804
+      ],
+      "iou": 0.9577101956657325,
+      "center_motion_px": 1.916517463717231
+    },
+    {
+      "group": "841012/tr_102",
+      "present": 2,
+      "area_fraction": [
+        0.3975809935160699,
+        0.37661240175651073
+      ],
+      "inner_depth_region_fraction": [
+        0.09939524837901748,
+        0.09415310043912768
+      ],
+      "iou": 0.9204995559740793,
+      "center_motion_px": 5.7437695502565695
+    },
+    {
+      "group": "841012/tr_40",
+      "present": 2,
+      "area_fraction": [
+        0.9611847216228113,
+        0.994345307821662
+      ],
+      "inner_depth_region_fraction": [
+        0.24029618040570283,
+        0.2485863269554155
+      ],
+      "iou": 0.9664226372354877,
+      "center_motion_px": 5.2850757460467985
+    },
+    {
+      "group": "841012/tr_100",
+      "present": 0
+    },
+    {
+      "group": "841150/tr_69",
+      "present": 2,
+      "area_fraction": [
+        0.617877211495346,
+        0.6276925509975229
+      ],
+      "inner_depth_region_fraction": [
+        0.1544693028738365,
+        0.15692313774938071
+      ],
+      "iou": 0.9718254362889924,
+      "center_motion_px": 2.0645680255853733
+    }
+  ],
+  "closed_loop_last_two_0p5s": [
+    {
+      "visible": "tr_42",
+      "requested": "tr_42",
+      "present": 2,
+      "area_fraction": [
+        0.9995025173900445,
+        0.9995284036081671
+      ],
+      "inner_depth_region_fraction": [
+        0.24987562934751112,
+        0.24988210090204177
+      ],
+      "iou": 0.9999741015682704,
+      "center_motion_px": 0.0030182042907362255
+    },
+    {
+      "visible": "tr_42",
+      "requested": "tr_69",
+      "present": 2,
+      "area_fraction": [
+        0.9999429591665887,
+        0.9997705932352545
+      ],
+      "inner_depth_region_fraction": [
+        0.24998573979164718,
+        0.24994264830881363
+      ],
+      "iou": 0.9998276242362084,
+      "center_motion_px": 0.020841868718168188
+    },
+    {
+      "visible": "tr_69",
+      "requested": "tr_42",
+      "present": 2,
+      "area_fraction": [
+        0.9995725252751754,
+        0.9995421773202149
+      ],
+      "inner_depth_region_fraction": [
+        0.24989313131879384,
+        0.24988554433005372
+      ],
+      "iou": 0.9999696390665078,
+      "center_motion_px": 0.003072359759071768
+    },
+    {
+      "visible": "tr_69",
+      "requested": "tr_69",
+      "present": 2,
+      "area_fraction": [
+        0.14630236345568848,
+        0.15303094091741515
+      ],
+      "inner_depth_region_fraction": [
+        0.03657559086392212,
+        0.03825773522935379
+      ],
+      "iou": 0.9257117032814023,
+      "center_motion_px": 1.625316798558128
+    }
+  ],
+  "method": "clipped DINO box area / image area, estimated central-half depth crop uses a quarter area before rounding; IoU compares final two boxes. Training pairs stationary and separated by 1s, closed loop consecutive 0.5s. Mesh distance is nearest point over exact transformed triangles."
+}

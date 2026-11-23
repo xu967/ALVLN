@@ -21,3 +21,5 @@
 840865 跨房间的冻结距离与图文复核在 exp-vln-stop-transfer-score-20261124 的入口运行，两份注册资料见 transfer/。按原数据盘目录布局运行，近、错、远组各 4 个实例，冻结距离头的停机计数为 1、0、0。
 
 目标短词对照有预先冻结和事后修正两个提交，训练入口分别与数据盘两个目录逐字节一致。命令、哈希与注册表见 noun_proposal/run_entries.json；原始指令及图像由实验机提供。
+
+visible_approach 记录圈外可见起点诊断。还原 flight_base.patch 对应的运行时、应用该目录 runtime.patch，在原数据盘实验目录放置 approach.py、登记、标定与四个场景清单，按原位置提供模型和固件。visibility/fit.py 为内部可见性统计对照的原始源码，复跑需从数据盘恢复已核实训练清单、冻结图像与外部 CLIP 权重。

@@ -1,0 +1,112 @@
+{
+  "registered": "2026-11-24T07:01:46.901971+08:00",
+  "scope": "Secondary, acquired-target approach. Original published lamp and cabinet instructions including old starting reference for cabinet. Two independently certified targets, target presence only on matched instruction. Same starting physical seed=421 in all eight observations, 125 steps. First human distinguishable teacher RGB outside goal disk, with independently linked CAD evidence. Preflight cold resets. If physical reset fails, freeze next earliest genuinely recognizable frame in same route without viewing outcome.",
+  "rows": [
+    {
+      "visible": "tr_42",
+      "requested": "tr_42",
+      "start": {
+        "x": 0.3873352903041088,
+        "y": -2.5786797743104852,
+        "z": 1.2029999999999998,
+        "yaw_deg": 133.75290076409814
+      },
+      "waypoint": {
+        "x": -3.235,
+        "y": -1.975,
+        "z": 1.2029999999999998
+      },
+      "text": "Go to the wall lamp mounted above the chairs in the waiting zone.",
+      "teacher_step": 64,
+      "teacher_rgb": "/root/rivermind-data/uav_rgb/exp-vln-new-scenes-20261124/controls/teacher/sage3d_839934_tr_42_tr_69/tr_42_0/rgb_00064.png",
+      "teacher_pose": {
+        "x": 0.3873352903041088,
+        "y": -2.5786797743104852,
+        "z": 1.210278101865742
+      },
+      "seed": 421,
+      "budget": 125,
+      "fixture": "/root/rivermind-data/uav_rgb/exp-vln-acquired-approach-839934-20261124/tr_42_to_tr_42.json"
+    },
+    {
+      "visible": "tr_42",
+      "requested": "tr_69",
+      "start": {
+        "x": 0.3873352903041088,
+        "y": -2.5786797743104852,
+        "z": 1.2029999999999998,
+        "yaw_deg": 133.75290076409814
+      },
+      "waypoint": {
+        "x": 3.465,
+        "y": -0.525,
+        "z": 1.2029999999999998
+      },
+      "text": "Go from the basin to the cabinet next to the wardrobes in Examination Room A.",
+      "teacher_step": 64,
+      "teacher_rgb": "/root/rivermind-data/uav_rgb/exp-vln-new-scenes-20261124/controls/teacher/sage3d_839934_tr_42_tr_69/tr_42_0/rgb_00064.png",
+      "teacher_pose": {
+        "x": 0.3873352903041088,
+        "y": -2.5786797743104852,
+        "z": 1.210278101865742
+      },
+      "seed": 421,
+      "budget": 125,
+      "fixture": "/root/rivermind-data/uav_rgb/exp-vln-acquired-approach-839934-20261124/tr_42_to_tr_69.json"
+    },
+    {
+      "visible": "tr_69",
+      "requested": "tr_42",
+      "start": {
+        "x": 1.2493817989532798,
+        "y": -1.0252110376623875,
+        "z": 1.2029999999999998,
+        "yaw_deg": 27.442755719010357
+      },
+      "waypoint": {
+        "x": -3.235,
+        "y": -1.975,
+        "z": 1.2029999999999998
+      },
+      "text": "Go to the wall lamp mounted above the chairs in the waiting zone.",
+      "teacher_step": 91,
+      "teacher_rgb": "/root/rivermind-data/uav_rgb/exp-vln-new-scenes-20261124/controls/teacher/sage3d_839934_tr_42_tr_69/tr_69_0/rgb_00091.png",
+      "teacher_pose": {
+        "x": 1.2493817989532798,
+        "y": -1.0252110376623875,
+        "z": 1.1950840614543359
+      },
+      "seed": 421,
+      "budget": 125,
+      "fixture": "/root/rivermind-data/uav_rgb/exp-vln-acquired-approach-839934-20261124/tr_69_to_tr_42.json"
+    },
+    {
+      "visible": "tr_69",
+      "requested": "tr_69",
+      "start": {
+        "x": 1.2493817989532798,
+        "y": -1.0252110376623875,
+        "z": 1.2029999999999998,
+        "yaw_deg": 27.442755719010357
+      },
+      "waypoint": {
+        "x": 3.465,
+        "y": -0.525,
+        "z": 1.2029999999999998
+      },
+      "text": "Go from the basin to the cabinet next to the wardrobes in Examination Room A.",
+      "teacher_step": 91,
+      "teacher_rgb": "/root/rivermind-data/uav_rgb/exp-vln-new-scenes-20261124/controls/teacher/sage3d_839934_tr_42_tr_69/tr_69_0/rgb_00091.png",
+      "teacher_pose": {
+        "x": 1.2493817989532798,
+        "y": -1.0252110376623875,
+        "z": 1.1950840614543359
+      },
+      "seed": 421,
+      "budget": 125,
+      "fixture": "/root/rivermind-data/uav_rgb/exp-vln-acquired-approach-839934-20261124/tr_69_to_tr_69.json"
+    }
+  ],
+  "source": "/root/rivermind-data/uav_rgb/exp-vln-near-start-839934-20261124/registration.json",
+  "method": "Legacy G3 vs frozen Grounding DINO box .4/text .3 & runtime destination parser, projected center alignment +/-9deg. Depth Anything-V2 Hypersim calibrated at .865145 source-only. Median central half-box depth; two consecutive near & aligned observations -> explicit STOP. Freeze scalar near threshold via maximizing source train group balanced accuracy across two-frame near correct vs far correct/wrong; ties favor smaller threshold. No object detections => rotate left. No target geometry/pose in actor."
+}

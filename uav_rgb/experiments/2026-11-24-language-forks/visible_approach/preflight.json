@@ -1,0 +1,50 @@
+[
+  {
+    "name": "tr_42",
+    "image": "/root/rivermind-data/uav_rgb/exp-vln-acquired-approach-839934-20261124/tr_42_start.png",
+    "teacher_rgb": "/root/rivermind-data/uav_rgb/exp-vln-new-scenes-20261124/controls/teacher/sage3d_839934_tr_42_tr_69/tr_42_0/rgb_00064.png",
+    "xyz": [
+      0.38652637607155355,
+      -2.5830717015314533,
+      1.2557519179135745
+    ],
+    "quat": [
+      0.3894443468705013,
+      0.0005864862726795777,
+      0.0008136100396035505,
+      0.921049452941135
+    ],
+    "reset_minus_teacher_m": [
+      -0.0008089142325552467,
+      -0.004391927220968039,
+      0.045473816047832516
+    ],
+    "yaw_teacher_deg": 133.75290076409814,
+    "yaw_actual_deg": 134.1600916834894,
+    "clearance_m": 0.2539335378953222
+  },
+  {
+    "name": "tr_69",
+    "image": "/root/rivermind-data/uav_rgb/exp-vln-acquired-approach-839934-20261124/tr_69_start.png",
+    "teacher_rgb": "/root/rivermind-data/uav_rgb/exp-vln-new-scenes-20261124/controls/teacher/sage3d_839934_tr_42_tr_69/tr_69_0/rgb_00091.png",
+    "xyz": [
+      1.2453937950570835,
+      -1.023201263577128,
+      1.2557519179135743
+    ],
+    "quat": [
+      0.9706111412500297,
+      0.0010027879704605947,
+      1.8539980709817002e-05,
+      0.2406512134892953
+    ],
+    "reset_minus_teacher_m": [
+      -0.003988003896196357,
+      0.002009774085259597,
+      0.060667856459238445
+    ],
+    "yaw_teacher_deg": 27.442755719010357,
+    "yaw_actual_deg": 27.8499466384013,
+    "clearance_m": 0.630977727304123
+  }
+]

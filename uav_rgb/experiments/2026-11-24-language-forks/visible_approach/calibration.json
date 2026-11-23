@@ -1,0 +1,465 @@
+{
+  "threshold_m": 1.9580330848693848,
+  "balanced_accuracy": 0.75,
+  "rows": [
+    {
+      "group": "840139/tr_105",
+      "condition": "near_correct",
+      "label": 1,
+      "views": [
+        {
+          "phrase": "the central counter",
+          "box": [
+            0.08196830749511719,
+            146.382080078125,
+            228.51589965820312,
+            239.91905212402344
+          ],
+          "label": "the central counter",
+          "score": 0.6795941591262817,
+          "angle_deg": -9.364338147248981,
+          "range_m": 1.2964842319488525
+        },
+        {
+          "phrase": "the central counter",
+          "box": [
+            0.04817962646484375,
+            142.6849365234375,
+            229.40252685546875,
+            239.87924194335938
+          ],
+          "label": "the central counter",
+          "score": 0.5694981217384338,
+          "angle_deg": -9.278489620863098,
+          "range_m": 1.1217758655548096
+        }
+      ],
+      "required_range_m": null
+    },
+    {
+      "group": "840139/tr_105",
+      "condition": "near_wrong",
+      "label": 0,
+      "views": [
+        {
+          "phrase": "a stool",
+          "box": [
+            264.3702392578125,
+            156.2689666748047,
+            299.8190002441406,
+            186.00025939941406
+          ],
+          "label": "a stool",
+          "score": 0.655153214931488,
+          "angle_deg": 23.77689862172921,
+          "range_m": 4.920874118804932
+        },
+        {
+          "phrase": "a stool",
+          "box": [
+            264.8601989746094,
+            153.74485778808594,
+            300.408447265625,
+            183.5526580810547
+          ],
+          "label": "a stool",
+          "score": 0.6572049856185913,
+          "angle_deg": 23.87027630628443,
+          "range_m": 5.462235450744629
+        }
+      ],
+      "required_range_m": null
+    },
+    {
+      "group": "840139/tr_105",
+      "condition": "far_correct",
+      "label": 0,
+      "views": [
+        {
+          "phrase": "the central counter",
+          "box": null,
+          "score": null,
+          "angle_deg": null,
+          "range_m": null
+        },
+        {
+          "phrase": "the central counter",
+          "box": null,
+          "score": null,
+          "angle_deg": null,
+          "range_m": null
+        }
+      ],
+      "required_range_m": null
+    },
+    {
+      "group": "841012/tr_102",
+      "condition": "near_correct",
+      "label": 1,
+      "views": [
+        {
+          "phrase": "the washing machine",
+          "box": [
+            83.29306030273438,
+            -0.056569576263427734,
+            234.98318481445312,
+            201.29339599609375
+          ],
+          "label": "the washing machine",
+          "score": 0.565156877040863,
+          "angle_deg": -0.17819115215512368,
+          "range_m": 0.9017428755760193
+        },
+        {
+          "phrase": "the washing machine",
+          "box": [
+            85.56047058105469,
+            -0.09261131286621094,
+            237.21395874023438,
+            190.72315979003906
+          ],
+          "label": "the washing machine",
+          "score": 0.5347360968589783,
+          "angle_deg": 0.28680192702927365,
+          "range_m": 1.0566020011901855
+        }
+      ],
+      "required_range_m": 1.0566020011901855
+    },
+    {
+      "group": "841012/tr_102",
+      "condition": "near_wrong",
+      "label": 0,
+      "views": [
+        {
+          "phrase": "the set of downlights",
+          "box": null,
+          "score": null,
+          "angle_deg": null,
+          "range_m": null
+        },
+        {
+          "phrase": "the set of downlights",
+          "box": null,
+          "score": null,
+          "angle_deg": null,
+          "range_m": null
+        }
+      ],
+      "required_range_m": null
+    },
+    {
+      "group": "841012/tr_102",
+      "condition": "far_correct",
+      "label": 0,
+      "views": [
+        {
+          "phrase": "the washing machine",
+          "box": [
+            58.97877502441406,
+            170.6375274658203,
+            133.8865509033203,
+            239.95445251464844
+          ],
+          "label": "the washing machine",
+          "score": 0.7059747576713562,
+          "angle_deg": -12.918959811286205,
+          "range_m": 1.859314203262329
+        },
+        {
+          "phrase": "the washing machine",
+          "box": [
+            60.019168853759766,
+            145.4774169921875,
+            137.07785034179688,
+            240.00758361816406
+          ],
+          "label": "the washing machine",
+          "score": 0.7428115606307983,
+          "angle_deg": -12.502692500197027,
+          "range_m": 1.5918169021606445
+        }
+      ],
+      "required_range_m": null
+    },
+    {
+      "group": "841012/tr_40",
+      "condition": "near_correct",
+      "label": 1,
+      "views": [
+        {
+          "phrase": "the window",
+          "box": [
+            11.867265701293945,
+            0.0135040283203125,
+            319.46368408203125,
+            240.0126190185547
+          ],
+          "label": "the window",
+          "score": 0.5789527297019958,
+          "angle_deg": 1.171164365587657,
+          "range_m": 1.9420523643493652
+        },
+        {
+          "phrase": "the window",
+          "box": [
+            1.2571144104003906,
+            0.04231452941894531,
+            319.50372314453125,
+            240.04037475585938
+          ],
+          "label": "the window",
+          "score": 0.5438891053199768,
+          "angle_deg": 0.07865089973968603,
+          "range_m": 1.9580330848693848
+        }
+      ],
+      "required_range_m": 1.9580330848693848
+    },
+    {
+      "group": "841012/tr_40",
+      "condition": "near_wrong",
+      "label": 0,
+      "views": [
+        {
+          "phrase": "the refrigerator",
+          "box": [
+            0.0426483154296875,
+            0.03696441650390625,
+            320.0410461425781,
+            240.03695678710938
+          ],
+          "label": "the refrigerator",
+          "score": 0.5292659997940063,
+          "angle_deg": 0.004408734110820713,
+          "range_m": 1.9437791109085083
+        },
+        {
+          "phrase": "the refrigerator",
+          "box": [
+            0.04138946533203125,
+            0.033402442932128906,
+            320.0413818359375,
+            240.03341674804688
+          ],
+          "label": "the refrigerator",
+          "score": 0.520969808101654,
+          "angle_deg": 0.00427860153022323,
+          "range_m": 1.95689058303833
+        }
+      ],
+      "required_range_m": 1.95689058303833
+    },
+    {
+      "group": "841012/tr_40",
+      "condition": "far_correct",
+      "label": 0,
+      "views": [
+        {
+          "phrase": "the window",
+          "box": [
+            82.641845703125,
+            0.0032901763916015625,
+            224.65142822265625,
+            240.0028076171875
+          ],
+          "label": "the window",
+          "score": 0.4637507200241089,
+          "angle_deg": -1.3133171785100348,
+          "range_m": 2.5984604358673096
+        },
+        {
+          "phrase": "the window",
+          "box": [
+            73.3811264038086,
+            0.031027793884277344,
+            232.750244140625,
+            240.031005859375
+          ],
+          "label": "the window",
+          "score": 0.4832521677017212,
+          "angle_deg": -1.4333589361871006,
+          "range_m": 2.232875108718872
+        }
+      ],
+      "required_range_m": 2.5984604358673096
+    },
+    {
+      "group": "841012/tr_100",
+      "condition": "near_correct",
+      "label": 1,
+      "views": [
+        {
+          "phrase": "the refrigerator",
+          "box": null,
+          "score": null,
+          "angle_deg": null,
+          "range_m": null
+        },
+        {
+          "phrase": "the refrigerator",
+          "box": null,
+          "score": null,
+          "angle_deg": null,
+          "range_m": null
+        }
+      ],
+      "required_range_m": null
+    },
+    {
+      "group": "841012/tr_100",
+      "condition": "near_wrong",
+      "label": 0,
+      "views": [
+        {
+          "phrase": "the window",
+          "box": [
+            78.7137222290039,
+            12.998571395874023,
+            219.99070739746094,
+            163.04164123535156
+          ],
+          "label": "the window",
+          "score": 0.8917844891548157,
+          "angle_deg": -2.200329553950473,
+          "range_m": 2.9170961380004883
+        },
+        {
+          "phrase": "the window",
+          "box": [
+            80.14024353027344,
+            7.4770188331604,
+            221.15115356445312,
+            157.6927490234375
+          ],
+          "label": "the window",
+          "score": 0.8836284875869751,
+          "angle_deg": -1.9332522563591923,
+          "range_m": 2.5498263835906982
+        }
+      ],
+      "required_range_m": 2.9170961380004883
+    },
+    {
+      "group": "841012/tr_100",
+      "condition": "far_correct",
+      "label": 0,
+      "views": [
+        {
+          "phrase": "the refrigerator",
+          "box": null,
+          "score": null,
+          "angle_deg": null,
+          "range_m": null
+        },
+        {
+          "phrase": "the refrigerator",
+          "box": null,
+          "score": null,
+          "angle_deg": null,
+          "range_m": null
+        }
+      ],
+      "required_range_m": null
+    },
+    {
+      "group": "841150/tr_69",
+      "condition": "near_correct",
+      "label": 1,
+      "views": [
+        {
+          "phrase": "the vehicle",
+          "box": [
+            29.780092239379883,
+            76.39973449707031,
+            320.0006408691406,
+            239.90667724609375
+          ],
+          "label": "the vehicle",
+          "score": 0.7079684734344482,
+          "angle_deg": 3.075534948620988,
+          "range_m": 0.7681317329406738
+        },
+        {
+          "phrase": "the vehicle",
+          "box": [
+            31.61947250366211,
+            72.72289276123047,
+            320.039306640625,
+            239.88670349121094
+          ],
+          "label": "the vehicle",
+          "score": 0.7354352474212646,
+          "angle_deg": 3.2650976107794802,
+          "range_m": 0.5766994953155518
+        }
+      ],
+      "required_range_m": 0.7681317329406738
+    },
+    {
+      "group": "841150/tr_69",
+      "condition": "near_wrong",
+      "label": 0,
+      "views": [
+        {
+          "phrase": "",
+          "box": null,
+          "score": null,
+          "angle_deg": null,
+          "range_m": null
+        },
+        {
+          "phrase": "",
+          "box": null,
+          "score": null,
+          "angle_deg": null,
+          "range_m": null
+        }
+      ],
+      "required_range_m": null
+    },
+    {
+      "group": "841150/tr_69",
+      "condition": "far_correct",
+      "label": 0,
+      "views": [
+        {
+          "phrase": "the vehicle",
+          "box": [
+            179.674072265625,
+            83.98230743408203,
+            319.9510192871094,
+            239.8540802001953
+          ],
+          "label": "the vehicle",
+          "score": 0.7824361324310303,
+          "angle_deg": 17.9566336277776,
+          "range_m": 1.2161023616790771
+        },
+        {
+          "phrase": "the vehicle",
+          "box": [
+            176.4828643798828,
+            68.5531005859375,
+            319.9343566894531,
+            239.73680114746094
+          ],
+          "label": "the vehicle",
+          "score": 0.7532410621643066,
+          "angle_deg": 17.65603384772952,
+          "range_m": 1.0944969654083252
+        }
+      ],
+      "required_range_m": null
+    }
+  ],
+  "threshold_search": [
+    0.0,
+    0.7681317329406738,
+    1.0566020011901855,
+    1.95689058303833,
+    1.9580330848693848,
+    2.5984604358673096,
+    2.9170961380004883
+  ]
+}

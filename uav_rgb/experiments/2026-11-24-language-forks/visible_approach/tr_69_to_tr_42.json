@@ -1,0 +1,317 @@
+{
+  "schema": "uavrgb.3dgs_scene.v1",
+  "name": "sage3d_839934_tr_42_tr_69",
+  "source": "SAGE-3D_InteriorGS_usdz \u573a\u666f 839934\uff08HF spatialverse/SAGE-3D_InteriorGS_usdz\uff0cNuRec usdz \u7ecf tools/nurec_to_ply.py \u8f6c INRIA PLY\uff09\uff1b\u8def\u7ebf\u4e0e\u6307\u4ee4\u6765\u81ea HF spatialverse/SAGE-3D_VLN_Data",
+  "license": "CC-BY-NC-4.0\uff08SAGE-3D_InteriorGS_usdz\uff1bInteriorGS \u4f7f\u7528\u6761\u6b3e\uff1a\u4ec5\u9650\u975e\u5546\u4e1a\u79d1\u7814\u6559\u5b66\uff0c\u4e0d\u5f97\u518d\u5206\u53d1\uff09\uff1b\u8def\u7ebf\u4e0e\u6307\u4ee4\u6765\u81ea SAGE-3D_VLN_Data\uff08CC-BY-4.0\uff09\u3002\u4ea7\u7269\u53ea\u7528\u4e8e\u7814\u7a76\uff0c\u4e0d\u518d\u5206\u53d1\u3002",
+  "ply": "/root/rivermind-data/uav_rgb/exp-vln-new-scenes-20261124/uav_rgb/3dgs-scenes/sage3d_839934/scene.ply",
+  "nav_to_world": [
+    [
+      -1.0,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      -1.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      1.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "world_up": "z",
+  "ground_z": 0.003,
+  "spawn": {
+    "x": 1.2493817989532798,
+    "y": -1.0252110376623875,
+    "z": 1.2029999999999998,
+    "yaw_deg": 27.442755719010357
+  },
+  "waypoint": {
+    "x": -3.235,
+    "y": -1.975,
+    "z": 1.2029999999999998
+  },
+  "reach_radius_m": 1.0,
+  "camera": {
+    "width": 320,
+    "height": 240,
+    "fov_deg": 60.0,
+    "pitch_deg": 0.0,
+    "fov_source": "\u4e0e Gazebo \u53ca\u5176\u4ed6 3DGS \u573a\u666f\u7edf\u4e00 60\u00b0 HFOV / 320\u00d7240"
+  },
+  "render": {
+    "sh_degree": 3,
+    "supersample": 2,
+    "ut_eval3d": true,
+    "near_plane_m": 0.2,
+    "max_scale_m": 0.8,
+    "max_aniso": 25.0,
+    "min_large_opacity": 0.25
+  },
+  "collision": {
+    "z_slice": [
+      1.003,
+      1.403
+    ],
+    "voxel_m": 0.1,
+    "envelope": "e1_mini",
+    "source": "mesh",
+    "geometry": "/root/rivermind-data/uav_rgb/exp-vln-new-scenes-20261124/uav_rgb/3dgs-scenes/sage3d_839934/collision_mesh.ply"
+  },
+  "max_steps": 74,
+  "step_s": 0.5,
+  "fly_height_m": 1.2,
+  "notes": [
+    "\u98de\u884c\u9ad8\u5ea6\uff1anav z = ground_z + 1.2 m\uff08spawn.z\u3001\u5360\u636e\u5207\u7247\u4e2d\u5fc3\u3001\u6e32\u67d3\u9ad8\u5ea6\u4e09\u5904\u540c\u503c\uff0c\u6765\u81ea\u914d\u7f6e\u533a FLY_H_M\uff09\uff1bcf_sitl \u8d77\u98de\u9ad8\u5ea6 = spawn.z \u2212 ground_z\uff0cdynamics_profile \u4e0e\u9ad8\u5ea6\u65e0\u5173\u3002",
+    "nav_to_world = \u7ed5 z \u8f74 180\u00b0\u3001\u96f6\u5e73\u79fb\uff1aSAGE \u8f68\u8ff9\u7cfb\u4e0e PLY \u4e16\u754c\u7cfb\u5dee\u8fd9\u4e2a\u65cb\u8f6c\uff08\u6bcf\u4e2a\u573a\u666f\u505a\u7edf\u8ba1\u590d\u6838\uff0c\u7ed3\u679c\u5728 align.json\uff09\u3002",
+    "\u78b0\u649e\u6e90 collision.source=mesh\uff08collision_mesh.ply\uff09\uff1a\u7531 SAGE-3D_Collision_Mesh \u63d0\u53d6\u5e76\u5f00\u542f\u95e8\u6d1e\u3002",
+    "routes[]\uff1a\u8d77\u70b9 = SAGE \u8f68\u8ff9\u7b2c\u4e00\u70b9\u3001\u7ec8\u70b9 = \u6700\u540e\u4e00\u70b9\uff08xy\uff09\uff0c\u671d\u5411\u671d\u8def\u5f84 0.6 m \u5904\uff1bmax_steps = planner.route_check.steps_estimate\uff08hold 0.5 \u53e3\u5f84\uff09\u3002routes[].sage \u91cc\u6709\u8f68\u8ff9\u53f7\u3001\u5212\u5206\u3001SAGE \u8def\u5f84\u957f\u3001A* \u957f\u5ea6\u3001\u6700\u5c0f\u51c0\u7a7a\u3001\u5168\u90e8\u6307\u4ee4\uff08\u5b57\u6bb5 instruction_type/start/end/text\uff09\u3002",
+    "ToF \u5e73\u5730\u6a21\u578b\u5bf9\u98de\u884c\u5c42\u4ee5\u4e0b\u7684\u5bb6\u5177\u4e0d\u6210\u7acb\uff08route_check \u7684 agl_model_unverified \u53ea\u6253\u6807\uff09\uff1b\u5ba4\u5185 1.2 m \u98de\u8d8a\u684c\u9762\u65f6\u771f\u673a ToF \u4f1a\u8bfb\u77ed\u3002",
+    "\u5750\u6807\u7cfb\u590d\u6838\uff1aok\uff08\u547d\u4e2d\u7387 0\u00b0:0.210 90\u00b0:0.220 180\u00b0:0.022 270\u00b0:0.191\uff1b180\u00b0 \u6700\u4f18\u5e73\u79fb 0.071 m\uff09\u3002\u5730\u9762\uff1az \u76f4\u65b9\u56fe\u4e3b\u5cf0 0.003 m\uff08\u5929\u82b1\u677f\u5cf0 2.699 m\uff09\u3002",
+    "\u8fc7\u6ee4\uff1a104 \u6761\u5019\u9009 -> 93 \u6761\u5355\u6bb5 + 24 \u6761 30-55m \u8de8\u623f\u95f4\u591a\u9636\u6bb5\u4efb\u52a1\u3002"
+  ],
+  "routes": [
+    {
+      "name": "tr_42",
+      "spawn": {
+        "x": 1.2493817989532798,
+        "y": -1.0252110376623875,
+        "z": 1.2029999999999998,
+        "yaw_deg": 27.442755719010357
+      },
+      "waypoint": {
+        "x": -3.235,
+        "y": -1.975,
+        "z": 1.2029999999999998
+      },
+      "max_steps": 125,
+      "ref_path": [
+        [
+          -2.735,
+          -6.525
+        ],
+        [
+          -2.5057,
+          -6.475
+        ],
+        [
+          -2.2557,
+          -6.475
+        ],
+        [
+          -2.0057,
+          -6.475
+        ],
+        [
+          -1.7557,
+          -6.475
+        ],
+        [
+          -1.5057,
+          -6.475
+        ],
+        [
+          -1.2557,
+          -6.475
+        ],
+        [
+          -1.0436,
+          -6.3836
+        ],
+        [
+          -0.8386,
+          -6.275
+        ],
+        [
+          -0.5886,
+          -6.275
+        ],
+        [
+          -0.3386,
+          -6.275
+        ],
+        [
+          -0.0886,
+          -6.275
+        ],
+        [
+          0.1614,
+          -6.275
+        ],
+        [
+          0.3686,
+          -6.1714
+        ],
+        [
+          0.465,
+          -5.9614
+        ],
+        [
+          0.465,
+          -5.7114
+        ],
+        [
+          0.465,
+          -5.4614
+        ],
+        [
+          0.465,
+          -5.2114
+        ],
+        [
+          0.465,
+          -4.9614
+        ],
+        [
+          0.465,
+          -4.7114
+        ],
+        [
+          0.465,
+          -4.4614
+        ],
+        [
+          0.465,
+          -4.2114
+        ],
+        [
+          0.465,
+          -3.9614
+        ],
+        [
+          0.616,
+          -3.774
+        ],
+        [
+          0.7928,
+          -3.5972
+        ],
+        [
+          0.9696,
+          -3.4204
+        ],
+        [
+          1.115,
+          -3.2306
+        ],
+        [
+          1.115,
+          -2.9806
+        ],
+        [
+          1.0129,
+          -2.7729
+        ],
+        [
+          0.8035,
+          -2.675
+        ],
+        [
+          0.6008,
+          -2.5608
+        ],
+        [
+          0.424,
+          -2.384
+        ],
+        [
+          0.2326,
+          -2.2426
+        ],
+        [
+          -0.0101,
+          -2.225
+        ],
+        [
+          -0.2601,
+          -2.225
+        ],
+        [
+          -0.4894,
+          -2.175
+        ],
+        [
+          -0.7394,
+          -2.175
+        ],
+        [
+          -0.9894,
+          -2.175
+        ],
+        [
+          -1.2394,
+          -2.175
+        ],
+        [
+          -1.4894,
+          -2.175
+        ],
+        [
+          -1.7394,
+          -2.175
+        ],
+        [
+          -1.9894,
+          -2.175
+        ],
+        [
+          -2.2394,
+          -2.175
+        ],
+        [
+          -2.4894,
+          -2.175
+        ],
+        [
+          -2.7394,
+          -2.175
+        ],
+        [
+          -2.9588,
+          -2.1012
+        ],
+        [
+          -3.1773,
+          -2.025
+        ],
+        [
+          -3.235,
+          -1.975
+        ]
+      ],
+      "note": "SAGE train \u8f68\u8ff9 42\uff0cSAGE \u8def\u5f84 11.578 m\uff0cA* 11.95 m",
+      "sage": {
+        "trajectory_id": 42,
+        "split": "train",
+        "sage_path_m": 11.578,
+        "n_points": 216,
+        "astar_path_m": 11.95,
+        "turn_deg": 201.0,
+        "min_clearance_m": 0.2,
+        "agl_model_unverified": false,
+        "tof_terrain_m": null,
+        "instructions": [
+          {
+            "instruction_type": "Relative_Relationship",
+            "start": "basin_1",
+            "end": "wall_lamp_1",
+            "text": "Go to the wall lamp mounted above the chairs in the waiting zone."
+          }
+        ]
+      }
+    }
+  ],
+  "multi_stage_routes": []
+}
