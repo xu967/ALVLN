@@ -1,0 +1,5 @@
+{
+  "time": "2026-11-24T07:38:18.102705+08:00",
+  "features_sha": "be38ae8cbc7ccf4c84fbb3d65950e255cd4a547b10f70cf9ab6931ce98fdbc89",
+  "fit": "Fit per-row balanced classes StandardScaler + LogisticRegression(C=1, class_weight=balanced, random_state=20261117, max_iter=1000, solver=lbfgs) on all 15 TRAIN windows. One held-out room at a time during train-only sensitivity, then final standardization and regression fitted to full training set. Count five training triplets, four independent movement targets. Each fitting record has eight physical visual feature summaries; no target names or coordinates. Decision: both windows reported a box and probability >=0.5. Do not tune. Frozen development inputs are all 9 prior near/wrong/far triplets with no tuning."
+}

@@ -1,0 +1,150 @@
+{
+  "rule": "One previously RGB-verified terminal instance per data group, five total. Back off 1.8m from each confirmed near anchor. Integer 5-degree headings. Straight swept path to 0.15m beyond anchor, start outside 1.6m, end inside 1m, subject center within 26deg at both ends. Minimize worst heading deviation; tie lexical angle. Each attempt 24 forward windows, stopping triggers only the offline teacher upon first pre-action radius<=0.90 m. For initially infeasible fixed heading, choose clear 1.25-2m straight approach to same anchor, initialize facing target within 65deg of travel, goal-bearing teacher steers to registered anchor. Original fixed poses remain in initial_straight_registration. Teacher only, never a student input. Mark manipulation text and exclude training if no same-route genuine navigation instruction.",
+  "rows": [
+    {
+      "scene": "840139",
+      "route": "tr_105",
+      "instance": "118",
+      "text": "Leave the area near the entertainment setup and head toward the central counter.",
+      "wp": {
+        "x": 1.325,
+        "y": 3.515,
+        "z": 1.2009999999999998
+      },
+      "seed": 421,
+      "verified_near": {
+        "x": 1.4802233366261353,
+        "y": 2.6134758417079853,
+        "z": 1.2009999999999998,
+        "yaw_deg": 16.527233927494137
+      },
+      "source": "/root/rivermind-data/uav_rgb/3dgs-scenes/sage3d_840139/scene.json",
+      "eligible_directions": 0,
+      "navigation_only": true,
+      "spawn": {
+        "x": 0.730223336626135,
+        "y": 1.3144377360313273,
+        "z": 1.2009999999999998,
+        "yaw_deg": 33.72704312662113
+      },
+      "teacher_aim": [
+        1.4802233366261353,
+        2.6134758417079853
+      ],
+      "guided_directions": 25
+    },
+    {
+      "scene": "841012",
+      "route": "tr_102",
+      "instance": "122",
+      "text": "Move from the cabinet in the kitchen to the washing machine next to the wardrobe.",
+      "wp": {
+        "x": -4.685,
+        "y": 5.255,
+        "z": 1.2029999999999998
+      },
+      "seed": 421,
+      "verified_near": {
+        "x": -3.8474384822543266,
+        "y": 5.207615247454954,
+        "z": 1.2029999999999998,
+        "yaw_deg": -174.18678310532002
+      },
+      "source": "/root/rivermind-data/uav_rgb/3dgs-scenes/sage3d_841012/scene.json",
+      "eligible_directions": 10,
+      "navigation_only": true,
+      "spawn": {
+        "x": -2.0542880256891847,
+        "y": 5.364495584400739,
+        "z": 1.2029999999999998,
+        "yaw_deg": -175
+      }
+    },
+    {
+      "scene": "841012",
+      "route": "tr_40",
+      "instance": "242",
+      "text": "Move the body pillow from the bed to the window that is farthest right in the living room.",
+      "wp": {
+        "x": 3.015,
+        "y": -5.645,
+        "z": 1.2029999999999998
+      },
+      "seed": 421,
+      "verified_near": {
+        "x": 2.799581108476785,
+        "y": -4.722383045503826,
+        "z": 1.2029999999999998,
+        "yaw_deg": -73.63637253328694
+      },
+      "source": "/root/rivermind-data/uav_rgb/3dgs-scenes/sage3d_841012/scene.json",
+      "eligible_directions": 2,
+      "navigation_only": false,
+      "spawn": {
+        "x": 2.333706827292248,
+        "y": -2.9837165581835032,
+        "z": 1.2029999999999998,
+        "yaw_deg": -75
+      }
+    },
+    {
+      "scene": "841012",
+      "route": "tr_100",
+      "instance": "109",
+      "text": "Take the pillow from the bed and place it in the cabinet near the refrigerator in the kitchen.",
+      "wp": {
+        "x": 0.415,
+        "y": -2.845,
+        "z": 1.2029999999999998
+      },
+      "seed": 421,
+      "verified_near": {
+        "x": -0.12183021133692469,
+        "y": -2.1434079127050922,
+        "z": 1.2029999999999998,
+        "yaw_deg": -87.75414607739366
+      },
+      "source": "/root/rivermind-data/uav_rgb/3dgs-scenes/sage3d_841012/scene.json",
+      "eligible_directions": 10,
+      "navigation_only": false,
+      "spawn": {
+        "x": -0.1218302113369248,
+        "y": -0.3434079127050922,
+        "z": 1.2029999999999998,
+        "yaw_deg": -90
+      }
+    },
+    {
+      "scene": "841150",
+      "route": "tr_69",
+      "instance": "259",
+      "text": "Move from the apple near the fridge to the vehicle in the garage.",
+      "wp": {
+        "x": 0.715,
+        "y": -8.615,
+        "z": 1.2
+      },
+      "seed": 421,
+      "verified_near": {
+        "x": 0.34078274247908363,
+        "y": -7.763243537030133,
+        "z": 1.2,
+        "yaw_deg": -99.72510338499748
+      },
+      "source": "/root/rivermind-data/uav_rgb/3dgs-scenes/sage3d_841150/scene.json",
+      "eligible_directions": 0,
+      "navigation_only": true,
+      "spawn": {
+        "x": 0.12372252039542062,
+        "y": -6.532233845764873,
+        "z": 1.2,
+        "yaw_deg": -94.60980201225519
+      },
+      "teacher_aim": [
+        0.34078274247908363,
+        -7.763243537030133
+      ],
+      "guided_directions": 24
+    }
+  ]
+}

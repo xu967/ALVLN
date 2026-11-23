@@ -1577,120 +1577,69 @@ def transfer_stop(config_path, parity=False):
     return 0
 
 
-def noun_proposals(config_path):
-    import re
-    import runpy
-    from collections import defaultdict
-
+def fit_moving_stop(out):
     import numpy as np
-    import torch
-    from PIL import Image
-    from scipy.special import expit
-    from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
+    import sklearn
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
 
-    out = config_path.parent
-    cfg = json.loads(config_path.read_text())
-    def digest(p):
-        with Path(p).open('rb') as stream:
-            return hashlib.file_digest(stream,'sha256').hexdigest()
-    def load(p):
-        return json.loads(Path(p).read_text())
-    assert os.environ.get('CUDA_VISIBLE_DEVICES') == ''
-    assert all(digest(p)==h for p,h in cfg['dependencies'].items())
-    assert digest(Path(cfg['detector'])/'model.safetensors')==cfg['checkpoint_sha']
-    torch.set_num_threads(4)
-    parser = runpy.run_path(cfg['parser'])
-    categories = sorted(load(cfg['clip_vocab'])['training_categories'],key=lambda s:-len(s.split()))
-    head = load(cfg['coefficients'])
-    pars,mean,sd = map(np.asarray,(head['classifier'],head['mean'],head['stdev']))
-    proc = AutoProcessor.from_pretrained(cfg['detector'],local_files_only=True)
-    detector = AutoModelForZeroShotObjectDetection.from_pretrained(cfg['detector'],local_files_only=True).eval()
-    cache = {}
-    for source in cfg['cache']:
-        for row in load(source)['rows']:
-            for view,sha in zip(row['predictions'],row['sha256']):
-                cache[sha,view['phrase']] = view
-    cache_hits = 0
-    def noun(phrase):
-        tokens = re.findall(r"[a-z]+(?:-[a-z]+)*",phrase.lower())
-        if not tokens:
-            return ''
-        for i,word in enumerate(tokens):
-            if word in ('that','which','where','with','near','at','beside','behind','under','above','on','in','among'):
-                tokens = tokens[:i]
-                break
-            if i>=1 and word.endswith('ing') and i<len(tokens)-1 and any(t not in ('the','a','an','only','nearest','closest','large','small','little','big') for t in tokens[:i]):
-                tokens = tokens[:i]
-                break
-        if not tokens:
-            return ''
-        phrase = ' '.join(tokens)
-        for category in categories:
-            if phrase == category or phrase.endswith(' '+category):
-                return category
-        return tokens[-1]
+    features = out / 'features.json'
+    doc = json.loads(features.read_text())
+    registration = json.loads((out / 'fit_registration.json').read_text())
+    assert hashlib.sha256(features.read_bytes()).hexdigest() == registration['features_sha']
+    assert (out/'FEATURES_DONE').is_file() and os.environ['CUDA_VISIBLE_DEVICES']==''
+    names = doc['feature_names']
+    assert len(names)==8 and names[0]=='two_found'
+    samples=doc['samples']
+    train=[r for r in samples if r['split']=='train']
+    development=[r for r in samples if r['split']=='development']
+    scenes={r['scene'] for r in train}
+    assert scenes=={'840139','841012','841150'} and {r['scene'] for r in development}=={'839992','840865'}
+    assert len(train)==15 and len(development)==27
 
-    def measure(path,sha,phrase):
-        nonlocal cache_hits
-        assert digest(path)==sha
-        if (sha,phrase) in cache:
-            cache_hits += 1
-            return {k:v for k,v in cache[sha,phrase].items() if k in ('phrase','box','features','centered','score','match')}
-        features = [0.]*7
-        record = dict(phrase=phrase,box=None,features=features,centered=False)
-        if phrase:
-            with Image.open(path) as im:
-                im = im.convert('RGB')
-                w,h = im.size
-                inp = proc(images=im,text=phrase+'.',return_tensors='pt')
-            predictions = detector(**inp)
-            result = proc.post_process_grounded_object_detection(predictions,inp.input_ids,threshold=.4,text_threshold=.3,target_sizes=[(h,w)])[0]
-            expected = parser['_tokens'](phrase)
-            for confidence,bbox,label in sorted(zip(result['scores'].tolist(),result['boxes'].tolist(),result['text_labels']),reverse=True):
-                words = parser['_tokens'](label)
-                if not words or words!=expected[-len(words):]:
-                    continue
-                x,y,X,Y = np.clip(bbox,0,[w,h,w,h])
-                cx,cy = (x+X)/(2*w),(y+Y)/(2*h)
-                touches = sum([x<=1,y<=1,X>=w-1,Y>=h-1])/4
-                features[:] = [1., confidence,(X-x)/w,(Y-y)/h,abs(cx-.5),abs(cy-.5),touches]
-                record.update(box=bbox,match=label,centered=bool(1/3<=cx<2/3))
-                break
-        record['score']=float(expit((np.asarray(features)-mean)/sd@pars[:-1]+pars[-1]))
-        cache[sha,phrase]=record
-        return record
+    def fit(rows):
+        X=np.array([r['pair_features'] for r in rows],dtype=float)
+        y=np.array([r['label'] for r in rows])
+        scaler=StandardScaler().fit(X)
+        classifier=LogisticRegression(C=1,class_weight='balanced',random_state=20261117,max_iter=1000).fit(scaler.transform(X),y)
+        coef=classifier.coef_[0]/scaler.scale_
+        intercept=classifier.intercept_[0]-np.dot(coef,scaler.mean_)
+        return scaler,classifier,coef,intercept
 
-    samples = [json.loads(line) for s in ('old','new') for line in Path(cfg[s]).read_text().splitlines() if line.strip()]
-    def evaluate(sample):
-        instruction = sample['instruction']
-        phrase = parser['_english_destination'](instruction.lower().strip(' .')).strip()
-        short = noun(phrase)
-        row = dict(sample)
-        for key,query in [('full',phrase),('noun',short)]:
-            views=[measure(path,sha,query) for path,sha in zip(sample['rgb_pair'],sample['sha256'])]
-            centered=all(v['centered'] for v in views)
-            row[key]=dict(prompt=query,views=views,has_pair=all(v['box'] is not None for v in views),centered=centered,
-                          stop=centered and all(v['score']>=.5 for v in views))
-        return row
-    with torch.inference_mode():
-        rows=[]
-        for sample in samples:
-            rows.append(evaluate(sample))
-            print(sample['group'],sample['condition'],flush=True)
-    groups=defaultdict(dict)
-    for scene in sorted({r['scene'] for r in rows}):
-        for cond in ('near_correct','near_wrong','far_correct'):
-            cases=[r for r in rows if r['scene']==scene and r['condition']==cond]
-            groups[scene][cond]={'n':len(cases),**{key:{metric:sum(r[key][metric] for r in cases) for metric in ('has_pair','centered','stop')} for key in ('full','noun')}}
-    assert len(rows)==42
-    result=dict(rows=rows,groups=groups,requests=len(rows)*4,cache_hits=cache_hits,registration_sha=digest(config_path),source_sha=digest(__file__))
-    (out/'results.json').write_text(json.dumps(result,indent=2,ensure_ascii=False)+'\n')
+    def score(rows,fit_result):
+        scaler,classifier,coef,intercept=fit_result
+        X=np.array([r['pair_features'] for r in rows],dtype=float)
+        logits=X@coef+intercept
+        sk_logits=classifier.decision_function(scaler.transform(X))
+        assert np.max(np.abs(logits-sk_logits)) < 1e-10
+        return [dict(scene=r['scene'],group=r['group'],condition=r['condition'],label=r['label'],
+                     two_found=bool(x[0]),probability=float(1/(1+np.exp(-z))),stop=bool(x[0] and z>=0))
+                for r,x,z in zip(rows,X,logits)]
+
+    def counts(rows):
+        return {cond:{'n':len(values),'accepted':sum(row['stop'] for row in values)} for cond in sorted({r['condition'] for r in rows})
+                for values in [[r for r in rows if r['condition']==cond]]}
+
+    result={'leave_one_room_out':{}}
+    for scene in sorted(scenes):
+        scored=score([r for r in train if r['scene']==scene],fit([r for r in train if r['scene']!=scene]))
+        result['leave_one_room_out'][scene]={'metrics':counts(scored),'rows':scored}
+    full=fit(train)
+    for split,rows in [('train',train),('development',development)]:
+        scored=score(rows,full)
+        result[split]={'metrics':counts(scored),'by_scene':{s:counts([r for r in scored if r['scene']==s]) for s in sorted({r['scene'] for r in scored})},'rows':scored}
+    _,_,coef,intercept=full
+    model_doc={'feature_names':names,'coef':coef.tolist(),'intercept':float(intercept),'threshold':.5,'require_two_found':True,
+               'features_sha':registration['features_sha'],'implementation':sklearn.__version__,'code_sha':hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
+    for filename,data in [('model.json',model_doc),('fit_results.json',result),('FIT_DONE',{'rc':0})]:
+        path=out/filename
+        tmp=path.with_suffix('.tmp');tmp.write_text(json.dumps(data,indent=2)+'\n');tmp.replace(path)
     return 0
 
 
 if __name__ == '__main__':
-    if len(sys.argv)==3 and sys.argv[1]=='noun_proposals':
-        raise SystemExit(noun_proposals(Path(sys.argv[2])))
+    if sys.argv[1:]==['moving_stop']:
+        raise SystemExit(fit_moving_stop(Path(__file__).resolve().parent))
     if len(sys.argv)==3 and sys.argv[1] in ('transfer','parity'):
         raise SystemExit(transfer_stop(Path(sys.argv[2]),sys.argv[1]=='parity'))
     if len(sys.argv)==3 and sys.argv[1]=='clip_stop':

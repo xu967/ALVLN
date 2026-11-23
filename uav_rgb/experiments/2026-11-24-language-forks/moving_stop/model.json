@@ -1,0 +1,28 @@
+{
+  "feature_names": [
+    "two_found",
+    "mean_DA2_m",
+    "mean_box_area_fraction",
+    "mean_touched_border_fraction",
+    "mean_abs_horizontal_angle_deg",
+    "box_IoU",
+    "abs_log_area_ratio",
+    "min_DINO_conf"
+  ],
+  "coef": [
+    1.7035725927774963,
+    -0.4804030843109253,
+    1.3015525597142032,
+    -0.7336737047604668,
+    0.008111323509804974,
+    3.7101593002866036,
+    -0.8523448574067203,
+    -0.4749571232507276
+  ],
+  "intercept": -2.3037928713120692,
+  "threshold": 0.5,
+  "require_two_found": true,
+  "features_sha": "be38ae8cbc7ccf4c84fbb3d65950e255cd4a547b10f70cf9ab6931ce98fdbc89",
+  "implementation": "1.8.0",
+  "code_sha": "6f276303e370f6684d62e4c5830bd363d185aa09a8a45ff92dee1b5676a5eded"
+}

@@ -1,0 +1,14 @@
+--- a/sim/3dgs/collect_3dgs.py
++++ b/sim/3dgs/collect_3dgs.py
+@@ -226,9 +226,9 @@
+         return turn
+ 
+     def __call__(self, rgb, depth, state):
+-        from approach import VisualApproach
++        from online import MovingStop
+         if not hasattr(self, 'visual_approach'):
+-            self.visual_approach = VisualApproach()
++            self.visual_approach = MovingStop()
+         action, self.stop_requested, self.last_decision, elapsed_ms = self.visual_approach.decide(
+             rgb, self.goal_fn.instruction)
+         self.last_executed = action
