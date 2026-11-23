@@ -266,8 +266,20 @@ def instruction_banner(vln):
     if "supplied_text" in vln:
         supplied = vln["supplied_text"]
         return f'"{supplied}"' if supplied else "[empty instruction]"
+    if vln.get("counterfactual") == "swap":
+        return "[swapped instruction unavailable]"
     original = vln.get("text")
     return f'"{original}"' if original else ""
+
+
+def _video_waypoint(task, original):
+    if (task or {}).get("counterfactual") != "swap":
+        return original
+    point = task.get("supplied_goal_waypoint")
+    if isinstance(point, dict) and all(type(point.get(k)) in (int, float)
+                                       and math.isfinite(point[k]) for k in ("x", "y")):
+        return point
+    return None
 
 
 def _decision_rgb(cv2, ep_dir, action):
@@ -313,6 +325,7 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
         with open(manifest_path, encoding="utf-8") as f:
             manifest = json.load(f)
     vln = manifest.get("vln") or scene.get("vln")
+    scene = dict(scene, waypoint=_video_waypoint(vln, scene.get("waypoint")))
     instruction = instruction_banner(vln) if vln else instruction
     banner = _banner_mask(instruction, CW, s, max_lines=4) if instruction else None
     blind_rgb = bool((vln or {}).get("blind_rgb"))
@@ -579,7 +592,7 @@ def video_policy(man):
     return "teacher"
 
 
-def episode_result(man, oracle=None, reach_radius_m=None, collided=False, actions=None):
+def episode_result(man, oracle=None, reach_radius_m=None, collided=False, actions=None, scene=None):
     """结尾大字：与 Gazebo eval_closed_loop._write_video 同一套词（SUCCESS / COLLISION / …）。
 
     VLN 集复用 vln.episode_metrics，必须主动停在目标旁；旧避障集给 oracle 与 reach_radius_m 时按 eval_3dgs 同口径：
@@ -607,11 +620,26 @@ def episode_result(man, oracle=None, reach_radius_m=None, collided=False, action
             return "ANOMALY %s" % man["dynamics_anomaly"]
         if not actions or not oracle or len(actions) != len(oracle) or reach_radius_m is None:
             return "INVALID trajectory"
-        grounding = (man.get("vln") or {}).get("grounding")
+        task = man["vln"]
+        waypoint = _video_waypoint(task, man.get("waypoint"))
+        if waypoint is None:
+            return "UNSCORED | goal unavailable"
         vln = importlib.import_module("sim.3dgs.vln")
-        m = vln.episode_metrics(actions, oracle, man["waypoint"], reach_radius_m,
-                                man.get("stopped_by_agent", False))
-        if isinstance(grounding, dict) and grounding.get("correct") is False:
+        stages = task.get("stage_waypoints") or []
+        swapped = task.get("counterfactual") == "swap"
+        if swapped and task.get("route_contract") == "sage.multi_stage.v2":
+            partner = next((ep for ep in vln.episodes(scene or {})
+                            if ep["key"] == task.get("supplied_instruction_key")), {})
+            stages = partner.get("stage_waypoints") or []
+            if not stages or any(stages[-1]["waypoint"][k] != waypoint[k] for k in ("x", "y")):
+                return "UNSCORED | supplied stages unavailable"
+        m = vln.episode_metrics(actions, oracle, waypoint, reach_radius_m, man.get("stopped_by_agent", False),
+                                stage_goals=[s["waypoint"] for s in stages])
+        grounding = task.get("grounding") or {}
+        correct = grounding.get("correct")
+        if swapped and grounding and task.get("supplied_goal_object"):
+            correct = grounding.get("target") == task["supplied_goal_object"]
+        if correct is False:
             return "WRONG GOAL %.1f m" % m["ne_m"]
         if m["success"]:
             return "SUCCESS stop %.2f m" % m["ne_m"]
@@ -682,7 +710,8 @@ def main():
         oracle = _read_jsonl(os.path.join(ep, "oracle.jsonl"))
         actions = _read_jsonl(os.path.join(ep, "actions.jsonl"))
         collided = any(a.get("collision") for a in actions)
-        result = episode_result(man, oracle, float(ep_scene.get("reach_radius_m", 1.5)), collided, actions)
+        result = episode_result(man, oracle, float(ep_scene.get("reach_radius_m", 1.5)), collided, actions,
+                                scene=ep_scene if want == scene_sha else None)
         manual_demo = bool((man.get("vln") or {}).get("manual_demo"))
         r = compose_views_video(ep, ep_scene, renderer, mount, occ, out_path=os.path.join(ep, args.out_name),
                                 title=f"{video_policy(man)} | {dyn} | {scene_short} | seed {man.get('seed')}",   # 与 Gazebo 标题同格式

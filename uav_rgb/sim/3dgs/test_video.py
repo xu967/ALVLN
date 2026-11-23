@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 import numpy as np
@@ -90,6 +91,34 @@ class TestEpisodeResult(unittest.TestCase):
         self.assertTrue(video.episode_result({"dynamics_anomaly": {"kind": "backward_under_forward"}}).startswith("ANOMALY"))
         self.assertEqual(video.episode_result({"num_steps": 7}), "NOT REACHED (7 steps)")
 
+    def test_swap_uses_the_supplied_target_for_the_map_and_stop_score(self):
+        supplied = {"x": 2., "y": 0.}
+        task = {"counterfactual": "swap", "supplied_goal_object": "lamp",
+                "supplied_goal_waypoint": supplied, "grounding": {"target": "lamp", "correct": False}}
+        man = {"vln": task, "waypoint": WP, "stopped_by_agent": True}
+        actions = [{"pose_before": {"x": 0., "y": 0.}, "collision": False}]
+        self.assertEqual(video._video_waypoint(task, WP), supplied)
+        self.assertEqual(video.episode_result(man, _oracle((2., 0.)), 1., actions=actions), "SUCCESS stop 0.00 m")
+        self.assertEqual(video.episode_result(man, _oracle((10., 0.)), 1., actions=actions), "WRONG STOP 8.0 m")
+        del task["supplied_goal_waypoint"]
+        self.assertIsNone(video._video_waypoint(task, WP))
+        self.assertEqual(video.episode_result(man, _oracle((10., 0.)), 1., actions=actions),
+                         "UNSCORED | goal unavailable")
+
+    def test_swapped_multistage_replay_requires_ordered_partner_stages(self):
+        partner = {"name": "other", "route_contract": "sage.multi_stage.v2", "instruction": "Go via the lamp.",
+                   "stages": [{"waypoint": {"x": 0., "y": 4.}}, {"waypoint": WP}]}
+        scene = {"name": "s", "multi_stage_routes": [partner]}
+        task = {"counterfactual": "swap", "route_contract": "sage.multi_stage.v2",
+                "supplied_goal_waypoint": WP, "supplied_instruction_key": "s/other/multi_stage"}
+        man = {"vln": task, "waypoint": {"x": -5., "y": 0.}, "stopped_by_agent": True}
+        actions = [{"pose_before": {"x": 0., "y": 0.}}, {"pose_before": {"x": 0., "y": 4.}}]
+        for via, success in [((0., 4.), True), ((0., 0.), False)]:
+            score = video.episode_result(man, _oracle(via, (10., 0.)), 1., actions=actions, scene=scene)
+            self.assertEqual(score.startswith("SUCCESS"), success)
+        self.assertEqual(video.episode_result(man, _oracle((0., 4.), (10., 0.)), 1., actions=actions),
+                         "UNSCORED | supplied stages unavailable")
+
     def test_legacy_goal_stop_cannot_override_failure(self):
         man = {"stopped_on_goal": True}
         self.assertEqual(video.episode_result(man, collided=True), "COLLISION")
@@ -136,10 +165,34 @@ class TestVideoTime(unittest.TestCase):
 
 
 class TestVlnReplay(unittest.TestCase):
+    def test_composed_swap_video_shows_the_supplied_goal_on_map_and_hud(self):
+        supplied = {"x": 2., "y": 0.}
+        scene = {"spawn": {"x": 0., "y": 0.}, "waypoint": WP,
+                 "vln": {"counterfactual": "swap", "text": "go to chair",
+                         "supplied_text": "go to lamp", "supplied_goal_waypoint": supplied}}
+        renderer = importlib.import_module("sim.3dgs.renderer").MockRenderer(scene)
+        trace = {"step": 0, "t": .1, "pos": [2., 0., 2.], "vel": [0., 0., 0.], "quat": [1, 0, 0, 0]}
+        with (tempfile.TemporaryDirectory() as ep,
+              mock.patch.object(video, "_TopMap", wraps=video._TopMap) as top_map,
+              mock.patch.object(video.vl, "panel", wraps=video.vl.panel) as panel,
+              mock.patch.object(video, "_banner_mask", wraps=video._banner_mask) as banner):
+            with open(os.path.join(ep, "trace.jsonl"), "w") as f:
+                f.write(json.dumps(trace) + "\n")
+            video.compose_views_video(ep, scene, renderer, None, SimpleNamespace(raw=np.empty(0)),
+                                      out_path=os.path.join(ep, "views.webm"), result="SUCCESS stop 0.00 m",
+                                      quality="low")
+            self.assertEqual(top_map.call_args.args[0]["waypoint"], supplied)
+            self.assertIn("GT goal 0.00m", panel.call_args.args[4][2])
+            self.assertEqual(panel.call_args.args[-1], "SUCCESS stop 0.00 m")
+            self.assertEqual(banner.call_args.args[0], '"go to lamp"')
+            self.assertEqual(scene["waypoint"], WP)
+
     def test_instruction_banner_uses_supplied_text_including_empty(self):
         self.assertEqual(video.instruction_banner({"text": "original", "supplied_text": "swap"}), '"swap"')
         self.assertEqual(video.instruction_banner({"text": "original", "supplied_text": ""}), "[empty instruction]")
         self.assertEqual(video.instruction_banner({"text": "original"}), '"original"')
+        self.assertEqual(video.instruction_banner({"text": "original", "counterfactual": "swap"}),
+                         "[swapped instruction unavailable]")
 
     def test_decision_frame_rejects_path_escape_and_reads_saved_rgb(self):
         import cv2
@@ -172,16 +225,17 @@ class TestVlnReplay(unittest.TestCase):
                   mock.patch.object(collision, "from_scene"),
                   mock.patch.object(video, "compose_views_video", return_value={}) as compose,
                   mock.patch("builtins.print")):
-                cases = [({}, '"go to chair"'),
-                         ({"supplied_text": "go to the window"}, '"go to the window"'),
-                         ({"supplied_text": ""}, "[empty instruction]")]
-                for fields, banner in cases:
+                cases = [({}, '"go to chair"', "NO STOP 0.0 m"),
+                         ({"counterfactual": "swap", "supplied_text": "go to the window",
+                           "supplied_goal_waypoint": {"x": 4., "y": 0.}}, '"go to the window"', "NO STOP 6.0 m"),
+                         ({"supplied_text": ""}, "[empty instruction]", "NO STOP 0.0 m")]
+                for fields, banner, result in cases:
                     with self.subTest(fields=fields):
                         with open(os.path.join(ep, "episode_manifest.json"), "w") as f:
                             json.dump(dict(man, vln=dict(man["vln"], **fields)), f)
                         video.main()
                         self.assertEqual(compose.call_args.kwargs["instruction"], banner)
-                        self.assertEqual(compose.call_args.kwargs["result"], "NO STOP 0.0 m")
+                        self.assertEqual(compose.call_args.kwargs["result"], result)
 
 
 if __name__ == "__main__":

@@ -100,3 +100,23 @@ An independent runtime audit found that `--counterfactual swap` changed the supp
 Regression coverage constructs two same-start, different-goal routes and a trajectory that stops at the supplied goal. It verifies that original-goal and supplied-goal success differ as expected. The full `test_vln.py` suite passes 71 tests, and `test_grounder.py` passes 27 tests in the VLM environment. Python compilation and `git diff --check` pass.
 
 The swap-score correction does not reopen closed-loop evaluation. The input is the latest frame only despite the four-frame history buffer, and target identity still uses text labels without regions or instance tracking. More matched route forks and independent stop positives/negatives are still needed before a G3 closed-loop comparison.
+
+## Follow-up 2026-11-23 18:26 CST
+
+### Paired closed-loop diagnostic registration
+
+Use the selected `sage3d_841980` same-spawn pair, `ts_2` and `ts_3`. Keep source instruction index 2 for each route. Both are `Relative_Relationship` tasks in `test_Scene_Unseen`, share the exact initial pose, and have different endpoint objects. Reduce `ts_2` from 128 to 107 steps so both routes have the same action budget. The generated pair scene contains only these two tasks and uses absolute scene asset paths.
+
+Run two arms on physical GPU0 with the same student checkpoint, UAV-PUR-4B model, inference binary, seed 0, 0.5-second action hold, explicit STOP, VLM update interval 2, split, and 107-step budget. The sole experimental change is correct versus swapped instruction assignment. Each arm requests both tasks. Disable videos to avoid additional render and encoding work.
+
+The checkpoint has `vln_nav=true` and `text_dim=0`. The tested language path is therefore the frozen VLM Grounder selecting a target-conditioned bearing for the student. This diagnostic does not test language embeddings in the student. Record original episode waypoint metrics and supplied-instruction waypoint metrics separately, along with target distance, stop, collision, and per-episode traces.
+
+This is a preselected development pair in a scene already used for diagnostics, not an independent paper test. One pair and one seed can reveal whether the instruction changes these two routes, but cannot establish generalization or reliable STOP behavior. The language and formal-evaluation gates remain closed pending broader held-out paired tasks.
+
+Inputs and hashes are recorded in `/root/rivermind-data/uav_rgb/exp-vln-cf-pair-ts2-ts3-20261123/experiment.json`; per-file runtime hashes are in `runtime_sources.sha256` and VLM weight shard hashes are in `vlm_weights.sha256`. The pair scene is `pair_scene.json` in the same directory. Evaluator fixes are committed as `0be72eff9bd3ac2f6b34d32b6658af41dcc72e45` and mirrored to ALVLN.
+
+The serialized correct/swap run started at `2026-11-23 18:32:45 CST`, PID/PGID `632501`. Startup verification found the 3DGS Python process, `uavrgb_infer`, and the VLM worker on physical GPU0. GPU1 remained occupied by its pre-existing processes and was not exposed to this run. Logs and the `DONE` marker are in the experiment directory. Estimated completion is `18:39 CST`; only the startup check has been performed.
+
+After launch, a separate evaluator fix made failed swap requests without a resolved partner count in the supplied-goal denominator. It changed report aggregation only. Because the two arms are separate serial processes, the later arm may have loaded the updated file. The selected pair passed the matching-partner preflight. The old and new `run_vln.py` hashes and this limitation are recorded in `experiment.json`; interpret the task traces and policy behavior as unchanged, while checking each report's request denominator explicitly.
+
+The denominator fix was committed as `a6892a55288d2da6d3cc1d4f7ff3ea4c9c805303` and mirrored to ALVLN `127b4f1`. It does not retroactively freeze the evaluator source used by the already-started pair.

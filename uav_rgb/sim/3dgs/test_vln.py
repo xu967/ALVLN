@@ -126,6 +126,25 @@ class TestEpisodes(unittest.TestCase):
 
 
 class TestMetrics(unittest.TestCase):
+    def test_first_forward_doorway_passages_follow_crossing_time(self):
+        doors = {"far": {"line_xy_m": [(1, 0), (1, 2)], "forward_normal_xy": (1, 0)},
+                 "near": {"line_xy_m": [(0, 2), (0, 0)], "forward_normal_xy": (1, 0)}}
+        actions = [{"step": 0, "pose_before": {"x": -1, "y": 1}}]
+        trace = [{"step": 0, "t": .1, "pos": (1, 1, 1.2)},
+                 {"step": 0, "t": .2, "pos": (-1, 1, 1.2)},
+                 {"step": 0, "t": .3, "pos": (2, 1, 1.2)}]
+        events = vln.doorway_passages(trace, actions, doors)
+        self.assertEqual(events, [{"door": "near", "step": 0, "t": .05},
+                                  {"door": "far", "step": 0, "t": .1}])
+
+    def test_touching_jamb_reverse_and_collision_window_do_not_count(self):
+        doors = {"door": {"line_xy_m": [(0, 1), (2, 1)], "forward_normal_xy": (0, 1)}}
+        actions = [{"step": 0, "pose_before": {"x": 0, "y": 0}}, {"step": 1, "collision": True}]
+        trace = [{"step": 0, "t": .1, "pos": (0, 2, 1.2)},
+                 {"step": 0, "t": .2, "pos": (2, 0, 1.2)},
+                 {"step": 1, "t": .3, "pos": (0, 2, 1.2)}]
+        self.assertEqual(vln.doorway_passages(trace, actions, doors), [])
+
     def test_stop_inside_radius_is_success(self):
         a, o = _steps([(0, 0), (1, 0), (2, 0), (3.5, 0)])
         m = vln.episode_metrics(a, o, GOAL, 1.0, stopped=True, shortest_m=3.0)
@@ -258,6 +277,28 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(vln.bearing_bin(0.0, (0, 0), (0, 5), 8), 2)
         self.assertEqual(vln.bearing_bin(0.0, (0, 0), (-5, 0), 8), 4)
         self.assertEqual(vln.bearing_bin(0.0, (0, 0), (0, -5), 8), 6)
+
+    def test_subgoal_bearing_uses_runtime_lookahead_and_goal_radius(self):
+        planner = SimpleNamespace(
+            plan=mock.Mock(return_value=[(0.0, 0.0), (2.0, 0.0)]),
+            aim_point=mock.Mock(return_value=(0.0, 2.0)),
+        )
+        self.assertEqual(vln.subgoal_bearing_bin(planner, 0.0, (0, 0), (5, 0), 0.5, 1.0), (2, 0))
+        planner.plan.assert_called_once_with((0.0, 0.0), (5.0, 0.0))
+        planner.aim_point.assert_called_once_with(
+            [(0.0, 0.0), (2.0, 0.0)], 0.0, 0.0,
+            lookahead=1.05, los_max=3.0, hard_los_max=1.0)
+
+        planner.plan.reset_mock()
+        planner.aim_point.reset_mock()
+        self.assertEqual(vln.subgoal_bearing_bin(planner, 0.0, (4.5, 0), (5, 0), 0.5, 1.0), (0, 1))
+        planner.plan.assert_not_called()
+        planner.aim_point.assert_not_called()
+
+    def test_subgoal_bearing_falls_back_to_direct_goal_when_astar_fails(self):
+        planner = SimpleNamespace(plan=mock.Mock(return_value=None), aim_point=mock.Mock())
+        self.assertEqual(vln.subgoal_bearing_bin(planner, 0.0, (0, 0), (0, 5), 0.2, 1.0), (2, 0))
+        planner.aim_point.assert_not_called()
 
     def test_phrase_grounder_and_wrong_goal_video_badge(self):
         grounder_mod = importlib.import_module("sim.3dgs.grounder")

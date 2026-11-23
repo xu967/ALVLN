@@ -4,6 +4,22 @@
 
 ## 2026-11-23 最新状态
 
+### 阶段 1 门洞对照，19:34 CST
+
+- 阶段 0 已固定 5 场景、6 对开发任务，完成 96 个双目标计分用例及 CAD 门线核验。带真值局部路标的 R2 学生在 840139 的两条闭环中穿过共同门 2/2，穿过指定分支门 0/2，碰撞 1/2、超时 1/2。酒瓶路线执行动作反转 59 次，最后 103 步没有执行前进。[配对与逐集结果](docs/experiments/2026-11-21-vln-paper-plan.md)
+- 19:34:44 以原生 `python -m sim.3dgs.run_vln` 在物理 GPU0 串行启动直线方位、局部路标加黑图、地图教师三臂。每臂 2 集，最多 436 个动作；基准臂 333 个动作耗时 81.3 秒，预计整组 255–370 秒，约 19:39–19:41 完成。准确 argv 写入 [comparisons.json](</root/rivermind-data/uav_rgb/exp-vln-door-control-20261123/comparisons.json>)。PID/PGID 为 681564；运行期间可用 `kill -- -681564` 停止本组。运行目录为 `/root/rivermind-data/uav_rgb/exp-vln-door-control-20261123/comparisons/`，其中 run.log、run.pid、DONE、results.json 分别记录日志、进程、退出码和逐臂结果。此条记录的是启动检查。
+
+### 更新 18:33 CST
+
+- `run_vln.py` 反事实配对和评分修复已提交为 `0be72eff`，并推送到 ALVLN 镜像提交 `c35777b`。项目 `3dgs-venv` 中 `test_vln` 与 `test_grounder` 共 98 项通过。
+- GPU0-only correct/swap 开发闭环于 18:32:45 CST 启动，PID/PGID `632501`，预计 18:39 CST 完成。两条任务来自 `sage3d_841980/ts_2`、`ts_3`，同起点、同 `test_Scene_Unseen` split、同句式，各 107 步。启动检查只确认一次，结果尚未读取。实验目录为 `/root/rivermind-data/uav_rgb/exp-vln-cf-pair-ts2-ts3-20261123/`。
+- 该 checkpoint 的 `text_dim=0`，实验测量冻结 VLM Grounder 是否按指令改变学生闭环路线，不测学生网络直接理解原始语言。单场景单 seed 仅为开发诊断，阶段 1、语言/STOP 门禁及正式论文评测仍未通过。没有新训练。
+- 详细输入哈希、运行参数和进程信息见[实验清单](</root/rivermind-data/uav_rgb/exp-vln-cf-pair-ts2-ts3-20261123/experiment.json>)。代码修改见提交 `0be72eff`，本轮工作日志见[代码审查与计划工作日志](docs/worklog/2026-11-23-vln-code-audit-and-next-plan.md)。
+- 后续 CPU 审查发现 swap 请求没有匹配伙伴时会从 supplied-goal 分母漏计。已修复并补回归测试，`run_vln.py` 的动作和输入逻辑未变。此汇总改动发生在配对任务启动后，两个独立串行臂可能读取不同的报告汇总代码；旧/新源码 SHA 和影响范围已记入实验清单。
+- 分母修复提交 `a6892a5` 已推送到 ALVLN 镜像 `127b4f1`。只提交了 `run_vln.py` 汇总 hunk 与新增测试，其他现存测试文件差异仍留在工作区。
+
+### 较早的同日状态快照
+
 - subgoal-bearing 诊断训练已于 15:00 CST 以 `rc=0` 完成，固定 8,375 updates。新旧 R2 配置只在数据包路径与 SHA 不同；best validation macro-F1 为 `0.787543`，checkpoint SHA256 为 `513e95a7a26709ab38a0157453138ea28ef0dac663e8f267919c2c64e397e667`。
 - 同一 checkpoint 的 `direct/subgoal` 训练标签 × `direct/subgoal` 在线 bearing 2x2 为 `0/10, 3碰撞`、`0/10, 5碰撞`、`0/10, 10碰撞`、`7/10, 1碰撞+2超时`。7/10 是复用开发路线上的特权局控信号，不是语言导航结果。学生 `text_dim=0`，闭环 `grounder=none`，没有读取英文指令。
 - 修复了 VLM 解析器接受截断 STOP JSON、tracker 将任意重复 `reason` 视为同一目标的问题。解析器要求完整 JSON，STOP 还要求标签与当前英文或中文指令的目标短语匹配；目标区域和同类实例区分仍未解决。

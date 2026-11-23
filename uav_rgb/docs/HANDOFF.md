@@ -4,6 +4,21 @@
 
 新会话先读 [当前进度](../progress.md)、[论文实验计划](experiments/2026-11-21-vln-paper-plan.md)、[固定更新诊断](experiments/2026-11-23-s1-dagger-r2-fixed-updates.md) 和 [冻结帧语言探针](experiments/2026-11-23-vln-grounding-frame-probe.md)。阶段 1 尚未正式放行。
 
+### 接手位置 · 2026-11-23 19:34 CST
+
+六对开发任务和原始指令编号已冻结。840139 双门任务的两条实飞仿真轨迹均跨过共同门，学生在到达两个分支门之前分别碰撞、超时。酒瓶侧最后 103 步的 42 次前进提议全部被深度避障改写。先按同一组门线核对直线方位、黑屏、地图教师结果，再比较门前净空与动作改写。学生使用 `text_dim=0` 权重，当前结果属于局控诊断。配对录像的地图、距离和成功标签现统一按所给指令显示。[任务表与失败分析](experiments/2026-11-21-vln-paper-plan.md) · [对照启动记录](../progress.md)
+
+### 2026-11-23 18:33 CST 配对评测记录
+
+- 修复 `run_vln.py` 的反事实配对约束和评分口径，项目环境下 `test_vln` + `test_grounder` 共 98 项通过。源码提交 `0be72eff9bd3ac2f6b34d32b6658af41dcc72e45` 已通过镜像脚本推送到 ALVLN，远端提交为 `c35777b`。
+- 已在 18:32:45 CST 启动单场景 correct/swap 开发闭环，路线为 `sage3d_841980/ts_2` 和 `ts_3`，同起点、同 split、同句式、同 107 步预算，seed 0。只暴露物理 GPU0。上次启动检查确认 3DGS、C++ 推理与 VLM worker 进程位于 GPU0，PID/PGID 为 `632501`，预计 18:39 CST 完成。输出、PID、日志和完成标记见 `/root/rivermind-data/uav_rgb/exp-vln-cf-pair-ts2-ts3-20261123/`。该检查之后尚未读取结果。
+- 实验使用的 checkpoint `text_dim=0`，原始语言由冻结 VLM Grounder 处理，学生只执行方位条件策略。结果只能回答这组预选路线上的语言因果诊断，不能证明学生直接理解语言、泛化或论文方法有效。
+- 阶段 1、语言/STOP 门禁和正式论文评测仍未放行。无新训练。当前工作区保留大量既有改动，本轮只提交了评测代码和对应测试。实验及过程记录见[配对实验登记](experiments/2026-11-23-vln-grounding-frame-probe.md)和[工作日志](worklog/2026-11-23-vln-code-audit-and-next-plan.md)。
+- 配对任务启动后又修复了 swap 失败请求的 supplied-goal 分母漏计，99 项 VLN/grounder 测试通过。该汇总代码变更不影响策略动作，但两个串行臂可能加载不同的报告代码版本；每臂源哈希和影响范围已登记在实验 `experiment.json`，查看结果时核对两边请求分母。
+- 该分母修复已提交为 `a6892a5` 并镜像推送到 ALVLN `127b4f1`。只含评测汇总修复及对应单测，没有把测试文件中的其他工作区差异提交进去。
+
+### 历史状态摘要（17:51 CST 之前）
+
 - 固定 8,375-update subgoal-bearing 诊断训练已完成，使用原 R2 seed 和训练超参数。Best validation macro-F1 为 `0.787543`，checkpoint SHA256 为 `513e95a7a26709ab38a0157453138ea28ef0dac663e8f267919c2c64e397e667`。
 - 同一权重的训练/推理 bearing 2x2 表明输入条件对控制成败影响很大。subgoal/subgoal 在 10 条复用开发路线上为 7/10 成功、1 次碰撞、2 次超时；没有独立门洞通过指标。该学生 `text_dim=0`，这些任务没有语言条件动作。
 - 修复了解析器补齐截断 JSON 后误收 STOP、以及 tracker 把任意重复 `reason` 当成目标身份的问题。当前 STOP 要求报告标签匹配指令末端目标短语并经过重复观测确认。这个文本门禁不提供视觉区域证据，也不能区分同类实例。

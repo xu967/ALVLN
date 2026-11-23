@@ -25,6 +25,15 @@ import statistics
 STOP_STREAK = 3     # 旧 v1/v2 兼容约定；新显式 STOP 不使用
 SAFE_NEUTRAL, YAW_LEFT, YAW_RIGHT = 0, 2, 3
 NDTW_STEP_M = 0.25  # 参考路径等距重采样步长（与 E1 单步位移同量级，消除源数据点密度差异）
+SUBGOAL_BEARING_CONTRACT = {
+    "planner": "OccPlanner.plan+aim_point",
+    "lookahead_base_m": 0.65,
+    "lookahead_speed_gain_s": 0.8,
+    "los_max_m": 3.0,
+    "hard_los_max_m": 1.0,
+    "near_goal_radius": "scene.reach_radius_m",
+    "speed_source": "horizontal_nav_velocity_mps",
+}
 
 
 def bearing_bin(yaw_rad, pos_xy, aim_xy, n_bins=8):
@@ -35,6 +44,25 @@ def bearing_bin(yaw_rad, pos_xy, aim_xy, n_bins=8):
                       float(aim_xy[0]) - float(pos_xy[0])) - float(yaw_rad)) % (2.0 * math.pi)
     width = 2.0 * math.pi / n_bins
     return int(((rel + 0.5 * width) % (2.0 * math.pi)) // width)
+
+
+def subgoal_bearing_bin(occ_planner, yaw_rad, pos_xy, goal_xy, speed_mps, reach_radius_m):
+    """按运行时 A* 子目标、速度 lookahead 与任务到达半径计算 VLN 条件。"""
+    px, py = float(pos_xy[0]), float(pos_xy[1])
+    gx, gy = float(goal_xy[0]), float(goal_xy[1])
+    if math.hypot(px - gx, py - gy) <= float(reach_radius_m):
+        return bearing_bin(yaw_rad, (px, py), (gx, gy)), 1
+    if occ_planner is not None:
+        path = occ_planner.plan((px, py), (gx, gy))
+        if path is not None:
+            lookahead = SUBGOAL_BEARING_CONTRACT["lookahead_base_m"] + \
+                SUBGOAL_BEARING_CONTRACT["lookahead_speed_gain_s"] * float(speed_mps)
+            tx, ty = occ_planner.aim_point(
+                path, px, py, lookahead=lookahead,
+                los_max=SUBGOAL_BEARING_CONTRACT["los_max_m"],
+                hard_los_max=min(SUBGOAL_BEARING_CONTRACT["hard_los_max_m"], lookahead))
+            return bearing_bin(yaw_rad, (px, py), (tx, ty)), 0
+    return bearing_bin(yaw_rad, (px, py), (gx, gy)), 0
 
 
 def resample_polyline(points, step_m=NDTW_STEP_M):
@@ -185,6 +213,40 @@ def trajectory(actions, oracle):
         return []
     p0 = actions[0]["pose_before"]
     return [(float(p0["x"]), float(p0["y"]))] + [(float(o["pose_gt"]["x"]), float(o["pose_gt"]["y"])) for o in oracle]
+
+
+def doorway_passages(trace, actions, doors):
+    """按模拟时间返回每扇 CAD 门首次正向穿越的 {door, step, t}。碰撞窗口整段排除。"""
+    if not actions or not trace:
+        return []
+    cutoff = next((a.get("step", i) for i, a in enumerate(actions) if a.get("collision")), math.inf)
+    start = actions[0]["pose_before"]
+    samples = [(0.0, start["x"], start["y"], 0)]
+    for row in trace:
+        if row["step"] >= cutoff:
+            break
+        if row["t"] <= samples[-1][0]:
+            raise ValueError("穿门评测需要时间严格递增的轨迹")
+        samples.append((row["t"], row["pos"][0], row["pos"][1], row["step"]))
+
+    events = []
+    for name, door in doors.items():
+        (ax, ay), (bx, by) = door["line_xy_m"]
+        nx, ny = door["forward_normal_xy"]
+        dx, dy = bx - ax, by - ay
+        for (t0, x0, y0, _), (t1, x1, y1, step) in zip(samples, samples[1:]):
+            side0 = (x0 - ax) * nx + (y0 - ay) * ny
+            side1 = (x1 - ax) * nx + (y1 - ay) * ny
+            if not side0 < 0 <= side1:
+                continue
+            fraction = -side0 / (side1 - side0)
+            x, y = x0 + fraction * (x1 - x0), y0 + fraction * (y1 - y0)
+            # 门框端点不算通过。刚好落在门线上的观测归于到达该点的轨迹段。
+            along = (x - ax) * dx + (y - ay) * dy
+            if 0 < along < dx * dx + dy * dy:
+                events.append({"door": name, "step": step, "t": t0 + fraction * (t1 - t0)})
+                break
+    return sorted(events, key=lambda event: (event["t"], event["door"]))
 
 
 def _segment_circle_entry(start, end, goal, radius, min_fraction=0.0):
