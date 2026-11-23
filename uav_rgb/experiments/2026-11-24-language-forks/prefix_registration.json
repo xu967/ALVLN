@@ -1,0 +1,23 @@
+{
+  "registered": "2026-11-24T01:44:12.587689+08:00",
+  "task": "Predict teacher motion action 1/2/3 before first positive target visibility proxy, use only strong out-of-frustum negatives at these times. Exclude SAFE/STOP. Right-censored episodes identified separately.",
+  "train_scenes": [
+    "840139",
+    "841012",
+    "841150"
+  ],
+  "dev_scenes": [
+    "839992"
+  ],
+  "sampling": "train uniformly over distinct scene-route and then rows; replacement, same pregenerated index batches. Duplicate native paraphrases must not supply additional process clusters. Dev score each distinct route cluster, aggregate weighted by image windows, supplementary on future proxy-acquired routes.",
+  "frozen_vision": "R2 original pre-FiLM third conv of previous/current frames, fixed strip-pooled features and unit L2 normalization; identical route preprocessing. Model was selected on known dev geometries, diagnostic only.",
+  "frozen_text": "Frozen BERT-base uncased masked mean final features for supplied natural language, L2 normalized. Zero input is exactly zero feature. Test swap = first lexically sorted different target from same scene, offline original teacher label under perturbation, not counterfactual ground truth. Original R2 and pretrained BERT not retrained.",
+  "fusion": "concatenate R2 features, frozen text, previous executed action one hot; tanh hidden 48 and 3-class linear; AdamW, lr=.001, wd=.0001, 250 x64 fixed updates, seed 20261117. Correct vs zero language fits identical initialization and schedule. No checkpoint selection.",
+  "gate": "Positive diagnostic requires correct language higher dev macro F1 than matched blank fit + correct-fit swapped and empty. Also report paired route cluster bootstrap 95% CI (2000, seed fixed), per-route and subset. No closed-loop promotion on nonpositive or statistically unresolved results.",
+  "base_train": "/root/claude-code-backup-20261028/code/uav_rgb/train.py",
+  "base_sha256": "07e0c264263c1f8aa7b70a02f9faa6db59d7c2af731de5388c2661ee8d86001d",
+  "replay_parser": "/root/rivermind-data/uav_rgb/exp-vln-box-control-839934-20261124/replay_bearing.py",
+  "frozen_r2_sha256": "513e95a7a26709ab38a0157453138ea28ef0dac663e8f267919c2c64e397e667",
+  "bert": "/root/rivermind-data/uav_rgb/hf-cache/hub/models--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594",
+  "allowed_gpu_uuid": "GPU-e9d01956-88db-b317-ea53-be3fb6cf7190"
+}

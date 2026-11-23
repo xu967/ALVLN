@@ -1,22 +1,22 @@
 #!/usr/bin/env python3
 # uav_rgb 唯一实验、训练与闭环录像入口（已移除所有散落的 run*.py 包装脚本与废弃的 VLM 线性判停探针）。
 # 所有实验超参数集中在下方 ENV_REGISTRY，直接运行即可：
-#   python3 train.py --check          仅检查配置、路径与防覆盖守卫并打印分阶段预计耗时，不碰 GPU
-#   python3 train.py                  默认主推路线 vln_3dgs（S1 三带列池化+深度门控绕障训练闭环 + G3 阶段路标分解与几何语义联合判停闭环，全集保存 MP4 视频与 index.html）
+#   python3 train.py --check          检查配置、路径和运行契约并打印分阶段预计耗时，不碰 GPU
+#   python3 train.py                  vln_3dgs 历史诊断套件，包含 S1 局控、G3 阶段路标与视觉判停
 #   python3 train.py s1_direct        仅运行 S1-PureDirect（纯直线方位打包 -> R0 训练 -> 在线 DAgger -> R1 训练 -> 室内外闭环对比与录像）
 #   python3 train.py s1_subgoal       运行 S1 A* 局部子目标特权上界训练与闭环对照
-#   python3 train.py g3_vlm           仅运行 G3 层次化阶段路标 VLM + 机载深度联合判停（未见公寓 840865 反事实 12 集 + 841980 跨房间 5 集闭环录像）
+#   python3 train.py g3_vlm           用指定学生权重做 G3 闭环诊断
 #   python3 train.py openfly_eval     仅运行 OpenFly v2 多场景 UE4 AirSim（env16 / env23 / env18 seen20）在线闭环与全程 MP4 录像
 #   python3 train.py openfly_v2       从头训练 OpenFly 6 场景 v2 模型 + 20 集时序对拍 + 多场景 UE4 闭环录像
 #   python3 train.py full_all         串联运行 vln_3dgs + openfly_eval 全套实验与录像
 #   UAVRGB_NAME=<新run名> python3 train.py   自定义重跑时换名，默认禁止覆盖已完成 run 目录
 import difflib
-import glob
+import fcntl
+import hashlib
 import html
 import json
 import os
 from pathlib import Path
-import shutil
 import signal
 import socket
 import subprocess
@@ -31,11 +31,12 @@ ENV_REGISTRY = {
     "UAVRGB_NAME": "exp-vln-3dgs-g3-20261117",                  # 默认实验目录名；已有 DONE(rc=0) 时拒绝覆盖
     "UAVRGB_OUT_ROOT": "/root/rivermind-data/uav_rgb",          # 所有数据集、权重、日志与 MP4 统一落数据盘（根分区仅剩 6.6G，rivermind-fs Inode 已满禁写）
     "UAVRGB_MODE": "vln_3dgs",                                  # vln_3dgs | s1_direct | s1_subgoal | g3_vlm | openfly_eval | openfly_v2 | full_all
-    "UAVRGB_OVERWRITE": "0",                                    # 0 = 严禁覆盖已完成目录；1 = 允许重跑覆盖
+    "UAVRGB_OVERWRITE": "0",                                    # 1 = 同契约下允许重新汇总已完成的 run
     "UAVRGB_RESUME": "1",                                       # 1 = 守护进程意外中断重拉起时跳过已完成子阶段；0 = 拒绝进入非空目录
+    "UAVRGB_CUDA_VISIBLE_DEVICES": "0",                         # 当前复现实验固定物理 GPU 0，并写入运行契约
     # ---- S1 机载双帧 C++/CUDA 三带列池化 + 深度扇区门控导航学生 ----
-    "UAVRGB_EXISTING_S1_COLLECT": "/root/rivermind-data/uav_rgb/exp-full_1019-1117-0828/s1_direct",  # 默认直接复用已校验的 90 集教师 RGB+Depth 示范（不存在时自动重采）
-    "UAVRGB_STUDENT_CKPT": "",           # g3_vlm 单跑时可选指定已训好的三带列池化 C++ 权重；空串时自动先训 S1
+    "UAVRGB_EXISTING_S1_COLLECT": "/root/rivermind-data/uav_rgb/exp-full_1019-1117-0828/s1_direct",  # 复用 90 集教师示范，显式设为空才重采
+    "UAVRGB_STUDENT_CKPT": "",           # g3_vlm 单跑时显式指定已训好的学生权重
     "UAVRGB_S1_DEMO_LIMIT": "25",        # 无现成采集时每个训练公寓采 25 集（3 场景共 75 集）
     "UAVRGB_S1_VAL_LIMIT": "15",         # 验证公寓 839992 采 15 集 train split 选模（严格隔离 test split）
     "UAVRGB_S1_DAGGER_LIMIT": "15",      # 每个训练公寓采 15 集在线 DAgger 纠偏（3 场景共 45 集，暴露近墙偏航恢复状态）
@@ -46,13 +47,13 @@ ENV_REGISTRY = {
     "UAVRGB_S1_BATCH": "32",             # 显存占用 < 1.5 GiB，梯度方差与更新步数平衡点
     "UAVRGB_S1_LR": "0.001",             # C++ AdamW 初始学习率 1e-3 配 --cosine-lr
     "UAVRGB_S1_WEIGHT_DECAY": "0.0001",  # 解耦权重衰减，抑制分类头后期验证集损失回升
-    "UAVRGB_S1_AUGMENT": "all",          # 同时开启光度扰动 + ±4px 平移 + 50% 水平镜像（自动同步翻转动作、方位桶与深度列）
+    "UAVRGB_S1_AUGMENT": "all",          # 历史配方。深度监督只随水平镜像变换
     "UAVRGB_S1_AUX_LAMBDA": "1.5",       # 未受 FiLM 调制的 p3 8 带物理深度辅助损失权重，支撑在线前视三扇区避障与判停
     "UAVRGB_S1_CLASS_WEIGHTS": "1.0,0.75,1.35,1.35",  # 温和抬高左右偏航避障权重(1.8x)，纠正纯直线方位下遇墙仍直冲偏置
     "UAVRGB_SEED": "20261117",           # 全局确定性随机种子
     # ---- 视频全量录制开关（用户要求：实验必须保存好视频供直接查看效果）----
     "UAVRGB_VIDEOS_PER_SCENE": "999",    # 999 = 评测集中每一集都渲染合成 10 FPS 四格指令横幅 MP4 视频（不抽样漏录）
-    # ---- G3 零特权层次化视觉语言大模型（UAV-PUR-4B：FINAL/SUBGOAL 阶段路标分解 + 机载深度联合判停）----
+    # ---- G3 层次化视觉语言大模型（UAV-PUR-4B 阶段路标与视觉目标确认）----
     "UAVRGB_VLM_MODEL": "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B",  # 只读挂载 Qwen3-VL-4B（共享卡自动分层）
     "UAVRGB_VLM_EVERY": "2",             # hold=0.5s 下每 2 步（1 Hz）更新一次 VLM 阶段路标信念
     # ---- OpenFly v2 多场景训练与 UE4 AirSim 在线闭环录像 ----
@@ -84,6 +85,7 @@ REPO_ROOT = Path(__file__).resolve().parent
 TRAIN_SCENES = ("sage3d_840139", "sage3d_841012", "sage3d_841150")  # 严格只用这 3 个公寓训练（留 840865 / 841980 作完全未见测试公寓）
 VAL_SCENE = "sage3d_839992"                                         # 仅取其 train split 作选模，留 test_Instruction_Unseen 作测试
 VALID_MODES = ("vln_3dgs", "s1_direct", "s1_subgoal", "g3_vlm", "openfly_eval", "openfly_v2", "full_all")
+RUN_BOOTSTRAP_FILES = {".run.lock", "run.log", "run_contract.json.tmp"}
 PRESETS = {
     "vln_3dgs": {"UAVRGB_MODE": "vln_3dgs", "UAVRGB_NAME": "exp-vln-3dgs-g3-20261117"},
     "s1_direct": {"UAVRGB_MODE": "s1_direct", "UAVRGB_NAME": "exp-s1-colpool-direct-20261117"},
@@ -130,55 +132,81 @@ def _parse_cli_and_validate_env(argv):
     mode = os.environ["UAVRGB_MODE"].strip()
     if mode not in VALID_MODES:
         raise SystemExit(f"[train.py] UAVRGB_MODE={mode!r} 非法，可选: {', '.join(VALID_MODES)}")
+    if os.environ["UAVRGB_CUDA_VISIBLE_DEVICES"].strip() != "0":
+        raise SystemExit("[train.py] 当前实验只允许 UAVRGB_CUDA_VISIBLE_DEVICES=0")
     for flag in ("UAVRGB_OVERWRITE", "UAVRGB_RESUME"):
         if os.environ.get(flag, "0") not in ("0", "1"):
             raise SystemExit(f"[train.py] {flag} 只接受 0 | 1，收到 {os.environ.get(flag)!r}")
     name = os.environ.get("UAVRGB_NAME", "").strip()
     if not name:
         raise SystemExit("[train.py] UAVRGB_NAME 不能为空")
+    if Path(name).name != name or name in (".", ".."):
+        raise SystemExit("[train.py] UAVRGB_NAME 必须是单个目录名")
     out_root = Path(os.environ["UAVRGB_OUT_ROOT"]).resolve()
     if str(out_root).startswith("/root/rivermind-fs"):
         raise SystemExit("[train.py] 严禁将输出目录设在 /root/rivermind-fs（JuiceFS Inode 已 100% 耗尽）")
     run_dir = out_root / name
+    if run_dir.is_symlink():
+        raise SystemExit(f"[train.py] 运行目录必须是普通目录: {run_dir}")
 
-    done_file = run_dir / "DONE"
-    overwrite = os.environ["UAVRGB_OVERWRITE"] == "1"
-    resume = os.environ["UAVRGB_RESUME"] == "1"
-    if done_file.is_file() and "rc=0" in done_file.read_text(errors="ignore") and not overwrite:
-        raise SystemExit(
-            f"[train.py] 拒绝启动：目标目录已完成 ({done_file})；请换用新的 UAVRGB_NAME，或显式设 UAVRGB_OVERWRITE=1。"
-        )
-    if run_dir.exists() and any(run_dir.iterdir()) and not (overwrite or resume):
-        raise SystemExit(
-            f"[train.py] 拒绝启动：目标目录非空 ({run_dir}) 且 UAVRGB_RESUME=0, UAVRGB_OVERWRITE=0。"
-        )
+    _check_run_directory(run_dir)
     return check_only, mode, run_dir
 
 
-def _has_complete_s1_collect(base: Path) -> bool:
-    col_tr = base / "collect_train"
-    col_val = base / "collect_val"
-    if not (base and str(base) != "." and (col_tr / "vln_eval.json").is_file() and (col_val / "vln_eval.json").is_file()):
-        return False
-    sample_depths = glob.glob(str(col_tr / "*/*/depth/depth_00000.npy"))
-    return len(sample_depths) > 0
+def _check_run_directory(run_dir):
+    done_file = run_dir / "DONE"
+    overwrite = os.environ["UAVRGB_OVERWRITE"] == "1"
+    resume = os.environ["UAVRGB_RESUME"] == "1"
+    if done_file.is_file() and done_file.read_text(errors="ignore").startswith("rc=0 ") and not overwrite:
+        raise SystemExit(
+            f"[train.py] 拒绝启动：目标目录已完成 ({done_file})；请换用新的 UAVRGB_NAME，或显式设 UAVRGB_OVERWRITE=1。"
+        )
+    if run_dir.exists() and any(p.name not in RUN_BOOTSTRAP_FILES for p in run_dir.iterdir()) and not (overwrite or resume):
+        raise SystemExit(
+            f"[train.py] 拒绝启动：目标目录非空 ({run_dir}) 且 UAVRGB_RESUME=0, UAVRGB_OVERWRITE=0。"
+        )
+
+
+def _collection_episodes(directory, scenes, limit, policy):
+    report = json.loads((directory / "vln_eval.json").read_text())
+    rows = [json.loads(line) for line in (directory / "episodes.jsonl").read_text().splitlines() if line.strip()]
+    expected = len(scenes) * limit
+    if (report.get("policy") != policy or report.get("collect") is not True
+            or report.get("teacher_clearance") != "braking" or report.get("split_filter") != ["train"]
+            or report["overall"]["n_requested"] != expected or report["failures"] or len(rows) != expected
+            or any(sum(row["scene"] == scene for row in rows) != limit for scene in scenes)):
+        raise ValueError(f"采集协议、场景或集数与本次设置不符: {directory}")
+    # 报告只包含有效集。相对路径按原采集目录解析，避免混入未完成的 episode。
+    episodes = [directory / row["scene"] / Path(row["dir"]).name for row in rows]
+    if len(set(episodes)) != expected or any(
+        not (episode / "episode_manifest.json").is_file()
+        or not (episode / "depth/depth_00000.npy").is_file()
+        for episode in episodes
+    ):
+        raise ValueError(f"采集记录缺失或重复: {directory}")
+    return sorted(episodes)
+
+
+def _base_collection_episodes(base):
+    return (
+        _collection_episodes(base / "collect_train", TRAIN_SCENES, int(os.environ["UAVRGB_S1_DEMO_LIMIT"]), "teacher")
+        + _collection_episodes(base / "collect_val", (VAL_SCENE,), int(os.environ["UAVRGB_S1_VAL_LIMIT"]), "teacher")
+    )
 
 
 def estimate_eta_minutes(mode: str):
     """基于本机 RTX 2080 Ti + 12 核 cgroup 实测吞吐给出各子阶段预计耗时（分钟）。"""
     stages = []
     ext_raw = os.environ.get("UAVRGB_EXISTING_S1_COLLECT", "").strip()
-    has_existing = _has_complete_s1_collect(Path(ext_raw)) if ext_raw else False
-    has_ckpt = bool(os.environ.get("UAVRGB_STUDENT_CKPT", "").strip()) and Path(os.environ["UAVRGB_STUDENT_CKPT"]).is_file()
-    need_s1 = mode in ("vln_3dgs", "full_all", "s1_direct", "s1_subgoal") or (mode == "g3_vlm" and not has_ckpt)
+    has_existing = bool(ext_raw)
+    need_s1 = mode in ("vln_3dgs", "full_all", "s1_direct", "s1_subgoal")
     if need_s1:
         if not has_existing:
             stages.append(("S1 教师 v5 初始示范采集 (90 集含渲染深度)", 7.5))
         stages.append(("S1 三带列池化+深度头训练 (R0 15轮 + 45集在线DAgger + R1 25轮)", 6.5))
-        if mode != "g3_vlm":
-            stages.append(("S1 室内留出 10 集四臂闭环 + 户外长航线 + 全量四格 MP4 (35 段视频)", 7.5))
+        stages.append(("S1 室内留出四臂闭环 + 户外长航线 + 四格 MP4", 7.5))
     if mode in ("vln_3dgs", "full_all", "g3_vlm"):
-        stages.append(("G3 阶段路标分解 VLM + 机载深度联合判停：未见公寓 840865 (12集) + 841980 (5集) 全录像", 8.5))
+        stages.append(("G3 阶段路标与视觉判停，840865 和 841980 闭环录像", 8.5))
     if mode == "openfly_v2":
         stages.append(("OpenFly 6 场景 v2 模型训练 (2×1200 updates) + 20 集时序对拍", 7.0))
     if mode in ("full_all", "openfly_eval", "openfly_v2"):
@@ -201,7 +229,9 @@ def _print_effective_config(mode: str, run_dir: Path):
     print("[train.py] 预计分阶段耗时（RTX 2080 Ti 实测基准 + 12% 余量）：", flush=True)
     for title, mins in stages:
         print(f"  - {title}: ~{mins:.1f} 分钟", flush=True)
-    print(f"[train.py] 总预计耗时: 约 {total_min:.0f} 分钟", flush=True)
+    print(f"[train.py] 总预计耗时参考: 约 {total_min:.0f} 分钟", flush=True)
+    if mode in ("vln_3dgs", "full_all"):
+        print("[train.py] 既有 vln_3dgs 两次完整运行实测约 54 分钟/次，共享 GPU 时按实测预留。", flush=True)
 
 
 def _paths():
@@ -223,15 +253,49 @@ def _paths():
     }
 
 
+def _openfly_checkpoints():
+    root = Path(os.environ["UAVRGB_OPENFLY_CKPT_DIR"])
+    return [root / f"v2_cma_rgb_{modality}/model.pt" for modality in ("language", "only")]
+
+
+def _resnet_checkpoint(data_uav):
+    return data_uav / "torch-cache/hub/checkpoints/resnet50-0676ba61.pth"
+
+
 def _preflight_files(mode: str):
     p = _paths()
     req = [p["py_tools"]]
-    if mode in ("vln_3dgs", "full_all", "s1_direct", "s1_subgoal", "g3_vlm"):
+    if mode in ("vln_3dgs", "full_all", "s1_direct", "s1_subgoal"):
         req += [p["py_3dgs"], p["train_bin"], p["infer_bin"], p["cf_sitl_proc"]]
+        req.extend(_scene_inputs(_scene_paths_for_mode(p["data_uav"], mode)))
+        if ext := os.environ["UAVRGB_EXISTING_S1_COLLECT"].strip():
+            try:
+                _base_collection_episodes(Path(ext))
+            except (OSError, ValueError, KeyError) as exc:
+                raise SystemExit(f"[train.py] 无法复用采集: {exc}") from exc
+    if mode == "g3_vlm":
+        ckpt = os.environ.get("UAVRGB_STUDENT_CKPT", "").strip()
+        if not ckpt or not Path(ckpt).is_file():
+            raise SystemExit("[train.py] g3_vlm 需要 UAVRGB_STUDENT_CKPT 指向已有学生权重")
+        req += [p["py_3dgs"], p["infer_bin"], p["cf_sitl_proc"]]
+        req.extend(_scene_inputs(_scene_paths_for_mode(p["data_uav"], mode)))
     if mode in ("vln_3dgs", "full_all", "g3_vlm"):
         req += [p["py_vlm"], Path(os.environ["UAVRGB_VLM_MODEL"])]
     if mode in ("full_all", "openfly_eval", "openfly_v2"):
-        req += [p["py_airvln"], p["airvln_root"], p["asset_inv"], Path(os.environ["UAVRGB_OPENFLY_MANIFEST"])]
+        manifest_path = Path(os.environ["UAVRGB_OPENFLY_MANIFEST"])
+        req += [
+            p["py_airvln"], p["airvln_root"], p["asset_inv"], manifest_path,
+            p["airvln_root"].parent / "DATA/data/aerialvln/train_vocab.txt",
+            _resnet_checkpoint(p["data_uav"]),
+            *_openfly_manifest_inputs(manifest_path),
+        ]
+        selected_scenes = os.environ["UAVRGB_OPENFLY_SCENES"]
+        req.extend(_openfly_scene_inputs(p["asset_inv"], selected_scenes))
+        if "env_airsim_18" in {scene.strip() for scene in selected_scenes.split(",")}:
+            seen_tasks = Path(os.environ["UAVRGB_OPENFLY_SEEN_TASKS"])
+            req.extend((seen_tasks, *_openfly_manifest_inputs(seen_tasks)))
+    if mode in ("full_all", "openfly_eval"):
+        req.extend(_openfly_checkpoints())
     missing = [str(x) for x in req if not x.exists()]
     if missing:
         raise SystemExit("[train.py] 预检失败，缺少关键依赖或资产:\n  " + "\n  ".join(missing))
@@ -253,11 +317,209 @@ def _base_env():
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
         "TMPDIR": str(p["data_uav"] / "tmp"),
+        "CUDA_VISIBLE_DEVICES": os.environ["UAVRGB_CUDA_VISIBLE_DEVICES"],
         "PYTHONDONTWRITEBYTECODE": "1",
         "OMP_NUM_THREADS": "2",
         "MKL_NUM_THREADS": "2",
     })
     return env
+
+
+def _run_contract(mode):
+    config = {k: os.environ.get(k, "") for k in ENV_REGISTRY if k not in {"UAVRGB_OVERWRITE", "UAVRGB_RESUME"}}
+    base = _paths()
+    fingerprint = hashlib.sha256()
+    sources = subprocess.check_output(
+        ["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard", "--",
+         "train.py", "env.sh", "config", "src", "sim", "tools"], cwd=REPO_ROOT,
+    )
+    for name in sorted(set(os.fsdecode(sources).split("\0")) - {""}):
+        path = REPO_ROOT / name
+        if path.suffix in {
+            ".py", ".cpp", ".hpp", ".c", ".h", ".cu", ".cuh", ".sh",
+            ".json", ".sdf", ".yaml", ".yml", ".toml", ".cfg", ".ini",
+        }:
+            fingerprint.update(os.fsencode(name) + b"\0")
+            fingerprint.update(bytes.fromhex(_file_hash(path)) if path.is_file() else b"\0")
+    inputs = []
+    if mode in ("vln_3dgs", "full_all", "s1_direct", "s1_subgoal"):
+        inputs += [base["train_bin"], base["infer_bin"], base["cf_sitl_proc"], base["soc100_json"]]
+        inputs += _scene_inputs(_scene_paths_for_mode(base["data_uav"], mode))
+        if ext := config["UAVRGB_EXISTING_S1_COLLECT"].strip():
+            collection = Path(ext)
+            for group in ("collect_train", "collect_val"):
+                directory = collection / group
+                inputs.extend(directory / name for name in ("vln_eval.json", "episodes.jsonl"))
+            inputs.extend(_base_collection_episodes(collection))
+    if mode in ("vln_3dgs", "full_all", "g3_vlm"):
+        inputs += _scene_inputs(_scene_paths_for_mode(base["data_uav"], mode))
+        config.update({k: os.environ[k] for k in sorted(os.environ) if k.startswith("UAV_RGB_VLM_")})
+        model_dir = Path(config["UAVRGB_VLM_MODEL"])
+        inputs.append(model_dir)
+    if mode == "g3_vlm":
+        inputs += [Path(config["UAVRGB_STUDENT_CKPT"].strip()), base["infer_bin"], base["cf_sitl_proc"]]
+    if mode in ("full_all", "openfly_eval", "openfly_v2"):
+        manifest_path = Path(config["UAVRGB_OPENFLY_MANIFEST"])
+        inputs += [
+            base["asset_inv"], base["airvln_root"],
+            base["airvln_root"].parent / "DATA/data/aerialvln/train_vocab.txt",
+            manifest_path, *_openfly_manifest_inputs(manifest_path),
+        ]
+        selected_scenes = config["UAVRGB_OPENFLY_SCENES"]
+        inputs += _openfly_scene_inputs(base["asset_inv"], selected_scenes)
+        if "env_airsim_18" in {scene.strip() for scene in selected_scenes.split(",")}:
+            seen_tasks = Path(config["UAVRGB_OPENFLY_SEEN_TASKS"])
+            inputs += [seen_tasks, *_openfly_manifest_inputs(seen_tasks)]
+        inputs.append(_resnet_checkpoint(base["data_uav"]))
+    if mode in ("full_all", "openfly_eval"):
+        inputs.extend(_openfly_checkpoints())
+    return {
+        "config": config,
+        "source_sha256": fingerprint.hexdigest(),
+        "input_sha256": _fingerprint_inputs(inputs),
+    }
+
+
+def _file_hash(path):
+    with path.open("rb") as stream:
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(4 << 20), b""):
+            digest.update(chunk)
+        return digest.hexdigest()
+
+
+def _scene_inputs(scene_paths):
+    inputs = []
+    for scene_path in scene_paths:
+        scene_path = Path(scene_path)
+        inputs.append(scene_path)
+        if not scene_path.is_file():
+            continue
+        scene = json.loads(scene_path.read_text())
+        ply = scene.get("ply") or scene.get("ply_path")
+        if isinstance(ply, str) and ply:
+            inputs.append(Path(ply) if Path(ply).is_absolute() else scene_path.parent / ply)
+        collision = scene.get("collision") or {}
+        geometry = collision.get("geometry") if isinstance(collision, dict) else None
+        if isinstance(geometry, str) and geometry:
+            inputs.append(Path(geometry) if Path(geometry).is_absolute() else scene_path.parent / geometry)
+    return inputs
+
+
+def _scene_paths_for_mode(data_uav, mode):
+    scene_names = []
+    if mode in ("vln_3dgs", "full_all", "s1_direct", "s1_subgoal"):
+        scene_names.extend((*TRAIN_SCENES, VAL_SCENE, "sage3d_841980", "wanderland_1MlUucug"))
+    if mode in ("vln_3dgs", "full_all", "g3_vlm"):
+        scene_names.extend(("sage3d_840865", "sage3d_841980"))
+    return [data_uav / f"3dgs-scenes/{name}/scene.json" for name in sorted(set(scene_names))]
+
+
+def _openfly_manifest_inputs(manifest_path):
+    if not manifest_path.is_file():
+        return []
+    manifest = json.loads(manifest_path.read_text())
+    inputs = [Path(manifest["annotation_source"])]
+    for episode in manifest.get("episodes", []):
+        inputs.extend(Path(path) for path in episode.get("images", []))
+    return inputs
+
+
+def _openfly_scene_inputs(inventory_path, selected_scenes):
+    if not inventory_path.is_file():
+        return []
+    selected = {name.strip() for name in selected_scenes.split(",") if name.strip()}
+    inventory = json.loads(inventory_path.read_text())
+    inputs = []
+    for row in inventory.get("rows", []):
+        if row.get("scene") not in selected:
+            continue
+        binaries = row.get("binaries", [])
+        if binaries and binaries[0].get("path"):
+            inputs.append(Path(binaries[0]["path"]))
+        if script := row.get("start_script"):
+            inputs.append(Path(script))
+            inputs.append(Path(script).parent)
+    return inputs
+
+
+def _fingerprint_inputs(inputs):
+    files = set()
+    missing = set()
+    for raw_path in inputs:
+        path = Path(raw_path)
+        if path.is_file():
+            files.add(path)
+            continue
+        if path.is_dir():
+            files.update(
+                child for child in path.rglob("*")
+                if child.is_file() and ".git" not in child.parts and "__pycache__" not in child.parts
+            )
+            continue
+        missing.add(path)
+    result = {str(path.resolve()): _file_hash(path) for path in sorted(files)}
+    result.update({str(path.resolve()): None for path in sorted(missing)})
+    return result
+
+
+def _stage_contract(cmd, required_files, env, allow_rc1):
+    return {
+        "schema": "uavrgb.stage_complete.v1",
+        "command": [str(item) for item in cmd],
+        "required_files": list(required_files),
+        "allow_rc1": bool(allow_rc1),
+        "config": {key: env.get(key, "") for key in ENV_REGISTRY},
+    }
+
+
+def _stage_output_hashes(output, required_files):
+    return {name: _file_hash(output / name) for name in required_files}
+
+
+def _validate_stage_marker(output, required_files, cmd, env, allow_rc1):
+    marker = output / ".stage_complete"
+    try:
+        recorded = json.loads(marker.read_text())
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"阶段完成标记不可验证，请使用新的运行目录: {marker}") from exc
+    if not isinstance(recorded, dict):
+        raise RuntimeError(f"阶段完成标记格式不匹配，请使用新的运行目录: {marker}")
+    expected = _stage_contract(cmd, required_files, env, allow_rc1)
+    if any(recorded.get(key) != value for key, value in expected.items()):
+        raise RuntimeError(f"已完成阶段的命令或配置与当前运行不一致: {output}")
+    _validate_stage_outputs(output, required_files, recorded)
+
+
+def _validate_stage_outputs(output, required_files, recorded=None):
+    marker = output / ".stage_complete"
+    if recorded is None:
+        try:
+            recorded = json.loads(marker.read_text())
+        except (OSError, ValueError) as exc:
+            raise RuntimeError(f"阶段完成标记不可验证，请使用新的运行目录: {marker}") from exc
+    if (not isinstance(recorded, dict)
+            or recorded.get("schema") != "uavrgb.stage_complete.v1"
+            or recorded.get("required_files") != list(required_files)):
+        raise RuntimeError(f"阶段完成标记格式不匹配，请使用新的运行目录: {marker}")
+    if recorded.get("outputs") != _stage_output_hashes(output, required_files):
+        raise RuntimeError(f"已完成阶段的产物哈希不一致，拒绝复用: {output}")
+
+
+def _check_run_contract(run_dir, contract):
+    path = run_dir / "run_contract.json"
+    if not path.is_file():
+        if run_dir.exists() and any(p.name not in RUN_BOOTSTRAP_FILES for p in run_dir.iterdir()):
+            raise SystemExit(f"[train.py] 旧目录没有可验证的运行契约，请使用新的 UAVRGB_NAME: {run_dir}")
+        return
+    if contract is None:
+        return
+    try:
+        previous = json.loads(path.read_text())
+    except (ValueError, OSError) as exc:
+        raise SystemExit(f"[train.py] 无法读取运行契约，请使用新的 UAVRGB_NAME: {path}") from exc
+    if previous != contract:
+        raise SystemExit(f"[train.py] 运行契约不一致，请使用新的 UAVRGB_NAME: {run_dir}")
 
 
 def _run_cmd(cmd, env, allow_rc1=False):
@@ -267,38 +529,57 @@ def _run_cmd(cmd, env, allow_rc1=False):
         raise RuntimeError(f"命令失败 rc={res.returncode}: {' '.join(str(c) for c in cmd)}")
 
 
+def _run_stage_cmd(output, required_files, cmd, env, allow_rc1=False):
+    marker = output / ".stage_complete"
+    if marker.is_file():
+        if not all((output / name).is_file() for name in required_files):
+            raise RuntimeError(f"已完成阶段的产物缺失: {output}")
+        _validate_stage_marker(output, required_files, cmd, env, allow_rc1)
+        return
+    if output.exists():
+        # 保留失败现场，从头重跑这个阶段以保持训练随机序列和学习率调度。
+        archive = output.parent / ".interrupted" / f"{output.name}-{time.time_ns()}"
+        archive.parent.mkdir(exist_ok=True)
+        output.rename(archive)
+        print(f"[train.py] 未完成阶段已移至 {archive}", flush=True)
+    _run_cmd(cmd, env, allow_rc1=allow_rc1)
+    if not all((output / name).is_file() for name in required_files):
+        raise RuntimeError(f"阶段结束后缺少必要产物: {output}")
+    record = _stage_contract(cmd, required_files, env, allow_rc1)
+    record["outputs"] = _stage_output_hashes(output, required_files)
+    temporary = marker.with_name(f"{marker.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(record, sort_keys=True, indent=2) + "\n")
+    os.replace(temporary, marker)
+
+
 def _ensure_s1_base_demos(s1_dir: Path, env: dict):
     """复用已有含完整 RGB+Depth 的 75 train + 15 val 教师 v5 示范集；否则自动采集。"""
     p = _paths()
-    ext_raw = os.environ.get("UAVRGB_EXISTING_S1_COLLECT", "").strip()
-    if ext_raw and _has_complete_s1_collect(Path(ext_raw)):
+    ext_raw = os.environ["UAVRGB_EXISTING_S1_COLLECT"].strip()
+    if ext_raw:
         existing = Path(ext_raw)
-        col_tr = existing / "collect_train"
-        col_val = existing / "collect_val"
-        print(f"[S1] 复用已有完整教师 v5 初始采集: {col_tr} & {col_val}", flush=True)
-        return col_tr, col_val
+        print(f"[S1] 复用教师示范 {existing}", flush=True)
+        return existing
 
     col_tr = s1_dir / "collect_train"
     col_val = s1_dir / "collect_val"
     tr_flags = []
     for s in TRAIN_SCENES:
         tr_flags += ["--scene", p["data_uav"] / f"3dgs-scenes/{s}/scene.json"]
-    if not (col_tr / "vln_eval.json").is_file():
-        _run_cmd([
-            p["py_3dgs"], "-m", "sim.3dgs.run_vln", *tr_flags, "--split", "train",
-            "--policy", "teacher", "--teacher-clearance", "braking",
-            "--collect", "--save-depth", "--limit", os.environ["UAVRGB_S1_DEMO_LIMIT"],
-            "--seed", "101", "--out", col_tr,
-        ], env)
-    if not (col_val / "vln_eval.json").is_file():
-        _run_cmd([
-            p["py_3dgs"], "-m", "sim.3dgs.run_vln",
-            "--scene", p["data_uav"] / f"3dgs-scenes/{VAL_SCENE}/scene.json", "--split", "train",
-            "--policy", "teacher", "--teacher-clearance", "braking",
-            "--collect", "--save-depth", "--limit", os.environ["UAVRGB_S1_VAL_LIMIT"],
-            "--seed", "201", "--out", col_val,
-        ], env)
-    return col_tr, col_val
+    _run_stage_cmd(col_tr, ("vln_eval.json", "episodes.jsonl"), [
+        p["py_3dgs"], "-m", "sim.3dgs.run_vln", *tr_flags, "--split", "train",
+        "--policy", "teacher", "--teacher-clearance", "braking",
+        "--collect", "--save-depth", "--limit", os.environ["UAVRGB_S1_DEMO_LIMIT"],
+        "--seed", "101", "--out", col_tr,
+    ], env)
+    _run_stage_cmd(col_val, ("vln_eval.json", "episodes.jsonl"), [
+        p["py_3dgs"], "-m", "sim.3dgs.run_vln",
+        "--scene", p["data_uav"] / f"3dgs-scenes/{VAL_SCENE}/scene.json", "--split", "train",
+        "--policy", "teacher", "--teacher-clearance", "braking",
+        "--collect", "--save-depth", "--limit", os.environ["UAVRGB_S1_VAL_LIMIT"],
+        "--seed", "201", "--out", col_val,
+    ], env)
+    return s1_dir
 
 
 def run_stage_s1(run_dir: Path, env: dict, g0_mode: str) -> dict:
@@ -307,7 +588,8 @@ def run_stage_s1(run_dir: Path, env: dict, g0_mode: str) -> dict:
     tag = "s1_direct" if g0_mode == "direct" else "s1_subgoal"
     s1_dir = run_dir / tag
     s1_dir.mkdir(parents=True, exist_ok=True)
-    col_tr, col_val = _ensure_s1_base_demos(s1_dir, env)
+    base = _ensure_s1_base_demos(s1_dir, env)
+    base_episodes = _base_collection_episodes(base)
 
     bearing_src = "direct" if g0_mode == "direct" else "recorded"
     dropout = os.environ["UAVRGB_S1_SEARCH_DROPOUT"]
@@ -322,16 +604,15 @@ def run_stage_s1(run_dir: Path, env: dict, g0_mode: str) -> dict:
     ds_dag = s1_dir / "ds_dagger"
     run_dag = s1_dir / "run_dagger"
 
-    if not (ds_r0 / "dataset.uavr").is_file():
-        eps = [d for d in sorted(glob.glob(str(col_tr / "*/*")) + glob.glob(str(col_val / "*/*")))
-               if os.path.isfile(os.path.join(d, "episode_manifest.json"))]
-        _run_cmd([
-            p["py_tools"], "tools/preprocess.py",
-            "--drop-collision", "--cond", "vln-nav",
-            "--vln-bearing-source", bearing_src,
-            "--vln-search-dropout", dropout,
-            "--out", ds_r0, *eps,
-        ], env)
+    pack_cmd = [
+        p["py_tools"], "tools/preprocess.py",
+        "--drop-collision", "--cond", "vln-nav",
+        "--vln-bearing-source", bearing_src,
+        "--vln-search-dropout", dropout,
+    ]
+    _run_stage_cmd(ds_r0, ("dataset.uavr", "dataset.aux"), [
+        *pack_cmd, "--out", ds_r0, *sorted(base_episodes),
+    ], env)
 
     aux_lam = os.environ["UAVRGB_S1_AUX_LAMBDA"]
     wd = os.environ["UAVRGB_S1_WEIGHT_DECAY"]
@@ -343,46 +624,35 @@ def run_stage_s1(run_dir: Path, env: dict, g0_mode: str) -> dict:
         "--two-frame", "--vln-nav", "--stop-head",
         "--depth-aux", "--aux-lambda", aux_lam,
         "--augment", aug, "--weight-decay", wd, *cw_flags,
-        "--cosine-lr", "--drop-collision", "--cuda-blocking-sync",
+        "--cosine-lr", "--drop-collision",
     ]
 
-    if not (run_r0 / "ckpt_best.bin").is_file():
-        _run_cmd([
-            p["train_bin"], "--data", ds_r0 / "dataset.uavr", "--out", run_r0,
-            "--epochs", os.environ["UAVRGB_S1_EPOCHS_R0"], *common_train_flags,
-        ], env)
+    _run_stage_cmd(run_r0, ("ckpt_best.bin", "ckpt.bin"), [
+        p["train_bin"], "--data", ds_r0 / "dataset.uavr", "--out", run_r0,
+        "--epochs", os.environ["UAVRGB_S1_EPOCHS_R0"], *common_train_flags,
+    ], env)
 
-    if not (col_dag / "vln_eval.json").is_file():
-        tr_flags = []
-        for s in TRAIN_SCENES:
-            tr_flags += ["--scene", p["data_uav"] / f"3dgs-scenes/{s}/scene.json"]
-        _run_cmd([
-            p["py_3dgs"], "-m", "sim.3dgs.run_vln", *tr_flags, "--split", "train",
-            "--policy", "student", "--ckpt", run_r0 / "ckpt_best.bin", "--infer-bin", p["infer_bin"],
-            "--g0-mode", g0_mode, "--teacher-clearance", "braking",
-            "--collect", "--save-depth",
-            "--dagger-beta", os.environ["UAVRGB_S1_DAGGER_BETA"], "--dagger-round", "1",
-            "--limit", os.environ["UAVRGB_S1_DAGGER_LIMIT"], "--seed", "301", "--out", col_dag,
-        ], env, allow_rc1=True)
-
-    if not (ds_dag / "dataset.uavr").is_file():
-        eps = [d for d in sorted(
-            glob.glob(str(col_tr / "*/*")) + glob.glob(str(col_dag / "*/*")) + glob.glob(str(col_val / "*/*"))
-        ) if os.path.isfile(os.path.join(d, "episode_manifest.json"))]
-        _run_cmd([
-            p["py_tools"], "tools/preprocess.py",
-            "--drop-collision", "--cond", "vln-nav",
-            "--vln-bearing-source", bearing_src,
-            "--vln-search-dropout", dropout,
-            "--out", ds_dag, *eps,
-        ], env)
+    tr_flags = []
+    for scene in TRAIN_SCENES:
+        tr_flags += ["--scene", p["data_uav"] / f"3dgs-scenes/{scene}/scene.json"]
+    _run_stage_cmd(col_dag, ("vln_eval.json", "episodes.jsonl"), [
+        p["py_3dgs"], "-m", "sim.3dgs.run_vln", *tr_flags, "--split", "train",
+        "--policy", "student", "--ckpt", run_r0 / "ckpt_best.bin", "--infer-bin", p["infer_bin"],
+        "--g0-mode", g0_mode, "--teacher-clearance", "braking",
+        "--collect", "--save-depth",
+        "--dagger-beta", os.environ["UAVRGB_S1_DAGGER_BETA"], "--dagger-round", "1",
+        "--limit", os.environ["UAVRGB_S1_DAGGER_LIMIT"], "--seed", "301", "--out", col_dag,
+    ], env)
+    dagger_episodes = _collection_episodes(col_dag, TRAIN_SCENES, int(os.environ["UAVRGB_S1_DAGGER_LIMIT"]), "student")
+    _run_stage_cmd(ds_dag, ("dataset.uavr", "dataset.aux"), [
+        *pack_cmd, "--out", ds_dag, *sorted(base_episodes + dagger_episodes),
+    ], env)
 
     ckpt_final = run_dag / "ckpt_best.bin"
-    if not ckpt_final.is_file():
-        _run_cmd([
-            p["train_bin"], "--data", ds_dag / "dataset.uavr", "--out", run_dag,
-            "--epochs", os.environ["UAVRGB_S1_EPOCHS_DAGGER"], *common_train_flags,
-        ], env)
+    _run_stage_cmd(run_dag, ("ckpt_best.bin", "ckpt.bin"), [
+        p["train_bin"], "--data", ds_dag / "dataset.uavr", "--out", run_dag,
+        "--epochs", os.environ["UAVRGB_S1_EPOCHS_DAGGER"], *common_train_flags,
+    ], env)
 
     eval_scenes = [
         "--scene", p["data_uav"] / "3dgs-scenes/sage3d_839992/scene.json",
@@ -410,28 +680,28 @@ def run_stage_s1(run_dir: Path, env: dict, g0_mode: str) -> dict:
     heldout = {}
     for arm, flags in eval_arms.items():
         adir = s1_dir / f"eval_{arm}"
-        if not (adir / "vln_eval.json").is_file():
-            _run_cmd([p["py_3dgs"], "-m", "sim.3dgs.run_vln", *eval_scenes, *flags, "--out", adir], env, allow_rc1=True)
+        _run_stage_cmd(adir, ("vln_eval.json", "episodes.jsonl"), [
+            p["py_3dgs"], "-m", "sim.3dgs.run_vln", *eval_scenes, *flags, "--out", adir,
+        ], env, allow_rc1=True)
         rep = json.loads((adir / "vln_eval.json").read_text())
         heldout[arm] = {"overall": rep["overall"], "by_split": rep.get("by_split")}
 
     wl_dir = s1_dir / f"eval_wanderland_{g0_mode}"
-    if not (wl_dir / "vln_eval.json").is_file():
-        _run_cmd([
+    _run_stage_cmd(wl_dir, ("vln_eval.json", "episodes.jsonl"), [
             p["py_3dgs"], "-m", "sim.3dgs.run_vln",
             "--scene", p["data_uav"] / "3dgs-scenes/wanderland_1MlUucug/scene.json",
             "--policy", "student", "--ckpt", ckpt_final, "--infer-bin", p["infer_bin"],
             "--g0-mode", g0_mode, "--dynamics-params", p["soc100_json"],
             "--limit", "3", "--videos", videos_n, "--out", wl_dir,
-        ], env, allow_rc1=True)
+    ], env, allow_rc1=True)
     wl_eval = json.loads((wl_dir / "vln_eval.json").read_text())["overall"]
 
     return {
         "g0_mode": g0_mode,
         "bearing_source": bearing_src,
         "ckpt_best": str(ckpt_final),
-        "col_tr": str(col_tr),
-        "col_val": str(col_val),
+        "col_tr": str(base / "collect_train"),
+        "col_val": str(base / "collect_val"),
         "heldout_eval": heldout,
         "wanderland_outdoor_long_eval": wl_eval,
     }
@@ -483,7 +753,7 @@ def _summarize_vln_dir(cdir: Path) -> dict:
 
 
 def run_stage_g3_vlm(run_dir: Path, env: dict, student_ckpt: Path) -> dict:
-    """运行 G3 零特权阶段路标分解 VLM + 机载几何深度联合判停：未见公寓 840865 反事实 12 集 + 841980 5 集全录像。"""
+    """运行 G3 阶段路标和视觉目标确认诊断。"""
     p = _paths()
     g3_dir = run_dir / "g3_subgoal_vlm"
     cf_scene = _build_unseen_vlm_cf_scene(g3_dir / "sage3d_840865_cf4.json")
@@ -494,26 +764,24 @@ def run_stage_g3_vlm(run_dir: Path, env: dict, student_ckpt: Path) -> dict:
     cf_results = {}
     for cf in ("correct", "swap", "zero"):
         cdir = g3_dir / f"vlm_student_{cf}"
-        if not (cdir / "vln_eval.json").is_file():
-            _run_cmd([
-                p["py_3dgs"], "-m", "sim.3dgs.run_vln",
-                "--scene", cf_scene, "--limit", "4",
-                "--policy", "student", "--ckpt", student_ckpt, "--infer-bin", p["infer_bin"],
-                "--grounder", "vlm", "--vlm-model", vlm_model, "--vlm-every", vlm_every,
-                "--counterfactual", cf, "--videos", videos_n, "--out", cdir,
-            ], env, allow_rc1=True)
+        _run_stage_cmd(cdir, ("vln_eval.json", "episodes.jsonl"), [
+            p["py_3dgs"], "-m", "sim.3dgs.run_vln",
+            "--scene", cf_scene, "--limit", "4",
+            "--policy", "student", "--ckpt", student_ckpt, "--infer-bin", p["infer_bin"],
+            "--grounder", "vlm", "--vlm-model", vlm_model, "--vlm-every", vlm_every,
+            "--counterfactual", cf, "--videos", videos_n, "--out", cdir,
+        ], env, allow_rc1=True)
         cf_results[cf] = _summarize_vln_dir(cdir)
 
     unseen_841980_dir = g3_dir / "unseen_841980_vlm_correct"
-    if not (unseen_841980_dir / "vln_eval.json").is_file():
-        _run_cmd([
-            p["py_3dgs"], "-m", "sim.3dgs.run_vln",
-            "--scene", p["data_uav"] / "3dgs-scenes/sage3d_841980/scene.json",
-            "--split", "test_Scene_Unseen", "--limit", "5",
-            "--policy", "student", "--ckpt", student_ckpt, "--infer-bin", p["infer_bin"],
-            "--grounder", "vlm", "--vlm-model", vlm_model, "--vlm-every", vlm_every,
-            "--videos", videos_n, "--out", unseen_841980_dir,
-        ], env, allow_rc1=True)
+    _run_stage_cmd(unseen_841980_dir, ("vln_eval.json", "episodes.jsonl"), [
+        p["py_3dgs"], "-m", "sim.3dgs.run_vln",
+        "--scene", p["data_uav"] / "3dgs-scenes/sage3d_841980/scene.json",
+        "--split", "test_Scene_Unseen", "--limit", "5",
+        "--policy", "student", "--ckpt", student_ckpt, "--infer-bin", p["infer_bin"],
+        "--grounder", "vlm", "--vlm-model", vlm_model, "--vlm-every", vlm_every,
+        "--videos", videos_n, "--out", unseen_841980_dir,
+    ], env, allow_rc1=True)
 
     return {
         "student_ckpt": str(student_ckpt),
@@ -541,8 +809,9 @@ def _wait_port_closed(port: int, timeout_s: float = 15.0):
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(0.5)
             if s.connect_ex(("127.0.0.1", port)) != 0:
-                return
+                return True
         time.sleep(0.5)
+    return False
 
 
 def _write_airsim_settings(dst: Path, port: int):
@@ -552,6 +821,18 @@ def _write_airsim_settings(dst: Path, port: int):
     dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(json.dumps(doc, indent=2) + "\n")
     os.chmod(dst, 0o644)
+
+
+def _openfly_eval_command(p, ckpt, lang_mode, extra_flags, manifest_path, port, output):
+    command = [p["py_airvln"], "tools/eval_openfly_subset.py"]
+    if ckpt is not None:
+        command.extend(["--checkpoint", ckpt, "--airvln-root", p["airvln_root"]])
+    elif lang_mode == "correct":
+        command.extend(["--policy", "blind_forward"])
+    return [
+        *command, "--manifest", manifest_path, "--language", lang_mode,
+        "--port", str(port), "--record-video", *extra_flags, "--out", output,
+    ]
 
 
 def summarize_openfly_job(job_name: str, scene: str, sdoc: dict) -> dict:
@@ -620,21 +901,16 @@ def run_stage_openfly(run_dir: Path, env: dict, retrain: bool = False) -> dict:
         ]
         for arm_name, extra in arms:
             adir = train_root / arm_name
-            if not (adir / "DONE").is_file():
-                _run_cmd([
-                    p["py_airvln"], "tools/train_openfly_subset.py",
-                    "--manifest", manifest_path, "--airvln-root", p["airvln_root"],
-                    "--out", adir, "--epochs", os.environ["UAVRGB_OPENFLY_EPOCHS"],
-                    "--seed", os.environ["UAVRGB_SEED"], *extra,
-                ], env)
+            _run_stage_cmd(adir, ("DONE", "model.pt", "result.json"), [
+                p["py_airvln"], "tools/train_openfly_subset.py",
+                "--manifest", manifest_path, "--airvln-root", p["airvln_root"],
+                "--out", adir, "--epochs", os.environ["UAVRGB_OPENFLY_EPOCHS"],
+                "--seed", os.environ["UAVRGB_SEED"], *extra,
+            ], env)
+        ckpt_lang = train_root / "v2_cma_rgb_language/model.pt"
+        ckpt_rgb = train_root / "v2_cma_rgb_only/model.pt"
     else:
-        train_root = Path(os.environ["UAVRGB_OPENFLY_CKPT_DIR"])
-
-    ckpt_lang = train_root / "v2_cma_rgb_language/model.pt"
-    ckpt_rgb = train_root / "v2_cma_rgb_only/model.pt"
-    for ck in (ckpt_lang, ckpt_rgb):
-        if not ck.is_file():
-            raise FileNotFoundError(f"找不到 OpenFly v2 权重: {ck}")
+        ckpt_lang, ckpt_rgb = _openfly_checkpoints()
 
     inv = json.loads(p["asset_inv"].read_text())
     scene_bins = {row["scene"]: (Path(row["binaries"][0]["path"]), Path(row["start_script"]).parent) for row in inv["rows"]}
@@ -648,14 +924,9 @@ def run_stage_openfly(run_dir: Path, env: dict, retrain: bool = False) -> dict:
     seen_tasks_orig = Path(os.environ["UAVRGB_OPENFLY_SEEN_TASKS"])
     seen_tasks = of_dir / "official_seen_tasks_bound.json"
     if seen_tasks_orig.is_file():
-        import hashlib
-        mh = hashlib.sha256()
-        with open(manifest_path, "rb") as mf:
-            for chunk in iter(lambda: mf.read(1 << 20), b""):
-                mh.update(chunk)
         sdoc_bind = json.loads(seen_tasks_orig.read_text())
         sdoc_bind["training_manifest"] = str(manifest_path)
-        sdoc_bind["training_manifest_sha256"] = mh.hexdigest()
+        sdoc_bind["training_manifest_sha256"] = _file_hash(manifest_path)
         seen_tasks.write_text(json.dumps(sdoc_bind, indent=2) + "\n")
     seen_limit = int(os.environ["UAVRGB_OPENFLY_SEEN_LIMIT"])
     closedloop_summary = {}
@@ -682,10 +953,13 @@ def run_stage_openfly(run_dir: Path, env: dict, retrain: bool = False) -> dict:
 
         pending_jobs = []
         for job in jobs:
-            summary_path = of_dir / "closedloop" / job[0] / "summary.json"
-            if not summary_path.is_file():
+            job_dir = of_dir / "closedloop" / job[0]
+            if not (job_dir / ".stage_complete").is_file():
                 pending_jobs.append(job)
                 continue
+            eval_cmd = _openfly_eval_command(p, job[1], job[2], job[3], manifest_path, port, job_dir)
+            _validate_stage_marker(job_dir, ("summary.json",), eval_cmd, env, True)
+            summary_path = job_dir / "summary.json"
             summary_doc = json.loads(summary_path.read_text())
             if summary_doc.get("metric_protocol") != "uavrgb.openfly_local_metrics.v2":
                 raise ValueError(
@@ -694,7 +968,8 @@ def run_stage_openfly(run_dir: Path, env: dict, retrain: bool = False) -> dict:
         if pending_jobs:
             bin_path, ue_cwd = scene_bins[scene]
             ue_log = of_dir / f"ue4_{scene}.log"
-            _wait_port_closed(port, timeout_s=10.0)
+            if not _wait_port_closed(port, timeout_s=10.0):
+                raise RuntimeError(f"AirSim RPC 端口 {port} 已被占用")
             ue_cmd = [
                 "runuser", "-u", "ubuntu", "--", "env",
                 f"DISPLAY={display}", "QT_X11_NO_MITSHM=1", "SDL_HINT_CUDA_DEVICE=0",
@@ -710,22 +985,10 @@ def run_stage_openfly(run_dir: Path, env: dict, retrain: bool = False) -> dict:
                 time.sleep(7.0)  # 等待首帧纹理解码与自动曝光稳定（防止 env23 首帧全黑）
                 for job_name, ckpt, lang_mode, extra_flags in pending_jobs:
                     jout = of_dir / "closedloop" / job_name
-                    if jout.exists():
-                        shutil.rmtree(jout)
-                    eval_cmd = [p["py_airvln"], "tools/eval_openfly_subset.py"]
-                    if ckpt is not None:
-                        eval_cmd.extend(["--checkpoint", ckpt, "--airvln-root", p["airvln_root"]])
-                    elif lang_mode == "correct":
-                        eval_cmd.extend(["--policy", "blind_forward"])
-                    _run_cmd([
-                        *eval_cmd,
-                        "--manifest", manifest_path,
-                        "--language", lang_mode,
-                        "--port", str(port),
-                        "--record-video",
-                        *extra_flags,
-                        "--out", jout,
-                    ], env, allow_rc1=True)
+                    _run_stage_cmd(jout, ("summary.json",),
+                                   _openfly_eval_command(p, ckpt, lang_mode, extra_flags,
+                                                         manifest_path, port, jout),
+                                   env, allow_rc1=True)
             finally:
                 try:
                     os.killpg(ue_proc.pid, signal.SIGTERM)
@@ -774,13 +1037,15 @@ def build_video_gallery(run_dir: Path) -> dict:
             if dst_mp4.is_symlink() or dst_mp4.exists():
                 dst_mp4.unlink()
             os.symlink(os.path.relpath(src_mp4, vid_dir), dst_mp4)
+            spl = row.get("spl")
+            spl_label = f"{spl:.2f}" if isinstance(spl, (int, float)) else "N/A"
             cards.append({
                 "domain": "3DGS 机载闭环",
                 "group": f"{stage_name} / {arm_name}",
                 "scene": row["scene"],
                 "episode": f"{row['route_name']} ({row.get('goal_object', '')})",
                 "badge": "SUCCESS" if row.get("success") else ("COLLISION" if row.get("collision") else ("STOPPED" if row.get("stopped") else "TIMEOUT")),
-                "metrics": f"SR={int(bool(row.get('success')))} | OSR={int(bool(row.get('oracle_success')))} | NE={row.get('ne_m', 0):.2f}m | SPL={row.get('spl', 0):.2f}",
+                "metrics": f"SR={int(bool(row.get('success')))} | OSR={int(bool(row.get('oracle_success')))} | NE={row.get('ne_m', 0):.2f}m | SPL={spl_label}",
                 "instruction": row.get("supplied_text", ""),
                 "rel_video": f"videos/{flat_name}",
             })
@@ -848,14 +1113,39 @@ def build_video_gallery(run_dir: Path) -> dict:
 def main(argv=None):
     raw_argv = sys.argv[1:] if argv is None else list(argv)
     check_only, mode, run_dir = _parse_cli_and_validate_env(raw_argv)
-    _print_effective_config(mode, run_dir)
+    _check_run_contract(run_dir, None)
     _preflight_files(mode)
+    contract = _run_contract(mode)
+    _check_run_contract(run_dir, contract)
+    _print_effective_config(mode, run_dir)
     if check_only:
         print("[train.py] --check 预检全部通过（未导入 torch，未触碰 GPU）。", flush=True)
         return 0
 
-    t0 = time.time()
     run_dir.mkdir(parents=True, exist_ok=True)
+    with (run_dir / ".run.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit(f"[train.py] 已有进程在运行该目录: {run_dir}")
+        _check_run_directory(run_dir)
+        _check_run_contract(run_dir, contract)
+        try:
+            return _execute_run(mode, run_dir, contract)
+        except Exception as exc:
+            (run_dir / "DONE").write_text(
+                f"rc=1 failed_at={time.strftime('%Y-%m-%dT%H:%M:%S%z')} error={type(exc).__name__}: {exc}\n"
+            )
+            raise
+
+
+def _execute_run(mode, run_dir, contract):
+    t0 = time.time()
+    contract_path = run_dir / "run_contract.json"
+    if not contract_path.is_file():
+        temp = run_dir / "run_contract.json.tmp"
+        temp.write_text(json.dumps(contract, indent=2, ensure_ascii=False) + "\n")
+        temp.replace(contract_path)
     (run_dir / "run.pid").write_text(f"{os.getpid()}\n")
     done_file = run_dir / "DONE"
     if done_file.exists():
@@ -879,13 +1169,7 @@ def main(argv=None):
         if s1_res is not None:
             student_ckpt = Path(s1_res["ckpt_best"])
         else:
-            ckpt_raw = os.environ.get("UAVRGB_STUDENT_CKPT", "").strip()
-            if ckpt_raw and Path(ckpt_raw).is_file():
-                student_ckpt = Path(ckpt_raw)
-            else:
-                s1_res = run_stage_s1(run_dir, env, g0_mode="direct")
-                summary["s1_pure_direct"] = s1_res
-                student_ckpt = Path(s1_res["ckpt_best"])
+            student_ckpt = Path(os.environ["UAVRGB_STUDENT_CKPT"].strip())
         summary["g3_subgoal_vlm"] = run_stage_g3_vlm(run_dir, env, student_ckpt)
 
     if mode in ("full_all", "openfly_eval", "openfly_v2"):
@@ -899,17 +1183,165 @@ def main(argv=None):
     return 0
 
 
+def search_probe():
+    """训练固定视觉、文本编码器上的导航行为探针。"""
+    import collections
+    import importlib.util
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from PIL import Image
+    from transformers import AutoModel, AutoTokenizer
+
+    out = Path(__file__).parent
+    reg = json.loads((out / "registration.json").read_text())
+    manifests = json.loads((out / "inputs.json").read_text())
+    assert os.environ["CUDA_VISIBLE_DEVICES"] == reg["allowed_gpu_uuid"] and torch.cuda.device_count() == 1
+    torch.manual_seed(20261117)
+    torch.set_num_threads(4)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    loader = importlib.util.spec_from_file_location("r2_replay", reg["replay_parser"])
+    frozen = importlib.util.module_from_spec(loader)
+    loader.loader.exec_module(frozen)
+    weights = [w.cuda() for w in frozen.weights]
+    h, w = frozen.h, frozen.w
+    groups = {}
+    frames = {}
+    action_logs = {}
+
+    def read_rgb(path):
+        im = Image.open(path).convert("RGB").resize((w, h), Image.Resampling.BILINEAR)
+        return np.asarray(im)
+
+    def motion_before(path, step):
+        if path not in action_logs:
+            action_logs[path] = [json.loads(s) for s in (path/"actions.jsonl").open()]
+        return action_logs[path][step-1]["action_executed"] if step else 0
+
+    for split, spec in manifests.items():
+        path = Path(spec["path"])
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == spec["sha256"]
+        rows = [json.loads(line) for line in path.open()]
+        rows = [row for row in rows if row["visibility_proxy"] == 0 and row["teacher_action"] in (1,2,3)
+                and (row["first_proxy_visible_step"] is None or row["step"] < row["first_proxy_visible_step"])]
+        assert rows and {str(row["scene"]) for row in rows} <= set(reg["train_scenes" if split=="train" else "dev_scenes"])
+        for row in rows:
+            p = Path(row["rgb"])
+            if p not in frames:
+                frames[p] = len(frames)
+            row["image_index"] = frames[p]
+            row["prev_action"] = motion_before(p.parent, row["step"])
+        groups[split] = rows
+    assert not ({row["trace_sha256"] for row in groups["train"]} & {row["trace_sha256"] for row in groups["development"]})
+    vectors = []
+    paths = list(frames)
+    with torch.inference_mode():
+        for start in range(0,len(paths),32):
+            batch=[]
+            for p in paths[start:start+32]:
+                n=int(p.stem.split("_")[-1])
+                prev=p.with_name(f"rgb_{max(0,n-1):05d}.png")
+                batch.append(np.concatenate([read_rgb(p),read_rgb(prev)],axis=2))
+            t=torch.from_numpy(np.stack(batch)).permute(0,3,1,2).cuda().float()/255
+            for i in (0,2,4):
+                t=F.max_pool2d(F.relu(F.conv2d(t,weights[i],weights[i+1],padding=1)),2)
+            H=t.shape[2]; K=min(3,H)
+            strips=torch.stack([t[:,:,i*H//K:(i+1)*H//K].mean(2) for i in range(K)],dim=2)
+            vectors.append(F.normalize(strips.flatten(1)).cpu())
+    visual=torch.cat(vectors)
+    sentences=sorted({row["original_instruction"] for rows in groups.values() for row in rows})
+    tokenizer=AutoTokenizer.from_pretrained(reg["bert"],local_files_only=True)
+    encoder=AutoModel.from_pretrained(reg["bert"],local_files_only=True).eval().cuda()
+    texts={}
+    with torch.inference_mode():
+        for j in range(0,len(sentences),16):
+            batch=sentences[j:j+16]
+            tokens=tokenizer(batch,padding=True,return_tensors="pt").to("cuda")
+            states=encoder(**tokens).last_hidden_state
+            mask=tokens.attention_mask.unsqueeze(-1)
+            features=F.normalize((states*mask).sum(1)/mask.sum(1))
+            texts.update({s:e.cpu() for s,e in zip(batch,features)})
+    del encoder
+    torch.cuda.empty_cache()
+
+    def features(rows, mode):
+        packets=[]
+        for row in rows:
+            phrase=row["original_instruction"]
+            if mode=="swap":
+                peers=sorted({r["original_instruction"] for r in rows if r["scene"]==row["scene"] and r["target"]!=row["target"]})
+                if not peers: raise ValueError("swap requires a second supplied target in the same scene")
+                phrase=peers[0]
+            language=texts[phrase] if mode!="zero" else torch.zeros_like(texts[phrase])
+            previous=F.one_hot(torch.tensor(row["prev_action"]),4).float()
+            packets.append(torch.cat([visual[row["image_index"]],language,previous]))
+        return torch.stack(packets).cuda()
+
+    def labels(rows):
+        return torch.tensor([r["teacher_action"]-1 for r in rows],device="cuda")
+
+    def route_groups(rows):
+        clusters=collections.defaultdict(list)
+        for j,row in enumerate(rows):
+            clusters[str(row["scene"])+"/"+row["raw_route"]].append(j)
+        return clusters
+
+    train,dev=groups["train"],groups["development"]
+    clusters=route_groups(train)
+    routes=sorted(clusters)
+    generator=np.random.default_rng(20261117)
+    schedule=np.array([[generator.choice(clusters[r]) for r in generator.choice(routes,size=64)] for _ in range(250)])
+    for split,data in groups.items():
+        (out/f"effective_{split}.jsonl").write_text("".join(json.dumps(r,ensure_ascii=False)+"\n" for r in data))
+    train_y=labels(train)
+    dev_y=labels(dev).cpu().numpy()
+    validation={m:features(dev,m) for m in ("correct","swap","zero")}
+    report={"seed":20261117,"schedule_sha256":hashlib.sha256(schedule.tobytes()).hexdigest(),"unique_images":len(paths),"unique_sentences":len(sentences),
+            "windows":{s:len(rr) for s,rr in groups.items()},"unique_routes":{s:len(route_groups(rr)) for s,rr in groups.items()},"arms":{}}
+
+    def metric(y,p):
+        matrix=np.bincount(3*y+p,minlength=9).reshape(3,3)
+        denominator=matrix.sum(0)+matrix.sum(1)
+        f1=np.divide(2*np.diag(matrix),denominator,out=np.zeros(3),where=denominator!=0)
+        return {"macro_F1":float(f1.mean()),"accuracy":float((y==p).mean()),"confusion_F_L_R":matrix.tolist()}
+
+    predictions={}
+    for fit_mode in ("correct","zero"):
+        train_x=features(train,fit_mode)
+        torch.manual_seed(20261117)
+        net=torch.nn.Sequential(torch.nn.Linear(train_x.shape[1],48),torch.nn.Tanh(),torch.nn.Linear(48,3)).cuda()
+        opt=torch.optim.AdamW(net.parameters(),lr=0.001,weight_decay=0.0001)
+        for batch in schedule:
+            opt.zero_grad(set_to_none=True)
+            F.cross_entropy(net(train_x[batch]),train_y[batch]).backward()
+            opt.step()
+        torch.save(net.cpu().state_dict(),out/f"weights_{fit_mode}.pt")
+        net.cuda().eval()
+        report["arms"][fit_mode]={}
+        for mode,v in validation.items():
+            with torch.inference_mode():pred=net(v).argmax(1).cpu().numpy()
+            predictions[fit_mode,mode]=pred
+            all_stats=metric(dev_y,pred)
+            acquired=np.array([r["first_proxy_visible_step"] is not None for r in dev])
+            all_stats["acquired_proxy_subset"]=metric(dev_y[acquired],pred[acquired]) if acquired.any() else None
+            all_stats["by_route"]={k:metric(dev_y[idx],pred[idx]) for k,idx in route_groups(dev).items()}
+            report["arms"][fit_mode][mode]=all_stats
+    rr=route_groups(dev)
+    rng=np.random.default_rng(20261117)
+    comparisons=[("fit_zero_eval_zero",("zero","zero")),("fit_correct_eval_swap",("correct","swap")),("fit_correct_eval_zero",("correct","zero"))]
+    ci={k:[] for k,_ in comparisons}; ordered=sorted(rr)
+    for _ in range(2000):
+        sample=np.concatenate([rr[k] for k in rng.choice(ordered,len(ordered))])
+        actual=metric(dev_y[sample],predictions["correct","correct"][sample])["macro_F1"]
+        for name,key in comparisons:
+            ci[name].append(actual-metric(dev_y[sample],predictions[key][sample])["macro_F1"])
+    report["cluster_bootstrap_delta_F1_95"]={k:np.percentile(v,[2.5,97.5]).tolist() for k,v in ci.items()}
+    report["dev_predictions"]={fit+"_"+mode:arr.tolist() for (fit,mode),arr in predictions.items()}
+    (out/"results.json").write_text(json.dumps(report,indent=2)+"\n")
+    print({k:{m:round(st["macro_F1"],4) for m,st in a.items()} for k,a in report["arms"].items()}, flush=True)
+    return 0
+
+
 if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except SystemExit:
-        raise
-    except Exception as exc:
-        out_root = Path(os.environ.get("UAVRGB_OUT_ROOT", "/root/rivermind-data/uav_rgb"))
-        name = os.environ.get("UAVRGB_NAME", "exp-failed")
-        rdir = out_root / name
-        if rdir.is_dir():
-            (rdir / "DONE").write_text(
-                f"rc=1 failed_at={time.strftime('%Y-%m-%dT%H:%M:%S%z')} error={type(exc).__name__}: {exc}\n"
-            )
-        raise
+    raise SystemExit(search_probe() if sys.argv[1:] == ["language_search_probe"] else main())
