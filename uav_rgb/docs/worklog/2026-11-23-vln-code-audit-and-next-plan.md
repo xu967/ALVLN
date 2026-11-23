@@ -154,6 +154,23 @@
 
 - 源仓库当前无 Git remote，发布入口是同级 `../ALVLN` 的 `origin/main` 和 `tools/git_mirror_alvln.sh`。后续必须核验提交标记与远端 head，避免仅凭本地 commit 宣称上传完成。
 
+## Git 同步结果 2026-11-23 17:51 CST
+
+### 做了什么
+
+- 源提交 `1a6f19c` 镜像为 `ALVLN` 提交 `859e83b`；本轮评分修复提交 `28ee824` 镜像为 `713e396`，已推送到 `origin/main`。
+- 通过 `git ls-remote origin refs/heads/main` 核实远端为 `713e3963c10502aa43ec0f54f9a2072a50e8dac1`。逐项 Git tree 比较确认 `ALVLN/uav_rgb` 与源 `28ee824` 提交一致，差异只有 ALVLN 管理的 `.mirror_src_commit`。
+
+### 没做什么
+
+- 没把源 worktree 中其他既有未提交内容纳入本次源提交。`sim/3dgs/test_vln.py` 中本次新增 hunk 已提交，其他既有修改仍留在工作区。
+- 没有启动 G3 闭环或新训练，语言/STOP/阶段 1 门禁仍关闭。
+
+### 验证
+
+- GPU 屏蔽环境下 `test_vln.py` 71/71、`test_grounder.py` 27/27 通过；`py_compile`、暂存区 `git diff --check` 均通过。
+- 物理 GPU0 只用于此前记录的 12 次冻结帧 VLM 查询；GPU1 未使用。
+
 ## 更新 2026-11-23 07:31 CST
 
 按上述门禁继续执行后，已经修复可确定的问题，并用既有失败轨迹做了单帧推理诊断。以下结果不改变“阶段 1 未放行”的结论。
