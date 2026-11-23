@@ -239,6 +239,50 @@ _TARGET_ACTION = re.compile(
 )
 
 
+_MAIN_TARGET = re.compile(
+    r"(?:look\s+for|find|locate|polish|adjust|"
+    r"(?:go|fly|move|head|navigate|travel|proceed)\s+(?:to|towards?|into))\s+"
+)
+_PLACEMENT_SITE = re.compile(
+    r"(?:place|put|hang|showcase|display)\s+(?:it|them|(?:the|a|an)\s+[a-z-]+(?:\s+[a-z-]+)?)"
+    r"\s+(?:(?:right\s+)?next\s+to|beside|near|close\s+to|into|onto|"
+    r"(?:on|in)(?=\s+(?:the|a|an)\s+[a-z-]+(?:\s+[a-z-]+)?$))\s+"
+)
+_ENDPOINT_MODIFIER = re.compile(
+    r"\b(?:that|which|where|at|nearest(?=\s+(?:the|a|an)\b)|closest\s+to|close\s+to|"
+    r"[a-z]+(?:ed|ing)\s+(?:for|to)|stored(?=\s+(?:[a-z]+ly|at|in|on)\b))\b"
+)
+_NEXT_ACTION = re.compile(
+    r"\band\s+(?:next,?\s+)?(?=(?:bring|carry|deliver|find|go|hang|head|leave|locate|look|move|"
+    r"place|position|put|set|showcase|stop|take|transfer|transport)\b)"
+)
+
+
+def _english_destination(command):
+    command = command.removeprefix("please ")
+    if _MAIN_TARGET.match(command):
+        command = _NEXT_ACTION.split(command)[-1].strip()
+    marker = _MAIN_TARGET.match(command) or _PLACEMENT_SITE.match(command)
+    if marker:
+        raw_goal = command[marker.end():].removeprefix("that ")
+        head = _MODIFIER_SPLIT.split(raw_goal, maxsplit=1)[0]
+        head = _ENDPOINT_MODIFIER.split(head, maxsplit=1)[0].strip()
+        if re.search(r"\s(?:a|an|the)\s", head):
+            return ""
+        return head
+    if re.match(r"(?:place|put|hang|showcase|display)\s+", command):
+        return ""
+    # 保留间接指令的既有目的地优先级。
+    directions = list(re.finditer(r"(?<!next )\b(?:to|toward|towards|into|at)\b"
+                                  r"(?!\s+the\s+(?:left|right)\s+of)", command))
+    relations = list(_TARGET_RELATION.finditer(command))
+    actions = list(_TARGET_ACTION.finditer(command))
+    for matches in (directions, relations, actions):
+        if matches:
+            return _MODIFIER_SPLIT.split(command[matches[-1].end():], maxsplit=1)[0]
+    return ""
+
+
 def _cjk_instruction_target_matches(instruction, visible_target):
     destinations = list(re.finditer(r"(?:前往|到|去)", instruction))
     label = str(visible_target or "").strip(" \t\r\n，。！？；、")
@@ -254,23 +298,8 @@ def instruction_target_matches(instruction, visible_target):
     text = str(instruction or "").lower().replace("’", "'")
     if re.search(r"[\u4e00-\u9fff]", text):
         return _cjk_instruction_target_matches(text, visible_target)
-    clauses = [clause.strip() for clause in re.split(r"[.;]", text) if clause.strip()]
-    goal_clause = clauses[-1] if clauses else text
-    destinations = list(re.finditer(
-        r"(?<!next )\b(?:to|toward|towards|into|at)\b(?!\s+the\s+(?:left|right)\s+of)",
-        goal_clause,
-    ))
-    relations = list(_TARGET_RELATION.finditer(goal_clause))
-    actions = list(_TARGET_ACTION.finditer(goal_clause))
-    if destinations:
-        raw_goal = goal_clause[destinations[-1].end():]
-    elif relations:
-        raw_goal = goal_clause[relations[-1].end():]
-    elif actions:
-        raw_goal = goal_clause[actions[-1].end():]
-    else:
-        return False
-    target_tokens = _tokens(_MODIFIER_SPLIT.split(raw_goal, maxsplit=1)[0])
+    clauses = [part.strip() for part in re.split(r"[.;]|\bthen\b", text) if part.strip()]
+    target_tokens = _tokens(_english_destination(clauses[-1])) if clauses else ()
     visible_tokens = _tokens(visible_target)
     if (not target_tokens or not visible_tokens
             or visible_tokens[0] in ("it", "thing", "object", "target", "word", "none", "unknown")

@@ -4,9 +4,21 @@
 
 ## 2026-11-23 最新状态
 
-### 阶段 1 门洞对照，19:34 CST
+### R2 语言闭环，20:10 CST 启动
 
-- 阶段 0 已固定 5 场景、6 对开发任务，完成 96 个双目标计分用例及 CAD 门线核验。带真值局部路标的 R2 学生在 840139 的两条闭环中穿过共同门 2/2，穿过指定分支门 0/2，碰撞 1/2、超时 1/2。酒瓶路线执行动作反转 59 次，最后 103 步没有执行前进。[配对与逐集结果](docs/experiments/2026-11-21-vln-paper-plan.md)
+在 GPU0 串行启动正确和交换指令两臂。每臂两条 841980 路线，共 4 集，最多 428 个动作，复用 15 份原始运行源码及相同 VLM。推理端只替换兼容的学生权重。上次两臂耗时 234.4、116.9 秒，本次预留 15%，预计约 405 秒、20:17 CST 完成。守护进程 PID/PGID `725767`。运行目录 `/root/rivermind-data/uav_rgb/exp-vln-cf-r2-ts2-ts3-20261123` 包含 `run.log`、`run.pid`、`DONE` 与汇总 `comparison.json`。每臂使用已有 `python -m sim.3dgs.run_vln`，完整 argv 见登记中的 `arms` 字段。需要主动终止时使用 `kill -- -725767`。本段记录启动时状态。[实验登记](</root/rivermind-data/uav_rgb/exp-vln-cf-r2-ts2-ts3-20261123/registration.json>)
+
+### 语言与局控配对结果，11 月 23 日晚
+
+- 840139 已完成四组各两集局控对照。RGB 加 A* 路标为 0/2 成功，黑图和地图教师均为 2/2。保留 RGB 单独旁路深度改写后 2/2 成功、0/2 碰撞。重复偏航候选为 0/2 成功、2/2 碰撞，已淘汰。原句只指定目标物体，示范路径分支仅作诊断。[轨迹与局控结果](docs/experiments/2026-11-21-vln-paper-plan.md)
+- 841980 旧权重正确和交换指令四集均超时，428 个动作连续右转。R2 checkpoint 在两条路线 correct/swap 都改变动作，但四次均未到达供给的目标，发生 2 次碰撞和 1 次距离目标 6.638 m 的错误停止。两模型的训练数据、标签和增强不同，结果只能比较策略包。[逐集数据](</root/rivermind-data/uav_rgb/exp-vln-cf-r2-ts2-ts3-20261123/comparison.json>)
+- 冻结图像方向提示的水平位置正确 8/10，九宫格适配正确 5/10；缺席误报为 0/5、2/5。指令末端词面修复的冻结正例命中 8/12，26 个起点/参照负例误收 0。它未解释该组四次闭环动作，216 次更新中没有出现居中 final。[帧评分](</root/rivermind-data/uav_rgb/exp-vln-region-probe-20261123/nine_regions/scores.json>) · [词面审计](</root/rivermind-data/uav_rgb/exp-vln-stage0-pairs-20261123/language_gate_audit.json>)
+- 默认局控旁路的完整制动诊断发现 4/54 个拦截状态延迟碰撞，15 个状态未确认停稳。保持默认避障和真机 PID。[制动结果](</root/rivermind-data/uav_rgb/exp-vln-door-control-20261123/one_window_forward/braking_results.json>)
+- 同画面人工植物实例探针中，上层植物描述未能区分实例 0/2；下层描述能够区分 2/2，方向却为 0/2；画面外的自行车拒答 2/2。两帧来自一条开发轨迹。[逐项评分](</root/rivermind-data/uav_rgb/exp-vln-instance-disambiguation-20261123/scores.json>)
+
+### 阶段 1 门洞对照启动快照，19:34 CST
+
+- 阶段 0 已固定 5 场景、6 对开发任务，完成 96 个双目标计分用例及 CAD 门线核验。带真值局部路标的 R2 学生在 840139 的两条闭环中穿过共同门 2/2，穿过对应示范分支门 0/2，碰撞 1/2、超时 1/2。酒瓶路线执行动作反转 59 次，最后 103 步没有执行前进。[配对与逐集结果](docs/experiments/2026-11-21-vln-paper-plan.md)
 - 19:34:44 以原生 `python -m sim.3dgs.run_vln` 在物理 GPU0 串行启动直线方位、局部路标加黑图、地图教师三臂。每臂 2 集，最多 436 个动作；基准臂 333 个动作耗时 81.3 秒，预计整组 255–370 秒，约 19:39–19:41 完成。准确 argv 写入 [comparisons.json](</root/rivermind-data/uav_rgb/exp-vln-door-control-20261123/comparisons.json>)。PID/PGID 为 681564；运行期间可用 `kill -- -681564` 停止本组。运行目录为 `/root/rivermind-data/uav_rgb/exp-vln-door-control-20261123/comparisons/`，其中 run.log、run.pid、DONE、results.json 分别记录日志、进程、退出码和逐臂结果。此条记录的是启动检查。
 
 ### 更新 18:33 CST

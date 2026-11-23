@@ -325,6 +325,48 @@ class TestVisualLanguageGrounder(unittest.TestCase):
             with self.subTest(instruction=instruction, label=label):
                 self.assertEqual(grounder.instruction_target_matches(instruction, label), expected)
 
+    def test_target_match_separates_destinations_from_visible_landmarks(self):
+        cases = (
+            ("Look for the wine stored vertically near the wardrobes behind the reception.",
+             "wine", ("wardrobes", "reception")),
+            ("Find the book that’s on the display stand, near the other exhibition items.",
+             "book", ("display stand", "exhibition items")),
+            ("Go to the audio device that's next to the television in the living room.",
+             "audio device", ("television", "living room")),
+            ("Go to the chair closest to the dining table after leaving the bedside table.",
+             "chair", ("dining table", "bedside table")),
+            ("Place the apple near the tea needle on the storage rack.",
+             "tea needle", ("apple", "storage rack")),
+            ("Place the apple on the table.", "table", ("apple",)),
+            ("Put the book in the basket.", "basket", ("book",)),
+            ("Place the apple right next to the tea needle near the storage rack.",
+             "tea needle", ("apple", "storage rack")),
+            ("Go to the jar right next to the stand near the wall.",
+             "jar", ("stand", "wall")),
+            ("Look for the wine stored at the reception.", "wine", ("reception",)),
+            ("Go to the jar at the reception.", "jar", ("reception",)),
+            ("Polish the mirror near the chair.", "mirror", ("chair",)),
+            ("Go to the box used to store the book.", "box", ("book",)),
+            ("Look for the painting that is hanging the banners near the stairs.",
+             "painting", ("banners", "stairs")),
+            ("Locate the red and white pillow near the sofa.", "pillow", ("sofa",)),
+            ("Find the apple in the kitchen and bring it to the carpet.",
+             "carpet", ("apple", "kitchen")),
+            ("Start at the window and finish at the wardrobe near the carpet.",
+             "wardrobe", ("window", "carpet")),
+        )
+        for instruction, target, references in cases:
+            with self.subTest(instruction=instruction):
+                self.assertTrue(grounder.instruction_target_matches(instruction, target))
+                for reference in references:
+                    self.assertFalse(grounder.instruction_target_matches(instruction, reference), reference)
+        for instruction, labels in (
+                ("Place the apple on the table near the window.", ("apple", "table", "window")),
+                ("Put the book from the shelf in the basket.", ("book", "shelf", "basket"))):
+            for label in labels:
+                with self.subTest(instruction=instruction, label=label):
+                    self.assertFalse(grounder.instruction_target_matches(instruction, label))
+
     def test_mock_worker_subprocess_roundtrip_and_cleanup(self):
         import sys
         import numpy as np
