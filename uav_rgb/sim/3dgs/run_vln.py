@@ -824,7 +824,7 @@ def main(argv=None):
                    "sdtw": r["supplied_goal_sdtw"], "ne_m": r["supplied_goal_ne_m"],
                    "collision": r["collision"], "stopped": r["stopped"]} for r in rows
                   if "supplied_goal_success" in r],
-                  [failure for failure in failures if failure.get("supplied_goal_waypoint") is not None])),
+                  failures)),
               "target_goal_metrics": (vln.summarize([
                   {"success": r["target_success"], "oracle_success": r["target_oracle_success"],
                    "spl": r["target_spl"], "ne_m": r["target_ne_m"],

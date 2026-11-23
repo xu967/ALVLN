@@ -713,6 +713,23 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(report["supplied_goal_metrics"]["n_requested"], 2)
         self.assertEqual(report["supplied_goal_metrics"]["sr"], 0.5)
 
+    def test_swap_missing_partner_stays_in_supplied_goal_denominator(self):
+        failure = {"key": "s/r0/0", "split": "test", "type": "A",
+                   "error": "ValueError: no compatible swap partner"}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(runner, "run_scene", return_value=([], [failure])), \
+                mock.patch.object(runner.CfSitlParams, "from_json",
+                                  return_value=SimpleNamespace(profile=lambda: "test")):
+            rc = runner.main(["--scene", "fixture", "--policy", "teacher",
+                              "--counterfactual", "swap", "--out", tmp])
+            with open(os.path.join(tmp, "vln_eval.json"), encoding="utf-8") as report_file:
+                report = json.load(report_file)
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(report["overall"]["n_requested"], 1)
+        self.assertEqual(report["supplied_goal_metrics"]["n_requested"], 1)
+        self.assertEqual(report["supplied_goal_metrics"]["sr"], 0.0)
+
     def test_route_waypoint_success_does_not_hide_catalog_goal_miss(self):
         scene = copy.deepcopy(SCENE)
         scene.update(ply_path="unused.ply", reach_radius_m=1.0, max_steps=8)
