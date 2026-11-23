@@ -1183,225 +1183,126 @@ def _execute_run(mode, run_dir, contract):
     return 0
 
 
-def fork_probe():
-    """训练固定视觉、文本编码器上的导航行为探针。"""
+def stop_head():
+    """目标检测特征上的固定正则二分类停车头。"""
     import collections
-    import importlib.util
+    import importlib
     import numpy as np
     import torch
-    import torch.nn.functional as F
     from PIL import Image
-    from transformers import AutoModel, AutoTokenizer
+    from scipy.optimize import minimize
+    from scipy.special import expit
+    from scipy.stats import beta
+    from transformers import AutoModelForZeroShotObjectDetection, AutoProcessor
 
-    out = Path(__file__).parent
-    reg = json.loads((out / "registration.json").read_text())
-    fit_reg = reg
-    dense_dir=Path(reg["dense_source"])
-    sparse_dir=Path(reg["previous"])
-    data=sparse_dir/"combined"
-    mask_file = data / "fork_mask.json"
-    mask = json.loads(mask_file.read_text())
-    prev=out.parent/"exp-vln-search-train-20261124"
-    reg = json.loads((prev / "registration.json").read_text())
-    assert os.environ["CUDA_VISIBLE_DEVICES"] == reg["allowed_gpu_uuid"] and torch.cuda.device_count() == 1
-    torch.manual_seed(20261117)
-    torch.set_num_threads(4)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    loader = importlib.util.spec_from_file_location("r2_replay", reg["replay_parser"])
-    frozen = importlib.util.module_from_spec(loader)
-    loader.loader.exec_module(frozen)
-    weights = [w.cuda() for w in frozen.weights]
-    h, w = frozen.h, frozen.w
-    groups = {}
-    frames = {}
-    action_logs = {}
+    out=Path(__file__).resolve().parent
+    data=out.parent/"exp-vln-instructed-stop-data-20261124"
+    assert (data/"DONE").read_text().startswith("rc=0")
+    assert os.environ["CUDA_VISIBLE_DEVICES"]=="GPU-e9d01956-88db-b317-ea53-be3fb6cf7190" and torch.cuda.device_count()==1
+    samples=[json.loads(v) for v in (data/"samples.jsonl").read_text().splitlines() if v]
+    model_dir=out.parent/"baselines/grounding-dino-tiny/2e311b914779978895827276d44f59285fc49f95"
+    parser_dir=out.parent/"exp-vln-box-control-839934-20261124/default_runtime"
+    sys.path.insert(0,str(parser_dir))
+    parser=importlib.import_module("sim.3dgs.grounder")
+    proc=AutoProcessor.from_pretrained(model_dir,local_files_only=True)
+    model=AutoModelForZeroShotObjectDetection.from_pretrained(model_dir,local_files_only=True).eval().cuda()
+    cache={}
 
-    def read_rgb(path):
-        im = Image.open(path).convert("RGB").resize((w, h), Image.Resampling.BILINEAR)
-        return np.asarray(im)
-
-    def motion_before(path, step):
-        if path not in action_logs:
-            action_logs[path] = [json.loads(s) for s in (path/"actions.jsonl").open()]
-        return action_logs[path][step-1]["action_executed"] if step else 0
-
-    omitted = {}
-    for split in ("train", "development"):
-        rows = []
-        for pair in mask["pairs"]:
-            if pair["split"] != split:
-                continue
-            key = pair["pair"]
-            if pair["status"] != "strict_rgb_fork" or not all(a["fork_action"] in (1,2,3) for a in pair["arms"]):
-                omitted[key] = pair["status"]
-                continue
-            step = pair["first_unequal_executed_action_step"]
-            prior_frames = []
-            for arm in pair["arms"]:
-                img = Path(arm["fork_frame"])
-                prior_frames.append(hashlib.sha256(img.with_name(f"rgb_{max(0,step-1):05d}.png").read_bytes()).hexdigest())
-                if img not in frames:
-                    frames[img] = len(frames)
-                rows.append(dict(pair=key, rgb=str(img), image_index=frames[img], scene=pair["scene"],
-                                 target=arm["target"], original_instruction=arm["instruction"], step=step,
-                                 teacher_action=arm["fork_action"], prev_action=motion_before(img.parent, step)))
-            assert prior_frames[0]==prior_frames[1] and rows[-2]["prev_action"]==rows[-1]["prev_action"]
-            assert pair["rgb_equal_through_divergence"] and pair["physics_equal_through_divergence"]
-            assert rows[-1]["teacher_action"] != rows[-2]["teacher_action"]
-        groups[split]=rows
-    sparse_dev=groups.pop("development")
-    groups.clear()
-    source_hashes={}
-    for split in ["train","development"]:
-        for category, prefix in [("different",""),("same","equal_")]:
-            path=dense_dir/(prefix+split+".jsonl")
-            source_hashes[path.name]=hashlib.sha256(path.read_bytes()).hexdigest()
-            records=[]
-            for line in path.read_text().splitlines():
-                q=json.loads(line)
-                if not all(v in (1,2,3) for v in q["actions"]):
+    def measure(path,text):
+        key=(path,text)
+        if key in cache:
+            return cache[key]
+        phrase=parser._english_destination(text.lower().strip(" .")).strip(" .")
+        features=[0.]*7
+        record=dict(path=path,text=text,phrase=phrase,box=None,features=features,centered=False)
+        if phrase:
+            im=Image.open(path).convert("RGB");w,h=im.size
+            inp=proc(images=im,text=phrase+".",return_tensors="pt").to("cuda")
+            with torch.inference_mode():
+                predictions=model(**inp)
+            result=proc.post_process_grounded_object_detection(predictions,inp.input_ids,
+                        threshold=.4,text_threshold=.3,target_sizes=[(h,w)])[0]
+            expected=parser._tokens(phrase)
+            detections=sorted(zip(result["scores"].tolist(),result["boxes"].tolist(),result["text_labels"]),reverse=True)
+            for score,bbox,label in detections:
+                tokens=parser._tokens(label)
+                if not tokens or tokens!=expected[-len(tokens):]:
                     continue
-                assert (q["actions"][0]!=q["actions"][1])==(category=="different") and q["split"]==split
-                img=Path(q["rgb"])
-                with Image.open(img) as original:
-                    assert hashlib.sha256(original.convert("RGB").tobytes()).hexdigest()==q["rgb_sha256"]
-                if img not in frames:
-                    frames[img]=len(frames)
-                for i in range(2):
-                    records.append(dict(pair=q["pair"],stratum=category,rgb=str(img),image_index=frames[img],scene=q["scene"],
-                        target=q["targets"][i], original_instruction=q["instructions"][i], step=q["step"],teacher_action=q["actions"][i],
-                        prev_action=motion_before(img.parent,q["step"])))
-            groups[split+"_"+category]=records
-    groups["development_actual_fork"]=sparse_dev
-    vectors = []
-    paths = list(frames)
-    with torch.inference_mode():
-        for start in range(0,len(paths),32):
-            batch=[]
-            for p in paths[start:start+32]:
-                n=int(p.stem.split("_")[-1])
-                prev=p.with_name(f"rgb_{max(0,n-1):05d}.png")
-                batch.append(np.concatenate([read_rgb(p),read_rgb(prev)],axis=2))
-            t=torch.from_numpy(np.stack(batch)).permute(0,3,1,2).cuda().float()/255
-            for i in (0,2,4):
-                t=F.max_pool2d(F.relu(F.conv2d(t,weights[i],weights[i+1],padding=1)),2)
-            H=t.shape[2]; K=min(3,H)
-            strips=torch.stack([t[:,:,i*H//K:(i+1)*H//K].mean(2) for i in range(K)],dim=2)
-            vectors.append(F.normalize(strips.flatten(1)).cpu())
-    visual=torch.cat(vectors)
-    sentences=sorted({row["original_instruction"] for rows in groups.values() for row in rows})
-    tokenizer=AutoTokenizer.from_pretrained(reg["bert"],local_files_only=True)
-    encoder=AutoModel.from_pretrained(reg["bert"],local_files_only=True).eval().cuda()
-    texts={}
-    with torch.inference_mode():
-        for j in range(0,len(sentences),16):
-            batch=sentences[j:j+16]
-            tokens=tokenizer(batch,padding=True,return_tensors="pt").to("cuda")
-            states=encoder(**tokens).last_hidden_state
-            token_mask=tokens.attention_mask.unsqueeze(-1)
-            features=F.normalize((states*token_mask).sum(1)/token_mask.sum(1))
-            texts.update({s:e.cpu() for s,e in zip(batch,features)})
-    del encoder
-    torch.cuda.empty_cache()
+                x,y,X,Y=np.clip(bbox,0,[w,h,w,h])
+                cx,cy=(x+X)/(2*w),(y+Y)/(2*h)
+                touches=sum([x<=1,y<=1,X>=w-1,Y>=h-1])/4
+                features[:]=[1.,score,(X-x)/w,(Y-y)/h,abs(cx-.5),abs(cy-.5),touches]
+                record.update(box=bbox,match=label,centered=bool(1/3<=cx<2/3))
+                break
+        cache[key]=record
+        return record
 
-    def features(rows, mode):
-        packets=[]
-        for row_i,row in enumerate(rows):
-            phrase=row["original_instruction"]
-            if mode=="swap":
-                peers=[rows[row_i^1]["original_instruction"]]
-                if not peers: raise ValueError("swap requires a second supplied target in the same scene")
-                phrase=peers[0]
-            language=texts[phrase] if mode!="zero" else torch.zeros_like(texts[phrase])
-            previous=F.one_hot(torch.tensor(row["prev_action"]),4).float()
-            packets.append(torch.cat([visual[row["image_index"]],language,previous]))
-        return torch.stack(packets).cuda()
+    rows=[]
+    for x in samples:
+        is_train=x["split"]=="train"
+        assert str(x["scene"]) in ({"840139","841012","841150"} if is_train else {"839992"})
+        pair=[measure(p,x["instruction"]) for p in x["rgb_pair"]]
+        assert len(pair)==2 and x["rgb_pair"][0]!=x["rgb_pair"][1]
+        assert int(x["label"])==int(x["condition"]=="near_correct")
+        rows.append(dict(x,predictions=pair))
 
-    rr = {}
-    for split,data in groups.items():
-        assert data and len(data)%2==0
-        rr[split] = (features(data, "correct"), torch.tensor([e["teacher_action"]-1 for e in data],device="cuda"))
-    train_rows=groups["train_different"]+groups["train_same"]
-    strata={}
-    for i,q in enumerate(train_rows[::2]):
-        strata.setdefault(q["pair"],{}).setdefault(q["stratum"],[]).append(i)
-    pairs=sorted(strata)
-    rng=np.random.default_rng(20261117)
-    schedule=[]
-    for update in range(250):
-        picked=[]
-        for pair in rng.choice(pairs,size=32):
-            bins=strata[pair]
-            bucket=("different","same")[rng.integers(2)]
-            options=bins.get(bucket) or next(iter(bins.values()))
-            picked.append(rng.choice(options))
-        schedule.append(picked)
-    schedule=np.array(schedule)
-    train_y=torch.tensor([r["teacher_action"]-1 for r in train_rows],device="cuda")
-    result={"source_hashes":source_hashes,"omitted":omitted,"schedule_sha256":hashlib.sha256(schedule.tobytes()).hexdigest(),
-            "unique_train_pairs":len(pairs),"n_pairs_per_strata":{p:{q:len(v) for q,v in bins.items()} for p,bins in strata.items()},
-            "fork_mask_sha256":hashlib.sha256(mask_file.read_bytes()).hexdigest(),"arms":{},"records":groups}
-    for fit in ["dense_correct","dense_blank","sparse_ce"]:
-        train_x=features(train_rows,"zero" if fit=="dense_blank" else "correct")
-        torch.manual_seed(20261117)
-        net=torch.nn.Sequential(torch.nn.Linear(train_x.shape[1],48),torch.nn.Tanh(),torch.nn.Linear(48,3)).cuda()
-        if fit=="sparse_ce":
-            net.load_state_dict(torch.load(sparse_dir/"weights_imitation.pt",map_location="cuda",weights_only=True))
-        else:
-            optim=torch.optim.AdamW(net.parameters(),lr=.001,weight_decay=.0001)
-            for row in schedule:
-                idx=torch.from_numpy(row).cuda()
-                index=torch.stack([idx*2,idx*2+1],1).flatten()
-                loss=F.cross_entropy(net(train_x[index]),train_y[index])
-                optim.zero_grad(set_to_none=True)
-                loss.backward()
-                optim.step()
-            torch.save(net.cpu().state_dict(),out/f"weights_{fit}.pt")
-        net.cuda().eval()
-        summary={}
-        for split,rows in groups.items():
-            if split.startswith("train"):
-                continue
-            truth=rr[split][1].reshape(-1,2)
-            summary[split]={}
-            for mode in ["correct","swap","zero"]:
-                x=features(rows,mode)
-                with torch.inference_mode():
-                    preds=net(x).argmax(1).reshape(-1,2)
-                eq=preds==truth
-                ok=preds==(truth.flip(1) if mode=="swap" else truth)
-                summary[split][mode]=dict(pairs=len(rows)//2,both_supplied=int(ok.all(1).sum()),
-                    either_supplied=int(ok.any(1).sum()),one_side_accuracy=float(ok.float().mean()),
-                    both_original=int(eq.all(1).sum()),individual_predictions=(preds+1).tolist(),
-                    pair_action_labels=(truth+1).tolist(),split_predictions=int((preds[:,0]!=preds[:,1]).sum()))
-        result["arms"][fit]=summary
-    cohort=json.loads((sparse_dir/"registration.json").read_text())["cohorts"]
-    summary={}
-    for model,sub in result["arms"].items():
-        summary[model]={}
-        for subset,modes in sub.items():
-            ids=[q["pair"] for q in groups[subset][::2]]
-            summary[model][subset]={}
-            for cohort_name, pairs in cohort.items():
-                summary[model][subset][cohort_name]={}
-                for mode,stats in modes.items():
-                    truths=stats["pair_action_labels"]
-                    preds=stats["individual_predictions"]
-                    by_pair={}
-                    for pair in sorted(set(ids)&set(pairs)):
-                        idx=[i for i,k in enumerate(ids) if k==pair]
-                        corr=[[a==b for a,b in zip(preds[i],truths[i][::-1] if mode=="swap" else truths[i])] for i in idx]
-                        by_pair[pair]={"both":sum(map(all,corr)),"either":sum(map(any,corr)),"n":len(idx)}
-                    scores=[v["both"]/v["n"] for v in by_pair.values()]
-                    summary[model][subset][cohort_name][mode]={"pair_balanced_both_correct":float(np.mean(scores)) if scores else None,
-                                                              "registered_pairs":len([q for q in mask["pairs"] if q["pair"] in pairs and q["split"]=="development"]),
-                                                              "available_pairs":len(by_pair),"by_pair":by_pair}
-    (out/"summary.json").write_text(json.dumps(summary,indent=2)+"\n")
+    train=[(q,v) for q in rows if q["split"]=="train" for v in q["predictions"]]
+    counts=collections.Counter((q["condition"],q["group"]) for q,_ in train)
+    unique=collections.Counter(c for c,_ in counts)
+    assert len(unique)==3 and len(train)>0
+    weight=np.array([1/(unique[q["condition"]]*counts[(q["condition"],q["group"])]) for q,v in train])
+    weight*=len(weight)/weight.sum()
+    X=np.array([v["features"] for q,v in train]);y=np.array([q["label"] for q,v in train],dtype=float)
+    mean=X.mean(0); sd=X.std(0);sd[sd<1e-12]=1
+    Z=(X-mean)/sd
+    def loss(par):
+        logits=Z@par[:-1]+par[-1]
+        data_loss=np.dot(weight,np.logaddexp(0,logits)-y*logits)
+        residual=(expit(logits)-y)*weight
+        grad=np.r_[Z.T@residual+par[:-1],residual.sum()]
+        return data_loss+0.5*float(par[:-1]@par[:-1]),grad
+
+    opt=minimize(loss,np.zeros(8),jac=True,method="L-BFGS-B",options={"maxiter":500})
+    assert opt.success,opt.message
+    for row in rows:
+        for v in row["predictions"]:
+            v["score"]=float(expit((np.asarray(v["features"])-mean)/sd@opt.x[:-1]+opt.x[-1]))
+        row["baseline_stop"]=all(v["centered"] for v in row["predictions"])
+        row["candidate_stop"]=all(v["centered"] and v["score"]>=.5 for v in row["predictions"])
+
+    def interval(k,n):
+        if not n: return None
+        return [float(beta.ppf(.025,k,n-k+1)) if k else 0.,float(beta.ppf(.975,k+1,n-k)) if k<n else 1.]
+
+    groups={}
+    for split in ("train","development"):
+        split_rows=[r for r in rows if r["split"]==split]
+        complete={r["group"] for r in split_rows if {q["condition"] for q in split_rows if q["group"]==r["group"]}=={"near_correct","far_correct","near_wrong"}}
+        summary={"complete_groups":sorted(complete)}
+        for cond in ("near_correct","far_correct","near_wrong"):
+            cases=[r for r in split_rows if r["condition"]==cond]
+            vals={}
+            for m in ("baseline_stop","candidate_stop"):
+                grouped={k:[r[m] for r in cases if r["group"]==k] for k in {r["group"] for r in cases}}
+                status={k:all(v) if cond=="near_correct" else any(v) for k,v in grouped.items()}
+                k=sum(status.values());n=len(status)
+                vals[m]={"n":n,"confirmed":k,"interval":interval(k,n),"by_group":status}
+            summary[cond]=vals
+        groups[split]=summary
+    dev=groups["development"]
+    complete=dev["complete_groups"]
+    near=dev["near_correct"]["candidate_stop"]["by_group"]
+    baseline=dev["near_correct"]["baseline_stop"]["by_group"]
+    k=sum(near[q] for q in complete)
+    gate=(len(complete)>=3 and 2*k>=len(complete) and k>=sum(baseline[q] for q in complete)
+          and all(dev[c]["candidate_stop"]["confirmed"]==0 for c in ("near_wrong","far_correct")))
+    result={"groups":groups,"passed":bool(gate),"rows":rows,"mean":mean.tolist(),"stdev":sd.tolist(),
+            "classifier":opt.x.tolist(),"sample_sha256":hashlib.sha256((data/"samples.jsonl").read_bytes()).hexdigest(),
+            "source_sha256":hashlib.sha256(Path(__file__).read_bytes()).hexdigest()}
     (out/"results.json").write_text(json.dumps(result,indent=2,ensure_ascii=False)+"\n")
-    print({k:{s:stats["correct"]["both_supplied"] for s,stats in arm.items()} for k,arm in result["arms"].items()})
+    print("gate",gate,"dev complete",len(complete),"near confirmed",k,flush=True)
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(fork_probe() if sys.argv[1:] == ["dense_forks"] else main())
+    raise SystemExit(stop_head() if sys.argv[1:]==["stop_head"] else main())

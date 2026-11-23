@@ -1,0 +1,5 @@
+{
+  "before_release": "2026-11-24T02:52:54.961754+08:00",
+  "backend": "sklearn is absent in the frozen runtime; use scipy.optimize.minimize L-BFGS-B for the same weighted binary negative log likelihood plus 0.5*||w||^2 with unpenalized intercept (C=1, sum sample weights normalized to N), maxiter 500. No validation-based tuning.",
+  "boxes": "Use clamped image edges, normalized box coordinates from original resolution; edge fraction = # sides touching pixel bounds within 1 px / 4; absolute center offset in fractions of full image size. Horizontal middle third = centered. Per-instance 95% exact two-sided Clopper-Pearson intervals by condition. Train on two individual views of each supervised pair with original pair label, test actual consecutive-view confirmations. Count per distinct near goal; negatives grouped under the matched-near goal of same cohort triplet for scoring."
+}

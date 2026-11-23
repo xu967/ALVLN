@@ -1,0 +1,11 @@
+{
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-head-20261124/train.py": "6bd9fbb881fdd1aa6e2ee47f8ed2c7a3ad9cfc5f2821bf5e52ec55c5a63e8956",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-head-20261124/candidate.diff": "c77b864fc9513eea329dc4e427f4dceeea4941a0e5ef1ef9d5d6c4e5d056db86",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-head-20261124/registration.json": "2543e358ec488051b6e2c784a3edb6c7b664fd377931efa606450885ed592033",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-head-20261124/backend_adaptation.json": "c7ba79c0147bbf76b2748f97b226c50c47ff4fc4ee93349d4b33d6ee43e22abf",
+  "/root/rivermind-data/uav_rgb/exp-vln-stop-head-20261124/results.json": "dcd6de25ae455d026815300f74340e111cb0f7bb9c3f2cfa61ca916f17131dfa",
+  "/root/rivermind-data/uav_rgb/exp-vln-instructed-stop-data-20261124/samples.jsonl": "5670a410f90a84d498d1f67d2c40963bd81cc702d9c508497371d6c9ae6d5082",
+  "/root/rivermind-data/uav_rgb/exp-vln-instructed-stop-data-20261124/appearance_review.json": "868534bfd29918f79f000e7cce8cd65412eef0158a7f28b6e1b288681ca1d4fc",
+  "/root/rivermind-data/uav_rgb/exp-vln-box-control-839934-20261124/default_runtime/sim/3dgs/grounder.py": "9248fdf3f73e92b9d0475143f3cb33ac11ecaa67debde58edc526ec11e5dedce",
+  "/root/rivermind-data/uav_rgb/baselines/grounding-dino-tiny/2e311b914779978895827276d44f59285fc49f95/model.safetensors": "1a2412ef99bd74bcd3c2a246fa1e48581f8889a1300c9051974741314fc042f3"
+}
