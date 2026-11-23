@@ -145,6 +145,7 @@ class VlmBeliefTracker:
         self.trace.append({
             "step": self.step_idx,
             "raw_bearing_bin": raw_bb,
+            "raw_near_goal": vg.near_goal,
             "bearing_bin": eff_bb,
             "goal_mode": vg.goal_mode,
             "near_goal": eff_ng,

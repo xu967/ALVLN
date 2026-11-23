@@ -1191,6 +1191,8 @@ class TestRunner(unittest.TestCase):
         self.assertFalse(tracker.trace[1]["confirmed_target"])
         self.assertEqual(tracker.trace[-1]["goal_mode"], "final")
         self.assertTrue(tracker.trace[-1]["confirmed_target"])
+        self.assertEqual([(t["raw_near_goal"], t["near_goal"]) for t in tracker.trace[-2:]],
+                         [(1, 0), (1, 1)])
         self.assertEqual([t["miss_streak"] for t in tracker.trace], [1, 0, 1, 2, 0, 0])
 
     def test_reactive_bearing_commits_executed_turn_to_tracker(self):
