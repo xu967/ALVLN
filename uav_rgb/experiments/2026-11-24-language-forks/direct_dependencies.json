@@ -1,0 +1,28 @@
+{
+  "hashes": {
+    "/root/rivermind-data/uav_rgb/exp-vln-box-control-839934-20261124/replay_bearing.py": "646918afb821265fdfa3b116fac2cdf2c90d1f70d111d545801dadeb80de49cb",
+    "/root/rivermind-data/uav_rgb/exp-vln-box-control-839934-20261124/registration.json": "4f13bcd52c8befc40725c9afd4c19365963f09b852c8e8c36d9933f5d8958b3a",
+    "/root/rivermind-data/uav_rgb/exp-s1-dagger-r2-cleanaug-20261123/train_r2_subgoal/model/ckpt_best.bin": "513e95a7a26709ab38a0157453138ea28ef0dac663e8f267919c2c64e397e667",
+    "/root/rivermind-data/uav_rgb/hf-cache/hub/models--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/tokenizer_config.json": "a025160ef0431f1a392f6f050c1310f4c5d9fb6f275932dbccba73c4d214bf10",
+    "/root/rivermind-data/uav_rgb/hf-cache/hub/models--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/model.safetensors": "68d45e234eb4a928074dfd868cead0219ab85354cc53d20e772753c6bb9169d3",
+    "/root/rivermind-data/uav_rgb/hf-cache/hub/models--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/vocab.txt": "07eced375cec144d27c900241f3e339478dec958f92fddbc551f295c992038a3",
+    "/root/rivermind-data/uav_rgb/hf-cache/hub/models--bert-base-uncased/snapshots/86b5e0934494bd15c9632b12f734a8a67f723594/config.json": "7160e1553ad2ca51d8c1cb066be533db31826e12d173824c1bb0cb1a4f187d20",
+    "/root/rivermind-data/uav_rgb/exp-vln-search-train-20261124/registration.json": "851b4577617d256c1d8f5959d12e159452f077996cf5a566e8b2cc49288572f8",
+    "/root/rivermind-data/uav_rgb/exp-vln-search-train-20261124/train.py": "7c80c896e180adc2332d9572240997947f1bd7b238e11d76cf17d041c90b17a3",
+    "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-20261124/registration.json": "a43caab69695d93c638f25f0537f51a1b998543e058567e41eb9b195520dc491",
+    "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-20261124/train.py": "ae4334030d14eabceef0d51273f36b13ce7fb0cceff5b7bbfee78c7ac13d2f3b",
+    "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/registration.json": "562aa2e4513116fbc4c0d68d6862a0d54825eb229834735fe4f166017549cbd5",
+    "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/train.py": "ae4334030d14eabceef0d51273f36b13ce7fb0cceff5b7bbfee78c7ac13d2f3b",
+    "/root/rivermind-data/uav_rgb/exp-vln-dense-fork-search-20261124/registration.json": "0e62eff9b37aa795a4f9f118435ed6528796632b8e25761755b95aba7f6a8d7f",
+    "/root/rivermind-data/uav_rgb/exp-vln-dense-fork-search-20261124/train.py": "e79371f5eff1bc10048b99bec1dc743efcb6d92377d06168710c33c36cb06456",
+    "/root/rivermind-data/uav_rgb/exp-vln-search-train-20261124/inputs.json": "3645c5281d66988d2a6b9ac734380743a3756e0665f2679fe541089fe7de2bb5",
+    "/root/rivermind-data/uav_rgb/exp-vln-search-data-20261124/supervision/offline_relabel/train.jsonl": "f43250d367fb8a6d179bc4804df921f24caeac85e99abd75d301adf85ac42d06",
+    "/root/rivermind-data/uav_rgb/exp-vln-search-data-20261124/supervision/offline_relabel/development.jsonl": "8662a76a32157997107b08060dd2a35eeeb3e646f49036b075845046f354248f",
+    "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/combined/registration.json": "49fc276b8375b426c5d257415aa19dab1899eea8ad0a16cc8097dd02b808e436",
+    "/root/rivermind-data/uav_rgb/exp-vln-language-forks-20261124/fork_mask.json": "9e9ed0e06862bfedd7423dbb922fd1401d33dea2441eab435f4dbc042c22f468",
+    "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/fork_mask.json": "25c3b1485f11700d751f3c3d25638324a581cda84c9a675969076873025fe922",
+    "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/combined/fork_mask.json": "ebefed0712146475af08ebd808cb8218cf5ad91702c774e0c4a7169829d39494"
+  },
+  "raw_files": "Effective records enumerate exact RGB current paths. Previous RGB = sibling rgb_{max(step-1,0):05d}.png, executed previous action from sibling actions.jsonl. Original R2 diagnostic parser loads baseline registration to resolve checkpoint at import time. Every online student feature uses R2 frozen tensors. train.py loads neighboring registration(s) with path-dependent filenames. Dense authoritative source four JSONL files from exp-vln-fork-counterfactual-states-20261124 after complete 40-pair CPU audit. Exact input hashes written to dense results.json; logical dependencies referenced here prior to completion.",
+  "runtime": "/root/rivermind-data/uav_rgb/envs/vlm-venv/bin/python torch2.7.1+cu128 transformers5.23.0; GPU UUID fixed for identity."
+}

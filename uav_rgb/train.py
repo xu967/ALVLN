@@ -1196,10 +1196,12 @@ def fork_probe():
     out = Path(__file__).parent
     reg = json.loads((out / "registration.json").read_text())
     fit_reg = reg
-    data = Path(reg["data_registration"]).parent
+    dense_dir=Path(reg["dense_source"])
+    sparse_dir=Path(reg["previous"])
+    data=sparse_dir/"combined"
     mask_file = data / "fork_mask.json"
     mask = json.loads(mask_file.read_text())
-    prev = Path(reg["previous"]["reuse"])
+    prev=out.parent/"exp-vln-search-train-20261124"
     reg = json.loads((prev / "registration.json").read_text())
     assert os.environ["CUDA_VISIBLE_DEVICES"] == reg["allowed_gpu_uuid"] and torch.cuda.device_count() == 1
     torch.manual_seed(20261117)
@@ -1248,6 +1250,29 @@ def fork_probe():
             assert pair["rgb_equal_through_divergence"] and pair["physics_equal_through_divergence"]
             assert rows[-1]["teacher_action"] != rows[-2]["teacher_action"]
         groups[split]=rows
+    sparse_dev=groups.pop("development")
+    groups.clear()
+    source_hashes={}
+    for split in ["train","development"]:
+        for category, prefix in [("different",""),("same","equal_")]:
+            path=dense_dir/(prefix+split+".jsonl")
+            source_hashes[path.name]=hashlib.sha256(path.read_bytes()).hexdigest()
+            records=[]
+            for line in path.read_text().splitlines():
+                q=json.loads(line)
+                if not all(v in (1,2,3) for v in q["actions"]):
+                    continue
+                assert (q["actions"][0]!=q["actions"][1])==(category=="different") and q["split"]==split
+                img=Path(q["rgb"])
+                assert hashlib.sha256(img.read_bytes()).hexdigest()==q["rgb_sha256"]
+                if img not in frames:
+                    frames[img]=len(frames)
+                for i in range(2):
+                    records.append(dict(pair=q["pair"],stratum=category,rgb=str(img),image_index=frames[img],scene=q["scene"],
+                        target=q["targets"][i], original_instruction=q["instructions"][i], step=q["step"],teacher_action=q["actions"][i],
+                        prev_action=motion_before(img.parent,q["step"])))
+            groups[split+"_"+category]=records
+    groups["development_actual_fork"]=sparse_dev
     vectors = []
     paths = list(frames)
     with torch.inference_mode():
@@ -1281,10 +1306,10 @@ def fork_probe():
 
     def features(rows, mode):
         packets=[]
-        for row in rows:
+        for row_i,row in enumerate(rows):
             phrase=row["original_instruction"]
             if mode=="swap":
-                peers=[r["original_instruction"] for r in rows if r["pair"]==row["pair"] and r["target"]!=row["target"]]
+                peers=[rows[row_i^1]["original_instruction"]]
                 if not peers: raise ValueError("swap requires a second supplied target in the same scene")
                 phrase=peers[0]
             language=texts[phrase] if mode!="zero" else torch.zeros_like(texts[phrase])
@@ -1296,33 +1321,47 @@ def fork_probe():
     for split,data in groups.items():
         assert data and len(data)%2==0
         rr[split] = (features(data, "correct"), torch.tensor([e["teacher_action"]-1 for e in data],device="cuda"))
-    train_x, train_y = rr["train"]
+    train_rows=groups["train_different"]+groups["train_same"]
+    strata={}
+    for i,q in enumerate(train_rows[::2]):
+        strata.setdefault(q["pair"],{}).setdefault(q["stratum"],[]).append(i)
+    pairs=sorted(strata)
     rng=np.random.default_rng(20261117)
-    schedule=rng.integers(0,len(train_y)//2,size=(250,32))
-    result={"omitted":omitted,"schedule_sha256":hashlib.sha256(schedule.tobytes()).hexdigest(),
+    schedule=[]
+    for update in range(250):
+        picked=[]
+        for pair in rng.choice(pairs,size=32):
+            bins=strata[pair]
+            bucket=("different","same")[rng.integers(2)]
+            options=bins.get(bucket) or next(iter(bins.values()))
+            picked.append(rng.choice(options))
+        schedule.append(picked)
+    schedule=np.array(schedule)
+    train_y=torch.tensor([r["teacher_action"]-1 for r in train_rows],device="cuda")
+    result={"source_hashes":source_hashes,"omitted":omitted,"schedule_sha256":hashlib.sha256(schedule.tobytes()).hexdigest(),
+            "unique_train_pairs":len(pairs),"n_pairs_per_strata":{p:{q:len(v) for q,v in bins.items()} for p,bins in strata.items()},
             "fork_mask_sha256":hashlib.sha256(mask_file.read_bytes()).hexdigest(),"arms":{},"records":groups}
-    for fit in ["imitation","paired"]:
+    for fit in ["dense_correct","dense_blank","sparse_ce"]:
+        train_x=features(train_rows,"zero" if fit=="dense_blank" else "correct")
         torch.manual_seed(20261117)
         net=torch.nn.Sequential(torch.nn.Linear(train_x.shape[1],48),torch.nn.Tanh(),torch.nn.Linear(48,3)).cuda()
-        optim=torch.optim.AdamW(net.parameters(),lr=.001,weight_decay=.0001)
-        for row in schedule:
-            idx=torch.from_numpy(row).cuda()
-            index=torch.stack([idx*2,idx*2+1],1).flatten()
-            target=train_y[index]
-            logits=net(train_x[index])
-            loss=F.cross_entropy(logits,target)
-            if fit=="paired":
-                a,b=logits[::2],logits[1::2]
-                ya,yb=target[::2,None],target[1::2,None]
-                margin=(a.gather(1,ya)-a.gather(1,yb)+b.gather(1,yb)-b.gather(1,ya))/2
-                loss=loss+F.softplus(-margin).mean()
-            optim.zero_grad(set_to_none=True)
-            loss.backward()
-            optim.step()
-        torch.save(net.cpu().state_dict(),out/f"weights_{fit}.pt")
+        if fit=="sparse_ce":
+            net.load_state_dict(torch.load(sparse_dir/"weights_imitation.pt",map_location="cuda",weights_only=True))
+        else:
+            optim=torch.optim.AdamW(net.parameters(),lr=.001,weight_decay=.0001)
+            for row in schedule:
+                idx=torch.from_numpy(row).cuda()
+                index=torch.stack([idx*2,idx*2+1],1).flatten()
+                loss=F.cross_entropy(net(train_x[index]),train_y[index])
+                optim.zero_grad(set_to_none=True)
+                loss.backward()
+                optim.step()
+            torch.save(net.cpu().state_dict(),out/f"weights_{fit}.pt")
         net.cuda().eval()
         summary={}
         for split,rows in groups.items():
+            if split.startswith("train"):
+                continue
             truth=rr[split][1].reshape(-1,2)
             summary[split]={}
             for mode in ["correct","swap","zero"]:
@@ -1336,10 +1375,32 @@ def fork_probe():
                     both_original=int(eq.all(1).sum()),individual_predictions=(preds+1).tolist(),
                     pair_action_labels=(truth+1).tolist(),split_predictions=int((preds[:,0]!=preds[:,1]).sum()))
         result["arms"][fit]=summary
+    cohort=json.loads((sparse_dir/"registration.json").read_text())["cohorts"]
+    summary={}
+    for model,sub in result["arms"].items():
+        summary[model]={}
+        for subset,modes in sub.items():
+            ids=[q["pair"] for q in groups[subset][::2]]
+            summary[model][subset]={}
+            for cohort_name, pairs in cohort.items():
+                summary[model][subset][cohort_name]={}
+                for mode,stats in modes.items():
+                    truths=stats["pair_action_labels"]
+                    preds=stats["individual_predictions"]
+                    by_pair={}
+                    for pair in sorted(set(ids)&set(pairs)):
+                        idx=[i for i,k in enumerate(ids) if k==pair]
+                        corr=[[a==b for a,b in zip(preds[i],truths[i][::-1] if mode=="swap" else truths[i])] for i in idx]
+                        by_pair[pair]={"both":sum(map(all,corr)),"either":sum(map(any,corr)),"n":len(idx)}
+                    scores=[v["both"]/v["n"] for v in by_pair.values()]
+                    summary[model][subset][cohort_name][mode]={"pair_balanced_both_correct":float(np.mean(scores)) if scores else None,
+                                                              "registered_pairs":len([q for q in mask["pairs"] if q["pair"] in pairs and q["split"]=="development"]),
+                                                              "available_pairs":len(by_pair),"by_pair":by_pair}
+    (out/"summary.json").write_text(json.dumps(summary,indent=2)+"\n")
     (out/"results.json").write_text(json.dumps(result,indent=2,ensure_ascii=False)+"\n")
     print({k:{s:stats["correct"]["both_supplied"] for s,stats in arm.items()} for k,arm in result["arms"].items()})
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(fork_probe() if sys.argv[1:] == ["paired_forks"] else main())
+    raise SystemExit(fork_probe() if sys.argv[1:] == ["dense_forks"] else main())

@@ -1,0 +1,10 @@
+{
+  "registered_at": "2026-11-24T02:16:10.478530+08:00",
+  "previous": "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124",
+  "dense_source": "/root/rivermind-data/uav_rgb/exp-vln-fork-counterfactual-states-20261124",
+  "goal": "Can adding expert decisions on reachable states beyond the first fork improve language conditional generalization over sparse CE and dense no-language under identical capacity/updates?",
+  "sampling": "Uniform over eligible physical train route pairs, 32 routes per optimizer update with replacement. For each sampled pair, choose a prior-defined stratum with .5 probability, differential vs agreement. Then uniform over available authenticated non-STOP (F/L/R) windows of that pair and stratum. If a stratum is empty use the other. Always include both original instructions with corresponding expert actions on exactly the same RGB and previous real executed action. Same random draws for dense-correct and dense-zero, no explicit contrastive loss. Training cannot read development or withheld 839934/840818. Frozen vision/BERT, seed, optimizer, 250*64 training exposures as in expanded sparse run.",
+  "eval": "New 8 dev pairs primary, old 2 separately. Compare saved expanded sparse CE, dense correct, dense blank. Report original actual-fork whole pair correct, any side correct, both-branch address on each distinct route pair. For replayed camera states report per-route whole pair accuracy on differing and common-action strata and mean across routes, so dense frame multiplicity cannot dominate. Include swapped/blank. Only closed-loop success proves navigation gain.",
+  "promotion": "strict gain on actual new forks and route-averaged dense disagreements over both controls; report all denominators and informative reruns. Closed-loop for diagnostic comparison by parent/nativecohort.",
+  "base_script_sha256": "ae4334030d14eabceef0d51273f36b13ce7fb0cceff5b7bbfee78c7ac13d2f3b"
+}
