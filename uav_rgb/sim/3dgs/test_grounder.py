@@ -354,6 +354,16 @@ class TestVisualLanguageGrounder(unittest.TestCase):
              "carpet", ("apple", "kitchen")),
             ("Start at the window and finish at the wardrobe near the carpet.",
              "wardrobe", ("window", "carpet")),
+            ("Leave the cabinet and proceed to the main door at the entrance.",
+             "door", ("cabinet", "entrance")),
+            ("Go from the shelf to the track light at the far end of the showroom.",
+             "track light", ("shelf", "showroom")),
+            ("Go from the sofa to the chair and stop at the entrance.",
+             "entrance", ("sofa", "chair")),
+            ("Stop at the wardrobe at the end of the hall.",
+             "wardrobe", ("hall",)),
+            ("Bring the blanket to someone waiting at the door.",
+             "door", ("blanket",)),
         )
         for instruction, target, references in cases:
             with self.subTest(instruction=instruction):

@@ -257,6 +257,11 @@ _NEXT_ACTION = re.compile(
     r"place|position|put|set|showcase|stop|take|transfer|transport)\b)"
 )
 
+_NAVIGATION_VERB = re.compile(
+    r"\b(?:(?:go|fly|move|head|navigate|travel|proceed|walk)(?:\s+from\b[^,;.]*?)?|"
+    r"stop|finish|end|arrive)\s+$"
+)
+
 
 def _english_destination(command):
     command = command.removeprefix("please ")
@@ -275,6 +280,14 @@ def _english_destination(command):
     # 保留间接指令的既有目的地优先级。
     directions = list(re.finditer(r"(?<!next )\b(?:to|toward|towards|into|at)\b"
                                   r"(?!\s+the\s+(?:left|right)\s+of)", command))
+    # 带起点的运动指令中，终点名词后面的 at 引入地点修饰语。
+    if len(directions) >= 2 and directions[-1].group() == "at":
+        start, location = directions[-2:]
+        verb = command[:start.start()]
+        goal = command[start.end():location.start()].strip()
+        if (_NAVIGATION_VERB.search(verb) and re.match(r"(?:a|an|the)\s+", goal)
+                and not re.search(r"[,;.]|\b(?:and|then)\b", goal)):
+            return _MODIFIER_SPLIT.split(goal, maxsplit=1)[0]
     relations = list(_TARGET_RELATION.finditer(command))
     actions = list(_TARGET_ACTION.finditer(command))
     for matches in (directions, relations, actions):
