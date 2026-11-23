@@ -1183,7 +1183,7 @@ def _execute_run(mode, run_dir, contract):
     return 0
 
 
-def search_probe():
+def fork_probe():
     """训练固定视觉、文本编码器上的导航行为探针。"""
     import collections
     import importlib.util
@@ -1195,7 +1195,12 @@ def search_probe():
 
     out = Path(__file__).parent
     reg = json.loads((out / "registration.json").read_text())
-    manifests = json.loads((out / "inputs.json").read_text())
+    fit_reg = reg
+    data = Path(reg["data_registration"]).parent
+    mask_file = data / "fork_mask.json"
+    mask = json.loads(mask_file.read_text())
+    prev = Path(reg["previous"]["reuse"])
+    reg = json.loads((prev / "registration.json").read_text())
     assert os.environ["CUDA_VISIBLE_DEVICES"] == reg["allowed_gpu_uuid"] and torch.cuda.device_count() == 1
     torch.manual_seed(20261117)
     torch.set_num_threads(4)
@@ -1219,21 +1224,30 @@ def search_probe():
             action_logs[path] = [json.loads(s) for s in (path/"actions.jsonl").open()]
         return action_logs[path][step-1]["action_executed"] if step else 0
 
-    for split, spec in manifests.items():
-        path = Path(spec["path"])
-        assert hashlib.sha256(path.read_bytes()).hexdigest() == spec["sha256"]
-        rows = [json.loads(line) for line in path.open()]
-        rows = [row for row in rows if row["visibility_proxy"] == 0 and row["teacher_action"] in (1,2,3)
-                and (row["first_proxy_visible_step"] is None or row["step"] < row["first_proxy_visible_step"])]
-        assert rows and {str(row["scene"]) for row in rows} <= set(reg["train_scenes" if split=="train" else "dev_scenes"])
-        for row in rows:
-            p = Path(row["rgb"])
-            if p not in frames:
-                frames[p] = len(frames)
-            row["image_index"] = frames[p]
-            row["prev_action"] = motion_before(p.parent, row["step"])
-        groups[split] = rows
-    assert not ({row["trace_sha256"] for row in groups["train"]} & {row["trace_sha256"] for row in groups["development"]})
+    omitted = {}
+    for split in ("train", "development"):
+        rows = []
+        for pair in mask["pairs"]:
+            if pair["split"] != split:
+                continue
+            key = pair["pair"]
+            if pair["status"] != "strict_rgb_fork" or not all(a["fork_action"] in (1,2,3) for a in pair["arms"]):
+                omitted[key] = pair["status"]
+                continue
+            step = pair["first_unequal_executed_action_step"]
+            prior_frames = []
+            for arm in pair["arms"]:
+                img = Path(arm["fork_frame"])
+                prior_frames.append(hashlib.sha256(img.with_name(f"rgb_{max(0,step-1):05d}.png").read_bytes()).hexdigest())
+                if img not in frames:
+                    frames[img] = len(frames)
+                rows.append(dict(pair=key, rgb=str(img), image_index=frames[img], scene=pair["scene"],
+                                 target=arm["target"], original_instruction=arm["instruction"], step=step,
+                                 teacher_action=arm["fork_action"], prev_action=motion_before(img.parent, step)))
+            assert prior_frames[0]==prior_frames[1] and rows[-2]["prev_action"]==rows[-1]["prev_action"]
+            assert pair["rgb_equal_through_divergence"] and pair["physics_equal_through_divergence"]
+            assert rows[-1]["teacher_action"] != rows[-2]["teacher_action"]
+        groups[split]=rows
     vectors = []
     paths = list(frames)
     with torch.inference_mode():
@@ -1270,7 +1284,7 @@ def search_probe():
         for row in rows:
             phrase=row["original_instruction"]
             if mode=="swap":
-                peers=sorted({r["original_instruction"] for r in rows if r["scene"]==row["scene"] and r["target"]!=row["target"]})
+                peers=[r["original_instruction"] for r in rows if r["pair"]==row["pair"] and r["target"]!=row["target"]]
                 if not peers: raise ValueError("swap requires a second supplied target in the same scene")
                 phrase=peers[0]
             language=texts[phrase] if mode!="zero" else torch.zeros_like(texts[phrase])
@@ -1278,70 +1292,54 @@ def search_probe():
             packets.append(torch.cat([visual[row["image_index"]],language,previous]))
         return torch.stack(packets).cuda()
 
-    def labels(rows):
-        return torch.tensor([r["teacher_action"]-1 for r in rows],device="cuda")
-
-    def route_groups(rows):
-        clusters=collections.defaultdict(list)
-        for j,row in enumerate(rows):
-            clusters[str(row["scene"])+"/"+row["raw_route"]].append(j)
-        return clusters
-
-    train,dev=groups["train"],groups["development"]
-    clusters=route_groups(train)
-    routes=sorted(clusters)
-    generator=np.random.default_rng(20261117)
-    schedule=np.array([[generator.choice(clusters[r]) for r in generator.choice(routes,size=64)] for _ in range(250)])
+    rr = {}
     for split,data in groups.items():
-        (out/f"effective_{split}.jsonl").write_text("".join(json.dumps(r,ensure_ascii=False)+"\n" for r in data))
-    train_y=labels(train)
-    dev_y=labels(dev).cpu().numpy()
-    validation={m:features(dev,m) for m in ("correct","swap","zero")}
-    report={"seed":20261117,"schedule_sha256":hashlib.sha256(schedule.tobytes()).hexdigest(),"unique_images":len(paths),"unique_sentences":len(sentences),
-            "windows":{s:len(rr) for s,rr in groups.items()},"unique_routes":{s:len(route_groups(rr)) for s,rr in groups.items()},"arms":{}}
-
-    def metric(y,p):
-        matrix=np.bincount(3*y+p,minlength=9).reshape(3,3)
-        denominator=matrix.sum(0)+matrix.sum(1)
-        f1=np.divide(2*np.diag(matrix),denominator,out=np.zeros(3),where=denominator!=0)
-        return {"macro_F1":float(f1.mean()),"accuracy":float((y==p).mean()),"confusion_F_L_R":matrix.tolist()}
-
-    predictions={}
-    for fit_mode in ("correct","zero"):
-        train_x=features(train,fit_mode)
+        assert data and len(data)%2==0
+        rr[split] = (features(data, "correct"), torch.tensor([e["teacher_action"]-1 for e in data],device="cuda"))
+    train_x, train_y = rr["train"]
+    rng=np.random.default_rng(20261117)
+    schedule=rng.integers(0,len(train_y)//2,size=(250,32))
+    result={"omitted":omitted,"schedule_sha256":hashlib.sha256(schedule.tobytes()).hexdigest(),
+            "fork_mask_sha256":hashlib.sha256(mask_file.read_bytes()).hexdigest(),"arms":{},"records":groups}
+    for fit in ["imitation","paired"]:
         torch.manual_seed(20261117)
         net=torch.nn.Sequential(torch.nn.Linear(train_x.shape[1],48),torch.nn.Tanh(),torch.nn.Linear(48,3)).cuda()
-        opt=torch.optim.AdamW(net.parameters(),lr=0.001,weight_decay=0.0001)
-        for batch in schedule:
-            opt.zero_grad(set_to_none=True)
-            F.cross_entropy(net(train_x[batch]),train_y[batch]).backward()
-            opt.step()
-        torch.save(net.cpu().state_dict(),out/f"weights_{fit_mode}.pt")
+        optim=torch.optim.AdamW(net.parameters(),lr=.001,weight_decay=.0001)
+        for row in schedule:
+            idx=torch.from_numpy(row).cuda()
+            index=torch.stack([idx*2,idx*2+1],1).flatten()
+            target=train_y[index]
+            logits=net(train_x[index])
+            loss=F.cross_entropy(logits,target)
+            if fit=="paired":
+                a,b=logits[::2],logits[1::2]
+                ya,yb=target[::2,None],target[1::2,None]
+                margin=(a.gather(1,ya)-a.gather(1,yb)+b.gather(1,yb)-b.gather(1,ya))/2
+                loss=loss+F.softplus(-margin).mean()
+            optim.zero_grad(set_to_none=True)
+            loss.backward()
+            optim.step()
+        torch.save(net.cpu().state_dict(),out/f"weights_{fit}.pt")
         net.cuda().eval()
-        report["arms"][fit_mode]={}
-        for mode,v in validation.items():
-            with torch.inference_mode():pred=net(v).argmax(1).cpu().numpy()
-            predictions[fit_mode,mode]=pred
-            all_stats=metric(dev_y,pred)
-            acquired=np.array([r["first_proxy_visible_step"] is not None for r in dev])
-            all_stats["acquired_proxy_subset"]=metric(dev_y[acquired],pred[acquired]) if acquired.any() else None
-            all_stats["by_route"]={k:metric(dev_y[idx],pred[idx]) for k,idx in route_groups(dev).items()}
-            report["arms"][fit_mode][mode]=all_stats
-    rr=route_groups(dev)
-    rng=np.random.default_rng(20261117)
-    comparisons=[("fit_zero_eval_zero",("zero","zero")),("fit_correct_eval_swap",("correct","swap")),("fit_correct_eval_zero",("correct","zero"))]
-    ci={k:[] for k,_ in comparisons}; ordered=sorted(rr)
-    for _ in range(2000):
-        sample=np.concatenate([rr[k] for k in rng.choice(ordered,len(ordered))])
-        actual=metric(dev_y[sample],predictions["correct","correct"][sample])["macro_F1"]
-        for name,key in comparisons:
-            ci[name].append(actual-metric(dev_y[sample],predictions[key][sample])["macro_F1"])
-    report["cluster_bootstrap_delta_F1_95"]={k:np.percentile(v,[2.5,97.5]).tolist() for k,v in ci.items()}
-    report["dev_predictions"]={fit+"_"+mode:arr.tolist() for (fit,mode),arr in predictions.items()}
-    (out/"results.json").write_text(json.dumps(report,indent=2)+"\n")
-    print({k:{m:round(st["macro_F1"],4) for m,st in a.items()} for k,a in report["arms"].items()}, flush=True)
+        summary={}
+        for split,rows in groups.items():
+            truth=rr[split][1].reshape(-1,2)
+            summary[split]={}
+            for mode in ["correct","swap","zero"]:
+                x=features(rows,mode)
+                with torch.inference_mode():
+                    preds=net(x).argmax(1).reshape(-1,2)
+                eq=preds==truth
+                ok=preds==(truth.flip(1) if mode=="swap" else truth)
+                summary[split][mode]=dict(pairs=len(rows)//2,both_supplied=int(ok.all(1).sum()),
+                    either_supplied=int(ok.any(1).sum()),one_side_accuracy=float(ok.float().mean()),
+                    both_original=int(eq.all(1).sum()),individual_predictions=(preds+1).tolist(),
+                    pair_action_labels=(truth+1).tolist(),split_predictions=int((preds[:,0]!=preds[:,1]).sum()))
+        result["arms"][fit]=summary
+    (out/"results.json").write_text(json.dumps(result,indent=2,ensure_ascii=False)+"\n")
+    print({k:{s:stats["correct"]["both_supplied"] for s,stats in arm.items()} for k,arm in result["arms"].items()})
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(search_probe() if sys.argv[1:] == ["language_search_probe"] else main())
+    raise SystemExit(fork_probe() if sys.argv[1:] == ["paired_forks"] else main())

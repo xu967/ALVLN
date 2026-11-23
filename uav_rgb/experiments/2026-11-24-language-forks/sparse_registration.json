@@ -1,0 +1,228 @@
+{
+  "registered_at": "2026-11-24T01:59:30.511614+08:00",
+  "data_registration": "/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/combined/registration.json",
+  "data_registration_sha256": "49fc276b8375b426c5d257415aa19dab1899eea8ad0a16cc8097dd02b808e436",
+  "all_pairs": [
+    [
+      "840139_tr_115_tr_155",
+      "train"
+    ],
+    [
+      "840139_tr_43_tr_102",
+      "train"
+    ],
+    [
+      "841012_tr_19_tr_47",
+      "train"
+    ],
+    [
+      "841012_tr_58_tr_59",
+      "train"
+    ],
+    [
+      "841150_tr_62_tr_86",
+      "train"
+    ],
+    [
+      "841150_tr_30_tr_57",
+      "train"
+    ],
+    [
+      "839992_tr_34_tr_175",
+      "development"
+    ],
+    [
+      "839992_tr_149_tr_190",
+      "development"
+    ],
+    [
+      "840139_tr_20_tr_53",
+      "train"
+    ],
+    [
+      "840139_tr_105_tr_156",
+      "train"
+    ],
+    [
+      "840139_tr_39_tr_70",
+      "train"
+    ],
+    [
+      "840139_tr_100_tr_133",
+      "train"
+    ],
+    [
+      "840139_tr_38_tr_122",
+      "train"
+    ],
+    [
+      "840139_tr_37_tr_110",
+      "train"
+    ],
+    [
+      "840139_tr_40_tr_138",
+      "train"
+    ],
+    [
+      "840139_tr_83_tr_104",
+      "train"
+    ],
+    [
+      "841012_tr_5_tr_36",
+      "train"
+    ],
+    [
+      "841012_tr_16_tr_28",
+      "train"
+    ],
+    [
+      "841012_tr_40_tr_100",
+      "train"
+    ],
+    [
+      "841012_tr_29_tr_75",
+      "train"
+    ],
+    [
+      "841012_tr_25_tr_79",
+      "train"
+    ],
+    [
+      "841012_tr_6_tr_12",
+      "train"
+    ],
+    [
+      "841012_tr_24_tr_102",
+      "train"
+    ],
+    [
+      "841012_tr_71_tr_101",
+      "train"
+    ],
+    [
+      "841150_tr_37_tr_84",
+      "train"
+    ],
+    [
+      "841150_tr_27_tr_93",
+      "train"
+    ],
+    [
+      "841150_tr_53_tr_80",
+      "train"
+    ],
+    [
+      "841150_tr_29_tr_69",
+      "train"
+    ],
+    [
+      "841150_tr_68_tr_91",
+      "train"
+    ],
+    [
+      "841150_tr_26_tr_82",
+      "train"
+    ],
+    [
+      "841150_tr_43_tr_58",
+      "train"
+    ],
+    [
+      "841150_tr_47_tr_71",
+      "train"
+    ],
+    [
+      "839992_tr_28_tr_55",
+      "development"
+    ],
+    [
+      "839992_tr_50_tr_183",
+      "development"
+    ],
+    [
+      "839992_tr_118_tr_136",
+      "development"
+    ],
+    [
+      "839992_tr_86_tr_156",
+      "development"
+    ],
+    [
+      "839992_tr_10_tr_171",
+      "development"
+    ],
+    [
+      "839992_tr_161_tr_166",
+      "development"
+    ],
+    [
+      "839992_tr_85_tr_159",
+      "development"
+    ],
+    [
+      "839992_tr_129_tr_160",
+      "development"
+    ]
+  ],
+  "fit_design": "3-way action labels F/L/R. Accept first expert divergence iff both expert labels in 1/2/3 and byte-identical current+previous RGB and earlier executed actions agree, no prior collision and same previous action. Earlier STOP, collision, no fork or failure reported as ineligible without replacing pair. Exact same frozen R2 conv feature and BERT embeddings, prev action, tanh 48-classifier, seed 20261117, AdamW lr .001 wd .0001, 250 updates, per update sample 32 train pairs uniform replacement giving 64 observations. Train only these paired fork examples for identifiability. No augmented data or backprop on dev. Both arms see identical batches.",
+  "loss": "CE across all 64 route-instruction actions; candidate add unit-weight softplus(-D) where D = .5*((logit_A[a]-logit_A[b])+(logit_B[b]-logit_B[a])), one margin per pair. Evaluate train/dev each distinct pair once under original instruction, paired partner instruction (swap should reverse both actions), empty. Swapped instruction scored against both supplied and original; duplicated side/paths are not replicated trials. Report both/any correct and accuracy; two dev pairs preselected, missing remain in accounting. No threshold tuning or retrospective replacements.",
+  "previous": {
+    "ntrain_routes": 38,
+    "ndev_routes": 8,
+    "dev_windows": 321,
+    "correct_f1": 0.3767,
+    "vision_only_f1": 0.3856,
+    "correct_minus_swap_changed": 5,
+    "reuse": "/root/rivermind-data/uav_rgb/exp-vln-search-train-20261124",
+    "train_py_sha256": "7c80c896e180adc2332d9572240997947f1bd7b238e11d76cf17d041c90b17a3"
+  },
+  "gate": "Training both correct demonstrates memorization only. Dev candidate strictly more whole correct pairs than imitation baseline and correct beats zero, under actual available pairs; retained effect requires independent larger trials and navigation evaluation. Never infer end-to-end benefit from teacher fork prediction.",
+  "code_lock": "ae4334030d14eabceef0d51273f36b13ce7fb0cceff5b7bbfee78c7ac13d2f3b",
+  "cohorts": {
+    "old": [
+      "840139_tr_115_tr_155",
+      "840139_tr_43_tr_102",
+      "841012_tr_19_tr_47",
+      "841012_tr_58_tr_59",
+      "841150_tr_62_tr_86",
+      "841150_tr_30_tr_57",
+      "839992_tr_34_tr_175",
+      "839992_tr_149_tr_190"
+    ],
+    "new": [
+      "840139_tr_20_tr_53",
+      "840139_tr_105_tr_156",
+      "840139_tr_39_tr_70",
+      "840139_tr_100_tr_133",
+      "840139_tr_38_tr_122",
+      "840139_tr_37_tr_110",
+      "840139_tr_40_tr_138",
+      "840139_tr_83_tr_104",
+      "841012_tr_5_tr_36",
+      "841012_tr_16_tr_28",
+      "841012_tr_40_tr_100",
+      "841012_tr_29_tr_75",
+      "841012_tr_25_tr_79",
+      "841012_tr_6_tr_12",
+      "841012_tr_24_tr_102",
+      "841012_tr_71_tr_101",
+      "841150_tr_37_tr_84",
+      "841150_tr_27_tr_93",
+      "841150_tr_53_tr_80",
+      "841150_tr_29_tr_69",
+      "841150_tr_68_tr_91",
+      "841150_tr_26_tr_82",
+      "841150_tr_43_tr_58",
+      "841150_tr_47_tr_71",
+      "839992_tr_28_tr_55",
+      "839992_tr_50_tr_183",
+      "839992_tr_118_tr_136",
+      "839992_tr_86_tr_156",
+      "839992_tr_10_tr_171",
+      "839992_tr_161_tr_166",
+      "839992_tr_85_tr_159",
+      "839992_tr_129_tr_160"
+    ]
+  },
+  "primary": "Newly selected dev pairs separately from previously examined old 2. Also pooled training and combined dev. Exact paired McNemar by new physical pair on both-correct outcome; cluster-aware descriptive if dependent. No held-out scene read."
+}
