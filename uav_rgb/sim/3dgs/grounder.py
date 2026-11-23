@@ -248,6 +248,7 @@ _PLACEMENT_SITE = re.compile(
     r"\s+(?:(?:right\s+)?next\s+to|beside|near|close\s+to|into|onto|"
     r"(?:on|in)(?=\s+(?:the|a|an)\s+[a-z-]+(?:\s+[a-z-]+)?$))\s+"
 )
+_PRONOUN_PLACEMENT = re.compile(r"(?:place|put)\s+(?:it|them)\s+(?:in|on|into|onto)\s+(?=(?:the|a|an)\s)")
 _ENDPOINT_MODIFIER = re.compile(
     r"\b(?:that|which|where|at|nearest(?=\s+(?:the|a|an)\b)|closest\s+to|close\s+to|"
     r"[a-z]+(?:ed|ing)\s+(?:for|to)|stored(?=\s+(?:[a-z]+ly|at|in|on)\b))\b"
@@ -265,9 +266,12 @@ _NAVIGATION_VERB = re.compile(
 
 def _english_destination(command):
     command = command.removeprefix("please ")
-    if _MAIN_TARGET.match(command):
-        command = _NEXT_ACTION.split(command)[-1].strip()
-    marker = _MAIN_TARGET.match(command) or _PLACEMENT_SITE.match(command)
+    final_action = _NEXT_ACTION.split(command)[-1].strip()
+    # “take the pillow and place it in the cabinet near the fridge” 的终点由最后的放置动作确定。
+    placement = _PRONOUN_PLACEMENT.match(final_action)
+    if placement or _MAIN_TARGET.match(command):
+        command = final_action
+    marker = placement or _MAIN_TARGET.match(command) or _PLACEMENT_SITE.match(command)
     if marker:
         raw_goal = command[marker.end():].removeprefix("that ")
         head = _MODIFIER_SPLIT.split(raw_goal, maxsplit=1)[0]
