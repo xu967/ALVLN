@@ -45,6 +45,12 @@ CPU 用真实双帧和权重复现了 332/332 个学生提议。四个语言请�
 
 **精确分岔的首轮验证。** 在三个训练房间分别取两对，另一个开发房间取两对。每对让两个教师使用同一物理种子。8/8 对的首帧、分歧前的物理状态、RGB、深度和已执行动作都一致，分歧处两条指令要求不同动作。16 次示教共 839 窗，15 次成功停靠、零碰撞。两种模型在相同的 250 次更新、每批 32 对、相同编码器和种子下训练。普通动作模仿及加配对损失均能答对训练的 6/6 对。开发上两者都只答对 1/2 对；另一对的两条指令都预测左转。空指令在两个开发分岔都选择前进，因此完整答对 0/2 对。说明这个小样本已有指令敏感的行为，尚无额外配对损失提高泛化的证据。[原始动作与图像哈希](/root/rivermind-data/uav_rgb/exp-vln-language-forks-20261124/fork_mask.json) · [两种训练逐对结果](/root/rivermind-data/uav_rgb/exp-vln-fork-loss-20261124/results.json)
 
+同一地图教师、语言基线和保持方位候选，在两条正确指令上的真实飞行轨迹与累计绝对偏航已按 0.5 秒动作窗对齐。壁灯与橱柜各列的十字为该次实际起点，圆圈为指令目标的 1 m 区域，点、叉、方块分别代表教师自主停下、基线碰撞、保持方位超时。绝对偏航衡量总转量，不能据此推断真机振动。[查看两目标轨迹与转向图](/root/rivermind-data/uav_rgb/exp-vln-new-scenes-20261124/controls/trajectories_and_yaw.png)
+
+### 开源对照的比较条件
+
+本项目在室内 1 m 水平目标圈内要求自主停机，同时报告按实际输入指令计算的 SR、OSR、SPL、NE、碰撞与错停。AerialVLN 原论文使用城市空中场景，OpenFlyV2 的官方闭环条件为距目标 25 m 内显式停止。它们提供了指标与评测协议的参照。要比较方法排名，需将公开策略接入相同的室内相机、动作窗、停止合同和路线，再执行配对飞行。已经完成的公开模型实测限于目标定位和采用该模型的闭环候选。[AerialVLN 原论文](https://openaccess.thecvf.com/content/ICCV2023/html/Liu_AerialVLN_Vision-and-Language_Navigation_for_UAVs_ICCV_2023_paper.html) · [OpenFlyV2 官方协议](https://ideal-ljl.github.io/AeroBrain/) · [SAGE-3D 官方指标](https://sage-3d.github.io/)
+
 ### 相机能看到任务要求的目标吗
 
 六个旧场景实际导入 578 条单阶段路线，其中 566 条能关联官方实例。在模型的标称定高、水平安装和 1 m 停靠圆内，即便允许任意朝向和圆内任意位置，119/566 条路线的目标仍完全超出相机的垂直视场。将允许姿态倾角增加到 10°、高度变化增加到 ±0.10 m，保守推算仍有 63/566 条无法入画。余下样本还可能被墙体挡住。841980 的四条 R2 语言闭环共 175 张决策帧，85 张的目标框在画外，其余 90 张的全部 55,338 条框内像素射线在到框前击中代理网格。89 次 VLM 更新却有 17 次宣告终点可见。单靠增加目标记忆长度，对这些从未取得过可见证据的飞行无济于事。[可观测性审计](/root/rivermind-data/uav_rgb/exp-vln-stage0-pairs-20261123/terminal_target_observability.json) · [逐帧视线和 VLM 判断](/root/rivermind-data/uav_rgb/exp-vln-region-probe-20261123/instance_projection/r2_grounding_history.json)

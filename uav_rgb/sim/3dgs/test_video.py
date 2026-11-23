@@ -105,6 +105,18 @@ class TestEpisodeResult(unittest.TestCase):
         self.assertEqual(video.episode_result(man, _oracle((10., 0.)), 1., actions=actions),
                          "UNSCORED | goal unavailable")
 
+    def test_empty_instruction_hides_original_goal_even_when_agent_stops_there(self):
+        actions = [{"pose_before": {"x": 0., "y": 0.}, "collision": False}]
+        for task in ({"counterfactual": "zero"}, {"text": "go to chair", "supplied_text": ""}):
+            with self.subTest(task=task):
+                self.assertIsNone(video._video_waypoint(task, WP))
+                self.assertEqual(video.instruction_banner(task), "[empty instruction]")
+                man = {"vln": task, "waypoint": WP, "stopped_by_agent": True}
+                self.assertEqual(video.episode_result(man, _oracle((10., 0.)), 1., actions=actions),
+                                 "STOP | UNSCORED EMPTY INSTRUCTION")
+                self.assertEqual(video.episode_result(man, _oracle((10., 0.)), 1.,
+                                                      actions=[dict(actions[0], collision=True)]), "COLLISION")
+
     def test_swapped_multistage_replay_requires_ordered_partner_stages(self):
         partner = {"name": "other", "route_contract": "sage.multi_stage.v2", "instruction": "Go via the lamp.",
                    "stages": [{"waypoint": {"x": 0., "y": 4.}}, {"waypoint": WP}]}
@@ -228,7 +240,7 @@ class TestVlnReplay(unittest.TestCase):
                 cases = [({}, '"go to chair"', "NO STOP 0.0 m"),
                          ({"counterfactual": "swap", "supplied_text": "go to the window",
                            "supplied_goal_waypoint": {"x": 4., "y": 0.}}, '"go to the window"', "NO STOP 6.0 m"),
-                         ({"supplied_text": ""}, "[empty instruction]", "NO STOP 0.0 m")]
+                         ({"supplied_text": ""}, "[empty instruction]", "NO STOP | UNSCORED EMPTY INSTRUCTION")]
                 for fields, banner, result in cases:
                     with self.subTest(fields=fields):
                         with open(os.path.join(ep, "episode_manifest.json"), "w") as f:

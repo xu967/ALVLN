@@ -8,6 +8,10 @@
 
 同种子分岔示教 8 对、16 集已完成，8 对均验证相同画面需要不同专家动作。普通模仿和额外配对损失均在 6 个训练分岔完整答对，开发均为 1/2 对，空指令 0/2 对。[首次分歧记录](/root/rivermind-data/uav_rgb/exp-vln-language-forks-20261124/fork_mask.json) · [训练对照](/root/rivermind-data/uav_rgb/exp-vln-fork-loss-20261124/results.json)
 
+24 对新增训练、8 对新增开发，同一出生位姿各飞两条指令，共 64 集。0 号卡采集进程组 995689 于北京时间 01:59 启动，按 8,354 窗上限和准备时间预计 02:21 完成。其后自动使用同一版 `train.py paired_forks` 比较普通模仿与配对损失，进程组 997102 预计 02:22 完成。两作业详情、原始命令、run.log 与 DONE 在各登记文件同目录。需要中止时分别执行 `kill -- -995689`、`kill -- -997102`。新增开发结果按独立路线对统计，另报旧 2 对。[采集登记](/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/job.json) · [训练登记](/root/rivermind-data/uav_rgb/exp-vln-fork-loss-expanded-20261124/job.json)
+
+录像修复后，839934 空指令两集均显示未停机、目标不计分。旧字幕分别写成距原目标 4.6 m 和 8.6 m。原句和交换指令的四集均显示碰撞。[逐集复核](/root/rivermind-data/uav_rgb/exp-vln-box-control-839934-20261124/video_score_audit.json)
+
 841980 固定权重的低纹理 STOP 对照已于 01:01:52 CST 以 rc=0 结束，只用物理 GPU0。错误停靠由 1/4 降到 0/4，碰撞由 2/4 升到 3/4，成功仍为 0/4。已按登记淘汰该候选。官方实例标签与代理网格显示原错停的真实出风口受到遮挡。已完成公开目标检测器冻结帧对照，并在新开发房间 839934 冻结同起点目标配对，840818 用于后续留出验证。[论文计划](docs/experiments/2026-11-21-vln-paper-plan.md)
 
 两组制动候选在同两条开发路线上成功均为 0/2，碰撞分别为 1/2、2/2。默认门控 28 集的 1,510 个执行动作与改写记录重放一致，16 次首次碰撞前的最后四窗（含碰撞窗）均无动作改写。[制动与稳定转向诊断](docs/experiments/2026-11-23-brake-stability-diagnostic.md)

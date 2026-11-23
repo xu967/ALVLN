@@ -259,10 +259,16 @@ def _video_trace(trace):
     return [trace[int(i)] for i in indices]
 
 
+def empty_instruction(task):
+    return bool(task) and (task.get("counterfactual") == "zero" or task.get("supplied_text") == "")
+
+
 def instruction_banner(vln):
     """优先显示实际输入；空指令也是一次实验干预。"""
     if not vln:
         return ""
+    if empty_instruction(vln):
+        return "[empty instruction]"
     if "supplied_text" in vln:
         supplied = vln["supplied_text"]
         return f'"{supplied}"' if supplied else "[empty instruction]"
@@ -273,6 +279,8 @@ def instruction_banner(vln):
 
 
 def _video_waypoint(task, original):
+    if empty_instruction(task):
+        return None
     if (task or {}).get("counterfactual") != "swap":
         return original
     point = task.get("supplied_goal_waypoint")
@@ -592,6 +600,18 @@ def video_policy(man):
     return "teacher"
 
 
+def navigation_result(metrics, *, empty=False, wrong_goal=False):
+    if metrics.get("collision"):
+        return "COLLISION"
+    if empty:
+        return ("STOP" if metrics["stopped"] else "NO STOP") + " | UNSCORED EMPTY INSTRUCTION"
+    if wrong_goal:
+        return "WRONG GOAL %.1f m" % metrics["ne_m"]
+    if metrics.get("success"):
+        return "SUCCESS stop %.2f m" % metrics["ne_m"]
+    return ("WRONG STOP %.1f m" if metrics["stopped"] else "NO STOP %.1f m") % metrics["ne_m"]
+
+
 def episode_result(man, oracle=None, reach_radius_m=None, collided=False, actions=None, scene=None):
     """结尾大字：与 Gazebo eval_closed_loop._write_video 同一套词（SUCCESS / COLLISION / …）。
 
@@ -621,6 +641,9 @@ def episode_result(man, oracle=None, reach_radius_m=None, collided=False, action
         if not actions or not oracle or len(actions) != len(oracle) or reach_radius_m is None:
             return "INVALID trajectory"
         task = man["vln"]
+        if empty_instruction(task):
+            return navigation_result({"collision": any(a.get("collision") for a in actions),
+                                      "stopped": man.get("stopped_by_agent", False)}, empty=True)
         waypoint = _video_waypoint(task, man.get("waypoint"))
         if waypoint is None:
             return "UNSCORED | goal unavailable"
@@ -639,13 +662,7 @@ def episode_result(man, oracle=None, reach_radius_m=None, collided=False, action
         correct = grounding.get("correct")
         if swapped and grounding and task.get("supplied_goal_object"):
             correct = grounding.get("target") == task["supplied_goal_object"]
-        if correct is False:
-            return "WRONG GOAL %.1f m" % m["ne_m"]
-        if m["success"]:
-            return "SUCCESS stop %.2f m" % m["ne_m"]
-        if m["collision"]:
-            return "COLLISION"
-        return ("WRONG STOP %.1f m" if m["stopped"] else "NO STOP %.1f m") % m["ne_m"]
+        return navigation_result(m, wrong_goal=correct is False)
     if man.get("stopped_on_collision") or man.get("truncated_on_collision") or collided:
         return "COLLISION"
     if man.get("dynamics_anomaly"):

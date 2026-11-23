@@ -163,17 +163,6 @@ class VlmBeliefTracker:
         return eff_bb, eff_ng
 
 
-def result_text(m):
-    """视频结尾大字；以 SUCCESS 开头画绿色，其余红色（view_layout.panel）。"""
-    if m.get("success"):
-        return "SUCCESS stop %.2f m" % m["ne_m"]
-    if m.get("collision"):
-        return "COLLISION"
-    if m["stopped"]:
-        return "WRONG STOP %.1f m" % m["ne_m"]
-    return "NO STOP %.1f m" % m["ne_m"]
-
-
 def _read_jsonl(path):
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
@@ -622,8 +611,8 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                      "VLM STOP | unscored manual demo" if m["stopped"] else
                      "NO STOP | unscored manual demo")
         else:
-            badge = (f"WRONG GOAL {result_metrics['ne_m']:.1f} m" if wrong_goal else
-                     result_text(result_metrics))
+            badge = video_mod.navigation_result(result_metrics, empty=video_mod.empty_instruction(scene["vln"]),
+                                                wrong_goal=wrong_goal)
         print(f"[{scene['name']} {n + 1}/{len(eps)}] {badge:24s} {ep['type']:22s} {supplied_text}", file=sys.stderr)
         if n < args.videos:
             try:
