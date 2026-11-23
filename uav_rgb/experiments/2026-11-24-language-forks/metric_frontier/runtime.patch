@@ -1,0 +1,23 @@
+--- a/sim/3dgs/collect_3dgs.py
++++ b/sim/3dgs/collect_3dgs.py
+@@ -185,6 +185,8 @@
+         self.last_bearing_bin = None
+         self.last_near_goal = None
+         self.last_decision = {}
++        from .metric_frontier import Frontier
++        self.metric_frontier=Frontier()
+         self._avoid_steps = 0
+         self._avoid_action = YAW_LEFT
+         self._last_avoid_dir = YAW_LEFT
+@@ -247,8 +249,10 @@
+         model_stop = bool(getattr(self.student, "last_stop_requested", False))
+         grounding = getattr(self.goal_fn, "last_vg", None)
+         self.stop_requested = model_stop if grounding is None else self.goal_fn.confirmed_target
+-        action = SAFE_NEUTRAL if self.stop_requested else self._apply_onboard_depth_gate(proposed, rgb_in)
++        proposed,self.stop_requested,diagnostics=self.metric_frontier.decide(rgb_in,self.last_executed,proposed,grounding,self.goal_fn,self.stop_requested)
++        action = SAFE_NEUTRAL if self.stop_requested else proposed
+         self.last_decision = {
++            **diagnostics,
+             "action_proposed": proposed,
+             "action_intervention": ("task_stop" if self.stop_requested else
+                                     "depth_avoidance" if action != proposed else None),

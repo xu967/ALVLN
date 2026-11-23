@@ -13,3 +13,5 @@
 图文停机复核采用固定 CLIP ViT-B/32 与训练房间的 104 类词表，两张图中目标均列前五才保留原停机决策。开发五个目标上正确停机 0/5。入口的固定版本、输入与输出对应数据盘上的 exp-vln-stop-clip-20261124。
 
 三个扇区的局部探索使用上一轮飞行基线的 default_runtime。在数据盘复制该基线并于副本根目录应用 sector_exploration/runtime.patch，把 visual_exploration.py 放到 sim/3dgs 后，按同目录 registration.json 的 arms 执行。两个实际运行源文件的 SHA256 在登记内。
+
+整图深度对照来自 exp-vln-metric-frontier-839934-20261124。将 metric_frontier 目录的注册、校正和深度 worker 文件放入该实验目录，其内 runtime 从保存的 default_runtime 复制，应用 runtime.patch 后将 metric_frontier.py 放入 runtime/sim/3dgs。相机校准与策略输入在源码内固定。需要数据盘上的 Depth Anything V2 Hypersim ViT-S 权重及依赖。

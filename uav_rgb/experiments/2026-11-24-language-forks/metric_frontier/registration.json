@@ -1,0 +1,337 @@
+{
+  "created": "2026-11-24T06:29:53.825572+08:00",
+  "calibration_frames": [
+    {
+      "scene": "840139",
+      "route": "tr_100",
+      "i": 0,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_100_tr_133/A/sage3d_840139/tr_100_0/rgb_00000.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_100_tr_133/A/sage3d_840139/tr_100_0/depth/depth_00000.npy"
+    },
+    {
+      "scene": "840139",
+      "route": "tr_100",
+      "i": 57,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_100_tr_133/A/sage3d_840139/tr_100_0/rgb_00057.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_100_tr_133/A/sage3d_840139/tr_100_0/depth/depth_00057.npy"
+    },
+    {
+      "scene": "840139",
+      "route": "tr_100",
+      "i": 113,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_100_tr_133/A/sage3d_840139/tr_100_0/rgb_00113.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_100_tr_133/A/sage3d_840139/tr_100_0/depth/depth_00113.npy"
+    },
+    {
+      "scene": "840139",
+      "route": "tr_104",
+      "i": 0,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_83_tr_104/B/sage3d_840139/tr_104_0/rgb_00000.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_83_tr_104/B/sage3d_840139/tr_104_0/depth/depth_00000.npy"
+    },
+    {
+      "scene": "840139",
+      "route": "tr_104",
+      "i": 61,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_83_tr_104/B/sage3d_840139/tr_104_0/rgb_00061.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_83_tr_104/B/sage3d_840139/tr_104_0/depth/depth_00061.npy"
+    },
+    {
+      "scene": "840139",
+      "route": "tr_104",
+      "i": 122,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_83_tr_104/B/sage3d_840139/tr_104_0/rgb_00122.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_83_tr_104/B/sage3d_840139/tr_104_0/depth/depth_00122.npy"
+    },
+    {
+      "scene": "840139",
+      "route": "tr_105",
+      "i": 0,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_105_tr_156/A/sage3d_840139/tr_105_0/rgb_00000.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_105_tr_156/A/sage3d_840139/tr_105_0/depth/depth_00000.npy"
+    },
+    {
+      "scene": "840139",
+      "route": "tr_105",
+      "i": 50,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_105_tr_156/A/sage3d_840139/tr_105_0/rgb_00050.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_105_tr_156/A/sage3d_840139/tr_105_0/depth/depth_00050.npy"
+    },
+    {
+      "scene": "840139",
+      "route": "tr_105",
+      "i": 100,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_105_tr_156/A/sage3d_840139/tr_105_0/rgb_00100.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_105_tr_156/A/sage3d_840139/tr_105_0/depth/depth_00100.npy"
+    },
+    {
+      "scene": "840139",
+      "route": "tr_110",
+      "i": 0,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_37_tr_110/B/sage3d_840139/tr_110_0/rgb_00000.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_37_tr_110/B/sage3d_840139/tr_110_0/depth/depth_00000.npy"
+    },
+    {
+      "scene": "840139",
+      "route": "tr_110",
+      "i": 61,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_37_tr_110/B/sage3d_840139/tr_110_0/rgb_00061.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_37_tr_110/B/sage3d_840139/tr_110_0/depth/depth_00061.npy"
+    },
+    {
+      "scene": "840139",
+      "route": "tr_110",
+      "i": 122,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_37_tr_110/B/sage3d_840139/tr_110_0/rgb_00122.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/840139_tr_37_tr_110/B/sage3d_840139/tr_110_0/depth/depth_00122.npy"
+    },
+    {
+      "scene": "841012",
+      "route": "tr_100",
+      "i": 0,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_40_tr_100/B/sage3d_841012/tr_100_0/rgb_00000.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_40_tr_100/B/sage3d_841012/tr_100_0/depth/depth_00000.npy"
+    },
+    {
+      "scene": "841012",
+      "route": "tr_100",
+      "i": 22,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_40_tr_100/B/sage3d_841012/tr_100_0/rgb_00022.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_40_tr_100/B/sage3d_841012/tr_100_0/depth/depth_00022.npy"
+    },
+    {
+      "scene": "841012",
+      "route": "tr_100",
+      "i": 43,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_40_tr_100/B/sage3d_841012/tr_100_0/rgb_00043.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_40_tr_100/B/sage3d_841012/tr_100_0/depth/depth_00043.npy"
+    },
+    {
+      "scene": "841012",
+      "route": "tr_101",
+      "i": 0,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_71_tr_101/B/sage3d_841012/tr_101_0/rgb_00000.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_71_tr_101/B/sage3d_841012/tr_101_0/depth/depth_00000.npy"
+    },
+    {
+      "scene": "841012",
+      "route": "tr_101",
+      "i": 32,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_71_tr_101/B/sage3d_841012/tr_101_0/rgb_00032.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_71_tr_101/B/sage3d_841012/tr_101_0/depth/depth_00032.npy"
+    },
+    {
+      "scene": "841012",
+      "route": "tr_101",
+      "i": 63,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_71_tr_101/B/sage3d_841012/tr_101_0/rgb_00063.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_71_tr_101/B/sage3d_841012/tr_101_0/depth/depth_00063.npy"
+    },
+    {
+      "scene": "841012",
+      "route": "tr_102",
+      "i": 0,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_24_tr_102/B/sage3d_841012/tr_102_0/rgb_00000.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_24_tr_102/B/sage3d_841012/tr_102_0/depth/depth_00000.npy"
+    },
+    {
+      "scene": "841012",
+      "route": "tr_102",
+      "i": 56,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_24_tr_102/B/sage3d_841012/tr_102_0/rgb_00056.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_24_tr_102/B/sage3d_841012/tr_102_0/depth/depth_00056.npy"
+    },
+    {
+      "scene": "841012",
+      "route": "tr_102",
+      "i": 112,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_24_tr_102/B/sage3d_841012/tr_102_0/rgb_00112.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_24_tr_102/B/sage3d_841012/tr_102_0/depth/depth_00112.npy"
+    },
+    {
+      "scene": "841012",
+      "route": "tr_12",
+      "i": 0,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_6_tr_12/B/sage3d_841012/tr_12_0/rgb_00000.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_6_tr_12/B/sage3d_841012/tr_12_0/depth/depth_00000.npy"
+    },
+    {
+      "scene": "841012",
+      "route": "tr_12",
+      "i": 13,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_6_tr_12/B/sage3d_841012/tr_12_0/rgb_00013.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_6_tr_12/B/sage3d_841012/tr_12_0/depth/depth_00013.npy"
+    },
+    {
+      "scene": "841012",
+      "route": "tr_12",
+      "i": 25,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_6_tr_12/B/sage3d_841012/tr_12_0/rgb_00025.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841012_tr_6_tr_12/B/sage3d_841012/tr_12_0/depth/depth_00025.npy"
+    },
+    {
+      "scene": "841150",
+      "route": "tr_26",
+      "i": 0,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_26_tr_82/A/sage3d_841150/tr_26_0/rgb_00000.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_26_tr_82/A/sage3d_841150/tr_26_0/depth/depth_00000.npy"
+    },
+    {
+      "scene": "841150",
+      "route": "tr_26",
+      "i": 31,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_26_tr_82/A/sage3d_841150/tr_26_0/rgb_00031.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_26_tr_82/A/sage3d_841150/tr_26_0/depth/depth_00031.npy"
+    },
+    {
+      "scene": "841150",
+      "route": "tr_26",
+      "i": 61,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_26_tr_82/A/sage3d_841150/tr_26_0/rgb_00061.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_26_tr_82/A/sage3d_841150/tr_26_0/depth/depth_00061.npy"
+    },
+    {
+      "scene": "841150",
+      "route": "tr_27",
+      "i": 0,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_27_tr_93/A/sage3d_841150/tr_27_0/rgb_00000.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_27_tr_93/A/sage3d_841150/tr_27_0/depth/depth_00000.npy"
+    },
+    {
+      "scene": "841150",
+      "route": "tr_27",
+      "i": 34,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_27_tr_93/A/sage3d_841150/tr_27_0/rgb_00034.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_27_tr_93/A/sage3d_841150/tr_27_0/depth/depth_00034.npy"
+    },
+    {
+      "scene": "841150",
+      "route": "tr_27",
+      "i": 67,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_27_tr_93/A/sage3d_841150/tr_27_0/rgb_00067.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_27_tr_93/A/sage3d_841150/tr_27_0/depth/depth_00067.npy"
+    },
+    {
+      "scene": "841150",
+      "route": "tr_29",
+      "i": 0,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_29_tr_69/A/sage3d_841150/tr_29_0/rgb_00000.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_29_tr_69/A/sage3d_841150/tr_29_0/depth/depth_00000.npy"
+    },
+    {
+      "scene": "841150",
+      "route": "tr_29",
+      "i": 24,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_29_tr_69/A/sage3d_841150/tr_29_0/rgb_00024.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_29_tr_69/A/sage3d_841150/tr_29_0/depth/depth_00024.npy"
+    },
+    {
+      "scene": "841150",
+      "route": "tr_29",
+      "i": 48,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_29_tr_69/A/sage3d_841150/tr_29_0/rgb_00048.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_29_tr_69/A/sage3d_841150/tr_29_0/depth/depth_00048.npy"
+    },
+    {
+      "scene": "841150",
+      "route": "tr_37",
+      "i": 0,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_37_tr_84/A/sage3d_841150/tr_37_0/rgb_00000.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_37_tr_84/A/sage3d_841150/tr_37_0/depth/depth_00000.npy"
+    },
+    {
+      "scene": "841150",
+      "route": "tr_37",
+      "i": 47,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_37_tr_84/A/sage3d_841150/tr_37_0/rgb_00047.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_37_tr_84/A/sage3d_841150/tr_37_0/depth/depth_00047.npy"
+    },
+    {
+      "scene": "841150",
+      "route": "tr_37",
+      "i": 94,
+      "rgb": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_37_tr_84/A/sage3d_841150/tr_37_0/rgb_00094.png",
+      "depth": "/root/rivermind-data/uav_rgb/exp-vln-language-forks-expanded-20261124/episodes/train/841150_tr_37_tr_84/A/sage3d_841150/tr_37_0/depth/depth_00094.npy"
+    }
+  ],
+  "calibration": "36 training-room frames 3 positions x4 lexicographically selected routes per room. Axial depth in metres, rendered finite 0.2-8m, subsample every 4px both axes. Freeze metric robust correction as median of frame median(gt/pred). Report uncorrected and corrected ratio/absrel/medianabs, near-end false clearance and Spearman. Fit on calibration only.",
+  "method": "Depth Anything V2 ViT-S Hypersim metric 20m, input 322. Full-image metric depth -> altitude-slice 2D occupied/free evidence using calibrated 60deg pinhole 320x240. 0.15m local grid, short-range 3m ray integration, inflate hit by 0.30m, nearest unused frontier via reachable cells. Map origin arbitrary. Integrate heading and displacement from RGB feature matching and on-board estimated depth via solvePnPRansac within bounded motion; nominal actions fallback. Physical clearance guard wins. A fresh G3 directional instruction-matching final claim twice with visual feature correspondence and in-frame finite depth is required for a three-window R2 approach/STOP handover. This only corroborates repeatability of the claim; no visual object detector supervision or target GT available. No threshold tuning on dev.",
+  "arms": {
+    "correct": [
+      "/root/rivermind-data/uav_rgb/3dgs-venv/bin/python",
+      "-m",
+      "sim.3dgs.run_vln",
+      "--scene",
+      "/root/rivermind-data/uav_rgb/exp-vln-new-scenes-20261124/uav_rgb/3dgs-scenes/sage3d_839934/tr_42_tr_69.json",
+      "--policy",
+      "student",
+      "--ckpt",
+      "/root/rivermind-data/uav_rgb/exp-s1-dagger-r2-cleanaug-20261123/train_r2_subgoal/model/ckpt_best.bin",
+      "--infer-bin",
+      "/root/claude-code-backup-20261028/code/uav_rgb/build/check/uavrgb_infer",
+      "--grounder",
+      "vlm",
+      "--vlm-model",
+      "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B",
+      "--vlm-every",
+      "2",
+      "--g0-mode",
+      "subgoal",
+      "--dynamics-params",
+      "/root/claude-code-backup-20261028/code/uav_rgb/sim/dynamics/e1_mini.json",
+      "--hold",
+      "0.5",
+      "--stop-mode",
+      "explicit",
+      "--seed",
+      "0",
+      "--split",
+      "train",
+      "--videos",
+      "0",
+      "--counterfactual",
+      "correct",
+      "--out",
+      "/root/rivermind-data/uav_rgb/exp-vln-metric-frontier-839934-20261124/correct"
+    ],
+    "swap": [
+      "/root/rivermind-data/uav_rgb/3dgs-venv/bin/python",
+      "-m",
+      "sim.3dgs.run_vln",
+      "--scene",
+      "/root/rivermind-data/uav_rgb/exp-vln-new-scenes-20261124/uav_rgb/3dgs-scenes/sage3d_839934/tr_42_tr_69.json",
+      "--policy",
+      "student",
+      "--ckpt",
+      "/root/rivermind-data/uav_rgb/exp-s1-dagger-r2-cleanaug-20261123/train_r2_subgoal/model/ckpt_best.bin",
+      "--infer-bin",
+      "/root/claude-code-backup-20261028/code/uav_rgb/build/check/uavrgb_infer",
+      "--grounder",
+      "vlm",
+      "--vlm-model",
+      "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B",
+      "--vlm-every",
+      "2",
+      "--g0-mode",
+      "subgoal",
+      "--dynamics-params",
+      "/root/claude-code-backup-20261028/code/uav_rgb/sim/dynamics/e1_mini.json",
+      "--hold",
+      "0.5",
+      "--stop-mode",
+      "explicit",
+      "--seed",
+      "0",
+      "--split",
+      "train",
+      "--videos",
+      "0",
+      "--counterfactual",
+      "swap",
+      "--out",
+      "/root/rivermind-data/uav_rgb/exp-vln-metric-frontier-839934-20261124/swap"
+    ]
+  },
+  "base": "/root/rivermind-data/uav_rgb/exp-vln-box-control-839934-20261124",
+  "unit_gate": "Median raw scale ratio must be in [0.33,3], finite coverage on each frame, and median frame local rank correlation >0.2. Report remaining close-range errors."
+}
