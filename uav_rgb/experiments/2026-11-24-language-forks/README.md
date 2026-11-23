@@ -15,3 +15,5 @@
 三个扇区的局部探索使用上一轮飞行基线的 default_runtime。在数据盘复制该基线并于副本根目录应用 sector_exploration/runtime.patch，把 visual_exploration.py 放到 sim/3dgs 后，按同目录 registration.json 的 arms 执行。两个实际运行源文件的 SHA256 在登记内。
 
 整图深度对照来自 exp-vln-metric-frontier-839934-20261124。将 metric_frontier 目录的注册、校正和深度 worker 文件放入该实验目录，其内 runtime 从保存的 default_runtime 复制，应用 runtime.patch 后将 metric_frontier.py 放入 runtime/sim/3dgs。相机校准与策略输入在源码内固定。需要数据盘上的 Depth Anything V2 Hypersim ViT-S 权重及依赖。
+
+重建飞行基线时，先取 GitHub 主线 4b376c3 的 uav_rgb 目录，从该目录应用 flight_base.patch，即可得到原 default_runtime 的 sim 下所有非测试 Python 与 JSON 源文件，逐个校验 flight_base_hashes.json。两个搜索方案的 runtime.patch 都以此版本为起点。固件、渲染资产、视觉模型和推理二进制依赖数据盘，整图方案的哈希见 metric_frontier/dependencies.json。

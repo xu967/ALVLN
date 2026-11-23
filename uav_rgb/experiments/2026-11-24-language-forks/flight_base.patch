@@ -1,0 +1,899 @@
+--- a/sim/3dgs/collect_3dgs.py
++++ b/sim/3dgs/collect_3dgs.py
+@@ -267,7 +267,7 @@
+ class DaggerPolicy:
+     """DAgger 采集（Ross 2011）：学生看图出动作并执行，占据栅格 A* 教师按特权状态给标签。
+ 
+-    每步以概率 beta 改执行教师动作（β 混合；第 1 轮 0.5，之后 0）。标签口径与 --policy astar
++    每步以概率 beta 执行教师动作；beta 由采集参数指定。标签口径与 --policy astar
+     完全一样（teacher=plan_action, planner=astar_occ），只是 executed_by=student；
+     信念软标签由 sim/tools/teacher_belief.py 离线按位姿重标，不在这里算。
+     """
+--- a/sim/3dgs/reactive.py
++++ b/sim/3dgs/reactive.py
+@@ -7,6 +7,12 @@
+ import math
+ 
+ from .dynamics import FORWARD_SLOW, SAFE_NEUTRAL, YAW_LEFT, YAW_RIGHT
++
++BEARING_TURNS = {
++    1: YAW_LEFT, 2: YAW_LEFT, 3: YAW_LEFT,
++    5: YAW_RIGHT, 6: YAW_RIGHT, 7: YAW_RIGHT,
++    8: YAW_LEFT,
++}
+ 
+ 
+ def _wrap_deg(angle):
+@@ -132,7 +138,7 @@
+         self.stop_requested = False
+         self.last_bearing_bin = None
+         self.last_near_goal = None
+-        self.avoid_turn = None
++        self.last_turn = None
+         self.turned_toward_target = False
+         self.last_decision = {}
+ 
+@@ -140,10 +146,21 @@
+         note_step = getattr(self.goal_fn, "note_step", None)
+         if note_step is not None:
+             note_step(action)
++        if action in (YAW_LEFT, YAW_RIGHT):
++            self.last_turn = action
+         self.turned_toward_target |= (
+             self.last_bearing_bin in (1, 7)
+             and action == (YAW_LEFT if self.last_bearing_bin == 1 else YAW_RIGHT)
+         )
++
++    def _choose_clear_side(self, left, right):
++        if left <= 0.0 and right <= 0.0:
++            return SAFE_NEUTRAL
++        if self.last_turn == YAW_LEFT and left + 0.25 >= right:
++            return YAW_LEFT
++        if self.last_turn == YAW_RIGHT and right + 0.25 >= left:
++            return YAW_RIGHT
++        return YAW_LEFT if left >= right else YAW_RIGHT
+ 
+     def __call__(self, rgb, depth, state):
+         del state  # 严禁读取真值位姿
+@@ -161,21 +178,16 @@
+         center = _sector_min(depth, x1, x2, y0, y1)
+         right = _sector_min(depth, x2, w, y0, y1)
+ 
+-        if self.last_bearing_bin == 8 or 1 <= self.last_bearing_bin <= 3:
+-            proposed = YAW_LEFT
+-        elif 5 <= self.last_bearing_bin <= 7:
+-            proposed = YAW_RIGHT
+-        else:
+-            proposed = FORWARD_SLOW
++        proposed = BEARING_TURNS.get(self.last_bearing_bin, FORWARD_SLOW)
++        if self.last_bearing_bin == 4:
++            proposed = self._choose_clear_side(left, right)
+ 
+         self.stop_requested = bool(self.last_near_goal == 1
+                                    and (center <= 0.0 or center <= self.stop_depth_m))
+         if self.stop_requested:
+             action = SAFE_NEUTRAL
+-        elif self.last_bearing_bin == 8 or 1 <= self.last_bearing_bin <= 3:
+-            action = YAW_LEFT
+-        elif 5 <= self.last_bearing_bin <= 7:
+-            action = YAW_RIGHT
++        elif proposed != FORWARD_SLOW:
++            action = proposed
+         elif center <= 0.0:
+             action = SAFE_NEUTRAL
+         elif center < self.emergency_m:
+--- a/sim/3dgs/run_vln.py
++++ b/sim/3dgs/run_vln.py
+@@ -161,6 +161,17 @@
+         })
+         self.step_idx += 1
+         return eff_bb, eff_ng
++
++
++def result_text(m):
++    """视频结尾大字；以 SUCCESS 开头画绿色，其余红色（view_layout.panel）。"""
++    if m.get("success"):
++        return "SUCCESS stop %.2f m" % m["ne_m"]
++    if m.get("collision"):
++        return "COLLISION"
++    if m["stopped"]:
++        return "WRONG STOP %.1f m" % m["ne_m"]
++    return "NO STOP %.1f m" % m["ne_m"]
+ 
+ 
+ def _read_jsonl(path):
+@@ -548,8 +559,8 @@
+             else:
+                 start = {**actions[0]["pose_before"], "yaw_deg": actions[0].get("yaw_before", 0.0)}
+                 route_scene = dict(scene, waypoint=evaluation_goal)
+-                # 多阶段示范长度不等于依次进入目标圈的最短距离。
+-                shortest = (None if is_multi_stage else
++                shortest = (ep["total_path_m"]
++                            if is_multi_stage else
+                             route_shortest_path_m(occ_planner, [{"pose_gt": start}] + oracle, route_scene))
+                 m = vln.episode_metrics(actions, oracle, evaluation_goal, radius, man["stopped_by_agent"],
+                                         shortest, ref_path=(ep.get("ref_path") or ref_paths.get(ep["route_index"])),
+@@ -563,7 +574,8 @@
+             if supplied_goal_waypoint is not None:
+                 supplied_scene = dict(scene, waypoint=supplied_goal_waypoint)
+                 supplied_stages = instruction_ep.get("stage_waypoints") if is_multi_stage else None
+-                supplied_shortest = (None if is_multi_stage else
++                supplied_shortest = (instruction_ep["total_path_m"]
++                                     if is_multi_stage else
+                                      route_shortest_path_m(occ_planner, [{"pose_gt": start}] + oracle,
+                                                            supplied_scene))
+                 supplied_metrics = vln.episode_metrics(
+@@ -610,8 +622,8 @@
+                      "VLM STOP | unscored manual demo" if m["stopped"] else
+                      "NO STOP | unscored manual demo")
+         else:
+-            badge = video_mod.navigation_result(result_metrics, empty=video_mod.empty_instruction(scene["vln"]),
+-                                                wrong_goal=wrong_goal)
++            badge = (f"WRONG GOAL {result_metrics['ne_m']:.1f} m" if wrong_goal else
++                     result_text(result_metrics))
+         print(f"[{scene['name']} {n + 1}/{len(eps)}] {badge:24s} {ep['type']:22s} {supplied_text}", file=sys.stderr)
+         if n < args.videos:
+             try:
+--- a/sim/3dgs/video.py
++++ b/sim/3dgs/video.py
+@@ -259,16 +259,10 @@
+     return [trace[int(i)] for i in indices]
+ 
+ 
+-def empty_instruction(task):
+-    return bool(task) and (task.get("counterfactual") == "zero" or task.get("supplied_text") == "")
+-
+-
+ def instruction_banner(vln):
+     """优先显示实际输入；空指令也是一次实验干预。"""
+     if not vln:
+         return ""
+-    if empty_instruction(vln):
+-        return "[empty instruction]"
+     if "supplied_text" in vln:
+         supplied = vln["supplied_text"]
+         return f'"{supplied}"' if supplied else "[empty instruction]"
+@@ -279,8 +273,6 @@
+ 
+ 
+ def _video_waypoint(task, original):
+-    if empty_instruction(task):
+-        return None
+     if (task or {}).get("counterfactual") != "swap":
+         return original
+     point = task.get("supplied_goal_waypoint")
+@@ -600,18 +592,6 @@
+     return "teacher"
+ 
+ 
+-def navigation_result(metrics, *, empty=False, wrong_goal=False):
+-    if metrics.get("collision"):
+-        return "COLLISION"
+-    if empty:
+-        return ("STOP" if metrics["stopped"] else "NO STOP") + " | UNSCORED EMPTY INSTRUCTION"
+-    if wrong_goal:
+-        return "WRONG GOAL %.1f m" % metrics["ne_m"]
+-    if metrics.get("success"):
+-        return "SUCCESS stop %.2f m" % metrics["ne_m"]
+-    return ("WRONG STOP %.1f m" if metrics["stopped"] else "NO STOP %.1f m") % metrics["ne_m"]
+-
+-
+ def episode_result(man, oracle=None, reach_radius_m=None, collided=False, actions=None, scene=None):
+     """结尾大字：与 Gazebo eval_closed_loop._write_video 同一套词（SUCCESS / COLLISION / …）。
+ 
+@@ -641,9 +621,6 @@
+         if not actions or not oracle or len(actions) != len(oracle) or reach_radius_m is None:
+             return "INVALID trajectory"
+         task = man["vln"]
+-        if empty_instruction(task):
+-            return navigation_result({"collision": any(a.get("collision") for a in actions),
+-                                      "stopped": man.get("stopped_by_agent", False)}, empty=True)
+         waypoint = _video_waypoint(task, man.get("waypoint"))
+         if waypoint is None:
+             return "UNSCORED | goal unavailable"
+@@ -662,7 +639,13 @@
+         correct = grounding.get("correct")
+         if swapped and grounding and task.get("supplied_goal_object"):
+             correct = grounding.get("target") == task["supplied_goal_object"]
+-        return navigation_result(m, wrong_goal=correct is False)
++        if correct is False:
++            return "WRONG GOAL %.1f m" % m["ne_m"]
++        if m["success"]:
++            return "SUCCESS stop %.2f m" % m["ne_m"]
++        if m["collision"]:
++            return "COLLISION"
++        return ("WRONG STOP %.1f m" if m["stopped"] else "NO STOP %.1f m") % m["ne_m"]
+     if man.get("stopped_on_collision") or man.get("truncated_on_collision") or collided:
+         return "COLLISION"
+     if man.get("dynamics_anomaly"):
+--- a/sim/tools/collect.py
++++ b/sim/tools/collect.py
+@@ -2,8 +2,7 @@
+ """E3 采集器：驱动四旋翼在 Gazebo 里跑专家策略，录 RGB/位姿/碰撞成完整 episode。
+ 
+ 依赖一个已在运行的 gz sim（见 sim/README.md 启动命令）。teacher/forward 路径纯 stdlib；
+-student 路径需要 PIL 与 uavrgb_infer（见 sim/tools/student.py）；teacher-nn 路径需要
+-torch/PIL/numpy（见 sim/tools/teacher_policy.py，解释器建议用 teacher-venv）。
++student 路径需要 PIL 与 uavrgb_infer（见 sim/tools/student.py）。
+ 
+ 用法：
+   python3 collect.py --steps 20 --out /tmp/ep0 --scene-id 1 --seed 42 --split train
+@@ -76,7 +75,6 @@
+ import gz_io
+ import save_frame
+ import split_manifest as sm
+-import cf_sil
+ import cf_blackbox
+ import cf_sitl_exec
+ import nav_cond
+@@ -201,10 +199,7 @@
+ # 倾角，水平加速度 g·tanθ，线性阻力 k；其余动作俯仰杆回中，靠阻力滑停（不刹车）。
+ # 速度在世界系积分（转头时动量不随机头转），发指令前转回机体系；底层仍由
+ # MulticopterVelocityControl 跟踪这条速度曲线。默认 x3_velocity 保持旧行为不变。
+-DYNAMICS = ("x3_velocity", "cf_stab", "cf_blackbox", "cf_sil", "cf_sitl")
+-# cf_sil 已退出 collect_parallel / eval 的默认矩阵，只在 collect.py 保留手动入口；
+-# 写进 manifest 的 experimental 位，提醒下游不要把它当默认训练档。
+-DYNAMICS_EXPERIMENTAL = ("cf_sil",)
++DYNAMICS = ("x3_velocity", "cf_stab", "cf_blackbox", "cf_sitl")
+ # cf_sitl：E1 MINI 固件在环（Gazebo 内 CfSitlSystem 插件 1 kHz 跑固件），collect 只发
+ # 「动作 + 截止仿真秒」；必须配 --vehicle e1_mini 的世界，默认参数 sim/dynamics/e1_mini.json。
+ DYNAMICS_VEHICLE = {"cf_sitl": "e1_mini"}
+@@ -215,11 +210,6 @@
+ CF_DRAG_K = 1.0         # 1/s。shortcut: 占位值，等松杆滑行实测阻力后替换
+ CF_LATENCY_S = 0.15     # 派发→生效。shortcut: 取 ALVLN/docs/09 的 P95≤150 ms 目标，等端到端实测后替换
+ 
+-# cf_sil：直接驱动 4 个 MotorModel 的串级 PID 载具（sim-only）。参数档默认在
+-# sim/dynamics/cf_sil_v1.json；profile 带参数 sha8，换参数后旧包不能混进来。
+-DEFAULT_CF_SIL_PARAMS = os.path.join(
+-    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+-    "dynamics", "cf_sil_v1.json")
+ # cf_blackbox 是纯 Python 模型（3DGS collector 直接 import），参数唯一来源是
+ # sim/dynamics/cf_blackbox_v1.json；Gazebo collect 只做参数校验，不驱动它。
+ DEFAULT_CF_BLACKBOX_PARAMS = cf_blackbox.DEFAULT_PARAMS_PATH
+@@ -285,24 +275,6 @@
+         return c * self.vx + s * self.vy, -s * self.vx + c * self.vy, wz
+ 
+ 
+-def rl_delay_remaining(dyn, now_ns):
+-    """teacher-rl 观测的 delay_remaining：上一次派发的指令延迟在观测时刻还剩多少秒。
+-
+-    N1：训练环境在决策时刻早已把延迟倒计时到 0（0.15 < ACTION_DT 0.2），常量 latency_s
+-    会让 Gazebo 侧 obs[-1]=0.3 而训练侧恒为 0。按仿真时间算：有尚未生效的派发才非零。
+-    """
+-    from pathlib import Path
+-    repo_root = str(Path(__file__).resolve().parents[2])
+-    if repo_root not in sys.path:
+-        sys.path.insert(0, repo_root)
+-    from rl_teacher.core import delay_remaining_at
+-    if not dyn.pending:
+-        return 0.0
+-    t_eff, _ = dyn.pending[-1]
+-    dispatch_s = (t_eff - int(dyn.latency_s * 1e9)) / 1e9
+-    return delay_remaining_at(dispatch_s, now_ns / 1e9, dyn.latency_s)
+-
+-
+ def dyn_twist(dyn, t_ns, yaw_deg, pose):
+     """cf_stab 指令：水平/偏航来自摇杆模型，垂直仍是真值定高。"""
+     vx, vy, wz = dyn.step(t_ns, yaw_deg)
+@@ -382,13 +354,13 @@
+ 
+ 
+ def stop_executor(publisher, sil=None):
+-    """安全网：cf_sil 停桨；其他档发零速。从不抛 Exception。"""
++    """安全网：执行器停机；其他档发零速。从不抛 Exception。"""
+     if sil is not None:
+         try:
+             sil.zero_now()
+             return True
+         except Exception as e:  # noqa: BLE001 - 安全网自身失败只能告警
+-            print(f"警告: cf_sil 停桨失败: {e}", file=sys.stderr)
++            print(f"警告: {getattr(sil, 'name', 'cf_sitl')} 停机失败: {e}", file=sys.stderr)
+             return False
+     return _try_zero(publisher)
+ 
+@@ -458,14 +430,6 @@
+     return True, stamp_ns(msg)
+ 
+ 
+-def read_rgb_png(path):
+-    """旧接口：一次性读 /uav/camera 并存 PNG。返回 (ok, sim_time_ns)。"""
+-    msg = echo_json(CAMERA_TOPIC)
+-    if not msg:
+-        return False, 0
+-    return write_rgb_png(msg, path)
+-
+-
+ def _depth_png16(depth, w, h):
+     """深度（米，行主序 flat list）-> 16 位灰度 PNG 字节（毫米，0=无效/无回波）。
+ 
+@@ -521,21 +485,6 @@
+ 
+ def _pose_stamp(msg):
+     return _pose_parts(msg)[1]
+-
+-
+-def read_pose():
+-    """旧接口：一次性读 /model/x3/pose。返回 (position, sim_time_ns, yaw_deg)。"""
+-    msg = echo_json(POSE_TOPIC)
+-    if not msg:
+-        return None, 0, None
+-    return _pose_parts(msg)
+-
+-
+-def spawn_contact_listener():
+-    """旧接口：在 /uav/contact 上等一条消息。主路径改用常驻订阅。"""
+-    return subprocess.Popen(
+-        ["gz", "topic", "-e", "-t", CONTACT_TOPIC, "-n", "1", "--json-output"],
+-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+ 
+ 
+ def contact_fired(proc):
+@@ -740,58 +689,10 @@
+     raise RuntimeError(f"起飞超时 {timeout:.0f}s：z={last_z}，目标 {z_target}")
+ 
+ 
+-def take_off_cf_sil(pose_sub, sil, contact_sub=None, z_target=None, timeout=120.0):
+-    """cf_sil 起飞：SAFE_NEUTRAL 的伴飞定高会自动爬升到 altitude_target。
+-
+-    不发布 twist：cf_sil 的电机由后台线程直接驱动，MulticopterVelocityControl 已停用。
+-    """
+-    z_target = sil.params.altitude_target if z_target is None else z_target
+-    def pose_now():
+-        msg = pose_sub.latest()
+-        return _pose_parts(msg) if msg else (None, 0, None)
+-
+-    pos, _, _ = pose_now()
+-    z0 = pos.get("z") if isinstance(pos, dict) else None
+-    if z0 is not None and z0 > 0.5:
+-        raise RuntimeError(
+-            f"world 未复位：起飞前 z={z0:.2f} m > 0.5；请重启 gz sim 或换新 world")
+-    if contact_sub is not None and not contact_sub.healthy():
+-        raise RuntimeError("contact 订阅进程已退出")
+-    if sil.error():
+-        raise RuntimeError(f"cf_sil 执行器故障: {sil.error()}")
+-
+-    sil.set_action(SAFE_NEUTRAL)
+-    air_seq0 = None
+-    deadline = time.monotonic() + timeout
+-    last_z = None
+-    while time.monotonic() < deadline:
+-        if sil.error():
+-            sil.zero_now()
+-            raise RuntimeError(f"起飞阶段 cf_sil 执行器故障: {sil.error()}")
+-        if contact_sub is not None and not contact_sub.healthy():
+-            sil.zero_now()
+-            raise RuntimeError("起飞阶段 contact 订阅进程已退出")
+-        pos, _, _ = pose_now()
+-        if isinstance(pos, dict):
+-            last_z = pos.get("z")
+-            if contact_sub is not None and last_z is not None and last_z > 0.5:
+-                if air_seq0 is None:
+-                    air_seq0 = _contact_seq(contact_sub)
+-                elif _contact_since(contact_sub, air_seq0):
+-                    sil.zero_now()
+-                    raise RuntimeError("起飞阶段检测到 contact（spawn 太近或撞柱）")
+-            if last_z is not None and last_z >= z_target:
+-                print(f"起飞完成: z={last_z:.2f} m", file=sys.stderr)
+-                return air_seq0
+-        time.sleep(0.1)
+-    sil.zero_now()
+-    raise RuntimeError(f"起飞超时 {timeout:.0f}s：z={last_z}，目标 {z_target}")
+-
+-
+ def take_off_cf_sitl(pose_sub, ex, contact_sub=None):
+     """cf_sitl 起飞：执行器自己发 reset/arm_takeoff 并等固件 READY；这里只管真值侧的检查。
+ 
+-    与 take_off_cf_sil 同样的两道门：world 必须是新鲜的（z<=0.5），离地后出现 contact
++    两道门：world 必须是新鲜的（z<=0.5），离地后出现 contact
+     就中止（spawn 太近或撞柱）。落地瞬间的接触不算：基线序号取 READY 时刻的值。
+     """
+     def pose_now():
+@@ -846,8 +747,7 @@
+                 prev_action=None, prev_rgb_ts=0, pillars=None, student=None,
+                 global_plan=True, window_from="dispatch", waypoint=None,
+                 stop_at_waypoint=False, stop_radius=0.5, save_depth=False,
+-                teacher_nn=None, text_ids=None, contact_seq0=None, dyn=None,
+-                predictive_teacher=None, rl_teacher=None, sil=None,
++                contact_seq0=None, dyn=None, sil=None,
+                 tiebreak="legacy", beta=0.0, rng=None, prev_executed=None,
+                 costmap_opts=None, heading_guard=0, net_yaw=0, rule_hfov_deg=60.0, last_turn=None,
+                 rule_version="v0", rule_mem=None, action_latency_s=None, student_cond="prev-action",
+@@ -856,8 +756,8 @@
+ 
+     dyn=None 为 x3_velocity 旧行为（定速 + 窗口末刹停）；给 CfStab 时按摇杆模型
+     在窗口内逐帧更新速度，窗口末不刹停，最后一条指令一直保持到下一步派发。
+-    给 sil（CfSilMotorThread）时不发 twist：后台线程按动作直接驱动 4 个电机，
+-    窗口末也不刹停，最后一条动作保持到下一步派发。
++    给 sil（CfSitlExecutor）时不发 twist：执行器直接按动作与截止时刻驱动固件，
++    窗口末也不发 twist。
+     tiebreak：A* 教师左右近平局的决定方式（teacher.TIEBREAKS；legacy 逐位等于旧 plan_action_global）。
+     beta / rng / prev_executed 只在 policy == "student" 且有柱子真值时起作用（DAgger 影子教师）：
+     每步以概率 beta 改执行教师动作，prev_executed 是上一步真正执行的动作（喂给 prev-action 模型）。
+@@ -947,12 +847,7 @@
+             if not pose_before:
+                 return None, "carrot planner 需要位姿真值，但该步 pose 缺 position"
+             # safe 出生用局部规划（要保留真正的 SAFE 标签）；普通集用 A* 全局路径。
+-            if predictive_teacher is not None:
+-                if dyn is None:
+-                    return None, "predictive teacher 需要 cf_stab 动力学档"
+-                action = predictive_teacher.act(pose_before["x"], pose_before["y"],
+-                    yaw_before, dyn.vx, dyn.vy, active=dyn.active, latency=dyn.latency_s)
+-            elif costmap_opts is not None:
++            if costmap_opts is not None:
+                 # 测地场代价 argmin（BRIEF_ALGO §1）：标签是 Q 最小的动作，Q 一并落盘给软标签用。
+                 action, cinfo = plan_action_costmap(
+                     pose_before["x"], pose_before["y"], yaw_before, pillars,
+@@ -970,25 +865,6 @@
+         else:
+             # 没有真值就退回深度反应式专家（传 prev_action 启用滞回）。
+             action = expert_action(d, w, h, prev_action=prev_action)
+-    elif policy == "teacher-rl":
+-        if rl_teacher is None or dyn is None or not pose_before or yaw_before is None:
+-            return None, "teacher-rl 需要 checkpoint、cf_stab、有效位姿与 scene-meta"
+-        try:
+-            from pathlib import Path
+-            repo_root = str(Path(__file__).resolve().parents[2])
+-            if repo_root not in sys.path: sys.path.insert(0, repo_root)
+-            from rl_teacher.core import Phys, state_vector
+-            state = Phys(x=pose_before["x"], y=pose_before["y"],
+-                         yaw=math.radians(yaw_before), vx=dyn.vx, vy=dyn.vy,
+-                         action=dyn.active, last_action=dyn.active,
+-                         delay_remaining=rl_delay_remaining(dyn, pose_before_ts))
+-            import numpy as np
+-            obs = np.asarray(state_vector(state, (waypoint["x"], waypoint["y"]),
+-                                          pillars), dtype=np.float32)
+-            result, _ = rl_teacher.predict(obs, deterministic=True)
+-            action = int(result)
+-        except Exception as e:
+-            return None, f"teacher-rl 推理失败: {type(e).__name__}: {e}"
+     elif policy == "student":
+         if student is None:
+             return None, "student 策略未初始化"
+@@ -1041,25 +917,6 @@
+         else:
+             action, rule_entry = rule_v0_entry(cols, net_yaw, last_turn)
+         rule_cols, executed_by = [round(v, 2) for v in cols], "rule_oracle"
+-    elif policy == "teacher-nn":
+-        if teacher_nn is None:
+-            return None, "teacher-nn 策略未初始化"
+-        try:
+-            import numpy as np
+-            # RGB 解码成 HWC uint8；注意别覆盖已有的 depth 的 w/h（后面写深度图要用）。
+-            rgb_w, rgb_h, rgb_nch, rgb_rows = save_frame.decode(rgb_msg)
+-            rgb_hwc = np.frombuffer(rgb_rows, dtype=np.uint8).reshape(
+-                rgb_h, rgb_w, rgb_nch)
+-            depth_hw = np.asarray(d, dtype=np.float32).reshape(h, w)
+-            if not isinstance(pose_before, dict) or yaw_before is None:
+-                raise ValueError("缺少 pose_before/yaw_before")
+-            if not isinstance(waypoint, dict):
+-                raise ValueError("teacher-nn 需要 waypoint 作为特权输入（用 --task l1）")
+-            pose_xyz = (pose_before["x"], pose_before["y"], pose_before["z"])
+-            action = teacher_nn.act(rgb_hwc, depth_hw, pose_xyz, yaw_before,
+-                                    (waypoint["x"], waypoint["y"]), text_ids)
+-        except Exception as e:  # noqa: BLE001 - 推理任何失败都算本步失败
+-            return None, f"teacher-nn 推理失败: {type(e).__name__}: {e}"
+     else:  # policy == "forward": 盲策略（恒定前进），用于撞柱/基线对照
+         action = FORWARD_SLOW
+     if label is None and not defer_label:
+@@ -1163,7 +1020,7 @@
+                 return None, "动作窗口内 contact 订阅进程已退出"
+             if sil is not None and sil.error():
+                 stop_executor(publisher, sil)
+-                return None, f"{getattr(sil, 'name', 'cf_sil')} 执行器故障: {sil.error()}"
++                return None, f"{getattr(sil, 'name', 'cf_sitl')} 执行器故障: {sil.error()}"
+             msg = subs["pose"].latest()
+             if msg is not None and _pose_stamp(msg) >= hold_end_ns:
+                 break
+@@ -1461,19 +1318,14 @@
+     p.add_argument("--window-from", choices=("dispatch", "observation"),
+                    default="observation",
+                    help="动作窗口起点：observation=观测位姿（默认，唯一被采纳基线）；"
+-                        "dispatch=派发位姿（R01，仅复现 T7-R，数字不可与 observation 混报）；"
+-                        "cf_sil 建议用 dispatch，窗口才和电机线程的派发时刻对齐")
++                        "dispatch=派发位姿（R01，仅复现 T7-R，数字不可与 observation 混报）")
+     p.add_argument("--dynamics", choices=DYNAMICS, default="x3_velocity",
+                    help="x3_velocity=旧行为（定速+每步刹停，唯一历史基线）；"
+                         "cf_stab=CF-Drone 摇杆模型（倾角加速+阻力滑行+指令延迟，"
+                         "高度仍真值定高；建议配 --hold 0.1~0.2；数字不可与旧档混报）；"
+                         "cf_blackbox=纯 Python 黑盒（3DGS collector 直接使用；"
+                         "Gazebo collect 只校验参数并明确拒绝，不拿 x3 物理冒充）；"
+-                        "cf_sil=直接驱动 4 个电机（串级 PID+混控，sim-only，"
+-                        "已退出默认矩阵，仅手动参考；参数见 --cf-sil-params）")
+-    p.add_argument("--cf-sil-params", default=None,
+-                   help="cf_sil 参数 JSON（默认 sim/dynamics/cf_sil_v1.json）；"
+-                        "只能和 --dynamics cf_sil 一起用")
++                        "cf_sitl=E1 MINI 固件在环（必须 --vehicle e1_mini）")
+     p.add_argument("--vehicle", choices=tuple(VEHICLES), default=None,
+                    help="世界里的载具模型：x3（默认）或 e1_mini；决定位姿话题 /model/<name>/pose "
+                         "与 camera_info 的 frame_id。缺省取 scene-meta 的 vehicle，再缺省 x3。"
+@@ -1481,27 +1333,19 @@
+     p.add_argument("--cf-sitl-params", default=None,
+                    help="cf_sitl 参数 JSON（默认 sim/dynamics/e1_mini.json，与世界模板同一单源）；"
+                         "只能和 --dynamics cf_sitl 一起用")
+-    p.add_argument("--flight-log", default=None,
+-                   help="cf_sil 参数辨识用 ULog(.ulg)；需要 pyulog，未安装时先导出 CSV")
+-    p.add_argument("--flight-log-csv", default=None,
+-                   help="cf_sil 参数辨识用 CSV（t,qw/qx/qy/qz,wx/wy/wz,thrust/motor,x/y/z）")
+     p.add_argument("--no-takeoff", action="store_true")
+-    p.add_argument("--teacher-planner", choices=("astar", "predictive", "costmap"), default="astar",
+-                   help="--policy teacher 的 T0/T1 规划器；predictive 需要 cf_stab + scene-meta；"
++    p.add_argument("--teacher-planner", choices=("astar", "costmap"), default="astar",
++                   help="--policy teacher 的规划器；"
+                         "costmap=测地场代价 argmin（teacher.plan_action_costmap，每行多记 q_costs）")
+     p.add_argument("--costmap-tol", type=float, default=25.0,
+                    help="costmap 教师的航向罚死区（度）；仅 --teacher-planner costmap")
+     p.add_argument("--costmap-lookahead-steps", type=int, default=1,
+                    help="costmap 教师的前瞻步数（1=单步 rollout）；仅 --teacher-planner costmap")
+-    p.add_argument("--rl-checkpoint", default="", help="teacher-rl 离线 PPO 模型路径")
+-    p.add_argument("--policy", choices=("teacher", "forward", "student", "teacher-nn", "teacher-rl", "rule-oracle"),
++    p.add_argument("--policy", choices=("teacher", "forward", "student", "rule-oracle"),
+                    default="teacher",
+                    help="teacher=专家策略；forward=盲策略（恒定前进）；student=模型闭环；"
+-                        "teacher-nn=特权教师网络闭环；"
+                         "rule-oracle=柱子真值算完美列距离 + 固定规则 v0（零训练的规则层上限，需要 --scene-meta）")
+     p.add_argument("--student-ckpt", default=None, help="--policy student 的 checkpoint")
+-    p.add_argument("--teacher-ckpt", default=None,
+-                   help="--policy teacher-nn 的 PrivilegedTeacher checkpoint")
+     p.add_argument("--infer-bin", default=None,
+                    help="uavrgb_infer 路径（默认 UAV_RGB_BUILD_DIR 或 build/check）")
+     p.add_argument("--stop-on-collision", action="store_true",
+@@ -1564,15 +1408,6 @@
+         p.error("--steps must be >= 1")
+     if args.policy == "student" and not args.student_ckpt:
+         p.error("--policy student 需要 --student-ckpt")
+-    if args.policy == "teacher-nn" and not args.teacher_ckpt:
+-        p.error("--policy teacher-nn 需要 --teacher-ckpt")
+-    if args.policy == "teacher-rl" and not args.rl_checkpoint:
+-        p.error("--policy teacher-rl 需要 --rl-checkpoint")
+-    if (args.teacher_planner == "predictive" or args.policy == "teacher-rl") and (
+-            args.dynamics != "cf_stab" or not args.scene_meta):
+-        p.error("新 Teacher 必须 --dynamics cf_stab 且提供 --scene-meta")
+-    if args.policy == "teacher-rl" and abs(args.hold - 0.2) > 1e-6:
+-        p.error("teacher-rl 的训练策略要求 --hold 0.2（5Hz）；其他时长需重新训练")
+     if args.policy != "student" and (args.beta != 0.0 or args.dagger_round != 0):
+         p.error("--beta/--dagger-round 只能和 --policy student 一起用")
+     if not (math.isfinite(args.beta) and 0.0 <= args.beta <= 1.0):
+@@ -1619,18 +1454,6 @@
+             f"cf_blackbox 参数 {blackbox_params.profile()} 校验通过，但该档是纯 Python "
+             "模型，Gazebo collect 未接入；请让 3DGS collector 直接调用 cf_blackbox，"
+             "或改用 --dynamics cf_stab/x3_velocity")
+-    cf_sil_params = None
+-    if args.dynamics == "cf_sil":
+-        try:
+-            cf_sil_params = cf_sil.CfSilParams.from_json(
+-                args.cf_sil_params or DEFAULT_CF_SIL_PARAMS)
+-        except (OSError, ValueError, TypeError, KeyError) as e:
+-            p.error(f"无法加载 cf_sil 参数: {e}")
+-        if not cf_sil_params.calibrated:
+-            print("警告: cf_sil 参数 calibrated=false（固件默认+占位值，不是实测标定）",
+-                  file=sys.stderr)
+-    elif args.cf_sil_params:
+-        p.error("--cf-sil-params 只能和 --dynamics cf_sil 一起用")
+     cf_sitl_params = None
+     if args.dynamics == "cf_sitl":
+         try:
+@@ -1645,18 +1468,6 @@
+             p.error("--dynamics cf_sitl 不支持 --no-takeoff：固件必须经 arm_takeoff 进入 READY")
+     elif args.cf_sitl_params:
+         p.error("--cf-sitl-params 只能和 --dynamics cf_sitl 一起用")
+-    if args.flight_log and args.flight_log_csv:
+-        p.error("--flight-log 和 --flight-log-csv 只能二选一")
+-    log_path = args.flight_log or args.flight_log_csv
+-    if log_path:
+-        if args.dynamics != "cf_sil":
+-            p.error("--flight-log/--flight-log-csv 只用于 --dynamics cf_sil")
+-        try:
+-            summary = cf_sil.load_flight_log(log_path)
+-        except Exception as e:  # noqa: BLE001 - 参数校验失败直接退出
+-            p.error(f"飞行日志读取失败: {e}")
+-        print(f"飞行日志（仅接口校验/摘要，未做参数辨识）: {summary}",
+-              file=sys.stderr)
+     if os.path.isdir(args.out) and os.listdir(args.out):
+         p.error(f"--out {args.out} 不是空目录；请换新目录（或先清空）")
+     os.makedirs(args.out, exist_ok=True)
+@@ -1737,11 +1548,6 @@
+         # 有柱子真值时是 DAgger 影子教师：标签口径与 --policy teacher 完全一样（plan_action/astar），
+         # 只是 executed_by=student（与 sim/3dgs/collect_3dgs.py 同义）。没真值时标签只能是学生自己的输出。
+         teacher_kind, planner_kind = ("plan_action", "astar") if pillars else ("student", None)
+-    elif args.policy == "teacher-rl":
+-        teacher_kind, planner_kind = "teacher_rl", "ppo_discrete4"
+-    elif args.policy == "teacher-nn":
+-        # 标签来自训练好的特权教师网络，必须与 plan_action/expert_action 区分。
+-        teacher_kind, planner_kind = "teacher_nn", None
+     elif pillars:
+         teacher_kind = "plan_action"
+         planner_kind = args.teacher_planner
+@@ -1757,14 +1563,6 @@
+     subs = {}
+     publisher = None
+     student = None
+-    teacher_nn = None
+-    predictive_teacher = None
+-    rl_teacher = None
+-    if args.policy == "teacher" and args.teacher_planner == "predictive":
+-        if not pillars or not isinstance(waypoint, dict):
+-            p.error("predictive teacher 需要 scene-meta 的 pillars/waypoint")
+-        from teacher_predictive import PredictiveTeacher
+-        predictive_teacher = PredictiveTeacher(pillars, waypoint)
+     # costmap 教师：只在 planner_kind == "costmap" 时给 collect_one 传选项（其余档位 None，行为不变）。
+     costmap_opts = ({"tol": args.costmap_tol, "lookahead_steps": args.costmap_lookahead_steps}
+                     if planner_kind == "costmap" else None)
+@@ -1772,7 +1570,6 @@
+         # manifest.teacher_version 写的是 TEACHER_COST_VERSION：规则档（B2 过柱阵后目标取线开，A* 重试 costmap 不用）
+         # 按它切，采集时生效的规则与 audit 按 manifest 版本复算的规则一致（forest_e1 档的 costmap 集也一样）。
+         _teacher.set_vehicle(vehicle, teacher_task, version=TEACHER_COST_VERSION)
+-    text_ids = None
+     cam_info = None
+     rows_written = 0
+     all_rgb_ok = True
+@@ -1801,8 +1598,7 @@
+                   "n_expert_executed": 0}
+     rng = random.Random(args.seed) if dagger is not None else None
+     dyn = CfStab() if args.dynamics == "cf_stab" else None
+-    sil = (cf_sil.CfSilMotorThread(cf_sil_params)
+-           if cf_sil_params is not None else None)
++    sil = None
+     if cf_sitl_params is not None:
+         sil = cf_sitl_exec.CfSitlExecutor(
+             cf_sitl_params, hold_s=args.hold,
+@@ -1851,16 +1647,6 @@
+             if cond_check["status"] == "unverified":
+                 print(f"警告: 条件输入一致性未核实（--student-cond {args.student_cond}）：{cond_check['message']}",
+                       file=sys.stderr)
+-        elif args.policy == "teacher-rl":
+-            from stable_baselines3 import PPO
+-            rl_teacher = PPO.load(args.rl_checkpoint, device="cpu")
+-            print("警告: teacher-rl 是轻量物理仿真训练的实验策略，Gazebo 效果尚未验证", file=sys.stderr)
+-        elif args.policy == "teacher-nn":
+-            from instruction import tokenize
+-            from teacher_policy import TeacherPolicy
+-            print(f"teacher-nn 策略: 加载 {args.teacher_ckpt}…", file=sys.stderr)
+-            text_ids = tokenize(instruction_text) if instruction_text else None
+-            teacher_nn = TeacherPolicy(args.teacher_ckpt)
+ 
+         if args.action_latency is not None and pillars and planner_kind == "astar":
+             # 每集（每个 collect 进程）起跑前把整张 A* 栅格的「可走」填满：否则第一步的 A* 比后续步慢约 0.45 s（K=3），
+@@ -1874,24 +1660,6 @@
+         if cf_sitl_params is not None:
+             print("cf_sitl: reset + arm_takeoff，等固件 READY…", file=sys.stderr)
+             contact_seq0 = take_off_cf_sitl(subs["pose"], sil, subs["contact"])
+-        elif sil is not None:
+-            print("cf_sil: 停用 MulticopterVelocityControl 并启动电机线程…",
+-                  file=sys.stderr)
+-            sil.start()
+-            if args.no_takeoff:
+-                # --no-takeoff 在 cf_sil 下表示「保持当前高度」，不是关电机。
+-                pos0 = _pose_parts(subs["pose"].latest())[0] \
+-                    if subs["pose"].latest() is not None else None
+-                if isinstance(pos0, dict) and pos0.get("z") is not None:
+-                    sil.set_altitude_target(pos0["z"])
+-                    sil.set_action(SAFE_NEUTRAL)   # 上电并保持当前高度
+-                    print(f"cf_sil --no-takeoff: 保持当前高度 z={pos0['z']:.2f} m",
+-                          file=sys.stderr)
+-            else:
+-                print("起飞中…", file=sys.stderr)
+-                contact_seq0 = take_off_cf_sil(
+-                    subs["pose"], sil, subs["contact"],
+-                    z_target=sil.params.altitude_target)
+         elif not args.no_takeoff:
+             print("起飞中…", file=sys.stderr)
+             contact_seq0 = take_off(subs["pose"], publisher, subs["contact"])
+@@ -1906,10 +1674,7 @@
+                                     stop_at_waypoint=goal_stop,
+                                     stop_radius=stop_radius or 0.5,
+                                     save_depth=args.save_depth,
+-                                    teacher_nn=teacher_nn, text_ids=text_ids,
+-                                    contact_seq0=contact_seq0, dyn=dyn,
+-                                    predictive_teacher=predictive_teacher,
+-                                    rl_teacher=rl_teacher, sil=sil,
++                                    contact_seq0=contact_seq0, dyn=dyn, sil=sil,
+                                     tiebreak=args.tiebreak, beta=args.beta, rng=rng,
+                                     prev_executed=prev_executed, costmap_opts=costmap_opts,
+                                     heading_guard=args.heading_guard, net_yaw=net_yaw,
+@@ -2061,13 +1826,10 @@
+             # 几何语义版本：v2/v3 的 gid 天然不同，只查 gid 交集查不出混包。
+             "geometry_version": scene_version,
+             **{key: scene_meta_obj.get(key) for key in sm.PROVENANCE_KEYS},
+-            # 动力学由采集器决定而非场景：cf_stab/cf_sil 覆盖 scene 的 x3_v1，
++            # 动力学由采集器决定而非场景：cf_stab/cf_sitl 覆盖 scene 的 x3_v1，
+             # preprocess 只比 dynamics_profile，据此拒绝混包。
+             **({"dynamics_profile": dyn.profile(), "dynamics_params": dyn.params()}
+                if dyn is not None else {}),
+-            # cf_sil 已退出 collect_parallel / eval 默认矩阵，只在 collect.py 手动可用；
+-            # 下游看到 experimental 就不要把它并进默认训练集。
+-            "dynamics_experimental": args.dynamics in DYNAMICS_EXPERIMENTAL,
+             **({"dynamics_profile": sil.params.profile(),
+                 "dynamics_params": sil.params.manifest(),
+                 "altitude_assumption": sil.params.altitude_assumption}
+@@ -2079,18 +1841,13 @@
+             **({"params_sha256": sil.params.sha256, "calibrated": sil.params.calibrated,
+                 "takeoff_failsafe_retries": sil.takeoff_failsafes}
+                if cf_sitl_params is not None else {}),
+-            # 飞行日志只做接口校验/摘要，不参与本次控制参数；留路径供事后追溯。
+-            **({"flight_log": os.path.abspath(log_path)} if log_path else {}),
+             # 标签由哪个教师产生：forward=盲策略对照，expert_action=深度反应式，
+-            # plan_action=柱子真值 carrot planner，teacher_nn=特权教师网络。
+-            # 缺这个字段就无法事后区分数据集。
++            # plan_action=柱子真值 carrot planner。缺这个字段就无法事后区分数据集。
+             "teacher": teacher_kind,
+             # 教师实现版本：改规划参数/前向安全门后必须能区分新旧标签。
+-            "teacher_version": ("uavrgb.predictive_teacher.v1" if planner_kind == "predictive"
+-                                else TEACHER_COST_VERSION if planner_kind == "costmap"
+-                                else "uavrgb.rlteacher.v1" if teacher_kind == "teacher_rl"
++            "teacher_version": (TEACHER_COST_VERSION if planner_kind == "costmap"
+                                 else teacher_version(teacher_task) if teacher_kind in ("plan_action",
+-                                                                                   "expert_action") else None),
++                                                                                       "expert_action") else None),
+             # plan_action 的具体实现：astar=全局路径（普通集），plan_action=局部
+             # （safe 出生集，保留真 SAFE 标签），costmap=测地场代价 argmin。audit 复算必须按这个字段选。
+             "planner": planner_kind,
+@@ -2111,8 +1868,6 @@
+             **({"rule_oracle": ({"hfov_deg": args.rule_hfov_deg, "params": RULE_V0} if args.rule_version == "v0"
+                                 else {"version": args.rule_version, "hfov_deg": args.rule_hfov_deg, "params": RULE_V1})}
+                if args.policy == "rule-oracle" else {}),
+-            "rl_checkpoint": (os.path.abspath(args.rl_checkpoint) if args.policy == "teacher-rl" else None),
+-            "experimental_policy": args.policy == "teacher-rl" or planner_kind == "predictive",
+             # hold 是**仿真时间**秒（D1 起）：窗口按位姿戳走满这个数才发零速，
+             # 与 RTF 无关。同 scene 的 0.5 与 1.0 两批数据仍靠它区分。
+             "hold_s": args.hold,
+--- a/sim/tools/collect_parallel.py
++++ b/sim/tools/collect_parallel.py
+@@ -419,8 +419,6 @@
+             cmd += ["--costmap-tol", str(args.costmap_tol)]
+         if getattr(args, "costmap_lookahead_steps", 1) != 1:
+             cmd += ["--costmap-lookahead-steps", str(args.costmap_lookahead_steps)]
+-    if args.policy == "teacher-rl":
+-        cmd += ["--rl-checkpoint", args.rl_checkpoint]
+     if args.policy == "student":
+         # DAgger 自采（DISTILL §3.2）：学生 ckpt 必传；β/轮次 0 是 collect.py 默认值，不传
+         cmd += ["--student-ckpt", args.student_ckpt]
+@@ -643,15 +641,14 @@
+                    help="透传给 scene_gen：forest_e1 密度档（最窄缝 0.45/0.35/0.28 m）；forest_e1 必填")
+     p.add_argument("--appearance", choices=("legacy", "v1"), default="v1",
+                    help="透传给 scene_gen：v1 删固定地标并随机化光照/天空（几何不变）；旧数据复现请显式 legacy")
+-    p.add_argument("--policy", choices=("teacher", "forward", "teacher-rl", "student"), default="teacher",
++    p.add_argument("--policy", choices=("teacher", "forward", "student"), default="teacher",
+                    help="student=DAgger 自采：学生闭环飞、A* 影子教师给标签（需 --student-ckpt）")
+-    p.add_argument("--teacher-planner", choices=("astar", "predictive", "costmap"), default="astar",
++    p.add_argument("--teacher-planner", choices=("astar", "costmap"), default="astar",
+                    help="透传给 collect.py：costmap=测地场代价 argmin 教师（每行多记 q_costs）")
+     p.add_argument("--costmap-tol", type=float, default=25.0,
+                    help="透传给 collect.py：costmap 教师航向罚死区（度）；仅 --teacher-planner costmap")
+     p.add_argument("--costmap-lookahead-steps", type=int, default=1,
+                    help="透传给 collect.py：costmap 教师前瞻步数；仅 --teacher-planner costmap")
+-    p.add_argument("--rl-checkpoint", default="")
+     p.add_argument("--student-ckpt", default=None, help="透传给 collect.py：--policy student 的 checkpoint")
+     p.add_argument("--infer-bin", default=None,
+                    help="透传给 collect.py：uavrgb_infer 路径（默认 UAV_RGB_BUILD_DIR 或 build/check）")
+@@ -712,13 +709,6 @@
+     # 等到生成世界才失败会白跑一轮，命令行阶段就拒绝。
+     if args.task == "l1" and args.spawn_mode != "random":
+         p.error("--task l1 必须配 --spawn-mode random")
+-    if (args.teacher_planner == "predictive" or args.policy == "teacher-rl") and (
+-            args.dynamics != "cf_stab" or args.task not in ("campus", "campus_assets")):
+-        p.error("新 Teacher 需要 --dynamics cf_stab 和校园场景")
+-    if (args.teacher_planner == "predictive" or args.policy == "teacher-rl") and abs(args.hold-0.2)>1e-6:
+-        p.error("新 Teacher 当前与 --hold 0.2s 配套")
+-    if args.policy == "teacher-rl" and not args.rl_checkpoint:
+-        p.error("teacher-rl 需要 --rl-checkpoint")
+     if args.policy == "student" and not (args.student_ckpt and os.path.isfile(args.student_ckpt)):
+         p.error("--policy student 需要存在的 --student-ckpt")
+     if args.policy != "student" and (args.beta != 0.0 or args.dagger_round != 0 or args.student_ckpt
+@@ -931,7 +921,6 @@
+                                     asset_campus.VERSION if args.task == "campus_assets" else args.appearance),
+             "policy": args.policy,
+             "teacher_planner": args.teacher_planner,
+-            "rl_checkpoint": args.rl_checkpoint if args.policy == "teacher-rl" else None,
+             # 可开关的采集特性（2026-11-07 DEV-DATA）；关着时就是旧值，便于按批次区分数据。
+             "stop_at_goal": bool(args.stop_at_goal),
+             "teacher_tiebreak": args.tiebreak,
+--- a/sim/tools/eval_closed_loop.py
++++ b/sim/tools/eval_closed_loop.py
+@@ -14,10 +14,6 @@
+   # --rule-hfov-deg 60 = 学生相机，81 = 真机 GC4653 的水平视场
+   python3 sim/tools/eval_closed_loop.py --policy rule-oracle --rule-hfov-deg 60 --episodes 3 \
+       --out /tmp/eval-rule --split test
+-  # teacher-nn 用训练好的特权教师闭环（必须用带 torch 的解释器跑，见 --teacher-ckpt）
+-  $DATA_ROOT/uav_rgb/teacher-venv/bin/python sim/tools/eval_closed_loop.py \
+-      --policy teacher-nn --teacher-ckpt $DATA_ROOT/uav_rgb/teacher-run-pilot/ckpt_best.pth \
+-      --episodes 3 --out /tmp/eval-teacher --split test
+   # T7 三个基线用同一批场景：把 student 的 seeds 回传给 --seeds。
+   # 动作窗口默认 observation（唯一被采纳基线）；--window-from dispatch 仅用于复现
+   # T7-R，其 SR/碰撞率不可与 observation 结果混报。
+@@ -562,13 +558,6 @@
+                                 waypoint=waypoint if waypoint_task else None,
+                                 radius=radius)
+     return path_m, win_collision
+-
+-
+-def flight_path_m(oracle, actions, goal_x, waypoint=None, stop_radius=None, goal_radius=None,
+-                  corridor_half_width=None):
+-    """collisions_per_100m 的分母（一集）：从起点量到第一个终局事件的路程（m），见 collision_window。"""
+-    return collision_window(oracle, actions, goal_x, waypoint=waypoint, stop_radius=stop_radius,
+-                            goal_radius=goal_radius, corridor_half_width=corridor_half_width)[0]
+ 
+ 
+ # W1-3：相邻两帧的间隔大于 hold 的这个倍数，per_episode 记 frame_gap_flag: true。
+@@ -997,10 +986,6 @@
+             cmd += ["--rule-hfov-deg", str(args.rule_hfov_deg)]       # 只给 rule-oracle 传：其它策略的命令行逐字不变
+             if args.rule_version != "v0":
+                 cmd += ["--rule-version", args.rule_version]          # v0 不传：v0 的命令行与 v0 实验逐字相同
+-        elif args.policy == "teacher-nn":
+-            cmd += ["--teacher-ckpt", args.teacher_ckpt]
+-        elif args.policy == "teacher-rl":
+-            cmd += ["--rl-checkpoint", args.rl_checkpoint]
+         if args.policy == "teacher" and args.teacher_planner != "astar":
+             cmd += ["--teacher-planner", args.teacher_planner]
+         if args.policy == "teacher" and args.teacher_planner == "costmap":
+@@ -1267,21 +1252,17 @@
+     p = argparse.ArgumentParser(
+         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+     p.add_argument("--ckpt", default=None, help="学生 checkpoint（--policy student 必填）")
+-    p.add_argument("--policy", choices=("student", "forward", "teacher-nn", "teacher", "teacher-rl", "rule-oracle"),
++    p.add_argument("--policy", choices=("student", "forward", "teacher", "rule-oracle"),
+                    default="student",
+                    help="student=模型闭环；forward=盲前进基线（T7）；"
+-                        "teacher-nn=特权教师网络闭环（可解性闸门）；"
+                         "teacher=柱子真值 A* 专家闭环（新动力学下的可解性上界）；"
+                         "rule-oracle=柱子真值列距离 + 固定规则 v0（零训练的规则层上限，不需要 --ckpt）")
+-    p.add_argument("--teacher-planner", choices=("astar", "predictive", "costmap"), default="astar",
++    p.add_argument("--teacher-planner", choices=("astar", "costmap"), default="astar",
+                    help="--policy teacher 的规划器：costmap=测地场代价 argmin（teacher.plan_action_costmap）")
+     p.add_argument("--costmap-tol", type=float, default=25.0,
+                    help="透传给 collect.py：costmap 教师航向罚死区（度）；仅 --teacher-planner costmap")
+     p.add_argument("--costmap-lookahead-steps", type=int, default=1,
+                    help="透传给 collect.py：costmap 教师前瞻步数；仅 --teacher-planner costmap")
+-    p.add_argument("--rl-checkpoint", default="")
+-    p.add_argument("--teacher-ckpt", default=None,
+-                   help="PrivilegedTeacher checkpoint（--policy teacher-nn 必填）")
+     p.add_argument("--episodes", type=int, default=None,
+                    help="请求评测的 episode 数 = SR 分母（失败集也占名额并计入分母，列在 failed；"
+                         "缺省：给了 --seeds 用其个数，否则 3）")
+@@ -1485,28 +1466,6 @@
+     if abs(args.goal_margin - GOAL_MARGIN_M) > 1e-9:
+         p.error(f"--goal-margin 只接受 {GOAL_MARGIN_M:g}：collect.py --stop-at-goal 的停线是最远柱 x + "
+                 f"collect.GOAL_MARGIN_M，评测线必须与它重合（sim09.v2）")
+-    if args.policy == "teacher-nn":
+-        if not args.teacher_ckpt:
+-            p.error("--policy teacher-nn 需要 --teacher-ckpt")
+-        if not os.path.isfile(args.teacher_ckpt):
+-            p.error(f"teacher checkpoint 不存在: {args.teacher_ckpt}")
+-        # collect.py 由 run_episode 用 sys.executable 起，所以这里探的就是子进程解释器。
+-        # 不能只看 find_spec：本机 conda 的 torch 装了但缺 libcudnn，import 会失败。
+-        try:
+-            torch_ok = subprocess.run([sys.executable, "-c", "import torch"],
+-                                      capture_output=True,
+-                                      timeout=120).returncode == 0
+-        except (OSError, subprocess.TimeoutExpired):
+-            torch_ok = False
+-        if not torch_ok:
+-            p.error("teacher-nn 需要带 torch 的解释器，例如 "
+-                    "$DATA_ROOT/uav_rgb/teacher-venv/bin/python")
+-    if (args.teacher_planner == "predictive" or args.policy == "teacher-rl") and (
+-            args.dynamics != "cf_stab" or args.task not in ("campus", "campus_assets")
+-            or abs(args.hold-0.2)>1e-6):
+-        p.error("新 Teacher 需要 --dynamics cf_stab --hold 0.2 --task campus_assets/campus")
+-    if args.policy == "teacher-rl" and not args.rl_checkpoint:
+-        p.error("teacher-rl 需要 --rl-checkpoint")
+     if args.teacher_planner == "costmap" and args.policy != "teacher":
+         p.error("--teacher-planner costmap 只能和 --policy teacher 一起用")
+     if args.teacher_planner != "costmap" and (args.costmap_tol != 25.0 or args.costmap_lookahead_steps != 1):
+@@ -1657,7 +1616,6 @@
+                              if e.get("stop_radius") is not None), None)
+     report = {"schema": "uavrgb.eval.v1", "policy": args.policy,
+               "teacher_planner": args.teacher_planner,
+-              "rl_checkpoint": args.rl_checkpoint if args.policy == "teacher-rl" else None,
+               "task": args.task, "window_from": args.window_from,
+               "dynamics": args.dynamics,
+               "vehicle": args.vehicle or "x3",
+--- a/sim/tools/nav_cond.py
++++ b/sim/tools/nav_cond.py
+@@ -117,7 +117,7 @@
+             if len(raw) != _CKPT_HEAD.size:
+                 return None
+             magic, ver, _np, _h, _w, _c, _nc, _at, _ep, nw = _CKPT_HEAD.unpack(raw)
+-            if magic != b"UAVRCK01" or ver < 5 or ver > 9 or nw > 64:
++            if magic != b"UAVRCK01" or ver < 5 or ver > 8 or nw > 64:
+                 return None
+             f.seek(4 * nw + 8, os.SEEK_CUR)      # class_weights + v3 best_macro_f1 + v4 text_dim
+             contract = f.read(_CKPT_CONTRACT_BYTES)
