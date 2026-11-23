@@ -548,8 +548,8 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
             else:
                 start = {**actions[0]["pose_before"], "yaw_deg": actions[0].get("yaw_before", 0.0)}
                 route_scene = dict(scene, waypoint=evaluation_goal)
-                shortest = (ep["total_path_m"]
-                            if is_multi_stage else
+                # 多阶段示范长度不等于依次进入目标圈的最短距离。
+                shortest = (None if is_multi_stage else
                             route_shortest_path_m(occ_planner, [{"pose_gt": start}] + oracle, route_scene))
                 m = vln.episode_metrics(actions, oracle, evaluation_goal, radius, man["stopped_by_agent"],
                                         shortest, ref_path=(ep.get("ref_path") or ref_paths.get(ep["route_index"])),
@@ -563,8 +563,7 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
             if supplied_goal_waypoint is not None:
                 supplied_scene = dict(scene, waypoint=supplied_goal_waypoint)
                 supplied_stages = instruction_ep.get("stage_waypoints") if is_multi_stage else None
-                supplied_shortest = (instruction_ep["total_path_m"]
-                                     if is_multi_stage else
+                supplied_shortest = (None if is_multi_stage else
                                      route_shortest_path_m(occ_planner, [{"pose_gt": start}] + oracle,
                                                            supplied_scene))
                 supplied_metrics = vln.episode_metrics(

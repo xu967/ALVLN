@@ -919,7 +919,10 @@ class TestRunner(unittest.TestCase):
                           rows[0]["stage_task_success"]), (2, 1.0, True))
         self.assertEqual(policy.goal_fn.stage_instructions,
                          [stage["instruction"] for stage in scene["multi_stage_routes"][0]["stages"]])
-        self.assertEqual((rows[0]["shortest_m"], shortest.call_count), (4.0, 0))
+        self.assertIsNone(rows[0]["shortest_m"])
+        self.assertIsNone(rows[0]["spl"])
+        self.assertIsNone(rows[0]["supplied_goal_spl"])
+        shortest.assert_not_called()
 
     def test_manual_instruction_uses_vlm_without_waypoint_scoring(self):
         scene = {"name": "s", "ply_path": "unused.ply", "reach_radius_m": 0.5,
