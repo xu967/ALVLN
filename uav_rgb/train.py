@@ -5,6 +5,7 @@
 #   python3 train.py                  vln_3dgs 历史诊断套件，包含 S1 局控、G3 阶段路标与视觉判停
 #   python3 train.py s1_direct        仅运行 S1-PureDirect（纯直线方位打包 -> R0 训练 -> 在线 DAgger -> R1 训练 -> 室内外闭环对比与录像）
 #   python3 train.py s1_subgoal       运行 S1 A* 局部子目标特权上界训练与闭环对照
+#   python3 train.py fork_region      冻结 CLIP，训练双指令局部路标方向分类器并离线对照
 #   python3 train.py g3_vlm           G3 阶段路标与视觉判停（840865 登记双目标反事实 6 集 + 841980 跨房间 5 集）
 #   python3 train.py openfly_eval     仅运行 OpenFly v2 多场景 UE4 AirSim（env16 / env23 / env18 seen20）在线闭环与全程 MP4 录像
 #   python3 train.py openfly_v2       从头训练 OpenFly 6 场景 v2 模型 + 20 集时序对拍 + 多场景 UE4 闭环录像
@@ -30,7 +31,7 @@ ENV_REGISTRY = {
     # ---- 运行标识与防覆盖 ----
     "UAVRGB_NAME": "exp-vln-3dgs-g3-20261117",                  # 默认实验目录名；已有 DONE(rc=0) 时拒绝覆盖
     "UAVRGB_OUT_ROOT": "/root/rivermind-data/uav_rgb",          # 所有数据集、权重、日志与 MP4 统一落数据盘（根分区仅剩 6.6G，rivermind-fs Inode 已满禁写）
-    "UAVRGB_MODE": "vln_3dgs",                                  # vln_3dgs | s1_direct | s1_subgoal | g3_vlm | openfly_eval | openfly_v2 | full_all
+    "UAVRGB_MODE": "vln_3dgs",                                  # 可选预设见 PRESETS
     "UAVRGB_OVERWRITE": "0",                                    # 0 = 严禁覆盖已完成目录；1 = 允许重跑覆盖
     "UAVRGB_RESUME": "1",                                       # 1 = 守护进程意外中断重拉起时跳过已完成子阶段；0 = 拒绝进入非空目录
     # ---- S1 机载双帧 C++/CUDA 三带列池化 + 深度扇区门控导航学生 ----
@@ -83,7 +84,7 @@ ENV_REGISTRY = {
 REPO_ROOT = Path(__file__).resolve().parent
 TRAIN_SCENES = ("sage3d_840139", "sage3d_841012", "sage3d_841150")  # 严格只用这 3 个公寓训练（留 840865 / 841980 作完全未见测试公寓）
 VAL_SCENE = "sage3d_839992"                                         # 仅取其 train split 作选模，留 test_Instruction_Unseen 作测试
-VALID_MODES = ("vln_3dgs", "s1_direct", "s1_subgoal", "g3_vlm", "openfly_eval", "openfly_v2", "full_all")
+VALID_MODES = ("vln_3dgs", "s1_direct", "s1_subgoal", "g3_vlm", "openfly_eval", "openfly_v2", "full_all", "fork_region")
 PRESETS = {
     "vln_3dgs": {"UAVRGB_MODE": "vln_3dgs", "UAVRGB_NAME": "exp-vln-3dgs-g3-20261117"},
     "s1_direct": {"UAVRGB_MODE": "s1_direct", "UAVRGB_NAME": "exp-s1-colpool-direct-20261117"},
@@ -92,6 +93,23 @@ PRESETS = {
     "openfly_eval": {"UAVRGB_MODE": "openfly_eval", "UAVRGB_NAME": "exp-openfly-v2-closedloop-20261117"},
     "openfly_v2": {"UAVRGB_MODE": "openfly_v2", "UAVRGB_NAME": "exp-openfly-v2-retrain-20261117"},
     "full_all": {"UAVRGB_MODE": "full_all", "UAVRGB_NAME": "exp-full-3dgs-g3-openfly-20261117"},
+    "fork_region": {"UAVRGB_MODE": "fork_region", "UAVRGB_NAME": "exp-vln-fork-region-20261127"},
+}
+# 四房间方向候选的设置预先固定，模型标识和文件指纹一起保存到每次实验的 registration.json。
+FORK_REGION = {
+    "labels": "/root/rivermind-data/uav_rgb/exp-vln-fork-bearings-20261127/labels",
+    "original_manifests": "../exp-vln-fork-counterfactual-states-20261124",
+    "protocol_sha256": "8e4b2b4bbae7b3d9170a455efeb23f7a8650c05fb25ba21269b92969c812cdbd",
+    "corpus_registration_sha256": "2a61161e5804e9bda79769b246b9235c8843d4775dcb9b4686db3ca9d266f084",
+    "label_sha256": {"train": "24a9d3ae740b69f9ebf9d4022f61ea59de38cb29e851fcd560bb7de4dc23b8c0",
+                     "development": "0c79a8079e84919c4355a5da3e6efed1321b1204aac143aed08e46c7d36c3566"},
+    "checkpoint": "/root/rivermind-data/uav_rgb/baselines/clip-vit-base-patch32/3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268",
+    "model_id": "openai/clip-vit-base-patch32", "revision": "3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268",
+    "model_files_digest": "b62549af8add6bf4bfb31fd7295b566267771a7310ef8e0e5fd4829a738aa00b",
+    "train_rooms": [room.removeprefix("sage3d_") for room in TRAIN_SCENES],
+    "development_rooms": [VAL_SCENE.removeprefix("sage3d_")],
+    "image_size": 224, "pad_rgb": [123, 117, 104], "patch_columns": [[0, 2], [2, 5], [5, 7]],
+    "batch_size": 16, "C": 1.0, "max_iter": 2000, "tol": 1e-8,
 }
 # =======================================================================
 
@@ -192,6 +210,9 @@ def estimate_eta_minutes(mode: str):
 
 def _print_effective_config(mode: str, run_dir: Path):
     print(f"[train.py] 模式={mode} | 输出目录={run_dir}", flush=True)
+    if mode == "fork_region":
+        print("[train.py] 冻结 CLIP，每张原图编码一次，三个线性分类器各自只在训练房间拟合。", flush=True)
+        return
     for k, default_v in ENV_REGISTRY.items():
         cur = os.environ.get(k, "")
         mark = "*" if cur != default_v else " "
@@ -225,6 +246,14 @@ def _paths():
 
 def _preflight_files(mode: str):
     p = _paths()
+    if mode == "fork_region":
+        from tools.fork_region import check_inputs
+        if not p["py_vlm"].is_file():
+            raise SystemExit(f"[train.py] 缺少 CLIP 环境: {p['py_vlm']}")
+        try:
+            return check_inputs(FORK_REGION)
+        except (OSError, ValueError, KeyError) as exc:
+            raise SystemExit(f"[train.py] 路标方向预检失败: {exc}") from exc
     req = [p["py_tools"]]
     if mode in ("vln_3dgs", "full_all", "s1_direct", "s1_subgoal", "g3_vlm"):
         req += [p["py_3dgs"], p["train_bin"], p["infer_bin"], p["cf_sitl_proc"]]
@@ -880,8 +909,12 @@ def build_video_gallery(run_dir: Path) -> dict:
 def main(argv=None):
     raw_argv = sys.argv[1:] if argv is None else list(argv)
     check_only, mode, run_dir = _parse_cli_and_validate_env(raw_argv)
+    if mode == "fork_region" and not check_only:
+        py_vlm = _paths()["py_vlm"]
+        if Path(sys.prefix).resolve() != py_vlm.parent.parent.resolve():
+            os.execve(str(py_vlm), [str(py_vlm), str(Path(__file__).resolve()), *raw_argv], _base_env())
     _print_effective_config(mode, run_dir)
-    _preflight_files(mode)
+    checked = _preflight_files(mode)
     if check_only:
         print("[train.py] --check 预检全部通过（未导入 torch，未触碰 GPU）。", flush=True)
         return 0
@@ -923,7 +956,11 @@ def main(argv=None):
     if mode in ("full_all", "openfly_eval", "openfly_v2"):
         summary["openfly_v2_closedloop"] = run_stage_openfly(run_dir, env, retrain=(mode == "openfly_v2"))
 
-    summary["video_gallery"] = build_video_gallery(run_dir)
+    if mode == "fork_region":
+        from tools.fork_region import run
+        summary["fork_region"] = run(FORK_REGION, checked, run_dir)
+    else:
+        summary["video_gallery"] = build_video_gallery(run_dir)
     summary["elapsed_s"] = round(time.time() - t0, 2)
     (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False) + "\n")
     done_file.write_text(f"rc=0 finished_at={time.strftime('%Y-%m-%dT%H:%M:%S%z')} elapsed_s={summary['elapsed_s']}\n")
