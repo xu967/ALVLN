@@ -2,6 +2,14 @@
 
 当前研究与实验顺序见 [论文实验计划](docs/experiments/2026-11-21-vln-paper-plan.md)。早期实现和数据记录见 [交接文档](docs/HANDOFF.md)。
 
+## 2026-11-27 18:47 · 五房间同图双指令补采已启动
+
+两条旧原句已各重飞 28 步，56 张 RGB、280 条固件遥测与各自历史记录一致。第 26 步去柜旁壁画要前进，去展示架上的饰物要右转。该帧两个局部路标仅一个入画，四个冻结读出都未整对答对，此历史样例单列。正式目标是在 839992、840865 两个开发房间找到至少 10 个不同物理起点，满足两臂实际飞过同一前缀、路标异向且双入画。三个训练房的分母另列。[方法与验收](docs/experiments/2026-11-21-vln-paper-plan.md#11-月-27-日五房间实飞共同分岔)
+
+守护进程于北京时间 18:47:45 启动，父 PID/PGID 均为 `452548`，已确认进入三进程 CPU 筛选，后续渲染与评分绑定物理 GPU0。五房筛选预估 4–12 分钟，最多 54 次单臂仿真预估 8–12 分钟，证据核验、审图和冻结推理约 2–3 分钟。含余量约 16–31 分钟，**预计 19:04–19:19 完成**。实验从干净提交 `88b3e1c` 运行，43 项相关回归通过。主动停止整组用 `kill -- -452548`。
+
+数据根为 `D=/root/rivermind-data/uav_rgb`，本次 `E=$D/exp-vln-shared-prefix-20261127`。在 `$E` 的启动命令为 `setsid nohup bash -c "$(jq -r .shell job.json)" shared-forks "$E" "$D" >> run.log 2>&1 < /dev/null &`。完整参数和环境在 `job.json`，逐臂状态在 `collection.jsonl`。结束时读取 `$E/DONE` 的退出码与 `$E/REPORT.md`，按实际证据填写覆盖和命中数。[运行登记](</root/rivermind-data/uav_rgb/exp-vln-shared-prefix-20261127/job.json>) · [运行日志](</root/rivermind-data/uav_rgb/exp-vln-shared-prefix-20261127/run.log>) · [交接](docs/HANDOFF.md)
+
 ## 2026-11-27 傍晚 · 局部方向对照已完成
 
 四房间 1,118 个状态、2,236 个路标与教师动作已逐条重放。三训练房间学习、839992 开发实测：需异向且前／左前／右前可表达的 32 对中，区域＋原句 2 对、整图＋原句 2 对、空句和恒前均 0 对。区域方法两次命中只来自一个起点，未通过闭环条件。当前无运行中实验。下一项是在多个独立起点补实际共享分岔，同时标记目标、参照物与两条局部路标的可见情况。[实验表和接手步骤](docs/experiments/2026-11-21-vln-paper-plan.md#11-月-27-日同图双指令的局部方向) · [同图两种飞行目的](</root/rivermind-data/uav_rgb/exp-vln-fork-bearings-20261127/paired_waypoints.png>)
