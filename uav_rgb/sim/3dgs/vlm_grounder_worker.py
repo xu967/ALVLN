@@ -4,12 +4,19 @@
 仅接收机载 RGB 与自然语言指令（及 VLM 自身历史摘要），区分 FINAL（最终目的地可见）与
 SUBGOAL（跨房间门洞/走廊过渡路标），严禁读取位姿、占据图或真值深度。
 """
+import argparse
 import base64
 import io
 import json
+import math
 import os
 import sys
 import time
+
+if __package__:
+    from .grounder import parse_vlm_output
+else:
+    from grounder import parse_vlm_output
 
 # ========================= 顶部集中配置区 =========================
 # 严禁向 /root/rivermind-fs（Inode 已满）写入任何缓存或临时文件
@@ -31,6 +38,7 @@ INPUT_H = int(os.environ.get("UAV_RGB_VLM_H", "192"))
 MAX_NEW_TOKENS = int(os.environ.get("UAV_RGB_VLM_MAX_TOKENS", "20"))
 MIN_FREE_VRAM_MIB = int(os.environ.get("UAV_RGB_VLM_MIN_VRAM_MIB", "6000"))
 ALLOWED_REQ_KEYS = frozenset(("cmd", "frames_b64", "instruction", "memory"))
+DIRECTION_TOKENS = ("L", "C", "R", "N")
 # =================================================================
 
 PROMPT_TEMPLATE = (
@@ -49,8 +57,53 @@ PROMPT_TEMPLATE = (
     'Output only this JSON array: ["C|L|R|N","F|S|N",0|1,"word"]'
 )
 
+LOCAL_WAYPOINT_PROMPT = (
+    'Drone front camera (HFOV 60°).\n'
+    'Instruction: "{ins}"\n'
+    'Choose the next short movement toward the requested destination. Use the destination '
+    'and its reference landmarks to decide which visible opening or clear space leads toward it. '
+    'An object the drone starts from is only a reference.\n'
+    'Plan for a drone flying level at camera height. Look for clearance for its body over the next '
+    'short flight segment, including when furniture blocks the direct line to the destination.\n'
+    'Choose C to advance straight ahead, L to turn toward a clear route on the left, '
+    'or R to turn toward a clear route on the right. If the image and instruction give '
+    'no evidence for a route, choose N.\n'
+    'For a route, return ["C|L|R","S",0,"short route label"]. '
+    'For unknown, return ["N","N",0,"none"]. Output only the JSON array.'
+)
 
-def _grounding_inputs(processor, frames_b64, instruction, memory):
+
+def _waypoint_reply(raw):
+    bearing, _, _, label, mode = parse_vlm_output(raw)
+    direction = {0: "C", 1: "L", 7: "R"}.get(bearing)
+    if mode == "subgoal" and direction:
+        return json.dumps([direction, "S", 0, label])
+    return json.dumps(["N", "N", 0, f"{mode}: {label}"])
+
+
+def _direction_ids(tokenizer, check_single=False):
+    encoded = [tokenizer.encode(d, add_special_tokens=False) for d in DIRECTION_TOKENS]
+    if check_single and (any(len(ids) != 1 for ids in encoded) or len({tuple(ids) for ids in encoded}) != 4):
+        raise ValueError("局部路标探针需要 L/C/R/N 各对应一个不同的 token")
+    return [ids[0] for ids in encoded]
+
+
+def _first_token_readout(raw_generation, scores, direction_ids):
+    result = {"raw_generation": raw_generation, "first_token_choice": None,
+              "vocab_argmax_token_id": None, "vocab_argmax_in_choices": None}
+    if scores is None:
+        return result
+    logits = scores[direction_ids].tolist()
+    # 四选项平分时取 L/C/R/N 中最靠前的一项；全词表 argmax 按 token ID 顺序打破平局。
+    best = max(range(len(logits)), key=logits.__getitem__)
+    if math.isfinite(logits[best]) and not any(math.isnan(x) for x in logits):
+        result["first_token_choice"] = DIRECTION_TOKENS[best]
+    token_id = int(scores.argmax().item())
+    result.update(vocab_argmax_token_id=token_id, vocab_argmax_in_choices=token_id in direction_ids)
+    return result
+
+
+def _grounding_inputs(processor, frames_b64, instruction, memory, prompt_template=PROMPT_TEMPLATE):
     from PIL import Image
 
     content = []
@@ -58,7 +111,7 @@ def _grounding_inputs(processor, frames_b64, instruction, memory):
         with Image.open(io.BytesIO(base64.b64decode(data))) as frame:
             image = frame.convert("RGB").resize((INPUT_W, INPUT_H), Image.Resampling.BILINEAR)
         content.append({"type": "image", "image": image})
-    prompt = PROMPT_TEMPLATE.format(ins=instruction, mem=memory)
+    prompt = prompt_template.format(ins=instruction, mem=memory)
     if len(content) > 1:
         prompt = ("Frames are ordered oldest to newest. Use earlier frames as context. "
                   "Report visibility, direction and proximity in the last image only.\n" + prompt)
@@ -72,7 +125,11 @@ def _grounding_inputs(processor, frames_b64, instruction, memory):
     )
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--local-waypoint-probe", action="store_true", help="离线询问下一段可通行方向")
+    args = parser.parse_args(argv)
+    prompt_template = LOCAL_WAYPOINT_PROMPT if args.local_waypoint_probe else PROMPT_TEMPLATE
     for sub in ("hf", "transformers", "torch", "tmp"):
         os.makedirs(os.path.join(CACHE_ROOT, sub), exist_ok=True)
     import torch
@@ -103,11 +160,11 @@ def main():
 
     tok = processor.tokenizer
     eos_ids = list({151645, 151643, tok.encode('"]')[0], tok.encode("]")[0]})
-    cand_ids = [tok.encode(c, add_special_tokens=False)[0] for c in ("L", "C", "R", "N")]
+    cand_ids = _direction_ids(tok, check_single=args.local_waypoint_probe)
 
     warm_im = Image.new("RGB", (INPUT_W, INPUT_H), (128, 128, 128))
     warm_msgs = [
-        {"role": "user", "content": [{"type": "image", "image": warm_im}, {"type": "text", "text": PROMPT_TEMPLATE.format(ins="warmup", mem="none")}]},
+        {"role": "user", "content": [{"type": "image", "image": warm_im}, {"type": "text", "text": prompt_template.format(ins="warmup", mem="none")}]},
         {"role": "assistant", "content": [{"type": "text", "text": '["'}]},
     ]
     warm_in = processor.apply_chat_template(
@@ -145,7 +202,7 @@ def main():
 
         mem = str(req.get("memory") or "none").strip()[:160] or "none"
         t0 = time.perf_counter()
-        inputs = _grounding_inputs(processor, frames_b64, ins, mem).to("cuda:0")
+        inputs = _grounding_inputs(processor, frames_b64, ins, mem, prompt_template).to("cuda:0")
         inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
         with torch.inference_mode():
             out = model.generate(
@@ -156,10 +213,15 @@ def main():
         ms = (time.perf_counter() - t0) * 1000.0
         gen_ids = out.sequences[:, inputs["input_ids"].shape[1]:]
         conf = float(out.scores[0][0, cand_ids].float().softmax(dim=-1).max().item()) if out.scores else 0.5
-        raw_txt = '["' + processor.batch_decode(gen_ids, skip_special_tokens=True)[0].strip()
+        continuation = processor.batch_decode(gen_ids, skip_special_tokens=True)[0]
+        raw_txt = '["' + continuation.strip()
+        reply = {"raw": raw_txt, "conf": round(conf, 4), "infer_ms": round(ms, 2)}
+        if args.local_waypoint_probe:
+            reply["raw"] = _waypoint_reply(raw_txt)
+            reply["waypoint_probe"] = _first_token_readout(
+                '["' + continuation, out.scores[0][0] if out.scores else None, cand_ids)
         del out, inputs
-
-        sys.stdout.write(json.dumps({"raw": raw_txt, "conf": round(conf, 4), "infer_ms": round(ms, 2)}) + "\n")
+        sys.stdout.write(json.dumps(reply) + "\n")
         sys.stdout.flush()
 
 

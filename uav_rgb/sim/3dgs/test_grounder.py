@@ -495,6 +495,72 @@ class TestVisualLanguageGrounder(unittest.TestCase):
                     self.assertIn("oldest to newest", prompt)
                     self.assertIn("last image only", prompt)
 
+    def test_offline_waypoint_replies_cannot_supply_stop_evidence(self):
+        worker = importlib.import_module("sim.3dgs.vlm_grounder_worker")
+        cases = {
+            '["R","S",1,"aisle"]': (7, "subgoal"),
+            '["C","F",1,"lamp"]': (8, "search"),
+            '["L",0,"lamp"]': (8, "search"),
+            '["far_right","S",0,"aisle"]': (8, "search"),
+            '["N","N",0,"wall"]': (8, "search"),
+            "incomplete": (8, "search"),
+        }
+        for raw, (expected_bin, expected_mode) in cases.items():
+            with self.subTest(raw=raw):
+                bearing, near, _, _, mode = grounder.parse_vlm_output(worker._waypoint_reply(raw))
+                self.assertEqual((bearing, near, mode), (expected_bin, 0, expected_mode))
+
+    def test_offline_first_token_validates_choices_and_resolves_ties(self):
+        import numpy as np
+        from unittest import mock
+
+        worker = importlib.import_module("sim.3dgs.vlm_grounder_worker")
+        ids = [4, 2, 5, 1]
+        tokenizer = mock.Mock()
+        for mapping in ([[4], [2], [5], [1, 6]], [[4], [2], [5], [4]]):
+            tokenizer.encode.side_effect = mapping
+            with self.assertRaisesRegex(ValueError, "不同的 token"):
+                worker._direction_ids(tokenizer, check_single=True)
+        tokenizer.encode.side_effect = [[n] for n in ids]
+        self.assertEqual(worker._direction_ids(tokenizer, check_single=True), ids)
+        logits = np.array([0., 3., 7., 1., 7., 2.])
+        raw = '["L","S",0,"unterminated'
+        result = worker._first_token_readout(raw, logits, ids)
+        self.assertEqual(result, {"raw_generation": raw, "first_token_choice": "L",
+                                  "vocab_argmax_in_choices": True, "vocab_argmax_token_id": 2})
+        logits[3] = 8
+        outside = worker._first_token_readout(raw, logits, ids)
+        self.assertEqual((outside["first_token_choice"], outside["vocab_argmax_in_choices"]), ("L", False))
+        self.assertIsNone(worker._first_token_readout(raw, None, ids)["first_token_choice"])
+
+    def test_offline_diagnostics_clear_on_legacy_empty_and_reset(self):
+        import sys
+        import numpy as np
+
+        mock_code = (
+            "import json, sys\n"
+            "print(json.dumps({'status':'ready'}), flush=True)\n"
+            "for line in sys.stdin:\n"
+            "    req = json.loads(line)\n"
+            "    if req.get('cmd') == 'close': break\n"
+            "    assert 'marker' not in req['memory']\n"
+            "    resp = {'raw': '[\"N\",\"N\",0,\"none\"]'}\n"
+            "    if req['instruction'] == 'local':\n"
+            "        resp['waypoint_probe'] = {'raw_generation':'marker','first_token_choice':'R'}\n"
+            "    print(json.dumps(resp), flush=True)\n"
+        )
+        frame = np.zeros((4, 4, 3), dtype=np.uint8)
+        with grounder.VisualLanguageGrounder(worker_cmd=[sys.executable, "-c", mock_code]) as vg:
+            for rgb, instruction in ((frame, "legacy"), (frame, ""), ([], "local")):
+                observation = vg.ground_step(frame, "local")
+                self.assertEqual((observation.bearing_bin, observation.near_goal), (8, 0))
+                self.assertEqual(vg.last_waypoint_probe["first_token_choice"], "R")
+                vg.ground_step(rgb, instruction)
+                self.assertIsNone(vg.last_waypoint_probe)
+            vg.ground_step(frame, "local")
+            vg.reset_episode()
+            self.assertIsNone(vg.last_waypoint_probe)
+
     def test_g3_subgoal_vs_final_parsing_and_memory_roundtrip(self):
         import sys
         import numpy as np

@@ -51,6 +51,36 @@ def _steps(xy, collide_at=None):
     return actions, oracle
 
 
+class TestReferencePaths(unittest.TestCase):
+    def test_cropped_routes_keep_navigation_scores_without_path_scores(self):
+        route = {"spawn": {"x": 0, "y": 0}, "waypoint": GOAL, "ref_path": [[0, 0], [4, 0]]}
+        routes = [route, dict(route, spawn={"x": 1, "y": 0}),
+                  dict(route, waypoint={"x": 4, "y": 1})]
+        paths = vln.sage_ref_paths({"routes": routes})
+        self.assertEqual(paths, {0: [(0, 0), (4, 0)]})
+        rows = []
+        for index, task in enumerate(routes):
+            start, end = task["spawn"], task["waypoint"]
+            actions, oracle = _steps([(start["x"], start["y"]), (end["x"], end["y"])])
+            rows.append(vln.episode_metrics(actions, oracle, end, 1, True, ref_path=paths.get(index)))
+        self.assertEqual([(r["ndtw"], r["sdtw"]) for r in rows], [(1, 1), (None, None), (None, None)])
+        counts = vln.summarize(rows)["denominators"]
+        self.assertEqual((counts["sr"], counts["ndtw"], counts["sdtw"]), (3, 1, 1))
+
+    def test_native_fallback_uses_the_same_endpoints(self):
+        route = {"spawn": {"x": 0, "y": 0}, "waypoint": GOAL,
+                 "sage": {"split": "train", "trajectory_id": 7}}
+        routes = [dict(route, ref_path=[[1, 0], [4, 0]]), dict(route, spawn={"x": 1, "y": 0}),
+                  dict(route, waypoint={"x": 4, "y": 1}), dict(route, ref_path=[[0, 0], [2, 1], [4, 0]])]
+        with tempfile.TemporaryDirectory() as root:
+            split_dir = Path(root) / "42" / "train"
+            split_dir.mkdir(parents=True)
+            sample = {"trajectory_id": 7, "points": [{"position": [0.05, 0, 1]}, {"position": [4, 0, 1]}]}
+            (split_dir / "routes.json").write_text(json.dumps({"scenes": [{"samples": [sample]}]}))
+            paths = vln.sage_ref_paths({"name": "sage3d_42", "routes": routes}, root)
+        self.assertEqual(paths, {0: [(0.05, 0), (4, 0)], 3: [(0, 0), (2, 1), (4, 0)]})
+
+
 class TestEpisodes(unittest.TestCase):
     def test_every_instruction_is_an_episode(self):
         eps = vln.episodes(SCENE)

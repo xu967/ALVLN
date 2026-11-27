@@ -107,3 +107,52 @@ PYTHONPATH=. CUDA_VISIBLE_DEVICES=0 "$D/3dgs-venv/bin/python" -B "$E/probe.py" \
 - 当前 STOP 仍依赖两次新鲜、居中、近距且名称匹配的模型观测。它缺少实例区域、跨帧 ID 和独立的距离核验。同名异物、房间或区域目标仍需分别标注。模型的 search 也没有独立区分画外、遮挡和漏检。
 - 尚未调飞控 PID、接入真机遥测、训练新模型、运行公开方法同协议主表或检验从未见过的路线。现有结果支持先比较局部真值路标与视觉方位，再冻结候选实例与停机证据。Studio 的普通 3DGS 评测仍读取另一种 `eval.json`；这次生成的有语言评测和录像来自 `run_vln`。
 - 当前工作树的大批既有删除、旧实验、日志及用户的训练入口改动留给独立清理。后续先查每个产物的登记、引用、哈希和可恢复来源。只把本次行为和对应测试从原提交提取并发布。
+
+## 更新 2026-11-27 午间 · 跨房间复验
+
+### 做了什么
+
+- 从发布镜像 `a2d0e37` 执行八集真实 `gsplat + cf_sitl` 匹配指令对照。采用原登记的橱柜起点和教师轨迹中的窗户起点，把模型、固件、场景、两条原句、四臂参数与输入指纹冻结到数据盘。橱柜教师在本次机器台账前已作为预检执行，计入八集。GPU0 的 UUID 为 `GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740`。
+- 用冷启动实际首帧、相机外参、官方实例框及原生窗网格复核 #122。将飞行日志中的真实位姿、动作、偏航及终止原因汇成距离曲线，只发布派生曲线。八集的逐步数据、原始文件指纹和可独立复现的评分代码在 [scores.json](</root/rivermind-data/uav_rgb/exp-vln-local-waypoint-transfer-20261127/scores.json>)。
+- 修复截断任务误用完整示范的 nDTW/SDTW 评分。内嵌和原始 SAGE 参考路径使用相同的 XY 首尾校验。实际 671 条原生单段路径逐点复核通过。原始报告保留，复核成绩在论文计划中列出。正确指令与交换指令各自使用对应参考路径。
+- 实现可复用的离线图文路标探针。相同模型、JPEG 和像素分别询问现有问题或局部可通行方向。每条原句前清记忆。探针支持同图双指令的教师动作、真实飞行的 A* 路标两种标签，输出逐条预测、每类分母和恒选正前的对照。局部路标不能触发 STOP。[探针与选样](../../tools/probe_vln_waypoints.py)
+
+### 验证到哪一步
+
+两条任务模板分别指定诊室衣柜旁的橱柜、卧室二采自然光的窗。地图教师和两种特权学生各自停靠 2/2，视觉语言学生 0/2，无碰撞。窗户起飞时另一窗体也有可见像素，只凭目标区域入画无法验收实例辨认。离线登记、各项得分、视觉见证、下一轮选择条件见[论文计划](../experiments/2026-11-21-vln-paper-plan.md#11-月-27-日跨房间局部路标复验)。
+
+同图双指令的严格局部路标读数为 0/10 对，17/20 条生成文本无法按原协议解析。额外记下原始文本和首个词元，复算得到动作 10/20、整对 1/10，三条教师路线的真路标为 5/6。这是事后诊断。两次运行的严格预测对 20 条分岔和 6 个真路标逐项相同，提示词和像素保持一致。另从动作前速度、位姿和地图重放同一张图的两个局部方向；20/20 个教师动作可复现，只有 2/10 对确实需要不同且可表达的方向。两对的原问法与候选首词元均为整对 0/2。[逐条真值与重放方法](</root/rivermind-data/uav_rgb/exp-vln-local-waypoint-transfer-20261127/fork_bearing_labels.json>)
+
+独立发布快照启用 `RUN_3DGS_REAL=1`，8 个模块的 Python 测试 248/248 通过，耗时 75.169 s。`ctest --test-dir build/check --output-on-failure -j4` 使用本机现有构建，42/42 通过，耗时 33.50 s。用评分 JSON 内的复核代码重读八集原始日志与派生图片，逐项核验通过。Git 含候选、评分源码、测试、数表和只用距离生成的图；原机载图片、权重及三维资产在登记的数据盘位置。[Python 测试输出](</root/rivermind-data/uav_rgb/exp-vln-local-waypoint-transfer-20261127/release-python-final.log>) · [CTest 输出](</root/rivermind-data/uav_rgb/exp-vln-local-waypoint-transfer-20261127/release-ctest.log>)
+
+### 复现
+
+从 `code/uav_rgb` 根目录运行。闭环登记中的 `defaults.common_argv` 替换场景和新输出目录，再接 `arms` 中的参数。为避免镜像滚动，复现原始闭环请使用 `fd63117` 的检出；探针和新路径评分使用本次提交。下例核对离线样本，随后运行局部路标条件。
+
+```bash
+D=/root/rivermind-data/uav_rgb
+E="$D/exp-vln-local-waypoint-transfer-20261127"
+PY="$D/3dgs-venv/bin/python"
+FORK="$D/exp-vln-fork-counterfactual-states-20261124/development.jsonl"
+TEACHERS=(--teacher-run "$D/exp-vln-frame-history-20261127-mdRWGA/control-teacher"
+          --teacher-run "$E/cabinet-teacher" --teacher-run "$E/window-teacher")
+"$PY" -B -m tools.probe_vln_waypoints --manifest "$FORK" --check
+"$PY" -B -m tools.probe_vln_waypoints "${TEACHERS[@]}" --check
+CUDA_VISIBLE_DEVICES=0 "$PY" -B -m tools.probe_vln_waypoints --manifest "$FORK" \
+  --condition local-waypoint --out "$E/fork-replica.json"
+CUDA_VISIBLE_DEVICES=0 "$PY" -B -m tools.probe_vln_waypoints "${TEACHERS[@]}" \
+  --condition local-waypoint --out "$E/bearing-replica.json"
+```
+
+`--condition baseline` 使用原来的单帧问题。`local-waypoint` 的同一次运行可核对原始生成文本、严格评分和单词元事后诊断。完整八次飞行的独立核验命令如下，运行目录须包含原始日志。
+
+```bash
+cd /root/rivermind-data/uav_rgb/exp-vln-local-waypoint-transfer-20261127
+/opt/conda/bin/python -B -c 'import json,sys; exec(json.load(open(sys.argv[1]))["reproduction"]["source"])' scores.json verify
+```
+
+### 没做什么
+
+- 本轮是圈外途中起飞的匹配指令复验。两夹具没有符合合同的交换伙伴，不能据此报告端到端的语言因果、整程任务成功、目标实例正确率或未见场景成绩。正式留出房间 840818 继续封存。
+- 未调真机 PID。两次超时都能由策略持续下达同一转向指令解释，尚无新的真机遥测。局部路标候选只参加离线对照，是否进入闭环按预先写下的判据决定。
+- 未追加公开榜单对比或清理历史实验。公开方法的同协议比较依赖可用的指令策略；旧日志同时是这次首帧和反事实动作可追溯的来源。

@@ -498,6 +498,7 @@ class VisualLanguageGrounder:
         import subprocess
         self.timeout_s = float(timeout_s)
         self._recent_notes = []
+        self.last_waypoint_probe = None
         if worker_cmd is not None:
             cmd = list(worker_cmd)
         else:
@@ -520,6 +521,7 @@ class VisualLanguageGrounder:
 
     def reset_episode(self):
         self._recent_notes.clear()
+        self.last_waypoint_probe = None
 
     def note_action(self, action_name: str):
         if not self._recent_notes:
@@ -568,6 +570,7 @@ class VisualLanguageGrounder:
         """严格零特权接口：仅接收机载 RGB 数组（单帧 HWC 或帧序列）与语言指令。"""
         import time
 
+        self.last_waypoint_probe = None
         text = str(instruction or "").strip()
         if not text:
             return VisualGrounding(BEARING_SEARCH, 0, 0.0, "empty_instruction", 0.0, "search")
@@ -581,6 +584,7 @@ class VisualLanguageGrounder:
         self._proc.stdin.write(req + "\n")
         self._proc.stdin.flush()
         resp = json.loads(self._readline(min(self.timeout_s, 30.0), "ground_step"))
+        self.last_waypoint_probe = resp.get("waypoint_probe")
         bb, ng, conf, reason, goal_mode = parse_vlm_output(resp.get("raw", ""), default_conf=resp.get("conf", 0.5))
         tag = "F" if goal_mode == "final" else ("S" if goal_mode == "subgoal" else "N")
         self._recent_notes.append(f"{_BIN_SHORT.get(bb, 'N')}({tag}:{reason[:18]})")

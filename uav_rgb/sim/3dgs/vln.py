@@ -101,13 +101,33 @@ def ndtw_sdtw(pred_pts, ref_pts, threshold_m, success):
     return ndtw, (float(bool(success)) * ndtw)
 
 
+def _matching_reference_path(route, points):
+    """截断任务可能沿用旧参考路径。单段路径首尾须与当前任务各相距不超过 5 cm。"""
+    if not isinstance(points, list) or len(points) < 2:
+        return None
+    try:
+        path = [(float(p[0]), float(p[1])) for p in points]
+        start = tuple(float(route["spawn"][k]) for k in ("x", "y"))
+        goal = tuple(float(route["waypoint"][k]) for k in ("x", "y"))
+    except (KeyError, IndexError, TypeError, ValueError, OverflowError):
+        return None
+    if not all(math.isfinite(x) and math.isfinite(y) for x, y in path):
+        return None
+    if math.dist(start, path[0]) <= 0.05 and math.dist(goal, path[-1]) <= 0.05:
+        return path
+    return None
+
+
 def sage_ref_paths(scene, sage_vln_root=None):
-    """返回 route_index -> [(x, y), ...] 参考路径表。优先读 route['ref_path']，否则查本地 pubdata/sage3d/vln。"""
+    """按航线索引返回已对齐的单段参考路径，内嵌路径优先，其次查 SAGE 原始标注。"""
     routes = scene.get("routes") or []
     out = {}
     for idx, r in enumerate(routes):
-        if isinstance(r.get("ref_path"), list) and len(r["ref_path"]) >= 2:
-            out[idx] = [(float(p[0]), float(p[1])) for p in r["ref_path"]]
+        path = _matching_reference_path(r, r.get("ref_path"))
+        if path is not None:
+            out[idx] = path
+    if len(out) == len(routes):
+        return out
     name = str(scene.get("name") or "")
     sid = name.split("sage3d_", 1)[1] if name.startswith("sage3d_") else None
     root = sage_vln_root or os.path.join(
@@ -127,21 +147,16 @@ def sage_ref_paths(scene, sage_vln_root=None):
                 doc = json.load(f)
             for sc in doc.get("scenes", []):
                 for smp in sc.get("samples", []):
-                    pts = [(float(p["position"][0]), float(p["position"][1]))
-                           for p in smp.get("points", []) if "position" in p]
+                    pts = [p["position"] for p in smp.get("points", []) if "position" in p]
                     if len(pts) >= 2:
                         by_key[(split, int(smp["trajectory_id"]))] = pts
     for idx, r in enumerate(routes):
         if idx in out:
             continue
         sage = r.get("sage") or {}
-        pts = by_key.get((sage.get("split"), sage.get("trajectory_id")))
-        if not pts:
-            continue
-        sp, wp = r.get("spawn") or {}, r.get("waypoint") or {}
-        if ("x" in sp and math.hypot(pts[0][0] - float(sp["x"]), pts[0][1] - float(sp["y"])) <= 0.05
-                and "x" in wp and math.hypot(pts[-1][0] - float(wp["x"]), pts[-1][1] - float(wp["y"])) <= 0.05):
-            out[idx] = pts
+        path = _matching_reference_path(r, by_key.get((sage.get("split"), sage.get("trajectory_id"))))
+        if path is not None:
+            out[idx] = path
     return out
 
 
