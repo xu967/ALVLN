@@ -1,0 +1,21 @@
+{
+  "schema": "uavrgb.fork_bearing_corpus.registration.v1",
+  "date": "2026-11-27",
+  "source_commit": "09e6d2b1db32bf371e454395879e575f3f246a0d",
+  "scope": "离线重放全部四份既有冻结清单中的同图双目标状态。两个指令共享动作前的 RGB、位姿和实测速度，各用原始登记的目标。只复核已采集的训练房间及开发房间。",
+  "registered_inputs": {
+    "index.json": "5fd400c5817df554a7f15fca024d53091ac96a9eb80713b8ec3334726980d9e4",
+    "registration.json": "5c20406d2b65502e214b69f29250e888dfcfa8e8a05b51901cbf43839b610226",
+    "train.jsonl": "3a32d19211443e483b8efffacf0453772f608bafee186ef890a99556a37c7fd9",
+    "equal_train.jsonl": "b3f88303e08ab798842fa0bb493cd5802b937d81987ac82acb8127ba08b3a00e",
+    "development.jsonl": "0f7ddd8e66ffa9439aee91155d1aab7c86acce76367eb59763baa1dd1cd90e80",
+    "equal_development.jsonl": "55d9b16b2671ca70ef73759685be08f31758029fb11473dcab9896fc42bad0aa",
+    "prior_10_development_states": "20bb1a49d52dbcd2b2c7c276506a9f02e74a867e2b2c594b3f10548cf4d0c876"
+  },
+  "splits": {"train": ["840139","841012","841150"], "development": ["839992"]},
+  "denominators": {"train_states":832,"development_states":286,"all_states":1118,"all_instruction_requests":2236,"registered_route_pairs":40},
+  "geometry": "按实际动作前水平速度使用 R2 的 A* 子目标契约，独立重放教师动作和方向。接近终点、无路径、未知方向与数据损坏分别记录。视场用真实相机内外参投影同高度瞄准点。保留同桶、大转角、画外和两臂共享前缀；不以多余条件删行。",
+  "language": "逐句关联官方起点与目标，另行复核目的地参照短语。仅对正文可证的文字跨度作标注；缺少独立身份的参照物不推定实例 ID。模型推理与概率不参与样本选择和真值标签。",
+  "analysis": "分别按项目划分、房间、起点簇、路线对与原动作同异统计。对全部已核样本细分局部方向同异、两边均在0/1/7、同时入画及真实共享。测十对旧样本的同一连续方位和桶，保留逐项差异。图像内点不代表通路无遮挡、目标可见或机器人停对。",
+  "protocol": "本批仅生成监督与诊断数据，训练、闭环和正式留出房间不计入标签成绩。"
+}

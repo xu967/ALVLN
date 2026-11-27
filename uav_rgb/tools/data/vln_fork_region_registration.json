@@ -1,0 +1,12 @@
+{
+  "schema": "uavrgb.vln.fork_region.registration.v1",
+  "date": "2026-11-27",
+  "inputs": "Use the four immutable manifests and split from registration.json. Three training rooms (840139,841012,841150), one development room (839992). All 832/286 paired states stay in reporting. Development has been examined in earlier studies.",
+  "model": "Frozen local OpenAI CLIP ViT-B/32, revision 3d74acf9a28c67741b2f4f2ea7635f0aaf6f0268; image and supplied instruction only. No metadata, map, pose, route, teacher actions, masks, target fields, spans or instance IDs enter model features.",
+  "image": "Fit full camera image into 224x224 by bicubic interpolation and center pad to CLIP mean RGB (123,117,104). Pool last 7x7 patch columns [0,2),[2,5),[5,7) for left, center and right. Each pool through the existing visual post-LN and projection, then L2. The global vector is the projected, normalized true CLS.",
+  "features": "Six scalars in fixed order: three sector-to-instruction cosines then three sector-to-global cosines. Full instruction encoded by CLIP. Empty text uses CLIP's encoded empty string. Global-only replaces every sector by the CLS embedding: its three self-cosines are exactly 1.",
+  "fit": "Three independent training-only standardizations and class-balanced, deterministic three-class multinomial logistic fits with L2 C=1, unpenalized intercept, L-BFGS max_iter=2000 tol=1e-8, float64. Fixed argmax class order center/left/right (0/1/7). One row per eligible A* arm. Compare full sectors+text, sectors+blank, global+text, and constant center. No tuning or best-checkpoint selection on development.",
+  "scores": "Show all 286 development pairs, both arms correct / all, per-class recall and macro recall on representable A* arms, pair accuracy on two A* arms with different and representable local bins, and break out verified shared history, both local waypoints in camera image, scene/route/spawn. Outside-prediction-range requests count wrong in all-request scores. No stop or vehicle metric produced by this classifier.",
+  "promotion": "Using this one frozen fit, full sectors+text must have strictly more different-and-representable pairs both correct on development than EACH of blank, global-only and constant; macro recall must be at least the largest comparator. Correct differentiating pairs must span at least two distinct starting poses. Report the verified-shared subset separately. Failure ends this candidate; no adaptive retuning or closed-loop run on that basis.",
+  "reserved_test_room": "840818 stays sealed."
+}

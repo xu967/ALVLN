@@ -156,3 +156,58 @@ cd /root/rivermind-data/uav_rgb/exp-vln-local-waypoint-transfer-20261127
 - 本轮是圈外途中起飞的匹配指令复验。两夹具没有符合合同的交换伙伴，不能据此报告端到端的语言因果、整程任务成功、目标实例正确率或未见场景成绩。正式留出房间 840818 继续封存。
 - 未调真机 PID。两次超时都能由策略持续下达同一转向指令解释，尚无新的真机遥测。局部路标候选只参加离线对照，是否进入闭环按预先写下的判据决定。
 - 未追加公开榜单对比或清理历史实验。公开方法的同协议比较依赖可用的指令策略；旧日志同时是这次首帧和反事实动作可追溯的来源。
+
+## 更新 2026-11-27 下午 · 同图双指令与局部方向
+
+### 做了什么
+
+- 并行复核了四份冻结状态清单、两份路线登记、原生 SAGE-3D 指令、80 条教师飞行和相机记录。旧清单在首次执行动作分歧时才置共享标志。新的读取器从两条实飞轨迹、动作前位姿、四元数、速度和解码 RGB 核验了完整共享前缀。每行记录实飞臂；分歧之后，另一条指令使用同一张照片、同一状态重放。原始记录及标志均保留。[来源读取器](../../tools/vln_fork_sources.py)
+- 离线重放沿用运行时 A* 子目标和制动教师，分别保存连续方位、八方向桶、下一动作和相机内外参投影。近终点、无路径、退化向量有独立状态。原句的起终点、实例关联来自原数据；逐句人工复核的目的地参照以联合摘要和字符区间保存，这样 Git 中可以复现短语，不需要分发源图文。[几何重放](../../tools/vln_fork_geometry.py) · [制标入口](../../tools/label_vln_forks.py) · [终点参照区间](../../tools/data/vln_fork_reference_spans.json)
+- 在独立工作树给 `train.py` 增加可选的 `fork_region`。固定 CLIP 同时提取整图和左中右三个视觉区域的表示。三种输入独立拟合，训练端只从三个训练房间取可表达的标签。训练和开发使用独立房间、起点、路线对和图像。原工作树 `train.py` 有既有 +453/−179 行改动，实验分支从已发布源码构建。[实验分支](https://github.com/xu967/ALVLN/tree/experiment/20261127-region-bearing/uav_rgb)
+
+### 复现
+
+在 `uav_rgb` 根目录执行。标签来源包含 `3dgs-scenes`、`pubdata`、11 月 23 日的实例关联目录，以及 11 月 24 日的两份分岔教师采集和反事实清单三个目录。复制数据时保留相对层级和文件字节。还原十对旧回归另需上一轮的 `fork_bearing_labels.json`。标签输出路径必须是新目录。
+
+```bash
+D=/root/rivermind-data/uav_rgb
+E="$D/exp-vln-fork-bearings-20261127"
+PY="$D/3dgs-venv/bin/python"
+JOB="$E/labels-replica-job"
+mkdir "$JOB"
+OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=1 setsid nohup bash -c '
+  "$1" -B -m tools.label_vln_forks --data-root "$2" --out "$3"
+  rc=$?
+  printf "rc=%d finished_at=%s\n" "$rc" "$(date -Iseconds)" > "$4/DONE"
+  exit "$rc"
+' _ "$PY" "$D" "$E/labels-replica" "$JOB" > "$JOB/run.log" 2>&1 < /dev/null &
+echo "$!" > "$JOB/run.pid"
+```
+
+本机首次逐状态重放实际耗时 4 分 11 秒。单房间的 32 张图低估了其他房间的 A* 开销。复跑可预留约 5 分钟；完成后读 `$JOB/DONE`，核对 `rc=0` 再执行真实数据回归。
+
+```bash
+UAVRGB_FORK_LABEL_DIR="$E/labels-replica" "$PY" -B -m unittest -q \
+  tools.test_label_vln_forks tools.test_vln_fork_sources tools.test_vln_fork_geometry \
+  tools.test_vln_fork_references tools.test_probe_vln_waypoints
+```
+
+训练命令在 GitHub 的 `experiment/20261127-region-bearing` 分支的 `uav_rgb` 目录运行。已完成的实验可先查分母、模型权重、逐条预测和运行登记；复跑指定新的输出名。实验分支读取数据盘原先登记的 `$E/labels`。在相同目录布局的备份机上恢复时，两个登记文件分别取自 Git 的 `tools/data/vln_fork_bearings_registration.json`、`tools/data/vln_fork_region_registration.json`，对应 `$E/registration.json`、`$E/region_registration.json`。派生 JSONL 含可回查的绝对证据路径；原登记 SHA 对应此机的数据根，迁移到不同绝对路径后仍可重放标签，不能将新 JSONL 当作原指纹启动这次固定协议的训练。
+
+```bash
+UAVRGB_NAME=exp-vln-fork-region-replica python3 train.py fork_region --check
+CUDA_VISIBLE_DEVICES=GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740 \
+  UAVRGB_NAME=exp-vln-fork-region-replica python3 train.py fork_region
+```
+
+### 没做什么
+
+- 没有给终点参照词分配假想实例或像素框。旧框标注 558 张图与这批 1,118 张图的解码像素哈希交集为零。相机内的瞄准点仅有几何投影，目标实体可见性及沿射线的遮挡需要分别标注。
+- 没有更改 R2 飞行权重、飞控增益或真机配置。既有固件在环日志能解释持续右转；本批输入是同一动作前状态，不能估计真实机体抖动或停机成功率。公开方法同任务闭环与正式留出房间 840818 仍按论文计划安排。已登记教师日志是重放来源，保留供复查。
+
+### 验证到哪一步
+
+- 真实数据回归将四房间来源与划分逐行对齐。再次根据位姿和瞄准点独立计算，2,236 个连续角度和桶均匹配；旧十对的两条原句、两条连续方向、相机投影和教师动作也逐项复现。标签清单 SHA-256 为训练 `24a9d3ae740b69f9ebf9d4022f61ea59de38cb29e851fcd560bb7de4dc23b8c0`、开发 `0c79a8079e84919c4355a5da3e6efed1321b1204aac143aed08e46c7d36c3566`。来源路径、代码指纹与其余输入由汇总文件保存。[标签汇总](</root/rivermind-data/uav_rgb/exp-vln-fork-bearings-20261127/labels/summary.json>)
+- 制标、参照、旧探针及真实十对回归的 27 项测试全部通过。再加 `sim.3dgs.test_teacher_clearance`、`test_teacher_tol`、`test_collision`、`test_collision_model`，在独立导出的发布快照中共 **181/181 通过，37.288 秒**。原工作树中两个既有测试文件有差异，相同命令在那里是 172/172，40.006 秒。候选分支的 `tools.test_fork_region` 五项通过。旧训练入口七个预设逐项比对版本前后预检的输出和退出码，OpenFly 的旧资产缺失在两版均会触发；本次候选使用了完整的真实权重与图像。[发布快照测试日志](</root/rivermind-data/uav_rgb/exp-vln-fork-bearings-20261127/release-regression.log>)
+- 物理 GPU0（NVIDIA GeForce RTX 2080 Ti）于 17:54 完成全部候选及对照，入口记录 19.09 秒，`DONE` 为 `rc=0`。独立从 286 对逐条预测重算四组、三类、32 对异向、九个路线对及起点分布；均与发布指标一致。双入画异向 0/5、真实共享异向 0/1。区域候选未过三项条件，本次实验停在离线阶段。[逐条预测与指标入口](</root/rivermind-data/uav_rgb/exp-vln-fork-region-20261127/fork_region/summary.json>) · [数据盘运行日志](</root/rivermind-data/uav_rgb/exp-vln-fork-region-20261127/run.log>)
+- 开发集的配对图按预先选样规则出图并人工检查；从配套 JSON 的复图代码得到字节相同的 PNG，SHA-256 为 `b3181d8f60ade7766ab7b835fb94909614ff7e50d98cb4d71f3aeea715477e6e`。含机载 RGB 的图与原始日志留在数据盘，Git 收录方法、文字区间、登记、结果表与复现命令。[配对图与复图代码](</root/rivermind-data/uav_rgb/exp-vln-fork-bearings-20261127/paired_waypoints.json>)
