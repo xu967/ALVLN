@@ -177,6 +177,46 @@ class TestVideoTime(unittest.TestCase):
 
 
 class TestVlnReplay(unittest.TestCase):
+    def test_sparse_grounding_trace_does_not_repeat_an_old_observation(self):
+        import cv2
+
+        scene = {"spawn": {"x": 0., "y": 0.}, "waypoint": WP}
+        renderer = importlib.import_module("sim.3dgs.renderer").MockRenderer(scene)
+        pose = {"pos": [0., 0., 2.], "vel": [0., 0., 0.], "quat": [1, 0, 0, 0]}
+        files = {"trace.jsonl": [dict(pose, t=.1, step=0), dict(pose, t=.2, step=1)],
+                 "actions.jsonl": [{"step": 0, "bearing_bin": 7}, {"step": 1, "bearing_bin": 1}],
+                 "grounding_trace.jsonl": [{"step": 0, "trace_source": "fresh", "raw_bearing_bin": 7,
+                                             "bearing_bin": 7, "goal_mode": "subgoal", "conf": .9,
+                                             "reason": "走廊尽头右侧的蓝色圆形玻璃门",
+                                             "active_stage_index": 0, "stage_count": 2}]}
+        with (tempfile.TemporaryDirectory() as ep, mock.patch.object(video, "HOLD_END_S", 0),
+              mock.patch.object(video.vl, "panel", wraps=video.vl.panel) as panel):
+            for name, rows in files.items():
+                with open(os.path.join(ep, name), "w", encoding="utf-8") as f:
+                    f.writelines(json.dumps(row) + "\n" for row in rows)
+            path = os.path.join(ep, "views.webm")
+            video.compose_views_video(ep, scene, renderer, None, SimpleNamespace(raw=np.empty(0)),
+                                      out_path=path, quality="low")
+            cap = cv2.VideoCapture(path)
+            try:
+                for recorded in (True, False):
+                    ok, frame = cap.read()
+                    self.assertTrue(ok)
+                    x, y = video.vl.CELL_BR
+                    label = frame[y + 162:y + 212, x + 344:x + video.vl.CW]
+                    self.assertEqual(label.max() > 120, recorded)
+                    self.assertLess(label[:, -6:].max(), 60)
+            finally:
+                cap.release()
+        self.assertIn("stage 1/2", panel.call_args_list[0].args[4][1])
+        self.assertNotIn("stage", panel.call_args_list[1].args[4][1])
+        first, second = [call.args[4][-1] for call in panel.call_args_list]
+        self.assertIn("fresh | raw 7 / used 7", first)
+        self.assertEqual(second, "VLM ? | unrecorded | raw - / used 1")
+        legacy = dict(files["grounding_trace.jsonl"][0], trace_source="inherited")
+        self.assertIn("inherited | raw - / used 7", video._grounding_line({}, legacy))
+        self.assertIn("inferred", video._grounding_line({"bearing_bin": 0}, files["grounding_trace.jsonl"][0]))
+
     def test_composed_swap_video_shows_the_supplied_goal_on_map_and_hud(self):
         supplied = {"x": 2., "y": 0.}
         scene = {"spawn": {"x": 0., "y": 0.}, "waypoint": WP,

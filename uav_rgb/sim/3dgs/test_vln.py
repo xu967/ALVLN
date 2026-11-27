@@ -10,6 +10,7 @@ import io
 import json
 import math
 import os
+from pathlib import Path
 import sys
 import tempfile
 import unittest
@@ -109,10 +110,45 @@ class TestEpisodes(unittest.TestCase):
              "split": "train", "type": "A"},
         ]
 
-        swapped = runner._swapped_instruction(episodes, 0, scene)
+        for i, ep in enumerate(episodes):
+            ep["key"] = f"s/r{i}/0"
+            scene["routes"][i]["waypoint"] = {"x": i, "y": 0}
 
-        self.assertIs(swapped, episodes[5])
-        self.assertIsNone(runner._swapped_instruction(episodes[:2], 0, scene))
+        partners = vln.swap_partners(scene, episodes, episodes)
+        self.assertEqual(partners, {"s/r0/0": episodes[5], "s/r5/0": episodes[0]})
+        # --limit 1 限制执行的请求，候选中第六条仍可作为输入。
+        self.assertEqual(vln.swap_partners(scene, episodes[:1], episodes), {"s/r0/0": episodes[5]})
+        del scene["routes"][5]["waypoint"]
+        self.assertEqual(vln.swap_partners(scene, episodes, episodes), {})
+
+    def test_limited_all_instructions_samples_routes_in_turns(self):
+        eps = [{"route_key": f"route:{r}", "key": (r, i)} for r in range(4) for i in range(4)]
+        picks = vln.select_requests(eps, all_instructions=True, limit=5, seed=0)
+        self.assertEqual([ep["key"] for ep in picks], [(0, 0), (1, 0), (2, 0), (3, 0), (0, 1)])
+        self.assertEqual(vln.select_requests(eps, all_instructions=True, limit=0, seed=0), eps)
+
+    def test_g3_rejects_unpairable_preset_before_any_arm(self):
+        from hashlib import sha256
+        train = importlib.import_module("train")
+        routes = []
+        for name, budget in (("tr_74", 106), ("tr_87", 107)):
+            instruction = {"text": f"Go to {name}", "end": name, "instruction_type": "A"}
+            routes.append({"name": name, "max_steps": budget, "spawn": {"x": 0, "y": 0, "z": 1},
+                           "waypoint": {"x": budget, "y": 0}, "sage": {"split": "train",
+                           "instructions": [instruction] * 9}})
+        source = json.dumps({"routes": routes, "ply": "scene.ply", "collision": {"geometry": "mesh"}}).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            directory = root / "3dgs-scenes/sage3d_840865"
+            directory.mkdir(parents=True)
+            (directory / "scene.json").write_bytes(source)
+            with mock.patch.object(train, "_paths", return_value={"data_uav": root}), \
+                    mock.patch.object(train, "G3_CF_SOURCE_SHA256", sha256(source).hexdigest()), \
+                    mock.patch.object(train.subprocess, "run") as launch:
+                with self.assertRaisesRegex(ValueError, "没有完整互配"):
+                    train.run_stage_g3_vlm(root / "run", {}, root / "fixture.bin")
+            launch.assert_not_called()
+            self.assertFalse((root / "run").exists())
 
     def test_external_grounder_changes_policy_goal_and_rejects_unknown(self):
         selector = importlib.import_module("sim.3dgs.grounder").LexicalGrounder()
@@ -126,6 +162,10 @@ class TestEpisodes(unittest.TestCase):
 
 
 class TestMetrics(unittest.TestCase):
+    def test_segment_circle_entry_uses_infinite_line_projection(self):
+        entry = vln._segment_circle_entry((0.0, 0.0), (1.0, 0.0), (1.5, 0.0), 1.0)
+        self.assertAlmostEqual(entry, 0.5)
+
     def test_first_forward_doorway_passages_follow_crossing_time(self):
         doors = {"far": {"line_xy_m": [(1, 0), (1, 2)], "forward_normal_xy": (1, 0)},
                  "near": {"line_xy_m": [(0, 2), (0, 0)], "forward_normal_xy": (1, 0)}}
@@ -192,6 +232,42 @@ class TestMetrics(unittest.TestCase):
         self.assertEqual(report["stage_sr"], 0.25)
         self.assertEqual(report["stage_csr"], 0.125)
         self.assertEqual(report["stage_task_sr"], 0.0)
+
+    def test_invalid_counterfactual_pair_stays_in_historical_request_denominators(self):
+        failure = {"route_contract": "sage.multi_stage.v2", "stage_waypoints": [{}, {}],
+                   "failure_kind": "invalid_counterfactual_pair"}
+        report = vln.summarize([], [failure])
+        stage_report = vln.summarize_stages([], [failure])
+        self.assertEqual((report["n_requested"], report["n_failed"], report["error_rate"]), (1, 1, 1.0))
+        self.assertEqual((stage_report["n_requested"], stage_report["n_stages_requested"]), (1, 2))
+
+    def test_train_summary_keeps_supplied_goal_fields_separate(self):
+        train_entry = importlib.import_module("train")
+        rows = [
+            {"route_name": "swap", "goal_object": "lamp_1", "supplied_text": "Go to tv_1",
+             "counterfactual": "swap", "supplied_goal_object": "tv_1", "success": False,
+             "oracle_success": True, "ne_m": 2.0, "spl": 0.0, "stopped": True, "collision": False,
+             "supplied_goal_success": True, "supplied_goal_oracle_success": True,
+             "supplied_goal_ne_m": 0.2, "supplied_goal_spl": 0.8,
+             "supplied_goal_stopped": True, "supplied_goal_collision": False},
+            {"route_name": "zero", "goal_object": "lamp_1", "supplied_text": "",
+             "counterfactual": "zero", "success": False, "oracle_success": False,
+             "ne_m": 3.0, "spl": None, "stopped": False, "collision": False},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            (directory / "vln_eval.json").write_text(json.dumps({
+                "overall": {"n": 2}, "supplied_goal_metrics": {"n_requested": 3},
+                "paired_supplied_goal_metrics": {"n_requested": 2}}))
+            (directory / "episodes.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+            summary = train_entry._summarize_vln_dir(directory)
+        swap, zero = summary["episodes"]
+        self.assertEqual(summary["supplied_goal_metrics"]["n_requested"], 3)
+        self.assertEqual(summary["paired_supplied_goal_metrics"]["n_requested"], 2)
+        self.assertEqual((swap["goal_object"], swap["supplied_goal_object"]), ("lamp_1", "tv_1"))
+        self.assertEqual((swap["success"], swap["supplied_goal_success"]), (False, True))
+        self.assertIsNone(zero["supplied_goal_object"])
+        self.assertIsNone(zero["supplied_goal_success"])
 
     def test_flying_through_without_stop_is_only_oracle_success(self):
         # 旧 3dgs.pilot.v2 判据会算成功；VLN 要求自己停在半径里
@@ -552,16 +628,21 @@ class TestExplicitStop(unittest.TestCase):
         self.assertFalse(teacher.stop_requested)
 
     def test_dagger_does_not_leak_expert_stop_into_student_execution(self):
-        expert = runner.planner_mod.OccAstarTeacher(mock.Mock(), {"x": 0, "y": 0})
-        student = mock.Mock(student_cond=None, stop_requested=False)
-        student.return_value = (collect.SAFE_NEUTRAL, None)
-        state = SimpleNamespace(x=0.0, y=0.0, z=2.0, yaw=0.0)
+        expert = mock.Mock(return_value=(collect.SAFE_NEUTRAL, None))
+        student = mock.Mock(student_cond=None, return_value=(collect.SAFE_NEUTRAL, None))
         with mock.patch.object(collect, "StudentAdapter", return_value=student):
-            for beta in (0.0, 1.0):
+            for beta, student_stop, expert_stop, source in (
+                    (0.0, False, True, None), (1.0, False, True, "dagger_expert"),
+                    (0.0, True, False, "visual_target"), (1.0, True, False, None)):
+                expert.stop_requested = expert_stop
+                student.stop_requested = student_stop
+                student.last_decision = {"stop_source": "visual_target" if student_stop else None,
+                                         "action_intervention": None}
                 dagger = collect.DaggerPolicy(None, expert, beta, np.random.default_rng(0))
-                dagger(None, None, state)
-                self.assertTrue(expert.stop_requested)
-                self.assertEqual(dagger.stop_requested, bool(beta))
+                dagger(None, None, None)
+                self.assertEqual(dagger.stop_requested, expert_stop if beta else student_stop)
+                self.assertEqual(dagger.last_decision["stop_source"], source)
+                self.assertEqual(dagger.last_decision["action_intervention"], "dagger_expert" if beta else None)
                 dagger.reset()
                 self.assertFalse(dagger.stop_requested)
 
@@ -758,34 +839,70 @@ class TestRunner(unittest.TestCase):
         self.assertEqual(videos.call_args_list[1].kwargs["result"], "WRONG STOP 4.0 m")
         self.assertEqual(episode_waypoints, [4.0, 8.0, 6.0, 8.0])
         with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(scene_mod, "load_scene", return_value=scene), \
                 mock.patch.object(runner, "run_scene", return_value=(rows, failures)), \
                 mock.patch.object(runner.CfSitlParams, "from_json",
                                   return_value=SimpleNamespace(profile=lambda: "test")):
             self.assertEqual(runner.main(["--scene", "fixture", "--policy", "teacher",
-                                          "--counterfactual", "swap", "--out", tmp]), 0)
+                                          "--counterfactual", "swap", "--all-instructions",
+                                          "--out", tmp]), 0)
             with open(os.path.join(tmp, "vln_eval.json"), encoding="utf-8") as report_file:
                 report = json.load(report_file)
         self.assertEqual(report["overall_goal_scope"], "original_episode_goal")
         self.assertEqual(report["supplied_goal_metric_scope"], "instruction_episode_waypoint")
         self.assertEqual(report["supplied_goal_metrics"]["n_requested"], 2)
         self.assertEqual(report["supplied_goal_metrics"]["sr"], 0.5)
+        self.assertEqual(report["paired_supplied_goal_metrics"], report["supplied_goal_metrics"])
+        self.assertEqual(report["swap_pair_preflight"][scene["name"]]["n_pairable"], 2)
+        self.assertNotIn("swap_pair_preflight", first)
 
-    def test_swap_missing_partner_stays_in_supplied_goal_denominator(self):
-        failure = {"key": "s/r0/0", "split": "test", "type": "A",
-                   "error": "ValueError: no compatible swap partner"}
+    def test_swap_without_any_partner_skips_workers_and_reports_both_denominators(self):
         with tempfile.TemporaryDirectory() as tmp, \
-                mock.patch.object(runner, "run_scene", return_value=([], [failure])), \
-                mock.patch.object(runner.CfSitlParams, "from_json",
-                                  return_value=SimpleNamespace(profile=lambda: "test")):
-            rc = runner.main(["--scene", "fixture", "--policy", "teacher",
-                              "--counterfactual", "swap", "--out", tmp])
+                mock.patch.object(scene_mod, "load_scene", return_value=SCENE), \
+                mock.patch.object(importlib.import_module("student"), "StudentPolicy") as student, \
+                mock.patch.object(runner.grounder_mod, "VisualLanguageGrounder") as vlm_worker, \
+                mock.patch.object(runner.renderer_mod, "make_renderer") as renderer:
+            rc = runner.main(["--scene", "fixture", "--policy", "student", "--ckpt", __file__,
+                              "--grounder", "vlm", "--counterfactual", "swap", "--out", tmp])
             with open(os.path.join(tmp, "vln_eval.json"), encoding="utf-8") as report_file:
                 report = json.load(report_file)
 
         self.assertEqual(rc, 1)
-        self.assertEqual(report["overall"]["n_requested"], 1)
-        self.assertEqual(report["supplied_goal_metrics"]["n_requested"], 1)
-        self.assertEqual(report["supplied_goal_metrics"]["sr"], 0.0)
+        for worker in (student, vlm_worker, renderer):
+            worker.assert_not_called()
+        for key in ("overall", "supplied_goal_metrics"):
+            self.assertEqual((report[key]["n_requested"], report[key]["n_failed"], report[key]["sr"]), (2, 2, 0.0))
+        paired = report["paired_supplied_goal_metrics"]
+        self.assertEqual((paired["n_requested"], paired["sr"]), (0, None))
+        coverage = report["swap_pair_preflight"]["s"]
+        self.assertEqual((coverage["n_candidates"], coverage["n_requested"], coverage["n_rejected"]), (3, 2, 2))
+        self.assertEqual([f["key"] for f in report["failures"]], [r["key"] for r in coverage["rejected"]])
+
+    def test_swap_runtime_failures_count_and_preserve_request_seeds(self):
+        scene = {"name": "s", "collision": {"source": "mesh"}, "routes": []}
+        for name, start_x in (("isolated", 9), ("lamp", 0), ("desk", 0)):
+            scene["routes"].append({"name": name, "max_steps": 8, "spawn": {"x": start_x, "y": 0, "z": 1},
+                                    "waypoint": {"x": len(scene["routes"]), "y": 0, "z": 1},
+                                    "sage": {"split": "train", "instructions": [
+                                        {"text": f"Go to {name}", "instruction_type": "A", "end": name}]}})
+        with ExitStack() as stack:
+            tmp = stack.enter_context(tempfile.TemporaryDirectory())
+            for module, name, result in ((scene_mod, "load_scene", scene), (collect, "scene_identity",
+                    {"ply_sha256": "fixture", "split": "train"}), (runner.collision_mod, "from_scene", None),
+                    (runner.renderer_mod, "make_renderer", None), (runner.planner_mod, "OccPlanner", None),
+                    (runner, "make_policy", None)):
+                stack.enter_context(mock.patch.object(module, name, return_value=result))
+            flight = stack.enter_context(mock.patch.object(collect, "run_episode", side_effect=RuntimeError("SITL")))
+            rc = runner.main(["--scene", "fixture", "--policy", "teacher", "--seed", "5",
+                              "--counterfactual", "swap", "--out", tmp])
+            report = json.loads((Path(tmp) / "vln_eval.json").read_text())
+        self.assertEqual(rc, 1)
+        self.assertEqual([call.kwargs["seed"] for call in flight.call_args_list], [6, 7])
+        self.assertEqual(report["supplied_goal_metrics"]["n_failed"], 3)
+        paired = report["paired_supplied_goal_metrics"]
+        self.assertEqual((paired["n_requested"], paired["n_failed"], paired["sr"]), (2, 2, 0.0))
+        self.assertEqual([ep.get("supplied_instruction_key") for ep in report["failures"]],
+                         [None, "s/desk/0", "s/lamp/0"])
 
     def test_route_waypoint_success_does_not_hide_catalog_goal_miss(self):
         scene = copy.deepcopy(SCENE)
@@ -947,7 +1064,7 @@ class TestRunner(unittest.TestCase):
                  "collision": {"source": "mesh"}, "step_s": 0.5,
                  "spawn": {"x": 0.0, "y": 0.0, "z": 2.0},
                  "waypoint": {"x": 4.0, "y": 0.0, "z": 2.0}}
-        actions, oracle = _steps([(0, 0), (1, 0), (2, 0)])
+        actions, oracle = _steps([(0, 0), (1, 0), (1.5, 0), (2, 0)])
         manifest = {"stopped_by_agent": True, "terminal_reason": "agent_stop",
                     "validity": {"physics_verified": True, "camera_verified": True}}
         args = SimpleNamespace(split=None, all_instructions=False, seed=0, limit=0, out="unused", hold=0.5,
@@ -955,7 +1072,22 @@ class TestRunner(unittest.TestCase):
                                counterfactual="correct", blind_rgb=False, collect=False,
                                teacher_clearance="ray", instruction="飞到走廊尽头，然后悬停",
                                spawn=(1.0, 2.0, 2.0), spawn_yaw_deg=270.0)
+        worker = mock.Mock()
+        worker.ground_step.side_effect = [runner.grounder_mod.VisualGrounding(0, 1, 0.9, "走廊尽头", ms)
+                                          for ms in (4, 12)]
+
+        def simulate(_scene, ep_dir, _renderer, _occ, _params, policy, *_args, **_kwargs):
+            os.makedirs(ep_dir)
+            for step, row in enumerate(actions):
+                action, _ = policy(None, np.full((10, 12), 1.5), None)
+                policy.note_executed(action)
+                row.update(policy.last_decision, step=step, bearing_bin=policy.last_bearing_bin,
+                           action_executed=action, stop_requested=policy.stop_requested,
+                           frame=f"rgb_{step:05d}.png", rgb_ts=step * 500_000_000, timestamp_ns=step * 500_000_000)
+            return manifest, None
+
         with ExitStack() as stack:
+            args.out = stack.enter_context(tempfile.TemporaryDirectory())
             stack.enter_context(mock.patch.object(scene_mod, "load_scene", return_value=scene))
             stack.enter_context(mock.patch.object(scene_mod, "read_gaussian_ply", return_value=None))
             apply_route = stack.enter_context(mock.patch.object(scene_mod, "apply_route"))
@@ -966,14 +1098,26 @@ class TestRunner(unittest.TestCase):
             stack.enter_context(mock.patch.object(runner.renderer_mod, "make_renderer", return_value=None))
             stack.enter_context(mock.patch.object(runner.planner_mod, "OccPlanner", return_value=None))
             stack.enter_context(mock.patch.object(collect, "_sha256", return_value="fixture-ply"))
-            run = stack.enter_context(mock.patch.object(collect, "run_episode", return_value=(manifest, None)))
+            run = stack.enter_context(mock.patch.object(collect, "run_episode", side_effect=simulate))
             stack.enter_context(mock.patch.object(runner, "_read_jsonl", side_effect=[actions, oracle]))
             shortest = stack.enter_context(mock.patch.object(runner, "route_shortest_path_m"))
             compose = stack.enter_context(mock.patch.object(
                 runner.video_mod, "compose_views_video", return_value={"video": "unused.mp4"}))
             rows, failures = runner.run_scene("fixture.json", args, SimpleNamespace(camera_mount={}),
-                                               vlm_grounder=object())
+                                               vlm_grounder=worker)
+            with open(os.path.join(run.call_args.args[1], "grounding_trace.jsonl"), encoding="utf-8") as f:
+                evidence = [json.loads(line) for line in f]
         self.assertEqual((len(rows), failures), (1, []))
+        self.assertEqual((rows[0]["vlm_calls"], rows[0]["vlm_latency_ms_p50"], rows[0]["vlm_latency_ms_p95"]),
+                         (2, 4, 12))
+        self.assertEqual([r["trace_source"] for r in evidence], ["fresh", "inherited", "fresh"])
+        self.assertEqual([r["latency_ms"] for r in evidence], [4, None, 12])
+        for step, row in enumerate(actions):
+            self.assertEqual(evidence[step]["bearing_bin"], row["bearing_bin"])
+            self.assertEqual(evidence[step]["trace_source"], row["grounding_trace_source"])
+            for key in ("frame", "rgb_ts", "timestamp_ns", "action_proposed", "action_executed",
+                        "action_intervention", "stop_requested", "stop_source"):
+                self.assertEqual(evidence[step][key], row[key])
         apply_route.assert_not_called()
         shortest.assert_not_called()
         self.assertEqual(run.call_args.args[0]["spawn"],
@@ -1174,15 +1318,15 @@ class TestRunner(unittest.TestCase):
             runner.main(["--scene", "fixture", "--policy", "teacher", "--spawn-yaw-deg", "90", "--out", "unused"])
         self.assertEqual(caught.exception.code, 2)
 
-    def test_vlm_belief_tracker_one_miss_hysteresis_prevents_7_8_limit_cycle(self):
+    def test_tracker_records_each_step_without_inventing_a_center_after_turn_or_miss(self):
         grounder_mod = importlib.import_module("sim.3dgs.grounder")
         seq = [
-            grounder_mod.VisualGrounding(8, 0, 0.90, "unseen_spawn", 4.0, "search"),    # step 0: 未见过目标 -> 立即 8 扫描
-            grounder_mod.VisualGrounding(7, 0, 0.88, "doorway_right", 4.0, "subgoal"),  # step 2: 右侧见门洞子目标 -> 7 (不锁 final)
-            grounder_mod.VisualGrounding(8, 0, 0.60, "transient_miss", 4.0, "search"),  # step 4: 首次漏检 -> 滞回置 0 推进，不回甩 8
-            grounder_mod.VisualGrounding(8, 0, 0.85, "second_miss", 4.0, "search"),     # step 6: 连续二次漏检 -> 切回 8 搜索
-            grounder_mod.VisualGrounding(0, 1, 0.94, "sofa", 4.0, "final"),             # step 8: 首次命中只记录证据
-            grounder_mod.VisualGrounding(0, 1, 0.94, "sofa", 4.0, "final"),             # step 10: 同一目标新观测确认 STOP
+            grounder_mod.VisualGrounding(8, 0, 0.90, "unseen_spawn", 4.0, "search"),
+            grounder_mod.VisualGrounding(7, 0, 0.88, "doorway_right", 4.0, "subgoal"),
+            grounder_mod.VisualGrounding(8, 0, 0.60, "transient_miss", 4.0, "search"),
+            grounder_mod.VisualGrounding(8, 0, 0.85, "second_miss", 4.0, "search"),
+            grounder_mod.VisualGrounding(0, 1, 0.94, "sofa", 4.0, "final"),
+            grounder_mod.VisualGrounding(0, 1, 0.94, "sofa", 4.0, "final"),
         ]
         mock_vlm = mock.Mock()
         mock_vlm.ground_step.side_effect = seq
@@ -1193,26 +1337,51 @@ class TestRunner(unittest.TestCase):
             outputs.append(tracker(rgb, None))
             if step == 2:
                 tracker.note_step(3)
-        self.assertEqual(outputs, [
-            (8, 0),  # step 0: 初始扫描
-            (8, 0),  # step 1: 延续扫描
-            (7, 0),  # step 2: 右转对准子目标门洞
-            (0, 0),  # step 3: 奇数步回正防过冲
-            (0, 0),  # step 4: 首次漏检保持 0 前进（消除 7<->8 极限环）
-            (0, 0),  # step 5: 延续 0 前进
-            (8, 0),  # step 6: 连续漏检 >= 2 进入搜索 8
-            (8, 0),  # step 7: 延续搜索 8
-            (0, 0),  # step 8: 首次最终目标近景只记录证据
-            (0, 0),  # step 9: VLM 更新前沿用非停止动作
-            (0, 1),  # step 10: 同一目标第二次近景证据确认 STOP
-        ])
-        self.assertEqual(tracker.trace[1]["goal_mode"], "subgoal")
-        self.assertFalse(tracker.trace[1]["confirmed_target"])
-        self.assertEqual(tracker.trace[-1]["goal_mode"], "final")
-        self.assertTrue(tracker.trace[-1]["confirmed_target"])
-        self.assertEqual([(t["raw_near_goal"], t["near_goal"]) for t in tracker.trace[-2:]],
+        self.assertEqual(outputs, [(8, 0), (8, 0), (7, 0), (7, 0), (8, 0), (8, 0),
+                                   (8, 0), (8, 0), (0, 0), (0, 0), (0, 1)])
+        calls = [row for row in tracker.trace if row["vlm_called"]]
+        self.assertEqual([r["trace_source"] for r in calls], ["search", "fresh", "search", "search", "fresh", "fresh"])
+        self.assertEqual([r["miss_streak"] for r in calls], [1, 0, 1, 2, 0, 0])
+        self.assertEqual([(t["raw_near_goal"], t["near_goal"]) for t in calls[-2:]],
                          [(1, 0), (1, 1)])
-        self.assertEqual([t["miss_streak"] for t in tracker.trace], [1, 0, 1, 2, 0, 0])
+        skipped = tracker.trace[1::2]
+        self.assertEqual([r["trace_source"] for r in skipped], ["search", "inherited", "search", "search", "inherited"])
+        self.assertEqual([r["evidence_age_steps"] for r in skipped], [None, 1, None, None, 1])
+        for row in skipped:
+            self.assertIsNone(row["raw_bearing_bin"])
+            self.assertIsNone(row["raw_near_goal"])
+            self.assertIsNone(row["latency_ms"])
+            self.assertEqual(row["rgb_frames_submitted"], 0)
+
+    def test_tracker_expires_bearing_and_near_evidence_before_slow_update(self):
+        worker = mock.Mock()
+        worker.ground_step.return_value = runner.grounder_mod.VisualGrounding(0, 1, 0.9, "sofa", 5.0)
+        tracker = runner.VlmBeliefTracker(worker, "Fly to the sofa.", update_every=4, history_frames=4)
+        outputs = [tracker(frame, None) for frame in range(5)]
+        self.assertEqual(outputs, [(0, 0), (0, 0), (8, 0), (8, 0), (0, 0)])
+        self.assertEqual([r["trace_source"] for r in tracker.trace], ["fresh", "inherited", "expired", "expired", "fresh"])
+        self.assertEqual([r["evidence_age_steps"] for r in tracker.trace], [0, 1, 2, 3, 0])
+        self.assertEqual([r["rgb_frames_submitted"] for r in tracker.trace], [1, 0, 0, 0, 4])
+        self.assertEqual([call.args[0] for call in worker.ground_step.call_args_list], [[0], [1, 2, 3, 4]])
+        self.assertIsNone(tracker.trace[2]["conf"])
+
+    def test_tracker_keeps_new_opposite_side_and_traces_zero_without_a_call(self):
+        worker = mock.Mock()
+        worker.ground_step.side_effect = [runner.grounder_mod.VisualGrounding(b, 0, 0.9, "sofa", 5.0) for b in (7, 1)]
+        tracker = runner.VlmBeliefTracker(worker, "Fly to the sofa.", update_every=1)
+        self.assertEqual([tracker(i, None) for i in range(2)], [(7, 0), (1, 0)])
+        self.assertEqual([call.args[0] for call in worker.ground_step.call_args_list], [[0], [1]])
+        with self.assertRaises(ValueError):
+            runner.VlmBeliefTracker(worker, "Fly to the sofa.", history_frames=3)
+        worker.reset_mock()
+        empty = runner.VlmBeliefTracker(worker, "")
+        self.assertEqual([empty(i, None) for i in range(2)], [(8, 0), (8, 0)])
+        worker.ground_step.assert_not_called()
+        self.assertEqual([row["step"] for row in empty.trace], [0, 1])
+        for row in empty.trace:
+            self.assertEqual((row["trace_source"], row["reason"], row["vlm_called"]), ("search", "empty_instruction", False))
+            self.assertIsNone(row["raw_bearing_bin"])
+            self.assertIsNone(row["latency_ms"])
 
     def test_reactive_bearing_commits_executed_turn_to_tracker(self):
         goal_fn = mock.Mock(return_value=(1, 0))
@@ -1224,7 +1393,8 @@ class TestRunner(unittest.TestCase):
         policy.note_executed(dyn3dgs.YAW_LEFT)
         goal_fn.note_step.assert_called_once_with(dyn3dgs.YAW_LEFT)
         second_action, _ = policy(None, depth, state)
-        self.assertEqual(second_action, dyn3dgs.FORWARD_SLOW)
+        self.assertEqual(second_action, dyn3dgs.YAW_LEFT)
+        self.assertEqual(policy.last_bearing_bin, 1)
 
     def test_reactive_bearing_records_depth_intervention(self):
         grounder_mod = importlib.import_module("sim.3dgs.grounder")
@@ -1256,24 +1426,24 @@ class TestRunner(unittest.TestCase):
             grounder_mod.VisualGrounding(0, 1, 0.9, "lamp", 1.0, "final"),
         ]
         tracker = runner.VlmBeliefTracker(
-            mock_vlm, "First go to the chair, then stop at the lamp.", update_every=1,
-            stage_instructions=["Go to the chair.", "Then go to the lamp."])
+            mock_vlm, "First go to the chair, then stop at the lamp.", update_every=2,
+            stage_instructions=["Go to the chair.", "Then go to the lamp."], history_frames=4)
         rgb = np.zeros((8, 8, 3), dtype=np.uint8)
         outputs = []
         task_stop = []
-        for _ in range(4):
+        for _ in range(7):
             outputs.append(tracker(rgb, None))
             task_stop.append(tracker.confirmed_target)
-        self.assertEqual(outputs, [(0, 0), (0, 0), (0, 0), (0, 1)])
-        self.assertEqual(task_stop, [False, False, False, True])
+        self.assertEqual(outputs, [(0, 0), (0, 0), (0, 0), (8, 0), (0, 0), (0, 0), (0, 1)])
+        self.assertEqual(task_stop, [False] * 6 + [True])
         self.assertTrue(tracker.confirmed_target)
         self.assertEqual(tracker.stage_index, 1)
-        self.assertEqual([row["stage_confirmed"] for row in tracker.trace], [False, True, False, True])
-        self.assertEqual([row["confirmed_target"] for row in tracker.trace], [False, False, False, True])
-        self.assertEqual([row["near_goal"] for row in tracker.trace], [0, 0, 0, 1])
-        self.assertEqual([row["stage_index"] for row in tracker.trace], [0, 1, 1, 1])
-        self.assertEqual([row["stage_confirmed_index"] for row in tracker.trace], [None, 0, None, 1])
-        self.assertEqual([row["task_complete"] for row in tracker.trace], [False, False, False, True])
+        self.assertEqual([row["active_stage_index"] for row in tracker.trace], [0, 0, 0, 1, 1, 1, 1])
+        self.assertEqual([row["stage_index"] for row in tracker.trace], [0, 0, 1, 1, 1, 1, 1])
+        self.assertEqual([row["stage_confirmed_index"] for row in tracker.trace], [None, None, 0, None, None, None, 1])
+        self.assertEqual([row["task_complete"] for row in tracker.trace], [False] * 6 + [True])
+        self.assertEqual(tracker.trace[3]["reason"], "no_current_evidence")
+        self.assertEqual(tracker.trace[4]["rgb_frames_submitted"], 2)
         prompts = [call.args[1] for call in mock_vlm.ground_step.call_args_list]
         self.assertEqual(prompts[0], prompts[1])
         self.assertIn("Current stage 1/2: Go to the chair.", prompts[0])

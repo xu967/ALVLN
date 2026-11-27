@@ -133,26 +133,18 @@ class ReactiveBearingPolicy:
         self.last_bearing_bin = None
         self.last_near_goal = None
         self.avoid_turn = None
-        self.turned_toward_target = False
         self.last_decision = {}
 
     def note_executed(self, action):
         note_step = getattr(self.goal_fn, "note_step", None)
         if note_step is not None:
             note_step(action)
-        self.turned_toward_target |= (
-            self.last_bearing_bin in (1, 7)
-            and action == (YAW_LEFT if self.last_bearing_bin == 1 else YAW_RIGHT)
-        )
 
     def __call__(self, rgb, depth, state):
         del state  # 严禁读取真值位姿
         if getattr(depth, "ndim", 0) != 2 or min(depth.shape) < 5:
             raise ValueError(f"reactive_bearing 需要二维深度图，得到 {getattr(depth, 'shape', None)}")
         bb, ng = self.goal_fn(rgb, None)
-        if self.turned_toward_target and bb in (1, 7):
-            bb = 0
-        self.turned_toward_target = False
         self.last_bearing_bin, self.last_near_goal = int(bb), int(ng)
         h, w = depth.shape
         y0, y1 = int(h * 0.4), int(h * 0.6)
@@ -200,4 +192,7 @@ class ReactiveBearingPolicy:
             "grounding_reason": goal_reason,
             "grounding_conf": confidence,
         }
+        evidence = getattr(self.goal_fn, "action_evidence", None)
+        if isinstance(evidence, dict):
+            self.last_decision.update(evidence)
         return action, None

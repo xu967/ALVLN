@@ -2,10 +2,10 @@
 # uav_rgb 唯一实验、训练与闭环录像入口（已移除所有散落的 run*.py 包装脚本与废弃的 VLM 线性判停探针）。
 # 所有实验超参数集中在下方 ENV_REGISTRY，直接运行即可：
 #   python3 train.py --check          仅检查配置、路径与防覆盖守卫并打印分阶段预计耗时，不碰 GPU
-#   python3 train.py                  默认主推路线 vln_3dgs（S1 三带列池化+深度门控绕障训练闭环 + G3 阶段路标分解与几何语义联合判停闭环，全集保存 MP4 视频与 index.html）
+#   python3 train.py                  vln_3dgs 历史诊断套件，包含 S1 局控、G3 阶段路标与视觉判停
 #   python3 train.py s1_direct        仅运行 S1-PureDirect（纯直线方位打包 -> R0 训练 -> 在线 DAgger -> R1 训练 -> 室内外闭环对比与录像）
 #   python3 train.py s1_subgoal       运行 S1 A* 局部子目标特权上界训练与闭环对照
-#   python3 train.py g3_vlm           仅运行 G3 层次化阶段路标 VLM + 机载深度联合判停（未见公寓 840865 反事实 12 集 + 841980 跨房间 5 集闭环录像）
+#   python3 train.py g3_vlm           G3 阶段路标与视觉判停（840865 登记双目标反事实 6 集 + 841980 跨房间 5 集）
 #   python3 train.py openfly_eval     仅运行 OpenFly v2 多场景 UE4 AirSim（env16 / env23 / env18 seen20）在线闭环与全程 MP4 录像
 #   python3 train.py openfly_v2       从头训练 OpenFly 6 场景 v2 模型 + 20 集时序对拍 + 多场景 UE4 闭环录像
 #   python3 train.py full_all         串联运行 vln_3dgs + openfly_eval 全套实验与录像
@@ -52,7 +52,7 @@ ENV_REGISTRY = {
     "UAVRGB_SEED": "20261117",           # 全局确定性随机种子
     # ---- 视频全量录制开关（用户要求：实验必须保存好视频供直接查看效果）----
     "UAVRGB_VIDEOS_PER_SCENE": "999",    # 999 = 评测集中每一集都渲染合成 10 FPS 四格指令横幅 MP4 视频（不抽样漏录）
-    # ---- G3 零特权层次化视觉语言大模型（UAV-PUR-4B：FINAL/SUBGOAL 阶段路标分解 + 机载深度联合判停）----
+    # ---- G3 层次化视觉语言大模型（UAV-PUR-4B 阶段路标与视觉目标确认）----
     "UAVRGB_VLM_MODEL": "/root/rivermind-fs/data/Drone-PUR/models/UAV-PUR-4B",  # 只读挂载 Qwen3-VL-4B（共享卡自动分层）
     "UAVRGB_VLM_EVERY": "2",             # hold=0.5s 下每 2 步（1 Hz）更新一次 VLM 阶段路标信念
     # ---- OpenFly v2 多场景训练与 UE4 AirSim 在线闭环录像 ----
@@ -178,7 +178,7 @@ def estimate_eta_minutes(mode: str):
         if mode != "g3_vlm":
             stages.append(("S1 室内留出 10 集四臂闭环 + 户外长航线 + 全量四格 MP4 (35 段视频)", 7.5))
     if mode in ("vln_3dgs", "full_all", "g3_vlm"):
-        stages.append(("G3 阶段路标分解 VLM + 机载深度联合判停：未见公寓 840865 (12集) + 841980 (5集) 全录像", 8.5))
+        stages.append(("G3 视觉方向与停机：840865 登记双目标 (6集) + 841980 (5集)", 8.5))
     if mode == "openfly_v2":
         stages.append(("OpenFly 6 场景 v2 模型训练 (2×1200 updates) + 20 集时序对拍", 7.0))
     if mode in ("full_all", "openfly_eval", "openfly_v2"):
@@ -437,22 +437,35 @@ def run_stage_s1(run_dir: Path, env: dict, g0_mode: str) -> dict:
     }
 
 
+G3_CF_SOURCE_SHA256 = "72a742f577ab0a2ae868c7debf2e096c62a6d5b5b6c87aa78020a955065ebcd6"
+
+
 def _build_unseen_vlm_cf_scene(out_json: Path) -> Path:
-    """未见公寓 sage3d_840865 两组同起点异目标真实指令对（与 §10.18 基线严格同任务对比）。"""
-    data_uav = _paths()["data_uav"]
-    src = json.loads((data_uav / "3dgs-scenes/sage3d_840865/scene.json").read_text())
-    src["ply"] = str((data_uav / "3dgs-scenes/sage3d_840865/scene.ply").resolve())
-    src["collision"]["geometry"] = str((data_uav / "3dgs-scenes/sage3d_840865/collision_mesh.ply").resolve())
-    routes = src["routes"]
-    p1a, p1b = json.loads(json.dumps(routes[53])), json.loads(json.dumps(routes[71]))
-    p1b["spawn"] = dict(p1a["spawn"])
-    p2a, p2b = json.loads(json.dumps(routes[17])), json.loads(json.dumps(routes[67]))
-    p2b["spawn"] = dict(p2a["spawn"])
-    picked = [p1a, p1b, p2a, p2b]
-    src["routes"] = picked
-    src["spawn"] = picked[0]["spawn"]
-    src["waypoint"] = picked[0]["waypoint"]
-    src["max_steps"] = max(int(r["max_steps"]) for r in picked)
+    """按 11 月 23 日 Stage 0 登记，复原 840865 的 tr_74/7 和 tr_87/8。"""
+    from hashlib import sha256
+    from importlib import import_module
+
+    vln = import_module("sim.3dgs.vln")
+    source_dir = _paths()["data_uav"] / "3dgs-scenes/sage3d_840865"
+    data = (source_dir / "scene.json").read_bytes()
+    if sha256(data).hexdigest() != G3_CF_SOURCE_SHA256:
+        raise ValueError("G3 反事实预设的源场景与登记哈希不符，三臂均未启动")
+    src = json.loads(data)
+    by_name = {r["name"]: r for r in src["routes"]}
+    routes = []
+    for name, index in (("tr_74", 7), ("tr_87", 8)):
+        route = by_name[name]
+        route["sage"]["instructions"] = [route["sage"]["instructions"][index]]
+        routes.append(route)
+    src.update(name="sage3d_840865_tr_74_tr_87", routes=routes, multi_stage_routes=[],
+               spawn=routes[0]["spawn"], waypoint=routes[0]["waypoint"], max_steps=routes[0]["max_steps"])
+    src["ply"] = str(source_dir / src["ply"])
+    src["collision"]["geometry"] = str(source_dir / src["collision"]["geometry"])
+    requested = vln.episodes(src)
+    partners = vln.swap_partners(src, requested, requested)
+    if len(requested) != 2 or len(partners) != len(requested):
+        missing = [ep["key"] for ep in requested if ep["key"] not in partners]
+        raise ValueError(f"G3 登记指令没有完整互配，三臂均未启动：{missing}")
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(src, indent=2, ensure_ascii=False) + "\n")
     return out_json
@@ -463,18 +476,36 @@ def _summarize_vln_dir(cdir: Path) -> dict:
     eps = [json.loads(ln) for ln in (cdir / "episodes.jsonl").read_text().splitlines() if ln.strip()]
     return {
         "overall": rep["overall"],
+        "overall_goal_scope": rep.get("overall_goal_scope"),
+        "supplied_goal_metrics": rep.get("supplied_goal_metrics"),
+        "paired_supplied_goal_metrics": rep.get("paired_supplied_goal_metrics"),
         "vlm_latency_ms": rep.get("vlm_latency_ms"),
+        "counterfactual": rep.get("counterfactual"),
+        "swap_pair_preflight": rep.get("swap_pair_preflight"),
         "episodes": [
             {
                 "route": r["route_name"],
+                "key": r.get("key"),
+                "seed": r.get("seed"),
                 "goal_object": r.get("goal_object"),
-                "supplied": r["supplied_text"][:80],
+                "supplied": r["supplied_text"],
+                "supplied_instruction_key": r.get("supplied_instruction_key"),
+                "counterfactual": r.get("counterfactual"),
+                "supplied_goal_object": r.get("supplied_goal_object"),
                 "success": r["success"],
                 "oracle_success": r["oracle_success"],
                 "ne_m": round(r["ne_m"], 3),
                 "spl": round(r["spl"], 3) if isinstance(r.get("spl"), (int, float)) else None,
                 "stopped": r["stopped"],
                 "collision": r["collision"],
+                "supplied_goal_success": r.get("supplied_goal_success"),
+                "supplied_goal_oracle_success": r.get("supplied_goal_oracle_success"),
+                "supplied_goal_ne_m": (round(r["supplied_goal_ne_m"], 3)
+                                        if isinstance(r.get("supplied_goal_ne_m"), (int, float)) else None),
+                "supplied_goal_spl": (round(r["supplied_goal_spl"], 3)
+                                      if isinstance(r.get("supplied_goal_spl"), (int, float)) else None),
+                "supplied_goal_stopped": r.get("supplied_goal_stopped"),
+                "supplied_goal_collision": r.get("supplied_goal_collision"),
                 "video": r.get("video"),
             }
             for r in eps
@@ -483,21 +514,21 @@ def _summarize_vln_dir(cdir: Path) -> dict:
 
 
 def run_stage_g3_vlm(run_dir: Path, env: dict, student_ckpt: Path) -> dict:
-    """运行 G3 零特权阶段路标分解 VLM + 机载几何深度联合判停：未见公寓 840865 反事实 12 集 + 841980 5 集全录像。"""
+    """运行 840865 登记双目标的三臂对照，以及 841980 正确指令诊断。"""
     p = _paths()
     g3_dir = run_dir / "g3_subgoal_vlm"
-    cf_scene = _build_unseen_vlm_cf_scene(g3_dir / "sage3d_840865_cf4.json")
+    cf_scene = _build_unseen_vlm_cf_scene(g3_dir / "sage3d_840865_tr_74_tr_87.json")
     videos_n = os.environ["UAVRGB_VIDEOS_PER_SCENE"]
     vlm_every = os.environ["UAVRGB_VLM_EVERY"]
     vlm_model = os.environ["UAVRGB_VLM_MODEL"]
 
     cf_results = {}
     for cf in ("correct", "swap", "zero"):
-        cdir = g3_dir / f"vlm_student_{cf}"
+        cdir = g3_dir / cf_scene.stem / f"vlm_student_{cf}"
         if not (cdir / "vln_eval.json").is_file():
             _run_cmd([
                 p["py_3dgs"], "-m", "sim.3dgs.run_vln",
-                "--scene", cf_scene, "--limit", "4",
+                "--scene", cf_scene,
                 "--policy", "student", "--ckpt", student_ckpt, "--infer-bin", p["infer_bin"],
                 "--grounder", "vlm", "--vlm-model", vlm_model, "--vlm-every", vlm_every,
                 "--counterfactual", cf, "--videos", videos_n, "--out", cdir,
@@ -517,6 +548,7 @@ def run_stage_g3_vlm(run_dir: Path, env: dict, student_ckpt: Path) -> dict:
 
     return {
         "student_ckpt": str(student_ckpt),
+        "counterfactual_cohort": cf_scene.stem,
         "unseen_840865_counterfactual": cf_results,
         "unseen_841980_scene_eval": _summarize_vln_dir(unseen_841980_dir),
     }

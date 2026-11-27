@@ -28,6 +28,22 @@ _MOTION = re.compile(
     r"\b(?:go|fly|move|head|proceed|continue|navigate|travel)\b",
     re.IGNORECASE,
 )
+_TERMINAL_ACTION = re.compile(
+    r"(?:^|\b(?:and(?:\s+then)?|then)\s+|[,.;!?]\s*)(?:please\s+)?"
+    r"(?:stop|hover|wait|pause|hold(?:\s+position)?|stay|remain)(?:\s+(?:here|there|in\s+place))?$"
+)
+_CJK_TERMINAL_ACTION = re.compile(
+    r"(?:^|[，。！？；、,.;!?]\s*|并且|并|然后|随后|之后|后|再)\s*(?:原地)?"
+    r"(?:保持悬停|悬停|停下|停止|停住|停留|等待|停)(?:在[这那]里|在原地)?$"
+)
+_PUNCTUATION = " \t\r\n,.;!?，。！？；、"
+
+
+def _navigation_text(instruction):
+    """Remove a terminal action only when it names no destination of its own."""
+    text = str(instruction or "").lower().replace("’", "'").strip(_PUNCTUATION)
+    text = _TERMINAL_ACTION.sub("", text)
+    return _CJK_TERMINAL_ACTION.sub("", text).rstrip(_PUNCTUATION)
 
 
 def _tokens(value):
@@ -37,7 +53,7 @@ def _tokens(value):
 
 def _goal_text(instruction):
     """优先明确运动目标，保留目标之后的约束，不把起点介词当目的地。"""
-    text = str(instruction).lower().replace("_", " ").replace("-", " ")
+    text = instruction.replace("_", " ").replace("-", " ")
     motion = _MOTION.search(text)
     if motion:
         text = text[motion.end():]
@@ -47,10 +63,6 @@ def _goal_text(instruction):
             if relation.start() <= match.start() < relation.end():
                 return text[relation.start():]
     return text[match.end():] if match else text
-
-
-def _goal_tokens(instruction):
-    return set(_tokens(_goal_text(instruction)))
 
 
 @dataclass(frozen=True)
@@ -183,18 +195,19 @@ class LexicalGrounder:
 
     def ground(self, instruction, candidates):
         """返回一个候选名；候选为空、无重叠或不够明确时拒绝。"""
-        text = str(instruction).lower().replace("’", "'")
+        text = _navigation_text(instruction)
         # shortcut: 只支持英文单目标词法检索；复杂语义交给后续关系 grounder。
         reason = _first_guard_rejection(text, _BASE_GUARDS + _LEXICAL_EXTRA_GUARDS)
         if reason:
             return Grounding(None, 0.0, 0.0, False, reason)
         names = [str(name) for name in candidates if str(name).strip()]
-        query = set(_tokens(instruction))
-        goal = _goal_tokens(instruction)
+        query = set(_tokens(text))
         if not names or not query:
             return Grounding(None, 0.0, 0.0, False, "empty_query_or_candidates")
+        goal_tokens = _tokens(_goal_text(text))
+        goal = set(goal_tokens)
+        target_text = " ".join(goal_tokens)
         scored = []
-        target_text = " ".join(_tokens(_goal_text(instruction)))
         for name in dict.fromkeys(names):
             words = set(_tokens(name))
             if not words:
@@ -254,13 +267,12 @@ _ENDPOINT_MODIFIER = re.compile(
     r"[a-z]+(?:ed|ing)\s+(?:for|to)|stored(?=\s+(?:[a-z]+ly|at|in|on)\b))\b"
 )
 _NEXT_ACTION = re.compile(
-    r"\band\s+(?:next,?\s+)?(?=(?:bring|carry|deliver|find|go|hang|head|leave|locate|look|move|"
-    r"place|position|put|set|showcase|stop|take|transfer|transport)\b)"
+    r"\band\s+(?:next,?\s+)?(?=(?:bring|carry|continue|deliver|find|fly|go|hang|head|hover|leave|"
+    r"locate|look|move|navigate|place|position|proceed|put|set|showcase|stop|take|transfer|transport|travel)\b)"
 )
-
 _NAVIGATION_VERB = re.compile(
     r"\b(?:(?:go|fly|move|head|navigate|travel|proceed|walk)(?:\s+from\b[^,;.]*?)?|"
-    r"stop|finish|end|arrive)\s+$"
+    r"stop|hover|finish|end|arrive)\s+$"
 )
 
 
@@ -301,18 +313,23 @@ def _english_destination(command):
 
 
 def _cjk_instruction_target_matches(instruction, visible_target):
-    destinations = list(re.finditer(r"(?:前往|到|去)", instruction))
-    label = str(visible_target or "").strip(" \t\r\n，。！？；、")
+    if re.search(r"不要|不能|不许|不准|不得|禁止|(?:别|勿|不)(?:再)?(?:飞|去|到|前往|靠近|悬停|停|向|在)"
+                 r"|(?:降落|起飞|上升|下降)(?:$|[，。；]|并|后|到|在)", instruction):
+        return False
+    destinations = list(re.finditer(r"前往|到|去|停在", instruction))
+    label = str(visible_target or "").strip(_PUNCTUATION)
     if not destinations or not label or label in ("它", "东西", "物品", "目标", "none", "unknown"):
         return False
-    target_phrase = instruction[destinations[-1].end():].strip(" \t\r\n，。！？；、")
+    target_phrase = instruction[destinations[-1].end():].strip(_PUNCTUATION)
     target_phrase = re.sub(r"(?:附近|旁边|周围|周边|区域|里面|内部)$", "", target_phrase)
     return bool(target_phrase) and target_phrase.endswith(label)
 
 
 def instruction_target_matches(instruction, visible_target):
     """Accept only a visible label matching the final destination phrase."""
-    text = str(instruction or "").lower().replace("’", "'")
+    text = _navigation_text(instruction)
+    if _NEGATION_RE.search(text) or _VERTICAL_RE.search(text):
+        return False
     if re.search(r"[\u4e00-\u9fff]", text):
         return _cjk_instruction_target_matches(text, visible_target)
     clauses = [part.strip() for part in re.split(r"[.;]|\bthen\b", text) if part.strip()]
@@ -333,7 +350,7 @@ class RelationPhraseGrounder(LexicalGrounder):
     """
 
     def ground(self, instruction, candidates):
-        text = str(instruction).lower().replace("’", "'")
+        text = _navigation_text(instruction)
         reason = _first_guard_rejection(text, _BASE_GUARDS)
         if reason:
             return Grounding(None, 0.0, 0.0, False, reason)
@@ -343,7 +360,8 @@ class RelationPhraseGrounder(LexicalGrounder):
         goal_clause = clauses[-1] if clauses else text
         dest_matches = list(re.finditer(r"\b(?:to|toward|towards|into)\b(?!\s+the\s+(?:left|right)\s+of\b)", goal_clause))
         raw_goal = goal_clause[dest_matches[-1].end():] if dest_matches else _goal_text(goal_clause)
-        head_phrase = _MODIFIER_SPLIT.split(raw_goal, maxsplit=1)[0].strip() or raw_goal
+        head_phrase = (_english_destination(goal_clause)
+                       or _MODIFIER_SPLIT.split(raw_goal, maxsplit=1)[0].strip() or raw_goal)
         head_tokens = set(_tokens(head_phrase))
         full_tokens = set(_tokens(raw_goal))
         names = [str(name) for name in candidates if str(name).strip()]
@@ -526,21 +544,25 @@ class VisualLanguageGrounder:
         return line
 
     @staticmethod
-    def _encode_latest_frame_b64(rgb_history):
+    def _encode_frames_b64(rgb_history):
         import base64
         import io
         import numpy as np
         from PIL import Image
 
-        frames = [rgb_history] if (isinstance(rgb_history, np.ndarray) and rgb_history.ndim == 3) else list(rgb_history or ())
-        if not frames:
-            return None
-        arr = np.asarray(frames[-1], dtype=np.uint8)
-        if arr.ndim != 3 or arr.shape[2] != 3:
-            raise ValueError(f"RGB 帧必须是 HxWx3 uint8，得到 {arr.shape}")
-        buf = io.BytesIO()
-        Image.fromarray(arr).save(buf, format="JPEG", quality=85)
-        return base64.b64encode(buf.getvalue()).decode("ascii")
+        if rgb_history is None:
+            return []
+        if isinstance(rgb_history, np.ndarray) and rgb_history.ndim == 3:
+            rgb_history = [rgb_history]
+        encoded = []
+        for frame in list(rgb_history)[-4:]:
+            arr = np.asarray(frame, dtype=np.uint8)
+            if arr.ndim != 3 or arr.shape[2] != 3:
+                raise ValueError(f"RGB 帧必须是 HxWx3 uint8，得到 {arr.shape}")
+            buf = io.BytesIO()
+            Image.fromarray(arr).save(buf, format="JPEG", quality=85)
+            encoded.append(base64.b64encode(buf.getvalue()).decode("ascii"))
+        return encoded
 
     def ground_step(self, rgb_history, instruction: str) -> VisualGrounding:
         """严格零特权接口：仅接收机载 RGB 数组（单帧 HWC 或帧序列）与语言指令。"""
@@ -549,22 +571,22 @@ class VisualLanguageGrounder:
         text = str(instruction or "").strip()
         if not text:
             return VisualGrounding(BEARING_SEARCH, 0, 0.0, "empty_instruction", 0.0, "search")
-        b64 = self._encode_latest_frame_b64(rgb_history)
-        if b64 is None:
+        t0 = time.perf_counter()
+        frames_b64 = self._encode_frames_b64(rgb_history)
+        if not frames_b64:
             return VisualGrounding(BEARING_SEARCH, 0, 0.0, "empty_rgb_history", 0.0, "search")
 
         mem = "; ".join(self._recent_notes[-3:]) if self._recent_notes else "none"
-        t0 = time.perf_counter()
-        req = json.dumps({"frames_b64": [b64], "instruction": text, "memory": mem}, ensure_ascii=False)
+        req = json.dumps({"frames_b64": frames_b64, "instruction": text, "memory": mem}, ensure_ascii=False)
         self._proc.stdin.write(req + "\n")
         self._proc.stdin.flush()
         resp = json.loads(self._readline(min(self.timeout_s, 30.0), "ground_step"))
-        ms = (time.perf_counter() - t0) * 1000.0
         bb, ng, conf, reason, goal_mode = parse_vlm_output(resp.get("raw", ""), default_conf=resp.get("conf", 0.5))
         tag = "F" if goal_mode == "final" else ("S" if goal_mode == "subgoal" else "N")
         self._recent_notes.append(f"{_BIN_SHORT.get(bb, 'N')}({tag}:{reason[:18]})")
         if len(self._recent_notes) > 6:
             self._recent_notes = self._recent_notes[-6:]
+        ms = (time.perf_counter() - t0) * 1000.0
         return VisualGrounding(bb, ng, conf, reason, round(ms, 2), goal_mode)
 
     def close(self):

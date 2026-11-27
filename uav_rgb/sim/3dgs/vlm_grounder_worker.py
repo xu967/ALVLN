@@ -50,6 +50,28 @@ PROMPT_TEMPLATE = (
 )
 
 
+def _grounding_inputs(processor, frames_b64, instruction, memory):
+    from PIL import Image
+
+    content = []
+    for data in frames_b64[-4:]:
+        with Image.open(io.BytesIO(base64.b64decode(data))) as frame:
+            image = frame.convert("RGB").resize((INPUT_W, INPUT_H), Image.Resampling.BILINEAR)
+        content.append({"type": "image", "image": image})
+    prompt = PROMPT_TEMPLATE.format(ins=instruction, mem=memory)
+    if len(content) > 1:
+        prompt = ("Frames are ordered oldest to newest. Use earlier frames as context. "
+                  "Report visibility, direction and proximity in the last image only.\n" + prompt)
+    content.append({"type": "text", "text": prompt})
+    messages = [
+        {"role": "user", "content": content},
+        {"role": "assistant", "content": [{"type": "text", "text": '["'}]},
+    ]
+    return processor.apply_chat_template(
+        messages, tokenize=True, continue_final_message=True, return_dict=True, return_tensors="pt",
+    )
+
+
 def main():
     for sub in ("hf", "transformers", "torch", "tmp"):
         os.makedirs(os.path.join(CACHE_ROOT, sub), exist_ok=True)
@@ -123,16 +145,7 @@ def main():
 
         mem = str(req.get("memory") or "none").strip()[:160] or "none"
         t0 = time.perf_counter()
-        raw_bytes = base64.b64decode(frames_b64[-1])
-        with Image.open(io.BytesIO(raw_bytes)) as im:
-            cur_img = im.convert("RGB").resize((INPUT_W, INPUT_H), Image.Resampling.BILINEAR)
-        msgs = [
-            {"role": "user", "content": [{"type": "image", "image": cur_img}, {"type": "text", "text": PROMPT_TEMPLATE.format(ins=ins, mem=mem)}]},
-            {"role": "assistant", "content": [{"type": "text", "text": '["'}]},
-        ]
-        inputs = processor.apply_chat_template(
-            msgs, tokenize=True, continue_final_message=True, return_dict=True, return_tensors="pt",
-        ).to("cuda:0")
+        inputs = _grounding_inputs(processor, frames_b64, ins, mem).to("cuda:0")
         inputs["pixel_values"] = inputs["pixel_values"].to(torch.float16)
         with torch.inference_mode():
             out = model.generate(

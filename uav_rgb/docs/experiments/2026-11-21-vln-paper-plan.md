@@ -2,6 +2,43 @@
 
 2026-11-21。开发阶段使用 SAGE-3D 室内场景、本仓 3DGS 渲染和 Crazyflie 固件在环仿真。实验入口统一使用 `train.py`，已有批量预设用于复现历史诊断。正式任务清单和对照组在开发阶段验收后登记。
 
+## 11 月 27 日单帧与四帧开发对照
+
+用于决策的问题是，给同一个局部控制器四张连续机载图像，能否改善它对当前指令目标的判断。沿用 11 月 24 日登记的 839934 教师视图、壁灯和橱柜原句，权重为 UAV-PUR-4B，每次查询前清空记忆。四帧条件使用同一路线连续四次决策图，按旧到新排列，额外提示模型以最后一帧判读。比较包含图像数量和多图提示这两个变化。空指令走生产拒答路径，每个条件两次均为 UNKNOWN。 [原始登记](</root/rivermind-data/uav_rgb/exp-vln-acquired-approach-839934-20261124/registration.json>) · [回放脚本](</root/rivermind-data/uav_rgb/exp-vln-frame-history-20261127-mdRWGA/probe.py>) · [逐条原始输出及图像哈希](</root/rivermind-data/uav_rgb/exp-vln-frame-history-20261127-mdRWGA/probe.jsonl>)
+
+| 已确认可见的物体及教师步 | 输入目的地 | 单帧所报阶段、方向、近距 | 四帧所报阶段、方向、近距 |
+| --- | --- | --- | --- |
+| 壁灯，tr_42 第 64 步 | 壁灯 | 最终，右，否 | 最终，左，是 |
+| 同上 | 橱柜 | 最终，右，否 | 最终，右，是 |
+| 橱柜，tr_69 第 91 步 | 壁灯 | 最终，右，否 | 路标，右，否 |
+| 同上 | 橱柜 | 最终，右，否 | 路标，右，否 |
+
+在两张已有可见性见证的匹配画面上，模型将正确物体报为最终目标的次数为单帧 2/2、四帧 1/2。另一物体在这些图像中的可见性没有独立标注。两张图不能估计定位准确率，也不能从输出的名称证明实例 ID。四帧暂列可选消融，`--vlm-history-frames` 默认 1。
+
+在同一登记壁灯起点，用 R2 学生、种子 421、0.5 秒动作窗、显式 STOP 跑满 125 步。单帧的 SR、OSR、SPL 均为 0，末端水平误差 3.627 m。125 个执行动作都是右转，策略与执行一致，累计绝对偏航 2143.57°，无碰撞，未请求停机。VLM 实际调用 63 次，另外 62 步沿用有时限的方位。11 月 24 日旧策略在这个起点第 8 步碰撞。取同一首帧和前 8 步作诊断，当前单帧、四帧均执行八次右转，累计绝对偏航均为 134.55°。完整路线只测了当前单帧，短前缀只比较动作。 [完整回报](</root/rivermind-data/uav_rgb/exp-vln-frame-history-20261127-mdRWGA/flight-one/episodes.jsonl>) · [四帧前缀](</root/rivermind-data/uav_rgb/exp-vln-frame-history-20261127-mdRWGA/flight-four-prefix/episodes.jsonl>) · [运行与交接](../worklog/2026-11-26-2123-vln-readonly-audit.md)
+
+同一八步前缀的空指令全部记录为 search，执行左、左、左、左、右、右、右、右，累计绝对偏航 128.20°。`supplied_goal_metrics` 为空。三臂首帧字节相同。就这个起点而言，指令能改变学生的转向选择，两种视觉输入窗没有改变前八步动作。 [空指令逐集报告](</root/rivermind-data/uav_rgb/exp-vln-frame-history-20261127-mdRWGA/flight-zero-prefix/episodes.jsonl>) · [四帧状态录像](</root/rivermind-data/uav_rgb/exp-vln-frame-history-20261127-mdRWGA/flight-four-prefix/sage3d_839934_tr_42_tr_69/tr_42_0/evidence.mp4>)
+
+**同起点局控对照**
+
+同一起点的局控对照已经完成，以下各臂用同一张首帧、种子 421、125 步预算及显式 STOP。只替换控制器或其方位输入。
+
+| 策略及可用信息 | 执行步数 | 前进步数 | 累计绝对偏航 | 末端误差 | 结局 |
+| --- | ---: | ---: | ---: | ---: | --- |
+| 地图教师，braking | 34 | 22 | 178.09° | 0.728 m | 自主停靠 |
+| R2，真值 A* 局部路标 | 24 | 20 | 48.42° | 0.866 m | 自主停靠 |
+| R2，真值终点直线方位 | 3 | 2 | 15.39° | 3.468 m | 碰撞 |
+| R2，单帧视觉语言方位 | 125 | 0 | 2143.57° | 3.627 m | 预算耗尽 |
+
+地图教师和两项真值条件是控制诊断。不同输入同时改变了 R2 可用的停机依据：真值条件使用学生 STOP head，视觉语言条件使用视觉确认。本例中视觉臂尚未进入目标圈；要区分停机策略的贡献，需要另外固定接近过程。 [三个对照的精确命令](</root/rivermind-data/uav_rgb/exp-vln-frame-history-20261127-mdRWGA/controls.sh>) · [教师](</root/rivermind-data/uav_rgb/exp-vln-frame-history-20261127-mdRWGA/control-teacher/episodes.jsonl>) · [局部路标](</root/rivermind-data/uav_rgb/exp-vln-frame-history-20261127-mdRWGA/control-subgoal/episodes.jsonl>) · [直线方位](</root/rivermind-data/uav_rgb/exp-vln-frame-history-20261127-mdRWGA/control-direct/episodes.jsonl>)
+
+**下一次实现和判据**
+
+1. 在同房间橱柜起点及另一开发房间复现上表。候选用指令指定目标或参照物，在 RGB 中选择通往该目标的局部可通行方向，再交给相同学生执行；离线用教师方向评分，在线不向候选提供地图、位姿或终点。记录目标首次可见、转后首次前进、净接近、累计绝对偏航和碰撞，报告每个起点。
+2. 在另一个开发房间先冻结同图不同指令的目标实例框、参照物、近距和缺席标注。候选只向策略提供从 RGB 与当前指令得到的实例区域、帧间关联、证据年龄及最近实际动作。两次新鲜的同名输出仍可能指向错物体。让独立停机判断检验指定实例与距离，分别比较去掉区域、去掉历史、去掉停机核验，报告错实例 STOP 及漏停。
+3. 固定每条路线的 correct、swap、zero 清单、检查点和预算，先在开发集验证候选能改善匹配指令下的接近与停靠，同时没有增加碰撞或错指令停机，再冻结未用于调试的场景及路线簇。至少三训练种子，共用测试起点，按场景和路线簇估计配对差值区间。主表列请求集 SR、OSR、NE、SPL、nDTW、SDTW、碰撞和错误 STOP，并附每项分母。
+4. 公开对照中，AerialVLN 提供室外航线基准，OpenFly 提供航空 VLN 平台与报告指标，See, Point, Fly 提供可对照的图像航点策略。先在同一输入、动作、半径和 STOP 规则下运行适配策略，原论文数字与本地适配各自成表。目前没有同协议胜出结果或“首次提出”的证据。 [AerialVLN](https://openaccess.thecvf.com/content/ICCV2023/html/Liu_AerialVLN_Vision-and-Language_Navigation_for_UAVs_ICCV_2023_paper.html) · [OpenFly](https://arxiv.org/abs/2502.18041) · [See, Point, Fly](https://proceedings.mlr.press/v305/hu25e.html)
+
 ## 11 月 24 日执行结果
 
 按实际供给的目标重新核验。R2 在 841980 的正确和交换指令共 4 集，成功 0/4，碰撞 2/4，错误 STOP 1/4。知道真值局部路标时的 7/10 属于另一套控制任务。两次实验用到的目标信息不同。

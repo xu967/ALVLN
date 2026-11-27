@@ -383,6 +383,46 @@ class TestVisualLanguageGrounder(unittest.TestCase):
                 with self.subTest(instruction=instruction, label=label):
                     self.assertFalse(grounder.instruction_target_matches(instruction, label))
 
+    def test_terminal_stop_action_is_not_treated_as_destination(self):
+        cases = (
+            ("Fly to the wall lamp and then stop.", "wall lamp", ("stop",)),
+            ("Fly to the wall lamp. Stop.", "wall lamp", ("stop",)),
+            ("Fly to the bus stop and hover.", "bus stop", ("hover",)),
+            ("Fly to the wall lamp next to the sofa and hover.", "wall lamp", ("sofa", "hover")),
+            ("Fly to the sofa and stop at the entrance.", "entrance", ("sofa", "stop")),
+            ("Go to the chair and fly to the lamp and stop.", "lamp", ("chair", "stop")),
+            ("到壁灯，然后悬停。", "壁灯", ("悬停",)),
+            ("飞到壁灯后悬停", "壁灯", ("悬停",)),
+            ("飞到沙发旁边的壁灯并原地悬停。", "壁灯", ("沙发", "悬停")),
+            ("先到椅子，然后飞到壁灯并悬停", "壁灯", ("椅子", "悬停")),
+            ("飞到别墅旁的降落区后悬停", "降落区", ("别墅", "悬停")),
+        )
+        for instruction, target, distractors in cases:
+            with self.subTest(instruction=instruction):
+                self.assertTrue(grounder.instruction_target_matches(instruction, target))
+                for label in distractors:
+                    self.assertFalse(grounder.instruction_target_matches(instruction, label), label)
+        for instruction in ("Don't fly to the lamp and stop.", "Fly to the lamp and don't stop.",
+                            "Fly to the lamp and land.", "请不要飞到壁灯并悬停", "飞到壁灯后降落"):
+            with self.subTest(instruction=instruction):
+                for label in ("lamp", "壁灯", "stop", "land", "悬停", "降落"):
+                    self.assertFalse(grounder.instruction_target_matches(instruction, label), label)
+
+    def test_catalog_grounders_keep_their_guards_after_a_stop_suffix(self):
+        names = ["lamp", "sofa", "stop"]
+        for cls in (grounder.LexicalGrounder, grounder.RelationPhraseGrounder):
+            catalog = cls()
+            self.assertEqual(catalog.ground("Fly to the lamp and then stop.", names).target, "lamp")
+            for instruction, reason in (
+                    ("Fly to the lamp and land.", "unsupported_vertical_command"),
+                    ("Don't fly to the lamp and stop.", "unsupported_negation"),
+                    ("Go to the sofa then fly to the lamp and stop.", "unsupported_multiple_goals")):
+                with self.subTest(grounder=cls.__name__, instruction=instruction):
+                    self.assertEqual(catalog.ground(instruction, names).reason, reason)
+        instruction = "Fly to the lamp next to the sofa and hover."
+        self.assertEqual(grounder.LexicalGrounder().ground(instruction, names).reason, "unsupported_relation")
+        self.assertEqual(grounder.RelationPhraseGrounder().ground(instruction, names).target, "lamp")
+
     def test_mock_worker_subprocess_roundtrip_and_cleanup(self):
         import sys
         import numpy as np
@@ -404,6 +444,56 @@ class TestVisualLanguageGrounder(unittest.TestCase):
             self.assertEqual((r2.bearing_bin, r2.near_goal, r2.reason), (7, 0, "plant"))
             r_zero = vg.ground_step([frame], "")
             self.assertEqual((r_zero.bearing_bin, r_zero.near_goal), (8, 0))
+
+    def test_ground_step_sends_the_four_newest_rgb_frames_in_order(self):
+        import sys
+        import numpy as np
+        mock_code = (
+            "import base64, io, json, sys\n"
+            "from PIL import Image\n"
+            "sys.stdout.write(json.dumps({'status':'ready'}) + '\\n'); sys.stdout.flush()\n"
+            "for line in sys.stdin:\n"
+            "    req = json.loads(line)\n"
+            "    if req.get('cmd') == 'close': break\n"
+            "    images = [Image.open(io.BytesIO(base64.b64decode(data))) for data in req['frames_b64']]\n"
+            "    levels = [str(im.getpixel((0,0))[0]) for im in images]\n"
+            "    raw = json.dumps(['C', 0, ','.join(levels)])\n"
+            "    sys.stdout.write(json.dumps({'raw': raw}) + '\\n'); sys.stdout.flush()\n"
+        )
+        frames = [np.full((8, 8, 3), level, dtype=np.uint8) for level in (0, 32, 64, 96, 128, 160)]
+        with grounder.VisualLanguageGrounder(worker_cmd=[sys.executable, "-c", mock_code], timeout_s=10.0) as vg:
+            self.assertEqual(vg.ground_step(frames, "Fly to the sofa.").reason, "64,96,128,160")
+            self.assertEqual(vg.ground_step(frames[-1], "Fly to the sofa.").reason, "160")
+
+    def test_worker_passes_ordered_images_and_current_view_prompt_to_processor(self):
+        from unittest import mock
+        import numpy as np
+
+        with mock.patch.dict(os.environ):
+            worker = importlib.import_module("sim.3dgs.vlm_grounder_worker")
+        levels = (0, 32, 64, 96, 128, 160)
+        frames = [grounder.VisualLanguageGrounder._encode_frames_b64(np.full((8, 8, 3), n, np.uint8))[0]
+                  for n in levels]
+        instruction = "Fly to the wall lamp."
+        memory = "L(F:lamp)->LEFT"
+        legacy_prompt = worker.PROMPT_TEMPLATE.format(ins=instruction, mem=memory)
+        for history in (frames[-1:], frames):
+            with self.subTest(frames=len(history)):
+                processor = mock.Mock()
+                worker._grounding_inputs(processor, history, instruction, memory)
+                messages = processor.apply_chat_template.call_args.args[0]
+                content = messages[0]["content"]
+                images = [item["image"] for item in content if item["type"] == "image"]
+                expected = levels[-min(4, len(history)):]
+                self.assertEqual([im.getpixel((0, 0))[0] for im in images], list(expected))
+                self.assertTrue(all(im.size == (worker.INPUT_W, worker.INPUT_H) for im in images))
+                prompt = content[-1]["text"]
+                if len(history) == 1:
+                    self.assertEqual(prompt, legacy_prompt)
+                else:
+                    self.assertTrue(prompt.endswith(legacy_prompt))
+                    self.assertIn("oldest to newest", prompt)
+                    self.assertIn("last image only", prompt)
 
     def test_g3_subgoal_vs_final_parsing_and_memory_roundtrip(self):
         import sys
@@ -504,6 +594,8 @@ class TestVisualLanguageGrounder(unittest.TestCase):
             self.assertFalse(adapter.stop_requested)
         self.assertEqual(adapter(rgb, None, None)[0], SAFE_NEUTRAL)
         self.assertTrue(adapter.stop_requested)
+        self.assertEqual(adapter.last_decision["grounding_trace_source"], "fresh")
+        self.assertEqual(adapter.last_decision["grounding_evidence_age_steps"], 0)
 
         class _WrongTargetVlm:
             def reset_episode(self):

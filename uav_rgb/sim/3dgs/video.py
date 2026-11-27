@@ -85,7 +85,7 @@ def compose_rgb_video(frames_dir, out_path, fps=10.0):
     return written
 
 
-def _banner_mask(text, width, s, max_lines=5):
+def _banner_mask(text, width, s, max_lines=5, fallback="[See episode_manifest.json for the original instruction]"):
     """指令每集栅格化一次，按像素宽度折行，支持没有空格的指令。"""
     from PIL import Image, ImageDraw, ImageFont
 
@@ -95,7 +95,7 @@ def _banner_mask(text, width, s, max_lines=5):
     else:
         font = ImageFont.truetype("DejaVuSans.ttf", 16 * s)
         if not text.isascii():
-            text = "[See episode_manifest.json for the original instruction]"
+            text = fallback
     max_width = width - 24 * s
     lines, cur = [], ""
     for char in " ".join(text.split()):
@@ -298,6 +298,24 @@ def _decision_rgb(cv2, ep_dir, action):
     return cv2.imread(path) if os.path.isfile(path) else None
 
 
+def _grounding_line(action, evidence):
+    mode = evidence.get("goal_mode") or action.get("grounding_mode") or "?"
+    source = evidence.get("trace_source") or action.get("grounding_trace_source") or "unrecorded"
+    raw = evidence.get("raw_bearing_bin", action.get("grounding_raw_bearing_bin"))
+    bearing = action.get("bearing_bin", evidence.get("bearing_bin"))
+    age = evidence.get("evidence_age_steps", action.get("grounding_evidence_age_steps"))
+    conf = evidence.get("conf", action.get("grounding_conf"))
+    # 旧档在无调用的步中重复上一次 raw，部分 fresh 步还会将漏检改成中心。
+    if source in ("inherited", "expired", "stabilized"):
+        raw = None
+    if source == "fresh" and raw is not None and raw != bearing:
+        source = "inferred"
+    age_text = f" +{age}" if age else ""
+    conf_text = f" | conf {conf:.2f}" if conf is not None and source != "unrecorded" else ""
+    return (f"VLM {mode} | {source}{age_text} | raw {raw if raw is not None else '-'}"
+            f" / used {bearing if bearing is not None else '?'}{conf_text}")
+
+
 def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_dir=None,
                         title="", result="", quality=None, log=print, instruction="", pred_goal=None,
                         goal_visible=True):
@@ -372,8 +390,8 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
     hit = next((a for a in actions if a.get("collision")), None)
     follow_label = "FOLLOW back %.1fm up %.1fm (E1 body %.2fm)" % (FOLLOW_BACK_M, FOLLOW_UP_M, e1_body.WIDTH_M)
     cells = None
-    last_rgb_step, decision_rgb = None, None
-    latest_grounding = {}
+    last_rgb_step, decision_rgb, landmark_label = None, None, None
+    label_width = CW - 344 * s
     cam_yaw, alpha = None, 1.0 - math.exp(-1.0 / (VIEW_FPS * FOLLOW_YAW_TAU_S))
     try:
         for i, row in enumerate(seq):
@@ -384,12 +402,20 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
             pitch = math.degrees(math.asin(max(-1.0, min(1.0, 2 * (w_ * qy - qz * qx)))))
             t, step = float(row["t"]), int(row["step"])
             step_row = steps.get(step, {})
+            evidence = grounding_steps.get(step, {})
             note = f"sim {t:.2f}s"
             if i < len(frames):
                 path_xy.append((x, y))
                 if last_rgb_step != step:
                     decision_rgb = _decision_rgb(cv2, ep_dir, step_row)
                     last_rgb_step = step
+                    landmark_label = None
+                    source = evidence.get("trace_source")
+                    if (source in ("fresh", "inherited") and evidence.get("goal_mode") in ("final", "subgoal")
+                            and evidence.get("reason") and evidence.get("raw_bearing_bin") != 8):
+                        prefix = "Reported" if source == "fresh" else "Last reported"
+                        landmark_label = _banner_mask(f"{prefix}: {evidence['reason']}", label_width, s,
+                                                      max_lines=2, fallback="[See grounding_trace.jsonl]")
                 onboard = decision_rgb
                 if onboard is None:
                     onboard = _render(renderer, renderer.width * s, renderer.height * s, ssaa=ssaa,
@@ -433,17 +459,14 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
                 gd = math.hypot(float(wp["x"]) - x, float(wp["y"]) - y)
                 gbrg = (math.degrees(math.atan2(float(wp["y"]) - y, float(wp["x"]) - x) - yaw) + 180.0) % 360.0 - 180.0
                 goal_tag = f"  GT goal {gd:4.2f}m {gbrg:+4.0f}deg"
-            latest_grounding = grounding_steps.get(step, latest_grounding)
-            mode = step_row.get("grounding_mode", latest_grounding.get("goal_mode"))
-            bearing = step_row.get("bearing_bin", latest_grounding.get("bearing_bin"))
-            confidence = step_row.get("grounding_conf", latest_grounding.get("conf"))
-            confidence = f" conf {confidence:.2f}" if confidence is not None else ""
-            grounding = f"VLM {mode or '?'} | bearing {bearing if bearing is not None else '?'}{confidence}"
+            grounded = bool(grounding_steps or step_row.get("grounding_mode"))
+            stage = evidence.get("active_stage_index")
+            stage_tag = f" | stage {stage + 1}/{evidence['stage_count']}" if stage is not None and evidence.get("stage_count") else ""
             lines = [title or str(scene.get("name", "")),
-                     f"{route_tag}step {step + 1}/{len(actions)}",
+                     f"{route_tag}step {step + 1}/{len(actions)}{stage_tag}",
                      f"pos ({x:5.2f},{y:5.2f},{z:4.2f})m{goal_tag}",
                      f"speed {speed:4.2f} m/s  yaw {math.degrees(yaw):6.1f} roll {roll:5.1f} pitch {pitch:5.1f} deg",
-                     grounding if mode or latest_grounding else f"sim t = {t:.2f}s"]
+                     _grounding_line(step_row, evidence) if grounded else f"sim t = {t:.2f}s"]
             flags = [(f"COLLISION @ step {hit['step'] + 1}", (0, 0, 255))] if hit and step >= hit["step"] else []
             proposed = step_row.get("action_proposed")
             executed = vl.ACTIONS[act] if isinstance(act, int) and 0 <= act < 4 else "?"
@@ -455,6 +478,9 @@ def compose_views_video(ep_dir, scene, renderer, mount, occ, out_path=None, png_
             vl.panel(cv2, canvas, *br, lines,
                      int(act) if act is not None and 0 <= int(act) < 4 else None,
                      flags, segments, t - t0, span, hold_result if i >= len(frames) else "", s=s)
+            if landmark_label is not None:
+                lx, ly = br[0] + CW - label_width, br[1] + 162 * s
+                canvas[ly:ly + len(landmark_label), lx:lx + label_width] = landmark_label
             if status:
                 cv2.putText(canvas, status, (br[0] + 16 * s, br[1] + 223 * s),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5 * s, vl.WHITE, s, cv2.LINE_AA)
@@ -705,7 +731,7 @@ def main():
     scene_sha = _sha256(args.scene)
     renderer = renderer_mod.make_renderer(scene, args.mock_renderer, device=args.device)
     occ = importlib.import_module("sim.3dgs.collision").from_scene(scene)   # 顶视地图 = 碰撞用的同一份占据
-    scene_short = os.path.basename(scene["dir"])
+    scene_short = scene.get("name") or os.path.basename(scene["dir"])
     for ep in args.ep:
         with open(os.path.join(ep, "episode_manifest.json"), encoding="utf-8") as f:
             man = json.load(f)

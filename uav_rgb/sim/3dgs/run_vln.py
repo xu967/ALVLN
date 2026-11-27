@@ -28,6 +28,7 @@ import math
 import os
 import sys
 import time
+from dataclasses import replace
 
 from . import collect_3dgs
 from . import collision as collision_mod
@@ -58,114 +59,148 @@ class VlmBeliefTracker:
     """维护可见路标方位。任务 STOP 需要连续两次新鲜的同一近景目标证据。"""
 
     _ACT_SHORT = {0: "SAFE", 1: "FWD", 2: "LEFT", 3: "RIGHT"}
+    _MAX_INHERITED_STEPS = 1
 
-    def __init__(self, vlm_grounder, instruction, update_every=2, stage_instructions=None):
+    def __init__(self, vlm_grounder, instruction, update_every=2, stage_instructions=None, history_frames=1):
+        if type(history_frames) is not int or history_frames not in (1, 4):
+            raise ValueError("history_frames 必须是 1 或 4")
         self.vlm_grounder = vlm_grounder
         self.instruction = str(instruction or "")
         self.stage_instructions = [str(text).strip() for text in (stage_instructions or []) if str(text).strip()]
         self.stage_index = 0
         self.task_complete = False
-        self.stage_confirmed = False
-        self.stage_confirmed_index = None
         self.update_every = max(1, int(update_every))
-        self.step_idx = 0
+        self.history_frames = history_frames
         self.history = []
         self.trace = []
-        self.prev_vlm_bin = None
-        self.last_seen_bin = None
+        self.last_seen_step = None
         self.miss_streak = 0
         self.last_near_target = None
         self.confirmed_target = False
-        self.turned_toward_target = False
         if vlm_grounder is not None and hasattr(vlm_grounder, "reset_episode"):
             vlm_grounder.reset_episode()
-        self.last_vg = grounder_mod.VisualGrounding(grounder_mod.BEARING_SEARCH, 0, 0.0, "init", 0.0, "search")
+        self.last_vg = self._search("init")
+
+    @staticmethod
+    def _search(reason):
+        return grounder_mod.VisualGrounding(grounder_mod.BEARING_SEARCH, 0, 0.0, reason, goal_mode="search")
+
+    @property
+    def last_trace(self):
+        return self.trace[-1] if self.trace else None
+
+    @property
+    def action_evidence(self):
+        row = self.last_trace
+        if row is None:
+            return {}
+        return {"grounding_trace_source": row["trace_source"], "grounding_conf": row["conf"],
+                "grounding_evidence_age_steps": row["evidence_age_steps"],
+                "grounding_rgb_history_len": row["rgb_history_len"],
+                "grounding_raw_bearing_bin": row["raw_bearing_bin"]}
 
     def note_step(self, action_executed: int):
-        self.turned_toward_target |= (self.last_vg.bearing_bin, action_executed) in ((1, 2), (7, 3))
         if self.vlm_grounder is not None and hasattr(self.vlm_grounder, "note_action"):
             self.vlm_grounder.note_action(self._ACT_SHORT.get(int(action_executed), "ACT"))
 
-    def __call__(self, rgb, _state):
-        self.confirmed_target = False
-        self.history.append(rgb)
-        if len(self.history) > 4:
-            self.history = self.history[-4:]
-        if not self.instruction.strip() or self.vlm_grounder is None:
-            self.last_vg = grounder_mod.VisualGrounding(grounder_mod.BEARING_SEARCH, 0, 0.0, "empty_instruction", 0.0, "search")
-            self.step_idx += 1
-            return self.last_vg.bearing_bin, 0
-        if self.step_idx % self.update_every != 0:
-            bb = 0 if self.turned_toward_target else self.last_vg.bearing_bin
-            self.step_idx += 1
-            return bb, 0
-
-        instruction = self.instruction
-        if self.stage_instructions:
-            instruction = ("Treat the current stage as the active FINAL destination until confirmed reached.\n"
-                           f"Overall instruction: {self.instruction}\n"
-                           f"Current stage {self.stage_index + 1}/{len(self.stage_instructions)}: "
-                           f"{self.stage_instructions[self.stage_index]}")
-        vg = self.vlm_grounder.ground_step(self.history, instruction)
-        self.stage_confirmed = False
-        self.stage_confirmed_index = None
-        self.turned_toward_target = False
-        raw_bb = vg.bearing_bin
-        if raw_bb in (0, 1, 7):
-            eff_bb = 0 if {self.prev_vlm_bin, raw_bb} == {1, 7} else raw_bb
-            self.miss_streak = 0
-            self.last_seen_bin = raw_bb
-        elif raw_bb == grounder_mod.BEARING_SEARCH and self.last_seen_bin is not None and self.miss_streak == 0:
-            self.miss_streak = 1
-            eff_bb = 0
-        elif raw_bb == grounder_mod.BEARING_SEARCH:
-            self.miss_streak += 1
-            eff_bb = grounder_mod.BEARING_SEARCH
-        else:
-            eff_bb = raw_bb
-        self.prev_vlm_bin = raw_bb
-        near_target = raw_bb == 0 and vg.goal_mode == "final" and vg.near_goal == 1
-        active_target_text = self.stage_instructions[self.stage_index] if self.stage_instructions else self.instruction
-        target_id = (vg.reason.strip().casefold() if near_target and
-                     grounder_mod.instruction_target_matches(active_target_text, vg.reason) else None)
+    def _confirm(self, observation, active_instruction):
+        near = observation.bearing_bin == 0 and observation.goal_mode == "final" and observation.near_goal == 1
+        target_id = (observation.reason.strip().casefold() if near and
+                     grounder_mod.instruction_target_matches(active_instruction, observation.reason) else None)
         confirmed = bool(target_id and target_id == self.last_near_target)
-        if self.stage_instructions and confirmed:
-            self.stage_confirmed = True
-            self.stage_confirmed_index = self.stage_index
-            if self.stage_index + 1 < len(self.stage_instructions):
-                self.stage_index += 1
-            else:
-                self.task_complete = True
-        eff_ng = int(near_target and confirmed and (not self.stage_instructions or self.task_complete))
-        self.confirmed_target = confirmed and (not self.stage_instructions or self.task_complete)
-        self.last_near_target = None if self.stage_instructions and confirmed and not self.task_complete else target_id
-        self.last_vg = grounder_mod.VisualGrounding(
-            eff_bb, eff_ng, vg.conf, vg.reason, vg.latency_ms, goal_mode=vg.goal_mode,
-        )
+        self.last_near_target = target_id
+        return confirmed
+
+    def __call__(self, rgb, _state):
+        step = len(self.trace)
+        self.history = (self.history + [rgb])[-self.history_frames:]
+        stage = self.stage_index
+        active = self.stage_instructions[stage] if self.stage_instructions else self.instruction
+        raw = None
+        source = "search"
+        self.confirmed_target = False
+        stage_confirmed = False
+        if not self.instruction.strip() or self.vlm_grounder is None:
+            effective = self._search("empty_instruction" if not self.instruction.strip() else "no_grounder")
+        elif step % self.update_every == 0:
+            prompt = self.instruction
+            if self.stage_instructions:
+                prompt = ("Treat the current stage as the active FINAL destination until confirmed reached.\n"
+                          f"Overall instruction: {self.instruction}\n"
+                          f"Current stage {stage + 1}/{len(self.stage_instructions)}: {active}")
+            raw = self.vlm_grounder.ground_step(self.history, prompt)
+            seen = raw.bearing_bin != grounder_mod.BEARING_SEARCH
+            self.last_seen_step = step if seen else None
+            self.miss_streak = 0 if seen else self.miss_streak + 1
+            source = "fresh" if seen else "search"
+            confirmed = self._confirm(raw, active)
+            stage_confirmed = bool(self.stage_instructions and confirmed)
+            if stage_confirmed:
+                self.task_complete = stage + 1 == len(self.stage_instructions)
+                if not self.task_complete:
+                    self.stage_index += 1
+            self.confirmed_target = confirmed and (not self.stage_instructions or self.task_complete)
+            effective = replace(raw, near_goal=int(self.confirmed_target))
+        elif self.last_seen_step is None:
+            effective = self._search("no_current_evidence")
+        elif step - self.last_seen_step <= self._MAX_INHERITED_STEPS:
+            source = "inherited"
+            effective = replace(self.last_vg, near_goal=0, latency_ms=0.0)
+        else:
+            source = "expired"
+            self.last_near_target = None
+            effective = self._search("stale_evidence")
+
+        self.last_vg = effective
         self.trace.append({
-            "step": self.step_idx,
-            "raw_bearing_bin": raw_bb,
-            "raw_near_goal": vg.near_goal,
-            "bearing_bin": eff_bb,
-            "goal_mode": vg.goal_mode,
-            "near_goal": eff_ng,
+            "step": step,
+            "vlm_called": raw is not None,
+            "raw_bearing_bin": raw.bearing_bin if raw is not None else None,
+            "raw_near_goal": raw.near_goal if raw is not None else None,
+            "bearing_bin": effective.bearing_bin,
+            "goal_mode": effective.goal_mode,
+            "near_goal": effective.near_goal,
             "confirmed_target": self.confirmed_target,
+            "instruction": self.instruction,
+            "active_instruction": active,
+            "active_stage_index": stage if self.stage_instructions else None,
+            "stage_count": len(self.stage_instructions),
             "stage_index": self.stage_index,
-            "stage_confirmed": self.stage_confirmed,
-            "stage_confirmed_index": self.stage_confirmed_index,
+            "stage_confirmed": stage_confirmed,
+            "stage_confirmed_index": stage if stage_confirmed else None,
             "task_complete": self.task_complete,
             "miss_streak": self.miss_streak,
-            "conf": vg.conf,
-            "reason": vg.reason,
-            "latency_ms": vg.latency_ms,
+            "conf": effective.conf if raw is not None or source == "inherited" else None,
+            "reason": effective.reason,
+            "latency_ms": raw.latency_ms if raw is not None else None,
+            "trace_source": source,
+            "evidence_age_steps": step - self.last_seen_step if self.last_seen_step is not None else None,
+            "rgb_history_len": len(self.history),
+            "rgb_frames_submitted": len(self.history) if raw is not None else 0,
         })
-        self.step_idx += 1
-        return eff_bb, eff_ng
+        if self.stage_index != stage:
+            self.last_seen_step = None
+            self.last_near_target = None
+            self.history = []
+            if hasattr(self.vlm_grounder, "reset_episode"):
+                self.vlm_grounder.reset_episode()
+        return effective.bearing_bin, effective.near_goal
 
 
 def _read_jsonl(path):
     with open(path, encoding="utf-8") as f:
         return [json.loads(line) for line in f if line.strip()]
+
+
+def _write_grounding_trace(ep_dir, trace, actions):
+    by_step = {action["step"]: action for action in actions}
+    fields = ("timestamp_ns", "rgb_ts", "frame", "action_proposed", "action_executed",
+              "action_intervention", "stop_requested", "stop_source")
+    rows = []
+    for entry in trace:
+        action = by_step.get(entry["step"], {})
+        rows.append({**entry, **{key: action.get(key) for key in fields}})
+    collect_3dgs._write_jsonl(os.path.join(ep_dir, "grounding_trace.jsonl"), rows)
 
 
 def resolve_grounding(selector, catalog, instruction):
@@ -252,59 +287,6 @@ def _manual_spawn_is_safe(occ, spawn):
     return float(clearance(x, y, z)) >= required
 
 
-def _episode_route(scene, episode):
-    route_index = episode.get("route_index")
-    if not isinstance(route_index, int) or route_index < 0:
-        return None
-    routes = scene.get("routes") or []
-    if route_index < len(routes):
-        return routes[route_index]
-    multi_index = route_index - len(routes)
-    multi_routes = scene.get("multi_stage_routes") or []
-    if multi_index >= len(multi_routes):
-        return None
-    return multi_routes[multi_index]
-
-
-def _episode_spawn(scene, episode):
-    route = _episode_route(scene, episode)
-    if route is None:
-        return None
-    spawn = route.get("spawn") or {}
-    if not all(axis in spawn for axis in ("x", "y", "z")):
-        return None
-    return tuple(float(spawn.get(axis, 0.0)) for axis in ("x", "y", "z", "yaw_deg"))
-
-
-def _episode_budget(scene, episode):
-    route = _episode_route(scene, episode)
-    if route is None:
-        return None
-    return int(route.get("max_steps", scene.get("max_steps", 0)))
-
-
-def _swapped_instruction(episodes, index, scene):
-    episode = episodes[index]
-    partner = index ^ 1
-    candidates = episodes[partner:partner + 1] + episodes[index + 1:] + episodes[:index]
-    goal = episode.get("goal_object")
-    spawn = _episode_spawn(scene, episode)
-    budget = _episode_budget(scene, episode)
-    if not goal or spawn is None or budget is None:
-        return None
-    for candidate in candidates:
-        if (candidate.get("goal_object") and candidate["goal_object"] != goal
-                and candidate["text"] != episode["text"]
-                and candidate.get("route_contract") == episode.get("route_contract")
-                and candidate.get("split") == episode.get("split")
-                and candidate.get("type") == episode.get("type")
-                and len(candidate.get("stage_waypoints") or []) == len(episode.get("stage_waypoints") or [])
-                and _episode_budget(scene, candidate) == budget
-                and _episode_spawn(scene, candidate) == spawn):
-            return candidate
-    return None
-
-
 def _episode_goal_waypoint(scene, episode):
     if episode is None or episode.get("manual_demo"):
         return None
@@ -330,10 +312,8 @@ def _active_bearing_source(args):
     return f"g0_{args.g0_mode}"
 
 
-def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_path=None,
-              vlm_grounder=None, student_proc=None):
-    import numpy as np
-    import random
+def _scene_requests(path, args):
+    """先固定本次运行的指令、种子顺序和交换目标，再加载模型及场景几何。"""
     scene = scene_mod.load_scene(path)
     manual_instruction = getattr(args, "instruction", None)
     if manual_instruction is not None:
@@ -352,12 +332,22 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                 "instruction_index": 0, "route_key": "manual", "split": scene.get("split"),
                 "type": "Manual instruction", "text": manual_instruction,
                 "start_object": None, "goal_object": None, "manual_demo": True}]
-    else:
-        eps = vln.episodes(scene, splits=args.split)
-        if not args.all_instructions:
-            eps = vln.one_per_route(eps, seed=args.seed)
-        if args.limit:
-            eps = eps[:args.limit]
+        return scene, eps, {}, 0
+    candidates = vln.episodes(scene, splits=args.split)
+    eps = vln.select_requests(candidates, all_instructions=args.all_instructions,
+                              limit=args.limit, seed=args.seed)
+    partners = (vln.swap_partners(scene, eps, candidates)
+                if getattr(args, "counterfactual", "correct") == "swap" else {})
+    return scene, eps, partners, len(candidates)
+
+
+def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_path=None,
+              vlm_grounder=None, student_proc=None, prepared=None):
+    import numpy as np
+    import random
+    scene, eps, partners, _ = prepared or _scene_requests(path, args)
+    cf_mode = getattr(args, "counterfactual", "correct")
+    manual_instruction = getattr(args, "instruction", None)
     if not eps:
         print(f"{path}: 没有带指令的航线（不是 SAGE-3D 导入的场景，或 --split 过滤光了）", file=sys.stderr)
         return [], []
@@ -365,16 +355,23 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
     collect_mode = bool(getattr(args, "collect", False))
     rows, failures = [], []
     runnable = []
-    for ep in eps:
+    for n, ep in enumerate(eps):
+        instruction_ep = partners.get(ep["key"]) if cf_mode == "swap" else ep
+        ep = dict(ep, seed=args.seed + n)
+        if instruction_ep is None:
+            failures.append({**ep, "scene": scene["name"], "failure_kind": "invalid_counterfactual_pair",
+                             "error": "ValueError: swap 缺少同 split、同句式/阶段数/预算、同起点的异目标指令"})
+            continue
+        if cf_mode == "swap":
+            ep["supplied_instruction_key"] = instruction_ep["key"]
         if (ep.get("route_contract") == "sage.multi_stage.v2"
                 and (grounder_kind != "vlm" or args.policy not in ("reactive", "student") or collect_mode)):
             ep_dir = os.path.join(args.out, scene["name"], f"{ep['route_name']}_{ep['instruction_index']}")
             failures.append({**ep, "scene": scene["name"], "dir": ep_dir,
                              "error": "ValueError: 多阶段任务需要 --grounder vlm、reactive/student 策略且不能使用 --collect"})
             continue
-        runnable.append(ep)
-    eps = runnable
-    if not eps:
+        runnable.append((n, ep, instruction_ep))
+    if not runnable:
         return rows, failures
     identity = collect_3dgs.scene_identity(scene)
     gaussians = (scene_mod.read_gaussian_ply(scene["ply_path"])
@@ -395,16 +392,11 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
     radius = reach_radius_of(scene)
     ref_paths = vln.sage_ref_paths(scene)
     clearance = getattr(args, "teacher_clearance", "ray")
-    cf_mode = getattr(args, "counterfactual", "correct")
     blind_rgb = bool(getattr(args, "blind_rgb", False))
     rng = random.Random(args.seed)
-    for n, ep in enumerate(eps):
+    scene_steps = scene.get("max_steps")
+    for n, ep, instruction_ep in runnable:
         ep_dir = os.path.join(args.out, scene["name"], f"{ep['route_name']}_{ep['instruction_index']}")
-        instruction_ep = _swapped_instruction(eps, n, scene) if cf_mode == "swap" else ep
-        if instruction_ep is None:
-            failures.append({**ep, "scene": scene["name"], "dir": ep_dir,
-                             "error": "ValueError: swap 缺少同 split、同句式/阶段数/预算、同起点的异目标指令"})
-            continue
         is_multi_stage = ep.get("route_contract") == "sage.multi_stage.v2"
         if is_multi_stage:
             route = (scene.get("multi_stage_routes") or [])[ep["multi_stage_index"]]
@@ -413,7 +405,11 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                           "route": {"index": ep["route_index"], "name": route["name"],
                                     "contract": ep["route_contract"]}})
         elif not ep.get("manual_demo"):
+            if scene_steps is not None:
+                scene["max_steps"] = scene_steps
             scene_mod.apply_route(scene, ep["route_index"])
+        steps = math.ceil(int(scene["max_steps"]) * STEPS_HOLD_S / args.hold)
+        ep.update(start_pose=dict(scene["spawn"]), step_budget=steps)
         identity = collect_3dgs.scene_identity(scene, ply_sha256=identity["ply_sha256"])
         evaluation_goal = None if ep.get("manual_demo") else dict(scene["waypoint"])
         supplied_goal_waypoint = (None if cf_mode == "zero" else
@@ -458,13 +454,12 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                         "supplied_text": supplied_text, "supplied_instruction_key": supplied_key,
                         "counterfactual": cf_mode, "blind_rgb": blind_rgb,
                         **({"grounding": grounding} if grounding is not None else {})}
-        steps = math.ceil(int(scene["max_steps"]) * STEPS_HOLD_S / args.hold)
-
         vlm_tracker = None
         if grounder_kind == "vlm":
             stage_instructions = [stage.get("instruction") or "" for stage in instruction_ep.get("stage_waypoints", [])]
             vlm_tracker = VlmBeliefTracker(vlm_grounder, supplied_text,
                                            update_every=getattr(args, "vlm_every", 2),
+                                           history_frames=getattr(args, "vlm_history_frames", 1),
                                            stage_instructions=stage_instructions if supplied_text else None)
             goal_fn = vlm_tracker
         elif grounder_kind == "blind_unknown":
@@ -531,14 +526,16 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                 dagger=dagger_meta,
                 stop_on_request=args.stop_mode == "explicit",
                 stop_after_safe=vln.STOP_STREAK if args.stop_mode == "legacy-safe" else None)
-            if vlm_tracker is not None and vlm_tracker.trace:
-                collect_3dgs._write_jsonl(os.path.join(ep_dir, "grounding_trace.jsonl"), vlm_tracker.trace)
-            if err or man.get("error"):
-                raise RuntimeError(err or man["error"])
+            episode_error = err or man.get("error")
             validity = man.get("validity", {})
-            if not validity.get("physics_verified") or not validity.get("camera_verified"):
-                raise RuntimeError(f"无效仿真观测: validity={validity}, dynamics_anomaly={man.get('dynamics_anomaly')}")
-            actions = _read_jsonl(os.path.join(ep_dir, "actions.jsonl"))
+            if not episode_error and not (validity.get("physics_verified") and validity.get("camera_verified")):
+                episode_error = f"无效仿真观测: validity={validity}, dynamics_anomaly={man.get('dynamics_anomaly')}"
+            action_path = os.path.join(ep_dir, "actions.jsonl")
+            actions = _read_jsonl(action_path) if not episode_error or os.path.isfile(action_path) else []
+            if vlm_tracker is not None and vlm_tracker.trace:
+                _write_grounding_trace(ep_dir, vlm_tracker.trace, actions)
+            if episode_error:
+                raise RuntimeError(episode_error)
             oracle = _read_jsonl(os.path.join(ep_dir, "oracle.jsonl"))
             if not actions or len(actions) != len(oracle):
                 raise ValueError("动作与位姿记录必须非空、长度一致")
@@ -585,7 +582,7 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                              **({"grounding": grounding} if grounding is not None else {}),
                              "error": f"{type(e).__name__}: {e}"})
             continue
-        row = {**ep, "seed": args.seed + n, "supplied_text": supplied_text,
+        row = {**ep, "supplied_text": supplied_text,
                "supplied_instruction_key": supplied_key, "counterfactual": cf_mode,
                **supplied_goal_record,
                "scene": scene["name"], **m, "error": err, "dir": ep_dir,
@@ -598,13 +595,11 @@ def run_scene(path, args, params, lexical_grounder=None, catalog=None, catalog_p
                                         evaluation_goal["y"] - supplied_goal_waypoint["y"])
                 row["swap_goal_separation_m"] = separation
                 row["swap_goal_disks_overlap"] = separation <= 2 * radius
-        if ep.get("manual_demo"):
-            row.update(start_pose=dict(scene["spawn"]), step_budget=steps)
         if vlm_tracker is not None:
-            lats = [x["latency_ms"] for x in vlm_tracker.trace]
+            lats = [entry["latency_ms"] for entry in vlm_tracker.trace if entry["vlm_called"]]
             row["vlm_calls"] = len(lats)
-            row["vlm_latency_ms_p50"] = collect_3dgs._percentile(lats, 50) if lats else None
-            row["vlm_latency_ms_p95"] = collect_3dgs._percentile(lats, 95) if lats else None
+            row["vlm_latency_ms_p50"] = collect_3dgs._percentile(lats, 50)
+            row["vlm_latency_ms_p95"] = collect_3dgs._percentile(lats, 95)
         if grounding is not None:
             row["grounding"] = grounding
             row.update({f"target_{key}": value for key, value in target_metrics.items()})
@@ -653,8 +648,10 @@ def main(argv=None):
                    help="G0 特权方位来源：subgoal=占据 A* 局部绕障子目标；direct=纯直线欧氏终点方位（S1-PureDirect 剥离机载视觉绕障）")
     p.add_argument("--vlm-model", default=None, help="--grounder vlm 的模型路径（默认 UAV-PUR-4B）")
     p.add_argument("--vlm-every", type=int, default=2, help="VLM 更新步间隔（hold=0.5s 时 2 步 = 1 Hz）")
+    p.add_argument("--vlm-history-frames", type=int, choices=(1, 4), default=1,
+                   help="每次视觉定位输入的连续决策帧数；4 用于与默认单帧做配对对照")
     p.add_argument("--counterfactual", choices=("correct", "swap", "zero"), default="correct",
-                   help="语言反事实模式：correct=原指令，swap=同场景异目标错配指令，zero=空指令")
+                   help="语言反事实模式：correct=原指令，swap=从同场景完整候选池换为同条件异目标指令，zero=空指令")
     p.add_argument("--blind-rgb", action="store_true", help="将喂给 student 的图像全置黑（排除复读机/纯条件捷径）")
     p.add_argument("--catalog", action="append", default=None,
                    help="--grounder lexical/phrase 时必填，每场景一个 uavrgb.vln_landmark_catalog.v1 JSON；可重复")
@@ -669,7 +666,7 @@ def main(argv=None):
     p.add_argument("--split", action="append", default=None,
                    help="只取这些 SAGE split（train / test_Instruction_Unseen / test_Trajectory_Unseen / test_Scene_Unseen）")
     p.add_argument("--all-instructions", action="store_true", help="每条航线的每句指令都跑（缺省每条航线一句）")
-    p.add_argument("--limit", type=int, default=0, help="每个场景最多跑几集（0 = 不限）")
+    p.add_argument("--limit", type=int, default=0, help="每个场景最多跑几集（0 = 不限）；截断全部指令时按航线轮取")
     p.add_argument("--videos", type=int, default=0, help="每个场景前几集合成带指令横幅的四格视频")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--instruction", default=None,
@@ -748,8 +745,21 @@ def main(argv=None):
     vlm_grounder = None
     student_proc = None
     ckpt_sha256 = None
+    plans = {}
+    preflight = {}
+    if args.counterfactual == "swap":
+        for path in args.scene:
+            plans[path] = _scene_requests(path, args)
+            scene, requested, partners, pool_size = plans[path]
+            rejected = [{"key": ep["key"], "reason": "no_compatible_swap_partner"}
+                        for ep in requested if ep["key"] not in partners]
+            preflight[scene["name"]] = {"n_candidates": pool_size, "n_requested": len(requested),
+                                        "n_pairable": len(partners), "n_rejected": len(rejected),
+                                        "pairs": {key: ep["key"] for key, ep in partners.items()},
+                                        "rejected": rejected}
+    needs_policy = args.counterfactual != "swap" or any(s["n_pairable"] for s in preflight.values())
     try:
-        if args.policy == "student":
+        if needs_policy and args.policy == "student":
             sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tools"))
             import student as student_mod
             import nav_cond
@@ -757,7 +767,7 @@ def main(argv=None):
             student_proc = student_mod.StudentPolicy(args.ckpt, infer_bin=args.infer_bin)
             if args.grounder == "vlm" and student_proc.prev_dim != nav_cond.VLN_NAV_DIM:
                 p.error("VLM student 模式需要 prev_dim=15 的 VLN_NAV checkpoint，当前权重不会消费 VLM 方位")
-        if args.grounder == "vlm" and args.counterfactual != "zero":
+        if needs_policy and args.grounder == "vlm" and args.counterfactual != "zero":
             vlm_grounder = grounder_mod.VisualLanguageGrounder(model_path=args.vlm_model)
         for path in args.scene:
             scene_catalog, catalog_path = None, None
@@ -770,7 +780,7 @@ def main(argv=None):
                 scene_catalog = grounder_mod.load_catalog(catalog_path, scene_name=scene_name, scene_path=path)
             r, f = run_scene(path, args, params, lexical_grounder=lexical_grounder,
                              catalog=scene_catalog, catalog_path=catalog_path,
-                             vlm_grounder=vlm_grounder, student_proc=student_proc)
+                             vlm_grounder=vlm_grounder, student_proc=student_proc, prepared=plans.get(path))
             rows += r
             failures += f
     finally:
@@ -785,6 +795,13 @@ def main(argv=None):
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     vlm_lats = [r["vlm_latency_ms_p50"] for r in rows if r.get("vlm_latency_ms_p50") is not None]
     manual_demo = args.instruction is not None
+    score_fields = ("success", "oracle_success", "spl", "ndtw", "sdtw", "ne_m", "collision", "stopped")
+    supplied_rows = [{key: r["supplied_goal_" + key] for key in score_fields}
+                     for r in rows if "supplied_goal_success" in r]
+    paired_supplied = None
+    if args.counterfactual == "swap":
+        matched_failures = [f for f in failures if f["key"] in preflight[f["scene"]]["pairs"]]
+        paired_supplied = vln.summarize(supplied_rows, matched_failures)
     report = {"metric_version": METRIC_VERSION if args.stop_mode == "explicit" else "3dgs.vln.v2",
               "stage_metric_version": "sage.multi_stage.v1",
               "policy": args.policy, "ckpt": args.ckpt,
@@ -797,6 +814,8 @@ def main(argv=None):
               "dynamics": "cf_sitl", "dynamics_profile": params.profile(),
               "scenes": args.scene, "split_filter": args.split, "all_instructions": args.all_instructions,
               "grounder": args.grounder, "g0_mode": args.g0_mode,
+              "vlm_history_frames": args.vlm_history_frames if args.grounder == "vlm" else None,
+              "vlm_every": args.vlm_every if args.grounder == "vlm" else None,
               "active_bearing_source": _active_bearing_source(args),
               "catalog": args.catalog,
               "vlm_latency_ms": ({"p50_median": collect_3dgs._percentile(vlm_lats, 50),
@@ -810,16 +829,12 @@ def main(argv=None):
               "by_type": {} if manual_demo else vln.summarize_by(rows, "type", failures),
               "by_split": {} if manual_demo else vln.summarize_by(rows, "split", failures),
               "by_scene": {} if manual_demo else vln.summarize_by(rows, "scene", failures),
+              "swap_pair_preflight": preflight if args.counterfactual == "swap" else None,
               "grounding": (_grounding_summary(rows, failures) if use_grounder and not manual_demo else None),
               "supplied_goal_metric_scope": "instruction_episode_waypoint",
-              "supplied_goal_metrics": (None if manual_demo or args.counterfactual == "zero" else vln.summarize([
-                  {"success": r["supplied_goal_success"],
-                   "oracle_success": r["supplied_goal_oracle_success"],
-                   "spl": r["supplied_goal_spl"], "ndtw": r["supplied_goal_ndtw"],
-                   "sdtw": r["supplied_goal_sdtw"], "ne_m": r["supplied_goal_ne_m"],
-                   "collision": r["collision"], "stopped": r["stopped"]} for r in rows
-                  if "supplied_goal_success" in r],
-                  failures)),
+              "supplied_goal_metrics": (None if manual_demo or args.counterfactual == "zero"
+                                        else vln.summarize(supplied_rows, failures)),
+              "paired_supplied_goal_metrics": paired_supplied,
               "target_goal_metrics": (vln.summarize([
                   {"success": r["target_success"], "oracle_success": r["target_oracle_success"],
                    "spl": r["target_spl"], "ne_m": r["target_ne_m"],

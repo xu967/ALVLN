@@ -18,6 +18,7 @@ collect_3dgs.run_episode(stop_on_request=True) 将它执行为一个 SAFE 窗口
 旧的 3dgs.pilot.v2 成功判据（轨迹进过半径就算，不要求停）在这里就是 OSR。
 """
 import json
+from itertools import chain, islice, zip_longest
 import math
 import os
 import statistics
@@ -207,6 +208,64 @@ def one_per_route(eps, seed=0):
     return picked
 
 
+def select_requests(episodes, *, all_instructions, limit, seed):
+    """各臂使用相同名单。全部指令模式有截断时，先遍历各航线的第一句，再取第二句。"""
+    if not all_instructions:
+        picked = one_per_route(episodes, seed)
+        return picked[:limit] if limit else picked
+    if not 0 < limit < len(episodes):
+        return episodes
+    routes = {}
+    for ep in episodes:
+        routes.setdefault(ep["route_key"], []).append(ep)
+    ordered = (ep for turn in zip_longest(*routes.values()) for ep in turn if ep is not None)
+    return list(islice(ordered, limit))
+
+
+def swap_partners(scene, requested, candidates):
+    """从当前 split 的完整指令池找相同实验条件的异目标。优先从本次请求中互换。"""
+    conditions = {}
+    routes = (scene.get("routes") or []) + (scene.get("multi_stage_routes") or [])
+    for i, route in enumerate(routes):
+        try:
+            spawn = route["spawn"]
+            pose = tuple(float(spawn[k]) for k in ("x", "y", "z")) + (float(spawn.get("yaw_deg", 0)),)
+            budget = int(route.get("max_steps", scene.get("max_steps")))
+            xy = tuple(float(route["waypoint"][k]) for k in ("x", "y"))
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if budget > 0 and all(math.isfinite(value) for value in (*pose, *xy)):
+            conditions[i] = (pose, budget)
+
+    keys = {ep["key"] for ep in requested}
+    ordered = chain(requested, (ep for ep in candidates if ep["key"] not in keys))
+    groups = {}
+    for ep in ordered:
+        condition = conditions.get(ep["route_index"])
+        labels = (ep.get("split"), ep.get("type"), ep.get("goal_object"), ep.get("text"))
+        if condition is None or not all(isinstance(s, str) and s.strip() for s in labels):
+            continue
+        group = (condition, ep.get("route_contract"), ep.get("split"), ep.get("type"),
+                 len(ep.get("stage_waypoints") or ()))
+        groups.setdefault(group, []).append(ep)
+
+    partners = {}
+    for group in groups.values():
+        if len({ep["goal_object"] for ep in group}) < 2:
+            continue
+        selected = [ep for ep in group if ep["key"] in keys]
+        outside = group[len(selected):]
+        for i, ep in enumerate(selected):
+            # 相邻请求优先互换；同一目标的改写不能当作语言换目标。
+            direction = 1 if i % 2 == 0 else -1
+            nearby = (selected[(i + direction * offset) % len(selected)] for offset in range(1, len(selected)))
+            for other in chain(nearby, outside):
+                if other["goal_object"] != ep["goal_object"] and other["text"] != ep["text"]:
+                    partners[ep["key"]] = other
+                    break
+    return partners
+
+
 def trajectory(actions, oracle):
     """[(x, y)]：第一步动作前的位姿，再接每步结束时的真值位姿。"""
     if not actions:
@@ -256,8 +315,7 @@ def _segment_circle_entry(start, end, goal, radius, min_fraction=0.0):
     if length_sq <= 1e-12:
         return min_fraction if math.dist(start, goal) <= radius else None
     projection = ((goal[0] - start[0]) * dx + (goal[1] - start[1]) * dy) / length_sq
-    closest = max(0.0, min(1.0, projection))
-    closest_x, closest_y = start[0] + closest * dx, start[1] + closest * dy
+    closest_x, closest_y = start[0] + projection * dx, start[1] + projection * dy
     offset = math.hypot(closest_x - goal[0], closest_y - goal[1])
     if offset > radius:
         return None

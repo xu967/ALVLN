@@ -114,14 +114,23 @@ def panel(cv2, canvas, x, y, lines, action, flags, segments, t_rel, span, result
     s         画布倍数：所有像素偏移、字号、线宽乘 s
     """
     font = cv2.FONT_HERSHEY_SIMPLEX
+
+    def draw_line(text, baseline, size, color, thickness):
+        scale, stroke = size * s, thickness * s
+        width = cv2.getTextSize(text, font, scale, stroke)[0][0]
+        available = (CW - 32) * s
+        if width > available:
+            scale *= (available - stroke) / width
+        cv2.putText(canvas, text, (x + 16 * s, baseline), font, scale, color, stroke)
+
     for i, text in enumerate(lines):
-        cv2.putText(canvas, text, (x + 16 * s, y + (34 + 30 * i) * s), font, 0.65 * s, WHITE, 2 * s)
+        draw_line(text, y + (34 + 30 * i) * s, 0.65, WHITE, 2)
     ay = y + (34 + 30 * len(lines) + 10) * s
     if action is not None:
         cv2.rectangle(canvas, (x + 16 * s, ay - 24 * s), (x + 330 * s, ay + 10 * s), ACTION_BGR[action], -1)
         cv2.putText(canvas, ACTIONS[action], (x + 24 * s, ay), font, 0.8 * s, (0, 0, 0), 2 * s)
     for i, (text, color) in enumerate(flags):
-        cv2.putText(canvas, text, (x + 16 * s, ay + (50 + 34 * i) * s), font, 0.7 * s, color, 2 * s)
+        draw_line(text, ay + (50 + 34 * i) * s, 0.7, color, 2)
     bx0, bx1, by = x + 16 * s, x + (CW - 16) * s, y + 330 * s
     for st, en, a in segments:
         u0, u1 = bx0 + int((bx1 - bx0) * st / span), bx0 + int((bx1 - bx0) * en / span)
@@ -130,8 +139,7 @@ def panel(cv2, canvas, x, y, lines, action, flags, segments, t_rel, span, result
     cv2.line(canvas, (u, by - 20 * s), (u, by + 4 * s), (255, 255, 255), 2 * s)
     if result:
         ok = result.upper().startswith("SUCCESS")
-        cv2.putText(canvas, result, (x + 16 * s, y + 290 * s), font, 1.1 * s,
-                    (80, 220, 80) if ok else (0, 0, 255), 3 * s)
+        draw_line(result, y + 290 * s, 1.1, (80, 220, 80) if ok else (0, 0, 255), 3)
 
 
 # ---------------------------------------------------------------- 编码

@@ -21,6 +21,9 @@ class _FakeCv2:
     def putText(self, _img, text, org, _font, scale, color, thickness, *_a):
         self.texts.append((text, org, scale, color, thickness))
 
+    def getTextSize(self, text, _font, scale, thickness):
+        return (round(len(text) * 18 * scale) + thickness, round(24 * scale)), 0
+
     def rectangle(self, _img, p0, p1, color, _t):
         self.rects.append((p0, p1, color))
 
@@ -65,6 +68,14 @@ def check_panel_layout():
     assert cursor == (bx0 + (bx1 - bx0) // 4, by - 20), cursor
     res = [(o, c, th) for t, o, _s, c, th in cv2.texts if t == "SUCCESS"][0]
     assert res == ((x + 16, y + 290), (80, 220, 80), 3), res
+    assert cv2.texts[-1][2] == 1.1
+    long_result = "VLM STOP | unscored manual demo | agent_stop"
+    long_title = "student | cf_sitl | sage3d_839934_tr_42_tr_69 | seed 421"
+    for scale in (1, 2):
+        vl.panel(cv2, None, x, y, [long_title], None, [], [], 0., 1., long_result, s=scale)
+        for expected, (text, _, text_scale, _, thickness) in zip((long_title, long_result), cv2.texts[-2:]):
+            width = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, text_scale, thickness)[0][0]
+            assert text == expected and width <= (vl.CW - 32) * scale
     # 失败结果红色；action=None 不画色块；result 空不画
     cv2 = _FakeCv2()
     vl.panel(cv2, None, x, y, ["t"], None, [], [], 0.0, 1.0, "COLLISION")

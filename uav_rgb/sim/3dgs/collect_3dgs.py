@@ -260,6 +260,9 @@ class StudentAdapter:
         if grounding is not None:
             self.last_decision.update(grounding_mode=grounding.goal_mode,
                                       grounding_reason=grounding.reason, grounding_conf=grounding.conf)
+            evidence = getattr(self.goal_fn, "action_evidence", None)
+            if isinstance(evidence, dict):
+                self.last_decision.update(evidence)
         self.last_executed = action
         return action, infer_ms
 
@@ -332,7 +335,8 @@ class DaggerPolicy:
             self.stop_requested = self.last_stop_expert
             self.n_expert_exec += 1
             self.student.last_executed = action
-            if action != student_action:
+            self.student.last_decision["stop_source"] = "dagger_expert" if self.stop_requested else None
+            if action != student_action or self.stop_requested != self.student.stop_requested:
                 self.student.last_decision["action_intervention"] = "dagger_expert"
         return action, infer_ms
 
