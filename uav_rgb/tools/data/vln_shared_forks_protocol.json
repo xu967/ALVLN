@@ -1,0 +1,42 @@
+{
+  "schema": "uavrgb.vln.flown_shared_forks.protocol.v1",
+  "frozen_on": "2026-11-27T18:32:00+08:00",
+  "base_source": "1b2d3bc72a96914bf0d1d4160332bc500cad3fb3",
+  "scope": "室内真实机载渲染与固件在环局部教师实验。同一物理位置的两条原生语言指令各自实飞。地图和实例信息仅用于预先构造实验和评测。",
+  "roles": {"development":["839992","840865"],"train":["840139","841012","841150"],"sealed":"840818"},
+  "scene_sha256": {
+    "839992":"ce2e6791c53998b88b77fad7ff2020cfba7cca3783ce8cfd30147c276e78364e",
+    "840865":"72a742f577ab0a2ae868c7debf2e096c62a6d5b5b6c87aa78020a955065ebcd6",
+    "840139":"4fbc16040f366dbf48c11dab4eee0779804f5c13f9bc8a01ba26363e6d1c299b",
+    "841012":"6b885d73f6178cb0a84c176a5de3bb24f1261405687c3d0759aabc92570a25f9",
+    "841150":"65cde0020238577b3b71c1a7c89a6ede72ef2645ee9bc2918abd435eaa2fb237"
+  },
+  "instance_join_sha256": "b0e9b2fbb564b081427d90d0e517b9371635aaa03856eff8fc3aa0f9ad455ddd",
+  "design": {
+    "native": "仅 SAGE-3D 原生 train。同一官方起点物体、起点实例、物理 xyz（保留 5 位），不同终点实例且停靠圆不相交。固定每条路线第一条与登记目标一致的 Relative_Relationship 原句。不得改原文或平移起点。",
+    "sites": "按房间和物理 xyz 排序。已选地点同房间至少相隔 1 米，yaw、seed、时间、路线对均不增加物理地点数。对于旧批已用的地点、路线和原句另行标记。两个开发房间都有历史使用记录。",
+    "cap": {"839992":8,"840865":8,"840139":2,"841012":2,"841150":2},
+    "control": "每房先留一个合法同原生 yaw 的原航向配对，按 SHA256(control|room|xyz|routeA|routeB) 确定，独立于预测方向、图像和模型；与富集样本分层。",
+    "targeted": "每址至多三对原生路线，优先使出生处两条 A* 路标短弧夹角接近 40 度，平局用接近 27 度及路线名。至多九个共同航向：原有航向优先，其余由两个瞄向的短弧中点及 ±8、±14、±23 度的固定偏置构造。保存所有实际尝试原因和计数。CPU 使用冻结固件及原教师自然动作；只在双方已执行相同动作时推进。选在 step 1..7 发生可表达异向、双方路标都入画的候选，优先保持相同原生航向，再比边距、角余量、早决策与稳定路线名。缺额保留。",
+    "seed": "每物理地点由 SHA256(vln-shared-v1|room|xyz) 的前八个十六进制字符取模 1000000 决定，同地两个目标与所有候选航向同一 seed。具体编码、顺序和数值写入设计清单。",
+    "denominators": "保留各房候选、预筛、入选、未达标、对照全部分母。几何富集只用于检测特定能力，不估计自然路线上的此类分岔比例。"
+  },
+  "acquisition": {
+    "conditions": ["targeted","control"],"heading_sources": ["native_common","designed_common"],
+    "steps": 8,"hold_s":0.5,"policy":"teacher","grounder":"none","clearance":"braking","stop_mode":"explicit",
+    "physics":"cf_sitl","render":"gsplat","save_rgb":true,"save_depth":true,
+    "cpu_binary_sha256":"25561f17d81ef88141a3c445ba31e79c606f0b106c0314153b2da3a0ccb612c0",
+    "gpu_uuid":"GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740",
+    "flight_path": "两独立进程/固件重置；同起点同航向同 seed，单路线单指令；两臂分别跑原 run_vln，结果按 pair/arm 写盘。记录失败和提前停止。"
+  },
+  "primary": "主覆盖为开发两房累计至少 10 个不同物理起点，每个取最早符合要求的共享帧。需在实际飞行的第 1 至 7 窗，相同完整已执行动作/时间/10 Hz 轨迹和相机像素，经验证有效的两条 A* 方向不同、均可表达（0/1/7）、两瞄点同在真实相机图中。step0 为单独的复位照。无动作分歧的配对也保留可核实的共享帧。报告开发各房和训练独立计数。",
+  "secondary": "报告同向、不同且可表达、单路标入画/都未入画、不可表达的样本和缺失/失败。按相机帧出具两目标实例的独立几何/深度证据；瞄点进画不代表目标物体可见。人工参照只复用逐字匹配的登记条目，新原句保留复核状态。",
+  "prediction": {
+    "use": "对验证后的原始 RGB 和原句做冻结模型离线迁移。权重不再训练，不根据新标签调参。四组固定，可见性/实例/位姿不输入；对每物理地点首个严格见证计双正确，按 train/development、房间、targeted/control 分层；全部有效共享观测另列。零分母输出空。",
+    "method_source":"4503dcb9f70f20bb9a843ca9609010b356643afc",
+    "feature_module_sha256":"002da450d816b9b01ec90635d304e540a2fbc692e7abee318ddcdfb6aed16e76",
+    "fit_sha256":"3cc5a5299b63659d56388a0b171fea2dbcafd0f964690bcd0c486bfe4fd2faf7"
+  },
+  "pilot": "先将旧登记的 839992_tr_118_tr_136 两臂（seed 3102）从原生同一出生姿态分别跑 28 步。该已知样例检验真实日志与历史第 26 步能否复现，始终单列，不增加本次新起点分母。",
+  "interpretation": "本批为短时同图双指令方向诊断。独立新样本由物理地点确定；训练房间、旧开发房间及新选配对的使用历史分别汇报。无整程 SR/SPL 或真实硬件结论。"
+}

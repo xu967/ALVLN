@@ -211,3 +211,46 @@ CUDA_VISIBLE_DEVICES=GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740 \
 - 制标、参照、旧探针及真实十对回归的 27 项测试全部通过。再加 `sim.3dgs.test_teacher_clearance`、`test_teacher_tol`、`test_collision`、`test_collision_model`，在独立导出的发布快照中共 **181/181 通过，37.288 秒**。原工作树中两个既有测试文件有差异，相同命令在那里是 172/172，40.006 秒。候选分支的 `tools.test_fork_region` 五项通过。旧训练入口七个预设逐项比对版本前后预检的输出和退出码，OpenFly 的旧资产缺失在两版均会触发；本次候选使用了完整的真实权重与图像。[发布快照测试日志](</root/rivermind-data/uav_rgb/exp-vln-fork-bearings-20261127/release-regression.log>)
 - 物理 GPU0（NVIDIA GeForce RTX 2080 Ti）于 17:54 完成全部候选及对照，入口记录 19.09 秒，`DONE` 为 `rc=0`。独立从 286 对逐条预测重算四组、三类、32 对异向、九个路线对及起点分布；均与发布指标一致。双入画异向 0/5、真实共享异向 0/1。区域候选未过三项条件，本次实验停在离线阶段。[逐条预测与指标入口](</root/rivermind-data/uav_rgb/exp-vln-fork-region-20261127/fork_region/summary.json>) · [数据盘运行日志](</root/rivermind-data/uav_rgb/exp-vln-fork-region-20261127/run.log>)
 - 开发集的配对图按预先选样规则出图并人工检查；从配套 JSON 的复图代码得到字节相同的 PNG，SHA-256 为 `b3181d8f60ade7766ab7b835fb94909614ff7e50d98cb4d71f3aeea715477e6e`。含机载 RGB 的图与原始日志留在数据盘，Git 收录方法、文字区间、登记、结果表与复现命令。[配对图与复图代码](</root/rivermind-data/uav_rgb/exp-vln-fork-bearings-20261127/paired_waypoints.json>)
+
+## 更新 2026-11-27 晚间 · 补采共同分岔
+
+### 做了什么
+
+- 先冻结房间、五房原文件与 CF-SITL 可执行文件指纹、8 步预算、原句选择、独立起点和主样本规则。补查了符合旧条件的轨迹库，核对旧 40 对与其共同前缀。使用原生 XYZ，在每一地点选一条共同航向，可还原每条路线原始的朝向。富集样本的 CPU 预演在两位教师发出相同动作时才推进固件。[设计与预演](../../tools/design_vln_shared_forks.py)
+- 原 `sim.3dgs.run_vln` 收到两份不同的原生 SAGE-3D 任务。A/B 用同一个 seed 和出生位姿分别飞，写出调试工具可直接读取的真实相机、深度、动作和轨迹。核验器打开两份产物核对整个共同前缀，包括各窗的 RGB、深度及 10 Hz 固件轨迹。复位图不进入主样本，首次动作分歧当下的前图仍属共同前缀。[飞行核验](../../tools/verify_vln_shared_forks.py)
+- 第一个表列的是局部瞄准点。目标实体另用 InteriorGS 原生实例盒和同期深度检查，输出候选区域及人工可复核的画面，参照词按原句与目标的精确摘要连接。再以已经发布的固定参数评分，每个主起点只计一次，推理端只读取 RGB 和实际原句。[目标可见性复核](../../tools/vln_fork_visibility.py) · [冻结模型评分](../../tools/score_vln_shared_forks.py)
+
+### 验证到哪一步
+
+复飞历史对照 `839992_tr_118_tr_136`，A/B 两进程共用 GPU0，合计 25.353 秒，两端均正常结束。完整 28+28 个 RGB、140+140 条遥测各自与旧飞行一致；第 26 步前图解码 SHA-256 为 `94b4c4329164b0b91fc5ad504fe45e35549f7e012f77f6cabd3e60b92b327d5e`。审核器验收了 26 个已经飞过共同前缀的状态，其中 25 个同向，1 个异向且单侧路标入画。没有把这对重复路线算作新增地点。[历史复飞对账](</root/rivermind-data/uav_rgb/exp-vln-shared-prefix-20261127/pilot/historical_comparison.json>)
+
+第 26 步两条原句的真方向依次为正前、右前。区域加原句给出左前／左前，区域加空句同样给出左前／左前，整图加原句给出右前／右前，恒前给出正前／正前。该步仅一个路标入画，严格主样本的分母为零。另对照原图、官方实例盒以及渲染深度，壁画 #157 的 85 条穿框射线与盒内深度相容，饰物 #86 的 475 条射线都先遇到更近的表面。盒内深度相容还需结合原图核对实例身份。[原图、目标框与局部路标](</root/rivermind-data/uav_rgb/exp-vln-shared-prefix-20261127/historical_visibility_smoke.png>) · [冻结模型逐窗预测](</root/rivermind-data/uav_rgb/exp-vln-shared-prefix-20261127/pilot/frozen-scores/predictions.jsonl>)
+
+设计、飞行证据、可见性、冻结模型、既有制标和真实历史回归共 43 项通过。覆盖了改动预算、漏登记房间、缺一臂、只共享复位图、相同动作直到时限及同一地点多帧等情形。正式批次按此次提交的干净源码运行。
+
+### 复现与接手
+
+数据根记为 `D=/root/rivermind-data/uav_rgb`，实验根为 `E=$D/exp-vln-shared-prefix-20261127`。固定训练产物来自 `$D/exp-vln-fork-region-20261127/fork_region`，该批冻结特征代码位于同目录的兄弟目录 `source`，源提交 `4503dcb`。另建输出目录复跑时，先将 Git 的 `tools/data/vln_shared_forks_protocol.json` 放入新目录作 `protocol.json`。使用相同的固件和五房原生资产；运行命令如下。
+
+```bash
+export CF_SITL_PROC="$D/tmp/build-cf-sitl/cf_sitl_proc"
+export TORCH_EXTENSIONS_DIR="$D/torch-cache/extensions-sm75" TORCH_CUDA_ARCH_LIST=7.5
+export CUDA_VISIBLE_DEVICES=GPU-b544b42e-15d3-c9c8-1bdb-4c339775a740
+export PYTHONDONTWRITEBYTECODE=1 OPENBLAS_NUM_THREADS=1 OMP_NUM_THREADS=2
+PY="$D/3dgs-venv/bin/python"
+"$PY" -B -m tools.design_vln_shared_forks --out "$E" --workers 3
+```
+
+设计器发布 `design.json` 后，按 `pairs[].arms[].argv` 的完整参数数组从干净源码运行每个独立教师进程。每个退出码单列，保留失败和提前终止。其余步骤读同一登记。
+
+```bash
+"$PY" -B -m tools.verify_vln_shared_forks --design "$E/design.json" --out "$E/verified" --data-root "$D"
+"$PY" -B -m tools.vln_fork_visibility --observations "$E/verified/observations.jsonl" --out "$E/visibility" --data-root "$D"
+"$D/envs/vlm-venv/bin/python" -B -m tools.score_vln_shared_forks --design "$E/design.json" \
+  --observations "$E/verified/observations.jsonl" --old-run "$D/exp-vln-fork-region-20261127/fork_region" \
+  --source "$D/exp-vln-fork-region-20261127/source" --out "$E/frozen-scores"
+```
+
+### 没做什么
+
+本批没有训练新权重、用富集样本估计自然路线分岔频率或调整飞行增益。几何入画、渲染深度和实例盒用于辅助审图，未获实例证据的参照保留为待复核。短窗结果不能衡量从原生起点到终点的导航成功率；840818 继续封存。即使 CPU 预演满足两点入画，也只有实采通过双臂核验才能增加覆盖数。
